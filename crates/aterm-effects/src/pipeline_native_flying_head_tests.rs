@@ -270,75 +270,124 @@ fn a_head_crossing_a_wrap_is_not_fitted_for_its_way_across() {
 }
 
 /// THE HEAD FITS ITS ROW WHERE NO SEAT HOLDS IT WHOLE ([`companion::HeadFit`]): typed along a
-/// full page's last row, under a row of letters in every cell, up to and past where its
-/// whole seat runs out at the margin, the head is drawn in every frame, and from its ease's
-/// end its box lies inside the caret's row and off the caret's cell and every letter, to the
-/// last column it has room past the caret. Its fit only falls with the room, so it does not
-/// pulse. The flier's glide is held to the same law to the same column: wider for its height, it
-/// is fitted down to the head's floor width (`kitty_cursor_fit_floor`), no narrower than the
-/// head stood. Negative control: without the fit the head lies on the row above.
+/// full page's last row, under a row of letters in every cell, the head is drawn in every frame,
+/// and from its ease's end its box lies inside the caret's row and off the caret's cell and every
+/// letter, to the last column it has room past the caret, and is never fitted under
+/// [`companion::HEAD_FIT_FLOOR`] of itself. Its fit only falls with the room, so it does not
+/// pulse; at the last column it is still fitted to its row, at the grid's end. Negative control:
+/// without the fit the head lies on the row above.
 #[test]
 fn the_head_fits_its_row_where_no_seat_holds_it_whole() {
-    // Held for the head and for the flier's glide, each to the last column with room for it.
-    let mut head_least_w = None;
-    for (body, last_room) in [
-        (CursorBody::Head, 116_u16),
-        (CursorBody::Glide(PetGlyphId::PetFly), 116),
-    ] {
-        let ch = i32::from(GEOM.cell_h);
-        let cw = i32::from(GEOM.cell_w);
-        let walk = last_row_walk(60, last_room, 50, 1_200, body);
-        let settled = (0.3 * 1000.0 / 16.0) as usize;
-        let mut least = 1.0f32;
-        let mut least_w = i32::MAX;
-        for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
-            least_w = least_w.min(x1 - x0);
-            assert!(
-                y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
-                "{body:?}: caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} leaves its row"
-            );
-            assert!(
-                x0 >= (i32::from(col) + 1) * cw,
-                "{body:?}: caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} meets the caret or \
-                 the letters behind it"
-            );
-            assert!(
-                fit <= least,
-                "{body:?}: caret ({row}, {col}): the head's fit grew back from {least} to {fit}"
-            );
-            least = fit;
-        }
-        match head_least_w {
-            None => {
-                assert!(
-                    least >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
-                    "the head stayed big enough to read: fit {least}"
-                );
-                head_least_w = Some(least_w);
-            }
-            Some(head_w) => assert!(
-                least_w >= head_w - 1,
-                "{body:?}: fitted to {least_w} px wide, under the head's {head_w}"
-            ),
-        }
-        crate::rainbow_kitty::companion::set_head_fit_unread(true);
-        let whole = last_row_walk(60, last_room, 50, 1_200, body);
-        crate::rainbow_kitty::companion::set_head_fit_unread(false);
-        let &(row, _, _, _, y0, ..) = whole.last().expect("frames");
-        assert!(
-            y0 < i32::from(row) * ch,
-            "{body:?}: negative control: without the fit the head still kept off the row above"
-        );
-        // To the last column, where no room is left past the caret: still fitted to its row, at
-        // the grid's end, and not back over the row above.
-        let to_the_end = last_row_walk(60, 119, 50, 1_400, body);
-        let &(row, col, x0, x1, y0, y1, _) = to_the_end.last().expect("frames");
-        assert_eq!(col, 119, "the caret reached the last column");
+    let ch = i32::from(GEOM.cell_h);
+    let cw = i32::from(GEOM.cell_w);
+    let body = CursorBody::Head;
+    let walk = last_row_walk(60, 116, 50, 1_200, body);
+    let settled = (0.3 * 1000.0 / 16.0) as usize;
+    let mut least = 1.0f32;
+    for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
         assert!(
             y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
-            "{body:?}: at the last column the head's box {x0}..{x1} x {y0}..{y1} left its row"
+            "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} leaves its row"
         );
+        assert!(
+            x0 >= (i32::from(col) + 1) * cw,
+            "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} meets the caret or the \
+             letters behind it"
+        );
+        assert!(
+            fit <= least,
+            "caret ({row}, {col}): the head's fit grew back from {least} to {fit}"
+        );
+        least = fit;
     }
+    assert!(
+        least >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
+        "the head stayed big enough to read: fit {least}"
+    );
+    crate::rainbow_kitty::companion::set_head_fit_unread(true);
+    let whole = last_row_walk(60, 116, 50, 1_200, body);
+    crate::rainbow_kitty::companion::set_head_fit_unread(false);
+    let &(row, _, _, _, y0, ..) = whole.last().expect("frames");
+    assert!(
+        y0 < i32::from(row) * ch,
+        "negative control: without the fit the head still kept off the row above"
+    );
+    let to_the_end = last_row_walk(60, 119, 50, 1_400, body);
+    let &(row, col, x0, x1, y0, y1, _) = to_the_end.last().expect("frames");
+    assert_eq!(col, 119, "the caret reached the last column");
+    assert!(
+        y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
+        "at the last column the head's box {x0}..{x1} x {y0}..{y1} left its row"
+    );
+}
+
+/// THE GLIDE FITTED BY THE WALL RISES, NEVER SHRINKS ([`companion::head_fit_seat`]): typed along
+/// the same last row to the grid's last column, the flier's glide is drawn in every frame, and
+/// from its ease's end its box lies inside one row and off the caret's cell and every letter: on
+/// the caret's row at its row's size while there is room past the caret, then, where the grid's
+/// end leaves none, on the blank row above the full one, at the same size, gone out and come in
+/// there across the full row ([`crate::word_decorations::HEAD_FLIGHT`]'s fade), never over it.
+/// Its size never changes, and it changes rows once. At 0a12236dc7b it shrank with the room to a
+/// quarter of itself (`kitty_cursor_fit_floor`), at full alpha a key at a time, to keep off the
+/// caret. Negative control (`FIT_RISES_OFF`, the glide shrinking with the room as the head does):
+/// at the last column its box, no smaller than the floor, lies on the caret.
+#[test]
+fn the_glide_fitted_by_the_wall_rises_and_never_shrinks() {
+    let ch = i32::from(GEOM.cell_h);
+    let cw = i32::from(GEOM.cell_w);
+    let body = CursorBody::Glide(PetGlyphId::PetFly);
+    let walk = last_row_walk(60, 119, 50, 1_400, body);
+    let settled = (0.3 * 1000.0 / 16.0) as usize;
+    let mut seat: Option<(i32, f32)> = None;
+    let mut rose = false;
+    for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
+        let seat_row = (y0 + y1) / 2 / ch;
+        assert!(
+            y0 >= seat_row * ch && y1 <= (seat_row + 1) * ch,
+            "caret ({row}, {col}): the glide's box {x0}..{x1} x {y0}..{y1} lies across rows"
+        );
+        // The page: every even row above the last lettered, the last row up to the caret.
+        let lettered = |r: i32, c: i32| {
+            (r < i32::from(row) && r % 2 == 0) || (r == i32::from(row) && c < i32::from(col))
+        };
+        for r in y0 / ch..=(y1 - 1) / ch {
+            for c in x0 / cw..=(x1 - 1) / cw {
+                assert!(
+                    !lettered(r, c) && (r, c) != (i32::from(row), i32::from(col)),
+                    "caret ({row}, {col}): the glide's box {x0}..{x1} x {y0}..{y1} meets cell \
+                     ({r}, {c})"
+                );
+            }
+        }
+        assert!(
+            fit >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
+            "caret ({row}, {col}): fitted to {fit}, under the floor"
+        );
+        if let Some((r, f)) = seat {
+            assert!(
+                (fit - f).abs() < 1e-4,
+                "caret ({row}, {col}): the glide's fit went from {f} to {fit}"
+            );
+            if r != seat_row {
+                assert!(!rose, "the glide changed rows twice");
+                rose = true;
+            }
+        }
+        seat = Some((seat_row, fit));
+    }
+    assert!(
+        rose,
+        "the grid's end left no room past the caret, and the glide took the blank row above"
+    );
+    crate::rainbow_kitty::companion::FIT_RISES_OFF.with(|c| c.set(true));
+    let shrunk = last_row_walk(60, 119, 50, 1_400, body);
+    crate::rainbow_kitty::companion::FIT_RISES_OFF.with(|c| c.set(false));
+    let &(row, col, x0, x1, ..) = shrunk.last().expect("frames");
+    assert!(
+        x0 < (i32::from(col) + 1) * cw && x1 > i32::from(col) * cw,
+        "negative control: shrinking with the room, the glide at ({row}, {col}) still kept off the \
+         caret: {x0}..{x1}"
+    );
 }
 
 /// §7.2(a): a head not yet drawn anywhere (nothing to fly from,

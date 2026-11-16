@@ -273,8 +273,10 @@ fn lost_nonce_engine() -> Mutex<Terminal> {
     Mutex::new(t)
 }
 
+/// Test session `n`'s tab ID (the `t` form), in a range of its own so no other test's typed
+/// re-key shares its entry.
 fn sid(n: u32) -> SessionId {
-    SessionId::new(format!("s-7e{n:04x}"))
+    SessionId::new(aterm_types::tab_id::TabId::from_bits(0x7e_0000 + u64::from(n)).as_str())
 }
 
 /// A degraded tab gets a private one-use `<sid>.<n>` file beside the channel's `<sid>`,

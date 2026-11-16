@@ -41,6 +41,48 @@ fn malformed_and_ambiguous_environment_entries_are_refused() {
 }
 
 #[test]
+fn sealed_native_arguments_reach_the_child_without_text_or_shell_conversion() {
+    let process = Process::observe(std::process::id()).unwrap();
+    let source = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();
+    let mut starter = starter(Vec::new(), Vec::new());
+    starter.exe = "/usr/bin/printf".into();
+    let arguments = vec![
+        "%s".into(),
+        OsString::from_vec(b"path with spaces/\xff".to_vec()),
+    ];
+    let selected = source.admit_arguments(&starter, arguments.clone()).unwrap();
+    let mut command = selected
+        .command(
+            &starter,
+            "1",
+            std::path::Path::new("/"),
+            aterm_uds::spawnfd::Stdio::null(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        command.command.get_args().collect::<Vec<_>>(),
+        arguments
+            .iter()
+            .map(OsString::as_os_str)
+            .collect::<Vec<_>>()
+    );
+    let output = command.command.spawn().unwrap().wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"path with spaces/\xff");
+    starter.args = Ok(vec!["changed-after-sealing".into()]);
+    assert_eq!(selected.check(&starter), Err(Error::Denied));
+    let source = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();
+    assert!(matches!(
+        source.admit_arguments(
+            &starter,
+            vec![OsString::from_vec(b"bad\0argument".to_vec())]
+        ),
+        Err(Error::Denied)
+    ));
+}
+
+#[test]
 fn backend_setting_comparison_excludes_only_the_replaced_native_constructor_nonce() {
     let process = Process::observe(std::process::id()).unwrap();
     let mut original = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();

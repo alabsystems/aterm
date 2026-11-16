@@ -1282,6 +1282,7 @@ fn only_a_live_exact_tippy_request_in_the_tree_opens_the_compiler_barrier() {
         accounting: aterm_capacity::Accounting::Holder,
         pid: 110,
         start_ms: 1,
+        laid_at: None,
         seq: 2,
         checkout: "/release".into(),
         need: aterm_capacity::Need::new(label)
@@ -1424,6 +1425,7 @@ fn cold_readiness_requires_the_exact_live_exclusive_parent() {
         accounting: aterm_capacity::Accounting::Holder,
         pid: 7,
         start_ms: 8,
+        laid_at: None,
         seq: 9,
         checkout: String::new(),
         need: crate::slice_units::cold_parent_need(),

@@ -10,7 +10,7 @@
 //! side, is judged in full. Each test sits beside the control that shows the rule bites.
 
 use super::*;
-use aterm_types::land_trailer::Rechecked;
+use aterm_land_trailer::Rechecked;
 
 /// The Markdown the worlds below share, eight lines each: a name no live tree holds, so this
 /// file names no live no-reach path in code and never stops its own landing's compose

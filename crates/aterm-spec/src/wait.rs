@@ -113,9 +113,12 @@ pub fn within_while_working<T>(
         gap,
         &mut Instant::now,
         // Gone where the kernel says so, or where its pid now names a process born at another
-        // time; a reading that fails is no evidence that it ended.
+        // time; a reading that fails is no evidence that it ended. One whose exit has begun and
+        // not finished (XNU reads it exited from the start) is not gone yet: what its end does,
+        // its reaping and its closed descriptors, is not all there for the one more probe.
         &mut || match kernel.presence(pid) {
-            ProcessPresence::Exited | ProcessPresence::Absent => false,
+            ProcessPresence::Exited => aterm_uds::process::exit_unfinished(pid),
+            ProcessPresence::Absent => false,
             ProcessPresence::Present | ProcessPresence::Unknown => {
                 birth.is_none() || kernel.birth(pid).is_none_or(|now| Some(now) == birth)
             }

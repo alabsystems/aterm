@@ -149,6 +149,7 @@ impl TerminalHandler<'_> {
                     self.apply_cwd_report(report);
                 }
                 self.shell_prompt_start(row, col);
+                self.program_state.prompt_drawn();
                 self.transient.kitty_pending = None;
             }
             'B' => {

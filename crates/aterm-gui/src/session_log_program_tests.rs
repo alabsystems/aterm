@@ -10,7 +10,7 @@ use aterm_core::terminal::program_state::{
     ProgramBlockedKind, ProgramState, ProgramStateWord as W,
 };
 
-use super::super::tests::{lines_of, opened, with_agent};
+use super::super::tests::{Engine, lines_of, opened, with_agent};
 use super::*;
 use crate::session_log::{LogQuery, render_log};
 use crate::session_timeline::SessionTimeline;
@@ -107,10 +107,9 @@ fn a_burst_of_50_moves_ends_on_its_newest_state_coalesced() {
 /// hand-set clock (each the sweep's tick, then the gate's move): its marks
 /// stay within the bucket (the burst, then one a second) and the log keeps
 /// its run's share of them (64, T6), and the newest mark is the newest
-/// state. The codex run's claimed turns are moved by its marks alone, since
-/// no engine edge reaches this rig, so they open and close while the burst
-/// lasts and then stay put, the bucket writing every fourth state, the same
-/// one each time.
+/// state. The marks move no claimed turn (only the engine's edges do, and
+/// none reaches this rig; `claimed_turns_spend_their_own_bucket` bounds
+/// those), so the hour writes no turn record.
 #[test]
 fn a_program_flapping_at_4_hz_for_an_hour_stays_within_its_bucket_and_share() {
     let (tl, hand) = opened();
@@ -127,13 +126,9 @@ fn a_program_flapping_at_4_hz_for_an_hour_stays_within_its_bucket_and_share() {
     }
     let g = tl.lock().unwrap();
     let log = g.slog().log();
-    let turns = log.window().filter(|r| r.k == Kind::Turn).count() as u64;
-    assert!(
-        turns > 0 && turns <= 2 * PROGRAM_BURST,
-        "{turns} turn records: with no engine edge fed, a turn moves only with a written mark, \
-         each a state the burst and its refill wrote"
-    );
-    let written = log.last_seq() - seq0 - turns;
+    let turns = log.window().filter(|r| r.k == Kind::Turn).count();
+    assert_eq!(turns, 0, "no turn record: the marks move no turn");
+    let written = log.last_seq() - seq0;
     let hour_s = SWEEPS * 250 / PROGRAM_REFILL_MS;
     assert!(
         written <= PROGRAM_BURST + hour_s + 1 && written >= hour_s,
@@ -506,15 +501,17 @@ fn the_status_sweep_writes_a_held_state_once_a_token_frees() {
 }
 
 /// A CODEX-ALAB'S CLAIMED TURN THROUGH ITS BOX AND ITS ERROR: `working`, `blocked` on an approval,
-/// `working` again and `error`, each written as its program mark, are one turn (`src=engine
-/// conf=claim`) that closes `out=error`: a `blocked` claim is a turn waiting on a person, never
-/// its end. NEGATIVE CONTROL: with `idle` where the box was, the rest closes the first turn
-/// `out=done` and the next `working` opens a second.
+/// `working` again and `error`, each written by its engine and swept with its program mark, are
+/// one turn (`src=engine conf=claim`) that closes `out=error`: `working` to `blocked` draws no
+/// edge, as a box is a turn waiting on a person, never its end. NEGATIVE CONTROL: with `idle`
+/// where the box was, the rest closes the first turn `out=done` and the next `working` opens a
+/// second.
 #[test]
 fn a_codex_alabs_blocked_claim_keeps_its_turn_and_an_error_closes_it() {
     let turns = |middle: (W, Option<ProgramBlockedKind>)| {
         let (tl, hand) = opened();
         with_agent(&tl, "codex");
+        let mut engine = Engine::new();
         let moves = [
             (W::Working, None),
             middle,
@@ -523,9 +520,7 @@ fn a_codex_alabs_blocked_claim_keeps_its_turn_and_an_error_closes_it() {
         ];
         for (i, (state, kind)) in (0_u64..).zip(moves) {
             hand.set(5_000 + 1_000 * i);
-            tl.lock()
-                .unwrap()
-                .note_program_state(report(state, kind), 1);
+            engine.says(&mut tl.lock().unwrap(), report(state, kind));
         }
         lines_of(&tl)
             .into_iter()
@@ -637,69 +632,86 @@ impl CodexTab {
     }
 }
 
-/// A CODEX TURN BETWEEN TWO SWEEPS IS ONE CLAIMED TURN AT ITS EDGES (ATERM-KI-1029-1): a codex
-/// in front reads `done` at a sweep, then writes `working` and `done` 17 ms apart before the next
-/// sweep, which shows no move and writes no mark; the log holds that turn once, opened and closed
-/// at its batches' wall clocks (`src=engine conf=claim`, `dur_ms=17`), and `log kinds=program`
-/// still holds the one `state=done`. CONTROL: a sweep between the two writes shows the `working`
-/// (its mark opens the turn) and the turn still closes at its own end, once.
-#[test]
-fn a_codex_turn_between_two_sweeps_is_one_claimed_turn_at_its_edges() {
-    for between in [false, true] {
-        let mut tab = CodexTab::new();
-        tab.says_at(DONE, 900);
-        tab.sweep_at(1_000);
-        let (turns0, _) = tab.turns();
-        tab.says_at(WORKING, 1_010);
-        if between {
-            tab.sweep_at(1_015);
-        }
-        tab.says_at(DONE, 1_027);
-        tab.sweep_at(1_250);
-        let lines = tab.turn_lines();
-        assert_eq!(tab.turns(), (turns0 + 1, false), "one turn: {lines:#?}");
-        let [open, close] = lines.as_slice() else {
-            panic!("one open and its close: {lines:#?}");
-        };
-        let opened = if between { 1_015 } else { 1_010 };
-        assert!(
-            open.contains(" src=engine conf=claim ")
-                && open.ends_with(&format!(" t={}", tab.wall(opened))),
-            "{between}: {lines:#?}"
-        );
-        assert!(
-            close.contains(" turn out=done ")
-                && close.contains(" src=engine conf=claim ")
-                && close.ends_with(&format!(" t={}", tab.wall(1_027))),
-            "{between}: closed at its own end: {lines:#?}"
-        );
-        let programs = program_lines(&tab.ctx.timeline);
-        if between {
-            assert_eq!(
-                programs.len(),
-                3,
-                "CONTROL: done, working, done: {programs:#?}"
-            );
-        } else {
-            assert!(
-                close.contains(" dur_ms=17 "),
-                "timed by its edges: {lines:#?}"
-            );
-            assert!(
-                programs.len() == 1 && programs[0].contains(" program state=done "),
-                "the edges write no mark: {programs:#?}"
-            );
-        }
+/// A codex in front reads `done` at a sweep, then writes `working` at 1,010 ms and `done` at
+/// 1,027 ms, with a sweep at 1,015 ms between them when `between`, and a sweep at 1,250 ms:
+/// the tab, the turns its log held before, and its turn lines and program marks after.
+fn a_codex_turn(between: bool) -> (CodexTab, u32, Vec<String>, Vec<String>) {
+    let mut tab = CodexTab::new();
+    tab.says_at(DONE, 900);
+    tab.sweep_at(1_000);
+    let (turns0, _) = tab.turns();
+    tab.says_at(WORKING, 1_010);
+    if between {
+        tab.sweep_at(1_015);
     }
+    tab.says_at(DONE, 1_027);
+    tab.sweep_at(1_250);
+    let lines = tab.turn_lines();
+    let programs = program_lines(&tab.ctx.timeline);
+    (tab, turns0, lines, programs)
 }
 
-/// A HELD `working` THE TICK WRITES IS CLOSED BY ITS EDGE: the run's program bucket is empty (a
-/// burst), so the sweep that shows a codex's `working` holds its mark; its `done` comes before a
-/// token frees, and the next sweep's tick writes the held `working` (opening its turn) before the
-/// `done` edge is fed (closing it), so the log holds one turn and none is left open, while the
-/// shown `done` waits for the next token.
+/// The one claimed turn of [`a_codex_turn`]: opened at its `working`'s batch, closed `out=done`
+/// at its `done`'s, 17 ms long.
+fn assert_one_claimed_turn_at_its_edges(tab: &CodexTab, turns0: u32, lines: &[String]) {
+    assert_eq!(tab.turns(), (turns0 + 1, false), "one turn: {lines:#?}");
+    let [open, close] = lines else {
+        panic!("one open and its close: {lines:#?}");
+    };
+    assert!(
+        open.contains(" src=engine conf=claim ")
+            && open.ends_with(&format!(" t={}", tab.wall(1_010))),
+        "opened at its batch: {lines:#?}"
+    );
+    assert!(
+        close.contains(" turn out=done ")
+            && close.contains(" dur_ms=17 ")
+            && close.contains(" src=engine conf=claim ")
+            && close.ends_with(&format!(" t={}", tab.wall(1_027))),
+        "closed at its own end: {lines:#?}"
+    );
+}
+
+/// A CODEX TURN BETWEEN TWO SWEEPS IS ONE CLAIMED TURN AT ITS EDGES (ATERM-KI-1029-1): a turn no
+/// sweep shows is held once, opened and closed at its batches' wall clocks (`src=engine
+/// conf=claim`, `dur_ms=17`), and its edges write no mark: `log kinds=program` still holds the
+/// one `state=done`.
 #[test]
-fn a_held_working_the_tick_writes_is_closed_by_its_edge() {
+fn a_codex_turn_between_two_sweeps_is_one_claimed_turn_at_its_edges() {
+    let (tab, turns0, lines, programs) = a_codex_turn(false);
+    assert_one_claimed_turn_at_its_edges(&tab, turns0, &lines);
+    assert!(
+        programs.len() == 1 && programs[0].contains(" program state=done "),
+        "the edges write no mark: {programs:#?}"
+    );
+}
+
+/// A SHOWN TURN OPENS AT ITS BATCH TIME: a sweep between the two writes shows the `working` and
+/// writes its mark at the sweep's time, 5 ms after the batch, yet the turn is its edges': opened
+/// at the batch and 17 ms long, as the unshown turn is. A host whose mark opens the turn opens it
+/// at the sweep, 12 ms long.
+#[test]
+fn a_shown_turn_opens_at_its_batch_time() {
+    let (tab, turns0, lines, programs) = a_codex_turn(true);
+    assert_one_claimed_turn_at_its_edges(&tab, turns0, &lines);
+    assert!(
+        programs.len() == 3
+            && programs[1].contains(" program state=working ")
+            && programs[1].ends_with(&format!(" t={}", tab.wall(1_015))),
+        "PRECONDITION: the sweep showed the working at its own time: {programs:#?}"
+    );
+}
+
+/// A HELD `working` MARK OPENS NO TURN, AND ITS EDGE IS THE TURN (R6): the run's program bucket
+/// is drained, a partial rollout's turn no beginning took is open, and the codex writes `working`
+/// 2 ms later. The sweep that reads the edge takes the rollout's turn at the batch's time; the
+/// held mark the tick writes 7 s on, past [`aterm_slog::ATTRIBUTION_MS`], opens nothing, and the
+/// `done` closes that one turn at its own time. A host whose held mark claims a turn at its
+/// flush finds no untaken turn there and logs a second.
+#[test]
+fn a_held_working_mark_opens_no_turn_and_its_edge_is_the_turn() {
+    use aterm_slog::{ShortId, TxEvent, TxPos, TxState};
+
     let mut tab = CodexTab::new();
     tab.says_at(DONE, 900);
     tab.sweep_at(1_000);
@@ -710,31 +722,72 @@ fn a_held_working_the_tick_writes_is_closed_by_its_edge() {
         "PRECONDITION: the bucket is empty"
     );
     let (turns0, _) = tab.turns();
-    tab.says_at(WORKING, 1_010);
-    tab.sweep_at(1_015);
+    tab.hand.set(1_008);
+    {
+        let mut g = tab.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        let slog = g.slog_mut();
+        let tracker = &mut slog.agent.as_mut().expect("codex run").tracker;
+        let pos = |off, ms| TxPos {
+            fp: 1,
+            id: None,
+            off,
+            wall_ms: tab.wall(ms),
+        };
+        tracker.transcript(
+            &mut slog.log,
+            TxEvent::Bind {
+                len: 0,
+                floor_ms: tab.wall(1_000),
+            },
+            pos(0, 1_000),
+            TxState::Partial,
+            now,
+        );
+        tracker.transcript(
+            &mut slog.log,
+            TxEvent::Prompt {
+                vref: ShortId::new("a").unwrap(),
+            },
+            pos(1, 1_008),
+            TxState::Partial,
+            now,
+        );
+    }
     assert_eq!(
         tab.turns(),
-        (turns0, false),
-        "PRECONDITION: the held working opened none"
+        (turns0 + 1, true),
+        "PRECONDITION: the rollout's turn"
     );
-    tab.says_at(DONE, 1_027);
-    tab.sweep_at(2_015);
+    tab.says_at(WORKING, 1_010);
+    tab.sweep_at(1_015);
+    tab.sweep_at(8_015);
     let programs = program_lines(&tab.ctx.timeline);
     assert!(
         programs.len() == PROGRAM_BURST as usize + 1
-            && programs[PROGRAM_BURST as usize].contains(" program state=working "),
-        "PRECONDITION: the tick wrote the held working, the done waits: {programs:#?}"
+            && programs[PROGRAM_BURST as usize].contains(" program state=working ")
+            && programs[PROGRAM_BURST as usize].ends_with(&format!(" t={}", tab.wall(8_015))),
+        "PRECONDITION: the tick wrote the held working at its flush: {programs:#?}"
     );
-    assert_eq!(
-        tab.turns(),
-        (turns0 + 1, false),
-        "one turn, closed by its edge: {:#?}",
-        tab.turn_lines()
+    tab.says_at(DONE, 8_020);
+    tab.sweep_at(8_030);
+    let lines = tab.turn_lines();
+    assert_eq!(tab.turns(), (turns0 + 1, false), "one turn: {lines:#?}");
+    let closes: Vec<&String> = lines.iter().filter(|l| l.contains(" close t")).collect();
+    assert!(
+        closes.len() == 1
+            && closes[0].contains(" turn out=done ")
+            && closes[0].ends_with(&format!(" t={}", tab.wall(8_020))),
+        "the rollout's turn, closed at the edge: {lines:#?}"
     );
 }
 
-/// A stalled sweep must not detach a held claim from the partial rollout's turns.
-/// The second beginning is genuinely unseen by the gate; the first was already shown.
+/// A STALLED SWEEP LOGS EACH SPAN ONCE, AT ITS OWN EDGES: with the marks' bucket spent, a codex's
+/// `working` swept at once is its claimed turn (the mark held without a token). Its rest, the next
+/// turn and that turn's rest are parsed while the main thread stalls; the partial rollout read in
+/// the stall names the claimed turn running and opens none. The late sweep closes it at its rest
+/// and opens and closes the second at its own batch times, and a further sweep moves nothing. The
+/// held mark keeps its actual flush time.
 #[test]
 fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
     use aterm_slog::{ShortId, TxEvent, TxPos, TxState};
@@ -762,8 +815,8 @@ fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
     tab.sweep_at(1_010);
     assert_eq!(
         tab.turns(),
-        (turns0, false),
-        "working is held without a token"
+        (turns0 + 1, true),
+        "the mark is held without a token, its edge the claimed turn"
     );
 
     tab.says_at(DONE, 1_020);
@@ -838,42 +891,34 @@ fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
             );
         }
     }
+    let stalled = tab.turn_lines();
     assert_eq!(
         tab.turns(),
-        (turns0 + 2, false),
-        "two completed rollout spans"
+        (turns0 + 1, true),
+        "the rollout read in the stall names the claimed turn and opens none: {stalled:#?}"
     );
-    let before = tab.turn_lines();
-    for (id, opened, ended) in [("a", 1_008, 1_020), ("b", 1_030, 1_040)] {
-        assert!(
-            before.iter().any(|line| {
-                line.contains(" open t")
-                    && line.contains(&format!(" vref={id} "))
-                    && line.contains(" src=transcript conf=strong ")
-                    && line.ends_with(&format!(" t={}", tab.wall(opened)))
-            }),
-            "partial rollout opens {id} at its own row: {before:#?}"
-        );
-        assert!(
-            before.iter().any(|line| {
-                line.contains(" close t")
-                    && line.contains(" turn out=done ")
-                    && line.ends_with(&format!(" t={}", tab.wall(ended)))
-            }),
-            "partial rollout closes {id} at its own row: {before:#?}"
-        );
-    }
     tab.sweep_at(8_000);
+    let lines = tab.turn_lines();
     assert_eq!(
         tab.turns(),
         (turns0 + 2, false),
-        "the held first claim and retained second beginning must reuse their spans: {:#?}",
-        tab.turn_lines()
+        "each span once, at the late sweep: {lines:#?}"
     );
-    assert_eq!(
-        tab.turn_lines(),
-        before,
-        "no duplicated or redated turn edges"
+    let opens: Vec<&String> = lines.iter().filter(|l| l.contains(" open t")).collect();
+    let closes: Vec<&String> = lines.iter().filter(|l| l.contains(" close t")).collect();
+    assert!(
+        opens.len() == 2
+            && opens.iter().all(|l| l.contains(" src=engine conf=claim "))
+            && opens[0].ends_with(&format!(" t={}", tab.wall(1_008)))
+            && opens[1].ends_with(&format!(" t={}", tab.wall(1_030))),
+        "each claimed turn opens at its edge's batch: {lines:#?}"
+    );
+    assert!(
+        closes.len() == 2
+            && closes.iter().all(|l| l.contains(" turn out=done "))
+            && closes[0].ends_with(&format!(" t={}", tab.wall(1_020)))
+            && closes[1].ends_with(&format!(" t={}", tab.wall(1_040))),
+        "and closes at its rest's: {lines:#?}"
     );
     let programs = program_lines(&tab.ctx.timeline);
     let flushed = &programs[PROGRAM_BURST as usize];
@@ -881,6 +926,12 @@ fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
         flushed.contains(" program state=working ")
             && flushed.ends_with(&format!(" t={}", tab.wall(8_000))),
         "the mark retains its actual flush time: {flushed}"
+    );
+    tab.sweep_at(8_100);
+    assert_eq!(
+        tab.turn_lines(),
+        lines,
+        "no duplicated or redated turn edges"
     );
 }
 
@@ -957,7 +1008,7 @@ fn a_partial_rollout_interrupt_keeps_the_next_claims_outcome() {
         for ((open, close), (began, ended)) in opens
             .iter()
             .zip(&closes)
-            .zip([(1_015, 1_020), (1_030, 1_040)])
+            .zip([(1_010, 1_020), (1_030, 1_040)])
         {
             assert_eq!(node_of(open), node_of(close), "matching claim: {lines:#?}");
             assert!(
@@ -1227,7 +1278,10 @@ fn a_second_partial_vendor_interrupt_does_not_own_the_first_named_claim() {
     assert_eq!(tab.turns(), (1, false), "one engine span: {lines:#?}");
     assert_eq!(lines.len(), 2);
     assert_eq!(node_of(&lines[0]), node_of(&lines[1]));
-    assert!(lines[0].ends_with(&format!(" t={}", tab.wall(1_015))));
+    assert!(
+        lines[0].ends_with(&format!(" t={}", tab.wall(1_010))),
+        "opened at its edge's batch: {lines:#?}"
+    );
     assert!(lines[1].ends_with(&format!(" t={}", tab.wall(1_060))));
     assert!(
         lines[1].contains(" turn out=done "),
@@ -1235,22 +1289,35 @@ fn a_second_partial_vendor_interrupt_does_not_own_the_first_named_claim() {
     );
 }
 
-/// THE EDGES' TURNS SPEND THE RUN'S PROGRAM BUCKET: 2,000 sweeps 50 ms apart on the log's clock,
-/// a whole codex turn between each two that no sweep shows, open no more turns than the bucket
-/// pays for (its burst, then one a second: 100 s), and still about one a second.
+/// CLAIMED TURNS SPEND THEIR OWN BUCKET (R2): with the run's mark bucket drained by a burst,
+/// 2,000 sweeps 50 ms apart on the log's clock, a whole codex turn between each two that no sweep
+/// shows, open the turn bucket's burst at once (every turn of the first second) and no more than
+/// it pays for after (one a second: 100 s), and the next `program` mark says how many it refused
+/// (`dropped=`). A host whose turns spend the marks' bucket opens none in that first second.
 #[test]
-fn edge_turns_spend_the_runs_program_bucket() {
+fn claimed_turns_spend_their_own_bucket() {
     let mut tab = CodexTab::new();
     tab.says_at(DONE, 900);
     tab.sweep_at(1_000);
+    burst(&tab.ctx.timeline, PROGRAM_BURST as usize - 1, W::Done);
+    assert_eq!(
+        program_lines(&tab.ctx.timeline).len(),
+        PROGRAM_BURST as usize,
+        "PRECONDITION: the mark bucket is empty"
+    );
     let (turns0, _) = tab.turns();
     const SWEEPS: u64 = 2_000;
+    let mut first_second = 0;
     for i in 1..=SWEEPS {
         let ms = 1_000 + 50 * i;
         tab.says_at(WORKING, ms - 40);
         tab.says_at(DONE, ms - 20);
         tab.sweep_at(ms);
+        if i == 19 {
+            first_second = tab.turns().0 - turns0;
+        }
     }
+    assert_eq!(first_second, 19, "the first second's turns, at once");
     let (turns, open) = tab.turns();
     let opened = u64::from(turns - turns0);
     let refills = SWEEPS * 50 / PROGRAM_REFILL_MS;
@@ -1258,27 +1325,38 @@ fn edge_turns_spend_the_runs_program_bucket() {
         (refills..=PROGRAM_BURST + refills + 1).contains(&opened) && !open,
         "{opened} turns opened in {refills} s"
     );
+    let end = 1_000 + 50 * SWEEPS + 2_000;
+    tab.says_at(WORKING, end - 10);
+    tab.sweep_at(end);
+    let programs = program_lines(&tab.ctx.timeline);
+    let said = programs.last().expect("a mark");
+    assert!(
+        said.contains(" program state=working ")
+            && said.contains(&format!(" dropped={} ", SWEEPS - opened)),
+        "the next mark says the refused turns: {said}"
+    );
 }
 
-/// EDGES MOVE ONLY A CODEX RUN'S TURNS, AND RING ITS WATCHERS: a beginning and a failed end fed
-/// under a claude in front open no turn and wake nobody. CONTROL: under a codex they are one turn,
-/// closed `out=error` at the end's time, and the watchers are rung once for it, so `await log
-/// close=turn` hears it on that wake.
+/// EDGES MOVE ONLY A CODEX RUN'S TURNS, AND RING ITS WATCHERS: a beginning and a failed end read
+/// in one sweep under a claude in front open no turn and wake nobody. CONTROL: under a codex they
+/// are one turn, closed `out=error` at the end's time, and the watchers are rung once for it, so
+/// `await log close=turn` hears it on that wake.
 #[test]
 fn edges_move_no_turn_but_a_codex_runs() {
-    use crate::program_state::FedEdge;
     for name in ["claude", "codex"] {
         let (tl, hand) = opened();
         with_agent(&tl, name);
-        hand.set(1_000);
+        let mut engine = Engine::new();
         let totals = || tl.lock().unwrap().slog().log().state().totals.turns;
         let rung = || tl.lock().unwrap().watchers().records_rung();
         let (turns0, rung0) = (totals(), rung());
+        hand.set(500);
+        engine.parse(&tl.lock().unwrap(), report(W::Working, None));
+        hand.set(700);
+        engine.parse(&tl.lock().unwrap(), report(W::Error, None));
+        hand.set(1_000);
+        engine.feed(&mut tl.lock().unwrap());
         let end = super::super::tests::WALL0 + 700;
-        tl.lock().unwrap().note_program_edges(&[
-            FedEdge::Began(Some(super::super::tests::WALL0 + 500)),
-            FedEdge::Ended(W::Error, Some(end)),
-        ]);
         let codex = name == "codex";
         let lines = lines_of(&tl);
         assert_eq!(totals() - turns0, u32::from(codex), "{name}: {lines:#?}");
@@ -1331,7 +1409,7 @@ fn run_named(tl: &std::sync::Mutex<SessionTimeline>, agent: &str) -> String {
 }
 
 /// G1, A CODEX BOX IS A CLAIMED APPROVAL STEP (GAP 26): a codex-alab's `working`, `blocked` on a
-/// permission, `working` and `idle`, each written as its program mark, are one claimed turn whose
+/// permission, `working` and `idle`, each swept with its program mark, are one claimed turn whose
 /// one box is an approval step `box=other src=engine conf=claim`, opened at the box's mark and
 /// closed `out=passed` (no input dismissed it) at the mark that stopped showing it, and the
 /// turn's close counts it (`appr=1`, no `qs=`). A host that writes no step (SessionLog::claim_box
@@ -1341,6 +1419,7 @@ fn a_codex_box_opens_a_claimed_approval_step_and_the_turn_counts_it() {
     let (tl, hand) = opened();
     with_agent(&tl, "codex");
     let run = codex_run(&tl);
+    let mut engine = Engine::new();
     let moves = [
         (W::Working, None),
         (W::Blocked, Some(ProgramBlockedKind::Permission)),
@@ -1349,9 +1428,7 @@ fn a_codex_box_opens_a_claimed_approval_step_and_the_turn_counts_it() {
     ];
     for (i, (state, kind)) in (0_u64..).zip(moves) {
         hand.set(5_000 + 1_000 * i);
-        tl.lock()
-            .unwrap()
-            .note_program_state(report(state, kind), 10 + i);
+        engine.says(&mut tl.lock().unwrap(), report(state, kind));
     }
     assert_eq!(
         box_lines(&tl, 0),
@@ -1377,15 +1454,14 @@ fn codex_acts_never_land_on_a_claim_step_and_claude_is_unchanged() {
         with_agent(&tl, agent);
         let run = run_named(&tl, agent);
         let seq0 = tl.lock().unwrap().slog().log().last_seq();
+        let mut engine = Engine::new();
         let moves = [
             (W::Working, None),
             (W::Blocked, Some(ProgramBlockedKind::Permission)),
         ];
         for (i, (state, kind)) in (0_u64..).zip(moves) {
             hand.set(5_000 + 1_000 * i);
-            tl.lock()
-                .unwrap()
-                .note_program_state(report(state, kind), 10 + i);
+            engine.says(&mut tl.lock().unwrap(), report(state, kind));
         }
         hand.set(6_500);
         let acted = tl.lock().unwrap().note_harness_act(
@@ -1395,9 +1471,7 @@ fn codex_acts_never_land_on_a_claim_step_and_claude_is_unchanged() {
         );
         assert!(acted.is_some(), "{agent}: the act is kept");
         hand.set(7_000);
-        tl.lock()
-            .unwrap()
-            .note_program_state(report(W::Working, None), 12);
+        engine.says(&mut tl.lock().unwrap(), report(W::Working, None));
         let lines: Vec<String> = lines_of(&tl)
             .into_iter()
             .filter(|l| {
@@ -1429,8 +1503,8 @@ fn codex_acts_never_land_on_a_claim_step_and_claude_is_unchanged() {
     assert_eq!(
         codex,
         [
-            format!("mark {run} program state=working src=engine conf=claim t=+5000"),
             format!("open t1 turn par={run} src=engine conf=claim t=+5000"),
+            format!("mark {run} program state=working src=engine conf=claim t=+5000"),
             format!(
                 "mark {run} program state=blocked ask=permission src=engine conf=claim t=+6000"
             ),
@@ -1439,7 +1513,8 @@ fn codex_acts_never_land_on_a_claim_step_and_claude_is_unchanged() {
             format!("mark {run} program state=working src=engine conf=claim t=+7000"),
             "close p1 approval out=passed dur_ms=1000 src=engine conf=claim t=+7000".to_string(),
         ],
-        "codex-alab's act is marked off its claimed box and closes nothing"
+        "codex-alab's act is marked off its claimed box and closes nothing; the turn is the \
+         sweep's edge, read before its mark"
     );
 }
 
@@ -1495,13 +1570,12 @@ fn the_escalation_lands_on_the_standing_box_and_is_not_carried() {
     let store = crate::session_store::new_store();
     store.write().unwrap().register(h.clone());
     with_agent(&h.ctx.timeline, "codex");
-    let note = |ms: u64, state: W, kind: Option<ProgramBlockedKind>, began: u64| {
+    let engine = std::cell::RefCell::new(Engine::new());
+    let note = |ms: u64, state: W, kind: Option<ProgramBlockedKind>| {
         hand.set(ms);
-        h.ctx
-            .timeline
-            .lock()
-            .unwrap()
-            .note_program_state(report(state, kind), began);
+        engine
+            .borrow_mut()
+            .says(&mut h.ctx.timeline.lock().unwrap(), report(state, kind));
     };
     let escalated = || {
         h.ctx
@@ -1518,8 +1592,8 @@ fn the_escalation_lands_on_the_standing_box_and_is_not_carried() {
             .map(|n| n.node.to_string())
             .collect::<Vec<_>>()
     };
-    note(5_000, W::Working, None, 10);
-    note(6_000, W::Blocked, Some(ProgramBlockedKind::Permission), 11);
+    note(5_000, W::Working, None);
+    note(6_000, W::Blocked, Some(ProgramBlockedKind::Permission));
     super::tests::supervisor_asks(
         &h.ctx,
         Some("codex approval echo"),
@@ -1527,13 +1601,13 @@ fn the_escalation_lands_on_the_standing_box_and_is_not_carried() {
     );
     assert_eq!(super::tests::escalation_marks(&h.ctx), ["mark p1 need"]);
     assert_eq!(escalated(), ["p1"]);
-    note(7_000, W::Working, None, 12);
+    note(7_000, W::Working, None);
     assert_eq!(
         escalated(),
         Vec::<String>::new(),
         "the box's close ended it"
     );
-    note(8_000, W::Blocked, Some(ProgramBlockedKind::Permission), 13);
+    note(8_000, W::Blocked, Some(ProgramBlockedKind::Permission));
     {
         let mut g = h.ctx.timeline.lock().unwrap();
         let now = g.slog().now();
@@ -1587,11 +1661,12 @@ fn the_sweep_opens_and_closes_through_note_program_state() {
 }
 
 /// G6, A HELD BOX THE TICK WRITES KEEPS ITS OBSERVATION TIME (GAP 26): the run's program bucket is
-/// empty (a burst), so the sweep that shows a codex's `blocked` on a permission holds its mark;
-/// its `done` comes before a token frees, and the next sweep's tick writes the held `blocked` a
-/// second later. Its box's step opens at the sweep that observed it, as its claimed turn does,
-/// so the `done` edge closes the turn at its own time, the box first. A box claimed on the
-/// flush clock opens after that edge and drags the turn's close to the flush.
+/// empty (a burst), so the sweep that shows a codex's `blocked` on a permission holds its mark
+/// while its edge opens the claimed turn at the batch's time; its `done` comes before a token
+/// frees, and the next sweep's tick writes the held `blocked` a second later. Its box's step opens
+/// at the sweep that observed it, under that turn, so the `done` edge closes the turn at its own
+/// time, the box first. A box claimed on the flush clock opens after that edge and drags the
+/// turn's close to the flush.
 #[test]
 fn a_held_box_the_tick_writes_keeps_its_observation_time() {
     let mut tab = CodexTab::new();
@@ -1609,8 +1684,8 @@ fn a_held_box_the_tick_writes_keeps_its_observation_time() {
     tab.sweep_at(1_015);
     assert_eq!(
         box_lines(&tab.ctx.timeline, base).len(),
-        before,
-        "PRECONDITION: the held blocked opened nothing"
+        before + 1,
+        "PRECONDITION: the held blocked opened no step, its edge the turn"
     );
     tab.says_at(DONE, 1_027);
     tab.sweep_at(2_015);
@@ -1631,8 +1706,8 @@ fn a_held_box_the_tick_writes_keeps_its_observation_time() {
     assert!(
         got.len() == 4
             && got[0].starts_with(&format!("open {t} turn "))
-            && got[0].ends_with(" src=engine conf=claim t=+1015"),
-        "the claimed turn at the sweep that saw it: {got:#?}"
+            && got[0].ends_with(" src=engine conf=claim t=+1010"),
+        "the claimed turn at its edge's batch: {got:#?}"
     );
     assert_eq!(
         got[1..],
@@ -1640,7 +1715,7 @@ fn a_held_box_the_tick_writes_keeps_its_observation_time() {
             format!("open {p} approval par={t} box=other src=engine conf=claim t=+1015"),
             format!("close {p} approval out=passed dur_ms=12 src=engine conf=claim t=+1027"),
             format!(
-                "close {t} turn out=done dur_ms=12 steps=1 appr=1 src=engine conf=claim t=+1027"
+                "close {t} turn out=done dur_ms=17 steps=1 appr=1 src=engine conf=claim t=+1027"
             ),
         ],
         "the box at its observation, the turn closed at its edge: {got:#?}"
@@ -1658,15 +1733,14 @@ fn a_standing_codex_box_is_the_status_step_and_need() {
         let g = tl.lock().unwrap();
         g.slog().status_fields(g.slog().now().wall_ms)
     };
+    let mut engine = Engine::new();
     let moves = [
         (W::Working, None),
         (W::Blocked, Some(ProgramBlockedKind::Permission)),
     ];
     for (i, (state, kind)) in (0_u64..).zip(moves) {
         hand.set(5_000 + 1_000 * i);
-        tl.lock()
-            .unwrap()
-            .note_program_state(report(state, kind), 10 + i);
+        engine.says(&mut tl.lock().unwrap(), report(state, kind));
     }
     hand.set(6_400);
     let p = tl
@@ -1681,9 +1755,7 @@ fn a_standing_codex_box_is_the_status_step_and_need() {
         "{standing}"
     );
     hand.set(7_000);
-    tl.lock()
-        .unwrap()
-        .note_program_state(report(W::Working, None), 12);
+    engine.says(&mut tl.lock().unwrap(), report(W::Working, None));
     let left = fields(&tl);
     assert!(left.contains(" step=- need=- need_since_ms=-"), "{left}");
 }

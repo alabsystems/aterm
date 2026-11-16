@@ -786,9 +786,10 @@ impl<C: Ctl> Session<'_, C> {
         // another supervisor holds.
         let scope = {
             let reader = self.reader(&screen.rows);
-            let asked = reader
-                .background_rest_seen(&screen.rows, reader.runs(screen.title.as_deref()))
-                == Some(Phase::Question);
+            let asked = reader.background_rest_seen(
+                &screen.rows,
+                reader.runs(screen.title.as_deref(), screen.program_report.as_deref()),
+            ) == Some(Phase::Question);
             let rest = if asked {
                 Scope::Questions
             } else {
@@ -1067,7 +1068,9 @@ impl<C: Ctl> Session<'_, C> {
     fn duty_withheld(&self, scope: Scope) -> bool {
         self.setup.builtin_duties
             && match self.builtin_authority {
-                BuiltinAuthority::Complement { .. } => !self.builtin_authority.keeps(scope),
+                BuiltinAuthority::Complement { .. } | BuiltinAuthority::Ceded { .. } => {
+                    !self.builtin_authority.keeps(scope)
+                }
                 BuiltinAuthority::Unknown | BuiltinAuthority::Exclusive => true,
                 BuiltinAuthority::Legacy | BuiltinAuthority::Unsupported => false,
             }

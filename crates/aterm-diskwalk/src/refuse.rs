@@ -7,8 +7,12 @@ use std::path::{Component, Path, PathBuf};
 
 use aterm_sysprobe::volumes::{Mount, Table, mount_of};
 
-/// The folders under `$HOME/Library` the walker may enter: aterm's own cache and state.
-pub const LIBRARY_ALLOW: &[&str] = &["Library/Caches/aterm", "Library/Application Support/aterm"];
+/// The folders under `$HOME/Library` the walker may enter: aterm's own cache, state and logs.
+pub const LIBRARY_ALLOW: &[&str] = &[
+    "Library/Caches/aterm",
+    "Library/Application Support/aterm",
+    "Library/Logs/aterm",
+];
 
 /// The file system types the walker never enters even when the table calls them local.
 pub const REMOTE_FSTYPES: &[&str] = &[

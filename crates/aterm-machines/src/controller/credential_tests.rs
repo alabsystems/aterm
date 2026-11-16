@@ -19,20 +19,30 @@ fn lab(home: &Path, names: Option<&[&str]>) -> Fake {
     sys.logged_in(&who);
     if let Some(names) = names {
         let paths = aterm_secrets::client::Paths::locate_for_home(home);
-        let source = home.join("team.vault");
-        aterm_secrets::client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+        aterm_secrets::client::create(
+            &paths,
+            home.join("fixture.vault").to_str().unwrap(),
+            None,
+            Some("controller"),
+        )
+        .unwrap();
         let admin = aterm_secrets::client::admin_open(&paths).unwrap();
         let mut doc = admin.doc.clone();
         for name in names {
-            doc.set_entry(&aterm_secrets::text::Audience::Everyone, name, b"x")
-                .unwrap();
+            doc.set_entry(
+                &aterm_secrets::text::Audience::Everyone,
+                name,
+                b"registered fixture entry",
+            )
+            .unwrap();
         }
         aterm_secrets::client::admin_publish(&paths, &admin, &doc).unwrap();
     }
     sys
 }
 
-/// `bytes` as the store's entry `entry` under `home`, read in place.
+/// `bytes` as the store's entry `entry` under `home`, as the port reads it in place
+/// ([`Fake::vault_set`]).
 fn landed(sys: &Fake, home: &Path, entry: &str, bytes: &[u8]) {
     sys.vault_set(home, entry, bytes);
 }
@@ -119,18 +129,36 @@ fn a_crlf_line_is_the_password_and_a_control_character_is_none() {
 
 /// NEGATIVE CONTROLS: no registry, a registry that names no entry, a missing entry and a
 /// token with whitespace in it each file the want once under its purpose, and the line names
-/// the want and the request, never a value.
+/// the want, the request and why, never a value. Each case names its own why, so a fixture
+/// whose registry names nothing cannot pass every case at the registry.
 #[test]
 fn a_value_this_mac_lacks_is_filed_once_with_the_lab() {
     let fleet = Want::Gh(GhProfile::Fleet);
-    type Case<'a> = (Option<&'a [&'a str]>, Option<&'a [u8]>);
-    let cases: [Case<'_>; 4] = [
-        (None, None),
-        (Some(&["gh_access_token"]), None),
-        (Some(&["gh_access_token_fleet"]), None),
-        (Some(&["gh_access_token_fleet"]), Some(b"ghp_a ghp_b\n")),
+    type Case<'a> = (Option<&'a [&'a str]>, Option<&'a [u8]>, &'a str);
+    let cases: [Case<'_>; 5] = [
+        (None, None, aterm_secrets::registry::NO_REGISTRY),
+        (
+            Some(&["gh_access_token"]),
+            None,
+            "the vault registry names none",
+        ),
+        (
+            Some(&["gh_access_token"]),
+            Some(b"unregistered_token\n"),
+            "the vault registry names none",
+        ),
+        (
+            Some(&["gh_access_token_fleet"]),
+            None,
+            "the vault holds no gh_access_token_fleet here",
+        ),
+        (
+            Some(&["gh_access_token_fleet"]),
+            Some(b"ghp_a ghp_b\n"),
+            "the vault entry gh_access_token_fleet holds no single value",
+        ),
     ];
-    for (names, bytes) in cases {
+    for (names, bytes, expected) in cases {
         let home = aterm_tempfile::tempdir().unwrap();
         let sys = lab(home.path(), names);
         if let Some(bytes) = bytes {
@@ -138,7 +166,9 @@ fn a_value_this_mac_lacks_is_filed_once_with_the_lab() {
         }
         let why = resolve(&sys, &fleet, Purpose::MachinesKeys, true).unwrap_err();
         assert!(
-            why.contains("no usable gh:fleet") && why.contains("asked the lab's Macs (request "),
+            why.contains("no usable gh:fleet")
+                && why.contains(&format!("({expected})"))
+                && why.contains("asked the lab's Macs (request "),
             "{why}"
         );
         assert!(!why.contains("ghp_"), "{why}");

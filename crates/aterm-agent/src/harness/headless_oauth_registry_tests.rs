@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::super::alab_roster::{self, LabMailbox, Part};
+use super::vendor_tests::mailbox_paths;
 use super::*;
 
 /// RFC 6238's SHA-1 test seed, `12345678901234567890` in Base32.
@@ -154,12 +155,9 @@ fn looking_at_a_registry_mailbox_reveals_nothing() {
 /// shared address `ai1@example.test` resolves to the file's other mailbox.
 #[test]
 fn the_registry_decides_before_the_mailbox_file() {
-    let home = bare_home();
-    crate::vault_entry::seed(
-        home.path(),
-        &[(
-            SECRETS_MAILBOX_TOML_FILE,
-            b"[[mailboxes]]\n\
+    for &mailbox_path in mailbox_paths() {
+        let home = bare_home();
+        let text = b"[[mailboxes]]\n\
          login = \"other@example.test\"\n\
          password = \"fixture-file-other\"\n\
          webmail_url = \"https://other.example.test/inbox\"\n\
@@ -168,42 +166,54 @@ fn the_registry_decides_before_the_mailbox_file() {
          login = \"OWNER@example.test\"\n\
          password = \"fixture-file-owner\"\n\
          totp_secret = \"fixture-file-seed\"\n\
-         receives = [\"ai3@example.test\"]\n", // gitleaks:allow
-        )],
-    );
-    let mut registry = mailbox();
-    registry.held = vec![Part::Password];
-    alab_roster::with_mail(vec![registry], secrets(), || {
-        let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
-        assert_eq!(
-            cfg.webmail_user_for(Some("ai1@example.test")).as_deref(),
-            Some("owner@example.test"),
-            "the registry's route comes first among equal patterns"
-        );
-        assert_eq!(
-            cfg.password_for(Some("ai1@example.test")).as_deref(),
-            Some("fixture-login-pass"),
-            "the registry's held password, not the file's"
-        );
-        assert_eq!(
-            cfg.totp_secret_for(Some("ai1@example.test")).as_deref(),
-            Some("fixture-file-seed"),
-            "a part the registry holds no cell for falls back to the file's entry"
-        );
-        assert_eq!(
-            cfg.webmail_user_for(Some("ai2@example.test")).as_deref(),
-            Some("other@example.test"),
-            "an address only the file routes keeps its route"
-        );
-        assert_eq!(
-            cfg.mailboxes
-                .iter()
-                .filter(|m| m.login.eq_ignore_ascii_case("owner@example.test"))
-                .count(),
-            1,
-            "one login is one route"
-        );
-    });
+         receives = [\"ai3@example.test\"]\n"; // gitleaks:allow
+        if let Some(entry) = mailbox_path.strip_prefix(".secrets/") {
+            #[cfg(unix)]
+            crate::vault_entry::seed(home.path(), &[(entry, text)]);
+            #[cfg(not(unix))]
+            {
+                let _ = entry;
+                panic!("this fixture source requires the Unix vault");
+            }
+        } else {
+            let path = home.path().join(mailbox_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            aterm_uds::atomic_file::write(&path, text, 0o600).unwrap();
+        }
+        let mut registry = mailbox();
+        registry.held = vec![Part::Password];
+        alab_roster::with_mail(vec![registry], secrets(), || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+            assert_eq!(
+                cfg.webmail_user_for(Some("ai1@example.test")).as_deref(),
+                Some("owner@example.test"),
+                "the registry's route comes first among equal patterns"
+            );
+            assert_eq!(
+                cfg.password_for(Some("ai1@example.test")).as_deref(),
+                Some("fixture-login-pass"),
+                "the registry's held password, not the file's"
+            );
+            assert_eq!(
+                cfg.totp_secret_for(Some("ai1@example.test")).as_deref(),
+                Some("fixture-file-seed"),
+                "a part the registry holds no cell for falls back to the file's entry"
+            );
+            assert_eq!(
+                cfg.webmail_user_for(Some("ai2@example.test")).as_deref(),
+                Some("other@example.test"),
+                "an address only the file routes keeps its route"
+            );
+            assert_eq!(
+                cfg.mailboxes
+                    .iter()
+                    .filter(|m| m.login.eq_ignore_ascii_case("owner@example.test"))
+                    .count(),
+                1,
+                "one login is one route"
+            );
+        });
+    }
 }
 
 /// `VendorApprover::new`, which every sign-in driver (`login_drive`, `grok_signin`) builds,

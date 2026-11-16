@@ -245,7 +245,7 @@ fn head_sites_agree() {
         let band = band_px(band_pts, scale);
         for font_px in [8.0, 11.0, 14.0, 18.0, 23.0, 28.0, 35.0] {
             {
-                let ws = app.windows.get_mut(&wid).expect("the window");
+                let mut ws = app.windows.get_mut(&wid).expect("the window");
                 ws.scale = scale;
                 ws.head_pts = band_pts;
                 ws.metrics.font_px = font_px;
@@ -263,10 +263,11 @@ fn head_sites_agree() {
             for (frame, pref, want) in frames {
                 set_size(&mut app, pref);
                 let head = app.deck_head_px(wid, band_pts, scale, frame as u32);
-                let ws = app.windows.get_mut(&wid).expect("the window");
+                let mut ws = app.windows.get_mut(&wid).expect("the window");
                 assert_eq!(ws.deck_form, want, "{at}");
                 ws.metrics.head = head;
                 app.backend.set_head(head);
+                drop(ws);
                 let f = app.deck_frame(wid).expect("the Deck shows");
                 let (above, below) = if crate::tab_bar::STRIP_IS_CHROME_BAND {
                     (0, band)
@@ -370,7 +371,7 @@ fn a_restored_window_keeps_its_size() {
     let wid = crate::WindowId(0);
     let (band_pts, scale) = (28.0, 2.0);
     {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.scale = scale;
         ws.head_pts = band_pts;
     }
@@ -387,7 +388,7 @@ fn a_restored_window_keeps_its_size() {
     let frame_in = |app: &mut crate::App, deck: DeckForm, rows: u16| {
         app.windows.get_mut(&wid).expect("the window").deck_form = deck;
         let head = app.deck_head_px(wid, band_pts, scale, 0);
-        app.backend.set_head(head);
+        app.windows.get_mut(&wid).expect("the window").metrics.head = head;
         app.window_frame_px_for(wid, rows, cols)
     };
     let attach = |app: &mut crate::App, rows: u16, carried: Option<PhysicalSize<u32>>| {
@@ -438,7 +439,7 @@ fn a_frame_no_deck_sized_sizes_the_deck_as_nothing_carried() {
     let wid = crate::WindowId(0);
     let (band_pts, scale, cols) = (28.0, 2.0, 80);
     {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.scale = scale;
         ws.head_pts = band_pts;
     }
@@ -453,7 +454,7 @@ fn a_frame_no_deck_sized_sizes_the_deck_as_nothing_carried() {
     };
     for rows in 3..=16u16 {
         let (form, size) = attach(&mut app, rows, None);
-        let bare = size.height as usize - app.backend.head();
+        let bare = size.height as usize - app.win_head(wid);
         let doubled = PhysicalSize::new(size.width * 2, size.height * 2);
         let halved = PhysicalSize::new(size.width / 2, size.height / 2);
         let no_deck = PhysicalSize::new(size.width, (bare + band) as u32);
@@ -481,7 +482,7 @@ fn a_new_window_opens_folded_and_holds_its_grid() {
     let wid = crate::WindowId(0);
     let (band_pts, scale, cols) = (28.0, 2.0, 80);
     {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.scale = scale;
         ws.head_pts = band_pts;
     }
@@ -507,14 +508,14 @@ fn a_frame_the_other_form_sized_regrids_each_tab_once_at_its_attach() {
         let (mut app, wid, sessions) = three_panes();
         let (band_pts, scale) = (28.0, 2.0);
         {
-            let ws = app.windows.get_mut(&wid).expect("the window");
+            let mut ws = app.windows.get_mut(&wid).expect("the window");
             ws.scale = scale;
             ws.head_pts = band_pts;
         }
         let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
         app.windows.get_mut(&wid).expect("the window").deck_form = deck;
         let head = app.deck_head_px(wid, band_pts, scale, 0);
-        app.backend.set_head(head);
+        app.windows.get_mut(&wid).expect("the window").metrics.head = head;
         let carried = app.window_frame_px_for(wid, rows, cols);
         let before = sites_of(&app, &sessions);
         let head = app.attach_deck_head(wid, band_pts, scale);
@@ -557,14 +558,14 @@ fn a_v0_147_band_excess_reads_as_a_deck_only_where_it_matches_the_full_form() {
             let (mut app, wid, sessions) = three_panes();
             let band_pts = 28.0;
             {
-                let ws = app.windows.get_mut(&wid).expect("the window");
+                let mut ws = app.windows.get_mut(&wid).expect("the window");
                 ws.scale = scale;
                 ws.head_pts = band_pts;
             }
             let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
             app.windows.get_mut(&wid).expect("the window").deck_form = DeckForm::Folded;
             let head = app.deck_head_px(wid, band_pts, scale, 0);
-            app.backend.set_head(head);
+            app.windows.get_mut(&wid).expect("the window").metrics.head = head;
             let (_, cell) = app.win_cell_size(wid);
             let exact = app.window_frame_px_for(wid, rows, cols);
             let band_px = u32::from(band) * u32::try_from(cell).expect("a cell's height");
@@ -621,7 +622,7 @@ fn three_panes() -> (crate::App, crate::WindowId, Vec<u64>) {
 }
 
 /// Each session's resize rows' `site=` words, oldest first.
-fn sites_of(app: &crate::App, sessions: &[u64]) -> Vec<Vec<String>> {
+pub(crate) fn sites_of(app: &crate::App, sessions: &[u64]) -> Vec<Vec<String>> {
     sessions
         .iter()
         .map(|id| {
@@ -646,7 +647,7 @@ fn sites_of(app: &crate::App, sessions: &[u64]) -> Vec<Vec<String>> {
 }
 
 /// What each session booked since `before`.
-fn new_sites(before: &[Vec<String>], after: &[Vec<String>]) -> Vec<Vec<String>> {
+pub(crate) fn new_sites(before: &[Vec<String>], after: &[Vec<String>]) -> Vec<Vec<String>> {
     before
         .iter()
         .zip(after)
@@ -656,8 +657,8 @@ fn new_sites(before: &[Vec<String>], after: &[Vec<String>]) -> Vec<Vec<String>> 
 
 /// A switch of the deck's size in the config re-grids every tab of the window once,
 /// booked `site=deck`, and a reload that keeps the size re-grids none. A headless
-/// window's head is the backend's, so the test moves it to the new size's deck as
-/// `refresh_all_window_metrics` moves an attached window's during the reload.
+/// window's head does not follow its form, so the test moves it to the new size's deck
+/// as `refresh_all_window_metrics` moves an attached window's during the reload.
 #[test]
 fn a_size_switch_regrids_each_tab_once_booked_deck() {
     use aterm_window::dpi::PhysicalSize;
@@ -673,7 +674,7 @@ fn a_size_switch_regrids_each_tab_once_booked_deck() {
     };
     let head_of = |app: &mut crate::App, pref: DeckSizePref| {
         let (_, cell) = app.win_cell_size(wid);
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.deck_form = plan::deck_form_for(pref);
         let head = chrome_head_px(0.0, ws.scale, StatsBars::Deck, ws.deck_form, cell);
         ws.metrics.head = head;
@@ -790,8 +791,8 @@ pub(crate) fn sample_at(t: u64, busy: &[u64], cpu: &[u64]) -> Sample {
             compressed: Some(1 << 30),
             cached: 8 << 30,
             free: 7 << 30,
-            swap_used: 0,
-            swap_total: 0,
+            swap_used: Some(0),
+            swap_total: Some(0),
             pressure: Pressure::Normal,
             commit: None,
             ..MemSample::default()
@@ -916,6 +917,7 @@ pub(crate) fn input(snap: &Snapshot) -> DeckInput<'_> {
         network: None,
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
+        disk_span: crate::stats_lens::DiskSpan::Day,
         lab: None,
         fleet: None,
         snap: Some(snap),

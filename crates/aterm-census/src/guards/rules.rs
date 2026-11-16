@@ -69,15 +69,9 @@ const ENGINE_FRAMEWORKS: &[(&str, Bound)] = &[
     ("AppKit", Bound::Sub),
 ];
 
-/// aterm-effects' replay pool for its unit tests and its integration suite, which its root mounts
-/// under `cfg(any(test, debug_assertions))`: a debug build holds it, so [`TestCode::holds`] reads
-/// it as shipped, and engine-platform leaves it out by this one name.
-const ENGINE_SUITE_POOL: &str = "crates/aterm-effects/src/test_pool.rs";
-
-/// Is `rel` an engine crate's file that engine-platform judges: not a build script, an example,
-/// aterm-effects' `file_feed.rs` or [`ENGINE_SUITE_POOL`]? The rule leaves test code out as
-/// every guard does ([`TestCode::holds`]), so a shipped file whose name opens with `test` is
-/// judged.
+/// Is `rel` an engine crate's file that engine-platform judges: not a build script, an example
+/// or aterm-effects' `file_feed.rs`? The rule leaves test code out as every guard does
+/// ([`TestCode::holds`]), so a shipped file whose name opens with `test` is judged.
 fn engine_shipped(rel: &str) -> bool {
     if !ENGINE_CRATES.iter().any(|c| rel.starts_with(c)) {
         return false;
@@ -85,7 +79,7 @@ fn engine_shipped(rel: &str) -> bool {
     if rel.ends_with("/build.rs") || rel.contains("/examples/") {
         return false;
     }
-    rel != "crates/aterm-effects/src/file_feed.rs" && rel != ENGINE_SUITE_POOL
+    rel != "crates/aterm-effects/src/file_feed.rs"
 }
 
 /// Every file a test-only `cfg` loads: an out-of-line `mod` or a literal `include!` inside an
@@ -152,9 +146,8 @@ impl Declared {
 
 /// Which files of the corpus are test code, and which ship whatever their names or their parents
 /// say. Every guard that leaves a file out because it is test code asks [`TestCode::holds`]
-/// ([`Corpus::test_code`]); beside it, engine-platform leaves out one piece of test support by
-/// its name ([`ENGINE_SUITE_POOL`]). A guard that asks another question walks its own way:
-/// seam-caller follows what a release build compiles.
+/// ([`Corpus::test_code`]). A guard that asks another question walks its own way: seam-caller
+/// follows what a release build compiles.
 pub(super) struct TestCode {
     /// The files and directories [`declared_test_modules`] names.
     declared: Declared,

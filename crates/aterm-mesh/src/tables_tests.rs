@@ -391,17 +391,33 @@ impl Stores for Fake {
         Ok(!lock(&self.excludes).contains(&table))
     }
 
-    fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>> {
+    fn table_inventory(&self, table: Digest) -> io::Result<Option<aterm_db::replica::Snapshot>> {
         let records = self.records(&table);
         Ok(
             (!records.is_empty() || self.table_file(&table).exists()).then(|| {
-                records
-                    .iter()
-                    .filter(|(kind, _)| *kind == Kind::Operation)
-                    .map(|(_, wire)| stores::digest(wire))
-                    .collect()
+                aterm_db::replica::Snapshot::new(
+                    records
+                        .iter()
+                        .filter(|(kind, _)| *kind == Kind::Operation)
+                        .map(|(_, wire)| stores::digest(wire))
+                        .collect(),
+                )
             }),
         )
+    }
+
+    /// The fake's records are kept in the order they arrived, which is causal: `ids` in that
+    /// order.
+    fn table_order(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Digest>> {
+        let at: BTreeMap<Digest, usize> = self
+            .records(&table)
+            .iter()
+            .enumerate()
+            .map(|(n, (_, wire))| (stores::digest(wire), n))
+            .collect();
+        let mut ordered = ids.to_vec();
+        ordered.sort_by_key(|id| at.get(id).copied().unwrap_or(usize::MAX));
+        Ok(ordered)
     }
 
     fn table_wires(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
@@ -623,10 +639,13 @@ fn settled_tables(macs: &[(Mac, Arc<Fake>)]) -> crate::presence::Held {
             let length = fake.records(&TABLE).len() as u64;
             let egress = mac.mesh().egress().expect("an egress");
             assert!(egress.wait_published(key, length, Instant::now() + HANG));
-            let operations = fake
+            let operations: BTreeSet<Digest> = fake
                 .table_inventory(TABLE)
                 .expect("the store reads")
-                .expect("the store holds the table");
+                .expect("the store holds the table")
+                .ids()
+                .copied()
+                .collect();
             let conflicts: BTreeSet<Digest> = fake
                 .records(&TABLE)
                 .iter()

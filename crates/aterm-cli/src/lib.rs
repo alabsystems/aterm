@@ -141,6 +141,8 @@ const HELP_HEAD: &str = concat!(
     "                              and exit.\n",
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
+    "        --build-facts         Write the immutable compile-facts record and exit\n",
+    "                              before application startup.\n",
     "\n",
 );
 
@@ -1991,6 +1993,11 @@ struct LanFact {
     install: Option<Result<LanInstall, String>>,
     /// Whether something accepts a connection at its socket ([`aterm_uds::lan::socket_path`]).
     answers: bool,
+    /// Where nothing answers and launchd lists the broker's job switched off
+    /// ([`aterm_uds::launchd::system_job_switched_off`]), the broker's own words for that and
+    /// what switches it back on (`aterm_uds::lan::Unavailable::SwitchedOff`); `None` where it
+    /// answers, its job is not switched off, or launchd could not say.
+    switched_off: Option<String>,
 }
 
 /// The broker's install as `aterm_uds::lan::install::Reading` reads it, in what the row shows.
@@ -2006,7 +2013,7 @@ struct LanInstall {
 /// macOS: the root LAN broker's install and whether its socket answers a plain connect; `None`
 /// elsewhere, where no broker runs.
 fn lan_fact() -> Option<LanFact> {
-    let (install, answers) = lan_read()?;
+    let (install, answers, switched_off) = lan_read()?;
     Some(LanFact {
         install: install.map(|read| {
             read.map(|(current, owed, words)| LanInstall {
@@ -2016,15 +2023,21 @@ fn lan_fact() -> Option<LanFact> {
             })
         }),
         answers,
+        switched_off,
     })
 }
 
-/// What [`lan_fact`] reads: the install (`current`, `owed`, its words), and whether the socket
-/// answers.
-type LanRead = (Option<Result<(bool, bool, String), String>>, bool);
+/// What [`lan_fact`] reads: the install (`current`, `owed`, its words), whether the socket
+/// answers, and where it does not, the words for a job launchd lists switched off.
+type LanRead = (
+    Option<Result<(bool, bool, String), String>>,
+    bool,
+    Option<String>,
+);
 
 /// [`lan_fact`]'s reads on macOS ([`aterm_uds::lan::install::read_here`], a plain connect to
-/// [`aterm_uds::lan::socket_path`]); none elsewhere or in a test.
+/// [`aterm_uds::lan::socket_path`], and where it fails
+/// [`aterm_uds::launchd::system_job_switched_off`]); none elsewhere or in a test.
 fn lan_read() -> Option<LanRead> {
     #[cfg(all(target_os = "macos", not(test)))]
     {
@@ -2033,7 +2046,10 @@ fn lan_read() -> Option<LanRead> {
         });
         let answers =
             std::os::unix::net::UnixStream::connect(aterm_uds::lan::socket_path()).is_ok();
-        Some((install, answers))
+        let switched_off = (!answers
+            && aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL) == Some(true))
+        .then(|| aterm_uds::lan::Unavailable::SwitchedOff.to_string());
+        Some((install, answers, switched_off))
     }
     #[cfg(not(all(target_os = "macos", not(test))))]
     {
@@ -2045,38 +2061,56 @@ fn lan_read() -> Option<LanRead> {
 /// its socket answers. A broker that is not installed is a note (setup's one elevation installs
 /// it, and nothing is wrong meanwhile but that aterm's own LAN traffic waits, or, where macOS
 /// already allowed this aterm, goes by the allowed direct path, `aterm_uds::lan::direct`); an
-/// installed one whose socket does not answer is a warning.
+/// installed one whose socket does not answer is a warning, which that elevation starts. One
+/// that does not answer because launchd lists its job switched off is the person's choice: a
+/// note naming what switches it back on, never the elevation, which leaves that job alone.
 fn lan_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(lan) = &facts.lan else {
         return Vec::new();
     };
     let answers = if lan.answers { "yes" } else { "no" };
     let remedy = "sudo aterm machines here apply --plain installs it";
-    let (mark, fact, unmeasured) = match &lan.install {
-        None => (
-            Mark::Note,
-            format!("not read: this aterm runs outside an app bundle; socket answers: {answers}"),
-            true,
-        ),
-        Some(Err(why)) => (
-            Mark::Note,
-            format!("not read: {why}; socket answers: {answers}"),
-            true,
-        ),
-        Some(Ok(reading)) if reading.current => (
-            if lan.answers { Mark::Ok } else { Mark::Warn },
-            format!("installed ({}); socket answers: {answers}", reading.words),
-            false,
-        ),
-        Some(Ok(reading)) => (
-            Mark::Note,
-            format!(
-                "not installed as this build installs it ({}); socket answers: {answers}; \
-                 {remedy}",
-                reading.words
+    let switched_off = lan.switched_off.as_deref().filter(|_| !lan.answers);
+    let (mark, fact, unmeasured) = if let Some(off) = switched_off {
+        (Mark::Note, format!("{off}; socket answers: no"), false)
+    } else {
+        match &lan.install {
+            None => (
+                Mark::Note,
+                format!(
+                    "not read: this aterm runs outside an app bundle; socket answers: {answers}"
+                ),
+                true,
             ),
-            !reading.owed,
-        ),
+            Some(Err(why)) => (
+                Mark::Note,
+                format!("not read: {why}; socket answers: {answers}"),
+                true,
+            ),
+            Some(Ok(reading)) if reading.current && lan.answers => (
+                Mark::Ok,
+                format!("installed ({}); socket answers: yes", reading.words),
+                false,
+            ),
+            Some(Ok(reading)) if reading.current => (
+                Mark::Warn,
+                format!(
+                    "installed ({}); socket answers: no; sudo aterm machines here apply --plain \
+                     starts it",
+                    reading.words
+                ),
+                false,
+            ),
+            Some(Ok(reading)) => (
+                Mark::Note,
+                format!(
+                    "not installed as this build installs it ({}); socket answers: {answers}; \
+                     {remedy}",
+                    reading.words
+                ),
+                !reading.owed,
+            ),
+        }
     };
     vec![DoctorRow {
         label: "lan:",
@@ -4411,6 +4445,9 @@ fn session_code(quiet: bool, #[cfg(unix)] maintenance: Option<SessionMaintenance
         env_add.push(("AGY_CLI_FAST_PROMPT_EDITOR".to_string(), "true".to_string()));
     }
 
+    // The shell loses the strip list the harness registry and aterm.toml make, as a window's
+    // shells do (`docs/HARNESS-CONTRACT.md` §2), not only the compiled default.
+    atpkg::harness_record::install_shell_strip_list();
     let shell = match aterm_pty::spawn_shell_with_pid(
         rows,
         cols,

@@ -22,8 +22,8 @@
 //! ([`known_issues::parts`]) as the entry-level merge of the text before the edit, the repair of it
 //! and the edit decides it ([`known_issues::merge`]), where both changed it unlike each other as
 //! their three-way merge line by line ([`known_issues::merge_part`]). A commit of one parent is its
-//! change of its parent's file, made on its parent's replay. A merge of two commits with one merge
-//! base is Git's union of its two sides ([`Git::union_tree`]) and what the merge changed of it,
+//! change of its parent's file, made on its parent's replay. A merge of two commits is Git's union
+//! of its two sides ([`Git::union_tree`]) and what the merge changed of it,
 //! made on the entry-level merge of its sides' replays over its base's: the union's parts as that
 //! merge decides them, dropped where it holds no such part, and a part of which the union lost the
 //! heading put back after the part before it on the side that holds it. So a line one side wrote
@@ -36,8 +36,13 @@
 //! else. No step loses a line of a part's text the edit holds, or makes one up, beyond what the
 //! repair moved, took out or put in ([`accounts`]): where the merge line by line would, the step
 //! takes each part as the edit holds it where the edit changed it and as the repair holds it
-//! elsewhere, which the count always passes. Any other commit (a merge with no merge base or with
-//! several, or of more than two) is replayed as a commit of its first parent, and a file
+//! elsewhere, which the count always passes. Several merge bases are folded in Git's order into
+//! virtual commits: their raw union trees and original parents, with their entry-level replays
+//! held separately ([`Replay::virtual_base`]). This fold handles readable regular issue files
+//! merged by the built-in union driver, not arbitrary whole-tree conflict resolution: a missing,
+//! nonregular, binary or unreadable issue file, or a conflict at its path, keeps the earlier
+//! first-parent replay instead. A merge with no merge base, or of more than two parents, is also
+//! replayed as a commit of its first parent, and a file
 //! [`known_issues::parts`] does not read is taken as the commit holds it. Main's own reopening of
 //! an entry needs no exception: the landing's merge of main's tip takes it from main's side.
 
@@ -85,6 +90,16 @@ impl Held {
             why: Rc::default(),
         }
     }
+
+    /// A present regular issue file whose raw and replayed texts support a virtual union.
+    fn virtual_text(&self) -> bool {
+        self.blob.is_some()
+            && [self.own.as_deref(), self.text()].into_iter().all(|text| {
+                text.is_some_and(|text| {
+                    !text.as_bytes().contains(&0) && known_issues::ordered(text).is_some()
+                })
+            })
+    }
 }
 
 /// The open-issues file the rule holds `head` to, and a line for each part it holds unlike
@@ -120,6 +135,7 @@ pub(super) fn fixed(
         git,
         held: HashMap::new(),
         texts: HashMap::new(),
+        bases: HashMap::new(),
     };
     let mut last = None;
     for (commit, parents) in commits {
@@ -146,6 +162,8 @@ struct Replay<'g, 'r> {
     held: HashMap<String, Held>,
     /// Each blob read, by its id.
     texts: HashMap<String, Option<Rc<str>>>,
+    /// Completed virtual bases, by Git's ordered base list; `None` where unsupported.
+    bases: HashMap<Vec<String>, Option<String>>,
 }
 
 impl Replay<'_, '_> {
@@ -178,10 +196,21 @@ impl Replay<'_, '_> {
             return Ok(own);
         };
         let ours = self.read(first)?;
-        if let [_, second] = parents
-            && let [base] = &self.git.merge_bases(first, second)?[..]
-        {
-            let (base, theirs) = (self.read(base)?, self.read(second)?);
+        if let [_, second] = parents {
+            let theirs = self.read(second)?;
+            let bases = self.git.merge_bases(first, second)?;
+            let several = bases.len() > 1;
+            let base = match &bases[..] {
+                [] => None,
+                [base] => Some(self.read(base)?),
+                _ if own.virtual_text() && ours.virtual_text() && theirs.virtual_text() => {
+                    self.virtual_base(bases)?
+                }
+                _ => None,
+            };
+            let Some(base) = base else {
+                return Ok(self.single(own, &ours));
+            };
             // Where a side's file is the base's, or both sides' are one, Git's merge of the file
             // is the other side's, and no merge need run.
             let union = if ours.blob == theirs.blob || theirs.blob == base.blob {
@@ -189,15 +218,95 @@ impl Replay<'_, '_> {
             } else if ours.blob == base.blob {
                 theirs.clone()
             } else {
-                let union = self.git.union_tree(first, second)?;
+                let union = if several {
+                    let (tree, conflict) = self.git.union_tree_of(first, second, false)?;
+                    if conflict {
+                        return Ok(self.single(own, &ours));
+                    }
+                    tree
+                } else {
+                    self.git.union_tree(first, second)?
+                };
                 self.read(&union)?
             };
+            if several && !union.virtual_text() {
+                return Ok(self.single(own, &ours));
+            }
             let names = [first.as_str(), second.as_str()];
             if let Some(held) = self.merged(&own, &union, names, [&base, &ours, &theirs]) {
                 return Ok(held);
             }
         }
         Ok(self.single(own, &ours))
+    }
+
+    /// Replay several best bases in the reverse of `merge-base --all`'s date order, as Git
+    /// folds its virtual ancestors. Each virtual object holds the raw union tree and its two
+    /// original parents; `held` alone keeps its repair. Recursive bases are older original
+    /// ancestors, so a virtual object's fixed date cannot reorder a later base list.
+    ///
+    /// Git's internal merge differs from a top-level merge for file deletion, type and binary
+    /// conflicts. Those issue-file shapes, unreadable parts and actual issue-path conflicts
+    /// propagate `None` to the original step rather than treating a partial fold as its base.
+    fn virtual_base(&mut self, mut bases: Vec<String>) -> Result<Option<Held>, String> {
+        bases.reverse();
+        if let Some(cached) = self.bases.get(&bases).cloned() {
+            return cached.map(|at| self.read(&at)).transpose();
+        }
+        let folded = self.fold_bases(&bases)?;
+        self.bases.insert(bases, folded.clone());
+        folded.map(|at| self.read(&at)).transpose()
+    }
+
+    /// Complete one ordered fold, publishing no partial result as the requested base.
+    fn fold_bases(&mut self, bases: &[String]) -> Result<Option<String>, String> {
+        let Some((first, rest)) = bases.split_first() else {
+            return Ok(None);
+        };
+        let mut at = first.clone();
+        for next in rest {
+            let (ours, theirs) = (self.read(&at)?, self.read(next)?);
+            if !ours.virtual_text() || !theirs.virtual_text() {
+                return Ok(None);
+            }
+            let older = self.git.merge_bases(&at, next)?;
+            let base = match &older[..] {
+                // Git's internal merge of unrelated older roots uses an empty tree. This
+                // does not change the top-level no-base fallback in `step`.
+                [] => Held::own(None, Some(Rc::from(""))),
+                [base] => {
+                    let base = self.read(base)?;
+                    if !base.virtual_text() {
+                        return Ok(None);
+                    }
+                    base
+                }
+                _ => {
+                    let Some(base) = self.virtual_base(older)? else {
+                        return Ok(None);
+                    };
+                    base
+                }
+            };
+            let (tree, conflict) = self.git.union_tree_of(&at, next, true)?;
+            if conflict {
+                return Ok(None);
+            }
+            let union = self.read(&tree)?;
+            if !union.virtual_text() {
+                return Ok(None);
+            }
+            let names = [at.as_str(), next.as_str()];
+            let Some(held) = self.merged(&union, &union, names, [&base, &ours, &theirs]) else {
+                return Ok(None);
+            };
+            let commit = self.git.virtual_commit(&tree, &at, next)?;
+            // Only a completed replay is associated with a virtual commit. Its tree stays
+            // raw, so later edits are still accounted against what Git actually merged.
+            self.held.insert(commit.clone(), held);
+            at = commit;
+        }
+        Ok(Some(at))
     }
 
     /// Replay a merge of `names` (its two sides, the one merged into first) whose file is `own`,
@@ -937,29 +1046,76 @@ impl Git<'_> {
     /// The tree of Git's own merge of `other` into `one` (`one`'s lines first), whether or not it
     /// conflicts: what a union merge makes of the open-issues file, which never conflicts.
     fn union_tree(&self, one: &str, other: &str) -> Result<String, String> {
-        let args = [
+        self.union_tree_of(one, other, false).map(|(tree, _)| tree)
+    }
+
+    /// [`Self::union_tree`], and whether Git reports a conflict at the issues path. Only an
+    /// internal virtual-base fold allows unrelated roots, as Git's own recursive merge does.
+    fn union_tree_of(
+        &self,
+        one: &str,
+        other: &str,
+        unrelated: bool,
+    ) -> Result<(String, bool), String> {
+        let mut args = vec![
             "merge-tree",
             "--write-tree",
             "--no-messages",
             "--name-only",
             "-z",
-            one,
-            other,
         ];
+        if unrelated {
+            args.push("--allow-unrelated-histories");
+        }
+        args.extend([one, other]);
         let out = self.complete(&args, LOCAL)?;
-        let tree = out
-            .stdout
-            .split(|byte| *byte == 0)
-            .next()
-            .unwrap_or_default();
-        let tree = String::from_utf8_lossy(tree).into_owned();
+        let mut records = out.stdout.split(|byte| *byte == 0);
+        let tree = String::from_utf8_lossy(records.next().unwrap_or_default()).into_owned();
         match out.status.code() {
-            Some(0 | 1) if aterm_types::land_trailer::object_id(&tree) => Ok(tree),
+            Some(0 | 1) if aterm_land_trailer::object_id(&tree) => {
+                Ok((tree, records.any(|path| path == INDEX.as_bytes())))
+            }
             _ => Err(format!(
                 "git merge-tree {one} {other}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         }
+    }
+
+    /// An unreferenced virtual commit: raw merge tree and original parents, with fixed
+    /// metadata. The normal progress-aware commit writer changes no ref, index or worktree;
+    /// `commit-tree` is invoked without a signing request.
+    fn virtual_commit(&self, tree: &str, one: &str, other: &str) -> Result<String, String> {
+        if ![tree, one, other]
+            .into_iter()
+            .all(aterm_land_trailer::object_id)
+        {
+            return Err("a virtual merge has an invalid tree or parent object id".into());
+        }
+        let make = |root: &std::path::Path| {
+            let mut cmd = (self.make)(root);
+            cmd.env("GIT_AUTHOR_NAME", "verify land")
+                .env("GIT_AUTHOR_EMAIL", "verify-land@aterm.invalid")
+                .env("GIT_AUTHOR_DATE", "@0 +0000")
+                .env("GIT_COMMITTER_NAME", "verify land")
+                .env("GIT_COMMITTER_EMAIL", "verify-land@aterm.invalid")
+                .env("GIT_COMMITTER_DATE", "@0 +0000")
+                .args(["-c", "i18n.commitEncoding=UTF-8"]);
+            cmd
+        };
+        let git = Git {
+            root: self.root,
+            make: &make,
+        };
+        let id = git.commit(
+            tree,
+            &[one, other],
+            "verify land: virtual open-issues merge base",
+        )?;
+        if !aterm_land_trailer::object_id(&id) {
+            return Err("git commit-tree returned no virtual commit object id".into());
+        }
+        Ok(id)
     }
 
     /// The merge bases of `one` and `other`: none where their histories share no commit.

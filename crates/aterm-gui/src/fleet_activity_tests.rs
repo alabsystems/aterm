@@ -5,7 +5,7 @@ use super::*;
 use aterm_types::fleet_activity::Plain;
 
 const NODE: &str = "05050505050505050505050505050505";
-const SID: &str = "s-0123456789abcdef0123";
+const SID: &str = "t0123456789";
 
 /// A driver's label names its host before its node, or its node alone: the record keeps the
 /// host and leaves a driver the book names by no host to its node id.
@@ -51,7 +51,7 @@ fn a_drivers_row_names_the_host_its_label_leads_with() {
 #[test]
 fn mail_a_window_sends_another_mac_is_an_outgoing_message() {
     use aterm_types::fleet_access::FleetAccess;
-    const SENDER: &str = "s-fedcba98765432100123";
+    const SENDER: &str = "tfedcba9876";
     let request = format!("@{SID} post key=k kind=note -- hi");
     let admitted =
         sent((NODE, "m86"), Some(SENDER), &request, "OK posted f1\n").expect("a message");

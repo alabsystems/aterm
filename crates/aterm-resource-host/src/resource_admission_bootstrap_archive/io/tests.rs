@@ -87,6 +87,8 @@ fn early_ack_and_peer_eof_are_not_completion() {
     peer.flush(endpoint()).unwrap();
     assert!(delivery.poll(endpoint()).is_err());
     let (mut delivery, peer) = self::delivery();
+    // Establish EOF even if a concurrent fork temporarily inherited the endpoint.
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
     drop(peer);
     assert!(delivery.poll(endpoint()).is_err());
 }

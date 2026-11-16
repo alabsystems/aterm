@@ -189,7 +189,7 @@ pub fn named(repo: &Path, var: &dyn Fn(&str) -> Option<OsString>) -> Result<Name
         let git_dir = PathBuf::from(directory);
         let commit = commit
             .and_then(|value| value.into_string().ok())
-            .filter(|value| aterm_types::land_trailer::object_id(value))
+            .filter(|value| aterm_land_trailer::object_id(value))
             .ok_or_else(invalid)?;
         if !git_dir.is_absolute() {
             return Err(invalid());
@@ -258,7 +258,7 @@ impl Commit {
         };
         match named {
             Named::Pinned { git_dir, commit } => {
-                if !git_dir.is_absolute() || !aterm_types::land_trailer::object_id(commit) {
+                if !git_dir.is_absolute() || !aterm_land_trailer::object_id(commit) {
                     return Err(unread("invalid publication engine pin".into()));
                 }
                 let resolved = in_pinned(

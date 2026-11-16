@@ -12,7 +12,7 @@ mod state_words;
 pub use letter_guard::letter_bar;
 pub(crate) use letter_guard::{
     FootRing, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, RING as LETTER_GUARD_RING,
-    ThinCaret, foot_ring,
+    ThinCaret, ThinHeld, ThinHood, ThinLift, bar_width, foot_ring, word_glow_floor,
 };
 #[cfg(any(test, debug_assertions))]
 pub use letter_guard::{with_aa_unrounded, with_share_over_aa};
@@ -23,6 +23,52 @@ pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
 /// A `[from, to)` span of light-owned lights of the under stream
 /// ([`InkLedger::note_light_owned_laid`]).
 pub(crate) type OwnedSpan = (u32, u32);
+
+/// Where item `i` of a stream a cut was laid from begins among its pieces: `starts[i]`, and
+/// `starts`' last for an index past it.
+#[inline]
+fn start_at(starts: &[u32], i: u32) -> u32 {
+    match starts.get(i as usize) {
+        Some(&at) => at,
+        None => starts.last().copied().unwrap_or(i),
+    }
+}
+
+/// Map each `[from, to)` span of `spans` through a cut ([`start_at`]): the pieces its items
+/// were cut into. A span the cut left empty is dropped.
+#[inline]
+fn remap_spans(starts: &[u32], spans: &mut Vec<(u32, u32, bool)>) {
+    if starts.is_empty() {
+        return;
+    }
+    for s in spans.iter_mut() {
+        *s = (start_at(starts, s.0), start_at(starts, s.1), s.2);
+    }
+    spans.retain(|s| s.1 > s.0);
+}
+
+/// [`remap_spans`] for spans with no mark.
+#[inline]
+fn remap_owned(starts: &[u32], spans: &mut Vec<OwnedSpan>) {
+    if starts.is_empty() {
+        return;
+    }
+    for s in spans.iter_mut() {
+        *s = (start_at(starts, s.0), start_at(starts, s.1));
+    }
+    spans.retain(|s| s.1 > s.0);
+}
+
+/// A frame's spans of its streams ([`InkLedger::spans`]): its rails' quads and ramps, its
+/// light-owned lights' and its page shades'.
+pub(crate) type Spans = (
+    Vec<(u32, u32, bool)>,
+    Vec<(u32, u32, bool)>,
+    Vec<OwnedSpan>,
+    Vec<OwnedSpan>,
+    Vec<OwnedSpan>,
+    Vec<OwnedSpan>,
+);
 
 /// Per-frame over-ink contrast account reset by [`CursorGlow::begin_ink_ledger`].
 pub(crate) struct InkLedger {
@@ -71,10 +117,31 @@ pub(crate) struct InkLedger {
     knots_x: Vec<i32>,
     knots_y: Vec<i32>,
     near: Vec<Dim>,
+    /// Whether a dim of [`Self::near`] is hard ([`Dim::hard`]).
+    near_hard: bool,
     /// What [`Self::knots_x`] was sliced from: the box's x range and the
-    /// feather's reach, and each near dim's x edges.
+    /// feather's reach, and each near dim's x edges and hardness.
     knot_span: (i32, i32, i32),
-    knot_key: Vec<(i32, i32)>,
+    knot_key: Vec<(i32, i32, bool)>,
+    /// Whether the cuts reach a light-owned light and a foot rail inside a
+    /// hard dim's box (`CursorGlow::hold_light_for_thin_caret`'s strip beside
+    /// the caret's line), its soft dims never.
+    pub(crate) owned_in_strip: bool,
+    /// Where each quad (then ramp) of a stream being cut begins among its
+    /// pieces, and one past the last: the spans' map through the cut.
+    starts: Vec<u32>,
+    /// A test's negative control: a cut spends the spans, as before CT-51,
+    /// so a later cut of the frame reads none.
+    #[cfg(test)]
+    pub(crate) spans_spent: bool,
+    /// A test's negative control: a frame the letter guard's memo lays again keeps the spans
+    /// it had, not the ones the memo kept, as before CT-51 W12.
+    #[cfg(test)]
+    pub(crate) memo_spans_off: bool,
+    /// A test's negative control: the night grounds laid under the frame leave the under
+    /// stream's spans where they were, as before CT-51 W12.
+    #[cfg(test)]
+    pub(crate) night_shift_off: bool,
     /// While a pass cuts row after row of fixed dims (`row_near_on`, the
     /// guard's ramps): the x range [`Self::near`] was gathered over and the
     /// rows `[from, to)` whose one-row box gathers the very same dims, and
@@ -165,6 +232,9 @@ struct Dim {
     x1: f32,
     y1: f32,
     share: f32,
+    /// A hard dim keeps its share on its box's pixels alone, with no
+    /// feather ([`InkLedger::hard_at`]): a thin caret's held ring.
+    hard: bool,
 }
 
 impl InkLedger {
@@ -187,8 +257,17 @@ impl InkLedger {
         knots_x: Vec::new(),
         knots_y: Vec::new(),
         near: Vec::new(),
+        near_hard: false,
         knot_span: (i32::MIN, i32::MIN, 0),
         knot_key: Vec::new(),
+        owned_in_strip: false,
+        starts: Vec::new(),
+        #[cfg(test)]
+        spans_spent: false,
+        #[cfg(test)]
+        memo_spans_off: false,
+        #[cfg(test)]
+        night_shift_off: false,
         row_near: None,
         row_near_on: false,
         near_gen: 0,
@@ -661,6 +740,51 @@ impl InkLedger {
             .filter(|&&(_, _, foot)| foot)
             .map(|&(from, to, _)| (to - from) as usize)
             .sum()
+    }
+
+    /// Move the frame's spans of the under stream's quads past `n` quads laid before them
+    /// (`CursorGlow::ground_the_frame`'s night grounds).
+    #[inline]
+    pub(crate) fn shift_under_spans(&mut self, n: u32) {
+        #[cfg(test)]
+        if self.night_shift_off {
+            return;
+        }
+        for s in &mut self.rails {
+            *s = (s.0.saturating_add(n), s.1.saturating_add(n), s.2);
+        }
+        for s in self
+            .light_owned
+            .iter_mut()
+            .chain(self.page_shades.iter_mut())
+        {
+            *s = (s.0.saturating_add(n), s.1.saturating_add(n));
+        }
+    }
+
+    /// The frame's spans, all six, to keep beside the streams they name (the letter guard's
+    /// memo).
+    #[inline]
+    pub(crate) fn spans(&self) -> Spans {
+        (
+            self.rails.clone(),
+            self.rail_ramps.clone(),
+            self.light_owned.clone(),
+            self.light_owned_ramps.clone(),
+            self.page_shades.clone(),
+            self.page_shade_ramps.clone(),
+        )
+    }
+
+    /// Keep `spans` ([`Self::spans`]) as the frame's.
+    #[inline]
+    pub(crate) fn set_spans(&mut self, spans: &Spans) {
+        self.rails.clone_from(&spans.0);
+        self.rail_ramps.clone_from(&spans.1);
+        self.light_owned.clone_from(&spans.2);
+        self.light_owned_ramps.clone_from(&spans.3);
+        self.page_shades.clone_from(&spans.4);
+        self.page_shade_ramps.clone_from(&spans.5);
     }
 
     /// Forget the frame's rails ([`Self::note_rail`], [`Self::note_rail_laid`]),
@@ -1455,6 +1579,7 @@ impl InkLedger {
             x1: x0 as f32 + cw,
             y1: y0 as f32 + ch,
             share: share.clamp(0.0, 1.0),
+            hard: false,
         }
     }
 
@@ -1482,7 +1607,7 @@ impl InkLedger {
         while i < dims.len() {
             let d = &dims[i];
             i += 1;
-            if d.share >= m {
+            if d.hard || d.share >= m {
                 continue;
             }
             let dy = (d.y0 - y).max(y - d.y1).max(0.0);
@@ -1507,6 +1632,44 @@ impl InkLedger {
             m = m.min(d.share + (1.0 - d.share) * rise);
         }
         m
+    }
+
+    /// The share a hard dim of the box [`Self::knots`] last sliced keeps
+    /// at window px `(x, y)`, a point inside a piece (its middle): the least
+    /// of every hard dim whose box holds it, `1.0` off them.
+    #[inline]
+    pub(super) const fn hard_at(&self, x: f32, y: f32) -> f32 {
+        if !self.near_hard {
+            return 1.0;
+        }
+        let dims = self.near.as_slice();
+        let mut m = 1.0f32;
+        let mut i = 0;
+        while i < dims.len() {
+            let d = &dims[i];
+            i += 1;
+            if d.hard && d.share < m && x >= d.x0 && x < d.x1 && y >= d.y0 && y < d.y1 {
+                m = d.share;
+            }
+        }
+        m
+    }
+
+    /// Whether the window px box `[x0, x1) × [y0, y1)` meets a hard dim's
+    /// box ([`Self::owned_in_strip`]).
+    #[inline]
+    pub(super) const fn meets_hard(&self, (x0, y0, x1, y1): (i32, i32, i32, i32)) -> bool {
+        let (x0f, y0f, x1f, y1f) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+        let dims = self.dims.as_slice();
+        let mut i = 0;
+        while i < dims.len() {
+            let d = &dims[i];
+            if d.hard && d.share < 1.0 && y0f < d.y1 && y1f > d.y0 && x0f < d.x1 && x1f > d.x0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 
     #[inline]
@@ -1554,6 +1717,10 @@ impl InkLedger {
         fn push_edge(k: &mut Vec<i32>, (a, b): (i32, i32), f: i32, (lo, hi): (i32, i32)) {
             push_in(k, a, lo, hi);
             push_in(k, b, lo, hi);
+            // A hard dim's edges alone (its `f` is 0).
+            if f == 0 {
+                return;
+            }
             let mut s = InkLedger::FEATHER_STEP;
             while s < f {
                 push_in(k, a - s, lo, hi);
@@ -1586,6 +1753,7 @@ impl InkLedger {
         self.near_gen += 1;
         let dims = self.dims.as_slice();
         self.near.clear();
+        self.near_hard = false;
         // The rows about `y0` a one-row box gathers these same dims over.
         let (mut from, mut to) = (i32::MIN, i32::MAX);
         let mut di = 0;
@@ -1608,6 +1776,7 @@ impl InkLedger {
             if reach1 <= y0 || reach0 >= y1 {
                 continue;
             }
+            self.near_hard |= d.hard;
             self.near.push(*d);
         }
         self.row_near = if one_row {
@@ -1624,7 +1793,7 @@ impl InkLedger {
         let mut same_x = self.knot_span == (x0, x1, fx) && self.knot_key.len() == near.len();
         let mut i = 0;
         while same_x && i < near.len() {
-            same_x = self.knot_key[i] == (near[i].x0 as i32, near[i].x1 as i32);
+            same_x = self.knot_key[i] == (near[i].x0 as i32, near[i].x1 as i32, near[i].hard);
             i += 1;
         }
         if !same_x {
@@ -1635,8 +1804,9 @@ impl InkLedger {
             let mut i = 0;
             while i < near.len() {
                 let (dx0, dx1) = (near[i].x0 as i32, near[i].x1 as i32);
-                push_edge(kx, (dx0, dx1), fx, (x0, x1));
-                self.knot_key.push((dx0, dx1));
+                let f = if near[i].hard { 0 } else { fx };
+                push_edge(kx, (dx0, dx1), f, (x0, x1));
+                self.knot_key.push((dx0, dx1, near[i].hard));
                 i += 1;
             }
             kx.sort_unstable();
@@ -1650,7 +1820,8 @@ impl InkLedger {
         if y1 - y0 != 1 {
             let mut i = 0;
             while i < near.len() {
-                push_edge(ky, (near[i].y0 as i32, near[i].y1 as i32), fy, (y0, y1));
+                let f = if near[i].hard { 0 } else { fy };
+                push_edge(ky, (near[i].y0 as i32, near[i].y1 as i32), f, (y0, y1));
                 i += 1;
             }
             ky.sort_unstable();

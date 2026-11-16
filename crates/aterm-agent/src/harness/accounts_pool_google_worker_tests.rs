@@ -582,8 +582,8 @@ fn native_google_worker_launch_on_a_missing_grant_signs_in_without_a_provider_re
 }
 
 /// ONLY A RENEWAL THAT LEAVES THE LOGIN SIGNED OUT READS AS A SIGN-OUT. A sign-in that failed or
-/// wants a person, one onto the wrong account and one that renewed another account are a person's
-/// to mend. One that could not run leaves it signed out too, but a later launch tries the renewal
+/// wants a person, one a bot protection stopped, one onto the wrong account and one that renewed
+/// another account are a person's to mend. One that could not run leaves it signed out too, but a later launch tries the renewal
 /// again, so a dispatcher is not sent to ask a person to sign in. CONTROL: a renewal that took
 /// refuses nothing.
 #[test]
@@ -596,6 +596,7 @@ fn only_a_renewal_that_leaves_the_login_signed_out_reads_as_a_sign_out() {
         Renewal::WrongAccount,
         Renewal::OtherRenewed,
         Renewal::NeedsPerson,
+        Renewal::BotCheck,
     ] {
         let refused = renewal_refused(result);
         assert!(
@@ -603,16 +604,91 @@ fn only_a_renewal_that_leaves_the_login_signed_out_reads_as_a_sign_out() {
             "{result:?}: {refused:?}"
         );
     }
-    for result in [
-        Renewal::Failed,
-        Renewal::SigninHeld,
-        Renewal::Deferred,
-        Renewal::BotCheck,
-    ] {
+    for result in [Renewal::Failed, Renewal::SigninHeld, Renewal::Deferred] {
         let refused = renewal_refused(result);
         assert!(
             matches!(&refused, Err(Refused::Preparation(why)) if why.contains(&format!("{result:?}"))),
             "{result:?}: {refused:?}"
         );
     }
+}
+
+/// A LAUNCH LOADS NO PAGE FOR A ROW A BOT PROTECTION STOPPED, ON ANY CLOCK: once agy's row `one`
+/// has its account's check on record, a launch that finds its grant gone refuses at the renewal
+/// door (`launch_renewal`) an hour, six hours and a minute and a day on, naming the person's step
+/// ([`super::super::cli::left_words`]), and runs no sign-in. CONTROL: with no check on record,
+/// and once a login made for the row has ended the check, the launch runs its sign-in.
+#[cfg(unix)]
+#[test]
+fn a_launch_loads_no_page_for_a_row_a_bot_protection_stopped_on_any_clock() {
+    use super::super::worker::Refused;
+    let world = World::new(Some([1; 32]));
+    let launch = |now: i64| {
+        let seat = Seat {
+            now,
+            ..world.seat()
+        };
+        let ran = std::cell::Cell::new(0);
+        let result = recover_google_worker_with(
+            &seat,
+            world.starter(),
+            |_, _| Err(agy_signin::PublishedRefusal::SignedOut),
+            |row, logins| {
+                launch_renewal(&seat, row, logins, |_, _, _| {
+                    ran.set(ran.get() + 1);
+                    Err("the stand-in signs nothing in".into())
+                })
+            },
+        );
+        (result.err(), ran.get())
+    };
+    let (_, ran) = launch(NOW + 1);
+    assert_eq!(
+        ran, 1,
+        "CONTROL: with no check on record the launch runs its sign-in"
+    );
+    let raw = world.seat().roster(Cli::Agy).unwrap();
+    let row = raw.row("one").unwrap().clone();
+    let store = world.seat().store(Cli::Agy);
+    store
+        .transact_logins(NOW + 2, &mut None, |_, logins| {
+            accounts::note_check_stop(logins, &row, NOW + 2);
+            Ok(Vec::new())
+        })
+        .unwrap();
+    for later in [3_600, 6 * 3_600 + 60, 25 * 3_600] {
+        assert_eq!(
+            launch(NOW + 2 + later),
+            (
+                Some(Refused::SignedOut(super::super::cli::left_words(
+                    Cli::Agy,
+                    "one"
+                ))),
+                0
+            ),
+            "{later} s after the check"
+        );
+    }
+    let at = NOW + 2 + 25 * 3_600 + 60;
+    store
+        .transact_logins(at, &mut None, |state, logins| {
+            let events = accounts::note_renewed(
+                state,
+                logins,
+                "one",
+                row.dir.as_deref(),
+                world.profile.to_str().unwrap(),
+                None,
+                at,
+            );
+            accounts::note_google_identity(logins, "one", EMAIL, [1; 32]);
+            Ok(events)
+        })
+        .unwrap();
+    let (refused, ran) = launch(at + 60);
+    assert_eq!(
+        ran, 1,
+        "CONTROL: a login made for the row ends its check, and the launch runs its sign-in: \
+         {refused:?}"
+    );
 }

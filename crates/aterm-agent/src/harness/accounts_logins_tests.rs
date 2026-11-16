@@ -1316,6 +1316,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
             routes: routes.to_owned(),
             since: NOW,
             tried_at: NOW,
+            stop: None,
         }),
         "since when it has been so"
     );
@@ -1445,6 +1446,7 @@ fn a_failed_hand_run_leaves_the_page_that_stopped_its_row_on_record() {
         routes: page.to_owned(),
         since: NOW,
         tried_at: NOW,
+        stop: None,
     };
     let attempt = |logins: &Logins| logins.get("main").and_then(|b| b.sign_in_attempt.clone());
     let hand = |logins: &mut Logins, outcome: AttemptOutcome| {
@@ -1487,6 +1489,7 @@ fn a_failed_hand_run_leaves_the_page_that_stopped_its_row_on_record() {
             routes: by_hand.to_owned(),
             since: NOW + HOUR,
             tried_at: NOW + HOUR,
+            stop: None,
         }),
         "CONTROL: with no page on record the hand failure is the row's last sign-in"
     );
@@ -1613,5 +1616,75 @@ fn a_due_login_is_renewed_only_while_this_mac_uses_it() {
         without_use_condition(|| due(&never, NOW + HOUR)),
         ["main"],
         "CONTROL: the timer renewal the use condition stops"
+    );
+}
+
+/// A BOT PROTECTION'S STOP IS ITS ACCOUNT'S, IN ITS REALM, AND READS BACK AS WRITTEN: a check
+/// that named an address holds a row of that address, or of none, in the same realm; one that
+/// named no address holds the row whatever it names later in that realm; `logins.json` keeps
+/// the address, or none, and the realm. CONTROL: a check of one address holds no row of another,
+/// and a global check holds no mainland-cn row of the same address.
+#[test]
+fn a_check_stop_is_its_accounts_in_its_realm_and_reads_back_as_written() {
+    use crate::ai::connector::Region;
+    let row = |email: Option<&str>, region: Option<Region>| Row {
+        label: "one".into(),
+        email: email.map(str::to_owned),
+        vendor: Vendor {
+            region,
+            ..Vendor::default()
+        },
+        ..Row::default()
+    };
+    // The check written for `checked`'s row, read back from `logins.json`, and when it holds
+    // `now`'s row.
+    let holds = |checked: &Row, now: &Row| {
+        let mut logins = Logins::default();
+        note_check_stop(&mut logins, checked, NOW);
+        let written = logins.get("one").and_then(|b| b.check_stop.clone());
+        assert_eq!(
+            written,
+            Some(check_of(checked, NOW)),
+            "the check names its row's account and realm"
+        );
+        let read = Logins::from_json(&logins.to_json(), NOW).expect("logins.json reads back");
+        assert_eq!(
+            read.get("one").and_then(|b| b.check_stop.clone()),
+            written,
+            "read back as written"
+        );
+        check_stopped_at(now, &read)
+    };
+    let (global, cn) = (Some(Region::Global), Some(Region::MainlandCn));
+    let a = row(Some("a@example.com"), global);
+    let nobody = row(None, global);
+    assert_eq!(
+        check_of(&nobody, NOW).account,
+        None,
+        "a check of no address"
+    );
+    assert_eq!(holds(&nobody, &nobody), Some(NOW));
+    assert_eq!(
+        holds(&nobody, &a),
+        Some(NOW),
+        "a check of no address holds the row whatever it names later"
+    );
+    assert_eq!(holds(&a, &a), Some(NOW));
+    assert_eq!(holds(&a, &nobody), Some(NOW));
+    assert_eq!(holds(&row(None, cn), &row(None, cn)), Some(NOW));
+    assert_eq!(
+        holds(&a, &row(Some("b@example.com"), global)),
+        None,
+        "CONTROL: a check of one address holds no row of another"
+    );
+    assert_eq!(
+        holds(&a, &row(Some("a@example.com"), cn)),
+        None,
+        "CONTROL: a global check holds no mainland-cn row of the same address"
+    );
+    assert_eq!(
+        holds(&row(None, cn), &nobody),
+        None,
+        "CONTROL: a mainland-cn check of no address holds no global row"
     );
 }

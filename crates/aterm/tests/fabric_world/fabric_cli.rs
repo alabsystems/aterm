@@ -763,7 +763,12 @@ fn a_weak_brokers_clean_stop_closes_its_log_and_a_reboot_keeps_its_identity() {
             if weak { tier } else { "strict" }
         );
         client
-            .publish(1, 1, "/f/t1/pub/n-00000000000000aa/s-x/history", b"v=1")
+            .publish(
+                1,
+                1,
+                "/f/t1/pub/n-00000000000000aa/t0000003vvr/history",
+                b"v=1",
+            )
             .expect("acked");
         drop(client);
         assert!(
@@ -921,14 +926,14 @@ fn doctor_retire_ghosts_lists_dry_and_publishes_exited_with_yes() {
     let sock = s.sock();
     let _broker = Broker::spawn(&s);
     let node = "n-00000000000000aa";
-    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
+    let subject = format!("/f/t1/pub/{node}/t004c2e8ee5/presence");
     let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
     publish(&sock, &[(subject.clone(), live.to_string())]);
     let env_cmd = s.command(&sock, true);
 
     let (code, out, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"]);
     assert_eq!(code, 0, "out={out} err={err}");
-    assert!(out.contains("@s-ghost"), "{out}");
+    assert!(out.contains("@t004c2e8ee5"), "{out}");
     assert_eq!(
         last_body(&sock, &subject).as_deref(),
         Some(live),
@@ -958,14 +963,19 @@ fn doctor_retire_ghosts_lists_dry_and_publishes_exited_with_yes() {
 /// to say yes and it is `--yes`, which says so in the argv.
 #[test]
 fn doctor_retire_ghosts_does_not_take_a_piped_yes() {
+    const GHOST: &str = "t004c2e8ee5";
     let s = Scratch::new("ghostpipe");
     let sock = s.sock();
     let _broker = Broker::spawn(&s);
     let node = "n-00000000000000aa";
-    let subject = format!("/f/t1/pub/{node}/s-ghost/presence");
+    let subject = format!("/f/t1/pub/{node}/{GHOST}/presence");
     let live = "v=1 t=1789400000000 inc=7 epoch=e1 gen=g1 state=live hold=0";
     publish(&sock, &[(subject.clone(), live.to_string())]);
     let env_cmd = s.command(&sock, true);
+
+    let (code, listed, err) = fabric(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"]);
+    assert_eq!(code, 0, "out={listed} err={err}");
+    assert!(listed.contains(&format!("@{GHOST}")), "{listed}");
 
     let mut child = fabric_cmd(&s, Some(&env_cmd), &["doctor", "--retire-ghosts"])
         .stdin(Stdio::piped())
@@ -1092,18 +1102,18 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
             "v=1 t=1789400000000 inc=1 state=live fabric=connected host=far".to_string(),
         ),
         (
-            format!("/f/t1/pub/{far}/s-far/presence"),
+            format!("/f/t1/pub/{far}/t000043pves/presence"),
             "v=1 t=1789400000000 inc=1 state=live hold=0 holder=-".to_string(),
         ),
         (
-            format!("/f/t1/pub/{far}/s-old/presence"),
+            format!("/f/t1/pub/{far}/t000043q5bz/presence"),
             "v=1 t=1789400000000 inc=1 state=exited hold=0".to_string(),
         ),
     ];
     for i in 0..12 {
         records.push(msg(
             far,
-            "s-far",
+            "t000043pves",
             "h-andrew",
             if i % 2 == 0 { "task" } else { "note" },
             &format!("the secret plan number {i}"),
@@ -1164,7 +1174,10 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     assert_eq!(got, offs[offs.len() - 10..].to_vec());
     let last = traffic.last().expect("a row");
     assert_eq!(last["from"].as_str(), Some("h-andrew"));
-    assert_eq!(last["to"].as_str(), Some(format!("s-far@{far}").as_str()));
+    assert_eq!(
+        last["to"].as_str(),
+        Some(format!("t000043pves@{far}").as_str())
+    );
     assert_eq!(last["kind"].as_str(), Some("note"));
     assert_eq!(last["trust"].as_str(), Some("human"));
     assert_eq!(
@@ -1176,7 +1189,7 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
 
     let sessions = arr(&v, "sessions");
     assert_eq!(sessions.len(), 1, "{out}");
-    assert_eq!(sessions[0]["sid"].as_str(), Some("s-far"));
+    assert_eq!(sessions[0]["sid"].as_str(), Some("t000043pves"));
     assert!(sessions[0]["pid"].is_null(), "no instance here hosts it");
     assert_eq!(v["exited_sessions"].as_u64(), Some(1));
     assert_eq!(arr(&v, "nodes")[0]["host"].as_str(), Some("far"));
@@ -1333,9 +1346,9 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     let offs = publish(
         &s.sock(),
         &[
-            msg(node, "s-a", "h-andrew", "task", "alpha secret"),
-            msg(node, "s-a", "s-b", "note", "beta secret"),
-            msg(node, "s-b", "h-andrew", "ask", "gamma secret"),
+            msg(node, "t0000003vv1", "h-andrew", "task", "alpha secret"),
+            msg(node, "t0000003vv1", "t0000003vv2", "note", "beta secret"),
+            msg(node, "t0000003vv2", "h-andrew", "ask", "gamma secret"),
         ],
     );
 
@@ -1355,7 +1368,7 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
             "bodies are hidden by default: {row}"
         );
     }
-    assert!(rows[0].contains("h-andrew  ") && rows[0].ends_with(&format!("s-a@{node}")));
+    assert!(rows[0].contains("h-andrew  ") && rows[0].ends_with(&format!("t0000003vv1@{node}")));
     assert!(rows[0].contains(" human "), "{}", rows[0]);
     assert!(rows[1].contains(" agent "), "{}", rows[1]);
 
@@ -1371,7 +1384,7 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
     assert!(header.starts_with("OFFSET"), "{header}");
     let new = publish(
         &s.sock(),
-        &[msg(node, "s-a", "h-andrew", "report", "delta")],
+        &[msg(node, "t0000003vv1", "h-andrew", "report", "delta")],
     );
     let rows = tail_rows(&live, 1);
     assert!(rows[0].starts_with(&format!("@{}", new[0])), "{rows:#?}");
@@ -1519,7 +1532,10 @@ fn tail_bodies_show_a_presence_rows_fields_and_their_length() {
     let body = "v=1 t=1789400000000 state=live attention=QZP7WORD2";
     let offs = publish(
         &s.sock(),
-        &[(format!("/f/t1/pub/{node}/s-a/presence"), body.to_string())],
+        &[(
+            format!("/f/t1/pub/{node}/t0000003vv1/presence"),
+            body.to_string(),
+        )],
     );
     let from = offs[0].to_string();
     let record = |args: &[&str]| -> (String, aterm_json::Value) {

@@ -65,6 +65,10 @@ pub(super) enum Wire {
     /// `atdb/6` ([`fleet::ALPN_DATABASE_DUPLEX`]): the delta-frontier frames, then
     /// credential handoffs in both directions so the custodian may also be the listener.
     Duplex,
+    /// `atdb/7` ([`fleet::ALPN_DATABASE_RECONCILE`]): [`Self::Duplex`]'s frames, with each table's
+    /// operation inventory reconciled by range and its difference drained in one round, parents
+    /// first ([`crate::replica`]).
+    Reconcile,
 }
 
 impl Wire {
@@ -72,7 +76,7 @@ impl Wire {
     pub(super) const fn batch_records(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_RECORDS,
-            Self::Delta | Self::Duplex => BATCH_RECORDS,
+            Self::Delta | Self::Duplex | Self::Reconcile => BATCH_RECORDS,
         }
     }
 
@@ -80,7 +84,7 @@ impl Wire {
     pub(super) const fn batch_bytes(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_BYTES,
-            Self::Delta | Self::Duplex => BATCH_BYTES,
+            Self::Delta | Self::Duplex | Self::Reconcile => BATCH_BYTES,
         }
     }
 
@@ -88,7 +92,7 @@ impl Wire {
     pub(super) const fn evidence_bytes(self) -> usize {
         match self {
             Self::Whole => MAX_RECORDS_STREAM,
-            Self::Delta | Self::Duplex => MAX_EVIDENCE,
+            Self::Delta | Self::Duplex | Self::Reconcile => MAX_EVIDENCE,
         }
     }
 
@@ -101,7 +105,7 @@ impl Wire {
     pub(super) const fn round_cap(self, capacity: usize) -> usize {
         match self {
             Self::Whole => capacity / (WHOLE_BATCH_BYTES / MAX_RECORD) + 2,
-            Self::Delta | Self::Duplex => {
+            Self::Delta | Self::Duplex | Self::Reconcile => {
                 2 * (capacity.div_ceil(BATCH_RECORDS) + MAX_RECORDS_STREAM.div_ceil(BATCH_BYTES))
                     + 2
             }
@@ -431,7 +435,7 @@ pub(super) fn send_evidence(
             admit_by_log_witness(log, target.binding())?;
             match wire {
                 Wire::Whole => log.records().map(Record::bytes).collect(),
-                Wire::Delta | Wire::Duplex => {
+                Wire::Delta | Wire::Duplex | Wire::Reconcile => {
                     lacked(endpoint, Some(log), log.records(), session.have)
                         .into_iter()
                         .map(Record::bytes)
@@ -583,7 +587,7 @@ fn receive_evidence(
             admit_by_log_witness(&log, target.binding())?;
             Ok(Received::Witness(Box::new(log)))
         }
-        Wire::Delta | Wire::Duplex => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
             let (overlay, pushed) = overlay(endpoint, session.view, records)?;
             admit_by_log_witness(&overlay, target.binding())?;
             Ok(Received::Push {
@@ -718,7 +722,7 @@ pub(super) fn connected(
     // Delta-frontier peers state what each side holds; an `atdb/4` peer sends its evidence next.
     let (view, have) = match wire {
         Wire::Whole => (View::NONE, Vec::new()),
-        Wire::Delta | Wire::Duplex => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
             let view = View::of(endpoint)?;
             let have = trade_haves(endpoint, stream, side, repair, &mut peer, &view)?;
             (view, have)
@@ -865,8 +869,13 @@ pub(super) fn connected(
                 compatible(endpoint, peer.bound)?;
                 let pass = verify_evidence(endpoint, &peer, &theirs)?;
                 lease.phase = Phase::Credentials;
-                lease.handoff =
-                    endpoint.hand_off_credentials(pass, actor, side, wire == Wire::Duplex, stream);
+                lease.handoff = endpoint.hand_off_credentials(
+                    pass,
+                    actor,
+                    side,
+                    matches!(wire, Wire::Duplex | Wire::Reconcile),
+                    stream,
+                );
             }
             lease.phase = Phase::Complete;
         }
@@ -1375,10 +1384,12 @@ fn enroll(
             .map_err(failure)?;
             let wires: Vec<_> = match session.wire {
                 Wire::Whole => chain.iter().map(Record::bytes).collect(),
-                Wire::Delta | Wire::Duplex => lacked(endpoint, None, &chain, session.have)
-                    .into_iter()
-                    .map(Record::bytes)
-                    .collect(),
+                Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+                    lacked(endpoint, None, &chain, session.have)
+                        .into_iter()
+                        .map(Record::bytes)
+                        .collect()
+                }
             };
             send_evidence_wires(
                 endpoint,

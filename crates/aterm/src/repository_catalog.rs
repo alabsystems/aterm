@@ -14,8 +14,8 @@ use aterm_machines::init_github::{
     RepositoryCatalog, RepositoryCatalogChanges, RepositoryCatalogVisibility,
 };
 use aterm_secrets::{
-    SecretBytes,
-    client::{self, Admin, Config, Paths},
+    ErrorKind, SecretBytes,
+    client::{self, Admin, Author, Config, Paths},
     text::Audience,
 };
 use std::sync::{
@@ -32,6 +32,33 @@ const FETCH: Duration = Duration::from_secs(20);
 const LOOK: Duration = Duration::from_secs(15 * 60);
 const RETRY: Duration = Duration::from_secs(60);
 const RESULT_AGE: Duration = Duration::from_secs(120);
+/// Who signs a refreshed catalog, as the vault log's fill is told: an automatic writer, which
+/// signs no `Put` over 64 KiB, stops at seven eighths of the log's bound and is held to what
+/// this Mac's seat signed in a day (`aterm_secrets::membership_log::budgets`).
+const WRITER: Author<'static> = Author::Automatic("the repository inventory upkeep");
+
+/// Why [`publish`] published nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpublished {
+    /// The source, the authority or the store is not ready yet: the candidate is kept and
+    /// offered again at the next step.
+    Awaits(String),
+    /// The vault refused the entry, in its words: the text's door (a fleet configuration value
+    /// over 64 KiB is not set) or the log's fill (an automatic writer's size limit, its class's
+    /// stop, its seat's day). Nothing was signed or sent, and the same candidate would be
+    /// refused at the next step too.
+    Refused(String),
+}
+impl From<String> for Unpublished {
+    fn from(why: String) -> Self {
+        Self::Awaits(why)
+    }
+}
+impl From<&str> for Unpublished {
+    fn from(why: &str) -> Self {
+        Self::Awaits(why.to_owned())
+    }
+}
 
 #[cfg(test)]
 #[path = "repository_catalog_tests.rs"]
@@ -154,6 +181,11 @@ pub(super) struct Upkeep {
     reported: Option<String>,
     members: Option<[u8; 32]>,
     followup: bool,
+    /// The vault refused the last candidate ([`Unpublished::Refused`]) and nothing has ended
+    /// that refusal since: the refusal was reported once, and is not again until a publication,
+    /// a look whose catalog the vault already holds, or a change of the entries, configuration
+    /// or paths the schedule is kept for ends it. A refusal after that is a new one, said once.
+    refused: bool,
     /// Runs in [`Upkeep::step`] between its take of a finished read and its choice to ask for
     /// another: a test's stand-in for a read that finishes in that window.
     #[cfg(test)]
@@ -170,6 +202,7 @@ impl Default for Upkeep {
             reported: None,
             members: None,
             followup: false,
+            refused: false,
             #[cfg(test)]
             between: None,
         }
@@ -276,6 +309,7 @@ impl Upkeep {
             self.due = None;
             self.members = None;
             self.followup = false;
+            self.refused = false;
         }
         let members = membership(admin);
         if self
@@ -329,7 +363,7 @@ impl Upkeep {
                             next_basis.catalog = entry_digest(&next_entry);
                             published = match publish(paths, admin, candidate.clone(), deadline) {
                                 Ok(done) => done,
-                                Err(error) => {
+                                Err(Unpublished::Awaits(error)) => {
                                     self.mailbox
                                         .0
                                         .lock()
@@ -337,9 +371,38 @@ impl Upkeep {
                                         .result = Some(Ok(candidate));
                                     return Err(error);
                                 }
+                                Err(Unpublished::Refused(why)) => {
+                                    // The vault refused the catalog (its size, or the log's
+                                    // fill): offering the same candidate at every step would
+                                    // be refused at every step. It is retired, the next look
+                                    // waits its whole interval, never the 60 s of a retry, and
+                                    // the refusal is said once, until a publication ends it.
+                                    self.followup = false;
+                                    self.due = Some(Instant::now() + LOOK);
+                                    return if std::mem::replace(&mut self.refused, true) {
+                                        Ok(0)
+                                    } else {
+                                        Err(format!(
+                                            "private repository catalog was not refreshed: {why}; \
+                                             it is looked at again every {} minutes",
+                                            LOOK.as_secs() / 60
+                                        ))
+                                    };
+                                }
                             };
                             self.due = (!self.followup).then(|| Instant::now() + LOOK);
+                            if published == 0 {
+                                // The vault holds this catalog already: what was refused no
+                                // longer stands, and a later refusal is a new one.
+                                self.refused = false;
+                            }
                             if published != 0 {
+                                if std::mem::take(&mut self.refused) {
+                                    aterm_log::info!(
+                                        "private repository catalog is refreshed again: the \
+                                         vault takes it"
+                                    );
+                                }
                                 self.basis = Some(next_basis);
                                 return Ok(published);
                             }
@@ -442,7 +505,7 @@ fn publish(
     supplied: &Admin,
     candidate: Candidate,
     deadline: Instant,
-) -> Result<usize, String> {
+) -> Result<usize, Unpublished> {
     // Reopen locally: unrelated versions do not invalidate a read, but changed relevant entries
     // or authority do. Exact receiving-parent CAS closes concurrent publication at the store.
     let fresh = client::admin_cached_until(paths, deadline).map_err(|e| e.to_string())?;
@@ -469,13 +532,23 @@ fn publish(
         old.if_absent,
         old.anchor.as_deref(),
     )
-    .map_err(|e| e.to_string())?;
+    // The text's door: a catalog over the 64 KiB a fleet configuration value may be set to is
+    // refused here, in words that hold the entry's name and the sizes. The same candidate
+    // would be refused at every step, so it is retired as a refusal by the log's fill is.
+    .map_err(|error| Unpublished::Refused(error.to_string()))?;
     if !allowed(paths) {
         return Err("private repository catalog upkeep was stopped".into());
     }
-    client::admin_publish_conditional_until(paths, &fresh, &doc, deadline).map_err(|_| {
-        "private catalog publication awaits current authority or readback".to_string()
-    })?;
+    client::admin_publish_conditional_until(paths, &fresh, &doc, deadline, WRITER).map_err(
+        |error| match error.kind() {
+            // The refusal's own words: the size and the limit, the class, the fill and what
+            // still fits, or what this Mac's seat signed in a day. They hold no value.
+            ErrorKind::MembershipCapacity => Unpublished::Refused(error.to_string()),
+            _ => Unpublished::Awaits(
+                "private catalog publication awaits current authority or readback".into(),
+            ),
+        },
+    )?;
     aterm_log::info!("{}", refreshed_line(&candidate));
     Ok(1)
 }

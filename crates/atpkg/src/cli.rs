@@ -73,7 +73,9 @@ const TABLE: &[Verb] = &[
                 aterm pkg install --default-set    — the whole ALab toolset\n\
                 aterm pkg install <trust|lean4> --build <N> [--retry] — a signed build beside \
                 `current`, which stays (Trust locks and exact Lean import worlds; --retry: \
-                download a held-back build again now)",
+                download a held-back build again now)\n\
+                aterm pkg install <id>-alab --build <N> — a harness's signed build, made live \
+                and held there until `aterm pkg update <id>-alab` names it",
         arity: Arity::Parsed {
             refuse: |rest| parse_install_argv(rest).err(),
         },
@@ -8369,12 +8371,14 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
         [program, flag, _] | [program, flag, _, _]
             if flag == BUILD_FLAG
                 && program != crate::trust_lock::PROGRAM
-                && program != crate::prerequisite::Prerequisite::Lake.program() =>
+                && program != crate::prerequisite::Prerequisite::Lake.program()
+                && !crate::harness::is_harness(program) =>
         {
             eprintln!(
                 "atpkg install: {BUILD_FLAG} stages the Trust build a trust.lock names: \
-                 `aterm pkg install {} {BUILD_FLAG} <N>` or an exact Lean import world with \
-                 `aterm pkg install lean4 {BUILD_FLAG} <N>`; {program} installs its pinned build",
+                 `aterm pkg install {} {BUILD_FLAG} <N>`, an exact Lean import world with \
+                 `aterm pkg install lean4 {BUILD_FLAG} <N>`, or a harness's earlier build with \
+                 `aterm pkg install <id>-alab {BUILD_FLAG} <N>`; {program} installs its pinned build",
                 crate::trust_lock::PROGRAM
             );
             Err(ExitCode::from(2))
@@ -8399,8 +8403,8 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
         _ => {
             eprintln!(
                 "atpkg install: one program at a time (got {}); the whole toolset is \
-                 `aterm pkg install --default-set`, one build of Trust \
-                 `aterm pkg install <trust|lean4> {BUILD_FLAG} <N> [{RETRY_FLAG}]`",
+                 `aterm pkg install --default-set`, one named build \
+                 `aterm pkg install <trust|lean4|<id>-alab> {BUILD_FLAG} <N> [{RETRY_FLAG}]`",
                 rest.len()
             );
             Err(ExitCode::from(2))
@@ -8409,8 +8413,9 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
 }
 
 /// `aterm pkg install <trust|lean4> --build <N>`: a build verified under the head index and staged
-/// beside `current`, which stays ([`crate::flow::install_build`]); held to the tree a `trust.lock`
-/// above this directory names when it names that build. Every successful named install records
+/// beside `current`, which stays ([`crate::flow::install_build`]), held to the tree a `trust.lock`
+/// above this directory names when it names that build; a harness's (`<id>-alab`) is made live
+/// and held there ([`crate::flow::install_harness_build`]). Every successful named install records
 /// recent use before releasing the store lock, so gc cannot collect it before a later lease
 /// within the existing keep window. A named Lean build supplies an exact import world;
 /// its consumer holds a named prerequisite lease while using it. It never acquires a Trust lock.
@@ -8436,7 +8441,13 @@ fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
         triple: current_triple(),
         installed: None,
     };
-    let got = crate::flow::install_build(
+    let harness = crate::harness::is_harness(program);
+    let install = if harness {
+        crate::flow::install_harness_build
+    } else {
+        crate::flow::install_build
+    };
+    let got = install(
         &*resolve_fetcher(&layout),
         &layout,
         &(seams.anchor)(&layout),
@@ -8455,10 +8466,18 @@ fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
                 crate::flow::NamedBuild::Present { tree_root } => ("is in the store", tree_root),
                 crate::flow::NamedBuild::Staged { tree_root } => ("staged", tree_root),
             };
-            println!(
-                "atpkg: {program} {build} {said} beside `current`, which stays (tree root {})",
-                root.get(..12).unwrap_or(root)
-            );
+            let root = root.get(..12).unwrap_or(root);
+            if harness {
+                println!(
+                    "atpkg: {program} {build} {said} and is live, held there (tree root \
+                     {root}) until `aterm pkg update {program}` names it"
+                );
+            } else {
+                println!(
+                    "atpkg: {program} {build} {said} beside `current`, which stays (tree root \
+                     {root})"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -9194,7 +9213,10 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    match crate::pin::set_pinned(&layout, program, pinned) {
+    // The person's own pin or unpin: whatever hold a named harness install made is theirs now.
+    let set = crate::pin::set_pinned(&layout, program, pinned)
+        .and_then(|changed| crate::pin::set_held(&layout, program, false).map(|_| changed));
+    match set {
         Ok(changed) => {
             let looked = if crate::vendor_direct::is_vendor(program) {
                 Some((None, Vec::new()))
@@ -12324,7 +12346,7 @@ fn set_disk_refusal(
     }
     let need = peak.saturating_add(floor);
     let sentence = format!(
-        "the ALab toolset needs {}{} free on the volume holding {}; {} free \u{2014} free {}",
+        "the ALab toolset needs {}{} free on the volume holding {}; {} free, {} short",
         crate::cost::human_bytes(need),
         if beside > 0 {
             " with the agents installing beside it"
@@ -12652,6 +12674,37 @@ fn sysroot_link_bins(
     }
 }
 
+/// Release `program`'s hold if a named harness install made it ([`crate::pin::set_held`]):
+/// `Ok(true)` when it did and its pin is gone, `Ok(false)` when the pin is the person's own.
+fn release_named_hold(layout: &crate::store::Layout, program: &str) -> std::io::Result<bool> {
+    if !crate::pin::is_held(layout, program)? {
+        return Ok(false);
+    }
+    crate::pin::set_pinned(layout, program, false)?;
+    crate::pin::set_held(layout, program, false)?;
+    Ok(true)
+}
+
+/// What `aterm pkg update <program>` makes of `program`'s pin once its plan decided `decision`:
+/// a harness held at a build the person named (`install <id>-alab --build <n>`) is released
+/// whatever the plan decides, the held build the pinned one or not, because the named update is
+/// their word ([`release_named_hold`]); a pin the person set themselves (`aterm pkg pin`) is not
+/// a hold, and stays. `(pinned, released)`: whether `program` stays pinned for an `Install`
+/// (`false` for any other decision), and whether a hold was released.
+///
+/// # Errors
+/// A pin or holds file that does not read or write.
+fn named_update_pin(
+    layout: &crate::store::Layout,
+    program: &str,
+    decision: crate::ApplyDecision,
+) -> std::io::Result<(bool, bool)> {
+    let released = crate::harness::is_harness(program) && release_named_hold(layout, program)?;
+    let pinned =
+        decision == crate::ApplyDecision::Install && crate::pin::is_pinned(layout, program)?;
+    Ok((pinned, released))
+}
+
 fn cmd_update_one(program: &String) -> ExitCode {
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
@@ -12719,6 +12772,18 @@ fn cmd_update_one(program: &String) -> ExitCode {
         }
     };
     let decision = plan.decision;
+    let pinned = match named_update_pin(&layout, program, decision) {
+        Ok((pinned, released)) => {
+            if released {
+                println!("atpkg: {program} was held at its build; released, as you named it");
+            }
+            pinned
+        }
+        Err(error) => {
+            eprintln!("atpkg: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     if plan.group.is_some() {
         let report = match crate::flow::apply_program_with_index(
             &*fetcher,
@@ -12760,17 +12825,6 @@ fn cmd_update_one(program: &String) -> ExitCode {
             ExitCode::from(1)
         };
     }
-    let pinned = if decision == crate::ApplyDecision::Install {
-        match crate::pin::is_pinned(&layout, program) {
-            Ok(pinned) => pinned,
-            Err(error) => {
-                eprintln!("atpkg: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        false
-    };
     if decision == crate::ApplyDecision::Install
         && plan.current_build_ok
         && let Some(c) = cur

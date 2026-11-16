@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Owner-directed public repository creation. The ordinary repository permit
+//! Owner-directed repository creation. The ordinary repository permit
 //! grants the destination; a separate exact-body capability grants this endpoint.
 
 use super::Repos;
@@ -20,11 +20,26 @@ use crate::write::{Effect, Ensured, Outcome, WriteOp};
 /// One bucket per prospective repository, independent of request options.
 pub const CREATE_KEY: &str = "repo create";
 
-/// Explicit visibility. Private and organization creation are not supported.
+/// Explicit visibility for User-owned creation; no later visibility change is made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepoVisibility {
     /// Public from its first creation; no later visibility change is made.
     Public,
+    /// Private from its first creation; no later visibility change is made.
+    Private,
+}
+
+impl RepoVisibility {
+    const fn is_private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
 }
 
 /// Authority to create this repository with this visibility, not a general
@@ -51,7 +66,7 @@ impl RepoCreatePermit {
 
     fn body(&self) -> Result<Vec<u8>> {
         encode_body(&aterm_json::json!({
-            "name": self.slug.repo(), "private": false, "auto_init": false,
+            "name": self.slug.repo(), "private": self.visibility.is_private(), "auto_init": false,
         }))
     }
 }
@@ -281,12 +296,15 @@ fn validate_repo(permit: &RepoCreatePermit, repo: &RepoObject) -> Result<()> {
         || !repo.name.eq_ignore_ascii_case(permit.slug.repo())
         || !repo.owner.login.eq_ignore_ascii_case(permit.slug.owner())
         || repo.owner.kind != "User"
-        || repo.raw.get("private").and_then(|v| v.as_bool()) != Some(false)
-        || repo.visibility.as_deref() != Some("public")
+        || repo.raw.get("private").and_then(|v| v.as_bool()) != Some(permit.visibility.is_private())
+        || repo.visibility.as_deref() != Some(permit.visibility.word())
     {
         return Err(Error::new(
             Kind::Conflict,
-            "repository metadata does not match the requested public owner/name",
+            format!(
+                "repository metadata does not match the requested {} owner/name",
+                permit.visibility.word()
+            ),
         )
         .with_repo(permit.slug.to_string()));
     }

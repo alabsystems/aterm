@@ -722,6 +722,33 @@ fn the_spawn_fingerprint_moves_with_what_shapes_a_shell_and_not_with_colours() {
     assert_eq!(colours.spawn_fingerprint(), fp, "colours do not move it");
 }
 
+/// A SPARE FORKED UNDER ANOTHER STRIP LIST IS NOT ADOPTED: a shell keeps the environment it was
+/// forked with, so the fingerprint a spare is judged by covers the strip list installed now, and
+/// adding or removing an entry (aterm.toml's `shell_env_strip`, a record's `env_strip`) moves it.
+/// NEGATIVE CONTROL (2026-11-14): before the list was hashed, all three fingerprints were equal
+/// and a reload that changed `shell_env_strip` kept the spare forked under the old list.
+#[test]
+fn the_spawn_fingerprint_moves_with_the_strip_list() {
+    use aterm_types::domain::EnvStrip;
+    let app = App::headless_for_test();
+    let f = &app.session_factory;
+    assert_eq!(
+        f.spawn_fingerprint(),
+        f.spawn_fingerprint_under(&aterm_types::domain::effective_env_strip()),
+        "the fingerprint is the installed list's"
+    );
+    let default = f.spawn_fingerprint_under(&EnvStrip::default());
+    let added = EnvStrip::compose(None, [("x-alab", "OPENAI_")]).0;
+    assert_ne!(f.spawn_fingerprint_under(&added), default, "an added entry");
+    let person = vec!["CLAUDE".to_string()];
+    let narrowed = EnvStrip::compose(Some(&person), []).0;
+    assert_ne!(
+        f.spawn_fingerprint_under(&narrowed),
+        default,
+        "a removed entry"
+    );
+}
+
 fn captured_link(id: u64) -> (Arc<SpareLink>, Arc<StdMutex<Vec<String>>>) {
     let seen = Arc::new(StdMutex::new(Vec::new()));
     let sink = Arc::clone(&seen);

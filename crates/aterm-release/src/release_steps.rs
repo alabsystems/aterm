@@ -2842,6 +2842,19 @@ impl Real {
                 ));
             }
         }
+        // A merge must not detach a repack that races the next audit commit. The release
+        // owns this copy and its operations; maintenance belongs outside that sequence.
+        if self
+            .engine_git(&["config", "maintenance.auto", "false"])
+            .is_none()
+        {
+            return Err(Refusal::new(
+                format!("could not disable automatic maintenance in the publication engine {e}"),
+                format!(
+                    "check that {e} has a writable Git configuration, then {RELEASE_COMMAND} again"
+                ),
+            ));
+        }
         for key in ["user.name", "user.email"] {
             let mut cmd = local_git()?;
             cmd.arg("-C")
@@ -9029,13 +9042,19 @@ impl Real {
 }
 
 impl Backend for Real {
-    fn main_lane(&mut self, base: &str) -> Option<String> {
-        Some(
-            match self.git_out(&["rev-parse", &format!("{base}^{{tree}}")]) {
-                Some(tree) => crate::main_lane::observe(&self.repo, base, &tree, now),
-                None => format!("main lane: base {base}: tree unavailable (advisory)"),
-            },
-        )
+    fn follower(&mut self, base: &str) -> Option<String> {
+        let read = || -> Result<String, String> {
+            let remote = crate::github_remote::Remote::origin(&self.repo)?;
+            Ok(match remote.follower(base)? {
+                Some((state, description)) => {
+                    format!("follower: base {base}: {state}: {description} (advisory)")
+                }
+                None => format!("follower: base {base}: not judged (advisory)"),
+            })
+        };
+        Some(read().unwrap_or_else(|why| {
+            format!("follower: base {base}: status unavailable: {why} (advisory)")
+        }))
     }
     fn prepare_sign(
         &mut self,
@@ -9604,7 +9623,7 @@ impl Backend for Real {
                     self.repo.display(),
                     crate::gates::MIN_FREE_DISK_GIB
                 ),
-                "free space, then re-run",
+                "re-run; nothing was changed",
             ));
         }
         out.extend(self.engine_unready());
@@ -10598,14 +10617,26 @@ impl Backend for Real {
     }
 
     fn repair(&mut self, failure: &aterm_release::repair::Failure) -> Vec<String> {
-        use aterm_release::repair::Spawner as _;
         let record = self.release.join(aterm_release::repair::RECORD_FILE);
-        // A cut the pump runs has no session: its worker starts in this Mac's newest aterm.
         let mut spawner = aterm_release::repair::spawner(
-            aterm_release::repair::Ctl.in_session(),
+            aterm_release::repair::Ctl::in_session(),
             std::env::var_os(aterm_release::repair::PUMP_ENV).is_some(),
         );
-        aterm_release::repair::open(&record, &self.repo, failure, spawner.as_mut()).lines(&record)
+        let opened = match spawner.as_mut() {
+            Some(spawner) => aterm_release::repair::open(
+                &record,
+                &self.repo,
+                failure,
+                aterm_release::repair::RepairMode::Pump(spawner.as_mut()),
+            ),
+            None => aterm_release::repair::open(
+                &record,
+                &self.repo,
+                failure,
+                aterm_release::repair::RepairMode::Caller,
+            ),
+        };
+        opened.lines(&record)
     }
 
     fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String> {
@@ -10632,6 +10663,46 @@ impl Backend for Real {
                 format!("fix what it names, then {RELEASE_COMMAND} (nothing was claimed)"),
             )
         })
+    }
+
+    fn windows_pull_config(&mut self, commit: &str) -> crate::buildplan::windows_pull::Config {
+        self.git_out(&["show", &format!("{commit}:publish/config.sh")])
+            .map_or(crate::buildplan::windows_pull::Config::OFF, |text| {
+                crate::buildplan::windows_pull::Config::read(&text)
+            })
+    }
+
+    fn windows_request(
+        &mut self,
+        version: &str,
+        build: u64,
+        commit: &str,
+        now: u64,
+    ) -> Result<String, String> {
+        let remote = (self.source_origin)(&self.repo)?;
+        crate::buildplan::windows_pull::write_request(
+            &crate::buildplan::windows_pull::RemoteOrigin(&remote),
+            &self.git(),
+            version,
+            build,
+            commit,
+            now,
+        )
+    }
+
+    fn windows_look(
+        &mut self,
+        ask: &crate::buildplan::windows_pull::Ask,
+        day: &str,
+    ) -> Result<crate::buildplan::windows_pull::Found, String> {
+        let remote = (self.source_origin)(&self.repo)?;
+        crate::buildplan::windows_pull::look(
+            &crate::buildplan::windows_pull::RemoteOrigin(&remote),
+            &self.git(),
+            ask,
+            &ask.directory(&self.release),
+            day,
+        )
     }
 
     fn preview_roll(&mut self, c: &Candidate) -> Result<String, Refusal> {

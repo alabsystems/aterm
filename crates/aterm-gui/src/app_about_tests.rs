@@ -137,7 +137,7 @@ fn about_tab_keys_visit_offscreen_actions_and_reveal_each_focus() {
             let (cw, ch) = app.win_cell_size(wid);
             let pad = app.win_pad(wid);
             {
-                let window = app.windows.get_mut(&wid).unwrap();
+                let mut window = app.windows.get_mut(&wid).unwrap();
                 window.scale = 1.0;
                 window.cols = u16::try_from(314usize.saturating_sub(pad * 2) / cw)
                     .unwrap()
@@ -327,7 +327,7 @@ fn about_scroll_before_its_details_frame_uses_the_target_views_current_layout() 
         {
             // As tall as 40 rows of macOS's 12 px cells, where the details outgrow it:
             // Linux's 15 px and Windows's 17 px cells make 40 rows a window they fit in.
-            let window = app.windows.get_mut(&wid).unwrap();
+            let mut window = app.windows.get_mut(&wid).unwrap();
             window.cols = 140;
             window.rows = (40.0 * 12.0 / crate::FONT_PX).round() as u16;
         }

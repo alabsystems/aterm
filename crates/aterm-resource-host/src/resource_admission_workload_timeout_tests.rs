@@ -6,7 +6,7 @@ use super::*;
 fn complete_maximum_repetition_budget_remains_finite_without_a_day_cap() {
     let mut request = aterm_types::resource_admission::Submission {
         binding: Binding {
-            session: "s-0000000000000000acde".into(),
+            session: "t000000acde".into(),
             attempt: [1; 16],
         },
         peer_pid: std::process::id(),

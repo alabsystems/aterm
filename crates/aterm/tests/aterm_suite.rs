@@ -12,6 +12,9 @@
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[path = "support/aterm_under_test_tests.rs"]
+mod aterm_under_test_tests;
 #[cfg(unix)]
 #[path = "support/child_output.rs"]
 mod child_output;
@@ -48,6 +51,8 @@ mod agent_verdict_live_headless;
 mod amacs_pty;
 #[cfg(unix)]
 mod app_front_hwkey_live_headless;
+#[cfg(debug_assertions)]
+mod build_facts;
 #[cfg(unix)]
 mod conn_live_headless;
 #[cfg(unix)]

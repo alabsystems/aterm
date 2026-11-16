@@ -4,6 +4,8 @@
 //! A plain build's claim on a scratch ledger and an injected machine ([`Fixed`]): no test reads
 //! this user's ledger, records or machine.
 
+use std::sync::{Arc, Mutex};
+
 use super::*;
 use aterm_capacity::reading::{Proc, Procs};
 use aterm_capacity::{Fixed, Reading};
@@ -840,6 +842,618 @@ fn a_process_holding_its_own_claim_builds_unclaimed() {
     drop(vm);
     let got = admit(&test_build(), dir.path(), &s, &mut |_| {});
     assert!(matches!(got, Admission::Claimed(_)), "{got:?}");
+}
+
+/// The lines of a 500 GiB volume under the default knobs and no measured room: its emergency
+/// line is 5 GiB, below its 25 GiB floor.
+fn emergency_lines() -> aterm_capacity::floor::Lines {
+    aterm_capacity::floor::lines(
+        aterm_capacity::floor::Knobs::default(),
+        Some(500 * GIB),
+        None,
+    )
+}
+
+/// A scratch volume as an emergency hold reads it: `free` bytes and `files_free` inodes free,
+/// beside [`emergency_lines`].
+fn scratch_volume(free: u64, files_free: Option<u64>) -> aterm_capacity::reading::Lined {
+    aterm_capacity::reading::Lined {
+        mount: PathBuf::from("/Volumes/scratch"),
+        free,
+        files_free,
+        lines: Some(emergency_lines()),
+    }
+}
+
+/// The claim and wait files of `dir`'s scratch ledger ([`seat`]).
+fn ledger_entries(dir: &Path) -> Vec<String> {
+    Ledger::at(dir.join("ledger"))
+        .dir()
+        .read_dir()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".claim") || n.ends_with(".wait"))
+        .collect()
+}
+
+/// Each ask a hand-made emergency hold made: the bytes and the mount.
+type Asks = Arc<Mutex<Vec<(u64, PathBuf)>>>;
+
+/// A hand-made emergency hold, in an aterm tab where `in_aterm`, that reads `volume` (`None`: a
+/// read fails the test) and whose ask answers `OK sys` at once: with its count of reads and its
+/// asks.
+fn counted_hold(
+    volume: Option<aterm_capacity::reading::Lined>,
+    in_aterm: bool,
+) -> (DiskHold, Arc<Mutex<u32>>, Asks) {
+    let reads = Arc::new(Mutex::new(0_u32));
+    let asks: Asks = Arc::default();
+    let (their_reads, their_asks) = (Arc::clone(&reads), Arc::clone(&asks));
+    let disk = DiskHold {
+        in_aterm,
+        at: None,
+        reader: Box::new(move |_at: &Path| {
+            *their_reads.lock().expect("reads") += 1;
+            Some(volume.clone().expect("this front's volume is never read"))
+        }),
+        ask: Some(Box::new(
+            move |bytes: u64, mount: &Path, _stopped: &dyn Fn() -> bool| {
+                their_asks
+                    .lock()
+                    .expect("asks")
+                    .push((bytes, mount.to_path_buf()));
+                Some("OK sys".to_owned())
+            },
+        )),
+        bound: aterm_spec::wait::MUST_HAPPEN,
+    };
+    (disk, reads, asks)
+}
+
+/// A plain test build's admission ([`front_admit`]) on a fresh scratch seat admitted `mode`, with
+/// `probe` its possible build lock, held for disk by `disk`; with the seat's folder, to outlive
+/// the claim.
+fn plain_front(
+    disk: &mut DiskHold,
+    probe: &dyn Fn() -> Option<PathBuf>,
+    mode: Admit,
+) -> (Admission, aterm_tempfile::TempDir) {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let mut s = seat(dir.path(), &m, std::process::id().wrapping_add(37));
+    s.mode = mode;
+    let got = front_admit(&test_build(), dir.path(), &s, probe, &mut |_| {}, disk);
+    (got, dir)
+}
+
+/// A PLAIN BUILD STARTED BELOW ITS VOLUME'S EMERGENCY LINE IS HELD FOR ONE PASS, THEN STARTS
+/// (DC-06b): in an aterm tab, its build directory's volume 3 GiB free below its 5 GiB emergency
+/// line, the front asks the window's disk watch once, for the emergency line, while it holds no
+/// claim and no place in the ledger's queue (`HoldHoldsNothing` of `atpkg_build_admit_model`);
+/// then it claims and starts, having said one line naming the volume, what was free, the line,
+/// the watch's answer and what is free now, and no remedy by hand. NEGATIVE CONTROL: the same
+/// listing of the ledger, taken once it is admitted, finds its claim.
+#[test]
+fn a_build_started_below_the_emergency_line_is_held_for_one_pass_and_then_starts() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(31));
+    let lines = emergency_lines();
+    let build_dir = dir.path().join("build.noindex");
+    let mut volumes = vec![
+        scratch_volume(3 * GIB, Some(1_000_000)),
+        scratch_volume(10 * GIB, Some(1_000_000)),
+    ]
+    .into_iter();
+    let read_at = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let asks: Asks = Arc::default();
+    let inside = Arc::new(Mutex::new(None::<Vec<String>>));
+    let (their_reads, their_asks, their_inside, scratch) = (
+        Arc::clone(&read_at),
+        Arc::clone(&asks),
+        Arc::clone(&inside),
+        dir.path().to_path_buf(),
+    );
+    let mut disk = DiskHold {
+        in_aterm: true,
+        at: Some(build_dir.clone()),
+        reader: Box::new(move |at: &Path| {
+            their_reads.lock().expect("reads").push(at.to_path_buf());
+            volumes.next()
+        }),
+        ask: Some(Box::new(
+            move |bytes: u64, mount: &Path, _stopped: &dyn Fn() -> bool| {
+                their_asks
+                    .lock()
+                    .expect("asks")
+                    .push((bytes, mount.to_path_buf()));
+                *their_inside.lock().expect("listing") = Some(ledger_entries(&scratch));
+                Some("OK sys\n".to_owned())
+            },
+        )),
+        bound: aterm_spec::wait::MUST_HAPPEN,
+    };
+    let mut said = Vec::new();
+    let got = front_admit(
+        &test_build(),
+        dir.path(),
+        &s,
+        &|| None,
+        &mut |l| said.push(l.to_owned()),
+        &mut disk,
+    );
+    let held = match got {
+        Admission::Claimed(held) => held,
+        other => panic!("expected a claim once held, got {other:?}"),
+    };
+    assert_eq!(
+        *asks.lock().expect("asks"),
+        [(lines.emergency, PathBuf::from("/Volumes/scratch"))],
+        "one ask, for the emergency line"
+    );
+    assert_eq!(
+        *read_at.lock().expect("reads"),
+        [build_dir.clone(), build_dir],
+        "its build directory's volume, as it was held and as it starts"
+    );
+    let inside = inside
+        .lock()
+        .expect("listing")
+        .clone()
+        .expect("the ask listed the ledger");
+    assert!(
+        inside.is_empty(),
+        "the hold holds no claim and no place in the queue: {inside:?}"
+    );
+    let held_lines: Vec<&String> = said.iter().filter(|l| l.contains("held")).collect();
+    assert_eq!(held_lines.len(), 1, "{said:?}");
+    let line = held_lines[0];
+    let (was, line_at) = (
+        aterm_capacity::gib(3 * GIB),
+        aterm_capacity::gib(lines.emergency),
+    );
+    for figure in [
+        "/Volumes/scratch",
+        was.as_str(),
+        line_at.as_str(),
+        "emergency line",
+        "OK sys",
+        "10 GiB free now",
+        "the build starts",
+    ] {
+        assert!(line.contains(figure), "{line:?} does not name {figure:?}");
+    }
+    let span = line
+        .split_once("; held ")
+        .and_then(|(_, rest)| rest.split_once(" for one pass"))
+        .map(|(span, _)| span)
+        .unwrap_or_else(|| panic!("{line:?} does not say how long it was held"));
+    let digits = span.trim_end_matches('s').replace('m', "");
+    assert!(
+        span.ends_with('s') && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
+        "held for {span:?}, not a span"
+    );
+    assert!(
+        !line.contains("Free ") && !line.contains("by hand"),
+        "no remedy by hand: {line:?}"
+    );
+    assert_eq!(
+        ledger_entries(dir.path()).len(),
+        1,
+        "negative control: the same listing finds its claim once it is admitted"
+    );
+    drop(held);
+}
+
+/// A BUILD AT OR ABOVE ITS EMERGENCY LINE, OR THAT NO HOLD APPLIES TO, IS NEVER HELD FOR DISK: a
+/// volume exactly at its emergency line or well above it (read once, never asked about), a build
+/// outside aterm (nothing read), one a covering claim covers, one beside its own claim, one
+/// admitted at once (`--admit now`) and one under a possible build lock (no build waits for a
+/// lock on a hold: `NoWaitOnAHold`) each come to what it comes to today, with no ask
+/// and, but the first two, no read. NEGATIVE CONTROL: a byte below the line is held once, for
+/// the line; a volume with bytes to spare but 49,999 inodes free is held once, for a byte more
+/// than it has free, so the watch makes a pass rather than answer at once.
+#[test]
+fn a_build_started_at_or_above_the_emergency_line_is_never_held_for_disk() {
+    let lines = emergency_lines();
+    let me = std::process::id();
+    let roomy = Some(1_000_000);
+    for (volume, why) in [
+        (scratch_volume(lines.emergency, roomy), "at the line"),
+        (scratch_volume(400 * GIB, roomy), "well above it"),
+    ] {
+        let (mut disk, reads, asks) = counted_hold(Some(volume), true);
+        let (got, dir) = plain_front(&mut disk, &|| None, Admit::Wait);
+        assert!(matches!(got, Admission::Claimed(_)), "{why}: {got:?}");
+        assert_eq!(*reads.lock().expect("reads"), 1, "{why}: read once");
+        assert!(asks.lock().expect("asks").is_empty(), "{why}: never held");
+        drop((got, dir));
+    }
+
+    let (mut disk, reads, asks) = counted_hold(None, false);
+    let (got, dir) = plain_front(&mut disk, &|| None, Admit::Wait);
+    assert!(
+        matches!(got, Admission::Claimed(_)),
+        "outside aterm: {got:?}"
+    );
+    assert_eq!(
+        *reads.lock().expect("reads"),
+        0,
+        "outside aterm: nothing read"
+    );
+    assert!(asks.lock().expect("asks").is_empty());
+    drop((got, dir));
+
+    let (mut disk, reads, asks) = counted_hold(None, true);
+    let (got, dir) = plain_front(&mut disk, &|| None, Admit::Now);
+    assert!(matches!(got, Admission::Claimed(_)), "--admit now: {got:?}");
+    assert_eq!(
+        *reads.lock().expect("reads"),
+        0,
+        "--admit now: nothing read"
+    );
+    assert!(asks.lock().expect("asks").is_empty());
+    drop((got, dir));
+
+    let (mut disk, reads, asks) = counted_hold(None, true);
+    let lock = || Some(PathBuf::from("/w/target/debug/.cargo-lock"));
+    let (got, dir) = plain_front(&mut disk, &lock, Admit::Wait);
+    assert!(
+        matches!(got, Admission::Claimed(_)),
+        "under a possible build lock: {got:?}"
+    );
+    assert_eq!(
+        *reads.lock().expect("reads"),
+        0,
+        "under a possible build lock: nothing read"
+    );
+    assert!(asks.lock().expect("asks").is_empty());
+    drop((got, dir));
+
+    // Covered: an ancestor's covering claim, as `a_build_under_a_covering_ancestor_claims_nothing`.
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let build_pid = me.wrapping_add(41);
+    m.set_procs(Some(Procs::of(vec![proc(build_pid, me), proc(me, 1)])));
+    let stage = hold(
+        dir.path(),
+        &m,
+        Need::new("verify test compile").mem(4 * GIB).covers(),
+    );
+    let (mut disk, reads, asks) = counted_hold(None, true);
+    let got = front_admit(
+        &test_build(),
+        dir.path(),
+        &seat(dir.path(), &m, build_pid),
+        &|| None,
+        &mut |_| {},
+        &mut disk,
+    );
+    assert!(matches!(got, Admission::Covered(_)), "covered: {got:?}");
+    assert_eq!(*reads.lock().expect("reads"), 0, "covered: nothing read");
+    assert!(asks.lock().expect("asks").is_empty());
+    drop(stage);
+
+    // Own: this process holds a claim of its own, as
+    // `a_process_holding_its_own_claim_builds_unclaimed`.
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let vm = hold(dir.path(), &m, Need::new("lab vm boot").mem(4 * GIB));
+    let (mut disk, reads, asks) = counted_hold(None, true);
+    let got = front_admit(
+        &test_build(),
+        dir.path(),
+        &seat(dir.path(), &m, me),
+        &|| None,
+        &mut |_| {},
+        &mut disk,
+    );
+    assert!(matches!(got, Admission::Own(_)), "own: {got:?}");
+    assert_eq!(*reads.lock().expect("reads"), 0, "own: nothing read");
+    assert!(asks.lock().expect("asks").is_empty());
+    drop(vm);
+
+    // NEGATIVE CONTROL: a byte below the line, and inodes short with bytes to spare.
+    for (volume, want, why) in [
+        (
+            scratch_volume(lines.emergency - 1, roomy),
+            lines.emergency,
+            "a byte below the line",
+        ),
+        (
+            scratch_volume(400 * GIB, Some(49_999)),
+            400 * GIB + 1,
+            "49,999 inodes free",
+        ),
+    ] {
+        let (mut disk, _reads, asks) = counted_hold(Some(volume), true);
+        let (got, dir) = plain_front(&mut disk, &|| None, Admit::Wait);
+        assert!(matches!(got, Admission::Claimed(_)), "{why}: {got:?}");
+        assert_eq!(
+            *asks.lock().expect("asks"),
+            [(want, PathBuf::from("/Volumes/scratch"))],
+            "{why}: held once"
+        );
+        drop((got, dir));
+    }
+}
+
+/// What a plain front held for disk came to ([`held_front`]): whether it claimed, how long its
+/// admission took, what it said, and when its admission returned.
+type FrontEnd = (bool, std::time::Duration, Vec<String>, Instant);
+
+/// A plain test build admitted on a thread of its own, on a fresh scratch seat, held for disk by
+/// a hold in an aterm tab whose volume reads 3 GiB free (below its emergency line), asking
+/// through `ask` for at most `bound`: where its end comes, and the thread.
+fn held_front(
+    ask: AskOnce,
+    bound: std::time::Duration,
+) -> (
+    std::sync::mpsc::Receiver<FrontEnd>,
+    std::thread::JoinHandle<()>,
+) {
+    let (done, ended) = std::sync::mpsc::channel();
+    let below = scratch_volume(3 * GIB, Some(1_000_000));
+    let thread = std::thread::spawn(move || {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let m = machine();
+        let s = seat(dir.path(), &m, std::process::id().wrapping_add(43));
+        let mut disk = DiskHold {
+            in_aterm: true,
+            at: None,
+            reader: Box::new(move |_at: &Path| Some(below.clone())),
+            ask: Some(ask),
+            bound,
+        };
+        let mut said = Vec::new();
+        let started = Instant::now();
+        let got = front_admit(
+            &test_build(),
+            dir.path(),
+            &s,
+            &|| None,
+            &mut |l| said.push(l.to_owned()),
+            &mut disk,
+        );
+        let returned = Instant::now();
+        let took = returned.duration_since(started);
+        let claimed = matches!(got, Admission::Claimed(_));
+        drop(got);
+        let _ = done.send((claimed, took, said, returned));
+    });
+    (ended, thread)
+}
+
+/// THE EMERGENCY HOLD ENDS AT ITS OWN BOUND, ITS ASK ENDED FIRST (`HoldBounded` of
+/// `atpkg_build_admit_model`): a watch that never answers (an older `aterm`, a hung window)
+/// holds the build its bound (300 ms here) and no longer. At the bound the ask is told to stop
+/// (its `stopped`), and the hold returns only once the ask has returned, as the live ask returns
+/// only once its child is killed and reaped ([`crate::admit_disk::answer_of`]): no ask is left
+/// running beside the build. The ask here takes 200 ms more to end once told, as a kill and reap
+/// may; the build then claims and starts, its line saying the watch gave no answer within the
+/// bound. The admission runs on a thread of its own and is waited for a minute at most, and an
+/// ask never told to stop ends itself at that minute, so a hold with no bound fails this rather
+/// than hanging it. NEGATIVE CONTROL: a watch that answers at once is named by its answer, with
+/// no "no answer".
+#[test]
+fn the_emergency_hold_ends_at_its_bound_when_the_watch_does_not_answer() {
+    let bound = std::time::Duration::from_millis(300);
+    let ask_end = Arc::new(Mutex::new(None::<(bool, Instant)>));
+    let their_end = Arc::clone(&ask_end);
+    let (ended, thread) = held_front(
+        Box::new(
+            move |_bytes: u64, _mount: &Path, stopped: &dyn Fn() -> bool| {
+                let asked = Instant::now();
+                while !stopped() && asked.elapsed() < aterm_spec::wait::MUST_HAPPEN {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let told = stopped();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                *their_end.lock().expect("the ask's end") = Some((told, Instant::now()));
+                None
+            },
+        ),
+        bound,
+    );
+    let (claimed, took, said, returned) = ended
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the hold ended at its bound");
+    thread.join().expect("the front");
+    assert!(claimed, "it starts once its hold ends: {said:?}");
+    assert!(took >= bound, "held its bound: {took:?}");
+    let (told, ask_ended) = ask_end
+        .lock()
+        .expect("the ask's end")
+        .expect("the hold returned before its ask did");
+    assert!(told, "the ask was told to stop at the bound");
+    assert!(
+        ask_ended <= returned,
+        "the hold returned while its ask still ran"
+    );
+    let line = said
+        .iter()
+        .find(|l| l.contains("held"))
+        .unwrap_or_else(|| panic!("no hold line: {said:?}"));
+    assert!(line.contains("no answer within"), "{line:?}");
+    assert!(line.contains("the build starts"), "{line:?}");
+
+    // NEGATIVE CONTROL: answered at once, with a minute's bound.
+    let (ended, thread) = held_front(
+        Box::new(|_bytes: u64, _mount: &Path, _stopped: &dyn Fn() -> bool| {
+            Some("OK sys".to_owned())
+        }),
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    let (claimed, _took, said, _returned) = ended
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("an answered hold ends");
+    thread.join().expect("the front");
+    assert!(claimed, "{said:?}");
+    let line = said
+        .iter()
+        .find(|l| l.contains("held"))
+        .unwrap_or_else(|| panic!("no hold line: {said:?}"));
+    assert!(
+        line.contains("OK sys") && !line.contains("no answer"),
+        "{line:?}"
+    );
+}
+
+/// THE LIVE HOLD IS ONE PASS OF THE WATCH AT THE BUILD'S OWN DIRECTORY: [`DiskHold::live`], as
+/// the shim's front makes it, waits [`crate::admit_disk::ASK_FOR`] (a minute) at most, reads the
+/// build directory it is given and asks once. NEGATIVE CONTROL: given none, it names none, and
+/// the directory the build runs in is read instead.
+#[cfg(unix)]
+#[test]
+fn the_live_hold_waits_a_minute_at_most_at_its_build_directory() {
+    let at = PathBuf::from("/w/target/build.noindex");
+    let live = DiskHold::live(Some(at.clone()));
+    assert_eq!(live.bound, crate::admit_disk::ASK_FOR);
+    assert_eq!(live.bound, std::time::Duration::from_secs(60), "a minute");
+    assert_eq!(live.at, Some(at), "its build directory's volume");
+    assert!(live.ask.is_some(), "it asks once");
+    assert_eq!(DiskHold::live(None).at, None, "unnamed: none");
+}
+
+/// Set, the test binary is [`standin_front_held_for_disk`], its ledger under this directory.
+#[cfg(unix)]
+const HELD_STANDIN: &str = "ATPKG_BUILD_ADMIT_HELD_STANDIN";
+
+/// Run by [`an_interrupt_ends_the_emergency_hold_and_starts_no_build`] in a process of its own: a
+/// plain front ([`front_admit`]) in an aterm tab whose build's volume reads 3 GiB free, below its
+/// emergency line, its hold's ask writing `asking` and lasting until it is stopped, or answered
+/// once an `answer` file appears beside it (a minute at most). It prints each line it says, then
+/// `stopped by <signal>` and exits 3 (a NOT RUN) where an interrupt stopped it, else `claimed`
+/// and exits 0 once its claim is let go.
+#[cfg(unix)]
+#[test]
+fn standin_front_held_for_disk() {
+    let Some(dir) = std::env::var_os(HELD_STANDIN).map(PathBuf::from) else {
+        return;
+    };
+    let m = machine();
+    let s = seat(&dir, &m, std::process::id());
+    let below = scratch_volume(3 * GIB, Some(1_000_000));
+    let at = dir.clone();
+    let mut disk = DiskHold {
+        in_aterm: true,
+        at: None,
+        reader: Box::new(move |_at: &Path| Some(below.clone())),
+        ask: Some(Box::new(
+            move |_bytes: u64, _mount: &Path, stopped: &dyn Fn() -> bool| {
+                std::fs::write(at.join("asking"), "asking").expect("said asking");
+                let asked = Instant::now();
+                while !stopped() && asked.elapsed() < aterm_spec::wait::MUST_HAPPEN {
+                    if at.join("answer").exists() {
+                        return Some("OK sys".to_owned());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None
+            },
+        )),
+        bound: aterm_spec::wait::MUST_HAPPEN * 2,
+    };
+    let got = front_admit(
+        &test_build(),
+        &dir,
+        &s,
+        &|| None,
+        &mut |l| println!("{l}"),
+        &mut disk,
+    );
+    match got {
+        Admission::Stopped(Error::Stopped {
+            signal: Some(sig), ..
+        }) => {
+            println!("stopped by {}", aterm_toolchain::interrupt::name(sig));
+            std::process::exit(3);
+        }
+        Admission::Claimed(held) => {
+            drop(held);
+            println!("claimed");
+            std::process::exit(0);
+        }
+        other => panic!("the front ended otherwise: {other:?}"),
+    }
+}
+
+/// AN INTERRUPT ENDS THE EMERGENCY HOLD AND STARTS NO BUILD, as it ends a claim's wait: SIGINT
+/// sent to a front while its hold asks the window's watch (which would last its minute) ends it
+/// as NOT RUN well inside the hang detector (the time is reported). The front says the hold's
+/// one line naming the interrupt and that the build did not start, is stopped by SIGINT and
+/// exits 3, and its ledger holds no claim and no wait. NEGATIVE CONTROL: the same front, its ask
+/// answered and no signal sent, claims and starts, its line saying the build starts and naming
+/// no interrupt, and leaves nothing behind once its claim is let go.
+#[cfg(unix)]
+#[test]
+fn an_interrupt_ends_the_emergency_hold_and_starts_no_build() {
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    for interrupted in [true, false] {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        // The front must take the SIGINT it is sent: one started with SIGINT ignored (a `&` job
+        // of a non-interactive shell) keeps it ignored, and its hold's watch would not see it.
+        let start = crate::platform::Starting::at_defaults(&[libc::SIGINT]);
+        let mut front = start.spawning(|| {
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "build_admit::tests::standin_front_held_for_disk",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(HELD_STANDIN, dir.path())
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the stand-in front")
+        });
+        drop(start);
+        until_within(MUST_HAPPEN, "the hold's ask", || {
+            dir.path().join("asking").exists().then_some(())
+        });
+        let sent = Instant::now();
+        if interrupted {
+            let pid = i32::try_from(front.id()).expect("a pid");
+            // SAFETY: `kill` takes two integers; the pid is this test's own child.
+            let signalled = unsafe { libc::kill(pid, libc::SIGINT) };
+            assert_eq!(signalled, 0, "signalled the front");
+        } else {
+            std::fs::write(dir.path().join("answer"), "").expect("answered");
+        }
+        let status = until_within(MUST_HAPPEN, "the front's end", || {
+            front.try_wait().ok().flatten()
+        });
+        let took = sent.elapsed();
+        let mut out = String::new();
+        if let Some(mut o) = front.stdout.take() {
+            let _ = std::io::Read::read_to_string(&mut o, &mut out);
+        }
+        let left = ledger_entries(dir.path());
+        assert!(left.is_empty(), "interrupted {interrupted}: left {left:?}");
+        if interrupted {
+            assert_eq!(status.code(), Some(3), "{status} {out}");
+            for words in [
+                "an interrupt (SIGINT) ended its hold for disk",
+                "the build did not start",
+                "stopped by SIGINT",
+            ] {
+                assert!(out.contains(words), "{out:?} does not say {words:?}");
+            }
+            eprintln!("SIGINT ended the emergency hold in {took:?}");
+        } else {
+            assert_eq!(status.code(), Some(0), "{status} {out}");
+            assert!(
+                out.contains("the build starts")
+                    && out.contains("claimed")
+                    && !out.contains("interrupt"),
+                "{out:?}"
+            );
+        }
+    }
 }
 
 /// An unreadable ledger refuses admission and the in-process launch port returns a failure,
@@ -2550,14 +3164,20 @@ fn looks_for_its_parents_claim(dir: &Path, ledger: &Path, out: &Path) -> PathBuf
 /// an unclaimed build's inner front never waits for a claim whose builder waits for that build's
 /// lock (`NoNestedWaitCycle`); and a front no lock is held over (D: a test's, a `targo run`
 /// program's) never holds its claim beside a claimed builder's (`NoUnrequestedOvercommit`). The
-/// model holds the four laws and every run of it ends. Its mutants: the rejected wrapper's order
+/// model holds its laws and every run of it ends. Its mutants: the rejected wrapper's order
 /// (claim from inside the build) breaks the first two and deadlocks with A holding its claim and
 /// B the lock; an exec before the hand-off breaks the first; an inner front that waits breaks the
 /// third and deadlocks with A holding its claim and waiting for C's lock; a holder that lets its
 /// claim go while its build runs (a watch that failed, taken for the build's end) breaks the
-/// first; D admitted at once by cargo's words breaks the fourth. The code, as a call runs it: a stand-in `targo` that `run_if_claimed_at`
-/// ran (classify, admit, then supervise's spawn) finds its parent's claim held at its start,
-/// once; the probe itself finds none for a stand-in run before any claim. The hop's order is
+/// first; D admitted at once by cargo's words breaks the fourth. B's hold for disk holds nothing
+/// while it lasts (`HoldHoldsNothing`), which a hold made once B entered breaks; it ends by its
+/// bound when the watch never answers (`HoldBounded`), which a hold only an answer ends breaks,
+/// and then deadlocks with B held and the watch silent; and no front is held under a possible
+/// build lock (`NoWaitOnAHold`), which a hold of C's inner front breaks. Each of those mutants
+/// breaks its law alone, and the hold adds no deadlock. The code, as a call runs it: a stand-in `targo` that
+/// `run_if_claimed_at` ran (classify, admit, then supervise's spawn) finds its parent's claim
+/// held at its start, once; the probe itself finds none for a stand-in run before any claim. The
+/// hold's laws are bound by the three emergency-hold tests above. The hop's order is
 /// bound through the real binary (`tests/build_hop.rs`: the stand-in the front became finds a
 /// claim held in its own pid while holding no descriptor of it, and its control, an exec before
 /// the hand-off, finds none), and the inner front's and D's by
@@ -2615,6 +3235,28 @@ fn a_builds_claim_is_held_before_its_targo_starts_as_the_model_orders() {
         by_words.contains("NoUnrequestedOvercommit") && !by_words.contains("NoNestedWaitCycle"),
         "a front admitted at once by cargo's words alone holds its claim beside another: \
          {by_words:?}"
+    );
+    let late = violated_invariants(&with_buggy(&model, 6));
+    assert!(
+        late.contains("HoldHoldsNothing") && late.len() == 1,
+        "a hold made once B entered keeps its place or its claim through it: {late:?}"
+    );
+    let answer_only = with_buggy(&model, 7);
+    let unbounded = violated_invariants(&answer_only);
+    assert!(
+        unbounded.contains("HoldBounded") && unbounded.len() == 1,
+        "a hold that outlasts its bound: {unbounded:?}"
+    );
+    let stuck = find_deadlock(&answer_only, ended).expect("a hold only an answer ends sticks");
+    assert_eq!(
+        (stuck["b"], stuck["hb"], stuck["hw"]),
+        (0, 1, 2),
+        "B is held for good by a watch that never answers"
+    );
+    let under_a_lock = violated_invariants(&with_buggy(&model, 8));
+    assert!(
+        under_a_lock.contains("NoWaitOnAHold") && under_a_lock.len() == 1,
+        "a front held under a possible build lock: {under_a_lock:?}"
     );
 
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -3025,6 +3667,7 @@ fn record(pid: u32, start_ms: u64, mem: u64, held: bool) -> Record {
         timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/ws".to_owned(),
         need: Need::new("a build").mem(mem),

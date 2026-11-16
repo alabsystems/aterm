@@ -123,18 +123,25 @@ fn malformed_route_frames_and_conflicting_interfaces_fail_closed() {
 #[test]
 fn scoped_requests_are_native_bounded_and_read_only() {
     let peer: SocketAddr = "[fe80::2%3]:99".parse().unwrap();
-    let bytes = request(peer, 88, 77, None, RTM_GET_SILENT).unwrap();
-    assert_eq!(bytes[3], 0x11);
-    let plain = request(peer, 88, 77, None, RTM_GET).unwrap();
-    assert_eq!(plain[3], 0x4);
+    let bytes = request(peer, 77, None).unwrap();
     assert_eq!(
-        (&plain[..3], &plain[4..]),
-        (&bytes[..3], &bytes[4..]),
-        "the two lookups differ in their type alone"
+        (bytes[3], u32_at(&bytes, 20).unwrap()),
+        (0, 0),
+        "no type or number until the process's one writer writes it"
+    );
+    assert!(
+        a_lookup(&bytes).is_err(),
+        "an untyped request is never written"
     );
     // RTM_ADD through RTM_LOCK, and whatever else is no lookup, is never written.
-    for kind in (0..=u8::MAX).filter(|kind| ![0x4, 0x11].contains(kind)) {
-        assert!(request(peer, 88, 77, None, kind).is_err(), "{kind:#x}");
+    for kind in 0..=u8::MAX {
+        let mut typed = bytes.clone();
+        typed[3] = kind;
+        assert_eq!(
+            a_lookup(&typed).is_ok(),
+            [RTM_GET, RTM_GET_SILENT].contains(&kind),
+            "{kind:#x}"
+        );
     }
     assert_eq!(u16_at(&bytes, 4).unwrap(), 3);
     assert_eq!(u32_at(&bytes, 8).unwrap(), 0x0100_0000);
@@ -142,27 +149,11 @@ fn scoped_requests_are_native_bounded_and_read_only() {
     assert_eq!(&bytes[HEADER + 10..HEADER + 12], &3_u16.to_be_bytes());
     assert_eq!(u32_at(&bytes, HEADER + 24).unwrap(), 0);
     assert_eq!(usize::from(u16_at(&bytes, 0).unwrap()), bytes.len());
-    assert!(
-        request(
-            "[fe80::2%65536]:99".parse().unwrap(),
-            1,
-            1,
-            None,
-            RTM_GET_SILENT
-        )
-        .is_err()
-    );
-    let bound = request(
-        "192.0.2.1:99".parse().unwrap(),
-        88,
-        77,
-        Some(3),
-        RTM_GET_SILENT,
-    )
-    .unwrap();
+    assert!(request("[fe80::2%65536]:99".parse().unwrap(), 1, None).is_err());
+    let bound = request("192.0.2.1:99".parse().unwrap(), 77, Some(3)).unwrap();
     assert_eq!(u16_at(&bound, 4).unwrap(), 3);
     assert_eq!(u32_at(&bound, 8).unwrap(), 0x0100_0000);
-    assert!(request(peer, 88, 77, Some(4), RTM_GET_SILENT).is_err());
+    assert!(request(peer, 77, Some(4)).is_err());
 }
 
 #[cfg(target_os = "macos")]
@@ -232,9 +223,14 @@ fn either_type_of_lookup_reads_the_same_route_or_the_same_refusal() {
     };
     for peer in peers {
         let asked = |kind: u8| {
-            outcome(lookup_as(peer, None, super::super::deadline(), |write| {
-                write(kind)
-            }))
+            outcome(lookup_as(
+                peer,
+                None,
+                super::super::deadline(),
+                |request, write| {
+                    aterm_uds::network::lookup_write_as(kind == RTM_GET, request, write)
+                },
+            ))
         };
         let plain = asked(RTM_GET);
         assert_eq!(asked(RTM_GET_SILENT), plain, "{peer}");
@@ -242,6 +238,34 @@ fn either_type_of_lookup_reads_the_same_route_or_the_same_refusal() {
         let made = lookup(None, peer, None, super::super::deadline());
         assert_eq!(outcome(made), plain, "{peer}");
     }
+}
+
+/// This crate's route lookups are numbered and typed by the process's one writer of lookups
+/// (`aterm_uds::network::lookup_write`), which aterm-uds's own lookups write through too, so the
+/// two crates' lookups never share a number: a lookup as built carries none, the bytes written
+/// to the socket carry the number the writer returns, and the answer is read by that number.
+///
+/// MUTANT: [`lookup_as`] reading the answer by a number of its own (a counter of this crate's,
+/// as before) in place of the one `send` returned never matches the answer, and the lookup ends
+/// at the one-minute hang detector (`"loopback's route"`).
+#[cfg(target_os = "macos")]
+#[test]
+fn this_crates_lookups_are_numbered_by_the_writer_aterm_uds_numbers_its_own_by() {
+    let (mut carried, mut returned) = (Vec::new(), 0);
+    let route = lookup_as(
+        "127.0.0.1:9".parse().unwrap(),
+        None,
+        super::super::deadline(),
+        |request, write| {
+            returned = aterm_uds::network::lookup_write_as(true, request, |bytes| {
+                carried.push((bytes[3], u32_at(bytes, 20).unwrap()));
+                write(bytes)
+            })?;
+            Ok(returned)
+        },
+    );
+    assert!(route.is_ok(), "loopback's route: {route:?}");
+    assert_eq!(carried, [(RTM_GET, returned.cast_unsigned())]);
 }
 
 /// The routing messages that can change an attachment move the interface generation, and the

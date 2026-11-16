@@ -7,7 +7,7 @@ use super::*;
 pub(super) fn handles(line: &str) -> bool {
     matches!(
         line.split_ascii_whitespace().next(),
-        Some("controller-open" | "controller-close")
+        Some("controller-open" | "controller-close" | "controller-startup-mode")
     )
 }
 
@@ -40,7 +40,7 @@ pub(super) fn serve(
         if Sequence::parse(request).is_none() || !hex(operation, 32) {
             return Err(registry::Error::Denied);
         }
-        let close = if action == "controller-close" {
+        let existing = if matches!(action, "controller-close" | "controller-startup-mode") {
             let member = fields.remove("member").ok_or(registry::Error::Denied)?;
             let original = fields
                 .remove("controller_operation")
@@ -62,9 +62,24 @@ pub(super) fn serve(
             .ok_or(registry::Error::Denied)?;
         let (caller, peer) = claim(ctx, master, registry)?;
         let connection = registry.connection(id)?;
-        let member = if let Some((member, original)) = close {
-            // Withdrawal is release-only and may finish while new App work is closed.
-            registry.close_frontend_controller(&peer, &connection, member, original)?;
+        let mut mode = None;
+        let member = if let Some((member, original)) = existing {
+            if action == "controller-startup-mode" {
+                let _scope = lifetime.enter().ok_or(registry::Error::Denied)?;
+                let controller =
+                    registry.frontend_controller(&peer, &connection, member, original)?;
+                if master < 0 {
+                    return Err(registry::Error::Denied);
+                }
+                // SAFETY: native dispatch retains this actual session PTY for
+                // the duration of this request; no descriptor is transferred.
+                let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(master) };
+                let _foreground = controller.foreground(master)?;
+                mode = Some(ctx.native_policy.retained_startup_mode());
+            } else {
+                // Withdrawal is release-only and may finish while new App work is closed.
+                registry.close_frontend_controller(&peer, &connection, member, original)?;
+            }
             member.to_owned()
         } else {
             let scope = lifetime.enter().ok_or(registry::Error::Denied)?;
@@ -76,12 +91,15 @@ pub(super) fn serve(
             return Err(registry::Error::Stale);
         }
         let epoch = host_epoch().ok_or(registry::Error::Unavailable)?;
-        frame(
-            action,
-            &aterm_json::json!({"schema":1,"request":request,"operation":operation,
-            "session":session(&caller, epoch),"member":member}),
-        )
-        .ok_or(registry::Error::Unavailable)
+        let mut value = aterm_json::json!({"schema":1,"request":request,"operation":operation,
+            "session":session(&caller, epoch),"member":member});
+        if let Some(mode) = mode {
+            value
+                .as_object_mut()
+                .ok_or(registry::Error::Unavailable)?
+                .insert("mode".into(), aterm_json::json!(mode));
+        }
+        frame(action, &value).ok_or(registry::Error::Unavailable)
     };
     run().unwrap_or_else(use_control::error)
 }

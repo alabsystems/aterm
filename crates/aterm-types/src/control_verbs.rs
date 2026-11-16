@@ -219,7 +219,7 @@ impl Requester {
         }
     }
 
-    /// The requesting session (`s-` and 20 lowercase hex digits).
+    /// The requesting session's ID, including the exact legacy ID a still-running tab holds.
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
         self.sid.as_deref()
@@ -282,7 +282,9 @@ impl Requester {
             return Err("a requester line names sid, program, model and account, and nothing more");
         }
         if sid.is_some_and(|sid| !is_minted_sid(sid)) {
-            return Err("a requester's sid= is a session aterm minted (`s-` and 20 hex digits)");
+            return Err(
+                "a requester's sid= is a tab ID (`t` and 10 base32 characters) or an exact legacy ID (`s-` and 20 lowercase hex digits)",
+            );
         }
         if [program, model]
             .into_iter()
@@ -1544,7 +1546,11 @@ pub const VERBS: &[VerbSpec] = &[
          and after the read; `null` across an active write, partial frame or spill), \
          `\"submits\":<n>` (Enters written over typed input since the previous Enter), and, when \
          they apply, `\"trimmed\"`, `\"first\"`, `\"order\":\"display\"` with \
-         `\"display_map\"`, and `\"frame\":\"open\"`. Every form first waits, holding nothing, \
+         `\"display_map\"`, `\"frame\":\"open\"`, and last `\"program_report\":\"<body>\"` \
+         (the OSC 7501 report standing, as `state=<word>:app=<app>[:kind=<kind>]`, read with the \
+         rows; Claude Code's run sign where its answered query leaves its title no glyph; not \
+         sent while the program whose output carried it is not in front). Every form \
+         first waits, holding nothing, \
          up to the 1 s sync timeout from the frame's start for an unfinished DEC 2026 frame to \
          close; one still open is read as it stands, the header saying `frame=open` after the \
          count (`aterm ctl` notes it on stderr), and `--json`'s stamps are taken after that \
@@ -2649,6 +2655,16 @@ pub const VERBS: &[VerbSpec] = &[
          `more=sessions:<k>`).",
     ),
     v(
+        "described",
+        Read,
+        Lines,
+        Session,
+        "described [--json]: each description slot's standing claim, its author, rank and the rest",
+        "",
+    )
+    .page(&crate::verb_page::described::PAGE)
+    .json(Json::Emits),
+    v(
         "mark",
         Write,
         Status,
@@ -2667,7 +2683,24 @@ pub const VERBS: &[VerbSpec] = &[
          approval or question step while one is open, else on the deepest open node (the \
          reply's `node=` names it). Never writes to a PTY or mutates \
          state (`by=ctl|harness|bridge|<sid>|-`). Rate-limited to 1/s burst 20 (`ERR busy \
-         retry_ms=<ms>`), capped at 1/4 of the log ring.",
+         retry_ms=<ms>`), capped at 1/4 of the log ring. DESC: `mark <-|r<n>> desc field=<slot> \
+         [value=<pct>] [upto=<seq>] [ttl=<s>] [as=<name>] [re=<seq>]` claims one slot of a \
+         description (`help described`): the session's, or one of its agents'. `<slot>` is \
+         `title`, `description` or another word of lower-case `[a-z0-9.-]{1,24}`, refused when it \
+         is anything else, never rewritten. `value=` is one visible line, percent-encoded, of at \
+         most 256 encoded bytes: an empty, longer or multi-line one is refused, never cut. \
+         `aterm ctl` reads the first line of stdin in place of a `value=-`; a value that is \
+         itself `-` is `value=%2D`. No `value=` withdraws the caller's own claim of that slot and \
+         nobody else's. For `desc`, `-` is the session's open agent run, else the session, and a \
+         named node is an open agent run `r<n>` (`ERR mark: <node> is not an agent run`). \
+         `upto=<seq>` is the log position the writer had read, which `behind=` is counted from \
+         (`ERR mark: upto=<n> is ahead of the log`); `ttl=<1..86400 s>` ends the claim's \
+         standing after that many seconds. Text from every author but a person is redacted \
+         before it is stored, and a value that reads whole as a credential is refused (`ERR \
+         mark: value reads as a credential`). Writing a `desc field=title` claim does not move \
+         the tab's title: `described` shows the claim, and the tab's title is read from the \
+         session's own claims only when `meta set|unset title` or a person's rename next \
+         writes one (`help meta title`).",
     )
     .input(Input::NONE),
     v(
@@ -3242,7 +3275,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "native Codex weekly quota rotation",
-        "A kernel-authenticated completed quota wall may select a fresh pooled account through a sealed native restart. No caller paths, commands or credentials are accepted.",
+        "A kernel-authenticated completed quota wall may select a fresh pooled account through a sealed native restart. `complete id=<receipt> turn=<walled turn>` is the bound successor's report that its resumed turn was served on the destination: it proves that destination for the pool, so sessions walled behind its canary follow it at their next ask instead of after the canary's ten-minute hold, and grants the reporting process nothing. No caller paths, commands or credentials are accepted.",
     ).input(Input::NONE),
     v(
         "codex-login-rotation",
@@ -3947,8 +3980,8 @@ pub const VERBS: &[VerbSpec] = &[
          …` (`turn <id> submitted=<0|1> status=<s> dur_ms=<n> by=<who>`, `agent <word> rev=<n> \
          gen=<e.s> fp=<hex16>` from `status agent=`, `program \
          state=<idle|working|blocked|done|error|-> [kind=<permission|question|auth>] rev=<id>` \
-         from `status program_state=` (a codex's or Grok Build's own report, a claim, never an \
-         `agent` event), `act <act> rev=<id>` (an act a proven self-claim's holder recorded, \
+         from `status program_state=` (a codex's, Grok Build's or Claude Code's own report, a \
+         claim, never an `agent` event), `act <act> rev=<id>` (an act a proven self-claim's holder recorded, \
          `status last_act=`; each `<id>` its `timeline` row's), `task rev=<n> state=<s> \
          attention=<0|1> \
          [why=<w>] [exit=<n>]`, `status phase=<p> outcome=<o> exit_code=<n|-> signal=<n|-> \
@@ -4364,15 +4397,16 @@ pub const VERBS: &[VerbSpec] = &[
          agent_fp=<hex16|->`, `wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|->` (a build's \
          front waiting for memory, as `status` prints it), \
          `program_state=<idle|working|blocked|done|error>[:<permission|\
-         question|auth>]|-` (a codex's or Grok Build's own report, as `status program_state=`: a claim beside \
-         `agent=`), `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> user_title=<pct|->`, \
+         question|auth>]|-` (a codex's, Grok Build's or Claude Code's own report, as \
+         `status program_state=`: a claim beside `agent=`), `human_ms=<ms|->`, `role=<pct|-> attention=<pct|-> user_title=<pct|->`, \
          `supervisor=<pct|-> supervisor_proven=<0|1>` (`1`: the live claim is a proven \
          self-claim or contract 3 claim, as `status` prints it), `supervisor_version=<pct|-> \
          supervisor_vendor=<pct|->` (the harness version and vendor build a proven contract 3 \
          claim announced, as `status` prints them; `-` otherwise), `autopilot=<off|cruise|land|->`, \
          `path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->`, `copy=<managed|foreign|->`, \
          `upgrade=<-|<state>/<to>/<why>/<age>>`, `land_at=<unix-s|-> task=<open|landed|theirs|-> \
-         pause=<unix-s|->`, and `task_state=<working|done|exited|stalled|failed|-> task_rev=<n>`. \
+         pause=<unix-s|->`, `task_state=<working|done|exited|stalled|failed|-> task_rev=<n>`, \
+         and `opened_ms=<unix-ms|->` (the session lineage's first open, as `status` prints it). \
          `sessions bridge` returns identity-only `<local> <sid> nonce=<hex32>` rows without \
          main-thread or terminal locks, under `OK <n> roster=<seq>`, the roster's generation \
          (it moves when a session comes, goes or changes its row). `sessions status` returns `<local> <sid> <nonce> \

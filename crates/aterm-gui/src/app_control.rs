@@ -241,7 +241,8 @@ fn parse_view(view: WireViewId<'_>) -> Result<ViewId, String> {
 }
 
 impl App {
-    pub(crate) fn inspect_app(&self, request: InspectRequest) -> Result<Vec<String>, String> {
+    pub(crate) fn inspect_app(&mut self, request: InspectRequest) -> Result<Vec<String>, String> {
+        self.reconcile_title_delivery(std::time::Instant::now());
         match request {
             InspectRequest::Network => network::inspect(self),
             InspectRequest::Tabs => {
@@ -317,7 +318,11 @@ impl App {
             .compiled
             .semantic(&key)
             .is_none_or(|node| node.offscreen)
-            && match self.native_runtime.view_state_mut(request.view) {
+            && match self
+                .native_runtime
+                .view_state_mut(request.view)
+                .as_deref_mut()
+            {
                 Some(crate::native_app::AppViewState::About(state)) => {
                     state.reveal_listed_control(&key)
                 }

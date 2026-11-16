@@ -28,10 +28,13 @@
 //!   the refill surely precedes. One that names no window (the limit still stood) cuts nothing,
 //!   and one dated past the skew bound ahead of the read is not believed. A workspace's
 //!   readings are its sub-account's (`sa-` key) and are folded under the account.
+//! - **Plan** is the newest plan word a Mac's CLI reported for the account ([`Seen::plan`]): a
+//!   `plan-seen` event, or the `plan` a Mac's `use` row states, with the Mac and the time. It is
+//!   what was observed, never the registry's `plan` cell, which is its owner's statement.
 
 use super::{
     EV, PLACE, RELAY, SUM, USE,
-    event::{Event, Kind, Pk, Res, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window},
+    event::{Event, Kind, Pk, Res, SIGNIN_UNKNOWN, SIGNIN_WORDS, Window, Word},
     place::{self, Places},
     relay::{Heard, Rk},
 };
@@ -53,6 +56,17 @@ pub struct SignedIn {
 /// The sign-in word a `use` row's `signin.state` holds, as a static word.
 fn state_word(word: &str) -> Option<&'static str> {
     SIGNIN_WORDS.into_iter().find(|state| *state == word)
+}
+
+/// The plan one Mac's CLI reported for an account: an observation, with who made it and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanSeen {
+    /// The plan word (`max`, `pro`, `plus`).
+    pub word: String,
+    /// When it was seen, by the clock of the Mac that saw it, and never after the read's `now`.
+    pub t: u64,
+    /// That Mac's Commons machine uuid (32 hex).
+    pub uuid: String,
 }
 
 /// One quota reading of one window, by the Mac that made it.
@@ -126,6 +140,9 @@ pub struct Seen {
     pub signins: BTreeMap<String, BTreeMap<String, SignedIn>>,
     readings: BTreeMap<String, BTreeMap<Window, Vec<Reading>>>,
     walls: BTreeMap<String, BTreeMap<Window, Wall>>,
+    /// The newest plan seen of each account (or of a workspace, under its `sa-` key), from any
+    /// Mac ([`Self::plan`]).
+    plans: BTreeMap<String, PlanSeen>,
     /// Each sub-account key to the account it belongs to.
     pub sub_of: BTreeMap<String, String>,
     /// Every in-window event, by (time, Mac, counter).
@@ -160,8 +177,8 @@ pub struct Claimed {
 }
 
 /// The clock-skew bound, in seconds: the claims ring reads a Mac's clock as split past 15
-/// minutes.
-const SKEW_S: u64 = 900;
+/// minutes. One bound with the one a sighting is held to ([`crate::alab::sighted::SKEW_MS`]).
+const SKEW_S: u64 = crate::alab::sighted::SKEW_MS / 1_000;
 
 /// One window's refill as the fold holds it ([`Seen::quota`]): the newest `reset-used` naming it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,6 +472,38 @@ impl Seen {
         self.walls.insert(pk.to_owned(), by_window);
     }
 
+    /// A plan word the Mac `uuid` saw of `pk` at `t`: the newest stands, by (time, Mac, word),
+    /// so every Mac folds the same answer from the same records. One dated past the skew bound
+    /// ahead of the read is not believed, as a refill is not; one inside it holds from now.
+    fn plan_seen(&mut self, pk: &str, uuid: &str, word: &str, t: u64) {
+        if t > self.now.saturating_add(SKEW_S) {
+            return;
+        }
+        let seen = PlanSeen {
+            word: word.to_owned(),
+            t: t.min(self.now),
+            uuid: uuid.to_owned(),
+        };
+        let newer =
+            |held: &PlanSeen| (held.t, &held.uuid, &held.word) < (seen.t, &seen.uuid, &seen.word);
+        if self.plans.get(pk).is_none_or(newer) {
+            self.plans.insert(pk.to_owned(), seen);
+        }
+    }
+
+    /// The newest plan a Mac saw `account` on: its own, else the newest of its workspaces'
+    /// (a workspace's plan is its sub-account's, as its readings are). `None` where no Mac
+    /// reported one: nothing here reads the registry's `plan` cell.
+    pub fn plan(&self, account: &str) -> Option<&PlanSeen> {
+        self.plans.get(account).or_else(|| {
+            self.sub_of
+                .iter()
+                .filter(|(_, of)| of.as_str() == account)
+                .filter_map(|(sa, _)| self.plans.get(sa))
+                .max_by(|a, b| (a.t, &a.uuid, &a.word).cmp(&(b.t, &b.uuid, &b.word)))
+        })
+    }
+
     fn fold_event(&mut self, uuid: &str, event: &Event) {
         let Some(account) = event.account else {
             return;
@@ -476,6 +525,13 @@ impl Seen {
             None => None,
         };
         let pk = sub_pk.as_deref().unwrap_or(account.as_str());
+        if event.kind == Kind::PlanSeen {
+            // The plan the CLI reported is the account's fact, not a window's.
+            if let Some(plan) = &event.plan {
+                self.plan_seen(pk, uuid, plan.as_str(), event.t);
+            }
+            return;
+        }
         let Some(window) = event.window else {
             // A reset that names no window refilled none (one spent with the limit still
             // standing): it cuts nothing.
@@ -541,9 +597,19 @@ impl Seen {
         }
     }
 
-    /// A `use` row's quota and wall lists (design §4.17: `quota: list<{w, p, r, rr, t, src}>`,
-    /// `wall: list<{w, until, t}>`), at the row's own key.
+    /// A `use` row's plan and its quota and wall lists (design §4.17: `plan: {word, t}`,
+    /// `quota: list<{w, p, r, rr, t, src}>`, `wall: list<{w, until, t}>`), at the row's own key.
+    /// A plan that is no word of the vocabulary (`[a-z0-9-]`, 12 bytes) is no plan.
     fn fold_use(&mut self, pk: &str, uuid: &str, row: &Value) {
+        if let Some(plan) = row.get("plan")
+            && let Some(word) = plan
+                .get("word")
+                .and_then(Value::as_str)
+                .and_then(Word::<12>::new)
+            && let Some(t) = plan.get("t").and_then(Value::as_u64)
+        {
+            self.plan_seen(pk, uuid, word.as_str(), t);
+        }
         for q in row
             .get("quota")
             .and_then(Value::as_array)

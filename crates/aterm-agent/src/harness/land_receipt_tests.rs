@@ -171,7 +171,7 @@ fn a_checked_readings_leg_is_its_remote_and_main_ref() {
 fn a_landing_merges_trailers_are_its_stated_receipt_and_any_other_commit_states_none() {
     use crate::harness::repo_work::tests::{repo, scratch_git};
     use crate::harness::repo_work::{PROBE_LIMIT, probe};
-    use aterm_types::land_trailer::{Checked, Interrupted, Row, Stated};
+    use aterm_land_trailer::{Checked, Interrupted, Row, Stated};
 
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let receipt_of = |work: &std::path::Path| {
@@ -630,7 +630,7 @@ fn the_receipt_says_whether_the_land_check_was_answered() {
 /// landed as judged, so `onto` is empty again.
 #[test]
 fn a_recheck_states_its_tip_as_onto_and_no_rejudge() {
-    use aterm_types::land_trailer::{Checked, Rechecked, Row, Stated};
+    use aterm_land_trailer::{Checked, Rechecked, Row, Stated};
     let id = |c: char| c.to_string().repeat(40);
     let rows = |checks: &[&str]| {
         checks

@@ -39,8 +39,8 @@ impl upgrade_drive::Kernel for Watched {
             .find(|(child, _)| *child == pid)
             .map(|(_, parent)| *parent)
     }
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        None
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(None)
     }
     fn process_start(&self, pid: u32) -> Option<String> {
         self.starts
@@ -85,8 +85,8 @@ impl upgrade_drive::Kernel for Inert {
     fn parent(&self, pid: u32) -> Option<u32> {
         self.0.parent(pid)
     }
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        None
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(None)
     }
     fn process_start(&self, pid: u32) -> Option<String> {
         self.0.process_start(pid)

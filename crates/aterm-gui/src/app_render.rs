@@ -2442,6 +2442,7 @@ pub(crate) fn apply_host_chrome_at(
     origin_y: i64,
     frame_width: usize,
     frame_height: usize,
+    inset: aterm_render::SideInsetPx,
     edge_rows: std::ops::Range<usize>,
     tray: Option<aterm_gpu::TrayQuad<'_>>,
     invert: bool,
@@ -2462,6 +2463,7 @@ pub(crate) fn apply_host_chrome_at(
             surface_height,
             frame_width,
             frame_height,
+            inset,
             edge_rows,
         );
     }
@@ -5963,16 +5965,38 @@ impl App {
     }
 
     /// Metrics for a logical window that has not reached glass attach yet.
+    ///
+    /// Its head is an estimate its attach replaces ([`Self::attach_deck_head`]). Beside an
+    /// attached front window it is that window's titlebar band alone: a window created after
+    /// the first carries no System Resources band ([`Self::window_bars`]), and the renderer's
+    /// head may be a window's that does, which would create the OS window a band too tall for
+    /// the frame its attach then asks. With no attached front window (a headless instance,
+    /// whose head is the boot head; a restore before the first attach) it is the renderer's.
     pub(crate) fn unattached_window_metrics(&self) -> crate::MetricsView {
         debug_assert!(
             !self.backend.is_pending(),
             "post-startup logical window creation requires the ready renderer"
         );
+        let head = self
+            .front()
+            .filter(|ws| ws.os_window.is_some())
+            .map_or_else(
+                || self.backend.head(),
+                |ws| {
+                    crate::stats_deck::chrome_head_px(
+                        ws.head_pts,
+                        ws.scale,
+                        crate::stats_deck::StatsBars::Off,
+                        crate::stats_plan::DeckForm::Folded,
+                        0,
+                    )
+                },
+            );
         crate::MetricsView::applied(
             self.font_px,
             self.backend.pad(),
             self.backend.pad_top(),
-            self.backend.head(),
+            head,
         )
     }
 
@@ -5991,7 +6015,7 @@ impl App {
             view_store,
             ..
         } = self;
-        for ws in windows.values_mut() {
+        for mut ws in windows.values_mut() {
             let lays_out = ws.tab_set.tabs().iter().any(|tab| {
                 tab.root.any_leaf(&mut |view| {
                     view_store
@@ -6419,7 +6443,8 @@ impl App {
                 }
             }
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.panes_stale = active_only && ntabs > 1;
         }
     }
@@ -6486,7 +6511,8 @@ impl App {
                 send_window_reports(s, reports);
             }
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.cell_px_reported = Some(px);
         }
         if self
@@ -6506,6 +6532,45 @@ impl App {
             .map_or_else(|| self.backend.pad(), |ws| ws.metrics.pad)
     }
 
+    /// The window's whole-cell side inset in device pixels. Zero needs no renderer metrics,
+    /// preserving early geometry reads before the backend joins.
+    pub(crate) fn win_side_inset_px(&self, wid: WindowId) -> usize {
+        match self.windows.get(&wid).map_or(0, |ws| ws.side_inset_cells) {
+            0 => 0,
+            cells => {
+                let cw = if self.backend.is_pending() {
+                    crate::seed_cell_px(self.windows[&wid].metrics.font_px).0
+                } else {
+                    self.win_cell_size(wid).0
+                };
+                usize::from(cells) * cw
+            }
+        }
+    }
+
+    /// Effects consume frame pixels, never the raw window's inset or remainder bands.
+    fn frame_pointer_px(&self, wid: WindowId) -> Option<(f32, f32)> {
+        let ws = self.windows.get(&wid)?;
+        let (x, y) = ws.last_cursor_px;
+        let (ox, oy) = self.frame_origin(wid);
+        (x.is_finite()
+            && y.is_finite()
+            && x >= 0.0
+            && y >= 0.0
+            && x >= ox as f64
+            && y >= oy as f64
+            && !self.in_side_inset(wid, x))
+        .then_some(((x - ox as f64) as f32, (y - oy as f64) as f32))
+    }
+
+    /// A headless destination for a bare frame.
+    pub(crate) fn headless_surface_px(
+        frame: (usize, usize),
+        inset: aterm_render::SideInsetPx,
+    ) -> (usize, usize) {
+        (frame.0.saturating_add(inset.0), frame.1)
+    }
+
     /// Top interior padding (device px) for window `wid`.
     pub(crate) fn win_pad_top(&self, wid: WindowId) -> usize {
         self.windows
@@ -6514,11 +6579,18 @@ impl App {
     }
 
     /// Chrome headroom (device px) above window `wid`'s padded grid (the titlebar band the effects
-    /// layer may draw into), from its own per-window [`MetricsView`](crate::MetricsView).
+    /// layer may draw into), from its own per-window [`MetricsView`](crate::MetricsView), whether
+    /// or not it has an OS window: two windows on one display differ in head (one carries the
+    /// System Resources band, [`Self::window_bars`]), so no window that is there is answered
+    /// from the renderer's head, which is the last window's to be attached, resized or drawn. A
+    /// window with no OS window keeps the head it was born with until its attach derives its
+    /// own ([`Self::unattached_window_metrics`]; in a headless instance the boot head,
+    /// [`Self::seed_headless_boot_metrics`]). No such window: `$ATERM_DEV_HEADROOM_PX`, else
+    /// the renderer's head.
     pub(crate) fn win_head(&self, wid: WindowId) -> usize {
         match self.windows.get(&wid) {
-            Some(ws) if ws.os_window.is_some() => ws.metrics.head,
-            _ => {
+            Some(ws) => ws.metrics.head,
+            None => {
                 let h = crate::headroom_override();
                 if h != 0 { h } else { self.backend.head() }
             }
@@ -6528,7 +6600,8 @@ impl App {
     /// Refresh the focused pane's cached raw program claim on `wid`'s [`aterm_effects::companion_look::LookPolicy`].
     pub(crate) fn resolve_app_kitty_claim(&mut self, wid: WindowId, session: u64) {
         let Some(s) = self.pool.get(session) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.fx.look_mut().resolve_claim(session, None);
             }
             return;
@@ -6538,7 +6611,8 @@ impl App {
             &s.ctx.ui_waiting,
             crate::metrics::TermWaitSite::Redraw,
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.look_mut().resolve_claim(
                 session,
                 term.current_block().or_else(|| term.all_blocks().last()),
@@ -6566,7 +6640,7 @@ impl App {
         let favourite = self.kitty_log.favourite_look();
         let launch = self.launch_kitty;
         match self.windows.get_mut(&wid) {
-            Some(ws) => ws
+            Some(mut ws) => ws
                 .fx
                 .look_mut()
                 .verdict_from_resolved_claim(favourite, launch, now),
@@ -6574,7 +6648,7 @@ impl App {
         }
     }
 
-    /// Window-space effects geometry for `wid`'s effect streams (fire/glow/halo/nova).
+    /// Frame-space effects geometry for `wid`'s effect streams (fire/glow/halo/nova).
     pub(crate) fn effects_origin_win(
         &self,
         wid: WindowId,
@@ -6698,20 +6772,39 @@ impl App {
         }
     }
 
-    /// The window/swapchain pixel size for a `total_rows`×`cols` grid, including the interior padding (`2·pad` horizontally, `pad_top + pad` vertically).
+    /// Bare frame pixel size for a `total_rows`×`cols` grid, including interior padding but excluding the side inset.
     pub(crate) fn frame_px(&self, total_rows: u16, cols: u16) -> PhysicalSize<u32> {
         let (w, h) = self.backend.frame_size(total_rows as usize, cols as usize);
         PhysicalSize::new(w as u32, h as u32)
     }
 
-    /// The window pixel size for the current terminal grid.
+    /// Window `wid`'s pixel size for a `rows`×`cols` terminal grid under its own cell, pads and
+    /// head ([`Self::win_cell_size`], [`Self::win_pad`], [`Self::win_pad_top`],
+    /// [`Self::win_head`]), never the renderer's ([`Self::frame_px`]), whose head is whichever
+    /// window was last attached, resized or drawn: [`Self::grid_dims_for`] of this frame is the
+    /// grid asked, whichever window drew last. The width includes the window's whole-cell side
+    /// inset ([`Self::win_side_inset_px`]).
     pub(crate) fn window_frame_px_for(
         &self,
         wid: WindowId,
         rows: u16,
         cols: u16,
     ) -> PhysicalSize<u32> {
-        self.frame_px(rows.saturating_add(self.chrome_rows(wid)), cols)
+        let (cell_w, cell_h) = self.win_cell_size(wid);
+        let (pad, pad_top) = (self.win_pad(wid), self.win_pad_top(wid));
+        let (width, raw_height) = aterm_render::frame_size_px(
+            usize::from(rows.saturating_add(self.chrome_rows(wid))),
+            usize::from(cols),
+            cell_w,
+            cell_h,
+            pad,
+            self.win_head(wid),
+        );
+        let height = crate::visible_frame_height(raw_height, pad, pad_top);
+        PhysicalSize::new(
+            (width as u32).saturating_add(self.win_side_inset_px(wid) as u32),
+            height as u32,
+        )
     }
 
     /// Resolve the motion policy for a window with focus `focused`.
@@ -6921,9 +7014,10 @@ impl App {
     /// Install the exact admitted config-asset generation into one window's effects state.
     pub(crate) fn install_window_config_assets(&mut self, id: WindowId) -> bool {
         let assets = std::sync::Arc::clone(&self.config_assets);
-        let Some(window) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&id) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if window
             .installed_config_assets
             .as_ref()
@@ -7407,12 +7501,14 @@ impl App {
                     .and_then(|ws| self.backend.glyph_ink_for(&ws.input_scratch))
             })
             .flatten();
-        let glow = &mut self.windows.get_mut(&id)?.fx.cursor_mut().glow;
+        let mut route_projection = self.windows.get_mut(&id)?;
+        let glow = &mut route_projection.fx.cursor_mut().glow;
         if let Some(ink) = glyph_ink {
             glow.observe_glyph_ink(Some(ink));
         } else {
             glow.observe_glyph_ink_unavailable();
         }
+        drop(route_projection);
         let page = self.page_facts(id, (default_fg, default_bg));
         self.windows.get_mut(&id)?.trail_ground.ground(
             &mut glow_cfg,
@@ -7482,7 +7578,8 @@ impl App {
         let focused_session = self.focused_session_id(id);
         let sound_session =
             aterm_effects::trail_sound::EventMeta::session_of(focused_session.unwrap_or(0));
-        let ws = self.windows.get_mut(&id)?;
+        let mut route_guard_ws = self.windows.get_mut(&id)?;
+        let ws = &mut **route_guard_ws;
         ws.fx.cursor_mut().glow.note_composer_entry(vim_entry);
         ws.fx.cursor_mut().glow.note_composer_insert_frame(editable);
         glow_cfg.head_dx = aterm_effects::cursor_fx::head_dx_for(cursor_style);
@@ -7639,6 +7736,7 @@ impl App {
                 ws.prompt_enter = None;
             }
         }
+        drop(route_guard_ws);
         if let Some(ws) = self.windows.get(&id) {
             let fx = ws.fx.cursor();
             // Every lit ramp row counts as the quad it stands for.
@@ -7760,7 +7858,8 @@ impl App {
         clip: Option<ComposedCursorEffectClip>,
         cursor_override: Option<CursorStyle>,
     ) -> bool {
-        let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(window) = route_projection.as_deref_mut().map(Box::as_mut) else {
             return false;
         };
         let valid = window.composed_cursor_effect_valid;
@@ -7833,7 +7932,8 @@ impl App {
     }
 
     fn retire_composed_cursor_effects_for_history(&mut self, wid: WindowId) {
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             retire_torn_cursor_fx_with(window, TornBand::Keep);
         }
     }
@@ -7864,14 +7964,16 @@ impl App {
             return false;
         };
         let crate::tab_model::View::Terminal(terminal_view) = view else {
-            if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
                 window.composed_cursor_effect_valid = false;
                 window.composed_cursor_effect_session = None;
             }
             return self.project_retained_composed_cursor_effects(wid, None, None);
         };
         if self.pool.is_rewound(terminal_view.session) {
-            if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
                 window.composed_cursor_effect_valid = false;
                 window.composed_cursor_effect_session = None;
             }
@@ -7908,7 +8010,8 @@ impl App {
             let (live_viewport, terminal_id, alternate_screen) = if let Some(sample) = exact_sample
             {
                 if sample.session != terminal_view.session {
-                    if let Some(window) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                        let window = &mut **route_guard_window;
                         window.composed_cursor_effect_valid = false;
                         window.composed_cursor_effect_session = None;
                     }
@@ -7923,7 +8026,8 @@ impl App {
                     terminal.is_alternate_screen(),
                 )
             };
-            if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
                 sync_cursor_effect_coordinate_space(window, terminal_id, alternate_screen);
                 if window.composed_cursor_effect_session != Some(terminal_view.session) {
                     window.composed_cursor_effect_valid = false;
@@ -7949,7 +8053,8 @@ impl App {
         let sample = match exact_sample {
             Some(sample) => {
                 if sample.session != terminal_view.session {
-                    if let Some(window) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                        let window = &mut **route_guard_window;
                         window.poof_row_buf = sample.row_probe;
                         window.poof_row_above_buf = sample.row_above_probe;
                         window.poof_row_below_buf = sample.row_below_probe;
@@ -7972,9 +8077,10 @@ impl App {
                     previous_scroll,
                     witness_rows,
                 ) = {
-                    let Some(window) = self.windows.get_mut(&wid) else {
+                    let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
                         return false;
                     };
+                    let window = &mut **route_guard_window;
                     let mut requested_witness_rows =
                         [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
                     let witness_n = window
@@ -8044,9 +8150,10 @@ impl App {
             print_anchor_glyph: sampled_print_anchor_glyph,
         } = sample;
         let (row_probe, witness_caret_row, row_above_present, row_below_present) = {
-            let Some(window) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
                 return false;
             };
+            let window = &mut **route_guard_window;
             window.poof_row_buf = sampled_row_probe;
             window.poof_row_above_buf = sampled_row_above_probe;
             window.poof_row_below_buf = sampled_row_below_probe;
@@ -8122,9 +8229,10 @@ impl App {
             )
         };
         if witness_caret_row.is_some() && col > 0 {
-            let Some(window) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
                 return false;
             };
+            let window = &mut **route_guard_window;
             for probe in [
                 &mut window.poof_row_buf,
                 &mut window.poof_row_above_buf,
@@ -8138,7 +8246,8 @@ impl App {
         if let Some(caret_row) = witness_caret_row {
             let mut ribbon_rows = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
             let (wanted, needs_read) = {
-                let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
+                let mut route_projection = self.windows.get_mut(&wid);
+                let Some(window) = route_projection.as_deref_mut().map(Box::as_mut) else {
                     return false;
                 };
                 let WindowState {
@@ -8180,7 +8289,8 @@ impl App {
                     if local >= pane_rows {
                         continue;
                     }
-                    let Some(window) = self.windows.get_mut(&wid).map(Box::as_mut) else {
+                    let mut route_projection = self.windows.get_mut(&wid);
+                    let Some(window) = route_projection.as_deref_mut().map(Box::as_mut) else {
                         return false;
                     };
                     let WindowState {
@@ -8213,7 +8323,8 @@ impl App {
                 }
             }
         }
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.composed_witness_rows = witness_rows;
         }
         let effect_cursor = (cursor_visible && display_offset == 0).then_some((
@@ -8273,17 +8384,20 @@ impl App {
         let active_keyline_tint = fx.caret_keyline_tint;
         let body_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         window.composed_cursor_effect_valid = true;
         window.composed_cursor_effect_session = Some(terminal_view.session);
         window.composed_cursor_fill = active_fill;
         window.composed_cursor_keyline_tint = active_keyline_tint;
         window.composed_cursor_style_override = body_style_override;
         window.composed_cursor_trail_color = fx.trail_color;
+        drop(route_guard_window);
         let projected = self.project_retained_composed_cursor_effects(wid, clip, cursor_override);
-        if projected && let Some(window) = self.windows.get_mut(&wid) {
+        if projected && let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.block_fill = presented_block_fill(
                 cursor_override,
                 window.input_scratch.cursor_fill_override,
@@ -8302,7 +8416,8 @@ impl App {
     /// Force the blink phase on (cursor solid) and restart the blink period.
     pub(crate) fn reset_blink(&mut self, wid: WindowId) {
         let mut flipped = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             if ws.next_blink.is_some() {
                 ws.next_blink = Some(Instant::now() + BLINK_INTERVAL);
             }
@@ -8559,9 +8674,10 @@ impl App {
     pub(crate) fn compose_native_route_card(&mut self, id: WindowId) -> bool {
         use std::hash::{Hash, Hasher};
 
-        let Some(window) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&id) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if window.overlay.is_some() {
             window.route_card = None;
             return window.settings_card.is_some();
@@ -8772,6 +8888,7 @@ impl App {
         let mut cache = self
             .windows
             .get_mut(&id)
+            .as_deref_mut()
             .and_then(|window| window.leaf_render_cache.remove(&view))
             .unwrap_or_default();
         let leaf_rasterized = if let (Some(damage), Some(compiled)) = (damage, compiled) {
@@ -8803,7 +8920,8 @@ impl App {
             _ => Vec::new(),
         };
         let Some(base_raster) = cache.native.as_ref() else {
-            if let Some(window) = self.windows.get_mut(&id) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                let window = &mut **route_guard_window;
                 window.leaf_render_cache.insert(view, cache);
             }
             return false;
@@ -8827,6 +8945,7 @@ impl App {
             && self
                 .windows
                 .get_mut(&id)
+                .as_deref_mut()
                 .and_then(|ws| ws.settings_card.as_mut())
                 .is_some_and(|card| {
                     let plain = card.serial != 0
@@ -8886,9 +9005,10 @@ impl App {
         let tab_strip = self.redraw_tab_strip_state(id);
         let dy = self.native_content_origin_y(id) as u32;
         let blank = chrome_band::blank_cell(page);
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         fill_divider_grid_tiled(
             &mut ws.input_scratch,
             rows,
@@ -8960,6 +9080,7 @@ impl App {
                 delta: None,
             });
         }
+        drop(route_guard_ws);
         self.splice_tab_strip_with(id, tab_strip);
         // A motion frame changes nothing a person can hear (a moving node is paint only), so it
         // stages no accessibility; the window's push reads the tree it already holds.
@@ -9010,9 +9131,10 @@ impl App {
         {
             return false;
         }
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         for leaf in &plan.leaves {
             if let Some(raster) = ws
                 .leaf_render_cache
@@ -9183,7 +9305,8 @@ impl App {
         let sync_preflight = if let Some(clock) = cursor_fx {
             let now = clock.observed_at();
             let mut sync_observations = {
-                let window = self.windows.get_mut(&id)?;
+                let mut route_guard_window = self.windows.get_mut(&id)?;
+                let window = &mut **route_guard_window;
                 std::mem::take(&mut window.composed_sync_observation_scratch)
             };
             sync_observations.clear();
@@ -9216,7 +9339,8 @@ impl App {
             )
             .min(SYNC_HOLD_CAP);
             let (sync_hold, retry_at) = {
-                let window = self.windows.get_mut(&id)?;
+                let mut route_guard_window = self.windows.get_mut(&id)?;
+                let window = &mut **route_guard_window;
                 let hold =
                     update_composed_sync_frame_hold(window, &sync_observations, now, timeout);
                 window.composed_sync_observation_scratch = sync_observations;
@@ -9254,7 +9378,8 @@ impl App {
             });
         let grid = self.chrome_palette(ChromeSurface::Grid);
         let fluent_seam = self.fluent_seam(plan);
-        if let Some(window) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+            let window = &mut **route_guard_window;
             fill_divider_grid(
                 &mut window.input_scratch,
                 rows,
@@ -9318,10 +9443,11 @@ impl App {
                             open_dirty: terminal.sync_open_dirty(),
                         };
                         let (sync_hold, retry_at) = {
-                            let Some(window) = self.windows.get_mut(&id) else {
+                            let Some(mut route_guard_window) = self.windows.get_mut(&id) else {
                                 abandoned = true;
                                 break;
                             };
+                            let window = &mut **route_guard_window;
                             let hold =
                                 recheck_sync_frame_hold(window, preflight, current, *now, *timeout);
                             let retry_at = (hold && preflight.terminal_id == current.terminal_id)
@@ -9341,7 +9467,8 @@ impl App {
                         }
                     }
                     terminal_ordinal += 1;
-                    let Some(mut cache) = self.windows.get_mut(&id).map(|window| {
+                    let Some(mut cache) = self.windows.get_mut(&id).map(|mut window| {
+                        let window = &mut **window;
                         window
                             .leaf_render_cache
                             .remove(&leaf.view)
@@ -9384,7 +9511,7 @@ impl App {
                     let (row_probe, row_above_probe, row_below_probe, witness_rows) =
                         if capture_row_probes {
                             match self.windows.get_mut(&id) {
-                                Some(window) => (
+                                Some(mut window) => (
                                     std::mem::take(&mut window.poof_row_buf),
                                     std::mem::take(&mut window.poof_row_above_buf),
                                     std::mem::take(&mut window.poof_row_below_buf),
@@ -9450,7 +9577,8 @@ impl App {
                     cache.native_pointer_style_only = false;
                     let row = leaf.rect.origin.y.round().max(0.0) as usize;
                     let col = leaf.rect.origin.x.round().max(0.0) as usize;
-                    if let Some(window) = self.windows.get_mut(&id) {
+                    if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                        let window = &mut **route_guard_window;
                         // The focused terminal owns the transient IME overlay in a
                         // mixed split too; paint before the blit so glyphs and the
                         // candidate anchor use its width and caret. The next fresh
@@ -9524,7 +9652,8 @@ impl App {
                     let leaf_cols = (leaf.rect.size.width.round() as usize).max(1);
                     let leaf_row = leaf.rect.origin.y.round().max(0.0) as usize;
                     let leaf_col = leaf.rect.origin.x.round().max(0.0) as usize;
-                    if let Some(window) = self.windows.get_mut(&id) {
+                    if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                        let window = &mut **route_guard_window;
                         fill_blank_pane_into(
                             &mut window.input_scratch,
                             leaf_row,
@@ -9548,7 +9677,8 @@ impl App {
                         abandoned = true;
                         break;
                     };
-                    let Some(mut cache) = self.windows.get_mut(&id).map(|window| {
+                    let Some(mut cache) = self.windows.get_mut(&id).map(|mut window| {
+                        let window = &mut **window;
                         window
                             .leaf_render_cache
                             .remove(&leaf.view)
@@ -9647,7 +9777,8 @@ impl App {
                             title = presentation.title;
                         }
                     }
-                    if let Some(window) = self.windows.get_mut(&id) {
+                    if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                        let window = &mut **route_guard_window;
                         window.leaf_render_cache.insert(leaf.view, cache);
                     }
                 }
@@ -9659,20 +9790,23 @@ impl App {
             // or repeated sync holds would churn allocations.
             if matches!(cursor_fx, Some(ComposedCursorFxClock::Advance(_)))
                 && let Some(sample) = focused_cursor_fx_sample
-                && let Some(window) = self.windows.get_mut(&id)
+                && let Some(mut route_guard_window) = self.windows.get_mut(&id)
             {
+                let window = &mut **route_guard_window;
                 window.poof_row_buf = sample.row_probe;
                 window.poof_row_above_buf = sample.row_above_probe;
                 window.poof_row_below_buf = sample.row_below_probe;
                 window.composed_witness_rows = sample.witness_rows;
             }
-            if any_leaf_rasterized && let Some(window) = self.windows.get_mut(&id) {
+            if any_leaf_rasterized && let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                let window = &mut **route_guard_window;
                 window.settings_card = None;
             }
             return None;
         }
 
-        if let Some(window) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+            let window = &mut **route_guard_window;
             for leaf in &plan.leaves {
                 if matches!(
                     self.view_store.get(leaf.view),
@@ -9719,44 +9853,45 @@ impl App {
         // from its leaf's raster, as the full blit below would blend it.
         if reuse
             && !motion_patches.is_empty()
-            && let Some(window) = self.windows.get_mut(&id)
-            && let Some(card) = window.settings_card.as_mut()
+            && let Some(mut route_guard_window) = self.windows.get_mut(&id)
         {
-            let mut rows: Option<(u32, u32)> = None;
-            for (view, regions) in &motion_patches {
-                let Some(&(_, x, y)) = pending_blits.iter().find(|(blit, _, _)| blit == view)
-                else {
-                    continue;
-                };
-                let Some(raster) = window
-                    .leaf_render_cache
-                    .get(view)
-                    .and_then(|cache| cache.native.as_ref())
-                else {
-                    continue;
-                };
-                for region in regions {
-                    if let Some(band) = reblend_rgba_region(
-                        &mut card.rgba,
-                        (card.pw, card.ph),
-                        &raster.rgba,
-                        (raster.width, raster.height),
-                        (x, y),
-                        *region,
-                    ) {
-                        rows =
-                            Some(rows.map_or(band, |(top, bottom)| {
+            let window = &mut **route_guard_window;
+            if let Some(card) = window.settings_card.as_mut() {
+                let mut rows: Option<(u32, u32)> = None;
+                for (view, regions) in &motion_patches {
+                    let Some(&(_, x, y)) = pending_blits.iter().find(|(blit, _, _)| blit == view)
+                    else {
+                        continue;
+                    };
+                    let Some(raster) = window
+                        .leaf_render_cache
+                        .get(view)
+                        .and_then(|cache| cache.native.as_ref())
+                    else {
+                        continue;
+                    };
+                    for region in regions {
+                        if let Some(band) = reblend_rgba_region(
+                            &mut card.rgba,
+                            (card.pw, card.ph),
+                            &raster.rgba,
+                            (raster.width, raster.height),
+                            (x, y),
+                            *region,
+                        ) {
+                            rows = Some(rows.map_or(band, |(top, bottom)| {
                                 (top.min(band.0), bottom.max(band.1))
                             }));
+                        }
                     }
                 }
+                let since = card.serial;
+                card.serial = crate::app_native_motion::next_card_serial();
+                card.delta = rows
+                    .filter(|_| since != 0)
+                    .map(|rows| aterm_gpu::TrayDelta { since, rows });
+                card.raster_fingerprint_once.take();
             }
-            let since = card.serial;
-            card.serial = crate::app_native_motion::next_card_serial();
-            card.delta = rows
-                .filter(|_| since != 0)
-                .map(|rows| aterm_gpu::TrayDelta { since, rows });
-            card.raster_fingerprint_once.take();
         }
         let native_layer = if reuse {
             None
@@ -9775,6 +9910,7 @@ impl App {
             let mut layer = self
                 .windows
                 .get_mut(&id)
+                .as_deref_mut()
                 .and_then(|window| window.settings_card.take())
                 .map_or_else(Vec::new, |card| card.rgba);
             layer.resize(byte_len, 0);
@@ -9800,7 +9936,8 @@ impl App {
             Some(layer)
         };
 
-        if let Some(window) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+            let window = &mut **route_guard_window;
             match native_layer {
                 Some(rgba) => {
                     window.settings_card = Some(crate::SettingsCard {
@@ -9859,7 +9996,10 @@ impl App {
             }
             // The yield (§15.2 1.9): the route runs no word pass, so the glass the step laid
             // yields to the frame's cells here, as a window's word publish yields it.
-            if let Some(window) = self.windows.get_mut(&id).map(Box::as_mut) {
+            if let Some(route_guard_window) =
+                self.windows.get_mut(&id).as_deref_mut().map(Box::as_mut)
+            {
+                let window = &mut *route_guard_window;
                 let WindowState {
                     fx, input_scratch, ..
                 } = window;
@@ -9871,7 +10011,8 @@ impl App {
                 self.compose_heterogeneous_output_streak(id, plan, now, present);
             }
             Some(ComposedCursorFxClock::Retain { .. }) => {
-                let window = self.windows.get_mut(&id)?;
+                let mut route_guard_window = self.windows.get_mut(&id)?;
+                let window = &mut **route_guard_window;
                 window
                     .heterogeneous_output_streak_staged
                     .clone_from(&window.heterogeneous_output_streak_presented);
@@ -9893,9 +10034,10 @@ impl App {
         id: WindowId,
         reason: metrics::PresentDropReason,
     ) {
-        let Some(state) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_state) = self.windows.get_mut(&id) else {
             return;
         };
+        let state = &mut **route_guard_state;
         state.on_present_dropped();
         let now = Instant::now();
         let bootstrap_occluded = reason == metrics::PresentDropReason::GpuOccluded
@@ -9911,6 +10053,7 @@ impl App {
         metrics::note_present_drop(reason, parked);
         #[cfg(a11y_tree)]
         if parked {
+            drop(route_guard_state);
             self.publish_in_a_parked_window(id, now);
         }
     }
@@ -9924,14 +10067,16 @@ impl App {
         presentable: bool,
         request_redraw: impl FnOnce(),
     ) -> bool {
-        let Some(state) = self.windows.get_mut(&window) else {
+        let Some(mut route_guard_state) = self.windows.get_mut(&window) else {
             return false;
         };
+        let state = &mut **route_guard_state;
         let accepted = state.finish_gpu_acquire_wait(current, surface, presentable, request_redraw);
         if accepted && !presentable {
             if let Some(PresentTarget::Gpu { gpu_surface, .. }) = state.present.as_mut() {
                 gpu_surface.discard_pending_acquire();
             }
+            drop(route_guard_state);
             #[cfg(a11y_tree)]
             self.publish_in_a_parked_window(window, Instant::now());
         }
@@ -9972,7 +10117,8 @@ impl App {
         let source_drop_counted = failed_reason.is_some();
 
         if let Some(reason) = failed_reason {
-            if let Some(state) = self.windows.get_mut(&id) {
+            if let Some(mut route_guard_state) = self.windows.get_mut(&id) {
+                let state = &mut **route_guard_state;
                 state.on_present_dropped();
             }
             metrics::note_present_drop(reason, false);
@@ -9988,7 +10134,8 @@ impl App {
             // surface reason would double-count the frame and could park forever on
             // a persistent GPU condition; one count per lost frame, with the final
             // diagnostic matching the CPU-recovery retry state.
-            if let Some(state) = self.windows.get_mut(&id) {
+            if let Some(mut route_guard_state) = self.windows.get_mut(&id) {
+                let state = &mut **route_guard_state;
                 state.on_present_dropped();
                 let (accounting, parked) = rearm_failed_gpu_recovery(
                     &mut state.present_retry,
@@ -10027,11 +10174,12 @@ impl App {
     }
 
     fn reveal_successfully_presented_window(&mut self, id: WindowId) {
-        if let Some(state) = self.windows.get_mut(&id)
-            && state.pending_reveal.take().is_some()
-            && let Some(window) = state.os_window.clone()
-        {
-            crate::app_window::reveal_os_window(&window, state.passive_reveal);
+        let reveal = self.windows.get_mut(&id).and_then(|mut state| {
+            state.pending_reveal.take()?;
+            Some((state.os_window.clone()?, state.passive_reveal))
+        });
+        if let Some((window, passive)) = reveal {
+            crate::app_window::reveal_os_window(&window, passive);
             crate::metrics::mark_first_window_visible();
             self.maybe_signal_handoff_ready();
         } else if self.handoff_ready.is_some() {
@@ -10110,7 +10258,8 @@ impl App {
         // presents left it, so an observer's frame never satisfies a wait for the window's own.
         if self.capture_barrier != Some(id) {
             let views = &self.view_store;
-            if let Some(ws) = self.windows.get_mut(&id) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+                let ws = &mut **route_guard_ws;
                 record_presented_grids(ws, views, route, presented_plan);
             }
         }
@@ -10121,7 +10270,8 @@ impl App {
             self.windows.get(&id).map(|state| &state.present_metrics),
             self.capture_barrier == Some(id),
         );
-        let present = self.windows.get_mut(&id).map(|state| {
+        let present = self.windows.get_mut(&id).map(|mut state| {
+            let state = &mut **state;
             let present = acknowledge_successful_present(
                 state,
                 app_frame_interval,
@@ -10257,7 +10407,10 @@ impl App {
             present_latency_ns,
             render_ns,
             startup_timing,
-            self.windows.get_mut(&id).map(|ws| &mut ws.present_metrics),
+            self.windows
+                .get_mut(&id)
+                .as_deref_mut()
+                .map(|ws| &mut ws.present_metrics),
             &mut self.present_observer,
             input,
         );
@@ -10293,7 +10446,8 @@ impl App {
         {
             let t_us = crate::metrics::now_us();
             let mut capture_stopped = false;
-            if let (Some(gpu), Some(state)) = (self.backend.gpu_mut(), self.windows.get_mut(&id))
+            if let (Some(gpu), Some(mut state)) =
+                (self.backend.gpu_mut(), self.windows.get_mut(&id))
                 && let Some(
                     PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
                 ) = &mut state.present
@@ -10339,7 +10493,8 @@ impl App {
 
         self.update_accessibility(id, presented_plan);
         let fallback_pending = self.backend.fallback_parse_pending();
-        if let Some(state) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_state) = self.windows.get_mut(&id) {
+            let state = &mut **route_guard_state;
             let fallback_was = state.cpu_cache.swap_fallback_pending(fallback_pending);
             let (rearm, invalidate) = fallback_convergence_action(fallback_pending, fallback_was);
             if rearm {
@@ -10389,9 +10544,10 @@ impl App {
         if self.tab_strip_rows == 0 {
             return false;
         }
-        let Some(state) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_state) = self.windows.get_mut(&id) else {
             return false;
         };
+        let state = &mut **route_guard_state;
         if crate::tray_raster::strip_band_font_epoch() == state.strip_band_key.4 {
             return false;
         }
@@ -10453,9 +10609,10 @@ impl App {
             surface_width,
             surface_height,
         };
-        let Some(state) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_state) = self.windows.get_mut(&id) else {
             return false;
         };
+        let state = &mut **route_guard_state;
         Self::retain_visible_leaf_render_caches(state, route, plan);
         let composed = route.is_composed();
         state.last_composed = Some(composed);
@@ -10553,9 +10710,10 @@ impl App {
         let glow_cfg = self.glow_config_for(trail_presentation);
         let pet = PetKept::of(&trail_presentation);
         let sound = self.companion_sound();
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         // The route draws no cat, so a collection hello waits for a frame that does.
         ws.fx
             .companions_mut()
@@ -10708,17 +10866,19 @@ impl App {
     /// A paint the window system asked for (`WindowEvent::RedrawRequested`) owes a present even when the frame is unchanged, when the CPU surface says the window holds pixels no present reached (on Windows, rows the window gained after its last present, still in its update region).
     pub(crate) fn note_owed_repaint(&mut self, id: WindowId) {
         if crate::platform::redraw_is_exposure()
-            && let Some(ws) = self.windows.get_mut(&id)
+            && let Some(mut route_guard_ws) = self.windows.get_mut(&id)
         {
+            let ws = &mut **route_guard_ws;
             ws.invalidate_raster_caches();
             let _ = ws.present_retry.on_external_stimulus();
             ws.present_retry.recovery_redraw_outstanding = true;
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&id)
-            && let Some(PresentTarget::Cpu { surface }) = ws.present.as_ref()
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&id)
+            && let Some(PresentTarget::Cpu { surface }) = route_guard_ws.present.as_ref()
             && crate::present::CpuPresenter::owes_repaint(surface)
         {
+            let ws = &mut **route_guard_ws;
             let _ = ws.present_retry.on_external_stimulus();
             ws.present_retry.recovery_redraw_outstanding = true;
         }
@@ -10823,6 +10983,7 @@ impl App {
         )>,
         frame_clock: Option<Instant>,
     ) {
+        self.reconcile_title_delivery(Instant::now());
         metrics::note_redraw_attempt();
         match self.windows.get(&id) {
             Some(ws) if ws.gpu_acquire_pending() => return,
@@ -10846,7 +11007,7 @@ impl App {
         if self
             .windows
             .get_mut(&id)
-            .is_some_and(|ws| ws.park_hidden_frame(recording, parked_at))
+            .is_some_and(|mut ws| ws.park_hidden_frame(recording, parked_at))
         {
             metrics::note_redraw_hidden_parked();
             self.settle_parked_frame(id, parked_at);
@@ -10899,11 +11060,13 @@ impl App {
         };
         self.prepare_layout_coordinate_space_from_plan(id, route, plan);
         if !matches!(route, crate::VisibleContentRoute::Terminal { .. })
-            && let Some(ws) = self.windows.get_mut(&id)
+            && let Some(mut route_guard_ws) = self.windows.get_mut(&id)
         {
+            let ws = &mut **route_guard_ws;
             ws.fx.companion_mut().withdraw_hit_rect();
         }
-        if let Some(ws) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             Self::retire_unfocused_pane_snapshots(ws, route);
             if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
                 ws.pane_overlay.clear();
@@ -10924,7 +11087,8 @@ impl App {
                 return;
             }
             crate::VisibleContentRoute::Native { instance, view } => {
-                if let Some(window) = self.windows.get_mut(&id) {
+                if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
+                    let window = &mut **route_guard_window;
                     window.composed_cursor_effect_valid = false;
                     window.composed_cursor_effect_session = None;
                 }
@@ -11036,9 +11200,11 @@ impl App {
             let rain_session_on = self.session_rain_enabled(front_terminal.session) && !rewound;
             let overlay_inputs = self.pane_overlay_inputs_from_plan(id, false, Some(plan));
             let question = self.question_key(id);
-            let Some(ws) = self.windows.get_mut(&id) else {
+            let pet_pointer = self.frame_pointer_px(id);
+            let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
                 return;
             };
+            let ws = &mut **route_guard_ws;
             ws.fx
                 .decos_mut()
                 .set_scan_session(Some(front_terminal.session));
@@ -11112,6 +11278,7 @@ impl App {
                 drop(term);
                 metrics::note_redraw_sync_hold();
                 if let Some(window) = &window {
+                    drop(route_guard_ws);
                     self.apply_title(id, window, &held_title);
                 }
                 return;
@@ -11264,6 +11431,7 @@ impl App {
                 .pool
                 .get(front_terminal.session)
                 .and_then(|entry| crate::vim_custody::capture(&term, &entry.ctx, false));
+            drop(route_guard_ws);
             self.refresh_hover_for_frame_locked(id, &term);
             // The caret's moves since the last frames, read under the caret's lock.
             let caret_path = term.caret_path();
@@ -11361,9 +11529,10 @@ impl App {
                 .unwrap_or_default();
             let claude_footer_fp = self.claude_footer_fp(id, plan);
             let deck_fp = self.stats_deck_fp(id);
-            let Some(ws) = self.windows.get_mut(&id) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
                 return;
             };
+            let ws = &mut **route_guard_ws;
             ws.fx
                 .companions_mut()
                 .cursor_cat
@@ -11483,10 +11652,7 @@ impl App {
                         .with_serious(!cursor_companions_allowed)
                         .with_shed_envelope(shed_envelope)
                         .with_shed_active(load_shed)
-                        .with_pointer_px(Some((
-                            ws.last_cursor_px.0 as f32,
-                            ws.last_cursor_px.1 as f32,
-                        ))),
+                        .with_pointer_px(pet_pointer),
                     aterm_effects::companion::PetOwnership { on: pet_mode },
                 )
                 .with_sing(aterm_effects::host::SingFacts {
@@ -12010,6 +12176,7 @@ impl App {
                 ws.deck_clock.served();
                 metrics::note_redraw_early_out();
                 ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
+                drop(route_guard_ws);
                 self.discard_unpresented_output_stamps_from_plan(plan, frame_started);
                 if let Some(w) = &window {
                     self.apply_title(id, w, &title);
@@ -12032,23 +12199,26 @@ impl App {
                 });
             if deck_only {
                 ws.stamp_present_decision(key);
-                if let Some(shown) =
-                    self.present_deck_overlay(id, visuals.invert, visuals.overlay, frame_started)
-                {
-                    self.finish_deck_overlay(
-                        id,
-                        shown,
-                        frame_started,
-                        window.as_ref(),
-                        &title,
-                        (route, visuals, plan),
-                    );
-                    return;
-                }
             }
-            let Some(ws) = self.windows.get_mut(&id) else {
+            drop(route_guard_ws);
+            if deck_only
+                && let Some(shown) =
+                    self.present_deck_overlay(id, visuals.invert, visuals.overlay, frame_started)
+            {
+                self.finish_deck_overlay(
+                    id,
+                    shown,
+                    frame_started,
+                    window.as_ref(),
+                    &title,
+                    (route, visuals, plan),
+                );
+                return;
+            }
+            let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
                 return;
             };
+            let ws = &mut **route_guard_ws;
             if let Some((pmode, editing)) = single_pane_pred_mode {
                 if pmode == crate::predict::PredictMode::Off {
                     ws.predictor.reset();
@@ -12133,7 +12303,8 @@ impl App {
             self.report_ime_cursor_area(id, pos, (0, 0), vis);
         }
         let mut painted_pred = false;
-        if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
+        if !multi_pane && let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             metrics::note_prediction_shown(&mut ws.present_metrics, None, |_| false);
         }
         if !multi_pane
@@ -12142,8 +12313,9 @@ impl App {
                 .windows
                 .get(&id)
                 .is_some_and(|ws| !ws.predictor.idle() || ws.pred_shown)
-            && let Some(ws) = self.windows.get_mut(&id)
+            && let Some(mut route_guard_ws) = self.windows.get_mut(&id)
         {
+            let ws = &mut **route_guard_ws;
             let now = frame_started;
             if scrolled {
                 let _ = ws.predictor.overlay(now);
@@ -12171,7 +12343,8 @@ impl App {
                 }
             }
         }
-        if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
+        if !multi_pane && let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             #[cfg(any(test, debug_assertions))]
             if ws.pred_shown && !painted_pred {
                 crate::predict_trace::clear(std::time::Instant::now());
@@ -12184,7 +12357,8 @@ impl App {
         self.splice_tab_strip_with(id, tab_strip);
         if !multi_pane {
             self.set_scroll_band(id);
-        } else if let Some(ws) = self.windows.get_mut(&id) {
+        } else if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             ws.input_scratch.scroll_frac_px = 0;
             ws.input_scratch.grid_top_row = 0;
             ws.input_scratch.grid_bot_row = 0;
@@ -12194,7 +12368,8 @@ impl App {
         let Some(composed) = self.compose_route_chrome(id, route, plan) else {
             return;
         };
-        if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
+        if !multi_pane && let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             ws.capture_leaf_snapshot_seqs.clear();
             ws.capture_leaf_snapshot_seqs
                 .push(ws.input_scratch.snapshot_seq);
@@ -12247,7 +12422,7 @@ impl App {
             let Some(mut titles) = self
                 .windows
                 .get_mut(&id)
-                .map(|ws| std::mem::take(&mut ws.strip_titles_scratch))
+                .map(|mut ws| std::mem::take(&mut ws.strip_titles_scratch))
             else {
                 return 0;
             };
@@ -12255,11 +12430,12 @@ impl App {
             let mut metadata = self
                 .windows
                 .get_mut(&id)
-                .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
+                .map(|mut ws| std::mem::take(&mut ws.strip_metadata_scratch))
                 .unwrap_or_default();
             self.refill_strip_metadata(id, &mut metadata);
             let fp = self.tab_strip_fingerprint_from_parts(id, &titles, &metadata);
-            if let Some(ws) = self.windows.get_mut(&id) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+                let ws = &mut **route_guard_ws;
                 ws.strip_titles_scratch = titles;
                 ws.strip_metadata_scratch = metadata;
             }
@@ -12388,7 +12564,8 @@ impl App {
         {
             return Ok(());
         }
-        if let Some(ws) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             ws.present = None;
             ws.capture_acquire_armed = false;
             ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
@@ -12396,9 +12573,10 @@ impl App {
         }
         let surface = crate::present::CpuSurface::new(window)
             .map_err(|_| metrics::PresentDropReason::CpuAcquire)?;
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return Err(metrics::PresentDropReason::TargetMismatch);
         };
+        let ws = &mut **route_guard_ws;
         ws.present = Some(PresentTarget::Cpu { surface });
         Ok(())
     }
@@ -12490,7 +12668,8 @@ impl App {
             }
             match ensure_target(self, wid) {
                 Ok(()) => {
-                    let requested = self.windows.get_mut(&wid).is_some_and(|ws| {
+                    let requested = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+                        let ws = &mut **ws;
                         // Replacing the swapchain is a surface stimulus: keep an
                         // outstanding acknowledgement until a real CPU present/drop,
                         // so a suppressed winit request is re-delivered.
@@ -12508,7 +12687,8 @@ impl App {
                     crate::logging::stderr_line!(
                         "aterm-gui: CPU surface creation failed during GPU recovery; retrying with bounded backoff"
                     );
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.on_present_dropped();
                         let _ = ws.present_retry.on_external_stimulus();
                         let (accounting, parked) = rearm_failed_gpu_recovery(
@@ -12562,9 +12742,10 @@ impl App {
             return;
         };
         let (w, h) = self.backend.raw_frame_size(rows, cols);
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some((sw, sh, rgba)) = source else {
             ws.wallpaper_scaled = None;
             ws.input_scratch.wallpaper = None;
@@ -12650,9 +12831,10 @@ impl App {
         wid: WindowId,
         arts: &[Arc<aterm_core::render::FxArt>],
     ) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let before = ws.fx_prefetch_pending.len();
         for art in arts {
             if !ws.fx_prefetch_pending.iter().any(|q| Arc::ptr_eq(q, art)) {
@@ -12674,7 +12856,8 @@ impl App {
         caption: Option<crate::app_mouse::ShownCaption>,
     ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let probe_before = startup_raster_probe_armed().then(|| self.backend.glyph_cache_len());
-        if let Some(ws) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             hand_fx_prefetch(&mut ws.fx_prefetch_pending, &mut ws.input_scratch);
         }
         let result = self.present_input_scratch_inner(id, invert, overlay);
@@ -12683,7 +12866,8 @@ impl App {
         {
             self.apprt.window_frame_presented(window);
         }
-        if let Some(ws) = self.windows.get_mut(&id) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+            let ws = &mut **route_guard_ws;
             settle_fx_prefetch(
                 &mut ws.fx_prefetch_pending,
                 &mut ws.input_scratch,
@@ -12706,7 +12890,8 @@ impl App {
             gpu.set_tray_prim_law(crate::tray_raster::gpu_prims::tray_prim_law());
             gpu.tray_stack_supported()
         });
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.tray_stacked = stacked;
             if stacked {
                 ws.deck_fold = None;
@@ -12742,13 +12927,16 @@ impl App {
         self.splice_stats_deck(id);
         self.stack_or_fold_stats_deck(id);
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
+        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
         let app_frame_interval = self.frame_interval;
         let App {
             backend, windows, ..
         } = self;
-        let ws = windows.get_mut(&id)?;
+        let mut route_guard_ws = windows.get_mut(&id)?;
+        let ws = &mut **route_guard_ws;
         let (input_rows, input_cols) = (ws.input_scratch.rows, ws.input_scratch.cols);
         let (visible_width, visible_height) = backend.frame_size(input_rows, input_cols);
+        let virtual_destination = Self::headless_surface_px((visible_width, visible_height), inset);
         let destination_height = ws
             .win_px
             .map_or(visible_height, |size| size.height.max(1) as usize);
@@ -12805,6 +12993,7 @@ impl App {
                     window_gpu,
                 }),
             ) => {
+                window_gpu.set_side_inset_px(inset.0 as u32);
                 aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
                 aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
                     input_hot: present_hot,
@@ -12849,16 +13038,17 @@ impl App {
                     })
                 })
             }
-            (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => gpu
-                .present_overlay_virtual(
+            (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
+                window_gpu.set_side_inset_px(inset.0 as u32);
+                gpu.present_overlay_virtual(
                     window_gpu,
                     invert,
                     gpu_overlay,
                     tray,
                     Some(present_crop),
                     (
-                        u32::try_from(visible_width).unwrap_or(u32::MAX),
-                        u32::try_from(visible_height).unwrap_or(u32::MAX),
+                        u32::try_from(virtual_destination.0).unwrap_or(u32::MAX),
+                        u32::try_from(virtual_destination.1).unwrap_or(u32::MAX),
                     ),
                 )
                 .ok()
@@ -12872,7 +13062,8 @@ impl App {
                     } else {
                         Err(metrics::PresentDropReason::Virtual)
                     }
-                }),
+                })
+            }
             _ => None,
         };
         drop(tray_layers);
@@ -12898,6 +13089,7 @@ impl App {
                 gpu.scroll_rescues(),
             );
         }
+        drop(route_guard_ws);
         if matches!(presented, Ok(Some(_)))
             && let Some(window) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref())
         {
@@ -12960,6 +13152,7 @@ impl App {
         overlay: Option<OverlayGlow>,
     ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let tray_floor_y = self.paste_banner_tray_floor_y(id);
+        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(id));
         let app_frame_interval = self.frame_interval;
         let App {
             backend,
@@ -12967,14 +13160,17 @@ impl App {
             theme,
             ..
         } = self;
-        let ws = windows
+        let mut route_guard_ws = windows
             .get_mut(&id)
             .ok_or(metrics::PresentDropReason::TargetMismatch)?;
+        let ws = &mut **route_guard_ws;
         ws.input_scratch.refresh_cursor_effect_damage();
         metrics::note_fx_streams(&ws.input_scratch);
         if backend.is_gpu() {
             let (input_rows, input_cols) = (ws.input_scratch.rows, ws.input_scratch.cols);
             let (visible_width, visible_height) = backend.frame_size(input_rows, input_cols);
+            let virtual_destination =
+                Self::headless_surface_px((visible_width, visible_height), inset);
             let destination_height = ws
                 .win_px
                 .map_or(visible_height, |size| size.height.max(1) as usize);
@@ -13040,6 +13236,7 @@ impl App {
                         window_gpu,
                     }),
                 ) => {
+                    window_gpu.set_side_inset_px(inset.0 as u32);
                     aterm_gpu::present_glass::arm_deck_target(deck_target_ns);
                     aterm_gpu::present_glass::arm_present(aterm_gpu::present_glass::ArmedPresent {
                         input_hot: present_hot,
@@ -13083,6 +13280,7 @@ impl App {
                     })
                 }
                 (Some(gpu), Some(PresentTarget::Virtual { window_gpu })) => {
+                    window_gpu.set_side_inset_px(inset.0 as u32);
                     if gpu.present_virtual_cropped_with_effects_transport(
                         window_gpu,
                         input,
@@ -13092,8 +13290,8 @@ impl App {
                         present_crop,
                         effects_transport_shift_y,
                         (
-                            u32::try_from(visible_width).unwrap_or(u32::MAX),
-                            u32::try_from(visible_height).unwrap_or(u32::MAX),
+                            u32::try_from(virtual_destination.0).unwrap_or(u32::MAX),
+                            u32::try_from(virtual_destination.1).unwrap_or(u32::MAX),
                         ),
                     ) {
                         metrics::note_gpu_frame(
@@ -13161,13 +13359,15 @@ impl App {
             let pixels = ws.cpu_cache.presented_pixels();
             let translated = ws.cpu_cache.last_translated();
             let translated_prev = ws.cpu_cache.presented_translated();
-            let (dw, dh) = ws.win_px.map_or((fw, fh), |s| {
-                (s.width.max(1) as usize, s.height.max(1) as usize)
-            });
-            let place = aterm_render::frame_placement(dw, dh, fw, fh);
+            let (dw, dh) = ws
+                .win_px
+                .map_or(Self::headless_surface_px((fw, fh), inset), |s| {
+                    (s.width.max(1) as usize, s.height.max(1) as usize)
+                });
+            let place = aterm_render::frame_placement(dw, dh, fw, fh, inset);
             let band_bg = present_band_bg(ws.input_scratch.default_bg, theme.bg);
             let chrome_edge_rows = r.chrome_extent_px(fh);
-            let chrome_bands_stale = dw > fw
+            let chrome_bands_stale = (place.x.band_before > 0 || place.x.band_after > 0)
                 && (chrome_edge_rows != ws.cpu_cache.presented_edge_rows()
                     || ws
                         .cpu_cache
@@ -13212,6 +13412,7 @@ impl App {
                         pixels,
                         fw,
                         fh,
+                        inset,
                         false,
                         band_bg,
                         chrome_edge_rows.clone(),
@@ -13235,6 +13436,7 @@ impl App {
                         place.y.origin,
                         fw,
                         fh,
+                        inset,
                         chrome_edge_rows.clone(),
                         tray,
                         invert,
@@ -13421,7 +13623,8 @@ impl App {
                     sess.last_output_ns.store(0, Ordering::Relaxed);
                 }
             }
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.last_visible_views.clear();
                 ws.last_visible_views
                     .extend(plan.leaves.iter().map(|leaf| leaf.view));
@@ -13621,7 +13824,8 @@ impl App {
             )
             .min(SYNC_HOLD_CAP);
             let mut observations = {
-                let window = self.windows.get_mut(&wid)?;
+                let mut route_guard_window = self.windows.get_mut(&wid)?;
+                let window = &mut **route_guard_window;
                 std::mem::take(&mut window.composed_sync_observation_scratch)
             };
             observations.clear();
@@ -13635,7 +13839,8 @@ impl App {
                 });
             }
             let (hold, retry_at) = {
-                let window = self.windows.get_mut(&wid)?;
+                let mut route_guard_window = self.windows.get_mut(&wid)?;
+                let window = &mut **route_guard_window;
                 let hold = update_composed_sync_frame_hold(window, &observations, now, timeout);
                 window.composed_sync_observation_scratch = observations;
                 (hold, window.sync_hold_until)
@@ -13668,7 +13873,8 @@ impl App {
                     end_seq: term.sync_end_seq(),
                     open_dirty: term.sync_open_dirty(),
                 };
-                let window = self.windows.get_mut(&wid)?;
+                let mut route_guard_window = self.windows.get_mut(&wid)?;
+                let window = &mut **route_guard_window;
                 if recheck_sync_frame_hold(window, preflight, current, *now, *timeout) {
                     metrics::note_redraw_sync_hold();
                     if preflight.terminal_id == current.terminal_id {
@@ -13683,7 +13889,8 @@ impl App {
                 }
             }
             let (focus, cursor_fx_sample) = {
-                let ws = self.windows.get_mut(&wid)?;
+                let mut route_guard_ws = self.windows.get_mut(&wid)?;
+                let ws = &mut **route_guard_ws;
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
                 ws.input_scratch.fx_occluders.clear();
                 crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
@@ -13791,7 +13998,8 @@ impl App {
                 None => {}
             }
             // A sole pane's bloom spreads into the padding, as the live single-pane frame's does.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.input_scratch.fx_clip = None;
             }
             return Some((
@@ -13820,7 +14028,8 @@ impl App {
             },
         );
         let fluent_seam = self.fluent_seam(&plan);
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         fill_divider_grid(&mut ws.input_scratch, rows, cols, grid, active_pane_mark);
         if let Some((inks, layout)) = &fluent_seam {
             crate::pane_chrome::stamp_seam_lines(
@@ -13839,10 +14048,12 @@ impl App {
         let advance_cursor_fx = matches!(cursor_fx, Some(ComposedCursorFxClock::Advance(_)));
         let mut focused_cursor_fx_sample: Option<FocusedComposedCursorFxSample> = None;
         let mut capture_focus = None;
+        drop(route_guard_ws);
         for (pane_index, (view, session, focused, row, col, pane_rows, pane_cols, term)) in
             panes.into_iter().enumerate()
         {
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             let mut term = term_lock(&term);
             if let Some((now, timeout)) = sync_preflight.as_ref() {
                 let preflight = ws.composed_sync_observation_scratch[pane_index];
@@ -13907,10 +14118,12 @@ impl App {
                     .or_default()
                     .clone_from(&ws.pane_scratch);
             }
+            drop(route_guard_ws);
             if focused {
                 self.refresh_hover_for_frame_locked(wid, &term);
             }
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             let blank = terminal_blank_cell(&term);
             if sole_pane {
                 sole_default_bg = Some(aterm_render::rgb_to_u32(blank.bg));
@@ -14012,7 +14225,8 @@ impl App {
                 term.take_damage();
             }
         }
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         ws.unfocused_pane_scratch
             .retain(|pane_index, _| leaves.get(*pane_index).is_some_and(|leaf| !leaf.focused));
         ws.input_scratch.default_bg = sole_default_bg.unwrap_or(aterm_core::render::COLOR_UNSET);
@@ -14026,9 +14240,11 @@ impl App {
         };
 
         after_extract();
+        drop(route_guard_ws);
         match cursor_fx {
             Some(ComposedCursorFxClock::Advance(now)) => {
                 let sample = focused_cursor_fx_sample?;
+
                 if !self.composed_cursor_frame_sampled(
                     wid,
                     ComposedCursorFxClock::Advance(now),
@@ -14086,9 +14302,10 @@ impl App {
             self.composed_output_streak_config(ctx.now, ctx.win_focused, ctx.animate_streak);
         let trail_audio = &mut self.trail_audio;
         let pool = &self.pool;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.retain_streak_panes(|session, pane_index| {
             !pool.is_rewound(session)
                 && ctx
@@ -14178,9 +14395,10 @@ impl App {
         let view_store = &self.view_store;
         let trail_audio = &mut self.trail_audio;
         let pool = &self.pool;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.retain_streak_panes(|session, pane_index| {
             plan.leaves.get(pane_index).is_some_and(|leaf| {
                 matches!(
@@ -14279,9 +14497,10 @@ impl App {
         let routed = self.route_composed_companion(wid, ctx, companion_focus_place);
         let Some(rs) = self.sparkle.as_ref() else {
             {
-                let Some(ws) = self.windows.get_mut(&wid) else {
+                let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                     return 0;
                 };
+                let ws = &mut **route_guard_ws;
                 ws.fx.open_words();
                 ws.fx
                     .retain_word_panes(|s| ctx.panes.iter().any(|(r, _)| r.session == s));
@@ -14299,9 +14518,10 @@ impl App {
         let trail_audio = &mut self.trail_audio;
         let pool = &self.pool;
         let installed_colors = &self.installed_colors;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.open_words();
         ws.fx.retain_word_panes(|s| {
             !pool.is_rewound(s) && ctx.panes.iter().any(|(r, _)| r.session == s)
@@ -14394,6 +14614,7 @@ impl App {
             ws.pending_deco_birth = None;
         }
         let mut fp = out.fp;
+        drop(route_guard_ws);
         fp ^= self.compose_cursor_companion(wid, ctx, companion_focus_place, routed);
         fp ^= self.compose_typed_dog(wid, ctx, out.focus_place);
         fp
@@ -14414,9 +14635,10 @@ impl App {
         };
         let default_bg = self.theme.bg;
         let (accent, cursor_color) = (ctx.accent, ctx.cursor_color);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         if ws.fx.companions_mut().dog_cameo_session != Some(ctx.focus) {
             return 0;
         }
@@ -14496,9 +14718,10 @@ impl App {
             cursor: ctx.cursor_color,
             accent: ctx.accent,
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.decos_mut().bind_pane(
             ctx.focus,
             (
@@ -14532,7 +14755,7 @@ impl App {
         let mut placement = None;
         let seat = self.windows.get_mut(&wid).map_or_else(
             aterm_effects::pipeline::FlyingSeat::default,
-            |ws| {
+            |mut ws| {
                 if let Some(place) = focus_place {
                     ws.fx.decos_mut().bind_pane(
                         ctx.focus,
@@ -14543,7 +14766,7 @@ impl App {
                     );
                 }
                 let seat = route_v2_companion(
-                    ws,
+                    &mut ws,
                     CompanionInk::Composed,
                     duty,
                     ctx.now,
@@ -14552,7 +14775,7 @@ impl App {
                     ctx.animate_cat,
                 );
                 placement = prepare_routed_head(
-                    ws,
+                    &mut ws,
                     CompanionInk::Composed,
                     router_geom,
                     duty,
@@ -14597,9 +14820,10 @@ impl App {
         let default_bg = self.theme.bg;
         let accent = ctx.accent;
         let cursor_color = ctx.cursor_color;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.decos_mut().bind_pane(
             ctx.focus,
             (
@@ -14815,6 +15039,7 @@ impl App {
         before_focused_extract: impl FnOnce(),
         after_focused_extract: impl FnOnce(),
     ) -> Option<Arc<str>> {
+        let pet_pointer = self.frame_pointer_px(wid);
         let theme = self.theme;
         let grid = self.chrome_palette(ChromeSurface::Grid);
         let raw_focused = self.windows.get(&wid)?.focused;
@@ -14932,13 +15157,15 @@ impl App {
             .map(|r| self.pool.shown_term(r.session).map(|term| (*r, term)))
             .collect::<Option<_>>()?;
         {
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             ws.composed_pane_stage_meta.clear();
             ws.composed_pane_stage_meta
                 .resize_with(panes.len(), || None);
         }
         let mut sync_observations = {
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             std::mem::take(&mut ws.composed_sync_observation_scratch)
         };
         sync_observations.clear();
@@ -14959,7 +15186,8 @@ impl App {
             sync_observations.push(observation);
         }
         let sync_hold = {
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             let hold =
                 update_composed_sync_frame_hold(ws, &sync_observations, now, sync_hold_timeout);
             ws.composed_sync_observation_scratch = sync_observations;
@@ -14980,7 +15208,8 @@ impl App {
                     .is_some_and(|w| w.fx.rain().is_some())
         });
         let overlay_inputs = self.pane_overlay_inputs_from_plan(wid, panes.len() > 1, Some(plan));
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             if overlay_inputs.is_some() {
                 ws.pane_overlay.begin();
             } else {
@@ -15010,7 +15239,8 @@ impl App {
                 .get(pane_index)
                 .copied()?;
             let sync_hold = {
-                let ws = self.windows.get_mut(&wid)?;
+                let mut route_guard_ws = self.windows.get_mut(&wid)?;
+                let ws = &mut **route_guard_ws;
                 recheck_sync_frame_hold(
                     ws,
                     preflight,
@@ -15032,8 +15262,9 @@ impl App {
             pane_selection_fp =
                 crate::fold_pane_selection_fp(pane_selection_fp, pane_index, term.text_selection());
             if overlay_inputs.is_some()
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut route_guard_ws) = self.windows.get_mut(&wid)
             {
+                let ws = &mut **route_guard_ws;
                 ws.pane_overlay.note(
                     crate::pane_chrome::PaneFacts::read(
                         r.session,
@@ -15069,7 +15300,8 @@ impl App {
                 focus_scheme = terminal_configured_colors(&term);
                 focus_title_sample = term.title_arc();
                 focus_ambiguous_cjk = term.modes().ambiguous_width_double;
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     let prior = ws.composed_focus_scratch.extract_gen;
                     let refill = term.cell_frame_damage_scoped_into(
                         &mut ws.composed_focus_scratch,
@@ -15196,7 +15428,8 @@ impl App {
                     );
                 }
                 self.refresh_hover_for_frame_locked(wid, &term);
-            } else if let Some(ws) = self.windows.get_mut(&wid) {
+            } else if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 let staged = ws.unfocused_pane_scratch.entry(pane_index).or_default();
                 let staged_seq = staged.content_seq;
                 let refill = term.cell_frame_damage_scoped_into(
@@ -15230,7 +15463,8 @@ impl App {
             return None;
         }
         let rain_fp = match self.windows.get_mut(&wid) {
-            Some(ws) => {
+            Some(mut route_guard_ws) => {
+                let ws = &mut **route_guard_ws;
                 let pane_cursor = (focus_vis && !focus_scrolled).then_some(focus_cur_pos);
                 let fp = ws.fx.rain_frame(
                     rain_cfg.map(|cfg| move || crate::rain_config_for_window(cfg, wid)),
@@ -15301,7 +15535,8 @@ impl App {
         let cursor_companions_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorCat);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.pill_shown = false;
             if focus_probe.is_some() && focus_off.1 > 0 {
                 let off = usize::from(focus_off.1);
@@ -15373,8 +15608,9 @@ impl App {
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
         if pet_mode
             && let Some(facts) = focus_world_facts.as_ref()
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut route_guard_ws) = self.windows.get_mut(&wid)
         {
+            let ws = &mut **route_guard_ws;
             let exclusions = pet_console_exclusions(
                 &ws.composed_focus_scratch,
                 !ws.preedit.is_empty(),
@@ -15404,7 +15640,8 @@ impl App {
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
         let (cat_frame, kitty_alpha, companion_step, pet, escort) = {
-            let ws = self.windows.get_mut(&wid)?;
+            let mut route_guard_ws = self.windows.get_mut(&wid)?;
+            let ws = &mut **route_guard_ws;
             ws.fx
                 .companions_mut()
                 .cursor_cat
@@ -15507,10 +15744,7 @@ impl App {
                     .with_serious(!cursor_companions_allowed)
                     .with_shed_envelope(shed_envelope)
                     .with_shed_active(load_shed)
-                    .with_pointer_px(Some((
-                        ws.last_cursor_px.0 as f32,
-                        ws.last_cursor_px.1 as f32,
-                    ))),
+                    .with_pointer_px(pet_pointer),
                     aterm_effects::companion::PetOwnership { on: pet_mode },
                 )
                 .with_sing(aterm_effects::host::SingFacts {
@@ -15675,7 +15909,8 @@ impl App {
             .filter(|_| !drag_covers)
             .map(|l| l.fingerprint(now));
         let overlay_fp = match overlay_inputs {
-            Some(inputs) => self.windows.get_mut(&wid).map_or(0, |ws| {
+            Some(inputs) => self.windows.get_mut(&wid).map_or(0, |mut ws| {
+                let ws = &mut **ws;
                 ws.pane_overlay
                     .finish(inputs, &mut ws.scroll_pill, &mut ws.pill_shown, now)
             }),
@@ -15749,7 +15984,8 @@ impl App {
         {
             // The screen is proved unchanged: the `video` recorder's sampling
             // ledger counts this as a sample (see `redraws_proved_unchanged`).
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
             }
             return None;
@@ -15766,7 +16002,8 @@ impl App {
             },
         );
         let fluent_seam = self.fluent_seam(plan);
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         let tiles_ready = panes.iter().enumerate().all(|(i, _)| {
             i == focus_index
                 || ws
@@ -16078,7 +16315,7 @@ impl App {
         let Some(mut titles) = self
             .windows
             .get_mut(&wid)
-            .map(|ws| std::mem::take(&mut ws.strip_titles_scratch))
+            .map(|mut ws| std::mem::take(&mut ws.strip_titles_scratch))
         else {
             return;
         };
@@ -16086,11 +16323,12 @@ impl App {
         let mut metadata = self
             .windows
             .get_mut(&wid)
-            .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
+            .map(|mut ws| std::mem::take(&mut ws.strip_metadata_scratch))
             .unwrap_or_default();
         self.refill_strip_metadata(wid, &mut metadata);
         let tab_strip = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.strip_titles_scratch = titles;
             ws.strip_metadata_scratch = metadata;
         }
@@ -16130,7 +16368,8 @@ impl App {
             f32::from_bits(band_key.3),
             attention,
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.version_slot_memo = Some((key, slot));
         }
         slot
@@ -16232,7 +16471,8 @@ impl App {
         // previous frame's chrome rasters before this frame's chrome splices push their own.
         // Each retired raster's icon list is kept for the next ones
         // (`RenderInput::chrome_icon_list`).
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.input_scratch.retire_chrome_rasters();
         }
         let strip = self.tab_strip_rows as usize;
@@ -16253,7 +16493,8 @@ impl App {
                 row_edges: [None; aterm_render::CHROME_ROW_EDGES],
             });
         self.backend.set_chrome_bleed(bleed);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.chrome_rows.clear();
             ws.chrome_spans.clear();
         }
@@ -16370,12 +16611,12 @@ impl App {
             let titles = self
                 .windows
                 .get_mut(&wid)
-                .map(|ws| std::mem::take(&mut ws.strip_titles_scratch))
+                .map(|mut ws| std::mem::take(&mut ws.strip_titles_scratch))
                 .unwrap_or_default();
             let metadata = self
                 .windows
                 .get_mut(&wid)
-                .map(|ws| std::mem::take(&mut ws.strip_metadata_scratch))
+                .map(|mut ws| std::mem::take(&mut ws.strip_metadata_scratch))
                 .unwrap_or_default();
             let shown = tab_bar::team_titles(&titles, &metadata);
             #[cfg(any(windows, target_os = "linux"))]
@@ -16494,7 +16735,8 @@ impl App {
                 )
                 .unwrap_or_default()
             };
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.tab_segments = segments;
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
@@ -16542,9 +16784,10 @@ impl App {
             header,
             floor,
         );
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         prepend_strip_rows(
             &mut ws.input_scratch,
             &ws.cached_strip_rows,
@@ -16616,9 +16859,10 @@ impl App {
         let strip = usize::from(self.chrome_rows(wid));
         let cell_h = self.win_cell_size(wid).1.max(1) as i32;
         let animate = self.smooth_scroll_animates(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.input_scratch.grid_top_row = strip;
         ws.input_scratch.grid_bot_row = ws.input_scratch.rows;
         ws.input_scratch.scroll_frac_px = if animate {
@@ -16774,7 +17018,8 @@ impl App {
         else {
             // Not searching: drop any indicator geometry a prior frame left, so a
             // click on those cells is not swallowed by a no-op toggle.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.find_bar_hit = None;
             }
             return;
@@ -16868,14 +17113,15 @@ impl App {
                 })
         };
         let laid = self.glass_grid(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         #[cfg(test)]
         {
             ws.find_bar_match_work = _match_search_comparisons + visible_matches.len();
         }
-        let matches: &[(i32, u16, u32)] = match ws.search.as_ref() {
+        let matches: &[(i32, u16, u32)] = match ws.routing.read().search.as_ref() {
             Some(s) => &s.matches,
             None => return,
         };
@@ -17159,6 +17405,7 @@ impl App {
         });
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(cell) = ime_caret.or(fallback_cell) {
+            drop(route_guard_ws);
             self.report_ime_cursor_area(wid, cell, (0, 0), true);
         }
     }
@@ -17217,7 +17464,8 @@ impl App {
         let panel_rows = self.windows.get(&wid).map_or(0, |ws| ws.overlay_rows());
         if panel_rows == 0 {
             // Closed (or too short to paint): drop any stale card so it stops compositing.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.settings_card = None;
             }
             return;
@@ -17233,9 +17481,10 @@ impl App {
         let head = self.win_head(wid) as u32;
         let font_px = self.win_font_px(wid);
         let system_dark = repaint_system_dark(self.os_appearance);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let fp = ws.overlay_fp();
         let px_per_pt = ws.scale.max(f64::EPSILON) as f32;
         let geom_key = {
@@ -17312,7 +17561,8 @@ impl App {
     /// Rasterize the top-right build/version badge into its paint-only `badge_card` slot (never gates the mouse).
     pub(crate) fn splice_build_badge(&mut self, wid: WindowId) {
         if !self.config.show_build_badge_or_default() {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.badge_card = None;
             }
             return;
@@ -17320,7 +17570,8 @@ impl App {
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols as usize);
         if cols == 0 {
             // No window / zero-width frame: drop any stale badge so it stops compositing.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.badge_card = None;
             }
             return;
@@ -17336,9 +17587,10 @@ impl App {
         } else {
             0
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let fp = crate::build_badge::fingerprint(true);
         let geom_key = {
             use std::hash::{Hash, Hasher};
@@ -17689,7 +17941,8 @@ impl App {
     ) {
         let panel_rows = built.len();
         let bands = aterm_render::RowBands::new(self.win_pad_top(wid) + self.win_head(wid), cell_h);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             for (offset, row) in built.enumerate() {
                 let r = start + offset;
                 if r >= ws.input_scratch.cells.len() {
@@ -17806,22 +18059,25 @@ impl App {
 
     /// Paint the open tab context menu over the finished frame.
     pub(crate) fn splice_tab_menu(&mut self, wid: WindowId) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws.tab_menu.is_none() {
             ws.tab_menu_rect = None;
             return;
         }
+        drop(route_guard_ws);
         let strip = usize::from(self.chrome_rows(wid));
         let palette = self.chrome_palette(ChromeSurface::OverGrid(wid));
         let theme = palette.theme;
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
         let laid = self.glass_grid(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some(menu) = ws.tab_menu.as_ref() else {
             return;
         };
@@ -17830,6 +18086,7 @@ impl App {
         let Some(rect) =
             crate::tab_menu::place(&menu.entries, menu.anchor_col, cols, frame_rows, strip)
         else {
+            drop(route_guard_ws);
             self.close_tab_menu(wid);
             return;
         };
@@ -17888,7 +18145,8 @@ impl App {
         if Some((rows, cols)) == self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) {
             return false;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.cursor_mut().glow.curtain(crate::metrics::host_now());
             ws.fx.cursor_mut().trail.reset();
             ws.rows = rows;
@@ -17919,8 +18177,9 @@ impl App {
             .focused_session_id(wid)
             .and_then(|id| self.session_by_id(id))
             .map(|s| term_lock(s.live_term()).content_scroll_state())
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut route_guard_ws) = self.windows.get_mut(&wid)
         {
+            let ws = &mut **route_guard_ws;
             ws.fx.set_scroll_baseline(Some(scroll_state));
         }
         true
@@ -17932,31 +18191,37 @@ impl App {
         } else {
             0
         };
+        let inset = aterm_render::SideInsetPx(self.win_side_inset_px(wid));
         let App {
             backend, windows, ..
         } = self;
-        if let Some(ws) = windows.get_mut(&wid)
-            && let (
+        if let Some(mut route_guard_ws) = windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let (
                 Some(gpu),
                 Some(PresentTarget::Gpu {
                     gpu_surface,
                     window_gpu,
                 }),
             ) = (backend.gpu_mut(), ws.present.as_mut())
-        {
-            let (w_px, h_px) = match ws.win_px {
-                Some(size) => (size.width.max(1), size.height.max(1)),
-                None => {
-                    let win_rows = ws.rows as usize + strip;
-                    let (w, h) = gpu.frame_size(win_rows, ws.cols as usize);
-                    (w as u32, h as u32)
-                }
-            };
-            gpu.resize_surface(window_gpu, gpu_surface, w_px, h_px);
+            {
+                let (w_px, h_px) = match ws.win_px {
+                    Some(size) => (size.width.max(1), size.height.max(1)),
+                    None => {
+                        let win_rows = ws.rows as usize + strip;
+                        let (w, h) = Self::headless_surface_px(
+                            gpu.frame_size(win_rows, ws.cols as usize),
+                            inset,
+                        );
+                        (w as u32, h as u32)
+                    }
+                };
+                gpu.resize_surface(window_gpu, gpu_surface, w_px, h_px);
+            }
         }
     }
 
-    /// Device-pixel size of window `wid`'s full composed frame with no glass, using the same fallback math as [`Self::sync_gpu_surface_size`]'s `win_px == None` arm (the offscreen `encode_frame` produces).
+    /// Device-pixel size of window `wid`'s headless surface (frame plus side inset), sharing [`Self::sync_gpu_surface_size`]'s `win_px == None` fallback with both Virtual present destinations.
     pub(crate) fn headless_frame_px(&mut self, wid: WindowId) -> Option<(u32, u32)> {
         let strip = if self.windows.contains_key(&wid) {
             usize::from(self.chrome_rows(wid))
@@ -17968,7 +18233,10 @@ impl App {
             (ws.rows as usize + strip, ws.cols as usize)
         };
         self.backend.gpu_mut()?;
-        let (w, h) = self.backend.frame_size(win_rows, cols);
+        let (w, h) = Self::headless_surface_px(
+            self.backend.frame_size(win_rows, cols),
+            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
+        );
         Some((w as u32, h as u32))
     }
 
@@ -17977,7 +18245,7 @@ impl App {
         let App {
             backend, windows, ..
         } = self;
-        if let Some(ws) = windows.get_mut(&wid)
+        if let Some(mut ws) = windows.get_mut(&wid)
             && let Some(size) = ws.win_px
             && let (
                 Some(gpu),
@@ -18011,14 +18279,14 @@ impl App {
             return (rows, cols);
         }
         #[cfg(target_os = "linux")]
-        if let Some(ws) = self.front_mut() {
+        if let Some(mut ws) = self.front_mut() {
             ws.initial_frame_settle = None;
         }
         if let Some(w) = self.front().and_then(|ws| ws.os_window.clone()) {
             // Best effort; the WM may clamp. `Some` means the backend applied
             // the size synchronously and no `Resized` follows (Wayland).
             if let Some(applied) = w.request_inner_size(size) {
-                if let Some(ws) = self.front_mut() {
+                if let Some(mut ws) = self.front_mut() {
                     ws.win_px = Some(applied);
                 }
                 self.sync_surface_to_window(wid);
@@ -18568,3 +18836,7 @@ mod licence_fence_tests;
 #[cfg(test)]
 #[path = "app_render_rain_latch_without_engine_tests.rs"]
 mod rain_latch_without_engine_tests;
+
+#[cfg(test)]
+#[path = "app_render_side_inset_tests.rs"]
+pub(crate) mod side_inset_tests;

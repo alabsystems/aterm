@@ -165,8 +165,11 @@ fn measure(json_out: Option<&Path>, sustained: bool, workload: Workload) -> Resu
             String::from_utf8_lossy(&built.stderr)
         )));
     }
-    let executable =
-        bench_build::built_executable(&String::from_utf8_lossy(&built.stdout), "aterm_db", "lib")?;
+    let executable = super::driver::built_executable(
+        &String::from_utf8_lossy(&built.stdout),
+        "aterm_db",
+        "lib",
+    )?;
     let test = workload.test(sustained);
     let mut run = command(executable);
     targo.environment(&mut run);

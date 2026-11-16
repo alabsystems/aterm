@@ -827,7 +827,8 @@ impl App {
             }
         }
         let pool = &self.pool;
-        let Some(ws) = self.windows.get_mut(&wid).map(Box::as_mut) else {
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(ws) = route_projection.as_deref_mut().map(Box::as_mut) else {
             panels.clear();
             return;
         };
@@ -1057,7 +1058,8 @@ impl App {
     pub(crate) fn claude_panels_due(&mut self, now: Instant) -> Vec<WindowId> {
         let views = &self.view_store;
         let mut due = Vec::new();
-        for (wid, ws) in &mut self.windows {
+        for (wid, mut route_guard_ws) in &mut self.windows {
+            let ws = &mut **route_guard_ws;
             let Some(t) = ws.claude_card.panels().ms(now) else {
                 continue;
             };
@@ -1099,9 +1101,10 @@ impl App {
 
     /// Restart stuck-dot breathing on window `wid` when it regains focus.
     pub(crate) fn rearm_claude_panels(&mut self, wid: WindowId, now: impl FnOnce() -> Instant) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let panels = ws.claude_card.panels_mut();
         if !panels.any_breath() {
             return;

@@ -14,6 +14,12 @@ use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 
+/// `verify land --tab`'s ask, as aterm-verify builds it: the file reads only `std` and
+/// `aterm_types`, so this suite drives it against a real instance without linking aterm-verify,
+/// and a change to it selects this suite through the mount.
+#[path = "../../aterm-verify/src/land_tab.rs"]
+mod land_tab;
+
 /// The stand-in `claude` (and `codex`, `agy`, `muse`: the same script under
 /// each name): `--version` answers at once (the helper runs every fake once
 /// that way, `headless_boot::standin`), and so, unrecorded, do agy's quota and
@@ -773,6 +779,199 @@ fn a_program_worker_concludes_on_its_exit_status_with_its_output_as_its_result()
         );
     }
     assert_eq!(rows(), before, "nothing was spawned");
+}
+
+/// A stand-in `targo`: `--version` answers at once (laying it runs it once so); any other call
+/// writes the physical folder it runs in, its words (one a line) and its standard input into the
+/// home, then prints a landing's verdict line, as `verify land` ends.
+const TARGO: &str = "#!/bin/sh\n\
+    case \"$1\" in --version) exit 0 ;; esac\n\
+    pwd -P > \"$HOME/targo.cwd\"\n\
+    for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$HOME/targo.argv\"\n\
+    cat > \"$HOME/targo.stdin\"\n\
+    echo 'verify land: VERDICT — LANDED on origin/main'\n";
+
+/// `land_tab::start`'s `aterm ctl`, run as the session `manager`'s from `cwd`.
+fn ask_from<'a>(
+    inst: &'a Instance,
+    manager: &'a str,
+    cwd: &'a Path,
+) -> impl FnMut(&[String], &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)> + 'a {
+    move |args: &[String], task: &[u8]| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (_, out, err) = spawn_as(inst, manager, cwd, &args, task);
+        Ok((out.into_bytes(), err.into_bytes()))
+    }
+}
+
+/// `aterm ctl` with the words of one of `land_tab::said`'s lines, and `extra` after them.
+fn said_line(inst: &Instance, line: &str, extra: &[&str]) -> std::process::Output {
+    let mut words: Vec<&str> = line
+        .strip_prefix("aterm ctl ")
+        .unwrap_or_else(|| panic!("an aterm ctl line: {line}"))
+        .split_whitespace()
+        .collect();
+    words.extend_from_slice(extra);
+    ctl(inst, &words)
+}
+
+/// `VERIFY LAND --TAB` (LS-41) RUNS THE LANDING AS A PROGRAM WORKER IN ITS CHECKOUT: asked from a
+/// folder inside the checkout by an agent's session (its `ATERM_PARENT_SESSION_ID`), it starts
+/// `targo --unverified verify land` with the landing's other words and `--at` the HEAD it asked
+/// for, at the checkout's root, as that session's worker in a background tab, its task on stdin;
+/// the await line it prints wakes on the landing's end, and the result line it prints reads the
+/// landing's verdict. NEGATIVE CONTROL: an instance with no harness answers `ERR unsupervised:`,
+/// so the landing runs in place and nothing is spawned.
+#[test]
+fn verify_land_tab_runs_the_landing_as_a_program_worker_in_its_checkout() {
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    let inst = boot("land", headless_boot::need_zsh(), Some(SUPERVISED), None);
+    headless_boot::standin(&inst.tmp.join("bin/targo"), TARGO);
+    let (_, manager) = boot_session(&inst);
+    let root = inst.tmp.join("work/repo");
+    let inside = root.join("crates/inner");
+    std::fs::create_dir_all(&inside).expect("the checkout");
+    let words: Vec<String> = ["--admit", "now"].map(String::from).to_vec();
+    let session =
+        |sid: String| move |key: &str| (key == "ATERM_PARENT_SESSION_ID").then(|| sid.clone());
+    let started = land_tab::start(
+        &root,
+        &words,
+        HEAD,
+        &session(manager.clone()),
+        &mut ask_from(&inst, &manager, &inside),
+    );
+    let land_tab::Start::Worker(worker) = started else {
+        panic!(
+            "the worker started: {started:?}\nlog:\n{}",
+            headless_boot::log_tail(&inst.log)
+        );
+    };
+    let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
+    assert!(record.contains(&format!(" from={manager} ")), "{record}");
+    let [_, await_line, result_line] = land_tab::said(&worker, &root);
+    let row = said_line(&inst, &await_line, &["timeout=60000"]);
+    let row = String::from_utf8_lossy(&row.stdout);
+    assert!(
+        row.contains(" conclusion=finished why=exit-status exit=0"),
+        "{row}"
+    );
+    let home = inst.tmp.join("home");
+    let read = |name: &str| std::fs::read_to_string(home.join(name)).expect(name);
+    assert_eq!(
+        read("targo.cwd").trim_end(),
+        std::fs::canonicalize(&root)
+            .expect("the checkout's root")
+            .to_string_lossy(),
+        "the landing runs at the checkout's root"
+    );
+    assert_eq!(
+        read("targo.argv").lines().collect::<Vec<_>>(),
+        [
+            "--unverified",
+            "verify",
+            "land",
+            "--admit",
+            "now",
+            "--at",
+            HEAD
+        ],
+        "the same landing, of the commit asked for"
+    );
+    assert_eq!(read("targo.stdin"), land_tab::task(&root, &words, HEAD));
+    let result = said_line(&inst, &result_line, &[]);
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "verify land: VERDICT — LANDED on origin/main\n",
+        "its result is the landing's verdict"
+    );
+
+    let off = boot("landoff", headless_boot::need_zsh(), None, None);
+    headless_boot::standin(&off.tmp.join("bin/targo"), TARGO);
+    let (_, alone) = boot_session(&off);
+    let rows = || ctl_ok(&off, &["sessions"]).lines().count();
+    let before = rows();
+    let started = land_tab::start(
+        &root,
+        &words,
+        HEAD,
+        &session(alone.clone()),
+        &mut ask_from(&off, &alone, &inside),
+    );
+    assert!(
+        matches!(&started, land_tab::Start::Here(why) if why.contains("ERR unsupervised:")),
+        "{started:?}"
+    );
+    assert_eq!(rows(), before, "nothing was spawned");
+    assert!(
+        !off.tmp.join("home/targo.argv").exists(),
+        "nothing ran the landing"
+    );
+}
+
+/// A PROGRAM WORKER OUTLIVES THE RESTART OF THE AGENT THAT SPAWNED IT (LS-41): a landing started
+/// from an agent's shell died with the agent when aterm restarted it (2026-11-13, a 3.5 h
+/// landing); one started as that agent's program worker runs in a tab of its own. The agent's
+/// `restart` is accepted and relaunches it while the worker's program runs; the worker's task is
+/// still `working` after it, and its program then ends on its own terms: `done` on its exit
+/// status, its output its result.
+#[test]
+fn a_program_worker_outlives_the_restart_of_the_agent_that_spawned_it() {
+    let (inst, agent) = crate::host_live::agent_ready_to_restart(
+        "wkr",
+        "autopilot = \"land\"\n",
+        headless_boot::need_zsh(),
+    );
+    let home = inst.tmp.join("home");
+    let task = "echo running > \"$HOME/worker.running\"\n\
+                while [ ! -e \"$HOME/worker.go\" ]; do sleep 0.1; done\n\
+                echo outlived the restart\n\
+                exit 0\n";
+    let (ok, stdout, stderr) = spawn_as(
+        &inst,
+        &inst.sid,
+        &inst.tmp.join("work"),
+        &["@self", "spawn", "program=/bin/sh", "raise=false", "-"],
+        task.as_bytes(),
+    );
+    assert!(ok, "spawn program=/bin/sh: {stdout} {stderr}");
+    let worker = sid_of(&stdout);
+    until(&inst, &worker, "the worker's program runs", || {
+        home.join("worker.running").exists()
+    });
+    let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
+    assert!(record.contains(&format!(" from={} ", inst.sid)), "{record}");
+
+    let relaunched = crate::host_live::restart_agent(&inst, agent);
+    assert_ne!(relaunched, agent, "the agent was restarted");
+    let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
+    assert!(
+        record.contains(" state=working "),
+        "the worker runs on past the restart: {record}"
+    );
+
+    std::fs::write(home.join("worker.go"), b"").expect("let the worker end");
+    let row = ctl_ok(
+        &inst,
+        &[
+            "await",
+            "task",
+            &format!("@{worker}"),
+            "since=0",
+            "timeout=60000",
+        ],
+    );
+    assert!(
+        row.contains(" conclusion=finished why=exit-status exit=0"),
+        "{row}"
+    );
+    let result = ctl(&inst, &[&format!("@{worker}"), "result"]);
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "outlived the restart\n"
+    );
 }
 
 /// Undo the wire's pct-encoding.

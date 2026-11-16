@@ -37,9 +37,10 @@ fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
     let capture_leaf_content_seqs: Vec<_> =
         single.leaves.iter().map(|leaf| leaf.content_seq).collect();
     assert_eq!(capture_leaf_snapshot_seqs.len(), 1);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.capture_leaf_snapshot_seqs = capture_leaf_snapshot_seqs;
     window.capture_leaf_content_seqs = capture_leaf_content_seqs;
+    drop(window);
 
     let mut gpu = match aterm_gpu::GpuRenderer::new(font_px, app.theme) {
         Ok(gpu) => gpu,
@@ -120,7 +121,7 @@ fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
     let trail_color = 0x00FA_01B5;
     let kitty_color = [0x22, 0xDD, 0x66, 0xFF];
     {
-        let window = app.windows.get_mut(&wid).expect("recorded window");
+        let mut window = app.windows.get_mut(&wid).expect("recorded window");
         window.input_scratch.cursor_trail = vec![aterm_render::TrailCell {
             row: 4,
             col: 12,
@@ -169,7 +170,7 @@ fn recording_image_keeps_the_exact_successful_present_cursor_layers() {
     app.prepare_terminal_capture_grid(wid)
         .expect("interleaved terminal snapshot");
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.capture_leaf_snapshot_seqs.clear();
         window.capture_leaf_content_seqs.clear();
         let scratch = &mut window.input_scratch;
@@ -439,7 +440,8 @@ fn split_capture_grid_composes_sparse_panes_without_present_side_effects() {
         .coordinate_generation();
     let predictor_now = Instant::now();
     let predictor_deadline = {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut field_guard_window = app.windows.get_mut(&wid).unwrap();
+        let window = &mut **field_guard_window;
         window
             .predictor
             .set_mode(crate::predict::PredictMode::Always);

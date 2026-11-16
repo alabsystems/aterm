@@ -10,7 +10,7 @@ use crate::geom_24x80_for_test as output_streak_geom;
 #[test]
 fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
     let mut app = App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&WindowId(0))
         .expect("the headless fixture owns window 0");
@@ -63,7 +63,7 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
 #[test]
 fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     let mut app = App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&WindowId(0))
         .expect("the headless fixture owns window 0");
@@ -118,7 +118,7 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
 #[test]
 fn a_parked_output_episode_wakes_once_for_settle() {
     let mut app = App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&WindowId(0))
         .expect("the headless fixture owns window 0");
@@ -209,7 +209,7 @@ fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
     let wid = WindowId(0);
     let now = Instant::now() + Duration::from_secs(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window");
         assert!(!ws.is_split());
         ws.fx
             .streak_panes_mut()
@@ -224,7 +224,7 @@ fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
     }
 
     app.split_active_stub_tab(wid);
-    let ws = app.windows.get_mut(&wid).expect("headless window");
+    let mut ws = app.windows.get_mut(&wid).expect("headless window");
     assert!(ws.is_split());
     ws.fx.clear_streak_panes();
     assert_eq!(
@@ -238,7 +238,7 @@ fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
 #[test]
 fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
     let mut app = App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&WindowId(0))
         .expect("the headless fixture owns window 0");
@@ -297,7 +297,7 @@ fn shared_success_ack_rebases_timers_but_content_gates_the_pacing_stamp() {
     let monitor_interval = Duration::from_millis(8);
     let app_interval = Duration::from_millis(16);
 
-    let state = app.windows.get_mut(&id).expect("bootstrap window");
+    let mut state = app.windows.get_mut(&id).expect("bootstrap window");
     state.last_present_at = Some(previous_content);
     state.content_pending = false;
     state.input_hot = true;
@@ -313,7 +313,7 @@ fn shared_success_ack_rebases_timers_but_content_gates_the_pacing_stamp() {
         "prime a retry episode"
     );
 
-    let outcome = acknowledge_successful_present(state, app_interval, frame, presented);
+    let outcome = acknowledge_successful_present(&mut state, app_interval, frame, presented);
     assert_eq!(
         outcome.frame_interval, monitor_interval,
         "the source window owns the load-shed budget"
@@ -347,7 +347,7 @@ fn shared_success_ack_rebases_timers_but_content_gates_the_pacing_stamp() {
     state.input_hot = true;
     let serial = state.capture_present_serial;
     let fired_anchor = state.last_trail_fire;
-    acknowledge_successful_present(state, app_interval, second_frame, second_presented);
+    acknowledge_successful_present(&mut state, app_interval, second_frame, second_presented);
     assert_eq!(
         state.last_trail_fire, fired_anchor,
         "a timer-driven frame with no pending slot preserves its fired anchor"
@@ -750,7 +750,7 @@ fn a_mixed_tab_charges_acquire_backpressure_to_the_shed_latch() {
             "precondition: a mixed tab"
         );
         {
-            let ws = app.windows.get_mut(&id).expect("the window");
+            let mut ws = app.windows.get_mut(&id).expect("the window");
             ws.frame_interval = Some(interval);
             ws.present = Some(crate::PresentTarget::Cpu {
                 surface: crate::present::CpuSurface::Scripted(Default::default()),

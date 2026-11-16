@@ -6,7 +6,7 @@
 //! vault, registry or account is read.
 
 use super::{
-    Class, Computed, Type,
+    Class, Computed, Store, Type,
     materialize::{self, Outcome, Pass},
     publish::{self, Answer},
     seam, write,
@@ -18,7 +18,7 @@ use crate::{
         registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, MACHINE, PREFERENCE},
     },
     att, generation,
-    table::tests::Lab,
+    table::tests::{Lab, repair_commons_among},
     typed::{grid, grid::tests::put, keys},
 };
 use aterm_file::{File, Name, Recorded, Root, Why, Word, cli};
@@ -31,6 +31,70 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+/// One Mac of `lab` writes `changes` into the journal's week ring at `t` (Unix seconds), as its
+/// flusher's record would: one signed write of the ring's collections.
+pub(super) fn state_ring(lab: &Lab, n: usize, changes: Vec<crate::database::Change>, t: u64) {
+    use crate::alab::journal::{APPLICATION, ROLE};
+    let bootstrap = lab.bootstrap(n);
+    let session = crate::table::Session::open(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[n], bootstrap.trust());
+    let request = crate::typed::request_id(APPLICATION, ROLE, &changes).unwrap();
+    let payload = crate::database::Command::Write { request, changes }
+        .encode()
+        .unwrap();
+    directory
+        .append_journal(&session, t, t, &payload)
+        .unwrap()
+        .unwrap();
+}
+
+/// The Commons machine uuid (32 hex) Mac `n` of `lab` writes its own rows at.
+pub(super) fn uuid_of(lab: &Lab, n: usize) -> String {
+    let bootstrap = lab.bootstrap(n);
+    let session = crate::table::Session::open(&bootstrap).unwrap();
+    let actor = session.actor();
+    let members = session.members().unwrap();
+    let binding = members
+        .iter()
+        .find(|binding| binding.actor() == actor)
+        .unwrap();
+    keys::uuid32(binding.machine())
+}
+
+/// The table ids of the journal ring's window at `t` (Unix seconds), as `[commons]
+/// exclude_tables` names them.
+pub(super) fn ring_tables(lab: &Lab, n: usize, t: u64) -> Vec<String> {
+    use crate::catalog::ring::JOURNAL;
+    let bootstrap = lab.bootstrap(n);
+    let session = crate::table::Session::open(&bootstrap).unwrap();
+    let directory = crate::catalog::Directory::new(&lab.paths[n], bootstrap.trust());
+    directory
+        .ring_view(&session, &JOURNAL)
+        .window(&JOURNAL, t)
+        .map(|epoch| {
+            aterm_codec::hex::encode_lower(
+                &JOURNAL.scope(bootstrap.trust(), epoch).unwrap().digest(),
+            )
+        })
+        .collect()
+}
+
+/// A row of a ring collection at `key`.
+pub(super) fn ring_row(
+    collection: &crate::typed::Collection,
+    key: &str,
+    value: Value,
+) -> crate::database::Change {
+    crate::database::Change {
+        collection: collection.name.to_owned(),
+        key: key.to_owned(),
+        value: Some(value),
+    }
+}
+
+/// The week reset the stand-in readings name: three days after the pass clock, Unix milliseconds.
+pub(super) const RESET: u64 = NOW + 3 * 86_400_000;
 
 /// Made-up addresses: no account of the owner's is named in a test.
 const ADA: &str = "ada.fb@alpha.example";
@@ -59,7 +123,12 @@ pub(super) struct Stand {
 
 impl Stand {
     pub(super) fn new() -> Self {
-        let lab = Lab::new(&[Role::Writer, Role::Writer]);
+        Self::with(&[Role::Writer, Role::Writer])
+    }
+
+    /// A stand whose lab has a Mac in each of `roles`; the second is the one whose files are read.
+    pub(super) fn with(roles: &[Role]) -> Self {
+        let lab = Lab::new(roles);
         let config = lab._home.path().join("aterm.toml");
         let registry = Registry::at(lab.paths[SEAT].clone());
         let table = registry.open().unwrap().digest();
@@ -96,6 +165,15 @@ impl Stand {
         changes.extend(account(&oai_ada, "openai", "codex", &ada));
         changes.extend(account(&claude_bea, "anthropic", "claude", &bea));
         registry.write(vec![changes]).unwrap();
+        // This Mac's harness states its login, its reading and an event of the account in the
+        // journal's week ring, as its flusher's record would.
+        let me = uuid_of(&lab, SEAT);
+        state_ring(
+            &lab,
+            SEAT,
+            Stand::ring_rows(&claude_ada, &me, 400, RESET, 1),
+            NOW / 1000,
+        );
         Self {
             lab,
             config,
@@ -103,6 +181,69 @@ impl Stand {
             claude_ada,
             machine,
         }
+    }
+
+    /// A Mac's login, usage reading (`w7d` tenths of a percent, at `reset`) and quota event
+    /// for `account`, at its uuid `me`, its record's `n` being `n`. The reading says it was read
+    /// `n` seconds after the pass clock, by that Mac's clock: a later record's reads later.
+    pub(super) fn ring_rows(
+        account: &str,
+        me: &str,
+        w7d: u64,
+        reset: u64,
+        n: u64,
+    ) -> Vec<crate::database::Change> {
+        use crate::alab::journal::{
+            EV, LOGIN, USAGE,
+            event::{Event, Kind, Pk, Source, Window, Word},
+        };
+        let key = format!("{account}.{me}");
+        let event = Event {
+            t: NOW / 1000,
+            kind: Kind::Quota,
+            account: Pk::new(account),
+            cli: Word::new("claude").unwrap(),
+            sub: None,
+            window: Some(Window::Week),
+            pct_x10: Some(u16::try_from(w7d).unwrap()),
+            reset: Some(reset / 1000),
+            res: None,
+            until: None,
+            plan: None,
+            src: Source::Statusline,
+            why: None,
+            to: None,
+            tab: None,
+            harness: None,
+            op: None,
+            via: None,
+            program: None,
+        };
+        vec![
+            ring_row(
+                &LOGIN,
+                &key,
+                json!({
+                    "r": 1, "n": n, "account": account, "cli": "claude", "place": "default",
+                    "state": "signed-in", "proof": "status", "src": "profile", "use": "idle",
+                    "tabs": 0, "held": "linked", "since": NOW, "at": NOW, "attempt": "none",
+                }),
+            ),
+            ring_row(
+                &USAGE,
+                &key,
+                json!({
+                    "r": 1, "n": n, "account": account, "w7d": w7d, "w7d_reset": reset,
+                    "wall": "none", "src": "statusline", "read_at": NOW + n * 1000, "at": NOW,
+                    "sessions_7d": 1,
+                }),
+            ),
+            ring_row(
+                &EV,
+                &format!("{me}.{n}"),
+                json!({"r": 1, "n": n, "e": [event.to_value()]}),
+            ),
+        ]
     }
 
     pub(super) fn paths(&self) -> &Paths {
@@ -337,11 +478,11 @@ fn a_read_answers_from_the_snapshot_while_custody_refuses_every_way() {
             .map(|file| stand.file(file).status().rev())
             .collect()
     };
-    assert_eq!(revs(&stand), [1, 1, 1]);
+    assert_eq!(revs(&stand), vec![1; super::FILES.len()]);
     // What each refusal must leave: the same rows at the same revision, whatever the word.
     let untouched = |seen: Seen| {
         assert_eq!(seen, live, "the snapshot is untouched");
-        assert_eq!(revs(&stand), [1, 1, 1]);
+        assert_eq!(revs(&stand), vec![1; super::FILES.len()]);
     };
 
     // 1. FENCED-PENDING. A writer succession reserved a successor whose import never completes.
@@ -378,9 +519,13 @@ fn a_read_answers_from_the_snapshot_while_custody_refuses_every_way() {
     drop(held);
 
     // 3. AN EXCLUDED TABLE, then sharing turned off: `off`, with the last rows still read.
+    // The registry's table and the journal ring's window: every table a file is read from.
+    let mut tables = vec![aterm_codec::hex::encode_lower(&stand.table)];
+    tables.extend(ring_tables(&stand.lab, SEAT, NOW / 1000));
+    let quoted: Vec<String> = tables.iter().map(|table| format!("\"{table}\"")).collect();
     stand.commons(&format!(
-        "[commons]\nexclude_tables = [\"{}\"]\n",
-        aterm_codec::hex::encode_lower(&stand.table)
+        "[commons]\nexclude_tables = [{}]\n",
+        quoted.join(", ")
     ));
     let excluded = stand.pass(true);
     all(&stand, &excluded, Word::Off, Some(Why::Policy));
@@ -499,7 +644,12 @@ fn the_face_is_the_grid_export_with_computed_columns_and_the_revision() {
     let compiled = registry.generation();
     let view = registry.view().unwrap();
     for file in super::FILES {
-        let collection = compiled.collection(file.collection.name).unwrap();
+        // A file of the journal ring or a view has no grid export; the exit test of SF-08
+        // reads their faces.
+        let Some((_, bound)) = file.table() else {
+            continue;
+        };
+        let collection = compiled.collection(bound.name).unwrap();
         let export = grid::export(compiled.table, collection, &view.cells, &[]).unwrap();
         let face = std::fs::read_to_string(stand.root().face(&file.file(), "tsv")).unwrap();
         let (theirs, ours) = (grid_of(&export.text), grid_of(&face));
@@ -572,9 +722,11 @@ fn a_file_with_a_secret_column_is_refused() {
     let emails = Type {
         name: "lab/emails",
         about: "",
-        family: &att::REGISTRY,
         class: Class::Owner,
-        collection: &crate::alab::registry::SEALED_ADDRESS,
+        store: Store::Table {
+            family: &att::REGISTRY,
+            collection: &crate::alab::registry::SEALED_ADDRESS,
+        },
         computed: Computed::None,
         handles: &["addr"],
     };
@@ -600,61 +752,120 @@ fn a_file_with_a_secret_column_is_refused() {
     assert!(handle.check().unwrap_err().contains("handle"));
 }
 
-/// A file's class fits its collection: an owner file projects a cells collection the owner
-/// writes, a Mac file an owned collection keyed by its writer's uuid or a log, and no Mac file
-/// compiles until this build's materializer projects one; every file of this build is an owner
-/// file. The publisher holds what a file's class does not take: an owner file no Mac's
-/// statement, a Mac file no owner's write, a revert included.
+/// A file's class fits what it is bound to: an owner file projects a cells collection of a
+/// catalog table the owner writes; a Mac file an owned collection keyed by its writer's uuid or
+/// a log, a file of the journal ring one of the ring's collections; a derived file a view, and
+/// only a derived file a view. The publisher holds what a file's class does not take: an owner
+/// file no Mac's statement, a Mac file no owner's write, a revert included, and a derived file
+/// nothing at all.
 /// NEGATIVE CONTROL, observed: with `Type::check`'s owner arm refusing nothing, the owner file
-/// over an owned collection is refused for its kind alone, and the assertion prints that rule:
-/// `` this build projects only cells collections: no Mac file compiles until its materializer
-/// does ``; with `Class::refuses` answering `None` for a Mac file, the owner's write to one
-/// passes: `` left: None right: Some("a Mac file takes no owner write") ``.
+/// over an owned collection checks: `` called `Result::unwrap_err()` on an `Ok` value: () ``;
+/// with `Class::refuses` answering `None` for a Mac file, the owner's write to one passes:
+/// `` left: None right: Some("a Mac file takes no owner write") ``.
 #[test]
 fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
     // A Mac file over this build's registry: each Mac's account observations.
     let seen = Type {
         name: "ai/seen",
         about: "",
-        family: &att::REGISTRY,
         class: Class::Mac,
-        collection: &ACCOUNT_OBS,
+        store: Store::Table {
+            family: &att::REGISTRY,
+            collection: &ACCOUNT_OBS,
+        },
         computed: Computed::None,
         handles: &[],
     };
-    let owned = Type {
-        class: Class::Owner,
-        ..seen
-    }
-    .check()
-    .unwrap_err();
-    assert!(
-        owned.contains("an owner file projects a cells collection"),
-        "{owned}"
+    let refused = |file: Type, why: &str| {
+        let said = file.check().unwrap_err();
+        assert!(said.contains(why), "{}: {said}", file.name);
+    };
+    refused(
+        Type {
+            class: Class::Owner,
+            ..seen
+        },
+        "an owner file projects a cells collection",
     );
-    let cells = Type {
-        class: Class::Mac,
-        ..super::ACCOUNTS
-    }
-    .check()
-    .unwrap_err();
-    assert!(
-        cells.contains("a Mac file projects an owned collection"),
-        "{cells}"
+    refused(
+        Type {
+            class: Class::Mac,
+            ..super::ACCOUNTS
+        },
+        "a Mac file projects an owned collection",
     );
-    // A Mac file over an owned collection or a log fits its class (`check` reads no family);
-    // this build compiles neither.
+    // A Mac file over an owned collection or a log fits its class, of a catalog table or of the
+    // journal ring.
     for file in [
         seen,
         Type {
-            collection: &crate::alab::journal::EV,
+            store: Store::Journal(&crate::alab::journal::EV),
             ..seen
         },
+        super::LOGINS,
     ] {
-        let why = file.check().unwrap_err();
-        assert!(why.contains("only cells collections"), "{why}");
+        assert_eq!(file.check(), Ok(()), "{}", file.name);
     }
-    assert!(super::FILES.iter().all(|file| file.class == Class::Owner));
+    refused(
+        Type {
+            store: Store::Journal(&ACCOUNT_OBS),
+            ..seen
+        },
+        "one of the ring's collections",
+    );
+    refused(
+        Type {
+            class: Class::Owner,
+            ..super::LOGINS
+        },
+        "an owner file projects a cells collection",
+    );
+    // A view is a derived file's and only a derived file's.
+    refused(
+        Type {
+            class: Class::Derived,
+            ..seen
+        },
+        "a derived file is a view",
+    );
+    for class in [Class::Owner, Class::Mac] {
+        refused(
+            Type {
+                class,
+                ..super::LIMITS
+            },
+            "a view is a derived file",
+        );
+    }
+    refused(
+        Type {
+            computed: Computed::Kept,
+            ..super::LIMITS
+        },
+        "declares no computed column",
+    );
+    assert_eq!(
+        super::FILES
+            .iter()
+            .map(|file| file.class)
+            .collect::<Vec<_>>(),
+        [
+            Class::Owner,
+            Class::Owner,
+            Class::Owner,
+            Class::Mac,
+            Class::Mac,
+            Class::Mac,
+            Class::Derived
+        ]
+    );
+    assert_eq!(
+        super::FILES
+            .iter()
+            .map(|file| file.kind())
+            .collect::<Vec<_>>(),
+        ["table", "table", "table", "table", "table", "log", "view"]
+    );
 
     let intent = |key: &str, revert: Option<String>| aterm_file::Intent {
         id: "0".repeat(32),
@@ -695,6 +906,12 @@ fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
         Some("a Mac file takes no owner write")
     );
     assert_eq!(Class::Mac.refuses(&mine), None);
+    for intent in [&mine, &write, &revert] {
+        assert_eq!(
+            Class::Derived.refuses(intent),
+            Some("a derived file takes no write: nobody writes a view")
+        );
+    }
 }
 
 /// The status counts the records of a file's collection the replica holds inert: a row a Mac
@@ -719,9 +936,11 @@ fn the_status_counts_the_records_a_file_holds_inert() {
     let seen = Type {
         name: "ai/seen",
         about: "",
-        family: &att::REGISTRY,
         class: Class::Mac,
-        collection: &ACCOUNT_OBS,
+        store: Store::Table {
+            family: &att::REGISTRY,
+            collection: &ACCOUNT_OBS,
+        },
         computed: Computed::None,
         handles: &[],
     };
@@ -1042,7 +1261,11 @@ fn refresh_runs_a_pass_and_reports_each_file() {
         text,
         "ai/accounts: live · snapshot written\n\
          ai/links: live · snapshot written\n\
-         lab/machines: live · snapshot written\n"
+         lab/machines: live · snapshot written\n\
+         ai/logins: live · snapshot written\n\
+         ai/usage: live · snapshot written\n\
+         ai/events: live · snapshot written\n\
+         ai/limits: live · snapshot written\n"
     );
     stand.commons("[commons]\nenabled = false\n");
     let (text, code) = refresh(&["ai/links", "--json"]).unwrap();
@@ -2099,4 +2322,366 @@ fn a_spent_vault_wait_reads_an_unheld_vault_and_a_spent_pass_is_out_of_time_not_
             outcome.detail
         );
     }
+}
+
+/// A text set's snapshot value is its members' texts (LT-15B): on registry.4, `lab/machines`
+/// keeps a Mac's nickname aliases as the aliases, never as nothing.
+/// NEGATIVE CONTROL (run 2026-11-15): with the snapshot reading a set by `Field::members` (the
+/// elements a candidate adds with `true`), the value is empty: `` left: Some(Array([])) ``.
+#[test]
+fn a_text_sets_snapshot_value_is_its_members_texts() {
+    let machine = keys::machine_pk("m7");
+    let mut book = crate::typed::grid::tests::Book::new();
+    book.write(
+        1,
+        &[],
+        vec![crate::typed::grid::tests::elem(
+            &MACHINE,
+            &machine,
+            "nickname_aliases",
+            "Red Balloon",
+        )],
+    );
+    let machines = crate::typed::cell::project(&MACHINE, &book.cells());
+    let column = MACHINE.column("nickname_aliases").unwrap();
+    let field = &machines.rows[&machine].fields["nickname_aliases"];
+    assert_eq!(
+        super::materialize::typed(column, field),
+        Some(json!(["Red Balloon"]))
+    );
+}
+
+/// The journal ring's collections as v0.201.0, the release before this build, compiled them: an
+/// older peer's readers read these and no other.
+const JOURNAL_0_201: [&crate::typed::Collection; 6] = {
+    use crate::alab::journal::{EV, PLACE, RELAY, SUM, UPD, USE};
+    [&EV, &USE, &SUM, &RELAY, &PLACE, &UPD]
+};
+
+/// The event kinds v0.201.0 reads (`git show v0.201.0:crates/aterm-db/src/alab/journal/event.rs`).
+const KINDS_0_201: [&str; 31] = [
+    "session-start",
+    "session-end",
+    "signed-in",
+    "signed-out",
+    "sign-in-failed",
+    "login-ended",
+    "renewed",
+    "wrong-account",
+    "displaced",
+    "auth",
+    "quota",
+    "wall",
+    "wall-cleared",
+    "reset-used",
+    "plan-seen",
+    "credits",
+    "error",
+    "code-requested",
+    "code-received",
+    "switch",
+    "enrolled",
+    "unenrolled",
+    "probe",
+    "token-minted",
+    "token-served",
+    "token-verified",
+    "token-rejected",
+    "token-fallback",
+    "token-offered",
+    "token-removed",
+    "seen",
+];
+
+/// The event keys v0.201.0 reads: an event that carries any other is dropped whole.
+const KEYS_0_201: [&str; 16] = [
+    "a", "c", "h", "k", "p", "plan", "r", "rr", "s", "src", "t", "to", "u", "w", "why", "x",
+];
+
+/// Whether v0.201.0 reads `event`: its keys and its kind are words that build knows.
+fn read_by_0_201(event: &Value) -> bool {
+    let Some(object) = event.as_object() else {
+        return false;
+    };
+    object.keys().all(|key| KEYS_0_201.contains(&key.as_str()))
+        && event["k"]
+            .as_str()
+            .is_some_and(|kind| KINDS_0_201.contains(&kind))
+}
+
+/// SF-08's exit test: the journal ring's rows become shared files. A peer states its login, its
+/// limit reading and its events in the ring beside the rows an older build writes; the record
+/// reaches this Mac only through a peer running the release before this build, which reads it
+/// exactly as it reads a record without the new rows. This Mac's pass projects `ai/logins`,
+/// `ai/usage` and `ai/events` from the ring, holds a row the peer wrote at this Mac's key inert
+/// (in no file, counted in the status), and folds `ai/limits`: the peer's hour-resolution
+/// reading and this Mac's exact one of one week are one instance (the largest percent at the
+/// latest reset), whichever Mac's clock read last; a later week replaces them.
+///
+/// NEGATIVE CONTROLS, observed: with the fold ordered by the reading Mac's clock
+/// (`limits::seam::fold_by_clock` held across the pass), this Mac's later-read 55% wins over the
+/// peer's 60%: `` left: Some(550) right: Some(600) ``; with `owned::read_owned` keeping a row at
+/// any machine's key, not only its signer's, the peer's row at this Mac's key replaces this
+/// Mac's own: `` left: "990" right: "550" ``.
+#[test]
+fn a_peers_login_and_usage_rows_fold_into_its_files_two_readings_of_one_week_merge_by_reset_and_a_foreign_row_is_inert()
+ {
+    use crate::alab::journal::{
+        EV, USAGE, USE,
+        event::{Event, Kind, Pk, Source, Word as EventWord},
+        flush,
+    };
+    use crate::typed::owned;
+    const PEER: usize = 0;
+    const OLD: usize = 2;
+    let stand = Stand::with(&[Role::Writer, Role::Writer, Role::Writer]);
+    let lab = &stand.lab;
+    let ada = stand.claude_ada.clone();
+    let t = NOW / 1000;
+    let (peer, me, old) = (uuid_of(lab, PEER), uuid_of(lab, SEAT), uuid_of(lab, OLD));
+
+    // The peer, on this build: its login, its reading of the week to the hour (60% at RESET),
+    // a row at this Mac's key, and events of the words only this build has.
+    let mut record = Stand::ring_rows(&ada, &peer, 600, RESET, 1);
+    record.push(ring_row(
+        &USAGE,
+        &format!("{ada}.{me}"),
+        json!({
+            "r": 1, "n": 9, "account": ada, "w7d": 990, "w7d_reset": RESET + 7 * 86_400_000,
+            "wall": "none", "src": "statusline", "read_at": NOW, "at": NOW, "sessions_7d": 1,
+        }),
+    ));
+    let event = |kind: Kind| Event {
+        t,
+        kind,
+        account: Pk::new(&ada),
+        cli: EventWord::new("claude").unwrap(),
+        sub: None,
+        window: None,
+        pct_x10: None,
+        reset: None,
+        res: None,
+        until: None,
+        plan: None,
+        src: Source::SigninFlow,
+        why: None,
+        to: None,
+        tab: None,
+        harness: None,
+        op: None,
+        via: None,
+        program: None,
+    };
+    let decided = Event {
+        account: None,
+        cli: EventWord::new("aterm").unwrap(),
+        src: Source::File,
+        op: EventWord::new("0123456789abcdef"),
+        via: EventWord::new("set"),
+        program: EventWord::new("claude"),
+        ..event(Kind::Decided)
+    };
+    let batch: Vec<Value> = [
+        event(Kind::SessionStart),
+        event(Kind::SignInBlocked),
+        event(Kind::NoRoute),
+        decided,
+    ]
+    .iter()
+    .map(Event::to_value)
+    .collect();
+    record.push(ring_row(
+        &EV,
+        &format!("{peer}.2"),
+        json!({"r": 1, "n": 2, "e": batch}),
+    ));
+    state_ring(lab, PEER, record, t);
+    // The older peer writes what v0.201.0 writes: a `use` row and an event batch.
+    state_ring(
+        lab,
+        OLD,
+        vec![
+            ring_row(
+                &USE,
+                &format!("{ada}.{old}"),
+                json!({
+                    "r": 2, "n": 1, "period": t / 604_800, "first": t, "last_start": t,
+                    "last_end": t, "sessions_7d": 1, "quota": [], "wall": [], "account": ada,
+                }),
+            ),
+            ring_row(
+                &EV,
+                &format!("{old}.1"),
+                json!({"r": 1, "n": 1, "e": [event(Kind::SessionEnd).to_value()]}),
+            ),
+        ],
+        t,
+    );
+    // This Mac restates its reading of the same week, to the second and half an hour later
+    // than the peer's: 55% at RESET + 30 minutes, read later by its clock.
+    state_ring(
+        lab,
+        SEAT,
+        Stand::ring_rows(&ada, &me, 550, RESET + 1_800_000, 2),
+        t,
+    );
+
+    // The peer's record reaches this Mac through the older peer only.
+    let clocks = [t; 3];
+    repair_commons_among(lab, 2, &[OLD, PEER], &clocks);
+    repair_commons_among(lab, 2, &[OLD, SEAT], &clocks);
+
+    // THE OLDER PEER reads the record as v0.201.0 does: every row of its collections, and
+    // nothing of the new ones, exactly as if the record carried no new row.
+    {
+        let bootstrap = lab.bootstrap(OLD);
+        let session = crate::table::Session::open(&bootstrap).unwrap();
+        let directory = crate::catalog::Directory::new(&lab.paths[OLD], bootstrap.trust());
+        let window = flush::window(&session, &directory, t).unwrap();
+        let resolve = owned::commons::historical(&session);
+        let new = |collection: &str| collection == "login" || collection == "usage";
+        assert!(
+            window.ops.iter().any(|op| op
+                .changes
+                .iter()
+                .any(|change| change.key == format!("{ada}.{peer}") && new(&change.collection))),
+            "the older peer holds the peer's new rows"
+        );
+        let stripped: Vec<owned::Op> = window
+            .ops
+            .iter()
+            .cloned()
+            .map(|mut op| {
+                op.changes.retain(|change| !new(&change.collection));
+                op
+            })
+            .collect();
+        let read = |ops: &[owned::Op]| -> Vec<String> {
+            JOURNAL_0_201
+                .iter()
+                .map(|collection| match collection.kind {
+                    crate::typed::Kind::Log => {
+                        format!("{:?}", owned::read_log(collection, ops, &resolve))
+                    }
+                    crate::typed::Kind::Owned | crate::typed::Kind::Cells => {
+                        format!("{:?}", owned::read_owned(collection, ops, &resolve))
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(read(&window.ops), read(&stripped));
+        let uses = owned::read_owned(&USE, &window.ops, &resolve);
+        assert!(uses.rows.contains_key(&format!("{ada}.{old}")), "{uses:?}");
+        // Of the peer's new events it reads the words it knows and drops the rest, one by one.
+        let log = owned::read_log(&EV, &window.ops, &resolve);
+        let batch = log
+            .entries
+            .iter()
+            .find(|entry| keys::uuid32(&entry.machine) == peer && entry.n == 2)
+            .expect("the peer's batch");
+        let kinds: Vec<&str> = batch.value["e"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| read_by_0_201(event))
+            .map(|event| event["k"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["session-start"]);
+    }
+
+    // THIS MAC'S PASS projects every file from the ring.
+    all(&stand, &stand.pass(true), Word::Live, None);
+    let logins = stand.file(&super::LOGINS).read();
+    let keyed: Vec<&str> = logins.rows().iter().map(|row| row.pk.as_str()).collect();
+    assert!(
+        keyed.contains(&format!("{ada}.{peer}").as_str()),
+        "{keyed:?}"
+    );
+    assert!(keyed.contains(&format!("{ada}.{me}").as_str()), "{keyed:?}");
+    assert!(!keyed.iter().any(|key| key.ends_with(&old)), "{keyed:?}");
+    assert_eq!(
+        logins.named(&format!("{ada}.{peer}"))[0].cell("state"),
+        "signed-in"
+    );
+
+    let usage = stand.file(&super::USAGE).read();
+    let mine = &usage.named(&format!("{ada}.{me}"));
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        mine[0].cell("w7d"),
+        "550",
+        "the row at this Mac's key is its own"
+    );
+    assert!(
+        usage.status.state.as_ref().unwrap().inert.unwrap() >= 1,
+        "the peer's row at this Mac's key is inert"
+    );
+    assert_eq!(usage.named(&format!("{ada}.{peer}"))[0].cell("w7d"), "600");
+
+    let events = stand.file(&super::EVENTS).read();
+    let kinds: Vec<&str> = events.rows().iter().map(|row| row.cell("kind")).collect();
+    for kind in [
+        "session-start",
+        "sign-in-blocked",
+        "no-route",
+        "decided",
+        "session-end",
+        "quota",
+    ] {
+        assert!(kinds.contains(&kind), "{kind}: {kinds:?}");
+    }
+    let decided = events
+        .rows()
+        .iter()
+        .find(|row| row.cell("kind") == "decided")
+        .unwrap();
+    assert_eq!(
+        (
+            decided.cell("op"),
+            decided.cell("via"),
+            decided.cell("program")
+        ),
+        ("0123456789abcdef", "set", "claude")
+    );
+    assert_eq!(
+        decided.values.get("at"),
+        Some(&json!(NOW)),
+        "an event's time in milliseconds"
+    );
+
+    // AI/LIMITS: one instance of the week, the peer's 60% at this Mac's reset, two readers.
+    let limit = |stand: &Stand| {
+        let limits = stand.file(&super::LIMITS).read();
+        let row = limits.named(&ada);
+        assert_eq!(row.len(), 1, "{:?}", limits.rows());
+        row[0].clone()
+    };
+    let week = limit(&stand);
+    assert_eq!(week.values.get("w7d").and_then(Value::as_u64), Some(600));
+    assert_eq!(
+        week.values.get("w7d_reset").and_then(Value::as_u64),
+        Some(RESET + 1_800_000)
+    );
+    assert_eq!(
+        week.cell("readers"),
+        "2",
+        "the older peer states no reading"
+    );
+    assert_eq!(week.cell("account_slug"), "claude-fb-alpha");
+
+    // A LATER WEEK: the peer reads the next instance at 3%, and it replaces both readings.
+    state_ring(
+        lab,
+        PEER,
+        Stand::ring_rows(&ada, &peer, 30, RESET + 7 * 86_400_000, 3),
+        t,
+    );
+    repair_commons_among(lab, 2, &[PEER, SEAT], &clocks);
+    all(&stand, &stand.pass(true), Word::Live, None);
+    let next = limit(&stand);
+    assert_eq!(next.values.get("w7d").and_then(Value::as_u64), Some(30));
+    assert_eq!(
+        next.values.get("w7d_reset").and_then(Value::as_u64),
+        Some(RESET + 7 * 86_400_000)
+    );
 }

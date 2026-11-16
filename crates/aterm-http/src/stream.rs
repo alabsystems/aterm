@@ -447,9 +447,11 @@ pub struct Interrupt {
 }
 
 impl Interrupt {
-    /// Wake pending I/O and prevent further network operations on the stream.
+    /// Wake pending I/O and prevent further network operations on the stream: both halves are
+    /// shut, and on Windows, whose `shutdown` ends no `recv` already waiting, the socket's pending
+    /// I/O is cancelled too (`aterm_uds::hangup::hang_up`).
     pub fn interrupt(&self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        let _ = aterm_uds::hangup::hang_up(&self.socket);
     }
 }
 

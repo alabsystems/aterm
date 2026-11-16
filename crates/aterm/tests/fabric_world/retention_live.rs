@@ -179,7 +179,7 @@ fn every_reader_reads_on_past_the_brokers_own_cut() {
             (
                 astream_cap::producer_id_of("n-filler"),
                 seq,
-                format!("/f/{FLEET}/pub/n-filler/s-filler/ev"),
+                format!("/f/{FLEET}/pub/n-filler/t04gefjd7ey/ev"),
                 vec![b'e'; BODY],
             )
         })

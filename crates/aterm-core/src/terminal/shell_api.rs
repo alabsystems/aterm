@@ -236,7 +236,51 @@ impl Terminal {
     #[must_use]
     #[inline]
     pub const fn program_state(&self) -> super::program_state::ProgramStateReport {
-        self.program_state
+        self.program_state.report()
+    }
+
+    /// THE TURNS THE PROGRAM'S REPORTS DREW PAST `after` (OSC 7501,
+    /// [`super::program_state::ProgramTurns::after`]): into `out`, oldest first, each kept turn
+    /// with an edge newer than the cursor (every kept turn for `None`), answering how many turns
+    /// kept after the cursor are no longer kept. A status sweep reads them beside
+    /// [`Self::program_state`] under the same guard, so no edge comes between the two.
+    ///
+    /// # Example
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+    /// term.process(b"\x1b]7501;state=done:app=codex\x1b\\");
+    /// let mut turns = Vec::new();
+    /// assert_eq!(term.program_turns_after(None, &mut turns), 0);
+    /// assert!(turns[0].began.is_some() && turns[0].ended.is_some());
+    /// let head = term.program_turns().head(term.program_state().seq);
+    /// assert_eq!(term.program_turns_after(Some(head), &mut turns), 0);
+    /// assert!(turns.is_empty(), "nothing past the head");
+    /// ```
+    #[inline]
+    pub fn program_turns_after(
+        &self,
+        after: Option<super::program_state::TurnCursor>,
+        out: &mut Vec<super::program_state::ProgramTurn>,
+    ) -> u64 {
+        self.program_state.turns().after(after, out)
+    }
+
+    /// The turns the program's reports drew ([`super::program_state::ProgramTurns`]).
+    #[must_use]
+    #[inline]
+    pub const fn program_turns(&self) -> &super::program_state::ProgramTurns {
+        self.program_state.turns()
+    }
+
+    /// The bytes the host parses next are process group `pgid`'s, the group in front of this
+    /// terminal's PTY when it read them: a report is a run sign only while its writer's group is
+    /// in front ([`super::program_state::ProgramStateReport::run_sign`]).
+    #[inline]
+    pub const fn program_front_is(&mut self, pgid: i32) {
+        self.program_state.front_is(pgid);
     }
 }
 

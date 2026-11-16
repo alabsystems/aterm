@@ -79,6 +79,7 @@ pub(super) fn prepare_with(
         build: package.build_number,
         exposes: package.exposes.clone(),
         shim_env: package.shim_env.clone(),
+        harness: None,
     };
     let row = BottleRow {
         triple: request.triple,

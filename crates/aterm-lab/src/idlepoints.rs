@@ -92,7 +92,8 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
             continue;
         }
         let rows = halfdraw::screen(&t);
-        let phase = reader.phase_seen(&rows, reader.runs(title.as_deref()));
+        let report = t.program_state().run_sign();
+        let phase = reader.phase_seen(&rows, reader.runs(title.as_deref(), report.as_deref()));
         let drawn_idle = reader.phase(&rows) == Phase::Idle;
         let composer = reader.composer(&rows);
         let typed = composer
@@ -803,7 +804,7 @@ fn gate_dir(dir: &Path) -> Result<(String, usize), Fail> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".journal.jsonl"))
-                .is_some_and(aterm_types::tab_id::is_tab_id)
+                .is_some_and(aterm_types::control_verbs::is_minted_sid)
         })
         .collect();
     rd.sort();

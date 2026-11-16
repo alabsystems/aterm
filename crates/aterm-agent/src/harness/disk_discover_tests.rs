@@ -2911,7 +2911,10 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(seen.is_err_and(|why| why.contains("working directory")));
     assert!(err.to_string().contains("uses"), "{err}");
     let user = format!("process {} uses", tests.id());
-    assert!(shipped.to_string().contains(&user), "{shipped}");
+    assert!(
+        shipped.to_string().contains(&user),
+        "expected {user}; targeted scan: {err}; global scan: {shipped}"
+    );
     assert!(gone.join("debug/deps/liblay.rlib").exists());
 
     // One program from its start, the file its stdin: a shell that opened it and then exec'd
@@ -2939,7 +2942,10 @@ fn a_process_running_from_an_ended_sessions_build_keeps_it() {
     assert!(seen.is_err_and(|why| why.contains("open file")));
     assert!(err.to_string().contains("uses"), "{err}");
     let user = format!("process {} uses", holder.id());
-    assert!(shipped.to_string().contains(&user), "{shipped}");
+    assert!(
+        shipped.to_string().contains(&user),
+        "expected {user}; targeted scan: {err}; global scan: {shipped}"
+    );
     assert!(gone.join("debug/deps/liblay.rlib").exists());
 
     // Both are reaped, so no listing names them, and their pids are free: a process that

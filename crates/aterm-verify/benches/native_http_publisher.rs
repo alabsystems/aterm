@@ -42,7 +42,7 @@ mod native {
     use std::time::Instant;
 
     const SLUG: &str = "fixture-dev/app";
-    const REFS: [&str; 2] = ["refs/heads/main", "refs/aterm/judged"];
+    const REFS: [&str; 2] = ["refs/heads/main", "refs/aterm/record"];
     type Probe = Arc<Mutex<Vec<NativePushTiming>>>;
 
     struct Case {

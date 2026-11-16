@@ -12,15 +12,19 @@
 //!
 //! A handoff directory holds exactly one pair: [`TARGET`]'s zip for the version
 //! (`aterm-<version>-windows-x86_64.zip`, `WindowsTarget::asset_name`) and its receipt
-//! ([`receipt_name`]). [`admit`] holds the receipt to the cut (its version, build and commit,
-//! the commit's tree), its compiler to the commit's pins ([`Pins`]), and the zip to the
-//! receipt (a regular file of its size and SHA-256) and to what a Windows release is
-//! (`WindowsTarget::validate_zip`). A name starting with `.` (a `.DS_Store` a Finder copy
-//! leaves) is no part of a carry and is passed over; any other name is refused.
+//! ([`receipt_name`]), and may hold the receipt's attestation (`crate::attest`), which the
+//! pull lane (`crate::pull`) brings in place of a typed digest. [`admit`] holds the receipt
+//! to the cut (its version, build and commit, the commit's tree), its compiler to the
+//! commit's pins ([`Pins`]), and the zip to the receipt (a regular file of its size and
+//! SHA-256) and to what a Windows release is (`WindowsTarget::validate_zip`). A name
+//! starting with `.` (a `.DS_Store` a Finder copy leaves) is no part of a carry and is passed
+//! over; any other name is refused.
 //!
 //! Admission proves the pair agrees with itself and the cut, not who wrote it: the cutter also
 //! holds the zip to the SHA-256 the person read off the Windows host's console
-//! ([`Receipt::check_carried`]), which whoever can write where the pair travels cannot set.
+//! ([`Receipt::check_carried`]), which whoever can write where the pair travels cannot set, or,
+//! for a pair the pull lane brought, the receipt to the attestation of a builder the release
+//! commit pins (`crate::attest::verify_beside`).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -541,7 +545,9 @@ pub fn missing(directory: &Path, version: &str) -> Result<Vec<String>, String> {
 }
 
 /// Admit `directory` as `cut`'s Windows handoff under `pins`: it holds [`TARGET`]'s zip for
-/// the version and its receipt and no other name (one starting with `.` is passed over); the
+/// the version and its receipt, may hold the receipt's attestation
+/// (`crate::pull::attestation_name`, which `crate::attest::verify_beside` checks; admission
+/// only passes it over), and no other name (one starting with `.` is passed over); the
 /// receipt is the cut's ([`Receipt::check_identity`]), of the commit's tree and an admitted
 /// compiler ([`Receipt::check_sources`]); the zip is the receipt's ([`Receipt::verify_zip`]).
 /// The receipt it admitted.
@@ -551,6 +557,7 @@ pub fn missing(directory: &Path, version: &str) -> Result<Vec<String>, String> {
 pub fn admit(directory: &Path, cut: &Cut<'_>, pins: &Pins<'_>) -> Result<Receipt, String> {
     let asset = TARGET.asset_name(cut.version);
     let receipt = receipt_name(&asset);
+    let attestation = crate::pull::attestation_name(&asset);
     let entries =
         std::fs::read_dir(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
     for entry in entries {
@@ -561,12 +568,13 @@ pub fn admit(directory: &Path, cut: &Cut<'_>, pins: &Pins<'_>) -> Result<Receipt
                 directory.display()
             )
         })?;
-        if name.starts_with('.') || name == asset || name == receipt {
+        if name.starts_with('.') || name == asset || name == receipt || name == attestation {
             continue;
         }
         return Err(format!(
             "the Windows handoff directory {} holds {name:?}, which is no part of v{}'s pair \
-             ({asset} and {receipt}): a carry holds that pair and nothing else; remove it",
+             ({asset} and {receipt}, and its attestation {attestation}): a carry holds that \
+             and nothing else; remove it",
             directory.display(),
             cut.version
         ));

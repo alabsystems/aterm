@@ -123,12 +123,14 @@ fn the_spans_land_on_the_written_tail_edit() {
         assert!(hit.cols.0 > chips_end, "{fact:?} past the chips");
     }
     let model = fact_hit(&app, wid, Fact::Model);
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+    let ws = &mut **field_guard_ws;
     assert!(
         crate::claude_footer::undo(&mut ws.claude_footer_undo, &mut ws.input_scratch),
         "CONTROL: the footer's write comes off"
     );
     ws.input_scratch.combining[model.frame_row].push((model.cols.0, Box::new(['\u{301}'])));
+    drop(field_guard_ws);
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     app.splice_claude_footer(wid, &plan, route);
     let lights = &app.windows[&wid].claude_lights;
@@ -1010,7 +1012,7 @@ fn the_hidden_state_is_the_sessions_in_every_view_of_it() {
         .expect("a second view of the session");
     app.pool.attach(session);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         assert!(
             ws.tab_set
                 .active_mut()
@@ -1333,7 +1335,7 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
     // Open a stats lens card covering the whole window: it must evict the hovered fact
     // and shield `claude_glass_at` and `resolve_hover_cursor` while open.
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.stats_lens.open = Some(crate::stats_lens::Lens {
             focus: crate::stats_paint::Instrument::Cpu,
             bar: crate::stats_paint::Bar::Global,
@@ -1380,7 +1382,7 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
     app.refresh_glass_cursor_for_frame(wid);
     assert_eq!(app.windows[&wid].claude_lights.hover, None);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.stats_lens.open = None;
         ws.stats_lens.rect = None;
     }

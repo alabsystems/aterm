@@ -1004,6 +1004,7 @@ fn close_safety_counts_all_same_session_views_inside_the_window() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.tab_set.active_mut())
             .is_some_and(
                 |tab| tab.split_focused(crate::tab_model::SplitAxis::Horizontal, second_view,)
@@ -1355,6 +1356,7 @@ fn a_vetoed_async_echo_is_parked_past_a_configure_round_trip() {
     let deadline = now + std::time::Duration::from_millis(20);
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|ws| ws.initial_frame_settle.as_mut())
         .expect("armed")
         .deadline = deadline;
@@ -1388,7 +1390,7 @@ fn a_synchronous_settle_grant_applies_the_granted_size_in_place_of_the_echo() {
     app.apply_window_resized_grid(wid, intended);
     assert_eq!(rows(&app), (24, 24));
     let deadline = settle_state(&app).expect("armed").deadline;
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.pending_resize = Some(echo);
         ws.next_resize_settle = Some(Instant::now());
     }

@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn the_tag_round_trips_and_refuses_what_it_cannot_trust() {
     let tag = Tag {
-        sid: Some("s-00ff".into()),
+        sid: Some("t00000000ff".into()),
         owner: Some(4242),
         rekey: true,
         loader: false,
@@ -16,7 +16,11 @@ fn the_tag_round_trips_and_refuses_what_it_cannot_trust() {
         slog_ep: Some(1_792_000_000),
     };
     assert_eq!(Tag::decode(&tag.encode()), Some(tag));
-    assert_eq!(Tag::decode(b"v=2\nsid=s-00\n"), None, "another version");
+    assert_eq!(
+        Tag::decode(b"v=2\nsid=t00000000ff\n"),
+        None,
+        "another version"
+    );
     let hostile = Tag::decode(
         b"v=1\nsid=../../x\nidentity=a b\nowner=zz\nhanded=1\nkeyed=0:1\nnew=1\nslog_ep=zz\n",
     )
@@ -26,33 +30,28 @@ fn the_tag_round_trips_and_refuses_what_it_cannot_trust() {
         Tag::default(),
         "a sid, owner or parent that is not one is dropped; unknown keys ignored"
     );
-    let retired = Tag::decode(b"v=1\nsid=s-00ff\nidentity=worker\n").expect("v1");
-    assert_eq!(retired.sid.as_deref(), Some("s-00ff"));
+    let retired = Tag::decode(b"v=1\nsid=t00000000ff\nidentity=worker\n").expect("v1");
+    assert_eq!(retired.sid.as_deref(), Some("t00000000ff"));
     assert!(!retired.encode().windows(9).any(|w| w == b"identity="));
     assert!(tag_under_the_wire_bound());
-    let older = Tag::decode(b"v=1\nsid=s-00ff\nowner=7\n").expect("v1");
+    let older = Tag::decode(b"v=1\nsid=t00000000ff\nowner=7\n").expect("v1");
     assert_eq!(older.slog_ep, None);
     assert_eq!(Tag::decode(b"v=1\nslog_ep=0\n").unwrap().slog_ep, None);
     assert_eq!(Tag::decode(b"v=1\nslog_ep=-3\n").unwrap().slog_ep, None);
 }
 
-/// A tag names its tab in either form: an `s-` tag keeps its sid (the ID an earlier build's
-/// shell holds), a `t` tag is read, and a malformed sid of either form is dropped.
+/// A tag names its tab by a tab ID or by a legacy tab's exact `s-` ID (the ID a shell opened
+/// before the `t` form holds), and drops anything else: a loose `s-` form or a malformed `t` one.
 #[test]
-fn a_tag_reads_a_tab_id_in_either_form_and_drops_a_malformed_one() {
+fn a_tag_reads_a_tab_id_or_a_legacy_one_and_drops_a_malformed_one() {
     let sid_of = |sid: &str| {
         Tag::decode(format!("v=1\nsid={sid}\nowner=7\n").as_bytes())
             .expect("v1")
             .sid
     };
-    // An `s-` tag keeps the looser shape earlier builds wrote (any hex, upper case too, at most 64
-    // characters): the tab's shell holds that ID, so it is read as written.
-    for kept in [
-        "s-1a2b3c4d5e6f70819203",
-        "s-1A2B3C4D5E6F70819203",
-        "tqn5r6e0148",
-        "t0000000000",
-    ] {
+    // A legacy tab's tag keeps its `s-` and 20 lower-case hex digits: the tab's shell holds that
+    // ID until aterm restores the tab, so it is read as written.
+    for kept in ["s-1a2b3c4d5e6f70819203", "tqn5r6e0148", "t0000000000"] {
         assert_eq!(sid_of(kept).as_deref(), Some(kept), "{kept}");
         let tag = Tag {
             sid: Some(kept.to_string()),
@@ -60,9 +59,16 @@ fn a_tag_reads_a_tab_id_in_either_form_and_drops_a_malformed_one() {
         };
         assert_eq!(Tag::decode(&tag.encode()), Some(tag), "{kept} round-trips");
     }
+    // NEGATIVE CONTROL: the looser `s-` shapes earlier builds took (upper-case hex, another
+    // length, a name) are no tab's ID any more.
     for malformed in [
         "s-",
         "s-xyz",
+        "s-00ff",
+        "s-1A2B3C4D5E6F70819203",
+        "s-1a2b3c4d5e6f7081920",
+        "s-1a2b3c4d5e6f708192034",
+        "S-1a2b3c4d5e6f70819203",
         "S-1a2b",
         "t",
         "t000000000",
@@ -75,9 +81,12 @@ fn a_tag_reads_a_tab_id_in_either_form_and_drops_a_malformed_one() {
     }
 }
 
+/// A tag at its longest (the longest sid it keeps, a legacy tab's, and every field at its widest)
+/// round-trips within the wire's bound.
 fn tag_under_the_wire_bound() -> bool {
     let long = Tag {
-        sid: Some(format!("s-{}", "f".repeat(62))),
+        // The longest ID a tag takes: a legacy tab's `s-` and 20 hex digits.
+        sid: Some(format!("s-{}", "f".repeat(20))),
         owner: Some(u32::MAX),
         rekey: true,
         loader: true,
@@ -1154,11 +1163,11 @@ fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
     );
 }
 
-/// A META not sent (not built, no link, a full queue) is retried on the next pass: the
-/// pump records only the fingerprints it sent.
+/// A META no link took is sent once one does; the pump records only the fingerprints it sent,
+/// and sends again only when the fingerprint or the session's fabric moves.
 #[cfg(unix)]
 #[test]
-fn a_meta_that_was_not_sent_is_retried() {
+fn a_meta_is_sent_once_a_link_takes_it_and_again_only_when_it_moves() {
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
     term.lock().expect("term").process(b"\x1b[?2004h");
     let session = crate::session_store::test_handle(7);
@@ -1185,11 +1194,17 @@ fn a_meta_that_was_not_sent_is_retried() {
     let unchanged = |_, _: &crate::fabric::KeeperCarry| -> Option<Vec<u8>> {
         panic!("an unchanged fingerprint and fabric build nothing")
     };
+    let sends = |n| Pass {
+        sent: n,
+        pending: false,
+    };
 
-    assert_eq!(meta_pass_over(&state, |_, _| None), 0);
-    assert_eq!(last(), None, "a META that was not built is tried again");
-    assert_eq!(meta_pass_over(&state, build), 0);
-    assert_eq!(last(), None, "a META no link took is tried again");
+    assert_eq!(meta_pass_over(&state, build), sends(0));
+    assert_eq!(
+        last(),
+        None,
+        "a META no link took is tried again (the link's start rings the pump)"
+    );
 
     let link = KeeperLink::start(
         std::path::PathBuf::from("/nonexistent-aterm-keeper-test/k.sock"),
@@ -1198,14 +1213,18 @@ fn a_meta_that_was_not_sent_is_retried() {
     )
     .expect("link");
     state.lock().expect("state").phase = Phase::Live(Arc::new(link));
-    assert_eq!(meta_pass_over(&state, build), 1, "the retry sends it");
+    assert_eq!(
+        meta_pass_over(&state, build),
+        sends(1),
+        "the retry sends it"
+    );
     let sent = Fingerprint::of(&term.lock().expect("term"));
     assert_eq!(
         last().map(|(fingerprint, _)| fingerprint),
         Some(sent),
         "what was sent is recorded"
     );
-    assert_eq!(meta_pass_over(&state, unchanged), 0);
+    assert_eq!(meta_pass_over(&state, unchanged), sends(0));
 
     let held = crate::fabric::Hold {
         reason: "stop".to_string(),
@@ -1221,19 +1240,23 @@ fn a_meta_that_was_not_sent_is_retried() {
             .clone_from(bytes.as_ref().expect("a META"));
         bytes
     };
-    assert_eq!(meta_pass_over(&state, capture), 1, "a hold sends it");
+    assert_eq!(meta_pass_over(&state, capture), sends(1), "a hold sends it");
     let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
     assert_eq!(recovered.holds, ["local stop"]);
-    assert_eq!(meta_pass_over(&state, unchanged), 0);
+    assert_eq!(meta_pass_over(&state, unchanged), sends(0));
     let halt = crate::fabric::Hold {
         reason: "halt".to_string(),
         origin: "fleet".to_string(),
     };
     assert!(crate::fabric::apply_hold_for_test(&session.ctx, Some(halt)));
-    assert_eq!(meta_pass_over(&state, capture), 1, "a second hold sends it");
+    assert_eq!(
+        meta_pass_over(&state, capture),
+        sends(1),
+        "a second hold sends it"
+    );
     let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
     assert_eq!(recovered.holds, ["fleet halt", "local stop"]);
-    assert_eq!(meta_pass_over(&state, unchanged), 0);
+    assert_eq!(meta_pass_over(&state, unchanged), sends(0));
     assert_eq!(
         session
             .ctx
@@ -1241,22 +1264,423 @@ fn a_meta_that_was_not_sent_is_retried() {
             .topic_add("builds", "head", &session.ctx.timeline),
         Ok(true)
     );
-    assert_eq!(meta_pass_over(&state, capture), 1, "a topic sends it");
+    assert_eq!(
+        meta_pass_over(&state, capture),
+        sends(1),
+        "a topic sends it"
+    );
     assert!(crate::fabric::apply_hold_for_test(&session.ctx, None));
-    assert_eq!(meta_pass_over(&state, capture), 1, "a lift sends it");
+    assert_eq!(meta_pass_over(&state, capture), sends(1), "a lift sends it");
     let recovered = crate::seamless::recovered_fabric(&sent_meta.lock().expect("capture"));
     assert_eq!(
         (recovered.holds, recovered.topics),
         (Vec::<String>::new(), vec!["builds head".to_string()]),
         "the last META sent is the fabric as it stands"
     );
-    assert_eq!(meta_pass_over(&state, unchanged), 0);
+    assert_eq!(meta_pass_over(&state, unchanged), sends(0));
     let phase = std::mem::replace(&mut state.lock().expect("state").phase, Phase::Off);
     if let Phase::Live(link) = phase
         && let Ok(link) = Arc::try_unwrap(link)
     {
         link.shutdown();
     }
+}
+
+/// A pass leaves pending (for the pump's [`META_POLL`] retry) only what no ring tells of: an
+/// engine another thread holds, a META the full queue refused or that waits behind an owed op,
+/// an op still owed. A META too big to build is not tried again until its inputs move.
+#[cfg(unix)]
+#[test]
+fn a_pass_is_pending_only_for_what_no_ring_tells_of() {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let session = crate::session_store::test_handle(8);
+    let link = TestLink::bare();
+    link.state.lock().expect("state").tracked.insert(
+        8,
+        Tracked {
+            rdev: 8,
+            prior_claim: false,
+            term: Arc::downgrade(&term),
+            fabric: Arc::downgrade(&session.ctx.fabric),
+            last: None,
+        },
+    );
+    let build = |meta, fabric: &crate::fabric::KeeperCarry| {
+        crate::seamless::keeper_meta_of(meta, Some(fabric))
+    };
+    let unchanged = |_, _: &crate::fabric::KeeperCarry| -> Option<Vec<u8>> {
+        panic!("unchanged inputs build nothing")
+    };
+    let pass = |pending, sent| Pass { sent, pending };
+
+    {
+        let _busy = term.lock().expect("the reader's hold");
+        assert_eq!(
+            meta_pass_over(&link.state, build),
+            pass(true, 0),
+            "an engine another thread holds"
+        );
+    }
+    assert_eq!(meta_pass_over(&link.state, build), pass(false, 1));
+    assert_eq!(
+        meta_pass_over(&link.state, unchanged),
+        pass(false, 0),
+        "nothing moved: the pump waits for a ring"
+    );
+
+    link.fill();
+    term.lock().expect("term").process(b"\x1b[?2004h");
+    assert_eq!(
+        meta_pass_over(&link.state, build),
+        pass(true, 0),
+        "the full queue refused it"
+    );
+    let _ = link.take_queued();
+    assert_eq!(meta_pass_over(&link.state, build), pass(false, 1));
+
+    link.fill();
+    link.release_companion(8);
+    assert_eq!(link.owed(), 1, "premise: an op is owed");
+    let _ = link.take_queued();
+    link.fill_but(1);
+    term.lock().expect("term").process(b"\x1b[?1h");
+    assert_eq!(
+        meta_pass_over(&link.state, build),
+        pass(true, 0),
+        "the owed op took the last place; the META waits behind it"
+    );
+    assert_eq!(link.owed(), 0);
+    let _ = link.take_queued();
+    assert_eq!(meta_pass_over(&link.state, build), pass(false, 1));
+
+    term.lock().expect("term").process(b"\x1b[?1l");
+    assert_eq!(
+        meta_pass_over(&link.state, |_, _| None),
+        pass(false, 0),
+        "a META over the wire's bound at its tersest"
+    );
+    assert_eq!(
+        meta_pass_over(&link.state, unchanged),
+        pass(false, 0),
+        "is built again only once its inputs move"
+    );
+    term.lock().expect("term").process(b"\x1b[?1h");
+    assert_eq!(meta_pass_over(&link.state, build), pass(false, 1));
+}
+
+/// The link on, for a watch whose rings this thread counts ([`rings`]).
+#[cfg(unix)]
+const COUNTED: MetaRing = MetaRing {
+    on: || true,
+    ring: ring_meta,
+};
+
+/// A reader's slice through `watch`: one hold of `term` in which `bytes` are parsed, and the
+/// rings made once it is dropped.
+#[cfg(unix)]
+fn slice(watch: &mut MetaWatch, term: &mut Terminal, bytes: &[u8]) -> u64 {
+    let before = rings();
+    watch.hold(term);
+    term.process(bytes);
+    watch.saw(term);
+    assert_eq!(rings(), before, "nothing rings under the slice's hold");
+    watch.ring();
+    rings() - before
+}
+
+/// The PTY reader rings the META pump when, and only when, a slice moved what a META's
+/// fingerprint reads, and only once the slice's hold is dropped: plain output and a re-asserted
+/// mode ring nothing, as each later mode change's single ring shows. With the link off it
+/// fingerprints nothing and rings nothing.
+#[cfg(unix)]
+#[test]
+fn the_reader_rings_the_pump_only_for_a_slice_that_moved_the_fingerprint() {
+    let mut term = Terminal::new(24, 80);
+    let mut watch = MetaWatch::new(COUNTED);
+    assert_eq!(slice(&mut watch, &mut term, b"plain"), 1, "the first sight");
+    assert_eq!(
+        slice(&mut watch, &mut term, b" text\r\n"),
+        0,
+        "plain output"
+    );
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?2004h"),
+        1,
+        "bracketed paste"
+    );
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?2004h"),
+        0,
+        "re-asserted"
+    );
+    assert_eq!(slice(&mut watch, &mut term, b"more plain text"), 0);
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[>1u"),
+        1,
+        "a kitty keyboard push"
+    );
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[>4;2m"),
+        1,
+        "modifyOtherKeys"
+    );
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?2026h"),
+        0,
+        "synchronized output is not carried"
+    );
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?1049h"),
+        1,
+        "the alternate screen"
+    );
+
+    let mut off = MetaWatch::new(MetaRing {
+        on: || false,
+        ring: ring_meta,
+    });
+    assert_eq!(slice(&mut off, &mut term, b"\x1b[?1h"), 0, "the link off");
+    assert_eq!(off.seen, None, "the link off fingerprints nothing");
+}
+
+/// A host-side change between slices (a reset, `mainscreen`, a config install) rings the pump by
+/// itself, and the watch does not take it for the program's: the program's next slice that puts
+/// back what the reader last saw moved the fingerprint, so it rings, and the pump sends the
+/// program's modes again. A host-side change that rang nothing is still caught at the next
+/// slice, which ends where the reader did not last see it.
+#[cfg(unix)]
+#[test]
+fn a_slice_that_undoes_a_host_side_change_rings_the_pump() {
+    let mut term = Terminal::new(24, 80);
+    let mut watch = MetaWatch::new(COUNTED);
+    assert_eq!(slice(&mut watch, &mut term, b"\x1b[?1h"), 1, "cursor keys");
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?1h"),
+        0,
+        "the program re-asserts them in each write"
+    );
+    // Edit > Reset Terminal: the host's change, outside any reader slice (its own ring is
+    // `manual_reset::record`'s, a_manual_reset_rings_the_pump_once_recorded).
+    term.process(b"\x1b[?1l");
+    assert_eq!(
+        slice(&mut watch, &mut term, b"\x1b[?1h"),
+        1,
+        "the program's next write sets them again: the keeper must hear it"
+    );
+    assert_eq!(slice(&mut watch, &mut term, b"\x1b[?1h"), 0);
+
+    term.process(b"\x1b[?2004h");
+    assert_eq!(
+        slice(&mut watch, &mut term, b"plain"),
+        1,
+        "a change between slices no one rang for, caught at the next slice"
+    );
+    assert_eq!(slice(&mut watch, &mut term, b"plain"), 0);
+}
+
+/// The pump's wait after a pass: [`META_POLL`] for what it left pending, else a ring with no
+/// deadline; a ring during the pass is read from the bell, not here.
+#[cfg(unix)]
+#[test]
+fn the_pump_waits_with_no_deadline_after_a_pass_with_nothing_pending() {
+    let pass = |sent, pending| Pass { sent, pending };
+    assert_eq!(PumpWait::after(pass(0, false)), PumpWait::Ring);
+    assert_eq!(
+        PumpWait::after(pass(1, false)),
+        PumpWait::Ring,
+        "a sent META leaves nothing pending"
+    );
+    assert_eq!(PumpWait::after(pass(0, true)), PumpWait::Retry);
+}
+
+/// A pass waits until [`META_POLL`] after the last one ended.
+#[cfg(unix)]
+#[test]
+fn a_pass_waits_out_the_meta_poll_after_the_last() {
+    let now = std::time::Instant::now();
+    let ago = |ms| {
+        now.checked_sub(Duration::from_millis(ms))
+            .expect("an instant")
+    };
+    assert_eq!(spacing(now, now), META_POLL);
+    assert_eq!(spacing(ago(100), now), Duration::from_millis(150));
+    assert_eq!(spacing(ago(250), now), Duration::ZERO);
+    assert_eq!(spacing(ago(4_000), now), Duration::ZERO);
+}
+
+/// The pump makes a pass at its start and then only for a reason: a ring (the test's, or one
+/// during a pass), or a pass left pending. A pass with nothing pending is followed by a wait with
+/// no deadline, so an idle window's pump never wakes: every pass is accounted for by a ring, a
+/// retry or the start. Each pass, sending or not, comes [`META_POLL`] or more after the last one
+/// ended, so a stream of rings costs at most one pass each `META_POLL`. A ring ends it once the
+/// link is off.
+#[cfg(unix)]
+#[test]
+fn the_pump_passes_only_at_its_start_a_ring_or_a_pending_retry() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+    let bell: &'static Bell = Box::leak(Box::new(Bell::new()));
+    let on: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
+    // Each pass: its number, when it began and when it handed back.
+    let (passed, passes) = std::sync::mpsc::channel::<(usize, Instant, Instant)>();
+    let (ended_tx, ended) = std::sync::mpsc::channel::<()>();
+    let pump_thread = std::thread::spawn(move || {
+        let mut n = 0;
+        pump(
+            bell,
+            || on.load(Ordering::SeqCst),
+            || {
+                let began = Instant::now();
+                let done = match n {
+                    1 => Pass {
+                        sent: 1,
+                        pending: false,
+                    },
+                    2 => Pass {
+                        sent: 0,
+                        pending: true,
+                    },
+                    3 => {
+                        // A ring while the pass runs.
+                        bell.ring();
+                        Pass::default()
+                    }
+                    _ => Pass::default(),
+                };
+                passed
+                    .send((n, began, Instant::now()))
+                    .expect("the test reads every pass");
+                n += 1;
+                done
+            },
+        );
+        let _ = ended_tx.send(());
+    });
+    let waits_until = |n: usize| {
+        let (waits, noted) = &bell.waits;
+        let (waits, waited) = noted
+            .wait_timeout_while(
+                waits.lock().expect("waits"),
+                aterm_spec::wait::MUST_HAPPEN,
+                |waits| waits.len() < n,
+            )
+            .expect("waits");
+        assert!(!waited.timed_out(), "the pump never chose its wait {n}");
+        waits.clone()
+    };
+    let pass = || {
+        passes
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a pass")
+    };
+    let mut last: Option<Instant> = None;
+    let mut next = |want: usize, why: &str| {
+        let (n, began, handed_back) = pass();
+        assert_eq!(n, want, "{why}");
+        if let Some(ended) = last {
+            assert!(
+                began.duration_since(ended) >= META_POLL,
+                "pass {n} came {:?} after the last ended, under META_POLL",
+                began.duration_since(ended)
+            );
+        }
+        last = Some(handed_back);
+    };
+
+    next(0, "the pass at its start");
+    assert_eq!(waits_until(1), [PumpWait::Ring], "nothing pending");
+    bell.ring();
+    next(1, "the ring's pass, one that sends");
+    // Rung as soon as the pass is heard: the wait the pump chose is its pass's alone.
+    bell.ring();
+    next(2, "the ring's pass, one left pending");
+    next(3, "the pending pass's retry, unrung");
+    next(4, "the ring during pass 3");
+    assert_eq!(
+        waits_until(5),
+        [
+            PumpWait::Ring,
+            PumpWait::Ring,
+            PumpWait::Retry,
+            PumpWait::Ring,
+            PumpWait::Ring
+        ]
+    );
+    on.store(false, Ordering::SeqCst);
+    bell.ring();
+    ended
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the pump ends at the ring once the link is off");
+    pump_thread.join().expect("the pump");
+    assert!(
+        passes.try_recv().is_err(),
+        "every pass is accounted for: the start, two rings, one retry, one ring during a pass"
+    );
+    assert_eq!(waits_until(5).len(), 5);
+}
+
+/// A registration rings the pump for its first META; so does the fabric's ring once the pump's
+/// listener is set, and an op the full queue made owed (the pump offers it again).
+#[cfg(unix)]
+#[test]
+fn a_registration_a_fabric_change_and_an_owed_op_ring_the_pump() {
+    let link = TestLink::bare();
+    let before = rings();
+    link.register(
+        3,
+        3,
+        owned_dup_of_null(),
+        LinkOp::CompanionRelease {
+            rdev: 3,
+            receipt: None,
+        },
+    );
+    assert_eq!(rings(), before + 1, "a registration rings once");
+
+    aterm_gui_fabric::on_carry_moved(ring_meta);
+    let session = crate::session_store::test_handle(9);
+    let before = rings();
+    let held = crate::fabric::Hold {
+        reason: "stop".to_string(),
+        origin: "local".to_string(),
+    };
+    assert!(crate::fabric::apply_hold_for_test(&session.ctx, Some(held)));
+    assert!(rings() > before, "a hold rings through the fabric");
+    let before = rings();
+    let _ = session.ctx.fabric.keeper_carry();
+    assert_eq!(rings(), before, "a read rings nothing");
+
+    link.fill();
+    let before = rings();
+    link.release(3);
+    assert_eq!(link.owed(), 1, "premise: the RELEASE is owed");
+    assert_eq!(rings(), before + 1, "an owed op rings");
+}
+
+/// A manual reset rings the pump as its record is made, which both its paths (the reader's parse
+/// stage, `run_direct`) do with the engine's lock dropped: the reset restored modes a META
+/// carries, with no output for the reader to see.
+#[cfg(unix)]
+#[test]
+fn a_manual_reset_rings_the_pump_once_recorded() {
+    let session = crate::session_store::test_handle(11);
+    let report = crate::manual_reset::ResetReport {
+        reverted: vec!["mouse"],
+        bytes: 8,
+    };
+    let before = rings();
+    crate::manual_reset::record(
+        11,
+        &session.ctx.timeline,
+        crate::manual_reset::ResetSource::Verb,
+        &report,
+    );
+    assert_eq!(rings(), before + 1);
+}
+
+#[cfg(unix)]
+fn owned_dup_of_null() -> std::os::fd::OwnedFd {
+    std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null"))
 }
 
 /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6). The memory shed hands the
@@ -1857,7 +2281,7 @@ impl Keeper {
     /// A link to this keeper on `booted` (or dialled), idle for good: only an op or the
     /// keeper's own frame wakes it, so nothing but the keeper's answer confirms a read.
     fn link(&self, booted: Option<KeeperClient>) -> KeeperLink {
-        KeeperLink::start_idling(
+        KeeperLink::start_retrying(
             self.sock.clone(),
             aterm_keeper::identity::Identity::same_uid(),
             "t".into(),

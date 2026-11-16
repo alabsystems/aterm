@@ -42,7 +42,7 @@ fn pairs<'a>(v: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
 }
 
 const QUIET: &[(&str, &str)] = &[
-    ("sid", "s-q"),
+    ("sid", "t000000000q"),
     ("state", "alive"),
     ("program", "zsh"),
     ("program_kind", "shell"),
@@ -58,18 +58,18 @@ fn a_fleet_read_parses_to_its_peers() {
         peer("self", &pairs(&header("own-node")), &[QUIET]),
     ];
     let stalled: &[(&str, &str)] = &[
-        ("sid", "s-w"),
+        ("sid", "t000000000w"),
         ("state", "alive"),
         ("program", "claude"),
         ("program_kind", "agent"),
         ("agent", "busy"),
         ("task", "stalled"),
-        ("task_from", "s-1e91aaaa"),
+        ("task_from", "t1e91aaaaa0"),
         ("task_ms", "120000"),
         ("needs", "stalled"),
     ];
     let manager: &[(&str, &str)] = &[
-        ("sid", "s-1e91aaaa"),
+        ("sid", "t1e91aaaaa0"),
         ("state", "alive"),
         ("program", "claude"),
         ("program_kind", "agent"),
@@ -79,7 +79,7 @@ fn a_fleet_read_parses_to_its_peers() {
     ];
     hosts.push(peer("mac-17", &pairs(&header("n17")), &[stalled, manager]));
     let older_row: &[(&str, &str)] = &[
-        ("sid", "s-o"),
+        ("sid", "t0000000010"),
         ("state", "alive"),
         ("program", "claude"),
         ("program_kind", "agent"),
@@ -194,7 +194,7 @@ fn unproven(entry: &str) -> String {
 #[test]
 fn an_unproven_peer_is_listed_on_its_word_alone() {
     let stalled: &[(&str, &str)] = &[
-        ("sid", "s-w"),
+        ("sid", "t000000000w"),
         ("state", "alive"),
         ("program", "claude"),
         ("program_kind", "agent"),
@@ -1025,7 +1025,7 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
         node: Some("n17".to_string()),
         needs: need
             .then(|| FleetNeed {
-                sid: "s-w".to_string(),
+                sid: "t000000000w".to_string(),
                 word: NeedWord::Stalled,
                 who: "claude".to_string(),
                 age_ms: Some(1_000),
@@ -1249,11 +1249,7 @@ fn the_glance_spawns_no_child_process_and_reads_a_fixtures_now_needs_rows() {
         )),
     };
     let sid = |text: &str| Sid::parse(text).expect("a sid");
-    let (worker, manager, held) = (
-        sid("s-0123456789abcdef0123"),
-        sid("s-aaaaaaaaaaaaaaaaaaaa"),
-        sid("s-bbbbbbbbbbbbbbbbbbbb"),
-    );
+    let (worker, manager, held) = (sid("t0123456789"), sid("taaaaaaaaaa"), sid("tbbbbbbbbbb"));
     let up_needs = NeedsRow {
         at: NOW / 1000 - 120,
         needs: vec![NeedEntry {
@@ -1277,7 +1273,7 @@ fn the_glance_spawns_no_child_process_and_reads_a_fixtures_now_needs_rows() {
     let silent_needs = NeedsRow {
         at: NOW / 1000 - 4 * 3_600,
         needs: vec![NeedEntry {
-            sid: sid("s-cccccccccccccccccccc"),
+            sid: sid("tcccccccccc"),
             word: Word::new("ask").expect("a word"),
             worker_of: None,
             harness: false,
@@ -1503,7 +1499,7 @@ fn tally_keeps_agent_words() {
     assert_eq!((asked.busy, asked.waiting), (1, 3));
     // The shell row is a session and no agent.
     assert_eq!(mac.agent_sessions.len(), 9);
-    assert!(mac.agent_sessions.iter().all(|s| s.sid != "s-q"));
+    assert!(mac.agent_sessions.iter().all(|s| s.sid != "t000000000q"));
     let first = &mac.agent_sessions[0];
     assert_eq!(
         (
@@ -1547,7 +1543,7 @@ fn tally_keeps_agent_words() {
 
     // An older aterm's agents are not read: absent, never zero.
     let older: &[(&str, &str)] = &[
-        ("sid", "s-o"),
+        ("sid", "t0000000010"),
         ("state", "alive"),
         ("program", "claude"),
         ("program_kind", "agent"),
@@ -1976,12 +1972,12 @@ fn agent_row<'a>(sid: &'a str, word: &'a str, needs: Option<&'a str>) -> Vec<(&'
 fn the_nodes_count_of_its_windows_is_the_surveys_count() {
     use aterm_metrics::row::{AgentEntry, Sid, Word};
     let sids = [
-        "s-00000000000000000001",
-        "s-00000000000000000002",
-        "s-00000000000000000003",
-        "s-00000000000000000004",
-        "s-00000000000000000005",
-        "s-00000000000000000006",
+        "t0000000001",
+        "t0000000002",
+        "t0000000003",
+        "t0000000004",
+        "t0000000005",
+        "t0000000006",
     ];
     let mut rows = vec![
         agent_row(sids[0], "prompt", Some("-")),
@@ -2112,7 +2108,7 @@ fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
             },
         )),
     };
-    let sid = Sid::parse("s-0123456789abcdef0123").expect("a sid");
+    let sid = Sid::parse("t0123456789").expect("a sid");
     let fresh = ActivityRow {
         at: (NOW - 1_000 - ACTIVITY_FRESH_MS) / 1000,
         busy: 3,
@@ -2681,14 +2677,16 @@ fn answer_of(seen: &aterm_db::fleet::read::MachineSeen) -> &aterm_db::fleet::rea
     }
 }
 
-/// A header of node `node` that carries a whole look, as `MachineFacts::header_tokens` writes
-/// one, answered at `at_ms` on its own clock.
+/// A header of node `node` that carries its home volume's free space and size, as
+/// `SwarmSurveyFacts::header_tokens` writes them, then a whole look, as
+/// `MachineFacts::header_tokens` writes one, answered at `at_ms` on its own clock.
 #[cfg(unix)]
 fn look_header(node: &str, at_ms: u64) -> Vec<(&'static str, String)> {
     let mut head = header(node);
     head.extend([
         ("at_ms", at_ms.to_string()),
         ("home_free_mb", "51234".to_string()),
+        ("home_total_mb", "953000".to_string()),
         ("os", "macos".to_string()),
         ("target", "aarch64-apple-darwin".to_string()),
         ("m_at_ms", (at_ms - 1_500).to_string()),
@@ -2705,7 +2703,6 @@ fn look_header(node: &str, at_ms: u64) -> Vec<(&'static str, String)> {
         ("mem_psi60_x100", "-".to_string()),
         ("swap_used_mb", "0".to_string()),
         ("swap_total_mb", "4096".to_string()),
-        ("home_total_mb", "953000".to_string()),
         ("gpu_cores", "38".to_string()),
         ("gpu_busy_pct", "97".to_string()),
         ("net_link_kbps", "10000000".to_string()),

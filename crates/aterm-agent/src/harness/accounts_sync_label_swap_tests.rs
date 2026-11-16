@@ -117,6 +117,7 @@ fn m3() -> Desk {
                             routes: format!("profile(none) for {label}"),
                             since: NOW - 10,
                             tried_at: NOW - 10,
+                            stop: None,
                         }),
                         ..accounts::Binding::default()
                     },
@@ -1771,6 +1772,7 @@ fn verified_account(staged: bool) -> (Desk, PathBuf, super::super::profile::Acco
                     by: "m3".into(),
                     attempts: 1,
                     cleared: false,
+                    seen: None,
                 },
             );
             Ok(Vec::new())

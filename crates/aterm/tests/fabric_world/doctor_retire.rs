@@ -82,7 +82,7 @@ fn the_doctor_retires_a_ghost_through_a_live_bridge() {
     let w = World::boot("r24retire", &[]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
-    let ghost = "s-deadbeefdeadbeefdead";
+    let ghost = "t9000000010";
     let subject = format!("/f/{FLEET}/pub/{}/{ghost}/presence", w.node);
     w.god()
         .publish(
@@ -221,7 +221,7 @@ fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
         .map(|g| harness::cap_line(g))
         .collect();
     harness::write_cap(&ghost_cap, caps);
-    let ghost = "s-0000000000000000a1ce";
+    let ghost = "t9000000000";
     let subject = format!("/f/{FLEET}/pub/{ghost_node}/{ghost}/presence");
     w.god()
         .publish(

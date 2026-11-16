@@ -1742,8 +1742,18 @@ fn refresh_stored_auth(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    fixture_client: Option<&Client>,
 ) -> Option<StoredAuth> {
-    refresh_outcome(home, stored, fallback_token_url, wait, now, expected_email).done()
+    refresh_outcome(
+        home,
+        stored,
+        fallback_token_url,
+        wait,
+        now,
+        expected_email,
+        fixture_client,
+    )
+    .done()
 }
 
 /// [`refresh_stored_auth`], saying why where it published nothing ([`Refreshed`]). A login, or
@@ -1756,6 +1766,7 @@ fn refresh_outcome(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
+    fixture_client: Option<&Client>,
 ) -> Refreshed {
     if check_stored_identity(stored, expected_email).is_err() {
         return Refreshed::Failed;
@@ -1767,6 +1778,7 @@ fn refresh_outcome(
         fallback_token_url,
         wait,
         now,
+        fixture_client,
         admit,
         write_auth_doc,
     )
@@ -1778,6 +1790,13 @@ fn refresh_outcome(
 /// same token. A response `admit` takes is journaled before the file is read again, so a failed
 /// re-read or write keeps the rotated token. `publish` writes the refreshed login
 /// (`write_auth_doc`; a conformance fixture passes its own).
+///
+/// The request goes over the platform's trust store ([`http_client`]) wherever `fixture_client`
+/// is `None`. Only the native fixture's read (`read_identified_login_with_fixture_roots`, which
+/// no release build compiles) passes one, through this module's private readers, so every other
+/// caller keeps platform trust. That client trusts the fixture's pinned roots alone and carries
+/// the request only to a loopback token endpoint: to one anywhere else it connects to nothing,
+/// sends nothing and journals no attempt.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1786,12 +1805,17 @@ fn refresh_outcome(
         project = "aterm_agent::harness::codex_app_login::tests::result_transition"
     )
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one refresh names its login, its deadline, its transport and its two seams"
+)]
 fn refresh_admitted(
     home: &Path,
     stored: &StoredAuth,
     fallback_token_url: &str,
     wait: Duration,
     now: i64,
+    fixture_client: Option<&Client>,
     admit: impl Fn(&StoredAuth) -> bool,
     publish: impl FnOnce(&Path, &Value) -> std::io::Result<()>,
 ) -> Refreshed {
@@ -1826,6 +1850,10 @@ fn refresh_admitted(
         return Refreshed::Failed;
     };
     let token_url = &authority.token_url;
+    // A fixture's pinned roots are no trust in an issuer anywhere but on this Mac.
+    if fixture_client.is_some() && !is_loopback_endpoint(token_url) {
+        return Refreshed::Failed;
+    }
     let Ok(body) = aterm_json::to_string(&json!({
         "client_id": authority.client_id,
         "grant_type": "refresh_token",
@@ -1855,7 +1883,9 @@ fn refresh_admitted(
         let _ = RefreshJournal::discard(home);
         return Refreshed::Failed;
     }
-    let response = http_client(token_url, left)
+    let response = fixture_client
+        .cloned()
+        .unwrap_or_else(|| http_client(token_url, left))
         .request(Method::Post, token_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
@@ -2022,12 +2052,358 @@ pub struct Usage {
     /// share taken up to the next whole percent.
     pub sample: crate::harness::accounts::Sample,
     /// Every full recognized window, with its own reset. If no window is full but the server
-    /// refuses ordinary use, one fallback wall names the most-used recognized window.
+    /// refuses ordinary use ([`Self::refusal`]), one fallback wall names the most-used recognized
+    /// window ([`Self::fallback_window`]), with that window's reset only where the sample shows it
+    /// spent ([`crate::harness::accounts::Sample::reached_reset`]): a refusal no spent window
+    /// explains names no reset, so its wall stands by rungs
+    /// ([`crate::harness::accounts::NO_RESET_WALL_S`]), not to an unrelated window's turnover.
     /// Keeping simultaneous walls prevents an earlier reset from releasing a later limit.
     pub walls: Vec<(&'static str, Option<i64>)>,
+    /// What the read says refuses the login's ordinary use, where it says something does.
+    pub refusal: Option<Refusal>,
+    /// Every other limit the read lists, by its id ([`limit_id`]): a model's own bucket, which
+    /// walls only sessions of that model. None of it is in [`Self::walls`], [`Self::sample`] or
+    /// [`Self::refusal`], so no ordinary decision reads it; a handoff asked about one limit
+    /// reads that entry alone. A Reserve (`gpt-reserve`, the fallback after the codex bucket is
+    /// spent) is ordinary use and listed nowhere here.
+    pub limits: std::collections::BTreeMap<String, LimitUsage>,
+}
+
+/// One limit other than the codex bucket, as a usage read lists it ([`Usage::limits`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitUsage {
+    /// Every window of it the read gives a figure for, of any length, in the order the read lists
+    /// them.
+    pub windows: Vec<LimitWindow>,
+    /// What the read says refuses its use where no spent window explains it: the backend's
+    /// `allowed` false (or `limit_reached`), or a reached type or spend control the entry names.
+    /// A spent window explains an ordinary refusal, so one beside a spent window is not kept:
+    /// its walls say all of it, and both of a read's shapes agree, since the app-server's
+    /// entry carries no allowance of its own.
+    pub refusal: Option<Refusal>,
+}
+
+/// One window of a limit other than the codex bucket ([`LimitUsage::windows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitWindow {
+    /// Its kind, by its length ([`crate::ai::codex_limits::Window::bucket`]).
+    pub bucket: crate::ai::codex_limits::Bucket,
+    /// Its share used, taken up to the next whole percent, as [`Usage::sample`]'s are.
+    pub used: u32,
+    /// When it resets, where the read names it.
+    pub reset: Option<i64>,
+}
+
+impl LimitWindow {
+    /// The share at which it is low, as an account's windows are
+    /// ([`crate::harness::accounts::Sample::low`]): a week's
+    /// ([`crate::harness::accounts::LOW_WEEK_PCT`]) for a window a week long or longer, the
+    /// session window's ([`crate::harness::accounts::LOW_SESSION_PCT`]) for any shorter one and
+    /// for one whose length the read does not give.
+    #[must_use]
+    pub fn low_pct(self) -> u32 {
+        use crate::ai::codex_limits::Bucket;
+        use crate::harness::accounts::{LOW_SESSION_PCT, LOW_WEEK_PCT};
+        match self.bucket {
+            Bucket::Week => LOW_WEEK_PCT,
+            Bucket::Minutes(minutes) if minutes >= 10_080 => LOW_WEEK_PCT,
+            Bucket::FiveHour | Bucket::Day | Bucket::Minutes(_) | Bucket::Unplaced(_) => {
+                LOW_SESSION_PCT
+            }
+        }
+    }
+}
+
+impl LimitUsage {
+    /// Every window of it spent (its share at 100), by its kind and with its own reset.
+    pub fn walls(&self) -> impl Iterator<Item = (crate::ai::codex_limits::Bucket, Option<i64>)> {
+        self.windows
+            .iter()
+            .filter(|window| window.used >= 100)
+            .map(|window| (window.bucket, window.reset))
+    }
+
+    /// Whether the read shows this limit standing: a window of it spent, or its use refused.
+    #[must_use]
+    pub fn walled(&self) -> bool {
+        self.walls().next().is_some() || self.refusal.is_some()
+    }
+
+    /// The reset a wall of this limit stands to: the latest of its spent windows' where each names
+    /// one and nothing else refuses it, else none, so the wall stands by rungs
+    /// ([`crate::harness::accounts::NO_RESET_WALL_S`]).
+    #[must_use]
+    pub fn until(&self) -> Option<i64> {
+        if self.refusal.is_some() || !self.walled() {
+            return None;
+        }
+        self.walls()
+            .map(|(_, reset)| reset)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+    }
+
+    /// Until when this entry shows no room for a session of its limit at `now`: `None` where it
+    /// has room, else `Some` of the instant that may end that, `Some(None)` where nothing it
+    /// shows names one. In order: a wall of it ([`Self::walled`]) stands to [`Self::until`]; an
+    /// entry with no window figure shows nothing to judge room by, as a codex bucket with no week
+    /// figure takes no session; and a window of any length at or above its low share
+    /// ([`LimitWindow::low_pct`]) that has not reset by `now` is low to the latest such reset.
+    #[must_use]
+    pub fn no_room_until(&self, now: i64) -> Option<Option<i64>> {
+        if self.walled() {
+            return Some(self.until());
+        }
+        if self.windows.is_empty() {
+            return Some(None);
+        }
+        let low: Vec<Option<i64>> = self
+            .windows
+            .iter()
+            .filter(|window| window.used >= window.low_pct())
+            .map(|window| window.reset)
+            .filter(|reset| reset.is_none_or(|reset| reset > now))
+            .collect();
+        if low.is_empty() {
+            return None;
+        }
+        Some(
+            low.into_iter()
+                .collect::<Option<Vec<_>>>()
+                .and_then(|resets| resets.into_iter().max()),
+        )
+    }
+
+    /// Whether this entry has room for a session of its limit at `now` ([`Self::no_room_until`]).
+    #[must_use]
+    pub fn room(&self, now: i64) -> bool {
+        self.no_room_until(now).is_none()
+    }
+}
+
+/// The id a limit is listed under, as upstream normalizes a `metered_feature` into one
+/// (`normalize_limit_id`): trimmed, ASCII lowercase, `-` as `_`. `None` where that is no limit id
+/// ([`is_limit_id`]), the codex bucket's own included.
+#[must_use]
+pub fn limit_id(raw: &str) -> Option<String> {
+    let id = raw.trim().to_ascii_lowercase().replace('-', "_");
+    is_limit_id(&id).then_some(id)
+}
+
+/// Whether `word` names a limit other than the codex bucket: 1 to 64 of `[a-z0-9_]`, and not
+/// `codex`. A handoff asked about a limit (`limit=`) names it so.
+#[must_use]
+pub fn is_limit_id(word: &str) -> bool {
+    (1..=64).contains(&word.len())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && word != crate::ai::codex_limits::CODEX_FAMILY
+}
+
+/// Whether a limit is a Reserve, by its name as upstream judges one (`gpt-reserve`, any case):
+/// the fallback after the codex bucket is spent, which is ordinary use and no limit of its own.
+fn is_reserve(name: Option<&Value>) -> bool {
+    name.and_then(Value::as_str)
+        .is_some_and(|name| name.trim().eq_ignore_ascii_case("gpt-reserve"))
+}
+
+impl Usage {
+    /// The window a wall no spent window explains is recorded under: the most used of the two the
+    /// read names, by the sample's whole percent and the week's on a tie, else the five-hour
+    /// window's. It is the name the pool records such a wall under, and the only two its plans
+    /// take ([`crate::harness::accounts::SESSION_LIMIT`], [`crate::harness::accounts::WEEK_LIMIT`]).
+    #[must_use]
+    pub fn fallback_window(&self) -> &'static str {
+        fallback_window(&self.sample)
+    }
+}
+
+fn fallback_window(sample: &crate::harness::accounts::Sample) -> &'static str {
+    use crate::harness::accounts::{SESSION_LIMIT, WEEK_LIMIT};
+    match (sample.session_pct, sample.week_pct) {
+        (Some(session), Some(week)) if session > week => SESSION_LIMIT,
+        (_, Some(_)) => WEEK_LIMIT,
+        _ => SESSION_LIMIT,
+    }
+}
+
+/// What a usage read says refuses a login's ordinary use. Only the four workspace types are a
+/// workspace's refusal; `rate_limit_reached`, a type aterm does not know, and a refusal that
+/// names no type are the codex bucket's own ([`Self::Ordinary`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The codex bucket's own: `ordinaryUsageAllowed` false, or a reached type that names no
+    /// workspace. A spent window explains it where one is spent; where none is (a credit-only
+    /// plan out of credits, or a refusal its windows do not show), its wall is the fallback one.
+    Ordinary,
+    /// The workspace's spend control is reached (`spend_control.reached`, which the app-server
+    /// names `rateLimits.spendControlReached`): a cap a person sets and lifts, which no window's
+    /// reset ends.
+    SpendControl,
+    /// The reached type names the workspace: its credits are depleted, or its usage limit (its
+    /// owner's spend cap, or the one its owner set on this member) is reached. Only a refill or
+    /// the owner ends it, never a window's reset.
+    Workspace(WorkspaceRefusal),
+}
+
+impl Refusal {
+    /// Whether no window's reset ends it, so a handoff leaves it whatever the login's windows show:
+    /// a spend control or a workspace's refusal.
+    #[must_use]
+    pub const fn outlasts_windows(self) -> bool {
+        !matches!(self, Self::Ordinary)
+    }
+}
+
+/// Which workspace refusal a usage read's reached type names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRefusal {
+    /// `workspace_owner_credits_depleted`.
+    OwnerCreditsDepleted,
+    /// `workspace_member_credits_depleted`.
+    MemberCreditsDepleted,
+    /// `workspace_owner_usage_limit_reached`.
+    OwnerUsageLimitReached,
+    /// `workspace_member_usage_limit_reached`.
+    MemberUsageLimitReached,
+}
+
+impl WorkspaceRefusal {
+    /// Every kind, in the provider's order.
+    pub const ALL: [Self; 4] = [
+        Self::OwnerCreditsDepleted,
+        Self::MemberCreditsDepleted,
+        Self::OwnerUsageLimitReached,
+        Self::MemberUsageLimitReached,
+    ];
+
+    /// The provider's word for it, as both the usage endpoint and the app-server spell it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerCreditsDepleted => "workspace_owner_credits_depleted",
+            Self::MemberCreditsDepleted => "workspace_member_credits_depleted",
+            Self::OwnerUsageLimitReached => "workspace_owner_usage_limit_reached",
+            Self::MemberUsageLimitReached => "workspace_member_usage_limit_reached",
+        }
+    }
+
+    /// The kind `word` names, where it names one.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
+    }
+}
+
+/// What one limit's snapshot in `account/rateLimits/read`'s normalized answer says refuses its use
+/// ([`Refusal`]), beside the allowance `allowed` the answer gives it: a workspace's reached type
+/// first, then a reached spend control, then an allowance of false or any other reached type.
+fn refusal_of(allowed: Option<&Value>, limits: &aterm_json::Map) -> Option<Refusal> {
+    let reached = limits
+        .get("rateLimitReachedType")
+        .filter(|kind| !kind.is_null());
+    if let Some(kind) = reached
+        .and_then(Value::as_str)
+        .and_then(WorkspaceRefusal::of)
+    {
+        return Some(Refusal::Workspace(kind));
+    }
+    if limits.get("spendControlReached").and_then(Value::as_bool) == Some(true) {
+        return Some(Refusal::SpendControl);
+    }
+    (allowed.and_then(Value::as_bool) == Some(false) || reached.is_some())
+        .then_some(Refusal::Ordinary)
+}
+
+/// The windows of one limit's snapshot (`primary`, `secondary`), as the app-server names them.
+fn windows_of(limits: &aterm_json::Map) -> Vec<crate::ai::codex_limits::Window> {
+    use crate::ai::codex_limits::{Slot, Window};
+    [("primary", Slot::Primary), ("secondary", Slot::Secondary)]
+        .into_iter()
+        .filter_map(|(key, slot)| {
+            let w = limits.get(key)?.as_object()?;
+            Some(Window {
+                slot,
+                used_percent: w.get("usedPercent")?.as_f64()?,
+                window_minutes: w.get("windowDurationMins").and_then(Value::as_u64),
+                resets_at: w.get("resetsAt").and_then(Value::as_i64),
+            })
+        })
+        .collect()
+}
+
+/// A share as the pool's samples take it: up to the next whole percent, clamped to 0..=100 first,
+/// so the cast neither truncates nor wraps.
+fn whole(share: f64) -> u32 {
+    share.ceil().clamp(0.0, 100.0) as u32
+}
+
+/// The sample of `windows` read at `now`: its five-hour window as the session, its week as the week.
+fn sample_of(
+    windows: &[crate::ai::codex_limits::Window],
+    now: i64,
+) -> crate::harness::accounts::Sample {
+    use crate::ai::codex_limits::Bucket;
+    let of = |bucket: Bucket| windows.iter().find(|w| w.bucket() == bucket);
+    let (session, week) = (of(Bucket::FiveHour), of(Bucket::Week));
+    crate::harness::accounts::Sample {
+        session_pct: session.map(|w| whole(w.used_percent)),
+        session_reset: session.and_then(|w| w.resets_at),
+        week_pct: week.map(|w| whole(w.used_percent)),
+        week_reset: week.and_then(|w| w.resets_at),
+        session_read_at: session.map(|_| now),
+        week_read_at: week.map(|_| now),
+        at: now,
+        by: String::new(),
+    }
+}
+
+/// One limit's snapshot ([`LimitUsage`]): its allowance is the entry's own `allowed`, which only
+/// the backend's reply gives ([`usage_from_backend`]).
+fn limit_usage_of(entry: &aterm_json::Map) -> LimitUsage {
+    let windows: Vec<_> = windows_of(entry)
+        .iter()
+        .map(|w| LimitWindow {
+            bucket: w.bucket(),
+            used: whole(w.used_percent),
+            reset: w.resets_at,
+        })
+        .collect();
+    let spent = windows.iter().any(|window| window.used >= 100);
+    let refusal = refusal_of(entry.get("allowed"), entry)
+        .filter(|refusal| refusal.outlasts_windows() || !spent);
+    LimitUsage { windows, refusal }
+}
+
+/// The limits other than the codex bucket an answer's `rateLimitsByLimitId` lists, by id
+/// ([`limit_id`]). A key that names no limit (the codex bucket's own included), a Reserve
+/// ([`is_reserve`]), and an id two keys normalize to are left out: nothing read says which of two
+/// such entries is the limit.
+fn limits_of(by_limit: Option<&Value>) -> std::collections::BTreeMap<String, LimitUsage> {
+    let mut limits = std::collections::BTreeMap::new();
+    let mut doubled = std::collections::BTreeSet::new();
+    for (key, entry) in by_limit.and_then(Value::as_object).into_iter().flatten() {
+        let (Some(id), Some(entry)) = (limit_id(key), entry.as_object()) else {
+            continue;
+        };
+        if is_reserve(entry.get("limitName")) {
+            continue;
+        }
+        if limits.insert(id.clone(), limit_usage_of(entry)).is_some() {
+            doubled.insert(id);
+        }
+    }
+    limits.retain(|id, _| !doubled.contains(id));
+    limits
 }
 
 /// Reads `account/rateLimits/read`'s normalized answer at `now`: `None` where it holds no `rateLimits`.
+/// What refuses ordinary use is read from `ordinaryUsageAllowed`, `rateLimits.rateLimitReachedType`
+/// and `rateLimits.spendControlReached`, the app-server's names ([`Refusal`]). Every other limit
+/// is read from `rateLimitsByLimitId` into [`Usage::limits`] alone, each entry by its own windows,
+/// reached type, spend control and, where the backend's reply gave one, `allowed`.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2046,35 +2422,13 @@ pub struct Usage {
     )
 )]
 pub fn usage_of(result: &Value, now: i64) -> Option<Usage> {
-    use crate::ai::codex_limits::{Bucket, Slot, Window};
-    use crate::harness::accounts::{SESSION_LIMIT, Sample, WEEK_LIMIT};
+    use crate::ai::codex_limits::Bucket;
+    use crate::harness::accounts::{SESSION_LIMIT, WEEK_LIMIT};
     let limits = result.get("rateLimits")?.as_object()?;
-    let windows: Vec<Window> = [("primary", Slot::Primary), ("secondary", Slot::Secondary)]
-        .into_iter()
-        .filter_map(|(key, slot)| {
-            let w = limits.get(key)?.as_object()?;
-            Some(Window {
-                slot,
-                used_percent: w.get("usedPercent")?.as_f64()?,
-                window_minutes: w.get("windowDurationMins").and_then(Value::as_u64),
-                resets_at: w.get("resetsAt").and_then(Value::as_i64),
-            })
-        })
-        .collect();
-    // Clamped to 0..=100 first, so the cast neither truncates nor wraps.
-    let whole = |share: f64| share.ceil().clamp(0.0, 100.0) as u32;
+    let windows = windows_of(limits);
     let of = |bucket: Bucket| windows.iter().find(|w| w.bucket() == bucket);
     let (session, week) = (of(Bucket::FiveHour), of(Bucket::Week));
-    let sample = Sample {
-        session_pct: session.map(|w| whole(w.used_percent)),
-        session_reset: session.and_then(|w| w.resets_at),
-        week_pct: week.map(|w| whole(w.used_percent)),
-        week_reset: week.and_then(|w| w.resets_at),
-        session_read_at: session.map(|_| now),
-        week_read_at: week.map(|_| now),
-        at: now,
-        by: String::new(),
-    };
+    let sample = sample_of(&windows, now);
     let mut walls: Vec<_> = [(session, SESSION_LIMIT), (week, WEEK_LIMIT)]
         .into_iter()
         .filter_map(|(w, name)| {
@@ -2082,22 +2436,17 @@ pub fn usage_of(result: &Value, now: i64) -> Option<Usage> {
                 .map(|w| (name, w.resets_at))
         })
         .collect();
-    let refused = result.get("ordinaryUsageAllowed").and_then(Value::as_bool) == Some(false)
-        || limits
-            .get("rateLimitReachedType")
-            .is_some_and(|t| !t.is_null());
-    if walls.is_empty() && refused {
-        let latest = [session, week]
-            .into_iter()
-            .flatten()
-            .max_by(|a, b| a.used_percent.total_cmp(&b.used_percent));
-        walls.push(match latest {
-            Some(w) if Some(w) == week => (WEEK_LIMIT, w.resets_at),
-            Some(w) => (SESSION_LIMIT, w.resets_at),
-            None => (SESSION_LIMIT, None),
-        });
+    let refusal = refusal_of(result.get("ordinaryUsageAllowed"), limits);
+    if walls.is_empty() && refusal.is_some() {
+        let window = fallback_window(&sample);
+        walls.push((window, sample.reached_reset(window)));
     }
-    Some(Usage { sample, walls })
+    Some(Usage {
+        sample,
+        walls,
+        refusal,
+        limits: limits_of(result.get("rateLimitsByLimitId")),
+    })
 }
 
 fn map_backend_window(window: Option<&Value>, now: i64) -> Value {
@@ -2144,43 +2493,82 @@ fn map_reached_type(raw: Option<&Value>) -> Value {
     }
 }
 
-/// Maps a raw `/wham/usage` or `/api/codex/usage` JSON payload into [`Usage`] via [`usage_of`].
+/// Maps a raw `/wham/usage` or `/api/codex/usage` JSON payload into [`Usage`] via [`usage_of`],
+/// under the app-server's names: `rate_limit.allowed` as `ordinaryUsageAllowed`, the reached type
+/// as `rateLimits.rateLimitReachedType` and `spend_control.reached` as
+/// `rateLimits.spendControlReached`, each passed through as read, so a spend control is a
+/// [`Refusal::SpendControl`] of its own, not folded into the ordinary allowance. Each of
+/// `additional_rate_limits[]` is listed in `rateLimitsByLimitId` under its `metered_feature` as
+/// upstream normalizes it ([`limit_id`]), with its name, its windows and its allowance
+/// (`rate_limit.allowed`, or `limit_reached` where that is all it gives), which upstream's own
+/// snapshot of it drops. Two entries of one id are listed as neither.
 #[must_use]
 pub fn usage_from_backend(payload: &Value, now: i64) -> Option<Usage> {
     let obj = payload.as_object()?;
     if !obj.contains_key("rate_limit") && !obj.contains_key("plan_type") {
         return None;
     }
-    let rl = obj.get("rate_limit").and_then(Value::as_object);
-    let rl_allowed = rl.and_then(|r| {
-        r.get("allowed").and_then(Value::as_bool).or_else(|| {
-            r.get("limit_reached")
-                .and_then(Value::as_bool)
-                .map(|lim| !lim)
+    let allowed = |rl: Option<&aterm_json::Map>| {
+        rl.and_then(|r| {
+            r.get("allowed").and_then(Value::as_bool).or_else(|| {
+                r.get("limit_reached")
+                    .and_then(Value::as_bool)
+                    .map(|lim| !lim)
+            })
         })
-    });
+    };
+    let rl = obj.get("rate_limit").and_then(Value::as_object);
+    let rl_allowed = allowed(rl);
+    let mut by_limit = aterm_json::Map::new();
+    for entry in obj
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+    {
+        let Some(id) = entry
+            .get("metered_feature")
+            .and_then(Value::as_str)
+            .and_then(limit_id)
+        else {
+            continue;
+        };
+        let rl = entry.get("rate_limit").and_then(Value::as_object);
+        let snapshot = json!({
+            "limitId": id,
+            "limitName": entry.get("limit_name").cloned().unwrap_or(Value::Null),
+            "allowed": allowed(rl),
+            "primary": map_backend_window(rl.and_then(|r| r.get("primary_window")), now),
+            "secondary": map_backend_window(rl.and_then(|r| r.get("secondary_window")), now),
+        });
+        match by_limit.entry(id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(snapshot);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.insert(Value::Null);
+            }
+        }
+    }
     let spend_reached = obj
         .get("spend_control")
         .and_then(Value::as_object)
         .and_then(|s| s.get("reached"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    let ordinary_allowed = if spend_reached {
-        Some(false)
-    } else {
-        rl_allowed
-    };
+        .and_then(Value::as_bool);
     let reached_type = map_reached_type(
         obj.get("rate_limit_reached_type")
             .or_else(|| rl.and_then(|r| r.get("rate_limit_reached_type"))),
     );
     let normalized = json!({
-        "ordinaryUsageAllowed": ordinary_allowed,
+        "ordinaryUsageAllowed": rl_allowed,
         "rateLimits": {
             "rateLimitReachedType": reached_type,
+            "spendControlReached": spend_reached,
             "primary": map_backend_window(rl.and_then(|r| r.get("primary_window")), now),
             "secondary": map_backend_window(rl.and_then(|r| r.get("secondary_window")), now),
-        }
+        },
+        "rateLimitsByLimitId": by_limit,
     });
     usage_of(&normalized, now)
 }
@@ -2453,8 +2841,9 @@ pub struct IdentifiedUsage {
 /// nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentifiedRead {
-    /// Its usage, under the identity the request carried.
-    Usage(IdentifiedUsage),
+    /// Its usage, under the identity the request carried: boxed, since a read's usage carries
+    /// every limit it lists ([`Usage::limits`]) and the other answers carry nothing.
+    Usage(Box<IdentifiedUsage>),
     /// The provider refused the login for good ([`Reading::SignedOut`]).
     SignedOut,
     /// Nothing was learned: no answer, no known identity, or a refusal not yet settled.
@@ -2466,7 +2855,7 @@ impl IdentifiedRead {
     #[must_use]
     pub fn usage(self) -> Option<IdentifiedUsage> {
         match self {
-            Self::Usage(usage) => Some(usage),
+            Self::Usage(usage) => Some(*usage),
             Self::SignedOut | Self::Unread => None,
         }
     }
@@ -2474,7 +2863,7 @@ impl IdentifiedRead {
 
 impl From<Option<IdentifiedUsage>> for IdentifiedRead {
     fn from(usage: Option<IdentifiedUsage>) -> Self {
-        usage.map_or(Self::Unread, Self::Usage)
+        usage.map_or(Self::Unread, |usage| Self::Usage(Box::new(usage)))
     }
 }
 
@@ -2534,6 +2923,9 @@ fn read_login_snapshot(
     )
 }
 
+/// [`read_login_snapshot`] over one transport for every request it makes, the usage read and
+/// any refresh of the login alike: the platform's trust store where `fixture_client` is `None`,
+/// else the native fixture's own client (`read_identified_login_with_fixture_roots`).
 fn read_login_snapshot_using(
     home: &Path,
     usage_url: &str,
@@ -2541,7 +2933,7 @@ fn read_login_snapshot_using(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
-    usage_client: Option<&Client>,
+    fixture_client: Option<&Client>,
 ) -> LoginSnapshot {
     read_login_snapshot_confirming(
         home,
@@ -2549,7 +2941,7 @@ fn read_login_snapshot_using(
         wait,
         now,
         expected_email,
-        usage_client,
+        fixture_client,
         |stored, deadline| {
             confirmed_signed_out(
                 home,
@@ -2558,7 +2950,7 @@ fn read_login_snapshot_using(
                 (deadline, Instant::now(), || {}),
                 now,
                 expected_email,
-                usage_client,
+                fixture_client,
             )
         },
     )
@@ -2570,7 +2962,7 @@ fn read_login_snapshot_confirming(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
-    usage_client: Option<&Client>,
+    fixture_client: Option<&Client>,
     confirm: impl FnOnce(&StoredAuth, Instant) -> LoginSnapshot,
 ) -> LoginSnapshot {
     if !legacy_reader_allowed(home) {
@@ -2580,7 +2972,7 @@ fn read_login_snapshot_confirming(
         if !legacy_reader_allowed(home) {
             return None;
         }
-        match usage_client {
+        match fixture_client {
             Some(client) => get_usage_once_using(usage_url, stored, left, expected_email, client),
             None => get_usage_once(usage_url, stored, left, expected_email),
         }
@@ -2609,6 +3001,7 @@ fn read_login_snapshot_confirming(
                 left(),
                 now,
                 expected_email,
+                fixture_client,
             )
         {
             stored = refreshed;
@@ -2637,6 +3030,7 @@ fn read_login_snapshot_confirming(
             left(),
             now,
             expected_email,
+            fixture_client,
         ) {
             Refreshed::Done(refreshed) => {
                 let Some(again) = get_usage(&refreshed, left()) else {
@@ -2704,7 +3098,7 @@ fn confirmed_signed_out(
     (deadline, started, mut observing): (Instant, Instant, impl FnMut()),
     now: i64,
     expected_email: Option<&str>,
-    usage_client: Option<&Client>,
+    fixture_client: Option<&Client>,
 ) -> LoginSnapshot {
     if Instant::now() >= deadline {
         return LoginSnapshot::unread();
@@ -2740,7 +3134,7 @@ fn confirmed_signed_out(
     if left.is_zero() || !legacy_reader_allowed(home) {
         return LoginSnapshot::unread();
     }
-    let response = match usage_client {
+    let response = match fixture_client {
         Some(client) => get_usage_once_using(usage_url, login, left, expected_email, client),
         None => get_usage_once(usage_url, login, left, expected_email),
     };
@@ -2896,9 +3290,14 @@ pub fn read_identified_login_with_config(
     read_identified_login_with(home, &usage_url, &token_url, wait, now, expected_email)
 }
 
-/// Explicit native-fixture transport: verify a loopback HTTPS server against
-/// supplied roots without changing platform trust or OAuth refresh transport.
-/// Installed release builds cannot select this path.
+/// Explicit native-fixture transport: every request this read makes, its usage reads and any
+/// refresh of the login alike (a lost login's one presentation of its refresh token among them,
+/// [`super::codex_login_rotation`]), goes over one client that trusts the supplied roots alone,
+/// so the fixture's loopback HTTPS provider under them answers both. Platform trust is
+/// unchanged, and every other reader keeps it for its usage reads and its refreshes. The usage
+/// route must be loopback HTTPS, and a refresh is sent only to a loopback token endpoint (the
+/// login's recorded issuer): one anywhere else, the default issuer among them, is sent nothing
+/// (`refresh_admitted`). Installed release builds cannot select this path.
 #[cfg(debug_assertions)]
 #[must_use]
 #[expect(

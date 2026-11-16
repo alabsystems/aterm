@@ -15,15 +15,16 @@ use super::upgrade::{self, Dialect, SessionFile, Version};
 #[cfg(test)]
 use super::upgrade_drive::state_dir;
 use super::upgrade_drive::{
-    Client, HUNG_EXIT_AFTER_S, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM,
-    Screen, SessionRosterCache, St, TAIL_BYTES, Targets, TerminalRead, Terminated, Typed,
-    WhereWritten, alive, composer_clear, composer_empty, connect, continuation_composer_empty,
-    conversation_live, conversation_typed_by, cwd_of, earlier_tabs, exe_of, finished_where_written,
-    first_word, foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor, kept_move,
-    kernel_start, ledger, left_to_person, live_background, load_record, model_and_mark,
-    native_root, note_stuck, now_s, owned_by_aterm, process_in_tab, read_upgrade_dir, restore,
-    roster, said, save, save_checked, screen, since, squash, sweep_lock, table, tail_to_end,
-    terminate, turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
+    Client, HUNG_EXIT_AFTER_S, Hand, Job, Kernel, Live, NotRead, Opts, Records, Report,
+    SAME_PROGRAM, Screen, SessionRosterCache, St, TAIL_BYTES, TERMINAL_UNREAD, Targets, Terminated,
+    Typed, WhereWritten, alive, composer_clear, composer_empty, connect,
+    continuation_composer_empty, conversation_live, conversation_typed_by, cwd_of, earlier_tabs,
+    exe_of, finished_where_written, first_word, foreground_shell, held, home_carried, host_roster,
+    ids, is_our_ancestor, kept_move, kernel_start, ledger, left_to_person, live_background,
+    load_record, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm, process_in_tab,
+    read_upgrade_dir, restore, roster, said, save, save_checked, screen, since, squash, sweep_lock,
+    table, tail_to_end, terminate, turn_fenced, type_line, typing_fence, under_hand,
+    unique_tab_for_group,
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
@@ -428,6 +429,19 @@ fn plan_with_selection(
     };
     let cd = (!want.is_empty() && !same_dir(cwd_of(shell).as_deref(), &want)).then(|| want.clone());
     let required = required_env(launch.home, launch.homedir, launch.login);
+    // The folder's trust under the Claude home this line names, settled before the line is
+    // built: a dry run starts nothing.
+    if !opts.dry_run && !want.is_empty() {
+        kernel.settle_trust(
+            opts,
+            &super::launch_trust::Line {
+                argv: launch.argv,
+                cwd: &want,
+                env: &required,
+                exe: launch.exe,
+            },
+        );
+    }
     let tap = opts
         .usage_tap
         .as_ref()
@@ -611,7 +625,7 @@ fn token_build(exe: &Path) -> Option<PathBuf> {
 
 /// atpkg's own store of Claude Code builds ([`token_route::configured_builds`]); a test's, where
 /// it set one ([`TOKEN_BUILDS`]).
-fn token_builds() -> Option<PathBuf> {
+pub(super) fn token_builds() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(builds) = TOKEN_BUILDS.with(|seam| seam.borrow().clone()) {
         return Some(builds);
@@ -1627,7 +1641,7 @@ fn tab_mode(opts: &Opts, tab: &str) -> Option<String> {
 
 /// The `--permission-mode` value of the pill under Claude's composer on `rows` ([`super::lights::read_screen`]).
 pub(crate) fn screen_mode(rows: &[String]) -> Option<String> {
-    super::lights::read_screen(rows, None)
+    super::lights::read_screen(rows, None, None)
         .and_then(|shown| shown.mode)
         .map(|mode| mode.setting().to_string())
 }
@@ -4698,7 +4712,7 @@ pub(super) fn restore_look(
         if quiet.is_none()
             && look_types(at, opts.background)
             && opts.press.is_none()
-            && aterm_types::control_verbs::is_minted_sid(&tab)
+            && aterm_types::control_request::Sid::parse(&tab).is_some()
             && let Ok(mut c) = connect(opts, &tab)
             && autopilot_on(&mut c, &tab)
         {
@@ -6568,10 +6582,13 @@ fn restart_source_current(
             && actual_start.as_deref() == Some(squash(&now.proc_start).as_str())
             && actual_start.as_deref() == Some(squash(&snap.start).as_str())
     }) || foreground_shell(k.job(snap.pid)) != Ok(shell)
-        || !k
-            .terminal(snap.pid)
-            .as_ref()
-            .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
+        || match k.terminal(snap.pid) {
+            Ok(owner) => !owner
+                .as_ref()
+                .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str()))),
+            // Not read: the source is not known changed, nor current.
+            Err(NotRead) => return Err(TERMINAL_UNREAD),
+        }
         || !screen(client, &snap.tab).is_some_and(|scr| at_rest_for(why, client, &snap.tab, &scr))
         || (!clicked && !k.restart_background(snap.pid).is_empty())
         || held(client, &snap.tab, opts.human_grace_s)
@@ -7314,6 +7331,37 @@ pub fn launched(
     native: &Path,
     registered: bool,
 ) -> Option<(PathBuf, Vec<String>)> {
+    launched_read(argv, image, registered, &mut |exe| {
+        claude_layout_read(exe, native)
+    })
+    .ok()
+    .flatten()
+}
+
+/// Whether `exe` is Claude Code's install by its vendor's layout under `native` (its native
+/// installer's versions directory), as that read came to it ([`NotRead`]: it was not made).
+fn claude_layout_read(exe: &Path, native: &Path) -> Result<bool, NotRead> {
+    super::agent_image::vendor_layout_read(
+        aterm_phase::Program::Claude,
+        &super::agent_image::Image::at(exe),
+        &super::agent_image::Places {
+            claude_versions: Some(native),
+            roots: None,
+        },
+    )
+}
+
+/// [`launched`] as its reads came to it, the vendor layout of an absolute `image` read by
+/// `layout` at most once and only where neither the image's name nor its record (`registered`)
+/// names it: `Ok(None)` where what was read names no Claude Code, [`NotRead`] where the layout
+/// read alone could have named it and was not made. One read decides both the program and why
+/// none is named, so a second read can never answer over a first that failed (LS-72).
+fn launched_read(
+    argv: &[String],
+    image: Option<&Path>,
+    registered: bool,
+    layout: &mut dyn FnMut(&Path) -> Result<bool, NotRead>,
+) -> Result<Option<(PathBuf, Vec<String>)>, NotRead> {
     let is_claude = |p: &Path| match p
         .file_name()
         .and_then(|n| n.to_str())
@@ -7336,24 +7384,54 @@ pub fn launched(
     {
         let mut out = vec![script.to_string_lossy().into_owned()];
         out.extend(argv[2..].iter().cloned());
-        return Some((script.to_path_buf(), out));
+        return Ok(Some((script.to_path_buf(), out)));
     }
-    let image = image.filter(|p| p.is_absolute())?;
-    let places = super::agent_image::Places {
-        claude_versions: Some(native),
-        roots: None,
+    let Some(image) = image.filter(|p| p.is_absolute()) else {
+        return Ok(None);
     };
-    let laid = super::agent_image::in_vendor_layout(
-        aterm_phase::Program::Claude,
-        &super::agent_image::Image::at(image),
-        &places,
-    );
-    if !(is_claude(image) || laid || registered) {
-        return None;
+    if !(is_claude(image) || registered || layout(image)?) {
+        return Ok(None);
     }
     let mut out = vec![image.to_string_lossy().into_owned()];
     out.extend(argv.iter().skip(1).cloned());
-    Some((image.to_path_buf(), out))
+    Ok(Some((image.to_path_buf(), out)))
+}
+
+/// [`launched`] for the Claude Code lane's foreground process, with why the read cannot name it
+/// one where it does not: `registered` is whether its own session record registers it
+/// ([`NotRead`]: that record was there and not read). `not-claude`, the tab's answer, only where
+/// the image, the record and the image's vendor layout were all read; with the image unread
+/// ([`EXE_UNREADABLE`]) the program may be any lane's agent, and one not named Claude Code's is
+/// still one its record registers, so a record not read ([`RECORDS_UNREAD`]) is no answer either,
+/// nor a layout not read ([`LAYOUT_UNREAD`]). A process its own arguments name needs none of
+/// these reads.
+fn claude_program(
+    argv: &[String],
+    image: Option<&Path>,
+    native: &Path,
+    registered: Result<bool, NotRead>,
+) -> Result<(PathBuf, Vec<String>), &'static str> {
+    claude_program_by(argv, image, registered, &mut |exe| {
+        claude_layout_read(exe, native)
+    })
+}
+
+/// [`claude_program`] with the image's vendor layout read by `layout`, once at most: the one
+/// read that names the program also says why none is named.
+fn claude_program_by(
+    argv: &[String],
+    image: Option<&Path>,
+    registered: Result<bool, NotRead>,
+    layout: &mut dyn FnMut(&Path) -> Result<bool, NotRead>,
+) -> Result<(PathBuf, Vec<String>), &'static str> {
+    let read = launched_read(argv, image, registered == Ok(true), layout);
+    match read {
+        Ok(Some(program)) => Ok(program),
+        _ if image.is_none() => Err(EXE_UNREADABLE),
+        _ if registered.is_err() => Err(RECORDS_UNREAD),
+        Err(NotRead) => Err(LAYOUT_UNREAD),
+        Ok(None) => Err("not-claude"),
+    }
 }
 
 /// Read the [`Snapshot`] of the Claude Code (or codex-alab, Muse Code or agy) in tab `opts.only_sid` on `opts.sock`.
@@ -7373,26 +7451,61 @@ pub fn snapshot_with_claim(
     snapshot_with_claimed(opts, &Live, claim)
 }
 
-/// A snapshot read's refusal where the process table, or the foreground process's row in it, was
-/// not read ([`TerminalRead`]): on a loaded Mac a process in the middle of an exec holds
-/// every read of the table. The read then knows nothing of who opened the terminal, which
-/// `"terminal"` (read, and not aterm's) would claim.
-pub(super) const TERMINAL_UNREAD: &str = "terminal-unread";
-
-/// A snapshot read's refusal where the foreground process's image was not read and nothing else
-/// named it an agent's: with no image the read cannot say the program is no agent, which
-/// `"not-claude"` (image read, and no Claude Code) would claim.
+/// A snapshot read's refusal where the foreground process's image was not read
+/// ([`Kernel::image`] `None`: `proc_pidpath` failed) and nothing else named it an agent's: with no
+/// image the read cannot say the program is no agent, which `"not-claude"` (image read, and no
+/// Claude Code) would claim.
 pub(super) const EXE_UNREADABLE: &str = "exe-unreadable";
 
-/// Whether the terminal of `pid` is one aterm opened, by `k`'s read of it: `terminal-unread`
-/// where that read was not made, `"terminal"` where it was and names another opener or none.
+/// A snapshot read's refusal where the foreground process's image was read and is not named
+/// Claude Code's, and its own session record, which registers such a program as one, was not read
+/// (there and unreadable or malformed, as a write in progress is, or its records folder not
+/// resolved): with no record read the read cannot say the program is no agent, which
+/// `"not-claude"` (image and record read, and no Claude Code) would claim.
+pub(super) const RECORDS_UNREAD: &str = "records-unread";
+
+/// A snapshot read's refusal where the foreground process's image was read and the vendor layout
+/// that names its lane was not ([`super::agent_image::vendor_layout_read`]'s [`NotRead`]: a Codex
+/// package's manifest or marker, or Claude Code's native entry, not read, as on a loaded host or
+/// mid-install): with no layout read the read cannot say the program is no lane's, which
+/// [`NO_LANE`] or `"not-claude"` would claim (LS-15).
+pub(super) const LAYOUT_UNREAD: &str = "layout-unread";
+
+/// A snapshot read's refusal where the foreground process's arguments and environment were read
+/// and withheld ([`Kernel::args_read`] `Ok(None)`): the kernel answers them to no process of this one's
+/// user for as long as it runs (another user's process, as `sudo claude` is, this one not root).
+/// A lasting state every later read finds again, so an answer, never `argv-unreadable`, the read
+/// that failed (LS-72): no restart can read, and so relaunch, the process.
+pub const ARGV_WITHHELD: &str = "argv-withheld";
+
+/// A snapshot read's refusal where the foreground process's arguments were not read
+/// ([`Kernel::args_read`] [`NotRead`]: the read failed, and nothing says the next one will).
+pub(super) const ARGV_UNREAD: &str = "argv-unreadable";
+
+/// `pid`'s arguments as a snapshot reads them ([`Kernel::args_read`]): withheld for good is
+/// [`ARGV_WITHHELD`], an answer; a read that failed is [`ARGV_UNREAD`].
+fn snapshot_args(k: &dyn Kernel, pid: u32) -> Result<atpkg::caller_shell::ProcArgs, &'static str> {
+    match k.args_read(pid) {
+        Ok(Some(args)) => Ok(args),
+        Ok(None) => Err(ARGV_WITHHELD),
+        Err(NotRead) => Err(ARGV_UNREAD),
+    }
+}
+
+/// A self-claimed snapshot read's refusal where the shell the roster names as the tab's
+/// foreground was not read (its ids: [`Kernel::shell_holds_tab`] `None`): never `no-shell`, the
+/// answer that it was read and holds no tab, or is the crashed copy itself (LS-15).
+pub(super) const SHELL_UNREAD: &str = "shell-unread";
+
+/// Whether the terminal of `pid` is one aterm opened, by `k`'s read of it ([`Kernel::terminal`]):
+/// [`TERMINAL_UNREAD`] where that read was not made (on a loaded Mac a process in the middle of
+/// an exec holds every read of the process table), `"terminal"` where it was and names another
+/// opener or none.
 fn terminal_is_aterms(k: &dyn Kernel, pid: u32) -> Result<(), &'static str> {
-    match k.terminal_read(pid) {
-        TerminalRead::Unread => Err(TERMINAL_UNREAD),
-        TerminalRead::Read(Some((opener, name))) if owned_by_aterm((opener, name.as_str())) => {
-            Ok(())
-        }
-        TerminalRead::Read(_) => Err("terminal"),
+    match k.terminal(pid) {
+        Err(NotRead) => Err(TERMINAL_UNREAD),
+        Ok(Some((opener, name))) if owned_by_aterm((opener, name.as_str())) => Ok(()),
+        Ok(_) => Err("terminal"),
     }
 }
 
@@ -7404,23 +7517,34 @@ fn terminal_is_aterms(k: &dyn Kernel, pid: u32) -> Result<(), &'static str> {
 pub enum SnapshotRefusal {
     /// The tab was read and holds no agent a lane carries (the refusal's code): no foreground
     /// group, a group no one tab owns, a job no shell runs or one in the background, a terminal
-    /// read and not one aterm opened, another tab's process, or a program whose image was read
-    /// and that no lane reads or carries.
+    /// read and not one aterm opened, another tab's process, a program whose image and layout
+    /// were read and that no lane reads or carries, or, for a crashed self-claimed copy, no shell
+    /// read holding the tab.
     Answered(&'static str),
     /// The read failed before it could answer (the refusal's code): no tab named, no control
     /// socket or no roster from it, or a process fact (its ids, argv, start, image, home, config
-    /// or open files, or the process that opened its terminal: `terminal-unread`) not read; an
-    /// agent whose conversation the read could not settle (`threads-ambiguous`); or any code
+    /// or open files, the process that opened its terminal: [`TERMINAL_UNREAD`], the session
+    /// record that registers it: [`RECORDS_UNREAD`], the vendor layout that names its lane:
+    /// [`LAYOUT_UNREAD`], or the shell holding the tab: [`SHELL_UNREAD`]) not read; an agent
+    /// whose conversation the read could not settle (`threads-ambiguous`); or any code
     /// [`Self::of`] does not name, which is never taken for an answer.
     Unread(&'static str),
 }
 
 impl SnapshotRefusal {
-    /// The refusal code `why` of a snapshot read, classified: the answers are named, and every
-    /// other code is [`Self::Unread`].
+    /// The refusal code `why` of a snapshot read, classified: the one classifier of every
+    /// refusal. The answers are named, each resting only on facts the read did read; every other
+    /// code, a fact not read or one this does not know, is [`Self::Unread`].
     #[must_use]
     pub fn of(why: &'static str) -> Self {
         match why {
+            // Read and negative: the roster names no foreground group or no one tab for it; the
+            // job's ids, and for a group leader its terminal's opener, say it is no shell's
+            // foreground job; its terminal was read and aterm did not open it; its environment
+            // names another tab; its image (read) runs no lane's program; its argv (read) is no
+            // TUI; its arguments (read) are withheld from aterm for good ([`ARGV_WITHHELD`]); a
+            // crashed self-claimed copy's tab group is its own, or a shell read that does not
+            // hold the tab (`no-shell`).
             "no-foreground"
             | "tab-ambiguous"
             | "not-a-shell-job"
@@ -7429,7 +7553,17 @@ impl SnapshotRefusal {
             | "tab-identity-conflict"
             | NO_LANE
             | "not-claude"
-            | "not-a-tui" => Self::Answered(why),
+            | "not-a-tui"
+            | ARGV_WITHHELD
+            | "no-shell" => Self::Answered(why),
+            // Every other code, each a fact not read: no tab named (`no-tab`), no socket or roster
+            // (`no-socket`, `roster`), ids or a group leader's opener (`ids`), its terminal
+            // ([`TERMINAL_UNREAD`]), argv ([`ARGV_UNREAD`]), start (`start`), image
+            // ([`EXE_UNREADABLE`]), session record ([`RECORDS_UNREAD`]), vendor layout
+            // ([`LAYOUT_UNREAD`]), a shell holding the tab ([`SHELL_UNREAD`]), home, config or
+            // open files (`home-unreadable`,
+            // `config-unreadable`, `files-unreadable`), or a conversation not settled
+            // (`threads-ambiguous`); and any code this does not name.
             _ => Self::Unread(why),
         }
     }
@@ -7463,6 +7597,9 @@ pub(super) enum SnapshotLane {
     Agy,
     /// No lane relaunches it.
     None,
+    /// The read that names its lane failed ([`LAYOUT_UNREAD`]): a Codex whose package was not
+    /// read may be codex-alab's.
+    Unread,
 }
 
 /// The lane a foreground process is read by: the basename of its mapped image (`image`; `None`:
@@ -7474,22 +7611,23 @@ pub(super) fn snapshot_lane(image: Option<&Path>) -> SnapshotLane {
         return SnapshotLane::None;
     }
     match name.and_then(aterm_phase::program_of) {
-        Some(aterm_phase::Program::Codex)
-            if image.is_some_and(|exe| {
-                super::agent_image::in_vendor_layout(
+        Some(aterm_phase::Program::Codex) => {
+            let read = image.map_or(Ok(false), |exe| {
+                super::agent_image::vendor_layout_read(
                     aterm_phase::Program::Codex,
                     &super::agent_image::Image::at(exe),
                     &super::agent_image::Places::default(),
                 )
-            }) =>
-        {
-            SnapshotLane::CodexAlab
+            });
+            match read {
+                Ok(true) => SnapshotLane::CodexAlab,
+                Ok(false) => SnapshotLane::None,
+                Err(NotRead) => SnapshotLane::Unread,
+            }
         }
         Some(aterm_phase::Program::Muse) => SnapshotLane::Muse,
         Some(aterm_phase::Program::Agy) => SnapshotLane::Agy,
-        Some(
-            aterm_phase::Program::Codex | aterm_phase::Program::Grok | aterm_phase::Program::Kimi,
-        ) => SnapshotLane::None,
+        Some(aterm_phase::Program::Grok | aterm_phase::Program::Kimi) => SnapshotLane::None,
         Some(aterm_phase::Program::Claude | aterm_phase::Program::Generic) | None => {
             SnapshotLane::Claude
         }
@@ -7523,11 +7661,18 @@ pub(super) fn self_claimed_snapshot_with(
         return Err("tab-ambiguous");
     }
     let shell = u32::try_from(group).map_err(|_| "no-foreground")?;
-    if shell == copy.pid || k.shell_holds_tab(shell) != Some(true) {
+    // The tab's group none (0) or the crashed copy's own, or a shell read and not holding the
+    // tab, is the answer that no shell holds it; a shell not read is no answer.
+    if shell == 0 || shell == copy.pid {
         return Err("no-shell");
     }
+    match k.shell_holds_tab(shell) {
+        Some(true) => {}
+        Some(false) => return Err("no-shell"),
+        None => return Err(SHELL_UNREAD),
+    }
     terminal_is_aterms(k, shell)?;
-    let args = atpkg::caller_shell::process_args(shell).ok_or("argv-unreadable")?;
+    let args = snapshot_args(k, shell)?;
     if args
         .env_var("ATERM_PARENT_SESSION_ID")
         .is_some_and(|env_tab| env_tab != tab)
@@ -7613,7 +7758,7 @@ fn snapshot_with_claimed(
         terminal_is_aterms(k, pid)?;
     }
     super::laps::lap("job");
-    let args = atpkg::caller_shell::process_args(pid).ok_or("argv-unreadable")?;
+    let args = snapshot_args(k, pid)?;
     super::laps::lap("args");
     if args
         .env_var("ATERM_PARENT_SESSION_ID")
@@ -7640,6 +7785,7 @@ fn snapshot_with_claimed(
                 .map(|snapshot| snapshot.with_live_lifetime(lifetime, k));
         }
         SnapshotLane::None => return Err(NO_LANE),
+        SnapshotLane::Unread => return Err(LAYOUT_UNREAD),
         SnapshotLane::Claude => {}
     }
     let records = Records::of_process(
@@ -7649,23 +7795,23 @@ fn snapshot_with_claimed(
         || aterm_sysprobe::process_cwd(pid),
         args.env_var("PWD"),
     );
-    let file = records
-        .session_file(pid)
-        .filter(|sf| squash(&sf.proc_start) == start);
+    // The record there and not read (a write in progress) is kept apart from none: it is not the
+    // answer that nothing registers this process.
+    let (file, registered) = match records.session_file_read(pid) {
+        Ok(file) => {
+            let file = file.filter(|sf| squash(&sf.proc_start) == start);
+            let registered = file.is_some();
+            (file, Ok(registered))
+        }
+        Err(NotRead) => (None, Err(NotRead)),
+    };
     super::laps::lap("claude.records");
-    // No Claude Code by its arguments, image or records. That is the tab's answer only where
-    // the image was read: unread, the program may be any lane's agent.
-    let (program, argv) = launched(
+    let (program, argv) = claude_program(
         &args.argv,
         image.as_deref(),
         &native_root(&opts.home),
-        file.is_some(),
-    )
-    .ok_or(if image.is_some() {
-        "not-claude"
-    } else {
-        EXE_UNREADABLE
-    })?;
+        registered,
+    )?;
     let cwd = file
         .as_ref()
         .map(|sf| sf.cwd.clone())
@@ -10774,3 +10920,7 @@ mod tests;
 #[cfg(test)]
 #[path = "relaunch_fable_tests.rs"]
 mod fable_tests;
+
+#[cfg(all(test, unix))]
+#[path = "relaunch_trust_tests.rs"]
+mod trust_tests;

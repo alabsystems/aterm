@@ -196,14 +196,19 @@ fn a_via_chain_is_bounded_in_hops_and_bytes() {
         "the longest legal chain fits"
     );
     assert!(via_ok(&full));
+    let too_many = vec!["n-a"; VIA_MAX_HOPS + 1].join(",");
     assert!(
-        !via_ok(&vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",")),
-        "one hop too many"
+        too_many.len() <= VIA_MAX_BYTES,
+        "only the hop bound is exceeded"
     );
+    assert!(!via_ok(&too_many), "one hop too many");
     assert!(!via_ok(""), "a relay claim naming no relay still demotes");
-    assert!(!via_ok("a-a@n-b"), "a hop is a BARE principal");
-    assert!(!via_ok("a-a,,n-b"), "an empty hop is not a principal");
-    assert!(!via_ok("s-a,n-b,h-c"), "a loose s- word is no session");
+    assert!(!via_ok("tqn5r6e0148@n-b"), "a hop is a BARE principal");
+    assert!(
+        !via_ok("tqn5r6e0148,,n-b"),
+        "an empty hop is not a principal"
+    );
     assert!(via_ok("tqn5r6e0148,n-b,h-c"));
+    assert!(!via_ok("s-a,n-b,h-c"), "a loose s- word is no session");
     assert!(via_ok("s-0123456789abcdef0123,n-b,h-c"));
 }

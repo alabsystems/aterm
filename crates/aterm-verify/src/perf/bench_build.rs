@@ -18,7 +18,7 @@ use aterm_uds::spawnfd::{Command, Stdio};
 
 use super::arena::{self, Halt};
 use super::workspace_root;
-use crate::perf::driver::CargoDriver;
+use crate::perf::driver::{CargoDriver, built_executable};
 
 /// THE BENCHES' OWN TABLE of arms, mounted from the fabric bench: the cargo profile
 /// each builds with, where its binaries land, and the opt-level it promises.
@@ -388,83 +388,6 @@ fn set_bench_environment(
         .env(env, words)
         .env(output.0, output.1)
         .env("ATERM_TEST_EXECUTABLE", built);
-}
-
-/// Cargo's exact executable artifact, matched by both target name and target kind.
-pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result<PathBuf, String> {
-    built_executable_checked(messages, name, kind, |_| Ok(()))
-}
-
-/// A normal debug executable whose compiler profile enables the checkout's lab identity.
-/// Test harnesses and missing or disabled debug assertions cannot supply that fixture.
-pub(crate) fn built_debug_app(messages: &str, name: &str) -> Result<PathBuf, String> {
-    built_executable_checked(messages, name, "bin", |message| {
-        let profile = message.get("profile");
-        if profile
-            .and_then(|p| p.get("debug_assertions"))
-            .and_then(aterm_json::Value::as_bool)
-            != Some(true)
-            || profile
-                .and_then(|p| p.get("test"))
-                .and_then(aterm_json::Value::as_bool)
-                != Some(false)
-        {
-            return Err(format!(
-                "`{name}` lab fixture requires a normal executable with debug assertions enabled"
-            ));
-        }
-        Ok(())
-    })
-}
-
-fn built_executable_checked(
-    messages: &str,
-    name: &str,
-    kind: &str,
-    accept: impl Fn(&aterm_json::Value) -> Result<(), String>,
-) -> Result<PathBuf, String> {
-    let mut selected: Option<PathBuf> = None;
-    for line in messages.lines() {
-        let Ok(wire) = aterm_json::from_str::<crate::compiler_message::UnitMessage>(line) else {
-            continue;
-        };
-        let message = match wire {
-            crate::compiler_message::UnitMessage::Unit(value) => value,
-            crate::compiler_message::UnitMessage::Other => continue,
-            crate::compiler_message::UnitMessage::Ambiguous { .. } => {
-                return Err("compiler reported ambiguous message fields".into());
-            }
-        };
-        if message.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
-            continue;
-        }
-        let Some(path) = message
-            .get("executable")
-            .and_then(aterm_json::Value::as_str)
-        else {
-            continue;
-        };
-        let kinds = crate::compiler_message::artifact_target_kinds(&message)?;
-        let target = message.get("target");
-        let named = target
-            .and_then(|t| t.get("name"))
-            .and_then(aterm_json::Value::as_str)
-            == Some(name);
-        let bin = kinds.contains(&kind);
-        if named && bin {
-            accept(&message)?;
-            if selected
-                .as_ref()
-                .is_some_and(|prior| prior.as_os_str() != std::ffi::OsStr::new(path))
-            {
-                return Err(format!(
-                    "compiler reported conflicting executables for `{name}`"
-                ));
-            }
-            selected.get_or_insert_with(|| PathBuf::from(path));
-        }
-    }
-    selected.ok_or_else(|| format!("cargo reported no `{name}` binary"))
 }
 
 /// Why a bench's report is not of `built` (`identity`): the aterm it says it launched, and that

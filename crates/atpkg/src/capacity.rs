@@ -11,18 +11,16 @@
 //! full peak)
 //! and its disk on its own volume (`disk <need> on <mount>, reserves <bytes> against the claims
 //! behind it`: its need less what it has written). A waiting claim's disk is marked
-//! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: only
-//! space freed, or what a scratch claim held there may give back by its end, can make room for
-//! it, so it holds back no claim behind it while it is so. After that claim ends the waiter
-//! rechecks the actual space, and is refused if its relief leaves it short with no scratch claim
-//! held there that could meet it (DISK-ADMIT,
-//! [`aterm_capacity::Short::unservable`], [`aterm_capacity::Error::Unmet`]); a held claim is
-//! never marked. What a tree holds is the figure its reservation counts, with its footprint whole
-//! beside it where the pages the kernel compressed or swapped make that a tenth of a GiB or more
-//! ([`aterm_capacity::overrun::whole`]), and a held claim whose holder's tree holds more than it
-//! claimed says by how much ([`aterm_capacity::Overrun`]: `14.7 GiB past its 16 GiB claim`). Each
-//! volume a claim's disk is on is read, besides the one holding `<path>`, and has a disk line of its own
-//! (and, in `--json`, an entry of `volumes`).
+//! [`UNSERVABLE`] where its need is more than that volume has free above the floor now: it holds
+//! back no claim behind it while it is so, and once its one relief has run it ends at once rather
+//! than wait for disk (DISK-ADMIT, [`aterm_capacity::Short::unservable`],
+//! [`aterm_capacity::Error::Unmet`]); a held claim is never marked. What a tree holds is the figure
+//! its reservation counts, with its footprint whole beside it where the pages the kernel compressed
+//! or swapped make that a tenth of a GiB or more ([`aterm_capacity::overrun::whole`]), and a held
+//! claim whose holder's tree holds more than it claimed says by how much
+//! ([`aterm_capacity::Overrun`]: `14.7 GiB past its 16 GiB claim`). Each volume a claim's disk is
+//! on is read, besides the one holding `<path>`, and has a disk line of its own (and, in `--json`,
+//! an entry of `volumes`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -375,7 +373,7 @@ fn claim_line(
         "  {:<8} {pid_role} {:<7} for {:<7}",
         if c.held.is_some() { "held" } else { "waiting" },
         c.pid,
-        span(Duration::from_millis(now.saturating_sub(c.start_ms)))
+        span(Duration::from_millis(now.saturating_sub(c.laid_ms())))
     )];
     parts.push(format!("accounting {accounting}, lifetime {lifetime}"));
     if c.need.mem > 0 {
@@ -574,7 +572,7 @@ fn json_of(
                     m.insert("start_ms".to_owned(), Value::from(c.start_ms));
                     m.insert(
                         "age_ms".to_owned(),
-                        Value::from(now.saturating_sub(c.start_ms)),
+                        Value::from(now.saturating_sub(c.laid_ms())),
                     );
                     m.insert("what".to_owned(), Value::from(c.need.what.as_str()));
                     m.insert("checkout".to_owned(), Value::from(c.checkout.as_str()));

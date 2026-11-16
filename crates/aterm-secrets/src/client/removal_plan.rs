@@ -149,6 +149,9 @@ pub(super) fn prepare(
     let mut retirement = None;
     let mut custody = None;
     let mut legacy = true;
+    // What the prepared removal must leave neither seated nor wrapped: the recipients named and,
+    // once the log's planner ran, their writer successors' (`remove::with_successors`).
+    let mut gone: BTreeSet<Recipient> = recipients.iter().copied().collect();
     if let Some(descriptor) = admin_keys::control_descriptor(&admin.published_doc)? {
         for recipient in recipients {
             retirement::non_admin_target(admin, *recipient)?;
@@ -178,6 +181,7 @@ pub(super) fn prepare(
                 .ok_or_else(|| Error::new("removal names an unknown Commons recipient"))?;
             records = planned.records;
             retirement = Some(planned.retirement);
+            gone = planned.gone;
             retain_complete(&mut candidate, &records)
                 .map_err(|error| plan_error(error, &before, &[]))?;
         }
@@ -224,7 +228,7 @@ pub(super) fn prepare(
         let (log, head) =
             log_entries::trusted_commons_log_from_store(paths, &candidate, descriptor.trust())?
                 .ok_or_else(|| Error::new("the prepared removal lost its trusted Commons log"))?;
-        if recipients.iter().any(|recipient| {
+        if gone.iter().any(|recipient| {
             log.membership()
                 .members()
                 .values()

@@ -1182,7 +1182,7 @@ Committed_AS:   19000000 kB
     );
     assert_eq!(
         (m.swap_used, m.swap_total),
-        (k(2_097_148 - 1_048_576), k(2_097_148))
+        (Some(k(2_097_148 - 1_048_576)), Some(k(2_097_148)))
     );
     assert_eq!(
         m.commit,
@@ -1486,7 +1486,7 @@ fn memory_by_page_class_is_counted_from_one_read() {
     );
     assert_eq!(
         (m.swap_used, m.swap_total, m.pressure),
-        (1 << 30, 2 << 30, Some(MemoryLevel::Normal))
+        (Some(1 << 30), Some(2 << 30), Some(MemoryLevel::Normal))
     );
     assert_eq!(
         m.counters,
@@ -1515,7 +1515,38 @@ fn memory_by_page_class_is_counted_from_one_read() {
         Some(u64::MAX),
         "products saturate, stored is not clamped"
     );
-    assert_eq!((m.swap_used, m.swap_total), (0, 0), "no swap reading");
+    assert_eq!((m.swap_used, m.swap_total), (None, None), "no swap reading");
+    let zero = machine::memory_detail_of(&odd, page, 1 << 30, Some((0, 0)), None);
+    assert_eq!(
+        (zero.swap_used, zero.swap_total),
+        (Some(0), Some(0)),
+        "measured zero is retained"
+    );
+    assert_eq!(
+        zero.used(),
+        m.used(),
+        "unread swap does not discard physical memory"
+    );
+}
+
+#[test]
+fn swap_measurements_keep_missing_linux_keys_distinct_from_measured_zero() {
+    let base = "MemTotal: 100 kB\nMemFree: 20 kB\nMemAvailable: 30 kB\n";
+    for (fields, expected) in [
+        ("", (None, None)),
+        ("SwapTotal: 0 kB\nSwapFree: 0 kB\n", (Some(0), Some(0))),
+        ("SwapTotal: 10 kB\n", (None, Some(10 * 1024))),
+        ("SwapFree: 0 kB\n", (None, None)),
+        (
+            "SwapTotal: 10 kB\nSwapFree: 11 kB\n",
+            (None, Some(10 * 1024)),
+        ),
+    ] {
+        let memory = linux::memory_detail(&format!("{base}{fields}"))
+            .expect("physical memory remains readable");
+        assert_eq!((memory.swap_used, memory.swap_total), expected, "{fields}");
+        assert_eq!(memory.available, 30 * 1024);
+    }
 }
 
 #[test]
@@ -1704,7 +1735,9 @@ fn memory_by_page_class_reads_on_this_host_and_adds_up() {
     .iter()
     .fold(0u64, |a, b| a.saturating_add(*b));
     assert!(sum.abs_diff(total) <= total / 10, "{sum} of {total}: {m:?}");
-    assert!(m.swap_used <= m.swap_total, "{m:?}");
+    if let Some((used, total)) = m.swap_used.zip(m.swap_total) {
+        assert!(used <= total, "{m:?}");
+    }
     assert!(m.pressure.is_some());
 }
 

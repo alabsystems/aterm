@@ -417,7 +417,11 @@ fn native_front_never_arms_or_traps_host_terminal_search() {
         "direct terminal-search entry fails closed on native content"
     );
 
-    app.windows.get_mut(&wid).unwrap().search = Some(SearchState::default());
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .routing
+        .set_search(Some(SearchState::default()));
     app.search_exit();
     assert!(
         app.windows[&wid].search.is_none(),
@@ -499,7 +503,8 @@ fn an_invalid_pattern_outranks_the_history_being_away() {
 fn set_query(app: &mut App, wid: WindowId, query: &str) {
     app.windows
         .get_mut(&wid)
-        .and_then(|window| window.search.as_mut())
+        .as_deref_mut()
+        .and_then(|window| window.routing.search_mut())
         .expect("active search")
         .set_query(query.into());
 }
@@ -1376,7 +1381,8 @@ fn nav_member(member: &str, app: &mut App, wid: WindowId, action: &str) {
                 .expect("the observer pipe accepts a byte");
         }
         ("past the end", "RepeatForward") => {
-            let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
+            let mut payload_guard_search = app.windows.get_mut(&wid).unwrap();
+            let search = payload_guard_search.routing.search_mut().unwrap();
             if search.current == 0 {
                 search.current = search.matches.len();
             }
@@ -1776,7 +1782,11 @@ fn a_search_jump_records_who_took_the_selection() {
         match_content_seq: seq,
         ..SearchState::default()
     };
-    app.windows.get_mut(&wid).unwrap().search = Some(st);
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .routing
+        .set_search(Some(st));
 
     app.search_apply_current_in(wid);
 

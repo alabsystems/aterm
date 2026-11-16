@@ -609,6 +609,12 @@ impl Writer<'_, '_> {
             };
             Command::Write { request, changes }
         };
+        // A record still waiting on a causal parent may write a row this one writes: its
+        // candidates are not in the cells compared above, so this intent waits for it. A write
+        // of any other row goes now.
+        if let Some(why) = view.holds_back(&[command.changes().unwrap_or_default().to_vec()]) {
+            return Ok(Step::Wait(why));
+        }
         let wrote = wrote(command.changes());
         Ok(Step::Signed(
             application::append(self.session, store, &command.encode()?)?.id,
@@ -650,7 +656,10 @@ fn family(
             // the last one left it.
             let mut read: Option<(Log, View)> = None;
             for at in 0..works.len() {
-                let collection = compiled.collection(works[at].file.collection.name)?;
+                let Some((_, bound)) = works[at].file.table() else {
+                    continue;
+                };
+                let collection = compiled.collection(bound.name)?;
                 let mut earlier = Earlier::of(&works[at].held);
                 let intents: Vec<Intent> = works[at].held.outbox().waiting().cloned().collect();
                 earlier.waiting = intents.iter().map(|intent| intent.id.clone()).collect();
@@ -668,12 +677,6 @@ fn family(
                             let log = Log::read_with(session, store, scope, att::decode)?;
                             log.writable(session.actor())?;
                             let view = View::read(table, session, &log);
-                            if !view.complete {
-                                return Err(Error::new(
-                                    "this table's history here is incomplete; a write waits for \
-                                     a complete scan",
-                                ));
-                            }
                             (log, view)
                         }
                     };
@@ -868,20 +871,30 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
         }
     };
     if let Some(policy) = policy {
+        // A file of the journal ring or a view has no catalog table an intent could be signed
+        // into: each Mac's rows go out with its journal flush, and nobody writes a view. What
+        // waits in such a file's outbox stays there, said why, and is never signed.
+        for work in &mut works {
+            if work.file.table().is_none() && work.held.outbox().waiting().next().is_some() {
+                work.queue("this file is written by each Mac's journal flush, not by its outbox");
+            }
+        }
         let mut families: Vec<&'static Compiled> = Vec::new();
-        for work in &works {
+        for (family, _) in works.iter().filter_map(|work| work.file.table()) {
             if !families
                 .iter()
-                .any(|family| family.table.role == work.file.family.table.role)
+                .any(|known| known.table.role == family.table.role)
             {
-                families.push(work.file.family);
+                families.push(family);
             }
         }
         for first in families {
             let mut of: Vec<&mut Work> = works
                 .iter_mut()
                 .filter(|work| {
-                    work.file.family.table.role == first.table.role
+                    work.file
+                        .table()
+                        .is_some_and(|(family, _)| family.table.role == first.table.role)
                         && work.held.outbox().waiting().next().is_some()
                 })
                 .collect();
@@ -939,7 +952,7 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ChooseRotation",
-        reason = "The model's choice of the law one walk checks: no code chooses it, and the rotation area's code is SF-08's."
+        reason = "The model's choice of the law one walk checks: no code chooses it. shared_file_conforms takes the rotation area's fold on a fresh stand-in lab."
     )
 )]
 #[cfg_attr(
@@ -1041,15 +1054,16 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
 #[doc(hidden)]
 pub fn shared_file_environment() {}
 
-/// The `SharedFile` steps of the areas later slices build: authority on merge (SF-07), the face
-/// and its commit (SF-06), and Mac files and account rotation (SF-08).
+/// The `SharedFile` steps no code of this build takes as its own: authority on merge (SF-07),
+/// the face and its commit (SF-06), the rotation pool (SF-09), a Mac's reading of a window,
+/// and the Mac rows and entries the journal's typed readers merge (`typed::owned`).
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "OwnRow",
-        reason = "No shared file of this build holds a Mac's own row yet: the Mac class is declared and checked (file::Type::check, file::Class::refuses), and SF-08 binds the first Mac file and anchors its merge."
+        reason = "A Mac's own row of the journal ring is merged by typed::owned::read_owned (its AlabCells anchors), and the materializer projects ai/logins and ai/usage from that read: file::tests' SF-08 exit test holds a row at another Mac's key inert in the file and counted in its status."
     )
 )]
 #[cfg_attr(
@@ -1057,7 +1071,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ForeignRow",
-        reason = "No shared file of this build holds a Mac's own row yet: the Mac class is declared and checked (file::Type::check, file::Class::refuses), and SF-08 binds the first Mac file and anchors its merge."
+        reason = "A Mac's own row of the journal ring is merged by typed::owned::read_owned (its AlabCells anchors), and the materializer projects ai/logins and ai/usage from that read: file::tests' SF-08 exit test holds a row at another Mac's key inert in the file and counted in its status."
     )
 )]
 #[cfg_attr(
@@ -1065,7 +1079,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "OwnEntry",
-        reason = "No shared file of this build is a log yet: a log fits the Mac class (file::Type::check), and SF-08 binds the first and anchors its merge."
+        reason = "A Mac's own entry of the journal ring's event log is merged by typed::owned::read_log, which keeps an entry only at its signer's own key by the rule read_owned's AlabCells anchors hold, and the materializer projects ai/events from that read: file::tests' SF-08 exit test holds every Mac's events to the file and an older build's reading of the same record."
     )
 )]
 #[cfg_attr(
@@ -1073,7 +1087,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ForeignEntry",
-        reason = "No shared file of this build is a log yet: a log fits the Mac class (file::Type::check), and SF-08 binds the first and anchors its merge."
+        reason = "A Mac's own entry of the journal ring's event log is merged by typed::owned::read_log, which keeps an entry only at its signer's own key by the rule read_owned's AlabCells anchors hold, and the materializer projects ai/events from that read: file::tests' SF-08 exit test holds every Mac's events to the file and an older build's reading of the same record."
     )
 )]
 #[cfg_attr(
@@ -1169,7 +1183,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "SignIn",
-        reason = "Account rotation over shared files is SF-08's."
+        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
     )
 )]
 #[cfg_attr(
@@ -1177,7 +1191,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "Link",
-        reason = "Account rotation over shared files is SF-08's."
+        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
     )
 )]
 #[cfg_attr(
@@ -1185,7 +1199,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "EndLink",
-        reason = "Account rotation over shared files is SF-08's."
+        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
     )
 )]
 #[cfg_attr(
@@ -1193,7 +1207,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "Pool",
-        reason = "Account rotation over shared files is SF-08's."
+        reason = "The rotation pool, built from ai/links and ai/logins, is SF-09's: no code of this build builds it."
     )
 )]
 #[cfg_attr(
@@ -1201,7 +1215,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "HereOldWeek",
-        reason = "Folding two Macs' limit observations is SF-08's."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1209,7 +1223,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "HereNewWeek",
-        reason = "Folding two Macs' limit observations is SF-08's."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1217,7 +1231,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "PeerOldWeek",
-        reason = "Folding two Macs' limit observations is SF-08's."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[cfg_attr(
@@ -1225,15 +1239,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "PeerNewWeek",
-        reason = "Folding two Macs' limit observations is SF-08's."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "Fold",
-        reason = "Folding two Macs' limit observations is SF-08's."
+        reason = "A Mac's reading of a limit window is the environment: the harness reads it, and states it in its ai/usage row (SF-08b). shared_file_conforms states each reading as that row says it and folds them."
     )
 )]
 #[doc(hidden)]

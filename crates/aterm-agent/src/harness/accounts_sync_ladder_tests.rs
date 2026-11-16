@@ -33,7 +33,8 @@ fn inline(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
 }
 
 /// The upkeep's effects with every sign-in run inline, each run of `claude auth login` ending
-/// as `ends` and each browser it is handed kept, and every line the ladder logs kept.
+/// as `ends` and each browser it is handed kept, and every line the ladder logs kept. A `live`
+/// bench scripts nothing: each run is the real one, of the `claude` the home holds.
 pub(super) struct Bench {
     cooldown: Mutex<Option<Instant>>,
     rediscovery: Mutex<Rediscovery>,
@@ -46,6 +47,9 @@ pub(super) struct Bench {
     pub(super) vault_sync: fn(&Path, Option<&crate::harness::account_work::Scope>) -> Vault,
     /// Which rows run on their vault token here: unknown unless a test says so.
     pub(super) tokens_here: TokensRead,
+    /// Each run is the live one ([`UpkeepEffects::run_attempt`] unset): `ends` and `handed` go
+    /// unused.
+    pub(super) live: bool,
 }
 
 impl Bench {
@@ -60,6 +64,7 @@ impl Bench {
             ends,
             vault_sync: |home, _scope| not_a_member(home),
             tokens_here: |_, _, _, _| None,
+            live: false,
         }
     }
 
@@ -86,10 +91,12 @@ impl Bench {
             log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned())),
             tokens_here: self.tokens_here,
             shared: shared_renewal::Effects::default(),
-            run_attempt: Some(Arc::new(move |browser: &RenewBrowser, _headless: bool| {
-                handed.lock().unwrap().push(browser.clone());
-                ends
-            })),
+            run_attempt: (!self.live).then(|| -> RunAttempt {
+                Arc::new(move |browser: &RenewBrowser, _headless: bool| {
+                    handed.lock().unwrap().push(browser.clone());
+                    ends
+                })
+            }),
         }
     }
 
@@ -171,10 +178,12 @@ pub(super) fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAtt
         .and_then(|b| b.sign_in_attempt.clone())
 }
 
-/// A PAGE'S STOP HOLDS ITS ROW FOR SIX HOURS, counted from its last try and on record: past a
-/// restart, which forgets the ladder's own wait, a changed secret, which ends that wait as a new
-/// input, and a move, which is heard at every launch. CONTROL: a person's signed-in browser window
-/// ends the hold, and six hours do, in a process that holds its own wait too.
+/// A PAGE'S STOP THAT NO BOT PROTECTION MADE (a sign-in window a person closed) HOLDS ITS ROW FOR
+/// SIX HOURS, counted from its last try and on record: past a restart, which forgets the ladder's
+/// own wait, a changed secret, which ends that wait as a new input, and a move, which is heard at
+/// every launch. CONTROL: a person's signed-in browser window ends the hold, and six hours do, in a
+/// process that holds its own wait too. A check's stop holds on no clock
+/// ([`a_claude_row_a_check_stopped_waits_for_a_person_at_every_door`]).
 #[cfg(unix)]
 #[test]
 fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
@@ -192,13 +201,14 @@ fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
     };
     let stop = |at: i64| {
         store
-            .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |_, _, logins| {
+            .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |raw, _, logins| {
                 accounts::admit_workflow(logins, "w3")?;
-                Ok(accounts::note_sign_in_attempt(
+                Ok(accounts::note_sign_in_stop(
                     logins,
-                    "w3",
-                    accounts::AttemptOutcome::Blocked,
-                    "profile: it met a bot check",
+                    raw.row("w3").expect("the row"),
+                    false,
+                    crate::harness::open_url::MetWord::WindowClosed,
+                    "window: a person closed it",
                     at,
                 ))
             })
@@ -227,7 +237,7 @@ fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
             .lock()
             .unwrap()
             .ladder
-            .page_stopped("w3", Instant::now() + 2 * PERSON_BACKOFF);
+            .page_stopped("w3", Some(Instant::now() + 2 * PERSON_BACKOFF));
         bench.cool();
         bench
     };
@@ -339,7 +349,6 @@ fn a_repaired_profile_reopens_the_ladder_inside_its_wrong_account_wait_and_backo
         assert!(guard.ladder.retry_at("w3", clock).is_some());
         guard.last_attempt.insert("w3".into(), clock);
         guard.parked.insert("w3".into(), clock);
-        guard.bot_checked.insert("w3".into(), clock);
         let owner = guard.ladder_owners["w3"].clone();
         guard.activity_owners.insert("w3".into(), owner);
     }
@@ -721,7 +730,10 @@ fn a_published_alternate_keeps_the_requested_retry_and_the_actual_login() {
         let clock = Instant::now();
         guard.last_attempt.insert("alternate".into(), clock);
         guard.parked.insert("alternate".into(), clock);
-        guard.bot_checked.insert("alternate".into(), clock);
+        guard.unrecorded_checks.insert(
+            "alternate".into(),
+            super::login_activity_tests::a_check_met("alternate"),
+        );
         guard.activity_owners.insert(
             "alternate".into(),
             LoginOwner::new(&store, Cli::Claude, "alternate", NOW - 1),
@@ -796,7 +808,7 @@ fn a_published_alternate_keeps_the_requested_retry_and_the_actual_login() {
         assert!(activity.iter().any(|entry| entry.label == "w3"));
         assert!(!guard.last_attempt.contains_key("alternate"));
         assert!(!guard.parked.contains_key("alternate"));
-        assert!(!guard.bot_checked.contains_key("alternate"));
+        assert!(!guard.unrecorded_checks.contains_key("alternate"));
         assert!(!guard.activity_owners.contains_key("alternate"));
         assert!(!guard.ladder_owners.contains_key("alternate"));
         assert!(guard.ladder.retry_at("alternate", Instant::now()).is_none());
@@ -1570,6 +1582,857 @@ fn the_upkeep_opens_no_window_for_a_row_left_to_a_person() {
     ));
 }
 
+/// `accounts renew` as a terminal on this Mac runs it: a person's, or with `agent` an agent's
+/// (Claude Code's own marker in its environment). Each renewal it starts is noted, opens nothing
+/// and ends at what `met` names in aterm's sign-in window.
+#[cfg(unix)]
+struct RenewAtTheDesk {
+    agent: bool,
+    now: i64,
+    met: crate::harness::open_url::MetWord,
+    started: std::cell::RefCell<Vec<RenewBrowser>>,
+}
+
+#[cfg(unix)]
+impl crate::harness::cli::AccountsHost for RenewAtTheDesk {
+    fn stdin_is_terminal(&self) -> bool {
+        true
+    }
+    fn auth_status(&self, login: &str) -> Result<crate::harness::align::Captured, String> {
+        Err(format!("no status check here (asked under {login:?})"))
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        Err("no login here".to_owned())
+    }
+    fn now(&self) -> i64 {
+        self.now
+    }
+    fn opens_sign_in_window(&self) -> bool {
+        true
+    }
+    fn current_exe(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok()
+    }
+    fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {
+        (self.agent && name == "CLAUDECODE").then(|| "1".into())
+    }
+    fn renew_outcome(
+        &self,
+        _home: &str,
+        _email: &str,
+        browser: &RenewBrowser,
+    ) -> Result<crate::harness::cli::RenewalExit, crate::harness::cli::RenewalFailure> {
+        self.started.borrow_mut().push(browser.clone());
+        Ok(crate::harness::cli::RenewalExit {
+            code: 1,
+            met: Some(crate::harness::open_url::Met::new(
+                self.met,
+                Some("claude.ai"),
+            )),
+        })
+    }
+}
+
+/// Runs `accounts renew` at `at` on `desk` as [`RenewAtTheDesk`] does, for `w3` by name or, with
+/// `due`, as a `--due` sweep: its exit, the renewals it started and what it said.
+#[cfg(unix)]
+fn renew_w3(
+    desk: &Desk,
+    (agent, met): (bool, crate::harness::open_url::MetWord),
+    due: bool,
+    at: i64,
+) -> (ExitCode, Vec<RenewBrowser>, String) {
+    let host = RenewAtTheDesk {
+        agent,
+        now: at,
+        met,
+        started: std::cell::RefCell::default(),
+    };
+    let env = quiet_env(&desk.home, &desk.state, &config_beside(&desk.roster()), at);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = super::super::cli::run_accounts(
+        &super::super::cli::AccountsCmd::Renew {
+            labels: if due {
+                Vec::new()
+            } else {
+                vec!["w3".to_owned()]
+            },
+            due,
+            on: None,
+        },
+        &env,
+        &host,
+        &mut out,
+        &mut err,
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    (code, host.started.into_inner(), said)
+}
+
+/// A stand-in `claude` in `desk`'s home whose every sign-in ends at `met` (an outcome file's
+/// line, `window-human-check claude.ai`); what it returns reads one line per run, saying whether
+/// the run was handed aterm's sign-in window.
+#[cfg(unix)]
+fn claude_ending_at(desk: &Desk, met: &str) -> impl Fn() -> String + use<> {
+    use crate::harness::open_url::{OUTCOME_ENV, WINDOW_ENV};
+    let ran = desk.home.join("claude-ran.log");
+    let bin = desk.home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    aterm_tempfile::stand_in(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\necho \"window=${WINDOW_ENV}\" >> '{}'\nprintf 'opener-outcome=1\\nphase=continuing\\nmet={met}\\n' > \"${OUTCOME_ENV}.part\"\nmv \"${OUTCOME_ENV}.part\" \"${OUTCOME_ENV}\"\nexit 1\n",
+            ran.display()
+        ),
+    )
+    .unwrap();
+    move || fs::read_to_string(&ran).unwrap_or_default()
+}
+
+/// The upkeep's bench at this Mac's desk, every run the live one ([`Bench::live`]), on this
+/// thread run as the account `aterm-test` ([`shared_renewal::RUN_AS`]) whatever the process's
+/// `USER` is: verify's declared test environment has none, and a live run without one starts no
+/// child.
+#[cfg(unix)]
+fn live_upkeep() -> Bench {
+    shared_renewal::RUN_AS.with(|person| *person.borrow_mut() = Some("aterm-test".into()));
+    Bench {
+        guard: guard_reading(at_the_desk()),
+        live: true,
+        ..Bench::ending(Renewal::AuthFailed)
+    }
+}
+
+/// The upkeep's bench at this Mac's desk, each run scripted to fail ([`Bench::ending`]): it
+/// starts `w3`'s sign-in where nothing holds the row
+/// ([`the_upkeeps_run_is_handed_the_window_only_where_the_window_reads_the_rows_mailbox`]).
+#[cfg(unix)]
+fn desk_upkeep() -> Bench {
+    Bench {
+        guard: guard_reading(at_the_desk()),
+        ..Bench::ending(Renewal::AuthFailed)
+    }
+}
+
+/// What the ladder answers for `w3` at `at` in `bench`'s process.
+#[cfg(unix)]
+fn w3_route(desk: &Desk, bench: &Bench, at: i64) -> LadderStep {
+    let store = desk.store();
+    let records = store
+        .read_account_records(Some(&desk.roster()), at)
+        .unwrap();
+    let row = records.roster.row("w3").unwrap().clone();
+    bench.cool();
+    let fx = bench.fx();
+    let ctx = LadderCtx::of(&fx, &desk.roster());
+    ladder_route(&desk.home, &store, &row, at, &bench.guard, &ctx)
+}
+
+/// Whether the ladder holds `w3` at `at` in `bench`'s process and in a restarted one, and no pass
+/// of the upkeep there starts it. The restarted process's runs are scripted, so a hold that
+/// failed signs nothing in.
+#[cfg(unix)]
+fn w3_held(desk: &Desk, bench: &Bench, at: i64) -> bool {
+    [bench, &desk_upkeep()].into_iter().all(|bench| {
+        matches!(w3_route(desk, bench, at), LadderStep::Held)
+            && !bench.pass(desk, at)
+            && bench.handed().is_empty()
+    })
+}
+
+/// Whether the ladder would start `w3`'s sign-in at `at` with nothing holding it: the CONTROL
+/// that the record a test leaves holds nothing without the check beside it.
+#[cfg(unix)]
+fn w3_goes(desk: &Desk, at: i64) -> bool {
+    matches!(w3_route(desk, &desk_upkeep(), at), LadderStep::Go { .. })
+}
+
+/// A CLAUDE ROW A CHECK STOPPED WAITS FOR A PERSON AT EVERY DOOR
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): the upkeep's own sign-in, live
+/// against a stand-in `claude` whose window ends at the consent page's human check, leaves the
+/// row one `renew` task, one `blocked` attempt that names the page and the check's stop of its
+/// account. From then on nothing with nobody there signs it in, on any clock: the ladder asked
+/// seven hours later, past the six hours any other stop holds for, is held, a later upkeep and a
+/// restarted one start nothing and run no child, and an agent's `accounts renew` runs none and
+/// names the person's step in its own words. CONTROL: with a person at the terminal the same
+/// renewal opens aterm's sign-in window once; a sign-in that ended with no desktop to open the
+/// window on records no task, says it is tried again in six hours, and is, seven hours on; and a
+/// Kimi row whose background renewal met a bot check, its last sign-in `blocked` on record too,
+/// is tried again once six hours have passed.
+#[cfg(unix)]
+#[test]
+fn a_claude_row_a_check_stopped_waits_for_a_person_at_every_door() {
+    use crate::harness::open_url::MetWord;
+    let desk = desk_with_a_mail_folder();
+    let store = desk.store();
+    // The live run stamps its end with the wall clock, so the fixture keeps to it.
+    let now = crate::supervise::limit::unix_now();
+    runs_signed_out(&desk, "w3", now - 60);
+    let runs = claude_ending_at(&desk, "window-human-check claude.ai");
+
+    let bench = live_upkeep();
+    assert!(bench.pass(&desk, now), "the upkeep's sign-in");
+    assert_eq!(runs(), "window=1\n", "one run, in aterm's sign-in window");
+    let records = store
+        .read_account_records(Some(&desk.roster()), now)
+        .unwrap();
+    assert_eq!(
+        accounts::sign_in_tasks(&records.raw_roster, &records.logins),
+        [("w3".to_owned(), accounts::SignInAction::Renew)],
+        "the row's renewal is a person's"
+    );
+    let binding = records.logins.get("w3").expect("the row's binding");
+    let attempt = binding.sign_in_attempt.clone();
+    let attempt = attempt.expect("the attempt is on record");
+    assert_eq!(attempt.outcome, accounts::AttemptOutcome::Blocked);
+    assert_eq!(attempt.stop, Some(MetWord::WindowHumanCheck));
+    assert!(attempt.waits_for_a_person());
+    assert_eq!(
+        binding
+            .check_stop
+            .as_ref()
+            .and_then(|check| check.account.as_deref()),
+        Some("w3.m30.3@example.test"),
+        "the check's stop of the row's account"
+    );
+    assert!(
+        bench
+            .logged()
+            .iter()
+            .any(|line| line.contains("not tried again until a person signs it in")),
+        "{:?}",
+        bench.logged()
+    );
+
+    let later = now + PERSON_BACKOFF_SECS + 60 * 60;
+    assert!(w3_held(&desk, &bench, later), "seven hours on");
+    assert_eq!(runs(), "window=1\n", "no child ran again");
+
+    let (code, started, said) = renew_w3(&desk, (true, MetWord::WindowHumanCheck), false, later);
+    assert!(started.is_empty(), "an agent's renewal starts none: {said}");
+    assert_eq!(code, ExitCode::from(1), "{said}");
+    assert!(
+        said.contains(&super::super::cli::left_words(Cli::Claude, "w3"))
+            && said.contains("a person runs `aterm harness accounts renew w3`"),
+        "it names the person's step, and who takes it: {said}"
+    );
+    let (_, started, said) = renew_w3(&desk, (false, MetWord::WindowHumanCheck), false, later);
+    assert!(
+        matches!(started.as_slice(), [RenewBrowser::Window { .. }]),
+        "CONTROL: a person's renewal opens the sign-in window once: {started:?} {said}"
+    );
+    assert_eq!(runs(), "window=1\n");
+
+    let desk = desk_with_a_mail_folder();
+    runs_signed_out(&desk, "w3", now - 60);
+    let runs = claude_ending_at(&desk, "window-no-desktop");
+    let bench = live_upkeep();
+    assert!(
+        bench.pass(&desk, now),
+        "the upkeep's sign-in with no desktop"
+    );
+    let records = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), now)
+        .unwrap();
+    assert!(
+        accounts::sign_in_tasks(&records.raw_roster, &records.logins).is_empty(),
+        "CONTROL: no desktop leaves no person's task"
+    );
+    let binding = records.logins.get("w3").expect("the row's binding");
+    assert_eq!(
+        binding
+            .sign_in_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.stop),
+        Some(MetWord::WindowNoDesktop)
+    );
+    assert_eq!(binding.check_stop, None, "no bot protection stopped it");
+    assert!(
+        bench
+            .logged()
+            .iter()
+            .any(|line| line.contains("(tried again in 6h or when a person signs it in")),
+        "{:?}",
+        bench.logged()
+    );
+    bench.cool();
+    assert!(
+        !bench.pass(&desk, now + 60 * 60),
+        "CONTROL: held an hour on"
+    );
+    assert!(
+        !live_upkeep().pass(&desk, now + 60 * 60),
+        "CONTROL: held an hour on, past a restart"
+    );
+    bench.cool();
+    assert!(
+        bench.pass(&desk, later),
+        "CONTROL: tried again seven hours on, as it said"
+    );
+    assert_eq!(runs(), "window=1\nwindow=1\n");
+
+    for cli in [Cli::Kimi, Cli::Codex] {
+        let (ended, tried) = super::cli_pool_tests::a_vendor_rows_stop_is_tried(
+            cli,
+            super::super::login_drive::Outcome::BotCheck(
+                "Cloudflare's bot check did not clear in 90 s".to_owned(),
+            ),
+        );
+        assert_eq!(ended, Renewal::BotCheck, "{cli:?}");
+        assert_eq!(
+            tried, [false; 3],
+            "a {cli:?} row's bot check holds it as a Claude row's does: an hour, six hours \
+             and a minute and a day on, after a restart"
+        );
+    }
+    for cli in [Cli::Kimi, Cli::Codex] {
+        let (ended, tried) = super::cli_pool_tests::a_vendor_rows_stop_is_tried(
+            cli,
+            super::super::login_drive::Outcome::NeedsSignIn("the page asks for a code".to_owned()),
+        );
+        assert_eq!(ended, Renewal::NeedsPerson, "{cli:?}");
+        assert_eq!(
+            tried,
+            [false, true, true],
+            "CONTROL {cli:?}: a stop no bot protection made is tried again after its six hours"
+        );
+    }
+}
+
+/// A CHECK MET BY A SIGN-IN THE LADDER DID NOT START HOLDS THE ROW TOO: a person's click at this
+/// desk, live against a stand-in `claude` whose window ends at the consent page's human check,
+/// records the row's `blocked` attempt by hand with the page, the check's stop and the row's
+/// `renew` task, as the upkeep's own sign-in would; seven hours on, the ladder and the upkeep, in
+/// this process and in a restarted one, start nothing.
+#[cfg(unix)]
+#[test]
+fn a_check_a_click_met_holds_the_row_for_a_person() {
+    use crate::harness::open_url::MetWord;
+    let desk = desk_with_a_mail_folder();
+    let now = crate::supervise::limit::unix_now();
+    runs_signed_out(&desk, "w3", now - 60);
+    let runs = claude_ending_at(&desk, "window-human-check claude.ai");
+    let bench = live_upkeep();
+    assert!(
+        auto_renew_next_account_interactive_with(
+            Cli::Claude,
+            &desk.home,
+            &desk.state,
+            &desk.roster(),
+            now,
+            &bench.fx()
+        ),
+        "the click's sign-in"
+    );
+    assert_eq!(runs(), "window=1\n");
+    let records = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), now)
+        .unwrap();
+    assert_eq!(
+        accounts::sign_in_tasks(&records.raw_roster, &records.logins),
+        [("w3".to_owned(), accounts::SignInAction::Renew)]
+    );
+    let binding = records.logins.get("w3").expect("the row's binding");
+    let attempt = binding.sign_in_attempt.clone().expect("the attempt");
+    assert_eq!(
+        (attempt.outcome, attempt.stop),
+        (
+            accounts::AttemptOutcome::Blocked,
+            Some(MetWord::WindowHumanCheck)
+        )
+    );
+    assert!(
+        attempt.routes.starts_with("by hand: "),
+        "{}",
+        attempt.routes
+    );
+    assert!(binding.check_stop.is_some(), "the check's stop");
+    let later = now + PERSON_BACKOFF_SECS + 60 * 60;
+    assert!(w3_held(&desk, &bench, later), "seven hours on");
+    assert_eq!(runs(), "window=1\n", "no child ran again");
+}
+
+/// Records on `desk` that a bot protection, `word`, stopped `w3`'s sign-in at `at`, as the
+/// upkeep's own run records it.
+#[cfg(unix)]
+fn check_stopped(desk: &Desk, word: crate::harness::open_url::MetWord, at: i64) {
+    check_stopped_row(desk, "w3", word, at);
+}
+
+/// Records on `desk` that a bot protection, `word`, stopped the row `label`'s sign-in at `at`,
+/// as the upkeep's own run records it.
+#[cfg(unix)]
+fn check_stopped_row(desk: &Desk, label: &str, word: crate::harness::open_url::MetWord, at: i64) {
+    desk.store()
+        .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |raw, _, logins| {
+            accounts::admit_workflow(logins, label)?;
+            Ok(accounts::note_sign_in_stop(
+                logins,
+                raw.row(label).expect("the row"),
+                false,
+                word,
+                "mailbox: it met Cloudflare's bot check",
+                at,
+            ))
+        })
+        .unwrap();
+}
+
+/// The roster of `desk` with `w3` moved from preferred to pool: a new sign-in workflow for the
+/// same account.
+#[cfg(unix)]
+fn pool_w3(desk: &Desk) {
+    let text = fs::read_to_string(desk.roster()).unwrap();
+    let records = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), NOW)
+        .unwrap();
+    let w3 = records.raw_roster.row("w3").unwrap();
+    let line = accounts::row_text(w3).unwrap();
+    assert!(text.contains(&line), "{text}");
+    let pooled = accounts::Row {
+        class: Class::Pool,
+        ..w3.clone()
+    };
+    fs::write(
+        desk.roster(),
+        text.replace(&line, &accounts::row_text(&pooled).unwrap()),
+    )
+    .unwrap();
+}
+
+/// Records on `desk` that the ladder found `w3`'s token in use here at `at` ([`note_attempt`]
+/// with [`accounts::AttemptOutcome::OnToken`]), over whatever attempt stood, under the row's
+/// admitted workflow as the ladder's own pass holds it.
+#[cfg(unix)]
+fn on_token_noted(desk: &Desk, at: i64) {
+    desk.store()
+        .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "w3")?;
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let records = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), at)
+        .unwrap();
+    let row = records.roster.row("w3").unwrap().clone();
+    assert!(note_attempt(
+        &desk.store(),
+        (&desk.roster(), &row, &records.logins),
+        (accounts::AttemptOutcome::OnToken, None),
+        "vault",
+        at,
+    ));
+}
+
+/// Whether `w3`'s record on `desk` at `at` leaves its next sign-in to a person
+/// ([`left_to_a_person`]).
+#[cfg(unix)]
+fn check_stands(desk: &Desk, at: i64) -> bool {
+    let store = desk.store();
+    let records = store
+        .read_account_records(Some(&desk.roster()), at)
+        .unwrap();
+    left_to_a_person(
+        &store,
+        records.raw_roster.row("w3").unwrap(),
+        &records.logins,
+    )
+}
+
+/// A CHECK'S STOP OUTLASTS WHAT ITS ATTEMPT DOES NOT: the row's run on its token (an `on-token`
+/// attempt written over it), a later stop no bot protection made (a person closed the window in
+/// front of the check), and a change of the row's policy that keeps its account (the lab moving
+/// it from preferred to pool) each leave it standing, so the ladder seven hours on is held, in
+/// this process and a restarted one, and an agent's `accounts renew` starts nothing, the row's
+/// token in use here or not. CONTROL: each of those records alone holds nothing seven hours on;
+/// with the token in use, the ladder's vault route alone goes on, and no route that loads a page;
+/// a row that names another account is not held by the first account's check; and an earlier
+/// build's `blocked` record that names no page becomes the account's check when a run on the
+/// token is written over it.
+#[cfg(unix)]
+#[test]
+fn a_checks_stop_outlasts_what_its_attempt_does_not() {
+    use crate::harness::open_url::MetWord;
+    let later = NOW + PERSON_BACKOFF_SECS + 60 * 60;
+
+    // A run on the row's token is written over the check's attempt.
+    let desk = desk_with_a_mail_folder();
+    check_stopped(&desk, MetWord::BotCheck, NOW);
+    on_token_noted(&desk, NOW + 60);
+    assert_eq!(
+        attempt_of(&desk, "w3").map(|attempt| attempt.outcome),
+        Some(accounts::AttemptOutcome::OnToken)
+    );
+    assert!(
+        check_stands(&desk, later),
+        "the token ended: the check stands"
+    );
+    let bench = desk_upkeep();
+    assert!(w3_held(&desk, &bench, later), "on the token's end");
+    let raw = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), later)
+        .unwrap()
+        .raw_roster
+        .row("w3")
+        .unwrap()
+        .clone();
+    let other = accounts::Row {
+        email: Some("another.m30@example.test".to_owned()),
+        ..raw
+    };
+    assert_eq!(
+        accounts::check_stopped_at(&other, &desk.store().load_logins(later).unwrap().0),
+        None,
+        "CONTROL: another account is not held by this one's check"
+    );
+
+    // The stored reading names the row's token in use here.
+    let mut reading = std::collections::BTreeMap::new();
+    reading.insert("w3".to_owned(), u64::try_from(later + 86_400).unwrap());
+    desk.store()
+        .note_tokens_here(Some(&reading), later)
+        .unwrap();
+    assert!(
+        check_stands(&desk, later),
+        "a token in use lifts nothing at a door that loads a page"
+    );
+    let (code, started, said) = renew_w3(&desk, (true, MetWord::BotCheck), false, later);
+    assert!(started.is_empty(), "{said}");
+    assert_eq!(code, ExitCode::from(1), "{said}");
+    assert!(
+        said.contains(&super::super::cli::left_words(Cli::Claude, "w3")),
+        "{said}"
+    );
+    let bench = desk_upkeep();
+    assert!(
+        matches!(
+            w3_route(&desk, &bench, later),
+            LadderStep::Held | LadderStep::OnToken
+        ),
+        "CONTROL: the vault route alone"
+    );
+    assert!(!bench.pass(&desk, later + 60));
+    assert!(bench.handed().is_empty());
+    assert!(
+        check_stands(&desk, later + 60),
+        "and the check still stands"
+    );
+
+    // A person closes the window in front of the check.
+    let desk = desk_with_a_mail_folder();
+    check_stopped(&desk, MetWord::BotCheck, NOW);
+    let (_, started, said) = renew_w3(&desk, (false, MetWord::WindowClosed), false, NOW + 60);
+    assert_eq!(started.len(), 1, "a person's renewal runs: {said}");
+    assert_eq!(
+        attempt_of(&desk, "w3").and_then(|attempt| attempt.stop),
+        Some(MetWord::WindowClosed)
+    );
+    assert!(
+        check_stands(&desk, later),
+        "a closed window passes no check"
+    );
+    assert!(w3_held(&desk, &desk_upkeep(), later), "seven hours on");
+
+    // The lab moves the row from preferred to pool: a new workflow, the same account.
+    let desk = desk_with_a_mail_folder();
+    check_stopped(&desk, MetWord::BlockPage, NOW);
+    pool_w3(&desk);
+    let records = desk
+        .store()
+        .read_account_records(Some(&desk.roster()), later)
+        .unwrap();
+    assert_eq!(
+        accounts::current_sign_in_attempt(records.raw_roster.row("w3").unwrap(), &records.logins),
+        None,
+        "the attempt was the old workflow's"
+    );
+    assert!(check_stands(&desk, later), "the account's check stands");
+    assert!(w3_held(&desk, &desk_upkeep(), later), "seven hours on");
+
+    // CONTROL: each record alone holds nothing seven hours on.
+    let desk = desk_with_a_mail_folder();
+    on_token_noted(&desk, NOW + 60);
+    assert!(w3_goes(&desk, later), "CONTROL: a run on the token alone");
+    let desk = desk_with_a_mail_folder();
+    let (_, started, said) = renew_w3(&desk, (false, MetWord::WindowClosed), false, NOW + 60);
+    assert_eq!(started.len(), 1, "{said}");
+    assert!(w3_goes(&desk, later), "CONTROL: a closed window alone");
+    let desk = desk_with_a_mail_folder();
+    pool_w3(&desk);
+    assert!(w3_goes(&desk, later), "CONTROL: the move to pool alone");
+
+    // An earlier build's record: `blocked`, with no page named and no check kept beside it.
+    let desk = desk_with_a_mail_folder();
+    desk.store()
+        .transact_pool_logins_within(&[], &desk.roster(), NOW, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "w3")?;
+            Ok(accounts::note_sign_in_attempt(
+                logins,
+                "w3",
+                accounts::AttemptOutcome::Blocked,
+                "mailbox: it met Cloudflare's bot check",
+                NOW,
+            ))
+        })
+        .unwrap();
+    on_token_noted(&desk, NOW + 60);
+    assert_eq!(
+        desk.store()
+            .load_logins(NOW + 60)
+            .unwrap()
+            .0
+            .get("w3")
+            .and_then(|binding| binding.check_stop.clone())
+            .map(|check| check.at),
+        Some(NOW),
+        "CONTROL: the earlier build's hold is kept as the account's check"
+    );
+    assert!(check_stands(&desk, later));
+}
+
+/// A CHECK WHOSE RUN COULD NOT RECORD IT IS HELD ANYWAY: the account's check is written under no
+/// fence but the account's own, where the run's own record was refused; and where the records
+/// cannot be written at all, this process keeps it and holds the row until a ladder pass has
+/// written it. CONTROL: a check of a row that a login was made for since its run started, or
+/// that names another account now, is no longer the row's to hold.
+#[cfg(unix)]
+#[test]
+fn a_check_its_run_could_not_record_is_held_anyway() {
+    let desk = desk_with_a_mail_folder();
+    let store = desk.store();
+    let records = store
+        .read_account_records(Some(&desk.roster()), NOW)
+        .unwrap();
+    let row = records.roster.row("w3").unwrap().clone();
+    let generation = records.logins.get("w3").map(|b| b.renewal_generation);
+    let check = |roster_path: PathBuf, generation: Option<u64>| PendingCheck {
+        roster_path,
+        row: row.clone(),
+        generation,
+        at: NOW,
+    };
+    let unwritable = desk.home.join("no-such-dir").join("accounts.toml");
+    let bench = desk_upkeep();
+    hold_for_a_person(
+        &bench.guard,
+        &store,
+        "w3".to_owned(),
+        check(unwritable.clone(), generation),
+    );
+    assert!(
+        bench
+            .guard
+            .lock()
+            .unwrap()
+            .unrecorded_checks
+            .contains_key("w3"),
+        "kept by this process"
+    );
+    let later = NOW + PERSON_BACKOFF_SECS + 60 * 60;
+    let fx = bench.fx();
+    let ctx = LadderCtx::of(&fx, &desk.roster());
+    assert!(matches!(
+        ladder_route(&desk.home, &store, &row, later, &bench.guard, &ctx),
+        LadderStep::Held
+    ));
+    assert!(
+        bench
+            .guard
+            .lock()
+            .unwrap()
+            .unrecorded_checks
+            .contains_key("w3"),
+        "still unwritten, still kept"
+    );
+    bench
+        .guard
+        .lock()
+        .unwrap()
+        .unrecorded_checks
+        .insert("w3".to_owned(), check(desk.roster(), generation));
+    assert!(matches!(
+        ladder_route(&desk.home, &store, &row, later, &bench.guard, &ctx),
+        LadderStep::Held
+    ));
+    assert!(
+        bench.guard.lock().unwrap().unrecorded_checks.is_empty(),
+        "written by the pass"
+    );
+    let raw = records.raw_roster.row("w3").unwrap();
+    assert!(left_to_a_person(
+        &store,
+        raw,
+        &store.load_logins(later).unwrap().0
+    ));
+    assert!(w3_held(&desk, &desk_upkeep(), later), "and held on record");
+
+    {
+        // A login made for the row after its run started: the check is no longer its to hold.
+        // Any other write since, which moves the row's generation too, leaves it standing (the
+        // run's own admission that made the binding, `cli_pool_tests::
+        // a_check_met_by_a_renewal_whose_record_did_not_land_is_recorded_alone`).
+        let desk = desk_with_a_mail_folder();
+        let store = desk.store();
+        let login = desk.home.join("w3-login-made-since");
+        store
+            .transact_logins(NOW + 1, &mut None, |state, logins| {
+                Ok(accounts::note_renewed(
+                    state,
+                    logins,
+                    "w3",
+                    row.dir.as_deref(),
+                    login.to_str().unwrap(),
+                    None,
+                    NOW + 1,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            write_check_stop(&store, &check(desk.roster(), generation)),
+            CheckWrite::Moot,
+            "CONTROL: a login was made since"
+        );
+    }
+    let desk = desk_with_a_mail_folder();
+    let store = desk.store();
+    let other = PendingCheck {
+        row: accounts::Row {
+            email: Some("another.m30@example.test".to_owned()),
+            ..row.clone()
+        },
+        ..check(desk.roster(), generation)
+    };
+    assert_eq!(
+        write_check_stop(&store, &other),
+        CheckWrite::Moot,
+        "CONTROL: the row names another account"
+    );
+    assert_eq!(
+        store
+            .load_logins(NOW)
+            .unwrap()
+            .0
+            .get("w3")
+            .and_then(|b| b.check_stop.clone()),
+        None
+    );
+    assert!(w3_goes(&desk, later), "CONTROL: a moot check holds nothing");
+}
+
+/// AN AGENT'S `--due` SWEEP PROMISES A ROW LEFT TO A PERSON NO UPKEEP RENEWAL: inside another
+/// account's sign-in spacing, the row a check stopped is named with the person's step, before any
+/// spacing is judged or any sign-in lock is waited for, never as one a window's upkeep renews
+/// later.
+#[cfg(unix)]
+#[test]
+fn an_agents_due_sweep_names_the_persons_step_for_a_row_left_to_a_person() {
+    use crate::harness::open_url::MetWord;
+    let desk = desk_with_a_mail_folder();
+    check_stopped(&desk, MetWord::BotCheck, NOW);
+    let store = desk.store();
+    fs::create_dir_all(store.shared_dir()).unwrap();
+    fs::write(
+        store
+            .shared_dir()
+            .join(crate::harness::sign_in_ladder::SIGNIN_SPACING_FILE),
+        format!("aterm-signin-spacing-v1\nclaude main {}\n", NOW + 30),
+    )
+    .unwrap();
+    let (_, started, said) = renew_w3(&desk, (true, MetWord::BotCheck), true, NOW + 60);
+    assert!(started.is_empty(), "{said}");
+    assert!(
+        said.contains(&super::super::cli::left_words(Cli::Claude, "w3")),
+        "the person's step: {said}"
+    );
+    assert!(!said.contains("w3: not run yet"), "{said}");
+}
+
+/// Runs `accounts token w3` in `mode` at `at` on `desk` as [`RenewAtTheDesk`] does, at this Mac's
+/// desk, with no vault and no `claude` to run, under a test key for the lab's journal: its exit
+/// and what it said.
+#[cfg(unix)]
+fn token_w3(
+    desk: &Desk,
+    agent: bool,
+    mode: super::super::cli::TokenMode,
+    at: i64,
+) -> (ExitCode, String) {
+    let host = RenewAtTheDesk {
+        agent,
+        now: at,
+        met: crate::harness::open_url::MetWord::BotCheck,
+        started: std::cell::RefCell::default(),
+    };
+    let env = quiet_env(&desk.home, &desk.state, &config_beside(&desk.roster()), at);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    // The lab's journal keys the account as the token verb's own tests key it.
+    let code =
+        crate::harness::journal::with_keyer(crate::harness::accounts_tokens::tests::keyer, || {
+            super::super::cli::run_accounts(
+                &super::super::cli::AccountsCmd::Token {
+                    name: "w3".to_owned(),
+                    mode,
+                },
+                &env,
+                &host,
+                &mut out,
+                &mut err,
+            )
+        });
+    assert!(
+        host.started.into_inner().is_empty(),
+        "a token run renews nothing"
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    (code, said)
+}
+
+/// AN AGENT'S `accounts token` OPENS NO SIGN-IN PAGE FOR A ROW LEFT TO A PERSON: a token is made
+/// on claude.ai's own page, in aterm's sign-in window, which a check that stands meets again, so
+/// for a row a bot protection stopped an agent's run, making or replacing, refuses before any
+/// vault or `claude` is asked for and names the person's step. CONTROL: a person at this
+/// terminal, an agent's removal, which loads no page, and an agent's run for a row no check
+/// stopped each go past it.
+#[cfg(unix)]
+#[test]
+fn an_agents_token_run_opens_nothing_for_a_row_left_to_a_person() {
+    use super::super::cli::TokenMode;
+    let refused = format!(
+        "aterm harness accounts token: {}",
+        super::super::cli::left_words(Cli::Claude, "w3")
+    );
+    let desk = desk_with_a_mail_folder();
+    check_stopped(&desk, crate::harness::open_url::MetWord::BotCheck, NOW);
+    for mode in [TokenMode::Make, TokenMode::Replace] {
+        let (code, said) = token_w3(&desk, true, mode, NOW + 60);
+        assert_eq!(code, ExitCode::from(1), "{said}");
+        assert!(said.contains(&refused), "{said}");
+    }
+    let (_, said) = token_w3(&desk, false, TokenMode::Make, NOW + 60);
+    assert!(!said.contains(&refused), "CONTROL: a person's run: {said}");
+    let (_, said) = token_w3(&desk, true, TokenMode::Remove, NOW + 60);
+    assert!(!said.contains(&refused), "CONTROL: a removal: {said}");
+    let desk = desk_with_a_mail_folder();
+    let (_, said) = token_w3(&desk, true, TokenMode::Make, NOW + 60);
+    assert!(!said.contains(&refused), "CONTROL: no check stands: {said}");
+}
+
 /// The log's line for a token step after a sign-in holds the row's label and no address (the
 /// token verb names the account to a person, and the upkeep's log is read by nobody who asked),
 /// and says where the token was made: in the sign-in window, or on the row's headless profile.
@@ -1598,4 +2461,1116 @@ fn the_token_steps_log_line_holds_no_address() {
         "w3: token: aterm harness accounts token: a token for <address> is being made in \
          another tab"
     );
+}
+
+/// The upkeep's log line for a capture it ran (plan package FL-138) is judged by the verb's exit:
+/// a token made says where, with any warning the verb wrote after it, and every address in that
+/// warning written `<address>`; a refusal says what the verb refused, and one with nothing to
+/// say that nothing was made.
+/// NEGATIVE CONTROL: with the line judged by whether the verb wrote to its error stream, the
+/// made token with a warning reads as the warning alone: `` w3: token (none): aterm harness
+/// accounts token: tokens-tried.json ``.
+#[cfg(unix)]
+#[test]
+fn the_token_upkeeps_log_line_is_judged_by_the_verbs_exit() {
+    use crate::harness::accounts_tokens::{Finding, Gap, Via};
+    let finding = Finding {
+        key: "ac-0000000000000001".to_owned(),
+        gap: Gap::None,
+        minted_at: None,
+        via: Via::Unattended,
+    };
+    let warned = "aterm harness accounts token: tokens-tried.json: the lock stayed held for \
+                  w3.m30.3@example.test\n";
+    let line = backfill_line("w3", &finding, ExitCode::SUCCESS, warned);
+    assert!(
+        line.starts_with("w3: token (none): made in the sign-in window with nobody there; "),
+        "{line}"
+    );
+    assert!(line.contains("<address>") && !line.contains('@'), "{line}");
+    assert_eq!(
+        backfill_line("w3", &finding, ExitCode::SUCCESS, " \n"),
+        "w3: token (none): made in the sign-in window with nobody there"
+    );
+    let headless = Finding {
+        gap: Gap::Soon,
+        via: Via::Headless,
+        ..finding.clone()
+    };
+    assert_eq!(
+        backfill_line("w3", &headless, ExitCode::SUCCESS, ""),
+        "w3: token (ends soon): made on its headless browser profile"
+    );
+    let refused = backfill_line(
+        "w3",
+        &finding,
+        ExitCode::from(1),
+        "aterm harness accounts token: a human check held the consent page for \
+         w3.m30.3@example.test\n",
+    );
+    assert_eq!(
+        refused,
+        "w3: token (none): aterm harness accounts token: a human check held the consent page \
+         for <address>"
+    );
+    assert_eq!(
+        backfill_line("w3", &finding, ExitCode::from(1), ""),
+        "w3: token (none): not made"
+    );
+}
+
+// THE TOKEN UPKEEP (plan package FL-138): `upkeep_tokens` end to end through the upkeep's pass,
+// with `claude setup-token` stood in (`setup_token::tests::stand_in`), the vault stood in by a
+// keyed fake (`FleetVault`) and this Mac's vault refresh scripted (`tier_sync`).
+
+/// The window route's account, as the stand-in signs it in.
+#[cfg(target_os = "macos")]
+const WORK: &str = "person@example.com";
+
+/// A second account the stand-in signs in as.
+#[cfg(target_os = "macos")]
+const OTHER: &str = crate::harness::setup_token::tests::OTHER_EMAIL;
+
+#[cfg(target_os = "macos")]
+const WORK_KEY: &str = "ac-0000000000000001";
+
+#[cfg(target_os = "macos")]
+const OTHER_KEY: &str = "ac-0000000000000002";
+
+/// This Mac's platform id, as the tier's reads give it.
+#[cfg(target_os = "macos")]
+const MACHINE: &str = "00000000-0000-4000-8000-000000000030";
+
+/// The upkeep's clock in these tests: the token fixtures' (2027-01-15).
+#[cfg(target_os = "macos")]
+const T0: i64 = 1_800_000_000;
+
+#[cfg(target_os = "macos")]
+fn tier_keyer(_realm: &str, email: &str) -> Option<String> {
+    match email {
+        WORK => Some(WORK_KEY.to_owned()),
+        OTHER => Some(OTHER_KEY.to_owned()),
+        _ => None,
+    }
+}
+
+/// The vault, stood in for, by account key: its route, the standings it holds, the status of
+/// each refusal this Mac recorded, and every write it took.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct FleetVault {
+    route: std::rc::Rc<std::cell::Cell<aterm_secrets::client::WriteRoute>>,
+    held: std::rc::Rc<std::cell::RefCell<BTreeMap<String, aterm_secrets::claude_token::Standing>>>,
+    refused: std::rc::Rc<std::cell::RefCell<BTreeMap<String, u16>>>,
+    writes: std::rc::Rc<std::cell::RefCell<Vec<(String, aterm_secrets::claude_token::Meta)>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl FleetVault {
+    fn seated() -> Self {
+        Self {
+            route: std::rc::Rc::new(std::cell::Cell::new(
+                aterm_secrets::client::WriteRoute::Seated,
+            )),
+            held: std::rc::Rc::default(),
+            refused: std::rc::Rc::default(),
+            writes: std::rc::Rc::default(),
+        }
+    }
+
+    fn writes(&self) -> Vec<(String, aterm_secrets::claude_token::Meta)> {
+        self.writes.borrow().clone()
+    }
+
+    fn hold(&self, standing: aterm_secrets::claude_token::Standing) {
+        self.held
+            .borrow_mut()
+            .insert(standing.key.as_str().to_owned(), standing);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl crate::harness::accounts_tokens::TokenVault for FleetVault {
+    fn route(&self, _by: Instant) -> Result<aterm_secrets::client::WriteRoute, String> {
+        Ok(self.route.get())
+    }
+    fn standing(
+        &self,
+        key: &aterm_secrets::claude_token::Key,
+        _by: Instant,
+    ) -> Result<aterm_secrets::claude_token::Lookup<aterm_secrets::claude_token::Standing>, String>
+    {
+        use aterm_secrets::claude_token::Lookup;
+        Ok(self
+            .held
+            .borrow()
+            .get(key.as_str())
+            .cloned()
+            .map_or(Lookup::Absent, Lookup::Found))
+    }
+    fn listed(
+        &self,
+    ) -> Result<
+        aterm_secrets::claude_token::Lookup<Vec<aterm_secrets::claude_token::Standing>>,
+        String,
+    > {
+        Ok(aterm_secrets::claude_token::Lookup::Found(
+            self.held.borrow().values().cloned().collect(),
+        ))
+    }
+    fn waiting_here(&self, _key: &aterm_secrets::claude_token::Key) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn seat_here(&self) -> Result<Option<String>, String> {
+        Ok(Some("m30".to_owned()))
+    }
+    fn write(
+        &self,
+        key: &aterm_secrets::claude_token::Key,
+        token: &aterm_secrets::SecretBytes,
+        meta: &aterm_secrets::claude_token::Meta,
+        _on_busy: aterm_secrets::client::OnBusy,
+    ) -> Result<aterm_secrets::client::MemberWritten, String> {
+        assert_eq!(
+            token.as_slice(),
+            crate::harness::setup_token::tests::token().as_bytes(),
+            "the token made"
+        );
+        self.writes
+            .borrow_mut()
+            .push((key.as_str().to_owned(), meta.clone()));
+        self.refused.borrow_mut().remove(key.as_str());
+        self.hold(aterm_secrets::claude_token::Standing {
+            key: key.clone(),
+            meta: Some(meta.clone()),
+            check: aterm_secrets::claude_token::Check::Readable,
+            signer: Some("m30".to_owned()),
+            minted_here: true,
+            exposed: Vec::new(),
+            refused_at: None,
+        });
+        Ok(aterm_secrets::client::MemberWritten::Posted)
+    }
+    fn remove(
+        &self,
+        _key: &aterm_secrets::claude_token::Key,
+        _by: Instant,
+    ) -> Result<aterm_secrets::client::MemberUnset, String> {
+        panic!("the upkeep removes no token")
+    }
+    fn verify(
+        &self,
+        _key: &aterm_secrets::claude_token::Key,
+        _minted_at: u64,
+        _evidence: aterm_secrets::claude_token::Verified,
+        _on_busy: aterm_secrets::client::OnBusy,
+    ) -> Result<aterm_secrets::client::MemberWritten, String> {
+        Ok(aterm_secrets::client::MemberWritten::Refused(
+            "the fake vault verifies nothing".to_owned(),
+        ))
+    }
+    fn refused_status(&self, standing: &aterm_secrets::claude_token::Standing) -> Option<u16> {
+        self.refused.borrow().get(standing.key.as_str()).copied()
+    }
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The vault and the stand-in's environment the tier's host on this thread runs on
+    /// ([`tier_host`]): the upkeep runs its capture on this thread ([`inline`]).
+    static TIER: std::cell::RefCell<Option<(FleetVault, Vec<(OsString, OsString)>)>> =
+        const { std::cell::RefCell::new(None) };
+    /// How many vault refreshes this thread's upkeep ran ([`tier_sync`]).
+    static TIER_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_os = "macos")]
+use std::ffi::OsString;
+
+/// The tier's vault refresh: it read the whole vault.
+#[cfg(target_os = "macos")]
+fn tier_sync(_home: &Path, _scope: Option<&crate::harness::account_work::Scope>) -> Vault {
+    TIER_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+    Vault::Applied(1)
+}
+
+/// The accounts host a capture the upkeep starts runs on: this thread's [`TIER`].
+#[cfg(target_os = "macos")]
+fn tier_host(
+    _scope: Option<crate::harness::account_work::Scope>,
+) -> Box<dyn crate::harness::cli::AccountsHost> {
+    let (vault, env) = TIER.with(|tier| tier.borrow().clone()).expect("a tier");
+    Box::new(TierHost { vault, env })
+}
+
+#[cfg(target_os = "macos")]
+struct TierHost {
+    vault: FleetVault,
+    env: Vec<(OsString, OsString)>,
+}
+
+#[cfg(target_os = "macos")]
+impl crate::harness::cli::AccountsHost for TierHost {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, login: &str) -> Result<crate::harness::align::Captured, String> {
+        panic!("the token upkeep runs no `claude auth status` (under {login:?})")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _dir: Option<&str>) -> Result<i32, String> {
+        panic!("the token upkeep runs no `claude auth login`")
+    }
+    fn now(&self) -> i64 {
+        0
+    }
+    fn on_macos(&self) -> bool {
+        true
+    }
+    fn opens_sign_in_window(&self) -> bool {
+        true
+    }
+    fn current_exe(&self) -> Option<PathBuf> {
+        std::env::current_exe().ok()
+    }
+    fn verb_env(&self) -> Vec<(OsString, OsString)> {
+        self.env.clone()
+    }
+    fn token_vault(&self) -> Option<Box<dyn crate::harness::accounts_tokens::TokenVault>> {
+        Some(Box::new(self.vault.clone()))
+    }
+    fn setup_token_program(&self) -> Option<(crate::harness::setup_token::Program, String)> {
+        Some((
+            crate::harness::setup_token::tests::World::program(),
+            "2.1.318".to_owned(),
+        ))
+    }
+    fn token_hang(&self) -> Duration {
+        aterm_spec::wait::MUST_HAPPEN
+    }
+    fn session_logins(&self, _env: &Env) -> Vec<crate::harness::accounts_tokens::SessionLogin> {
+        Vec::new()
+    }
+}
+
+/// One Mac's token upkeep: its desk, its rows (each signed in here, with its window store
+/// holding the account's session), the stand-in's world, the vault, and the upkeep's bench.
+#[cfg(target_os = "macos")]
+struct Tier {
+    desk: Desk,
+    world: crate::harness::setup_token::tests::World,
+    vault: FleetVault,
+    bench: Bench,
+}
+
+#[cfg(target_os = "macos")]
+impl Tier {
+    /// A Mac whose rows are `rows` (label, email), whose stand-in plays `mode`.
+    fn new(mode: &str, rows: &[(&str, &str)]) -> Self {
+        TIER_SYNCS.with(|syncs| syncs.set(0));
+        Self::on("m30", mode, rows, FleetVault::seated(), Self::bench())
+    }
+
+    /// The Mac `machine` of a fleet whose vault is `vault`, its rows `rows` (label, email), its
+    /// stand-in playing `mode`, its upkeep's bench `bench`.
+    fn on(
+        machine: &str,
+        mode: &str,
+        rows: &[(&str, &str)],
+        vault: FleetVault,
+        bench: Bench,
+    ) -> Self {
+        let desk = Desk::new(machine);
+        let store = desk.store();
+        let mut text = String::new();
+        for (label, email) in rows {
+            let dir = store.logins_dir().join(label);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("settings.json"), "{}").unwrap();
+            text += &(accounts::row_text(&accounts::Row {
+                label: (*label).to_owned(),
+                class: Class::Preferred,
+                dir: Some(dir.to_string_lossy().into_owned()),
+                email: Some((*email).to_owned()),
+                ..accounts::Row::default()
+            })
+            .unwrap()
+                + "\n");
+            let marker = crate::harness::signin_window::store_marker(&store.dir, email);
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(&marker, email).unwrap();
+        }
+        fs::write(desk.roster(), text).unwrap();
+        let source = desk.home.join(".config/aterm/secrets/source.toml");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(source, "# vault A\n").unwrap();
+        let world = crate::harness::setup_token::tests::World::new(mode, false);
+        fs::write(world.home().join("go"), "").unwrap();
+        Self {
+            desk,
+            world,
+            vault,
+            bench,
+        }
+    }
+
+    /// The upkeep's bench as a new process has it, with nothing remembered, on the machine
+    /// whose platform id is [`MACHINE`].
+    fn bench() -> Bench {
+        Self::bench_on(|| Some(MACHINE.to_owned()))
+    }
+
+    /// [`Self::bench`] on the machine whose platform id `machine` reads.
+    fn bench_on(machine: fn() -> Option<String>) -> Bench {
+        Bench {
+            guard: guard_reading(MachineReads {
+                desk: true,
+                graphic: || true,
+                machine,
+                tokens: Some(tier_host),
+                ..MachineReads::default()
+            }),
+            vault_sync: tier_sync,
+            ..Bench::ending(Renewal::Failed)
+        }
+    }
+
+    /// One upkeep pass at `at`, its captures on this Mac's vault and stand-in.
+    fn pass(&self, at: i64) {
+        TIER.with(|tier| *tier.borrow_mut() = Some((self.vault.clone(), self.world.env(&[]))));
+        crate::harness::journal::with_keyer(tier_keyer, || self.bench.pass(&self.desk, at));
+    }
+
+    /// This Mac in an account pool (its `swarm_label`), the home Mac (`warm[0]`) of the row
+    /// `label` where `home`, else one of its other warm Macs.
+    fn in_pool(&self, label: &str, home: bool) {
+        self.desk
+            .store()
+            .transact(T0 - 60, &mut None, |state| {
+                state.swarm_label = Some("m30".to_owned());
+                if home {
+                    state.home_accounts.insert(label.to_owned());
+                } else {
+                    state.home_accounts.remove(label);
+                }
+                Ok(Vec::new())
+            })
+            .unwrap();
+    }
+
+    /// Ends the ladder's wait for its next vault refresh, which runs on the real clock, as the
+    /// minutes between two passes the fixture's clock skips would: the next pass that wants a
+    /// fresh read of the vault starts one.
+    fn refresh_due(&self) {
+        self.bench
+            .guard
+            .lock()
+            .unwrap()
+            .ladder
+            .moved(Instant::now());
+    }
+
+    /// The passes at `at` and at the end of the account `key`'s wait from it, each after the
+    /// ladder's refresh wait ended ([`Self::refresh_due`]).
+    fn found_and_ripe(&self, key: &str, at: i64) {
+        self.refresh_due();
+        self.pass(at);
+        self.refresh_due();
+        self.pass(at + token_delay_s(key, MACHINE));
+    }
+
+    /// The gaps this Mac's upkeep ran a capture for, on record.
+    fn tried(&self) -> BTreeMap<String, crate::harness::token_steps::Tried> {
+        crate::harness::token_steps::read_tried(&self.desk.store()).expect("the record reads")
+    }
+
+    /// The passes at the account `key`'s gap's finding at `T0` and at its wait's end: the time
+    /// its capture may start.
+    fn ripen(&self, key: &str) -> i64 {
+        self.pass(T0);
+        let ripe = T0 + token_delay_s(key, MACHINE);
+        self.pass(ripe);
+        ripe
+    }
+
+    fn syncs() -> usize {
+        TIER_SYNCS.with(std::cell::Cell::get)
+    }
+
+    /// The account `key`'s step record, where a stop left one.
+    fn stopped(&self, key: &str) -> Option<crate::harness::token_steps::Stopped> {
+        crate::harness::token_steps::read(&self.desk.store())
+            .expect("the steps file reads")
+            .get(key)
+            .cloned()
+    }
+}
+
+/// Another Mac's token of the account `key` (`email`): made in m7's sign-in window a day ago,
+/// verified there, readable here, ending in a year.
+#[cfg(target_os = "macos")]
+fn fleet_token(key: &str, email: &str) -> aterm_secrets::claude_token::Standing {
+    use aterm_secrets::claude_token::{Check, ExpiryFrom, Key, Meta, MintedBy, Standing, Verified};
+    let now = u64::try_from(T0).unwrap();
+    Standing {
+        key: Key::parse(key).unwrap(),
+        meta: Some(Meta {
+            email: email.to_owned(),
+            account_id: "c-0123456789ab".to_owned(),
+            minted_at: now - 86_400,
+            expires_at: now + 365 * 86_400,
+            expiry_from: ExpiryFrom::Printed,
+            minted_on: "m7".to_owned(),
+            cli: "2.1.318".to_owned(),
+            minted_by: Some(MintedBy::Window),
+            verified: Some(Verified {
+                on: "m7".to_owned(),
+                at: now - 3_600,
+                by: aterm_secrets::claude_token::BY_WINDOWS.to_owned(),
+                seven_day_resets_at: None,
+                five_hour_resets_at: None,
+            }),
+        }),
+        check: Check::Readable,
+        signer: Some("m7".to_owned()),
+        minted_here: false,
+        exposed: Vec::new(),
+        refused_at: None,
+    }
+}
+
+/// A SIGNED-IN ROW WITH NO FLEET TOKEN GETS ONE WITH NOBODY THERE, ONCE, AND A CHECK HOLDS IT
+/// (plan package FL-138; sitting design §6 S4): a row signed in here whose window store holds
+/// its session, with no token in the vault, waits its account's delay (under an hour, fixed by
+/// the account and the machine), then a vault refresh runs first and the token is made in aterm's
+/// window with nobody there (the window told so, `ATERM_OPEN_URL_UNATTENDED`): one vault write,
+/// whose meta says the window minted it (`minted_by = window`, which the fleet serves), and one
+/// log line with no address. The next tick, an hour later and a day later, make none. On a Mac
+/// whose capture meets the consent page's human check, nothing is written, one step record is
+/// left, and a new process 25 hours later runs nothing.
+/// NEGATIVE CONTROL: with `step_held` reading no record (`steps.get(..)` as `None`), the new
+/// process runs the stopped capture again: `` the held step ran again ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_signed_in_row_with_no_fleet_token_gets_one_with_nobody_there_once_and_a_check_holds_it() {
+    use aterm_secrets::claude_token::MintedBy;
+    let tier = Tier::new("renew-window-token", &[("work", WORK)]);
+    let ripe = T0 + token_delay_s(WORK_KEY, MACHINE);
+    assert!(
+        ripe > T0 + 60,
+        "the fixture's delay is a wait: {}",
+        ripe - T0
+    );
+    tier.pass(T0);
+    tier.pass(ripe - 1);
+    assert_eq!(
+        tier.world.runs(),
+        0,
+        "a capture ran before its wait was over"
+    );
+    assert_eq!(
+        Tier::syncs(),
+        0,
+        "the vault was refreshed before the wait was over"
+    );
+    assert!(tier.vault.writes().is_empty());
+
+    tier.pass(ripe);
+    assert_eq!(
+        Tier::syncs(),
+        1,
+        "the vault is refreshed once, before the capture"
+    );
+    assert_eq!(tier.world.runs(), 1);
+    let writes = tier.vault.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let (key, meta) = &writes[0];
+    assert_eq!(key, WORK_KEY);
+    assert_eq!(meta.email, WORK);
+    assert_eq!(meta.minted_on, "m30");
+    assert_eq!(
+        meta.minted_by,
+        Some(MintedBy::Window),
+        "a token aterm's window made proves its account, so every Mac serves it"
+    );
+    let env = fs::read_to_string(tier.world.home().join("env")).expect("the stand-in's env");
+    assert!(
+        env.lines()
+            .any(|line| line == "ATERM_OPEN_URL_UNATTENDED=1"),
+        "the window was not told nobody is there: {env}"
+    );
+    let logged = tier.bench.logged();
+    assert!(
+        logged
+            .iter()
+            .any(|line| line == "work: token (none): made in the sign-in window with nobody there"),
+        "{logged:?}"
+    );
+    assert!(logged.iter().all(|line| !line.contains('@')), "{logged:?}");
+    assert!(tier.stopped(WORK_KEY).is_none());
+
+    for at in [ripe + 1, ripe + 3_600, ripe + 86_400] {
+        tier.pass(at);
+    }
+    assert_eq!(tier.vault.writes().len(), 1, "a later tick wrote the vault");
+    assert_eq!(tier.world.runs(), 1);
+
+    // A check holds it.
+    let held = Tier::new("window-human-check", &[("work", WORK)]);
+    let ripe = held.ripen(WORK_KEY);
+    assert_eq!(held.world.runs(), 1);
+    assert!(
+        held.vault.writes().is_empty(),
+        "a stopped capture wrote the vault"
+    );
+    let stopped = held.stopped(WORK_KEY).expect("the stop is on record");
+    assert_eq!(
+        stopped.word,
+        crate::harness::open_url::MetWord::WindowHumanCheck
+    );
+    let logged = held.bench.logged();
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.starts_with("work: token (none): ") && line.contains("human check")),
+        "{logged:?}"
+    );
+    for at in [ripe + 1, ripe + 3_600] {
+        held.pass(at);
+    }
+    // A new process, 25 hours later: only the record holds it.
+    let held = Tier {
+        bench: Tier::bench(),
+        ..held
+    };
+    let later = T0 + 25 * 3_600;
+    held.pass(later);
+    held.pass(later + token_delay_s(WORK_KEY, MACHINE));
+    held.pass(later + 3_600);
+    assert_eq!(held.world.runs(), 1, "the held step ran again");
+    assert_eq!(held.stopped(WORK_KEY), Some(stopped));
+}
+
+/// WHAT IS NOT THIS MAC'S TO MAKE, THE UPKEEP LEAVES ALONE (plan package FL-138), each through
+/// the upkeep's passes past the account's wait: a token that does not read here, a refusal
+/// this Mac recorded with no `401` (Cloudflare's `403`) or no status (an earlier build's), a
+/// draft whose meta is not its token's (the vault's to settle), another Mac's window or headless
+/// token in use, one ending soon, verified or not, on a Mac that is not the account's home Mac, a
+/// row another Mac holds and a row signed out here: no capture runs and nothing is written.
+/// CONTROL: a refusal with a `401`, a token minted here by no route (m2's two), and a year-long
+/// one ending soon on its home Mac, verified or not, are each replaced once, by a token the
+/// window made.
+/// NEGATIVE CONTROL: with `gap_of` taking every `rejected` reading for `Gap::Refused`, the 403
+/// is replaced: `` 403: ``; with `gap_of` reading `soon` off `TokenState::Soon` alone (a verified
+/// token's), the unverified one is kept: `` its home Mac replaces an unverified token that ends
+/// soon ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_token_upkeep_leaves_alone_what_is_not_this_macs_to_make() {
+    use aterm_secrets::claude_token::{Check, MintedBy, Mismatch};
+    let now = u64::try_from(T0).unwrap();
+    let run = |case: &str, setup: &dyn Fn(&Tier)| {
+        let tier = Tier::new("renew-window-token", &[("work", WORK)]);
+        setup(&tier);
+        let ripe = tier.ripen(WORK_KEY);
+        tier.pass(ripe + 1);
+        let writes = tier.vault.writes();
+        assert!(writes.len() <= 1, "{case}: {writes:?}");
+        assert_eq!(tier.world.runs(), writes.len(), "{case}");
+        writes.into_iter().next().map(|(key, meta)| {
+            assert_eq!(key, WORK_KEY, "{case}");
+            assert_eq!(meta.minted_by, Some(MintedBy::Window), "{case}");
+            meta
+        })
+    };
+    let refused = |status: Option<u16>| {
+        move |tier: &Tier| {
+            let mut token = fleet_token(WORK_KEY, WORK);
+            token.refused_at = Some(now - 60);
+            tier.vault.hold(token);
+            if let Some(status) = status {
+                tier.vault
+                    .refused
+                    .borrow_mut()
+                    .insert(WORK_KEY.to_owned(), status);
+            }
+        }
+    };
+    // A year-long token in its last ten days, verified, or not (`unverified_soon`).
+    let soon_token = |verified: bool| {
+        let mut token = fleet_token(WORK_KEY, WORK);
+        let meta = token.meta.as_mut().unwrap();
+        meta.minted_at = now - 355 * 86_400;
+        meta.expires_at = now + 10 * 86_400;
+        if !verified {
+            meta.verified = None;
+        }
+        token
+    };
+    let soon = move |tier: &Tier| tier.vault.hold(soon_token(true));
+    let unverified_soon = move |tier: &Tier| tier.vault.hold(soon_token(false));
+    let home = |tier: &Tier| {
+        tier.desk
+            .store()
+            .transact(T0 - 60, &mut None, |state| {
+                state.home_accounts.insert("work".to_owned());
+                Ok(Vec::new())
+            })
+            .unwrap();
+    };
+    let unverified_by = |by: MintedBy| {
+        move |tier: &Tier| {
+            let mut token = fleet_token(WORK_KEY, WORK);
+            let meta = token.meta.as_mut().unwrap();
+            meta.verified = None;
+            meta.minted_by = Some(by);
+            tier.vault.hold(token);
+        }
+    };
+    let left_alone: [(&str, Box<dyn Fn(&Tier)>); 10] = [
+        (
+            "unreadable",
+            Box::new(|tier: &Tier| {
+                let mut token = fleet_token(WORK_KEY, WORK);
+                token.check = Check::Unreadable;
+                tier.vault.hold(token);
+            }),
+        ),
+        ("403", Box::new(refused(Some(403)))),
+        ("no status", Box::new(refused(None))),
+        (
+            "draft",
+            Box::new(|tier: &Tier| {
+                let mut token = fleet_token(WORK_KEY, WORK);
+                token.check = Check::Mismatched(Mismatch::Draft);
+                tier.vault.hold(token);
+            }),
+        ),
+        (
+            "another Mac's window token",
+            Box::new(unverified_by(MintedBy::Window)),
+        ),
+        (
+            "another Mac's headless token",
+            Box::new(unverified_by(MintedBy::Headless)),
+        ),
+        ("ends soon, not the home Mac", Box::new(soon)),
+        (
+            "ends soon unverified, not the home Mac",
+            Box::new(unverified_soon),
+        ),
+        (
+            "held by m7",
+            Box::new(|tier: &Tier| {
+                let text = fs::read_to_string(tier.desk.roster()).unwrap();
+                fs::write(tier.desk.roster(), text + "held_by = \"m7\"\n").unwrap();
+            }),
+        ),
+        (
+            "signed out here",
+            Box::new(|tier: &Tier| {
+                tier.desk
+                    .store()
+                    .transact(T0 - 60, &mut None, |state| {
+                        Ok(accounts::note_auth(
+                            state,
+                            "work",
+                            accounts::Auth::SignedOut,
+                            T0 - 60,
+                        ))
+                    })
+                    .unwrap();
+            }),
+        ),
+    ];
+    for (case, setup) in &left_alone {
+        assert!(
+            run(case, setup.as_ref()).is_none(),
+            "{case}: a token was made"
+        );
+    }
+
+    let replaced = run("401", &refused(Some(401))).expect("401: a refused token is replaced");
+    assert_ne!(
+        replaced.minted_at,
+        now - 86_400,
+        "the refused token was kept: {replaced:?}"
+    );
+    run("minted here by no route", &|tier: &Tier| {
+        let mut token = fleet_token(WORK_KEY, WORK);
+        let meta = token.meta.as_mut().unwrap();
+        meta.verified = None;
+        meta.minted_by = None;
+        meta.minted_on = "m30".to_owned();
+        token.minted_here = true;
+        token.signer = Some("m30".to_owned());
+        tier.vault.hold(token);
+    })
+    .expect("a token minted here by no route is replaced");
+    run("ends soon, the home Mac", &|tier: &Tier| {
+        soon(tier);
+        home(tier);
+    })
+    .expect("its home Mac replaces a token that ends soon");
+    // A token the upkeep made is not verified until a comparison verifies it, which may never
+    // come: its end, not its verification, says it ends soon.
+    run("ends soon unverified, the home Mac", &|tier: &Tier| {
+        unverified_soon(tier);
+        home(tier);
+    })
+    .expect("its home Mac replaces an unverified token that ends soon");
+}
+
+/// THE CODE PAGE NO MAILBOX ANSWERS ENDS A CAPTURE NOBODY STARTED, ON RECORD (plan package
+/// FL-138): the window's stop on the code page is the account's step record (`code-no-mailbox`),
+/// nothing is written, no need or sign-in task is posted, and the step is held. A mailbox
+/// configuration written after the stop, in the same process, runs it exactly once more.
+/// NEGATIVE CONTROL: with the upkeep keeping, in memory, every gap it ran as tried for the
+/// process's life, the mailbox's event runs nothing: `` a mailbox written after the stop ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_code_page_no_mailbox_answers_holds_the_step_and_asks_nobody() {
+    let tier = Tier::new("window-code-no-mailbox", &[("work", WORK)]);
+    let tasks = || {
+        let records = tier
+            .desk
+            .store()
+            .read_account_records(Some(&tier.desk.roster()), T0)
+            .unwrap();
+        accounts::sign_in_tasks(&records.roster, &records.logins)
+    };
+    let before = tasks();
+    let ripe = tier.ripen(WORK_KEY);
+    assert_eq!(tier.world.runs(), 1);
+    assert!(tier.vault.writes().is_empty());
+    let stopped = tier.stopped(WORK_KEY).expect("the stop is on record");
+    assert_eq!(
+        stopped.word,
+        crate::harness::open_url::MetWord::WindowCodeNoMailbox
+    );
+    assert_eq!(stopped.why(), "code-no-mailbox");
+    assert_eq!(tasks(), before, "the stop posted a sign-in task");
+    assert!(
+        tier.bench
+            .logged()
+            .iter()
+            .all(|line| !line.contains("NEEDS YOU")),
+        "{:?}",
+        tier.bench.logged()
+    );
+    tier.found_and_ripe(WORK_KEY, ripe + 86_400);
+    assert_eq!(tier.world.runs(), 1, "the held step ran again");
+
+    // An event the record waits for, in the same process: a mailbox configuration written after
+    // the stop. The step runs exactly once more, which the code page stops again.
+    let config = tier
+        .desk
+        .store()
+        .dir
+        .join(crate::harness::headless_oauth::MAILBOX_TOML_FILE);
+    fs::write(&config, "").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&config)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(stopped.at + 60))
+        .unwrap();
+    let event = ripe + 2 * 86_400;
+    tier.found_and_ripe(WORK_KEY, event);
+    assert_eq!(
+        tier.world.runs(),
+        2,
+        "a mailbox written after the stop did not run the step once more"
+    );
+    for at in [event + 86_400, event + 30 * 86_400] {
+        tier.found_and_ripe(WORK_KEY, at);
+    }
+    assert_eq!(tier.world.runs(), 2, "the event ran the step twice");
+    assert!(tier.vault.writes().is_empty());
+}
+
+/// A SHORT-LIVED TOKEN IS NOT REPLACED ON ITS OWN CLOCK (plan package FL-138,
+/// [`crate::harness::accounts_tokens::SHORT_LIVED_SECS`]): where Claude Code makes a token for
+/// 30 days, the upkeep on the account's home Mac makes it once; its end, which the fixture's clock
+/// has passed, is no gap to the Claude Code build that made it, so passes an hour, a day and a
+/// month later, each past the account's wait, run no capture and write nothing.
+/// NEGATIVE CONTROL: with `gap_of` taking every `ended` reading for `Gap::Ended`, the next pass
+/// makes another: `` a short-lived token was replaced by the build that made it ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_short_lived_token_is_not_replaced_on_its_own_clock() {
+    let tier = Tier::new("renew-window-30-days", &[("work", WORK)]);
+    tier.in_pool("work", true);
+    let ripe = tier.ripen(WORK_KEY);
+    assert_eq!(tier.world.runs(), 1);
+    let writes = tier.vault.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    let meta = &writes[0].1;
+    assert!(
+        meta.expires_at - meta.minted_at <= 30 * 86_400,
+        "the stand-in's token lasts 30 days: {meta:?}"
+    );
+    for at in [ripe + 3_600, ripe + 86_400, ripe + 31 * 86_400] {
+        tier.found_and_ripe(WORK_KEY, at);
+    }
+    assert_eq!(
+        tier.world.runs(),
+        1,
+        "a short-lived token was replaced by the build that made it"
+    );
+    assert_eq!(tier.vault.writes().len(), 1);
+}
+
+/// A second Mac's platform id.
+#[cfg(target_os = "macos")]
+const MACHINE_B: &str = "00000000-0000-4000-8000-000000000031";
+
+/// THE ACCOUNT'S HOME MAC TAKES THE FIRST TURN AT A GAP ANY MAC MAY FIND (plan package FL-138,
+/// [`HOME_TURN_S`]): two Macs of a pool, both signed in to one account whose token the vault does
+/// not hold, find the gap at one pass. The Mac that is not the account's home waits the home
+/// Mac's turn beside its own spread, though its spread is the shorter of the two: the home Mac's
+/// capture runs first, and the other Mac, reading the vault's token at the end of its wait, runs
+/// none, so the fleet makes one token. CONTROL: that Mac alone, with no home Mac signed in, makes
+/// it once at the end of the turn and its spread, and not a second before.
+/// NEGATIVE CONTROL: with `token_wait_s` giving no home turn, the other Mac runs its capture
+/// first: `` the other Mac ran a capture before the home Mac's turn ended ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_accounts_home_mac_takes_the_first_turn_at_a_gap_any_mac_may_find() {
+    let rows = [("work", WORK)];
+    let a = Tier::new("renew-window-token", &rows);
+    let b = Tier::on(
+        "m31",
+        "renew-window-token",
+        &rows,
+        a.vault.clone(),
+        Tier::bench_on(|| Some(MACHINE_B.to_owned())),
+    );
+    let (da, db) = (
+        token_delay_s(WORK_KEY, MACHINE),
+        token_delay_s(WORK_KEY, MACHINE_B),
+    );
+    assert_ne!(da, db, "the fixture's two Macs spread apart");
+    // The Mac with the shorter spread is the one that is not the account's home.
+    let ((home, dh), (away, dw)) = if da > db {
+        ((&a, da), (&b, db))
+    } else {
+        ((&b, db), (&a, da))
+    };
+    home.in_pool("work", true);
+    away.in_pool("work", false);
+    away.pass(T0);
+    home.pass(T0);
+    away.pass(T0 + dw);
+    assert_eq!(
+        away.world.runs(),
+        0,
+        "the other Mac ran a capture before the home Mac's turn ended"
+    );
+    home.pass(T0 + dh);
+    assert_eq!(home.world.runs(), 1);
+    assert_eq!(a.vault.writes().len(), 1);
+    for at in [T0 + HOME_TURN_S + dw, T0 + HOME_TURN_S + dw + 3_600] {
+        away.refresh_due();
+        away.pass(at);
+    }
+    assert_eq!(away.world.runs(), 0, "the other Mac made a second token");
+    assert_eq!(a.vault.writes().len(), 1, "{:?}", a.vault.writes());
+
+    // CONTROL: alone, the other Mac makes it at the end of the home Mac's turn and its spread.
+    let alone = Tier::new("renew-window-token", &rows);
+    alone.in_pool("work", false);
+    alone.pass(T0);
+    alone.pass(T0 + HOME_TURN_S + da - 1);
+    assert_eq!(alone.world.runs(), 0, "a capture ran before the turn ended");
+    alone.refresh_due();
+    alone.pass(T0 + HOME_TURN_S + da);
+    assert_eq!(alone.world.runs(), 1);
+    assert_eq!(alone.vault.writes().len(), 1);
+}
+
+/// A GAP THE UPKEEP RAN IS NOT RUN AGAIN BY A NEW PROCESS (plan package FL-138,
+/// [`crate::harness::token_steps::Tried`]): a capture in aterm's window whose browser did not
+/// start leaves no stop record (nothing a person passes stopped it), and the upkeep's record that
+/// it ran that gap; a new process 25 hours later, and a month later, past the account's wait each
+/// time, runs no capture.
+/// NEGATIVE CONTROL: with `step_held` reading no tried record (`tried.get(..)` as `None`), the
+/// new process runs it again: `` a new process ran the gap again ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_gap_the_upkeep_ran_is_not_run_again_by_a_new_process() {
+    use crate::harness::accounts_tokens::Gap;
+    let tier = Tier::new("window-browser-start", &[("work", WORK)]);
+    let ripe = tier.ripen(WORK_KEY);
+    assert_eq!(tier.world.runs(), 1);
+    assert!(tier.vault.writes().is_empty());
+    assert!(
+        tier.stopped(WORK_KEY).is_none(),
+        "a browser that did not start left a stop record"
+    );
+    let tried = tier.tried();
+    assert_eq!(tried[WORK_KEY].gap, Gap::None, "{tried:?}");
+    assert_eq!(tried[WORK_KEY].minted_at, None);
+    let logged = tier.bench.logged();
+    assert!(
+        logged
+            .iter()
+            .any(|line| line.starts_with("work: token (none): ")
+                && !line.contains("made in the sign-in window")),
+        "{logged:?}"
+    );
+    assert!(logged.iter().all(|line| !line.contains('@')), "{logged:?}");
+    tier.found_and_ripe(WORK_KEY, ripe + 3_600);
+    let tier = Tier {
+        bench: Tier::bench(),
+        ..tier
+    };
+    for at in [T0 + 25 * 3_600, T0 + 30 * 86_400] {
+        tier.found_and_ripe(WORK_KEY, at);
+    }
+    assert_eq!(tier.world.runs(), 1, "a new process ran the gap again");
+    assert_eq!(tier.tried(), tried);
+}
+
+/// A SIGNED-IN ROW LEFT TO A PERSON SPENDS NO TOKEN CAPTURE (plan package FL-138;
+/// `docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): a row signed in here with no fleet
+/// token, whose account a bot protection stopped (its `CheckStop`) or whose renewal is a
+/// person's task, is no gap the upkeep fills, since the verb refuses it to a run with nobody
+/// there. Past the account's wait, an hour and a day on and after a restart, no capture runs, no
+/// sign-in spacing record is written (no other account waits on it), no record of a run is left
+/// and nothing is logged of the row's token. CONTROL: the same row with nothing standing gets
+/// its token, its capture spaced on that record.
+/// NEGATIVE CONTROL: with `backfill_due` not asking `left_to_a_person_here`, the upkeep spaces
+/// the refused run: `` check stop: the upkeep spaced a capture the verb refuses ``.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_signed_in_row_left_to_a_person_spends_no_token_capture() {
+    use crate::harness::sign_in_ladder::last_started;
+    let check_stop = |tier: &Tier| {
+        check_stopped_row(
+            &tier.desk,
+            "work",
+            crate::harness::open_url::MetWord::BotCheck,
+            T0 - 60,
+        );
+    };
+    let renew_task = |tier: &Tier| {
+        tier.desk
+            .store()
+            .transact_pool_logins_within(
+                &[],
+                &tier.desk.roster(),
+                T0 - 60,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, "work")?;
+                    accounts::note_sign_in_task(
+                        logins,
+                        "work",
+                        accounts::SignInAction::Renew,
+                        T0 - 60,
+                    );
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+    };
+    let cases: [(&str, &dyn Fn(&Tier)); 2] =
+        [("check stop", &check_stop), ("renew task", &renew_task)];
+    for (case, left) in cases {
+        let tier = Tier::new("renew-window-token", &[("work", WORK)]);
+        left(&tier);
+        let ripe = tier.ripen(WORK_KEY);
+        tier.found_and_ripe(WORK_KEY, ripe + 3_600);
+        let tier = Tier {
+            bench: Tier::bench(),
+            ..tier
+        };
+        tier.found_and_ripe(WORK_KEY, ripe + 86_400);
+        assert_eq!(tier.world.runs(), 0, "{case}: a capture ran");
+        assert!(tier.vault.writes().is_empty(), "{case}");
+        assert_eq!(
+            last_started(&tier.desk.store()).expect("the spacing record reads"),
+            None,
+            "{case}: the upkeep spaced a capture the verb refuses"
+        );
+        assert!(
+            tier.tried().is_empty(),
+            "{case}: a refused run was recorded as run: {:?}",
+            tier.tried()
+        );
+        let logged = tier.bench.logged();
+        assert!(
+            logged.iter().all(|line| !line.starts_with("work: token")),
+            "{case}: {logged:?}"
+        );
+    }
+
+    let tier = Tier::new("renew-window-token", &[("work", WORK)]);
+    tier.ripen(WORK_KEY);
+    assert_eq!(tier.world.runs(), 1, "CONTROL: nothing stands");
+    assert_eq!(tier.vault.writes().len(), 1);
+    assert!(
+        last_started(&tier.desk.store())
+            .expect("the spacing record reads")
+            .is_some(),
+        "CONTROL: the capture is spaced"
+    );
+}
+
+/// A SECOND DUE ACCOUNT WAITS THE SIGN-IN SPACING (plan package FL-138): two rows' gaps ripe at
+/// the same pass make one capture there; the second account's waits
+/// [`super::super::sign_in_ladder::SPACING_S`] after the first's start, on the one spacing record
+/// every sign-in here keeps, and then runs. One account per pass.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_second_due_account_waits_the_sign_in_spacing() {
+    use crate::harness::sign_in_ladder::SPACING_S;
+    let tier = Tier::new("renew-window-token", &[("work", WORK), ("other", OTHER)]);
+    tier.pass(T0);
+    let both = T0 + token_delay_s(WORK_KEY, MACHINE).max(token_delay_s(OTHER_KEY, MACHINE));
+    tier.pass(both);
+    let keys = || -> Vec<String> {
+        tier.vault
+            .writes()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    };
+    assert_eq!(keys(), [WORK_KEY], "one account per pass");
+    tier.pass(both + 1);
+    tier.pass(both + SPACING_S - 1);
+    assert_eq!(
+        keys(),
+        [WORK_KEY],
+        "the second capture did not wait the spacing"
+    );
+    tier.pass(both + SPACING_S);
+    assert_eq!(keys(), [WORK_KEY, OTHER_KEY]);
+    assert_eq!(tier.world.runs(), 2);
+}
+
+/// A MAC NOT SEATED IN THE VAULT'S LOG MAKES NO TOKEN (plan package FL-138), and says so once
+/// in the log (`vault-not-seated`), with no clock: no capture runs and no refresh is asked for.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mac_not_seated_in_the_vault_makes_no_token_and_says_so_once() {
+    let tier = Tier::new("renew-window-token", &[("work", WORK)]);
+    tier.vault
+        .route
+        .set(aterm_secrets::client::WriteRoute::NotSeated);
+    let ripe = tier.ripen(WORK_KEY);
+    tier.pass(ripe + 86_400);
+    assert_eq!(tier.world.runs(), 0);
+    assert!(tier.vault.writes().is_empty());
+    assert_eq!(Tier::syncs(), 0);
+    let said: Vec<_> = tier
+        .bench
+        .logged()
+        .into_iter()
+        .filter(|line| line.contains("vault-not-seated"))
+        .collect();
+    assert_eq!(said.len(), 1, "{said:?}");
 }

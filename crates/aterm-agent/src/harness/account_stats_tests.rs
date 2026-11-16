@@ -733,6 +733,7 @@ fn every_source_of_a_window_merges_by_one_rule() {
             by: MACHINE.to_string(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     let l = look(walled.accounts.get("main"), &p, Tap::On);
@@ -852,6 +853,7 @@ fn a_record_of_another_account_is_not_shown_under_the_one_signed_in() {
             by: MACHINE.to_string(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     held.warned_week = Some(accounts::WindowSaid {
@@ -1071,6 +1073,7 @@ fn the_accounts_report_shows_no_record_of_another_account() {
             by: MACHINE.to_string(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     let record = &state.accounts["main"];

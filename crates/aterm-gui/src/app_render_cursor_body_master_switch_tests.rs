@@ -15,7 +15,7 @@ fn one_focused_block_frame(trail_on: bool, style: &str) -> (usize, bool) {
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).expect("headless window");
+        let mut window = app.windows.get_mut(&wid).expect("headless window");
         window.focused = true;
         window.poof_row_buf = vec![' '; 80];
     }
@@ -60,7 +60,7 @@ fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).expect("headless window");
+        let mut window = app.windows.get_mut(&wid).expect("headless window");
         window.focused = true;
         window.poof_row_buf = vec![' '; 80];
     }
@@ -108,7 +108,7 @@ fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
         let wid = WindowId(0);
         let t0 = Instant::now();
         {
-            let window = app.windows.get_mut(&wid).expect("headless window");
+            let mut window = app.windows.get_mut(&wid).expect("headless window");
             window.focused = true;
             for k in 0..24u64 {
                 window.fx.cursor_mut().momentum.on_key(
@@ -171,7 +171,7 @@ fn ribbon_witness_take(style: &str, t0: Instant) -> (App, WindowId, Instant) {
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).expect("headless window");
+        let mut window = app.windows.get_mut(&wid).expect("headless window");
         window.focused = true;
         window.poof_row_buf = vec![' '; 80];
     }
@@ -182,7 +182,7 @@ fn ribbon_witness_take(style: &str, t0: Instant) -> (App, WindowId, Instant) {
     for col in 3..=5u16 {
         let typed = at + std::time::Duration::from_millis(1);
         {
-            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut ws = app.windows.get_mut(&wid).expect("window");
             ws.last_key_at = Some(typed);
             ws.fx.cursor_mut().cadence.on_keystroke(typed);
             ws.fx.cursor_mut().glow.note_typed(typed);

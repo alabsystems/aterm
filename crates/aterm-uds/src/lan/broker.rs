@@ -71,7 +71,7 @@ enum Absent {
     /// Takes this process's own server when macOS already allowed this code (`super::direct`):
     /// a LAN use.
     Direct,
-    /// Reads [`Unavailable::NotInstalled`]: a question about the broker itself
+    /// Reads why no broker answers ([`super::absent`]): a question about the broker itself
     /// ([`super::Arrivals`]), which this process's own server cannot answer.
     #[cfg_attr(
         all(not(target_os = "macos"), not(test)),
@@ -125,10 +125,10 @@ fn open_cancelled_at(
                             Instant::now(),
                             cancel,
                         ),
-                        Err(_) => Err(Unavailable::NotInstalled.into()),
+                        Err(_) => Err(super::absent().into()),
                     }
                 }
-                Absent::NotInstalled => Err(Unavailable::NotInstalled.into()),
+                Absent::NotInstalled => Err(super::absent().into()),
             };
         }
         Err(error) => return Err(error.into()),

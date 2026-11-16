@@ -225,21 +225,29 @@ impl Attempt<'_> {
                 self.store
                     .tail(accounts::LEDGER_KEEP_ROWS)
                     .map_err(|error| unavailable(error.to_string()))?;
-                if super::super::accounts_sync::unaddressed_sign_in_task_at(
-                    self.store,
-                    &records.logins,
-                    raw,
-                )
-                .into_iter()
-                .chain(super::super::accounts_sync::bot_check_on_record_at(
-                    self.store,
-                    raw,
-                    &records.logins,
-                ))
-                .any(|at| {
-                    host.now().max(self.now).saturating_sub(at)
-                        < super::super::accounts_sync::PERSON_BACKOFF_SECS
-                }) {
+                // The page a refused login falls back to is not loaded with nobody at this Mac
+                // where a bot protection stopped the account's sign-in, or another row's of the
+                // pool in its realm, on any clock
+                // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3); another stop for a
+                // person holds it as long as its task's wait.
+                if (!super::person_at_terminal(host)
+                    && super::super::accounts_sync::person_hold(
+                        self.store,
+                        &records.raw_roster,
+                        raw,
+                        &records.logins,
+                    )
+                    .is_some())
+                    || super::super::accounts_sync::unaddressed_sign_in_task_at(
+                        self.store,
+                        &records.logins,
+                        raw,
+                    )
+                    .is_some_and(|at| {
+                        host.now().max(self.now).saturating_sub(at)
+                            < super::super::accounts_sync::PERSON_BACKOFF_SECS
+                    })
+                {
                     return Err(unavailable("Kimi reauthentication retry is held"));
                 }
                 let home = self

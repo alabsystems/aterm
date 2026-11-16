@@ -61,7 +61,8 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
     );
 
     let now = Instant::now();
-    let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+    let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     let fingerprint = glow.tick(Some((2, 3)), now, &cfg, geom, &mut out);
     let admitted = fingerprint != 0
         || !glow.out_laid(&out).is_empty()
@@ -69,6 +70,7 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
         || !glow.under_laid().is_empty();
 
     drop(ordering_pin);
+    drop(payload_guard_glow);
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
     unsafe {
@@ -154,7 +156,8 @@ fn delivered_paste_then_hop(
     let batch = ctx.output_echo.deliveries_after(&ctx.sink, Some(0), now);
     let ticket = batch.items[0].map(|(_, t)| t);
     let width = ticket.and_then(|t| t.insert);
-    let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+    let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     if apply
         && let Some((at, ticket)) = batch.items[0]
         && let Some(width) = ticket.insert

@@ -482,6 +482,9 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         to: None,
         tab: None,
         harness: None,
+        op: None,
+        via: None,
+        program: None,
     }
 }
 
@@ -685,4 +688,107 @@ fn an_auth_word_heals_and_withdraws_a_macs_sign_in_word() {
         Some("in"),
         "a later sign-in is a word again"
     );
+}
+
+fn plan_seen(t: u64, account: Pk, plan: &str) -> Event {
+    Event {
+        plan: Word::new(plan),
+        ..ev(t, Kind::PlanSeen, account)
+    }
+}
+
+/// THE PLAN A MAC'S CLI REPORTED IS READ FROM THE WINDOW, WITH THE MAC AND THE TIME: the newest
+/// `plan-seen` stands, whichever Mac logged it and in whatever order the records were folded;
+/// one dated past the skew bound ahead of the read is not believed, and one inside it holds
+/// from the read; an account nobody reported a plan for has none.
+/// NEGATIVE CONTROLS: with `fold_event` not reading `plan-seen` (as before), `ann has a plan`
+/// fails; with `plan_seen` taking the last record folded instead of the newest, the reversed
+/// order reads `left: ("pro", 9500, "0303…") right: ("max", 9900, "0707…")`.
+#[test]
+fn the_newest_plan_a_mac_reported_stands_with_its_mac_and_time() {
+    let (ann, bob) = (account("ann@example.test"), account("bob@example.test"));
+    let (m3, m7) = ("03".repeat(16), "07".repeat(16));
+    let now = 10_000;
+    let events = [
+        (m3.clone(), plan_seen(now - 500, ann, "pro")),
+        (m7.clone(), plan_seen(now - 100, ann, "max")),
+        // A clock an hour ahead says nothing of now; one five minutes ahead holds from now.
+        (m3.clone(), plan_seen(now + 3_600, ann, "team")),
+        (m7.clone(), plan_seen(now + 300, bob, "plus")),
+    ];
+    let mut reversed = events.clone();
+    reversed.reverse();
+    for events in [&events[..], &reversed[..]] {
+        let seen = Seen::of_events(events, now);
+        let plan = seen.plan(ann.as_str()).expect("ann has a plan");
+        assert_eq!(
+            (plan.word.as_str(), plan.t, plan.uuid.as_str()),
+            ("max", now - 100, m7.as_str())
+        );
+        let plan = seen.plan(bob.as_str()).expect("bob has a plan");
+        assert_eq!((plan.word.as_str(), plan.t), ("plus", now));
+        assert_eq!(seen.plan(account("cat@example.test").as_str()), None);
+    }
+}
+
+/// A `use` row's plan (`plan: {word, t}`, what a Mac's book states of the account every week,
+/// past the weeks that held the event) is read as an event's is, under the row's own key: a
+/// workspace's plan is its sub-account's, and stands for the account only where the account has
+/// none of its own. A plan that is no word of the vocabulary is no plan.
+/// NEGATIVE CONTROL: with `fold_use` reading only `quota` and `wall` (as before), `the
+/// workspace's plan` fails.
+#[test]
+fn a_use_rows_plan_is_read_and_a_workspaces_stands_only_where_the_account_has_none() {
+    let ann = account("ann@example.test");
+    let mac = "03".repeat(16);
+    let sa = keys::subaccount_pk(ann.as_str(), "0123456789ab").unwrap();
+    let row = |word: &str, t: u64| aterm_json::json!({"plan": {"word": word, "t": t}});
+
+    let mut seen = Seen::empty(1_000);
+    seen.sub_of.insert(sa.clone(), ann.as_str().to_owned());
+    seen.fold_use(&sa, &mac, &row("team", 900));
+    let plan = seen.plan(ann.as_str()).expect("the workspace's plan");
+    assert_eq!((plan.word.as_str(), plan.t), ("team", 900));
+    // The account's own row stands over its workspace's, however old.
+    seen.fold_use(ann.as_str(), &mac, &row("max", 400));
+    let plan = seen.plan(ann.as_str()).expect("the row's plan");
+    assert_eq!(
+        (plan.word.as_str(), plan.t, plan.uuid.as_str()),
+        ("max", 400, mac.as_str())
+    );
+    // An older row never replaces a newer one, and text outside the vocabulary is no plan.
+    seen.fold_use(ann.as_str(), &mac, &row("pro", 300));
+    seen.fold_use(ann.as_str(), &mac, &row("Max 20x <ann@example.test>", 950));
+    seen.fold_use(
+        ann.as_str(),
+        &mac,
+        &aterm_json::json!({"plan": {"word": "pro"}}),
+    );
+    assert_eq!(
+        seen.plan(ann.as_str()).map(|plan| plan.word.as_str()),
+        Some("max")
+    );
+}
+
+/// END TO END on a scratch lab: the plan a Mac noted is in what it flushes (the `ev` batch and
+/// its `use` row), and a read of the window gives it back with that Mac and the time.
+#[test]
+fn a_noted_plan_is_flushed_and_read_back() {
+    let lab = Lab::new(&[Role::Writer]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = Spool::at(scratch.path().join("alab"));
+    let ann = account("ann@example.test");
+    let now = W * WEEK + 3_600;
+    // A sign-in is sharp, so the pass sends the batch at once; a plan alone waits for the
+    // routine flush.
+    spool.append(&ev(now - 600, Kind::SignedIn, ann)).unwrap();
+    spool.append(&plan_seen(now - 590, ann, "max")).unwrap();
+    let pass = |now| flush::pass(&lab.paths[0], &spool, &Presence::default, false, now).unwrap();
+    // The first pass states this Mac's presence; the next sends what waits.
+    assert!(matches!(pass(now), Flushed::Wrote { events: 0, .. }));
+    assert!(matches!(pass(now + 60), Flushed::Wrote { events: 2, .. }));
+    let seen = read(&lab.paths[0], None, now + 120).unwrap().unwrap();
+    let plan = seen.plan(ann.as_str()).expect("the plan the Mac noted");
+    assert_eq!((plan.word.as_str(), plan.t), ("max", now - 590));
+    assert!(seen.me.contains(&plan.uuid), "this Mac read it");
 }

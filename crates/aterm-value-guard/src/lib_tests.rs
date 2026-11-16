@@ -111,3 +111,76 @@ fn a_url_carrying_a_password_is_credential_shaped() {
         assert!(!credential_shaped(other), "{other:?} carries no password");
     }
 }
+
+/// The tracker's secret rule refuses a real secret and lets the tracker's own text stand: a
+/// provider's prefix with a token's body, a PEM private key, an `otpauth://` seed, an upper-case
+/// or grouped TOTP seed, a URL's password and a random key are refused; a commit, a long path or
+/// test name, an `@`, a bare prefix named in prose, a KI number, words written without spaces and
+/// a hex digest are not.
+/// NEGATIVE CONTROL: with `seed_shaped` taking a lower-case run, `` "4alternatingpairs" stands ``
+/// fails; with `TOKENS`' bodies dropped, `` "sk-ssh-ed25519" stands `` fails; with
+/// `random_token` splitting runs at `/`, `` "AWS_SECRET" is a secret `` fails.
+#[test]
+fn the_tracker_rule_refuses_real_secrets_and_lets_tracker_text_stand() {
+    // In halves, so no scan reads a token here.
+    for secret in [
+        concat!("ghp", "_", "R7w2Kq9ZbX4mVn8LpT3sYc6HdJ1fGa5Ue0Wi"),
+        concat!(
+            "token sk",
+            "-ant-api03-",
+            "Zx8Qw2Er4Ty6Ui8Op0As2Df4Gh6Jk8Lz0Xc2Vb4Nm6"
+        ),
+        concat!("key=AK", "IA", "Z7Q2W9X4C6V8B3N5"),
+        concat!("-----BEGIN EC ", "PRIVATE KEY-----"),
+        concat!("otpauth://totp/a?sec", "ret=JBSWY3DPEHPK3PXP"),
+        concat!("seed JBSWY3DP", "EHPK3PXP"),
+        concat!("jbsw y3dp ", "ehpk 3pxp"),
+        concat!("https://ann:", "synthetic-pass-08", "@host.example.invalid"),
+        concat!("epJL7EGWiFbCY2pB", "Vjb2A1NPXIyzSropDjP8HKn4"),
+        concat!(
+            "aws s3 ls failed with wJalrXUtnFEMI/K7MD",
+            "ENG/bPxRfiCYEXAMPLEKEY in the env"
+        ),
+        concat!(
+            "https://hooks.slack.com/services/",
+            "T0123ABCD/B0123ABCD/Kq7Zp2Wx9Lm4Vb8Nc3Hj6Gf1"
+        ),
+        concat!(
+            "AGE-SECRET-KEY-1",
+            "QL3Z7HNZ0Y8X9W6V5U4T3S2R1Q0P9N8M7L6K5J4H3G2F1E0D9C8B7A6"
+        ),
+        concat!("scan otpauth://totp/lab:ann?sec", "ret=jbswy3dpehpk3pxp."),
+        concat!("(otpauth://totp/x?sec", "ret=jbswy3dpehpk3pxp)"),
+    ] {
+        assert!(secret_shaped(secret), "{:?}… is a secret", &secret[..6]);
+        assert_eq!(prose(secret, 4096), Err(Refusal::CredentialShape));
+    }
+    for text in [
+        "landed as 0a386e53d70f1c2b3a4d5e6f708192a3b4c5d6e7 on main",
+        "crates/aterm-db/src/typed/keys_slug_tests.rs::a_very_long_test_name_here",
+        "claimed by s-ed8f5c@m60 with lean-init@v4.30.0",
+        "ssh-ed25519 or sk-ssh-ed25519 by the key in policy/owner.pub",
+        "the ghp_ and xoxb- prefixes are tokens",
+        "ATERM-KI-1114-533 and +1 202 555 0149",
+        "4alternatingpairs/all5samplesretained baseline25requests",
+        "Nativecoldquery160columns161allocationrequests LANDED2ef0af5482c3a8e569727dfd922364e9d399e22e",
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a package about the vault's password and TOTP entries",
+        "-----BEGIN CERTIFICATE-----",
+        "otpauth: URIs import into the vault",
+        "test ipv6 with real hosts, then pick gpt5 when tool runs fail",
+        "npm_config_cache=/tmp/.ubd/npm.noindex npm ci",
+        concat!(
+            "Slack's xoxb-/xoxp-/xapp- tokens and the xox",
+            "p-user-token flow"
+        ),
+        "sk-ssh-ed25519-cert-v01@openssh.com keys",
+    ] {
+        assert!(!secret_shaped(text), "{text:?} stands");
+        assert_eq!(prose(text, 4096), Ok(()), "{text:?} is prose");
+    }
+    assert_eq!(prose("a\tb", 16), Err(Refusal::Control));
+    assert_eq!(prose("abc", 2), Err(Refusal::Length));
+    assert_eq!(command("  ", 16), Err(Refusal::Empty));
+    assert_eq!(command("true", 16), Ok(()));
+}

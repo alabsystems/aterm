@@ -2781,18 +2781,21 @@ impl App {
         let tuned = if self.backend.is_pending() {
             None
         } else {
-            self.windows.values().find(|ws| {
-                (ws.metrics.font_px - self.font_px).abs() < 0.5
-                    && ws.metrics.pad == self.backend.pad()
-                    && ws.metrics.pad_top == self.backend.pad_top()
-                    && ws.metrics.head == self.backend.head()
-            })
+            self.windows
+                .values()
+                .find(|ws| {
+                    (ws.metrics.font_px - self.font_px).abs() < 0.5
+                        && ws.metrics.pad == self.backend.pad()
+                        && ws.metrics.pad_top == self.backend.pad_top()
+                        && ws.metrics.head == self.backend.head()
+                })
+                .map(Box::as_ref)
         };
         tuned
             .or_else(|| {
                 self.frontmost_window
                     .and_then(|wid| self.windows.get(&wid))
-                    .or_else(|| self.windows.values().next())
+                    .or_else(|| self.windows.values().next().map(Box::as_ref))
             })
             .map_or(1.0, |ws| ws.scale)
     }
@@ -2893,8 +2896,16 @@ impl App {
             );
             let (surface_w, surface_h, geometry) = match ws.win_px {
                 Some(size) => (size.width.max(1), size.height.max(1), "window"),
-                None if self.headless => (frame_w, frame_h, "headless"),
-                None => (frame_w, frame_h, "pre_attach"),
+                None if self.headless => (
+                    frame_w.saturating_add(self.win_side_inset_px(wid) as u32),
+                    frame_h,
+                    "headless",
+                ),
+                None => (
+                    frame_w.saturating_add(self.win_side_inset_px(wid) as u32),
+                    frame_h,
+                    "pre_attach",
+                ),
             };
             (
                 cell_w,
@@ -2974,6 +2985,7 @@ impl App {
             surface_h as usize,
             frame_w as usize,
             frame_h as usize,
+            aterm_render::SideInsetPx(selected.map_or(0, |wid| self.win_side_inset_px(wid))),
         );
         let (offset_x, band_left, band_right, crop_left, crop_right) = dims_axis(place.x);
         let (offset_y, band_top, band_bottom, crop_top, crop_bottom) = dims_axis(place.y);
@@ -3162,9 +3174,10 @@ impl App {
         };
         let glow_geom = self.capture_glow_geom(wid, (cell_w, cell_h), (rows, cols));
         let (origin_x, origin_y) = (glow_geom.origin_x, glow_geom.origin_y);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
             sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
         }
@@ -3305,9 +3318,11 @@ impl App {
             cursor_color: ws.input_scratch.cursor_color,
             now,
         };
+        drop(route_guard_ws);
         self.compose_words(wid, &ctx);
         self.compose_output_streak(wid, &ctx);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.publish_words(&mut ws.input_scratch);
         }
     }
@@ -3340,7 +3355,8 @@ impl App {
             .is_some_and(|window| window.os_window.is_some());
         let capture_owns_cursor_fx = capture_ticks_cursor_fx(has_os_window, recording_this_window);
         if !capture_owns_cursor_fx {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.fx.withdraw_rain(&mut ws.input_scratch);
                 ws.fx.publish_words(&mut ws.input_scratch);
             }
@@ -3352,7 +3368,8 @@ impl App {
         if self.rain_dirty {
             self.recompute_matrix_rain();
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.withdraw_rain(&mut ws.input_scratch);
             ws.input_scratch.word_decorations.clear();
             ws.input_scratch.ink.clear();
@@ -3427,9 +3444,10 @@ impl App {
         };
         let glow_geom = self.capture_glow_geom(wid, (cell_w, cell_h), (rows, cols));
         let (origin_x, origin_y) = (glow_geom.origin_x, glow_geom.origin_y);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
         let live_viewport = exact_focus.live_viewport;
         let rewound = self.pool.is_rewound(exact_focus.session);
@@ -4222,9 +4240,10 @@ impl App {
     /// Marks window `wid`'s redraws as a capture's (`on`), or no longer (`!on`): a hidden window
     /// presents a capture's frame (`docs/ATERM_DESIGN.md` §7.4), as its GPU target does.
     fn mark_capture_present(&mut self, wid: crate::WindowId, on: bool) {
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         window.capture_redraw = on;
         if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = window.present.as_mut() {
             window_gpu.set_capture_present(on);
@@ -4293,17 +4312,20 @@ impl App {
                             }
                             Err(_) => false,
                         });
-                let Some(window) = self.windows.get_mut(&wid) else {
+                let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
                     last_capture_error = Some("capture lost its window".to_string());
                     return false;
                 };
+                let window = &mut **route_guard_window;
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
+                drop(route_guard_window);
                 self.redraw_capture_frame(wid, frame_layout);
-                let Some(window) = self.windows.get_mut(&wid) else {
+                let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
                     last_capture_error = Some("capture lost its window".to_string());
                     return false;
                 };
+                let window = &mut **route_guard_window;
                 acquire_pending = window.gpu_acquire_pending();
                 let serial = window.capture_present_serial;
                 self.capture_present_budget.record_attempt(
@@ -4326,6 +4348,7 @@ impl App {
                     overlay: window.capture_present_overlay,
                 };
                 let client = if armed {
+                    drop(route_guard_window);
                     match self.take_presented_client_capture(wid) {
                         Ok(client) => Some(client),
                         Err(error) if tap_required => {
@@ -4516,10 +4539,17 @@ impl App {
     ) -> Result<ResolvedCapture, CaptureDeferral> {
         let destination = match kind {
             SourceKind::Rerender => None,
-            SourceKind::Destination => Some(
-                self.recording_presented_destination_capture(front)
-                    .map_err(CaptureDeferral::Refused)?,
-            ),
+            SourceKind::Destination => {
+                let mut destination = self
+                    .recording_presented_destination_capture(front)
+                    .map_err(CaptureDeferral::Refused)?;
+                if policy.frame_only {
+                    destination.pixels = self
+                        .presented_frame_of(front, destination.pixels)
+                        .map_err(CaptureDeferral::Refused)?;
+                }
+                Some(destination)
+            }
         };
         if !policy.model
             && let Some(destination) = destination
@@ -4735,6 +4765,7 @@ impl App {
             0,
             width,
             height,
+            aterm_render::SideInsetPx(0),
             0..0,
             cpu_tray,
             visuals.invert,
@@ -5833,10 +5864,12 @@ impl App {
 
     /// THE FRONT WINDOW'S TAB LINE WHERE NO NATIVE STRIP DRAWS IT (a macOS `--headless` instance builds no toolbar).
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn stripless_tab_chrome(&self) -> Option<String> {
+    pub(crate) fn stripless_tab_chrome(&mut self) -> Option<String> {
+        self.reconcile_title_delivery(std::time::Instant::now());
         let wid = self
             .frontmost_window
             .or_else(|| self.windows.keys().next().copied())?;
+        let tooltips = self.tab_tooltips(wid);
         let ws = self.windows.get(&wid)?;
         let titles: Vec<String> = ws
             .tab_set
@@ -5858,7 +5891,7 @@ impl App {
         let line = crate::toolbar::format_tab_chrome(
             &titles,
             &self.tab_strip_metadata(wid),
-            &self.tab_tooltips(wid),
+            &tooltips,
             ws.tab_set.strip_active().unwrap_or(0),
         )?;
         #[cfg(any(test, debug_assertions))]
@@ -5872,7 +5905,8 @@ impl App {
 
     /// Read the frontmost window's native macOS chrome.
     #[cfg(target_os = "macos")]
-    pub(crate) fn read_native_chrome(&self) -> Vec<String> {
+    pub(crate) fn read_native_chrome(&mut self) -> Vec<String> {
+        self.reconcile_title_delivery(std::time::Instant::now());
         use aterm_objc::{autoreleasepool, sel};
 
         use crate::appkit::consts::{
@@ -5978,7 +6012,8 @@ impl App {
 
     /// Off macOS there is no native window toolbar.
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn read_native_chrome(&self) -> Vec<String> {
+    pub(crate) fn read_native_chrome(&mut self) -> Vec<String> {
+        self.reconcile_title_delivery(std::time::Instant::now());
         #[cfg(windows)]
         let out: Vec<String> = crate::platform_win::read_chrome_lines(
             self.front().and_then(|ws| ws.os_window.as_deref()),
@@ -6190,12 +6225,15 @@ impl App {
             .and_then(|window| window.capture_present_frame)
             .ok_or_else(|| "capture: the present recorded no frame size".to_string())?;
         let (width, height) = client.dims();
-        let visible =
-            aterm_render::frame_placement(width, height, frame_w as usize, frame_h as usize)
-                .visible_rect(width, height)
-                .ok_or_else(|| {
-                    "capture: the destination is not the surface of its present".to_string()
-                })?;
+        let visible = aterm_render::frame_placement(
+            width,
+            height,
+            frame_w as usize,
+            frame_h as usize,
+            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
+        )
+        .visible_rect(width, height)
+        .ok_or_else(|| "capture: the destination is not the surface of its present".to_string())?;
         client.cut_to(visible)
     }
 
@@ -6203,9 +6241,10 @@ impl App {
         let App {
             backend, windows, ..
         } = self;
-        let window = windows
+        let mut route_guard_window = windows
             .get_mut(&wid)
             .ok_or_else(|| "window capture lost its window".to_string())?;
+        let window = &mut **route_guard_window;
         window.capture_present_client = None;
         match window.present.as_mut() {
             Some(crate::PresentTarget::Cpu { .. }) => {
@@ -6229,9 +6268,10 @@ impl App {
         let App {
             backend, windows, ..
         } = self;
-        let window = windows
+        let mut route_guard_window = windows
             .get_mut(&wid)
             .ok_or_else(|| "window capture lost its window".to_string())?;
+        let window = &mut **route_guard_window;
         window.capture_acquire_armed = false;
         match window.present.as_mut() {
             Some(crate::PresentTarget::Cpu { .. }) => {
@@ -6259,9 +6299,10 @@ impl App {
         let App {
             backend, windows, ..
         } = self;
-        let Some(window) = windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         window.capture_acquire_armed = false;
         window.capture_client_requested = false;
         window.capture_present_client = None;

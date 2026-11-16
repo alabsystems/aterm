@@ -276,6 +276,12 @@ impl ReclaimAfter {
     }
     /// The root the cache moved from ([`reclaim_moved`]), where nothing is pruned in part.
     const MOVED: Self = Self::CALM;
+    /// The volume holds more than its rebuildable budget's cap ([`reclaim_over_budget`]): a stale
+    /// part of a shared-cache build directory no live session's builds keep goes once unwritten
+    /// an hour, as below the floor; every other wait is [`Self::CALM`]'s.
+    pub const OVER_BUDGET: Self = Self {
+        stale: RECLAIM_STALE_UNDER_PRESSURE,
+    };
 }
 
 /// Keep explicit age policies unchanged. A manual per-volume observation only
@@ -284,6 +290,14 @@ impl ReclaimAfter {
 enum ReclaimPolicy<'a> {
     Fixed(ReclaimAfter),
     Observed(&'a dyn Fn(&Path) -> Option<(u64, u64)>),
+    /// Over the rebuildable budget ([`reclaim_over_budget`]): a leaf of the shared cache under
+    /// `root` whose workspace `keeps` does not keep (no live session works in it, started a build
+    /// there or used it in its recent runs) waits [`ReclaimAfter::OVER_BUDGET`]; every other
+    /// leaf and every whole build directory wait [`ReclaimAfter::CALM`].
+    Budget {
+        root: &'a Path,
+        keeps: &'a dyn Fn(&Path, &Path) -> bool,
+    },
 }
 
 impl From<ReclaimAfter> for ReclaimPolicy<'_> {
@@ -296,7 +310,7 @@ impl ReclaimPolicy<'_> {
     fn whole(self) -> ReclaimAfter {
         match self {
             Self::Fixed(after) => after,
-            Self::Observed(_) => ReclaimAfter::CALM,
+            Self::Observed(_) | Self::Budget { .. } => ReclaimAfter::CALM,
         }
     }
 
@@ -306,6 +320,18 @@ impl ReclaimPolicy<'_> {
             Self::Observed(observe) => observe(path).map_or(ReclaimAfter::CALM, |(free, floor)| {
                 ReclaimAfter::by_floor(free <= floor)
             }),
+            Self::Budget { root, keeps } => {
+                let unkept = path.starts_with(root)
+                    && path
+                        .parent()
+                        .and_then(|dir| workspace_of(root, dir))
+                        .is_some_and(|workspace| !keeps(path, &workspace));
+                if unkept {
+                    ReclaimAfter::OVER_BUDGET
+                } else {
+                    ReclaimAfter::CALM
+                }
+            }
         }
     }
 
@@ -321,12 +347,18 @@ impl ReclaimPolicy<'_> {
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/.ubd/cargo-build.noindex
-__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r= __atb_query= __atb_configured= __atb_fresh=
-case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
-case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
-case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
-case ${PWD-} in "$__atb_c" | "$__atb_c"/*) __atb= ;; esac
+__atb= __atb_L= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r= __atb_query= __atb_configured= __atb_fresh=
+# The launcher's folder is one a call with no `-C` is placed from (`__atb_L`); a `-C` call is
+# judged from its directory instead (below).
+case ${HOME-} in /?*) __atb=1; case ${PWD-} in "$HOME"/*) __atb_L=1 ;; esac ;; esac
+case ${HOME-} in *[\'[:cntrl:]{}]*) __atb= ;; esac
+case ${PWD-} in *[{}]* | "$__atb_c" | "$__atb_c"/*) __atb_L= ;; esac
 [ -n "${CARGO_BUILD_BUILD_DIR+1}${TARGO_BUILD_BUILD_DIR+1}" ] && __atb=
+# Targo's config walk stops at a test root and folds a home's `..` as written, which this block
+# cannot follow: either leaves the call as typed.
+[ -z "${__CARGO_TEST_ROOT+1}" ] || __atb=
+case /${CARGO_HOME-}/ in */../*) __atb= ;; esac
+[ -n "${CARGO_HOME+1}" ] || case /${TARGO_HOME-}/ in */../*) __atb= ;; esac
 __atb_scan() {
   for __atb_f in "$1/config.toml" "$1/config"; do
     [ -f "$__atb_f" ] || continue
@@ -336,7 +368,7 @@ __atb_scan() {
     while IFS= read -r __atb_l || [ -n "$__atb_l" ]; do
       __atb_x=${__atb_l#"${__atb_l%%[![:blank:]]*}"}
       case $__atb_x in [#]*) continue ;; esac
-      case $__atb_l in *build-dir* | *include*) __atb=; return ;; esac
+      case $__atb_l in *build-dir* | *include* | *'"""'* | *"'''"* | *'\u'* | *'\U'* | *'\x'*) __atb=; return ;; esac
       case $__atb_l in *target-dir*) __atb_tn=1 ;; esac
       case $__atb_x in
         "["*) case $__atb_x in "[alias]"*) __atb_s=1 ;; *) __atb_s= ;; esac; continue ;;
@@ -386,7 +418,7 @@ __atb_ok() {
   esac
 }
 if [ -n "$__atb" ]; then
-  __atb_v=$__atb_t __atb_u= __atb_n= __atb_M=${__atb_t:+1} __atb_dd= __atb_P=
+  __atb_v=$__atb_t __atb_u= __atb_n= __atb_M=${__atb_t:+1} __atb_dd= __atb_P= __atb_w=$PWD __atb_C= __atb_Cs= __atb_g= __atb_zv=
   for __atb_a in "$@"; do
     # The lane's consent, as targo reads it: any `--unverified` before `--`, whatever it follows.
     case $__atb_a in
@@ -400,6 +432,10 @@ if [ -n "$__atb" ]; then
       c | m | t) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
       s) __atb_n=; continue ;;
       o) __atb_n=; case $__atb_a in -?*) ;; *) continue ;; esac ;;
+      # A directory's value where clap takes it; with none (`-C -q`) clap refuses the call.
+      d) __atb_n=; case $__atb_a in -?*) __atb= ;; *) __atb_C=$__atb_a; continue ;; esac ;;
+      # A `-Z` value before the verb, read for the gate Targo's `-C` needs.
+      z) __atb_n=; case $__atb_a in -?*) ;; *) [ "$__atb_a" != unstable-options ] || __atb_g=1; continue ;; esac ;;
     esac
     case $__atb_a in
       --) break ;;
@@ -417,7 +453,6 @@ if [ -n "$__atb" ]; then
       --target-dir) case $__atb_v in "" | @ATB_BUILTIN_COMMANDS@) __atb_n=t ;; *) __atb= ;; esac ;;
       --target-dir=*) case $__atb_v in "" | @ATB_BUILTIN_COMMANDS@) __atb_ok t "${__atb_a#--target-dir=}" ;; *) __atb= ;; esac ;;
       --profile) __atb_n=s ;;
-      -C | -C?*) __atb= ;;
       --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
       # After the verb a long option takes the word clap gives it (`long_takes_next`): `--jobs`
       # any, `--color` and the others none that starts with `-` and is no lone `-`.
@@ -428,7 +463,33 @@ if [ -n "$__atb" ]; then
       -[!-]*)
         __atb_cl "$__atb_a"
         case $__atb_y in
-          C*) __atb= ;;
+          # The first directory before the verb, in each spelling clap reads (`-C d`, `-Cd`,
+          # `-C=d`, `-qC d`, `-qCd`), is where Targo works (below); a second, or one after the
+          # verb, which clap refuses, leaves the call as typed. A detached value is no verb.
+          C | C?*)
+            if [ -n "$__atb_v" ] || [ -n "$__atb_Cs" ]; then
+              __atb=
+              [ "$__atb_y" != C ] || __atb_n=o
+            else
+              __atb_Cs=1
+              case $__atb_y in
+                C) __atb_n=d ;;
+                *) __atb_C=${__atb_y#C}; __atb_C=${__atb_C#=} ;;
+              esac
+            fi
+            ;;
+          # A `-Z` value: the gate's before the verb; after it, one that may replace the gate.
+          Z)
+            if [ -z "$__atb_v" ]; then __atb_n=z; else __atb_zv=1 __atb_n=o; fi
+            ;;
+          Z?*)
+            if [ -z "$__atb_v" ]; then
+              __atb_y=${__atb_y#Z}
+              [ "${__atb_y#=}" != unstable-options ] || __atb_g=1
+            else
+              __atb_zv=1
+            fi
+            ;;
           m*)
             # Its `-m` only among Targo's own words: after a verb that takes one, and not in a
             # trailing verb's program words (`__atb_M`, set with the verb below).
@@ -470,7 +531,7 @@ if [ -n "$__atb" ]; then
   done
   # With no tool argument, `trust` itself answers its usage without compiling.
   [ "$__atb_v" != trust ] || [ -z "$__atb_fresh" ] || __atb_query=1
-  case $__atb_n in "" | s | o) ;; *) __atb= ;; esac
+  case $__atb_n in "" | s | o | z) ;; *) __atb= ;; esac
   case $__atb_v in
     clean | tippy | clippy) __atb_k=1 ;;
     trust) __atb_e=1 ;;
@@ -478,6 +539,22 @@ if [ -n "$__atb" ]; then
     "") __atb= ;;
     *) [ -n "$__atb_u" ] && __atb_k=1 __atb_al=1 || __atb= ;;
   esac
+  # With a directory, the call is judged as the same call typed there (`__atb_w`): Targo changes
+  # into it, read back as the kernel resolves it, before it reads a config, an alias or a
+  # relative path. Only Targo's own call behind its gate, held before the verb with no `-Z`
+  # after it and on the channel Targo reads as its own, is placed so.
+  [ -n "$__atb_Cs" ] || [ -n "$__atb_L" ] || __atb=
+  if [ -n "$__atb_Cs" ]; then
+    { [ -z "$__atb_t" ] && [ -n "$__atb_g" ] && [ -z "$__atb_zv" ] && [ -z "${__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS+1}" ]; } || __atb=
+    case $__atb_C in "") __atb= ;; /*) __atb_w=$__atb_C ;; *) __atb_w=$PWD/$__atb_C ;; esac
+    if [ -n "$__atb" ]; then
+      __atb_w=$(cd -P -- "$__atb_w" 2>/dev/null && /bin/pwd -P 2>/dev/null && printf .) || __atb=
+      __atb_w=${__atb_w%.}
+      __atb_w=${__atb_w%?}
+      case $__atb_w in "$HOME"/*) ;; *) __atb= ;; esac
+      case $__atb_w in *[{}]* | "$__atb_c" | "$__atb_c"/*) __atb= ;; esac
+    fi
+  fi
 fi
 # aterm: a test run's scratch out of fseventsd's stream, in $TMPDIR's .ubd folder once one is this user's
 case $__atb_v in
@@ -492,7 +569,7 @@ case $__atb_v in
     ;;
 esac
 if [ -n "$__atb" ]; then
-  __atb_d=$PWD
+  __atb_d=$__atb_w
   while [ -n "$__atb" ]; do
     if [ -h "$__atb_d" ]; then __atb=; break; fi
     __atb_scan "$__atb_d/.cargo"
@@ -500,10 +577,17 @@ if [ -n "$__atb" ]; then
     __atb_d=${__atb_d%/*}
   done
 fi
-[ -n "$__atb" ] && __atb_scan "${CARGO_HOME:-$HOME/.cargo}"
-# aterm: targo reads each TARGO_ variable for its unset CARGO_ twin; the store's takes its home
-# from CARGO_HOME alone and Trust's main from TARGO_HOME instead, so both homes are read.
-[ -n "$__atb" ] && [ -z "${CARGO_HOME+1}" ] && [ -n "${TARGO_HOME-}" ] && __atb_scan "$TARGO_HOME"
+# A relative home is the working directory's, as Targo resolves it there.
+__atb_home() { case $1 in /*) __atb_scan "$1" ;; *) __atb_scan "$__atb_w/$1" ;; esac; }
+[ -n "$__atb" ] && __atb_home "${CARGO_HOME:-$HOME/.cargo}"
+# aterm: targo reads each TARGO_ variable for its unset CARGO_ twin; Targo 16387 takes its home
+# from CARGO_HOME alone and Trust's main from TARGO_HOME instead, so both homes are read. An
+# alias only TARGO_HOME's config builds is no command of 16387's: it places no call.
+[ -n "$__atb" ] && [ -z "${CARGO_HOME+1}" ] && [ -n "${TARGO_HOME-}" ] && {
+  __atb_b=$__atb_ab
+  __atb_home "$TARGO_HOME"
+  __atb_ab=$__atb_b
+}
 [ -z "$__atb_al" ] || [ -n "$__atb_ab" ] || __atb=
 # A caller config may replace a short alias: its help words may be a program's.
 if [ -n "$__atb_query" ]; then
@@ -512,7 +596,7 @@ if [ -n "$__atb_query" ]; then
     *) [ -n "$__atb_configured" ] || __atb= ;;
   esac
 fi
-if [ -n "$__atb" ]; then
+if [ -n "$__atb" ] && [ -z "$__atb_Cs" ]; then
   __atb_p=$(/bin/pwd -P 2>/dev/null && printf .) || {
     printf '%s\n' 'atpkg: cannot resolve the physical working directory; no build started' >&2
     exit 75
@@ -528,7 +612,7 @@ if [ -n "$__atb" ] && [ -z "$__atb_tf" ]; then
   fi
 fi
 if [ -n "$__atb" ] && [ -n "$__atb_tf" ]; then
-  case $__atb_T in "") __atb= ;; /*) ;; *) __atb_T=$PWD/$__atb_T ;; esac
+  case $__atb_T in "") __atb= ;; /*) ;; *) __atb_T=$__atb_w/$__atb_T ;; esac
   case $__atb_T in *[\'{}[:cntrl:]]*) __atb= ;; esac
   __atb_D=$__atb_T/.ubd/build.noindex
 elif [ -n "$__atb" ]; then
@@ -2033,9 +2117,9 @@ pub fn reclaim_home_watched(
 
 /// THE BUILD DIRECTORIES OF REMOVED WORKSPACES under the shared cache `root`: each [`LEAF`] whose
 /// workspace ([`workspace_of`]) has no folder and is seen gone ([`checkout::gone_placed`], `home`
-/// naming the folders it never looks into), which a pass takes at once. It reads the mirror folders and stats each workspace, never a
-/// build directory's own tree, so a wait can ask it at every look ([`crate::admit_disk`]); what it
-/// lists a pass ([`reclaim_home_watched`]) takes whole once no build holds it.
+/// naming the folders it never looks into), which a pass takes at once. It reads the mirror
+/// folders and stats each workspace, never a build directory's own tree, so it is cheap to ask at
+/// any moment; what it lists a pass ([`reclaim_home_watched`]) takes whole once no build holds it.
 #[must_use]
 pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeSet<PathBuf> {
     fn walk(
@@ -2155,6 +2239,41 @@ pub fn reclaim_beside_sessions(
         &fence::Fence::default(),
         record,
     )
+}
+
+/// WHAT THE DISK WATCH SWEEPS OVER THE REBUILDABLE BUDGET: `home`'s shared build cache alone,
+/// as [`reclaim_home_watched`] sweeps it with room ([`ReclaimAfter::CALM`]), except that a stale
+/// part of a build directory there whose workspace `keeps` does not keep (`keeps(leaf,
+/// workspace)`: a live session works in it, started a build there or used it in its recent
+/// runs) goes once unwritten an hour ([`ReclaimAfter::OVER_BUDGET`]). The other roots (the one
+/// the cache moved from, tooling, the registered caches) are not swept here: `keeps` reads no
+/// session of their builds, so over the budget they would go by the calm sweep's age rule
+/// alone, which the watch's own sweeps and the daily passes apply already. `keeps` only ever
+/// keeps: it never makes a build directory or a stale part eligible that the calm sweep would
+/// keep. `record` is asked before each removal
+/// (`false` keeps it, and the walk prunes nothing more), and every path is returned with why it
+/// went. Nothing off macOS, where no shared cache is written.
+pub fn reclaim_over_budget(
+    home: &Path,
+    now: SystemTime,
+    keeps: &dyn Fn(&Path, &Path) -> bool,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let root = cache_root(home);
+    reclaim_root_on(
+        &root,
+        Some(home),
+        now,
+        ReclaimPolicy::Budget { root: &root, keeps },
+        placing,
+        record,
+        &fence::Fence::default(),
+    )
+    .0
 }
 
 /// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing off macOS or without a home.

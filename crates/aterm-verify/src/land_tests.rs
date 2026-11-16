@@ -5,7 +5,7 @@
 //! re-judge, and the stated receipt, each beside the control that shows the rule bites.
 
 use super::*;
-use aterm_types::land_trailer::{Interrupted, KEYS};
+use aterm_land_trailer::{Interrupted, KEYS};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -190,6 +190,7 @@ fn own() -> Own<'static> {
     Own {
         words: &[],
         image: OWN,
+        at: None,
     }
 }
 
@@ -1566,6 +1567,79 @@ fn a_checkout_that_moves_or_changes_during_the_run_pushes_nothing() {
     let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_ne!(origin_main(&world), before);
+}
+
+/// ONE LANDING RUNS IN A CHECKOUT AT A TIME: while one holds the checkout's landing lock, a
+/// second refuses at once and says why; once the first ends, the next takes it.
+#[test]
+fn a_second_landing_of_a_checkout_refuses_while_one_runs() {
+    let world = world();
+    let git = Git {
+        root: &world.work,
+        make: &git_cmd,
+    };
+    let first = git.hold().expect("the first landing takes the checkout");
+    let refused = git.hold().expect_err("a second landing refuses");
+    assert!(refused.contains("another landing runs in"), "{refused}");
+    drop(first);
+    git.hold().expect("once the first ended, the next takes it");
+}
+
+/// A LANDING ASKED FOR A COMMIT LANDS THAT COMMIT OR NOTHING (`--at`, which `verify land --tab`
+/// gives its worker): where the checkout's HEAD moved on after the ask, nothing is judged or
+/// pushed. CONTROL: asked for the HEAD it reads, the same landing judges and lands.
+#[test]
+fn a_landing_asked_for_a_commit_lands_it_or_nothing() {
+    let world = world();
+    let asked = commit(&world.work, "a/x.txt", "a2\n");
+    let head = commit(&world.work, "a/x.txt", "a3\n");
+    let before = origin_main(&world);
+    let branch = crates(&["a"]);
+    let reach = whole_reach(&branch);
+    let judged = RefCell::new(0);
+    let land_at = |at: &str| {
+        let said = RefCell::new(Vec::new());
+        let code = land(
+            &world.work,
+            &Own {
+                words: &[],
+                image: OWN,
+                at: Some(at),
+            },
+            &mut Seams {
+                git: &git_cmd,
+                verifier: &mut |_: &Path| Ok(own_image()),
+                judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| {
+                    *judged.borrow_mut() += 1;
+                    Ran::Ended(green())
+                },
+                records: quiet(),
+                reach: &|_: &Path, _: &str, paths: Option<&[String]>| reach(paths),
+                recheck: &mut |_, _, _, _| panic!("no round was expected"),
+                autofix: &mut |_: &Path, _: &[String]| Ok(()),
+                hand_over: &mut |_, _, _| panic!("nothing is handed over"),
+                say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+                remote: &crate::remote::run,
+                pause: &no_retry,
+            },
+        );
+        (code, said.into_inner())
+    };
+    let (code, said) = land_at(&asked);
+    assert_eq!(
+        (code, *judged.borrow()),
+        (exit::COULD_NOT_RUN, 0),
+        "{said:#?}"
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.contains(&format!("HEAD is {head}, not {asked}"))),
+        "{said:#?}"
+    );
+    assert_eq!(origin_main(&world), before, "nothing was pushed");
+    let (code, said) = land_at(&head);
+    assert_eq!((code, *judged.borrow()), (exit::PASS, 1), "{said:#?}");
+    assert_ne!(origin_main(&world), before, "the asked commit landed");
 }
 
 /// A PUSH MAIN REFUSED WHILE IT STAYED PUT IS AN ERROR, NEVER A RETRY OR A MOVED MAIN: origin's

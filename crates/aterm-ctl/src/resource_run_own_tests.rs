@@ -194,17 +194,17 @@ fn capability_query_accepts_no_execution_or_resource_arguments() {
 #[test]
 fn confirmation_requires_one_matching_identity_and_session() {
     assert!(registered(
-        "OK resources version=1 root_pid=42 start=77 session=s-a",
+        "OK resources version=1 root_pid=42 start=77 session=taxxxxxxxxx",
         42,
         77,
-        "s-a"
+        "taxxxxxxxxx"
     ));
     for status in [
-        "OK resources version=1 root_pid=43 start=77 session=s-a",
-        "OK resources version=1 root_pid=42 start=78 session=s-a",
-        "OK resources version=1 root_pid=42 start=77 session=s-b",
-        "OK resources version=1 root_pid=42 root_pid=42 start=77 session=s-a",
+        "OK resources version=1 root_pid=43 start=77 session=taxxxxxxxxx",
+        "OK resources version=1 root_pid=42 start=78 session=taxxxxxxxxx",
+        "OK resources version=1 root_pid=42 start=77 session=tbxxxxxxxxx",
+        "OK resources version=1 root_pid=42 root_pid=42 start=77 session=taxxxxxxxxx",
     ] {
-        assert!(!registered(status, 42, 77, "s-a"));
+        assert!(!registered(status, 42, 77, "taxxxxxxxxx"));
     }
 }

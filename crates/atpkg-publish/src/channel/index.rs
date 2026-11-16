@@ -949,6 +949,9 @@ pub enum RosterCandidate {
     Store(PathBuf),
 }
 
+/// A file's bytes and its detached signature's bytes.
+type SignedBytes = (Vec<u8>, Vec<u8>);
+
 impl RosterCandidate {
     /// How the candidate is named to a person.
     #[must_use]
@@ -960,7 +963,7 @@ impl RosterCandidate {
     }
 
     /// Its bytes and signature, or why they cannot be read; `Ok(None)` where nothing is there.
-    fn read(&self) -> std::result::Result<Option<(Vec<u8>, Vec<u8>)>, String> {
+    fn read(&self) -> std::result::Result<Option<SignedBytes>, String> {
         match self {
             Self::File(path) => {
                 let mut sig_path = path.as_os_str().to_owned();
@@ -1468,6 +1471,7 @@ fn qualify_candidate(
     candidate: &VerifiedQuad,
     log: &mut Log,
 ) -> Result<()> {
+    admit_harness_leads(ctx, request, plan, candidate, log)?;
     for (def, build) in alab_pins(plan) {
         crate::artifact::package::verify_pinned(
             ctx,
@@ -1501,6 +1505,88 @@ fn qualify_candidate(
         }
     }
     Ok(())
+}
+
+/// One harness leads a word in the candidate (`docs/HARNESS-CONTRACT.md` §2): each harness pin
+/// this index moves or adds is read for the words it leads (its signed record's, else its
+/// seed's), and when any of them leads a word, every other harness pin is read too, and two
+/// that lead one word refuse the index ([`one_leader_among`]). An index that moves only pins
+/// leading nothing fetches nothing more.
+fn admit_harness_leads(
+    ctx: &Ctx,
+    request: &IndexRequest,
+    plan: &Plan,
+    candidate: &VerifiedQuad,
+    log: &mut Log,
+) -> Result<()> {
+    let fresh: BTreeSet<&str> = plan
+        .moved
+        .iter()
+        .map(|m| m.program.as_str())
+        .chain(plan.added.iter().map(|(p, _)| p.as_str()))
+        .collect();
+    let harnesses: Vec<(&'static programs::ProgramDef, Build)> = plan
+        .channel
+        .pin
+        .iter()
+        .filter_map(|(p, &b)| {
+            programs::get(p)
+                .filter(|d| d.harness().is_some())
+                .map(|d| (d, b))
+        })
+        .collect();
+    let leads_of = |def: &programs::ProgramDef, build: Build, pack: Option<&Path>| {
+        let pkg = crate::artifact::package::pinned_manifest(ctx, candidate, def, build, pack)?;
+        let leads = atpkg::harness_record::pinned_leads(def.name, pkg.harness.as_ref())
+            .ok_or_else(|| {
+                Error::refused(format!(
+                    "REFUSING to pin {}@{build}: its signed [harness] record does not read",
+                    def.name
+                ))
+            })?;
+        Ok::<_, Error>((def.name.to_string(), leads))
+    };
+    let moved = harnesses
+        .iter()
+        .filter(|(d, _)| fresh.contains(d.name))
+        .map(|&(def, build)| leads_of(def, build, request.pack_dir.as_deref()))
+        .collect::<Result<Vec<_>>>()?;
+    let compared = one_leader_among(moved, || {
+        harnesses
+            .iter()
+            .filter(|(d, _)| !fresh.contains(d.name))
+            .map(|&(def, build)| leads_of(def, build, None))
+            .collect()
+    })?;
+    if compared {
+        log.say("each word the pinned harnesses lead has one leader");
+    }
+    Ok(())
+}
+
+/// One harness leads a word among an index's harness pins: `moved`, each pin the index moves or
+/// adds with the words it leads (its record's, or, with no record, its seed's:
+/// [`atpkg::harness_record::pinned_leads`]), and `rest`, the pins it leaves, read only when a
+/// moved pin leads a word, since a pin moving to a build that leads nothing takes no word from
+/// another. `Ok(true)` when the pins were compared.
+///
+/// # Errors
+/// A pin of `rest` that does not read, or two pins leading one word.
+fn one_leader_among(
+    moved: Vec<(String, Vec<String>)>,
+    rest: impl FnOnce() -> Result<Vec<(String, Vec<String>)>>,
+) -> Result<bool> {
+    if moved.iter().all(|(_, leads)| leads.is_empty()) {
+        return Ok(false);
+    }
+    let mut pins = moved;
+    pins.extend(rest()?);
+    atpkg::harness_record::one_leader_per_word(&pins).map_err(|why| {
+        Error::refused(format!(
+            "REFUSING the index: {why}, and one harness leads a word — nothing was published"
+        ))
+    })?;
+    Ok(true)
 }
 
 /// Read the verified baseline without touching the output. The caller owns `head_dir`
@@ -2317,3 +2403,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     ));
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "index_tests.rs"]
+mod tests;

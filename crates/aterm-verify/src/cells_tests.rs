@@ -1658,3 +1658,641 @@ fn patched_crates_and_renamed_package_handle_subtables_quotes_and_comments() {
         names(&["foo", "bar-real", "sub", "sub-real"])
     );
 }
+
+/// The rustc a stock 1.97.1 fingerprint names: the id a linux-arm cell's directory held on
+/// 2026-11-13.
+#[cfg(unix)]
+const STOCK_RUSTC: u64 = 11_722_972_603_611_519_644;
+
+/// One unit a cell's fixture lays in its directory ([`CellBuild::lay`]) and its calls report
+/// ([`CellBuild::wire`]), in the layout stock cargo builds a cell in: under its profile,
+/// `.fingerprint/<package>-<hash>/` and `deps/lib<crate>-<hash>.rmeta` beside `<crate>-<hash>.d`.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct Laid {
+    /// Its profile below the cell's directory (`aarch64-unknown-linux-gnu/debug`).
+    profile: &'static str,
+    /// Its package, as its fingerprint folder names it.
+    package: &'static str,
+    /// Its crate, as its outputs name it.
+    krate: &'static str,
+    /// What its fingerprint folder says it is a build of (`test-lib-aterm_grid`).
+    kind: &'static str,
+    /// Cargo's name for it in its profile.
+    hash: &'static str,
+    /// Whether it is a build of a test (`profile.test`).
+    test: bool,
+}
+
+#[cfg(unix)]
+impl Laid {
+    /// A unit of the member `aterm-grid`.
+    const fn grid(
+        profile: &'static str,
+        kind: &'static str,
+        hash: &'static str,
+        test: bool,
+    ) -> Self {
+        Self {
+            profile,
+            package: "aterm-grid",
+            krate: "aterm_grid",
+            kind,
+            hash,
+            test,
+        }
+    }
+
+    /// A unit of `memchr`, a dependency and no member.
+    const fn memchr(profile: &'static str, hash: &'static str) -> Self {
+        Self {
+            profile,
+            package: "memchr",
+            krate: "memchr",
+            kind: "lib-memchr",
+            hash,
+            test: false,
+        }
+    }
+
+    /// Its `package_id` in cargo's messages.
+    fn id(&self) -> String {
+        if self.package == "memchr" {
+            "registry+https://github.com/rust-lang/crates.io-index#memchr@2.7.4".to_owned()
+        } else {
+            format!("path+file:///w/crates/{}#0.155.0", self.package)
+        }
+    }
+}
+
+/// A run's context in the scratch checkout at `root`, checking the cells: the main lane's build
+/// directory at `<root>/cache/w/.cargo-build` and the side lanes inside it, as the shared cache
+/// holds them.
+#[cfg(unix)]
+fn cell_run(root: &Path) -> Ctx {
+    let leaf = root.join("cache/w/.cargo-build");
+    let mut ctx = Ctx::new(
+        root.join("w"),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        root.join("scratch"),
+    )
+    .with_checks(&[crate::checks::Check::Cells]);
+    ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+    ctx.cached_lanes_dir = Some(leaf.join("verify/.ubd"));
+    ctx
+}
+
+/// One of forge's cells in a scratch checkout ([`cell_run`]), its directory in the cells lane
+/// ([`cell_dir`]), and a stand-in for the stock pin's cargo that prints, for the verb it is
+/// called with, what [`Self::wire`] wrote, and then exits 1 where [`Self::fail`] marked that verb.
+#[cfg(unix)]
+struct CellBuild {
+    scratch: aterm_tempfile::TempDir,
+    cell: Cell,
+    toolchain: rustup::Toolchain,
+    /// The cell's directory.
+    dir: PathBuf,
+}
+
+#[cfg(unix)]
+impl CellBuild {
+    /// The fixture of forge's cell `name`.
+    fn new(name: &str) -> Self {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("verify-cell-used-")
+            .suffix(".noindex")
+            .tempdir()
+            .expect("scratch");
+        let cell = aterm_forge::resolve::default_cells()
+            .into_iter()
+            .find(|c| c.name == name)
+            .expect("one of forge's cells");
+        let bin = scratch.path().join("bin");
+        crate::standin_body(
+            &bin.join("cargo"),
+            &format!(
+                "/bin/cat \"{0}/wire.$1\" && test ! -e \"{0}/fail.$1\"",
+                scratch.path().display()
+            ),
+        );
+        let toolchain = rustup::Toolchain {
+            name: "1.97.1".into(),
+            cargo: bin.join("cargo"),
+            rustc: bin.join("rustc"),
+            clippy: true,
+        };
+        let ctx = cell_run(scratch.path());
+        let dir = cell_dir(&ctx, &cell.name);
+        std::fs::create_dir_all(&dir).expect("the cell's directory");
+        std::fs::create_dir_all(ctx.scratch.join(format!("cells-{}", cell.name)))
+            .expect("the cell's neutral cwd");
+        Self {
+            scratch,
+            cell,
+            toolchain,
+            dir,
+        }
+    }
+
+    /// The main lane's build directory, which the cells lane lies in.
+    fn leaf(&self) -> PathBuf {
+        self.scratch.path().join("cache/w/.cargo-build")
+    }
+
+    fn fingerprint(&self, unit: &Laid) -> PathBuf {
+        self.dir
+            .join(unit.profile)
+            .join(".fingerprint")
+            .join(format!("{}-{}", unit.package, unit.hash))
+    }
+
+    fn rmeta(&self, unit: &Laid) -> PathBuf {
+        self.dir
+            .join(unit.profile)
+            .join("deps")
+            .join(format!("lib{}-{}.rmeta", unit.krate, unit.hash))
+    }
+
+    fn dep_file(&self, unit: &Laid) -> PathBuf {
+        self.dir
+            .join(unit.profile)
+            .join("deps")
+            .join(format!("{}-{}.d", unit.krate, unit.hash))
+    }
+
+    /// Lay `unit` as stock cargo leaves it, compiled by the rustc its fingerprint names
+    /// (`rustc`), its metadata `bytes` long, every entry of it and then its fingerprint folder
+    /// last written `ago`; and cargo's locks in its profile, which a trim surveys only where one
+    /// stands.
+    fn lay(&self, unit: &Laid, rustc: u64, bytes: usize, ago: Duration) {
+        let profile = self.dir.join(unit.profile);
+        let fingerprint = self.fingerprint(unit);
+        std::fs::create_dir_all(&fingerprint).expect("its fingerprint folder");
+        std::fs::create_dir_all(profile.join("deps")).expect("its profile's outputs");
+        for lock in [".cargo-lock", ".cargo-build-lock"] {
+            std::fs::write(profile.join(lock), b"").expect("cargo's lock");
+        }
+        let kind = fingerprint.join(unit.kind);
+        let json = fingerprint.join(format!("{}.json", unit.kind));
+        let dep_info = fingerprint.join(format!("dep-{}", unit.kind));
+        let invoked = fingerprint.join("invoked.timestamp");
+        std::fs::write(&kind, b"0123456789abcdef").expect("its hash");
+        std::fs::write(&json, format!("{{\"rustc\":{rustc},\"features\":\"[]\"}}"))
+            .expect("its fingerprint");
+        std::fs::write(&dep_info, b"").expect("its dep-info");
+        std::fs::write(&invoked, b"").expect("its timestamp");
+        std::fs::write(self.rmeta(unit), vec![7u8; bytes]).expect("its metadata");
+        std::fs::write(self.dep_file(unit), b"").expect("its dep file");
+        let at = std::time::SystemTime::now() - ago;
+        for path in [
+            kind,
+            json,
+            dep_info,
+            invoked,
+            self.rmeta(unit),
+            self.dep_file(unit),
+            fingerprint,
+        ] {
+            std::fs::File::open(&path)
+                .and_then(|f| f.set_modified(at))
+                .unwrap_or_else(|e| panic!("dated {}: {e}", path.display()));
+        }
+    }
+
+    /// Whether every entry of `unit` stands.
+    fn stands(&self, unit: &Laid) -> bool {
+        self.fingerprint(unit).is_dir()
+            && self.rmeta(unit).is_file()
+            && self.dep_file(unit).is_file()
+    }
+
+    /// Whether no entry of `unit` stands.
+    fn gone(&self, unit: &Laid) -> bool {
+        [
+            self.fingerprint(unit),
+            self.rmeta(unit),
+            self.dep_file(unit),
+        ]
+        .iter()
+        .all(|path| std::fs::symlink_metadata(path).is_err())
+    }
+
+    /// Write what the stand-in cargo prints for `verb` (`clippy`, the lint; `check`, the
+    /// all-targets pass): a fresh `compiler-artifact` naming the metadata of each of `units`,
+    /// then cargo's successful `build-finished` where `finished`. Written aside and renamed into
+    /// place, so the stand-in reads it whole.
+    fn wire(&self, verb: &str, units: &[Laid], finished: bool) {
+        let mut lines: Vec<String> = units
+            .iter()
+            .map(|unit| {
+                aterm_json::json!({
+                    "reason": "compiler-artifact",
+                    "package_id": unit.id(),
+                    "target": {"kind": ["lib"], "name": unit.krate},
+                    "profile": {"test": unit.test},
+                    "filenames": [self.rmeta(unit).display().to_string()],
+                    "fresh": true,
+                })
+                .to_string()
+            })
+            .collect();
+        if finished {
+            lines
+                .push(aterm_json::json!({"reason": "build-finished", "success": true}).to_string());
+        }
+        let wire = self.scratch.path().join(format!("wire.{verb}"));
+        let aside = self.scratch.path().join(format!("wire.{verb}.aside"));
+        std::fs::write(&aside, lines.join("\n") + "\n").expect("the wire");
+        std::fs::rename(&aside, &wire).expect("the wire in place");
+    }
+
+    /// Whether the stand-in exits 1 for `verb` once it printed the whole wire (`fails`), as cargo
+    /// does once a compile it reported failed; else it exits as its `cat` did.
+    fn fail(&self, verb: &str, fails: bool) {
+        let mark = self.scratch.path().join(format!("fail.{verb}"));
+        if fails {
+            std::fs::write(&mark, b"").expect("the call fails");
+        } else {
+            std::fs::remove_file(&mark).expect("the call exits as its cat did");
+        }
+    }
+
+    /// One run's calls in the cell, each printing what its verb's wire holds: its lint and,
+    /// where `check`, its all-targets pass, the workspace's members `members`; then its row's
+    /// `outcome` closes the cell's note or not ([`close_passed`]), and the run keeps its record
+    /// ([`crate::disk::keep_used`]).
+    fn ran(
+        &self,
+        check: bool,
+        outcome: &CellOutcome,
+        members: &BTreeSet<String>,
+    ) -> (Ctx, Vec<crate::disk::KeptDir>) {
+        let ctx = cell_run(self.scratch.path());
+        let cwd = ctx.scratch.join(format!("cells-{}", self.cell.name));
+        let cargo = CellCargo {
+            ctx: &ctx,
+            triple: &self.cell.triple,
+            toolchain: &self.toolchain,
+            cwd: &cwd,
+            target_dir: &self.dir,
+            shim_args: &[],
+        };
+        let mut calls = Vec::new();
+        let built = [aterm_uds::runs::canonical(&self.dir)];
+        let lint = cargo.lint(&lint_packages(&self.cell, &[]));
+        cargo_call(&ctx, &mut calls, LINT_CALL, &lint, members, &built);
+        if check {
+            let all = cargo.all_targets(&[]);
+            cargo_call(&ctx, &mut calls, ALL_TARGETS_CALL, &all, members, &built);
+        }
+        close_passed(&ctx, &self.cell, outcome);
+        let kept = crate::disk::keep_used(&ctx);
+        (ctx, kept)
+    }
+
+    /// The record at the top of the cell's directory.
+    fn record(&self) -> atpkg::build_cache::stale::Kept {
+        let bytes = std::fs::read(self.dir.join(atpkg::build_cache::stale::USED)).expect("kept");
+        atpkg::build_cache::stale::Kept::decode(&bytes).expect("a record")
+    }
+
+    /// How many stages a trim left in the cell's directory.
+    fn stages(&self) -> usize {
+        std::fs::read_dir(&self.dir)
+            .expect("the cell's directory")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cargo-build.removing")
+            })
+            .count()
+    }
+}
+
+/// The run's end trim of what the run of `ctx` kept (`crate::disk::trim_used_with`,
+/// `atpkg::build_cache::trim_run_end`), its process probe inert (no fixture reads the person's
+/// processes): what it said, and what the cache's entry took of each directory it trimmed.
+#[cfg(unix)]
+fn cell_trim(
+    ctx: &Ctx,
+    kept: &[crate::disk::KeptDir],
+) -> (Vec<String>, Vec<atpkg::build_cache::Trimmed>) {
+    let took = std::cell::RefCell::new(Vec::new());
+    let said = crate::disk::trim_used_with(ctx, kept, &|dir| {
+        let trimmed = atpkg::build_cache::trim_run_end_with_processes(
+            dir,
+            std::time::SystemTime::now(),
+            &|| true,
+            &|_, _| Ok(aterm_uds::holders::PathScan::default()),
+        );
+        took.borrow_mut().push(trimmed.clone());
+        trimmed
+    });
+    (said, took.into_inner())
+}
+
+/// How many units the trim took as superseded ones.
+#[cfg(unix)]
+fn superseded(trimmed: &atpkg::build_cache::Trimmed) -> usize {
+    trimmed
+        .went
+        .iter()
+        .map(|(_, why)| match why {
+            atpkg::build_cache::Unused::Stale { superseded, .. } => *superseded,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A CELL KEEPS THE UNITS ITS CALLS USED, AND ITS RUN'S END TRIMS WHAT THEY REPLACED
+/// ([`cargo_call`], [`close_passed`], `crate::disk::keep_used`, `crate::disk::trim_used`): in a
+/// linux-arm cell's directory as the stock pin's cargo leaves it (the classic layout, its
+/// fingerprints naming a stock rustc, its `.rustc_info.json` a rustup sysroot), a first run whose
+/// lint and all-targets pass passed keeps, at the cell directory's top and not the main lane's,
+/// the units each reported in its own profile and the member it built, and retires nothing, so
+/// nothing is surveyed or taken; a second run of the same checks that used newer units retires
+/// the three the first alone used, and once no build holds the cell's locks its trim takes the
+/// two of the workspace's own (the lint's and the test's), an hour old, says the bytes that went,
+/// and leaves every unit the run used, the dependency's retired unit, the locks,
+/// `.rustc_info.json` and the record, with no stage; a third run alike retires and takes nothing.
+/// A stock pin's units are judged as Trust's by construction, and no unit here stands for it: a
+/// run's end reads no compiler store (`atpkg::build_cache::trim_run_end`), so its old-compiler
+/// rule takes nothing of either. NEGATIVE CONTROLS: a cell whose row did not pass (it failed,
+/// could not run, was not selected or was skipped) though both its calls passed, one whose
+/// all-targets call reported all it used and that its build finished and then exited 1, and one
+/// whose all-targets call was cut short before cargo said its build finished keep nothing,
+/// before any record and beside one, whose bytes stay; and while another run's cargo holds a
+/// lock of one of the cell's profiles (two runs in one checkout), the trim takes nothing in any
+/// profile and says that its Cargo locks could not all be taken. Without the note in
+/// [`cargo_call`] nothing is kept and the first run's assertions fail; a close in
+/// [`close_passed`] whatever the row fails the first control; a call read as passed by its exit
+/// alone fails the third, and one read by cargo's last message alone the second. That
+/// [`check_cell`] and `run_prepared` make these calls is held by
+/// `prerequisite_tests::a_checked_cell_keeps_what_its_calls_used_and_a_failed_one_keeps_nothing`.
+#[cfg(unix)]
+#[test]
+fn a_cell_keeps_the_units_it_used_and_its_run_end_trims_what_it_replaced() {
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const RELEASE: &str = "aarch64-unknown-linux-gnu/release";
+    const DEBUG: &str = "aarch64-unknown-linux-gnu/debug";
+    // What a trim says where a build holds a lock of the directory (`KeepReason::CargoLocks`).
+    const LOCKS_HELD: &str = "its Cargo locks could not all be taken";
+    let lint_old = Laid::grid(RELEASE, "lib-aterm_grid", "1111111111111111", false);
+    let lint_new = Laid::grid(RELEASE, "lib-aterm_grid", "2222222222222222", false);
+    let old = Laid::grid(DEBUG, "test-lib-aterm_grid", "3333333333333333", true);
+    let new = Laid::grid(DEBUG, "test-lib-aterm_grid", "4444444444444444", true);
+    let both = Laid::grid(DEBUG, "test-lib-aterm_grid", "5555555555555555", true);
+    let dep_old = Laid::memchr(DEBUG, "6666666666666666");
+    let dep_new = Laid::memchr(DEBUG, "7777777777777777");
+    let build = CellBuild::new("linux-arm");
+    build.lay(&lint_old, STOCK_RUSTC, 64 << 10, HOUR);
+    build.lay(&old, STOCK_RUSTC, 64 << 10, HOUR);
+    build.lay(&dep_old, STOCK_RUSTC, 1 << 10, HOUR);
+    for unit in [&lint_new, &new, &both, &dep_new] {
+        build.lay(unit, STOCK_RUSTC, 1 << 10, 5 * DAY);
+    }
+    let rustc_info = build.dir.join(".rustc_info.json");
+    std::fs::write(
+        &rustc_info,
+        aterm_json::json!({
+            "rustc_fingerprint": STOCK_RUSTC,
+            "outputs": {
+                "1": {
+                    "success": true,
+                    "status": "",
+                    "code": 0,
+                    "stdout": "/home/h/.rustup/toolchains/1.97.1-aarch64-apple-darwin\n",
+                    "stderr": "",
+                },
+            },
+            "successes": {},
+        })
+        .to_string(),
+    )
+    .expect("cargo's record of the compiler");
+    let members = BTreeSet::from(["aterm-grid".to_owned()]);
+    let passed = CellOutcome::Checked("1/1 own crates linted".to_owned());
+    let not_passed = [
+        CellOutcome::Failed {
+            status: "WARNING(1)".to_owned(),
+            detail: Vec::new(),
+        },
+        CellOutcome::CouldNotRun {
+            status: "COULD-NOT-RUN".to_owned(),
+            detail: Vec::new(),
+        },
+        CellOutcome::Unselected,
+        CellOutcome::Skipped {
+            why: "a fixture's".to_owned(),
+            fix: "none".to_owned(),
+        },
+    ];
+    let record = build.dir.join(atpkg::build_cache::stale::USED);
+    // Each a run that keeps nothing: its row did not pass though both its calls passed; its
+    // all-targets call printed all it used and that its build finished, then exited 1; that call
+    // was cut short before cargo said its build finished.
+    let keeps_nothing = |lint: &[Laid], check: &[Laid]| {
+        build.wire("clippy", lint, true);
+        build.wire("check", check, true);
+        for outcome in &not_passed {
+            let (_, kept) = build.ran(true, outcome, &members);
+            assert!(kept.is_empty(), "its row is {outcome:?}: {kept:?}");
+        }
+        build.fail("check", true);
+        let (_, kept) = build.ran(true, &passed, &members);
+        assert!(kept.is_empty(), "its all-targets call exited 1: {kept:?}");
+        build.fail("check", false);
+        build.wire("check", check, false);
+        let (_, kept) = build.ran(true, &passed, &members);
+        assert!(
+            kept.is_empty(),
+            "its all-targets call was cut short: {kept:?}"
+        );
+    };
+    keeps_nothing(&[lint_old], &[old, both, dep_old]);
+    assert!(!record.exists());
+
+    build.wire("clippy", &[lint_old], true);
+    build.wire("check", &[old, both, dep_old], true);
+    let (ctx, kept) = build.ran(true, &passed, &members);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        (&kept[0].of, kept[0].dir.as_path(), kept[0].retired),
+        (
+            &crate::disk::Dir::Side(build.dir.clone()),
+            build.dir.as_path(),
+            0
+        ),
+        "{kept:?}"
+    );
+    assert!(kept[0].bound.is_some(), "{kept:?}");
+    let hashes = |units: &[Laid]| -> BTreeSet<String> {
+        units.iter().map(|unit| unit.hash.to_owned()).collect()
+    };
+    let first = build.record();
+    let run = &first.runs[&crate::disk::run_key(&ctx)];
+    assert_eq!(
+        run.profiles,
+        BTreeMap::from([
+            (RELEASE.to_owned(), hashes(&[lint_old])),
+            (DEBUG.to_owned(), hashes(&[old, both, dep_old])),
+        ])
+    );
+    assert_eq!(run.members, members);
+    assert!(
+        !build.leaf().join(atpkg::build_cache::stale::USED).exists(),
+        "the main lane's record is not the cell's"
+    );
+    let (said, took) = cell_trim(&ctx, &kept);
+    assert_eq!(said, Vec::<String>::new());
+    assert_eq!(
+        took,
+        vec![atpkg::build_cache::Trimmed::default()],
+        "nothing retired: nothing is surveyed or taken"
+    );
+    assert!(
+        build.stands(&lint_new) && build.stands(&new),
+        "a unit no run used waits for a retirement"
+    );
+
+    let bytes = std::fs::read(&record).expect("kept");
+    keeps_nothing(&[lint_new], &[new, both, dep_new]);
+    assert_eq!(std::fs::read(&record).expect("kept"), bytes);
+
+    build.wire("clippy", &[lint_new], true);
+    build.wire("check", &[new, both, dep_new], true);
+    let (ctx, kept) = build.ran(true, &passed, &members);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].retired, 3, "{kept:?}");
+    // Another run's cargo builds in the cell: it holds one profile's lock.
+    let held = aterm_toolchain::record_lock::RecordLock::try_lock(
+        std::fs::File::open(build.dir.join(DEBUG).join(".cargo-lock")).expect("cargo's lock"),
+        0,
+    )
+    .expect("held");
+    let (said, took) = cell_trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].contains("3 retired unit(s)") && said[0].contains(LOCKS_HELD),
+        "{said:?}"
+    );
+    assert_eq!(took.len(), 1, "{took:?}");
+    assert!(took[0].went.is_empty() && took[0].freed == 0, "{took:?}");
+    assert_eq!(took[0].kept.as_deref(), Some(LOCKS_HELD), "{took:?}");
+    for unit in [lint_old, lint_new, old, new, both, dep_old, dep_new] {
+        assert!(
+            build.stands(&unit),
+            "{unit:?}: a build holds a lock of the cell"
+        );
+    }
+    assert_eq!(build.stages(), 0);
+    drop(held);
+
+    let (said, took) = cell_trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(took.len(), 1, "{took:?}");
+    assert_eq!(superseded(&took[0]), 2, "{took:?}");
+    assert!(
+        took[0].freed >= 128 << 10 && took[0].kept.is_none(),
+        "{took:?}"
+    );
+    assert!(
+        said[0].contains(&atpkg::admit_disk::size(took[0].freed)),
+        "the line says the bytes that went: {said:?}"
+    );
+    for unit in [lint_old, old] {
+        assert!(build.gone(&unit), "{unit:?}: retired and replaced");
+    }
+    for unit in [lint_new, new, both, dep_old, dep_new] {
+        assert!(build.stands(&unit), "{unit:?}");
+    }
+    for profile in [RELEASE, DEBUG] {
+        for lock in [".cargo-lock", ".cargo-build-lock"] {
+            assert!(
+                build.dir.join(profile).join(lock).is_file(),
+                "{profile}/{lock}"
+            );
+        }
+    }
+    assert!(record.is_file() && rustc_info.is_file());
+    assert_eq!(build.stages(), 0);
+
+    let (ctx, kept) = build.ran(true, &passed, &members);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].retired, 0, "{kept:?}");
+    let (said, took) = cell_trim(&ctx, &kept);
+    assert_eq!(said, Vec::<String>::new());
+    assert_eq!(
+        took,
+        vec![atpkg::build_cache::Trimmed::default()],
+        "an identical run takes nothing"
+    );
+}
+
+/// A LINT-ONLY CELL COUNTS THE CRATES ITS LINT BUILT AS ITS OWN ([`cargo_call`],
+/// `crate::disk::note_call_owning`): a mac-x64 cell, which a pulled run only lints, builds no
+/// test, so its record names as the workspace's own the member its lint built (`members`); a
+/// second run that used newer units retires the two the first alone used, and its trim takes the
+/// member's, an hour old, and leaves the dependency's. NEGATIVE CONTROL: the same runs noted with
+/// no member names (as a call noted without them is) keep a record that names no member of the
+/// workspace, so the trim takes nothing and says the retired units were not trimmed.
+#[cfg(unix)]
+#[test]
+fn a_lint_only_cell_counts_the_crates_its_lint_built_as_its_own() {
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const RELEASE: &str = "x86_64-apple-darwin/release";
+    let lint_old = Laid::grid(RELEASE, "lib-aterm_grid", "1111111111111111", false);
+    let lint_new = Laid::grid(RELEASE, "lib-aterm_grid", "2222222222222222", false);
+    let dep_old = Laid::memchr(RELEASE, "3333333333333333");
+    let dep_new = Laid::memchr(RELEASE, "4444444444444444");
+    let passed = CellOutcome::Checked("1/1 own crates linted".to_owned());
+    let trimmed = |members: BTreeSet<String>| {
+        let build = CellBuild::new("mac-x64");
+        build.lay(&lint_old, STOCK_RUSTC, 64 << 10, HOUR);
+        build.lay(&dep_old, STOCK_RUSTC, 1 << 10, HOUR);
+        for unit in [&lint_new, &dep_new] {
+            build.lay(unit, STOCK_RUSTC, 1 << 10, 5 * DAY);
+        }
+        build.wire("clippy", &[lint_old, dep_old], true);
+        let (_, kept) = build.ran(false, &passed, &members);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].retired, 0, "{kept:?}");
+        build.wire("clippy", &[lint_new, dep_new], true);
+        let (ctx, kept) = build.ran(false, &passed, &members);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].retired, 2, "{kept:?}");
+        assert_eq!(
+            build.record().runs[&crate::disk::run_key(&ctx)].members,
+            members
+        );
+        let (said, took) = cell_trim(&ctx, &kept);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(took.len(), 1, "{took:?}");
+        (build, said, took)
+    };
+
+    let (build, said, took) = trimmed(BTreeSet::from(["aterm-grid".to_owned()]));
+    assert_eq!(superseded(&took[0]), 1, "{took:?}");
+    assert!(took[0].kept.is_none(), "{took:?}");
+    assert!(said[0].contains("trimmed 1 unit(s)"), "{said:?}");
+    assert!(build.gone(&lint_old), "the member's retired unit went");
+    for unit in [lint_new, dep_old, dep_new] {
+        assert!(build.stands(&unit), "{unit:?}");
+    }
+
+    let (build, said, took) = trimmed(BTreeSet::new());
+    assert_eq!(superseded(&took[0]), 0, "{took:?}");
+    assert!(took[0].kept.is_some(), "{took:?}");
+    assert!(
+        said[0].contains("2 retired unit(s)") && said[0].contains("were not trimmed"),
+        "{said:?}"
+    );
+    for unit in [lint_old, lint_new, dep_old, dep_new] {
+        assert!(build.stands(&unit), "{unit:?}");
+    }
+}

@@ -1364,7 +1364,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         .filter(|l| {
             l.split(' ')
                 .next()
-                .is_some_and(aterm_types::tab_id::is_tab_id)
+                .is_some_and(aterm_types::control_verbs::is_minted_sid)
         })
         .collect();
     let shown = survey_shown(&text, &asked_said);

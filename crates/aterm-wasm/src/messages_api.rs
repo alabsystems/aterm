@@ -429,17 +429,22 @@ impl WebBand {
     fn log_since(&self, cursor: u64) -> String {
         let end = self.journal_first.saturating_add(self.journal.len() as u64);
         let from = cursor.min(end);
-        let mut lines = Vec::new();
-        if from < self.journal_first {
+        let dropped = if from < self.journal_first {
             let count = u32::try_from(self.journal_first - from).unwrap_or(u32::MAX);
-            lines.push(LogLine::Dropped { count }.encode());
-        }
+            Some(LogLine::Dropped { count }.encode())
+        } else {
+            None
+        };
         let skip = usize::try_from(from.saturating_sub(self.journal_first)).unwrap_or(usize::MAX);
-        lines.extend(self.journal.iter().skip(skip).cloned());
-        let mut out = format!("OK {end} {}", lines.len());
-        for line in lines {
+        let count = self.journal.len().saturating_sub(skip) + usize::from(dropped.is_some());
+        let mut out = format!("OK {end} {count}");
+        if let Some(line) = dropped {
             out.push('\n');
             out.push_str(&line);
+        }
+        for line in self.journal.iter().skip(skip) {
+            out.push('\n');
+            out.push_str(line);
         }
         out
     }
@@ -1093,3 +1098,7 @@ web_terminal_impl!(bind);
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "messages_api_own_tests.rs"]
 mod tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "messages_log_tests.rs"]
+mod log_tests;

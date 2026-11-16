@@ -96,11 +96,20 @@ fn found(message: &[u8], pid: i32, sequence: i32) -> Option<Result<Found, i32>> 
     )
 }
 
-/// One lookup of `to` written as message type `kind` and nothing else: its sequence, and the
-/// routing table's word ([`table_word`]).
+/// One lookup of `to` written as message type `kind` ([`lookup_write_as`]: on this kernel, which
+/// takes the silent type, nothing else): the number it was written as (0 where its write failed),
+/// and the routing table's word ([`table_word`]).
 fn ask(to: IpAddr, kind: u8) -> (i32, Option<Option<Found>>) {
-    let sequence = route_get_sequence();
-    let asked = route_get_as(to, None, sequence, |write| write(kind), found);
+    let mut sequence = 0;
+    let asked = route_get_as(
+        to,
+        None,
+        |request, write| {
+            sequence = lookup_write_as(kind == RTM_GET, request, write)?;
+            Ok(sequence)
+        },
+        found,
+    );
     (sequence, table_word(asked))
 }
 
@@ -205,14 +214,14 @@ fn a_kernel_that_refuses_the_silent_type_is_asked_with_rtm_get_from_then_on() {
             let asked = route_get_as(
                 to,
                 None,
-                route_get_sequence(),
-                |write| {
-                    lookup_write_latched(&refused, |kind| {
+                |request, write| {
+                    lookup_write_latched(&refused, request, |bytes| {
+                        let kind = bytes[std::mem::offset_of!(RtMsghdr, rtm_type)];
                         written.borrow_mut().push(kind);
                         if kind == RTM_GET_SILENT {
                             return Err(refusal(errno));
                         }
-                        write(kind)
+                        write(bytes)
                     })
                 },
                 found,
@@ -230,10 +239,11 @@ fn a_kernel_that_refuses_the_silent_type_is_asked_with_rtm_get_from_then_on() {
         );
     }
 
+    let kind_of = |bytes: &[u8]| bytes[std::mem::offset_of!(RtMsghdr, rtm_type)];
     let refused = AtomicBool::new(false);
     let mut written = Vec::new();
-    let outcome = lookup_write_latched(&refused, |kind| {
-        written.push(kind);
+    let outcome = lookup_write_latched(&refused, &mut route_get_request(to, None), |bytes| {
+        written.push(kind_of(bytes));
         Err(refusal(libc::ESRCH))
     });
     assert_eq!(outcome.unwrap_err().raw_os_error(), Some(libc::ESRCH));
@@ -245,8 +255,8 @@ fn a_kernel_that_refuses_the_silent_type_is_asked_with_rtm_get_from_then_on() {
     assert!(!refused.load(Relaxed), "and latches nothing");
 
     let mut written = Vec::new();
-    let outcome = lookup_write_latched(&refused, |kind| {
-        written.push(kind);
+    let outcome = lookup_write_latched(&refused, &mut route_get_request(to, None), |bytes| {
+        written.push(kind_of(bytes));
         Err(refusal(libc::EINVAL))
     });
     assert_eq!(outcome.unwrap_err().raw_os_error(), Some(libc::EINVAL));
@@ -259,9 +269,9 @@ fn a_kernel_that_refuses_the_silent_type_is_asked_with_rtm_get_from_then_on() {
     // The kernel's own "no route" in place of a refusal on the second write still latches: the
     // kernel took the type RTM_GET and refused only the silent one.
     let mut written = Vec::new();
-    let outcome = lookup_write_latched(&refused, |kind| {
-        written.push(kind);
-        Err(refusal(if kind == RTM_GET_SILENT {
+    let outcome = lookup_write_latched(&refused, &mut route_get_request(to, None), |bytes| {
+        written.push(kind_of(bytes));
+        Err(refusal(if kind_of(bytes) == RTM_GET_SILENT {
             libc::EPERM
         } else {
             libc::ESRCH
@@ -270,6 +280,92 @@ fn a_kernel_that_refuses_the_silent_type_is_asked_with_rtm_get_from_then_on() {
     assert_eq!(outcome.unwrap_err().raw_os_error(), Some(libc::ESRCH));
     assert_eq!(written, [RTM_GET_SILENT, RTM_GET]);
     assert!(refused.load(Relaxed));
+}
+
+/// [`lookup_write`] is the one place a lookup of the process gets its number and its type, so
+/// this crate's lookups and aterm-net's, which write through it alike, never share a number: a
+/// lookup as built carries neither; the bytes written carry the number the writer returns, both
+/// writes of a fallen-back lookup the same one, differing in their type alone; each lookup's
+/// number is a new one of the process's one counter, which rises strictly between draws made
+/// beside it; a live ask is read by the number its bytes carried; and a message too short to
+/// carry a number is written nowhere.
+///
+/// MUTANT (each named by the assert it fails): `lookup_write_latched` leaving `rtm_seq` as built
+/// (`"the bytes carry the number returned"`); drawing its number from a counter of its own in
+/// place of [`lookup_sequence`] (`"one counter"`); `route_get_as` reading the answer by a number
+/// other than the one `send` returned (`"read by the number it was written as"`, after the
+/// one-minute hang detector).
+#[test]
+fn every_lookup_is_numbered_and_typed_by_the_one_writer() {
+    use std::sync::atomic::AtomicBool;
+    let type_at = std::mem::offset_of!(RtMsghdr, rtm_type);
+    let number_of = |bytes: &[u8]| head_i32(bytes, std::mem::offset_of!(RtMsghdr, rtm_seq));
+    let built = route_get_request(Ipv4Addr::LOCALHOST.into(), None);
+    assert_eq!((built[type_at], number_of(&built)), (0, 0), "as built");
+
+    let mut written = Vec::new();
+    let number = lookup_write_latched(&AtomicBool::new(false), &mut built.clone(), |bytes| {
+        written.push(bytes.to_vec());
+        if bytes[type_at] == RTM_GET_SILENT {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(())
+    })
+    .expect("the plain write");
+    assert_eq!(
+        written
+            .iter()
+            .map(|bytes| (bytes[type_at], number_of(bytes)))
+            .collect::<Vec<_>>(),
+        [(RTM_GET_SILENT, number), (RTM_GET, number)],
+        "the bytes carry the number returned"
+    );
+    let (silent, plain) = (&written[0], &written[1]);
+    assert_eq!(
+        (&silent[..type_at], &silent[type_at + 1..]),
+        (&plain[..type_at], &plain[type_at + 1..]),
+        "the two writes differ in their type alone"
+    );
+    let at = std::mem::offset_of!(RtMsghdr, rtm_seq);
+    let mut unnumbered = plain.clone();
+    unnumbered[type_at] = 0;
+    unnumbered[at..at + 4].fill(0);
+    assert_eq!(unnumbered, built, "and are otherwise the lookup as built");
+
+    let mut taken = Vec::new();
+    for _ in 0..64 {
+        taken.push(lookup_sequence());
+        taken.push(lookup_write_as(true, &mut built.clone(), |_| Ok(())).expect("written"));
+    }
+    assert!(taken.is_sorted_by(|a, b| a < b), "one counter: {taken:?}");
+
+    let (mut carried, mut returned) = (Vec::new(), 0);
+    let asked = route_get_as(
+        Ipv4Addr::LOCALHOST.into(),
+        None,
+        |request, write| {
+            returned = lookup_write_as(true, request, |bytes| {
+                carried.push(number_of(bytes));
+                write(bytes)
+            })?;
+            Ok(returned)
+        },
+        found,
+    );
+    assert!(
+        matches!(table_word(asked), Some(Some(_))),
+        "loopback's route, read by the number it was written as"
+    );
+    assert_eq!(carried, [returned]);
+
+    let mut short = vec![0u8; std::mem::size_of::<RtMsghdr>() - 1];
+    let refused = lookup_write_latched(&AtomicBool::new(false), &mut short, |_| {
+        panic!("a message too short for its head is written nowhere")
+    });
+    assert_eq!(
+        refused.map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::InvalidInput)
+    );
 }
 
 /// Asking whether a route takes an IPv6 destination is heard by nobody: after

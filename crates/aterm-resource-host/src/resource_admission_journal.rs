@@ -99,12 +99,11 @@ fn exists(path: &std::path::Path) -> io::Result<bool> {
     }
 }
 fn name(binding: &Binding) -> io::Result<String> {
-    let session = &binding.session;
-    if !aterm_types::control_verbs::is_minted_sid(session) {
-        return Err(refused("invalid host attempt session"));
-    }
+    let session = aterm_types::control_request::Sid::parse(&binding.session)
+        .ok_or_else(|| refused("invalid host attempt session"))?;
     Ok(format!(
-        "{session}.{}.json",
+        "{}.{}.json",
+        session.as_str(),
         aterm_codec::hex::encode_lower(&binding.attempt)
     ))
 }

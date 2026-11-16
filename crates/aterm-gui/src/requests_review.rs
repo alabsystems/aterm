@@ -1161,11 +1161,13 @@ fn reply_to<'a>(by: &'a str, node: &'a str) -> Result<To<'a>, &'static str> {
     {
         return if sid == "-" {
             Err("its requester named no session, so no mail reaches it")
-        } else {
+        } else if aterm_types::control_request::Sid::parse(sid).is_some() {
             Ok(To::There { sid, node })
+        } else {
+            Err("its requester names no session")
         };
     }
-    if aterm_types::control_verbs::is_minted_sid(by) {
+    if aterm_types::control_request::Sid::parse(by).is_some() {
         Ok(To::Here(by))
     } else {
         Err("its requester names no session")

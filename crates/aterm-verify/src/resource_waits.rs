@@ -123,12 +123,79 @@ impl Reason {
             "queued before this binary's next resource decision".into(),
         )
     }
+
+    /// The ledger's lock met at every look for `span` since the binary's last decision, by
+    /// `holder` where it wrote its pid ([`LOCK_HELD`]).
+    fn lock_held(holder: Option<u32>, span: Duration) -> Self {
+        let holder = holder.map_or_else(|| "another waiter".to_owned(), |pid| format!("pid {pid}"));
+        Self::new(
+            "ledger",
+            vec!["ledger"],
+            format!(
+                "{holder} holds the ledger's lock: no look has read the ledger for {}",
+                aterm_toolchain::stall::words(span)
+            ),
+        )
+    }
+}
+
+/// How long the looks for a binary may meet only the ledger's lock, from the first of them since
+/// its last decision, before the lock is its reason ([`Wait::Unread`]): a minute.
+pub(super) const LOCK_HELD: Duration = Duration::from_secs(60);
+
+/// WHAT A LOOK FOUND for a binary it did not start ([`Trace::waits`]).
+#[derive(Clone, Debug)]
+pub(super) enum Wait {
+    /// A decision: the binary waits for this reason.
+    For(Reason),
+    /// NO DECISION: the look met another admission's hold of the ledger's lock (that holder,
+    /// where it wrote its pid) and read nothing, so it says nothing of why the binary waits. A
+    /// row keeps its reason across such looks and counts them; once they have gone on for
+    /// [`LOCK_HELD`] from the first of them, with no decision between, the lock is the reason.
+    Unread(Option<u32>),
+}
+
+impl Wait {
+    /// What a ledger look short of `short` found: nothing decided where it met only the
+    /// ledger's lock ([`aterm_capacity::admit::Short::Turn`]); any shortfall it read, an I/O
+    /// fault of the ledger among them, is a reason.
+    pub(super) fn ledger(short: &aterm_capacity::admit::Shortfall) -> Self {
+        use aterm_capacity::admit::Short;
+        match short.shorts[..] {
+            [Short::Turn { holder }, ..]
+                if short
+                    .shorts
+                    .iter()
+                    .all(|short| matches!(short, Short::Turn { .. })) =>
+            {
+                Self::Unread(holder)
+            }
+            _ => Self::For(Reason::ledger(short)),
+        }
+    }
 }
 
 struct Waiting {
     since: Duration,
     first_detail: String,
     reason: Reason,
+    /// When the first look since its last decision that met only the ledger's lock was made,
+    /// where the looks since that decision met only the lock ([`Wait::Unread`]).
+    unread_since: Option<Duration>,
+    /// The looks since it opened that decided nothing ([`Wait::Unread`]).
+    undecided: u64,
+}
+
+impl Waiting {
+    fn opened(reason: Reason, at: Duration) -> Self {
+        Self {
+            since: at,
+            first_detail: reason.detail.clone(),
+            reason,
+            unread_since: None,
+            undecided: 0,
+        }
+    }
 }
 
 struct Closed {
@@ -137,6 +204,8 @@ struct Closed {
     to: Duration,
     first_detail: String,
     reason: Reason,
+    /// The looks it saw that decided nothing.
+    undecided: u64,
 }
 
 struct Book(Vec<Option<Waiting>>);
@@ -148,37 +217,57 @@ impl Book {
             let Some(slot) = rows.get_mut(b.index) else {
                 continue;
             };
-            let reason = Reason::ordered();
-            *slot = Some(Waiting {
-                since: Duration::ZERO,
-                first_detail: reason.detail.clone(),
-                reason,
-            });
+            *slot = Some(Waiting::opened(Reason::ordered(), Duration::ZERO));
         }
         Self(rows)
     }
 
+    /// Row `index` at `at`: `next` its reason from now on, or none (closed). A reason of the class
+    /// it has updates its detail; any other closes it and opens one.
     fn change(&mut self, index: usize, next: Option<Reason>, at: Duration) -> Option<Closed> {
         let slot = self.0.get_mut(index)?;
         if let (Some(current), Some(next)) = (slot.as_mut(), next.as_ref())
             && current.reason.classification() == next.classification()
         {
             current.reason.detail.clone_from(&next.detail);
+            current.unread_since = None;
             return None;
         }
         let previous = slot.take();
-        *slot = next.map(|reason| Waiting {
-            since: at,
-            first_detail: reason.detail.clone(),
-            reason,
-        });
+        *slot = next.map(|reason| Waiting::opened(reason, at));
         previous.map(|previous| Closed {
             index,
             from: previous.since,
             to: at,
             first_detail: previous.first_detail,
             reason: previous.reason,
+            undecided: previous.undecided,
         })
+    }
+
+    /// What a look at `at` found for the binary of row `index`: a reason is a decision
+    /// ([`Self::change`]); a look that met only the ledger's lock leaves the row as it is and
+    /// is counted in it, until such looks have gone on for [`LOCK_HELD`] from the first of them
+    /// since its last decision, when the lock is its reason. The lock's span runs on from that
+    /// first look while the looks meet only the lock. A closed row stays closed.
+    fn wait(&mut self, index: usize, wait: Wait, at: Duration) -> Option<Closed> {
+        match wait {
+            Wait::For(reason) => self.change(index, Some(reason), at),
+            Wait::Unread(holder) => {
+                let row = self.0.get_mut(index)?.as_mut()?;
+                let first = *row.unread_since.get_or_insert(at);
+                let unread = at.saturating_sub(first);
+                if unread < LOCK_HELD {
+                    row.undecided = row.undecided.saturating_add(1);
+                    return None;
+                }
+                let closed = self.change(index, Some(Reason::lock_held(holder, unread)), at);
+                if let Some(row) = self.0.get_mut(index).and_then(Option::as_mut) {
+                    row.unread_since = Some(first);
+                }
+                closed
+            }
+        }
     }
 }
 
@@ -211,13 +300,8 @@ impl<'a> Trace<'a> {
 
     pub(super) fn probe(ctx: &'a crate::Ctx, bins: &'a [Binary], index: usize) -> Self {
         let began = Instant::now();
-        let reason = Reason::ordered();
         let mut rows: Vec<_> = (0..bins.len()).map(|_| None).collect();
-        rows[index] = Some(Waiting {
-            since: Duration::ZERO,
-            first_detail: reason.detail.clone(),
-            reason,
-        });
+        rows[index] = Some(Waiting::opened(Reason::ordered(), Duration::ZERO));
         Self {
             ctx: Some(ctx),
             bins,
@@ -230,13 +314,46 @@ impl<'a> Trace<'a> {
         }
     }
 
-    pub(super) fn change(&self, index: usize, next: Option<Reason>) {
-        let Some(ctx) = self.ctx else { return };
+    /// A look did not start binary `index`, having found `wait` ([`Book::wait`]).
+    pub(super) fn waits(&self, index: usize, wait: Wait) {
+        self.waits_at(index, wait, self.began.elapsed());
+    }
+
+    /// [`Self::waits`] at `at` since the trace began.
+    fn waits_at(&self, index: usize, wait: Wait, at: Duration) {
+        if self.ctx.is_none() {
+            return;
+        }
         let row = self
             .book
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .change(index, next, self.began.elapsed());
+            .wait(index, wait, at);
+        self.closed(row);
+    }
+
+    /// Binary `index` left the queue: its permit came back, granted or refused (a run its
+    /// pool paid no tokens for). Its wait ends.
+    pub(super) fn started(&self, index: usize) {
+        self.started_at(index, self.began.elapsed());
+    }
+
+    /// [`Self::started`] at `at` since the trace began.
+    fn started_at(&self, index: usize, at: Duration) {
+        if self.ctx.is_none() {
+            return;
+        }
+        let row = self
+            .book
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .change(index, None, at);
+        self.closed(row);
+    }
+
+    /// Write the event of a row that closed, with the looks it saw that decided nothing.
+    fn closed(&self, row: Option<Closed>) {
+        let Some(ctx) = self.ctx else { return };
         if let Some(row) = row {
             let stamp = |offset: Duration| {
                 self.epoch_ms.map(|base| {
@@ -254,6 +371,7 @@ impl<'a> Trace<'a> {
                     "started_at_unix_ms":stamp(row.from),"ended_at_unix_ms":stamp(row.to),
                     "waiting_s":row.to.saturating_sub(row.from).as_secs_f64(),
                     "first_detail":detail(&row.first_detail),"last_detail":detail(&row.reason.detail),
+                    "undecided_looks":row.undecided,
                     "bounds":"resource decisions; availability may change between looks",
                 }),
             );
@@ -275,7 +393,7 @@ impl<'a> Trace<'a> {
             .filter_map(|(index, row)| row.as_ref().map(|_| index))
             .collect();
         for index in pending {
-            self.change(index, None);
+            self.started(index);
         }
     }
 }
@@ -310,11 +428,7 @@ impl UnitTrace {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .and_then(|d| u64::try_from(d.as_millis()).ok()),
-            book: Book(vec![Some(Waiting {
-                since: Duration::ZERO,
-                first_detail: reason.detail.clone(),
-                reason,
-            })]),
+            book: Book(vec![Some(Waiting::opened(reason, Duration::ZERO))]),
         }
     }
 

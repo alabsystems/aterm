@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them and stamp each one's seal ([`aterm_census::seal`]).
+//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them and stamp each one's seal ([`aterm_seal`]).
 //!
 //! Native cells and cross cells with actual std/core in the selected Trust
 //! sysroot are documented and probed under Trust. Remaining cells need a stock
@@ -31,7 +31,7 @@ use crate::verdict::CouldNotRun;
 /// The reference libc's version, in the rustdoc dumps' names.
 pub const REFERENCE_VERSION: &str = "0.2.191";
 
-/// The generator each module's seal line names ([`aterm_census::seal`]).
+/// The generator each module's seal line names ([`aterm_seal`]).
 pub const GENERATOR: &str = "`aterm-libc-oracle regen`";
 
 /// Where and how to regenerate.
@@ -76,12 +76,7 @@ impl From<CouldNotRun> for Stop {
 
 fn io(what: &str, path: &Path) -> impl FnOnce(std::io::Error) -> Stop {
     let what = format!("{what} {}", path.display());
-    move |e| {
-        Stop::CouldNotRun(CouldNotRun::new(
-            format!("{what}: {e}"),
-            "free disk space and rerun",
-        ))
-    }
+    move |e| Stop::CouldNotRun(CouldNotRun::new(format!("{what}: {e}"), "rerun"))
 }
 
 /// The compiler for one cell: Trust with matching target libraries, else stock.
@@ -219,7 +214,7 @@ impl Reference {
                     "the disk filled during {what}:\n{}",
                     tail(&outcome.stderr, 5)
                 ),
-                "free disk space and rerun",
+                "rerun",
             )));
         }
         if outcome.locked_failure() == Some(LockedFailure::NotDownloaded) {
@@ -483,7 +478,7 @@ fn format(trust: &Trust, files: &[PathBuf]) -> Result<(), Stop> {
 fn seal(files: &[PathBuf]) -> Result<(), Stop> {
     for path in files {
         let text = crate::read_regular_text(path).map_err(io("reading", path))?;
-        let sealed = aterm_census::seal::stamp(&text)
+        let sealed = aterm_seal::stamp(&text)
             .map_err(|e| Stop::Failed(format!("{}: {e}", path.display())))?;
         crate::write_fresh(path, sealed).map_err(io("writing", path))?;
     }

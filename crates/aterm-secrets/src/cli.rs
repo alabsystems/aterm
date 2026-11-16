@@ -15,7 +15,13 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
 
   aterm secrets [status [--json]]        this machine's vault, join code, membership,
                                          secrets, subscriber and server, and on an admin
-                                         whether the approver runs
+                                         whether the approver runs; `log:` is the membership
+                                         log's bytes of its 64 MiB bound, the classes of write
+                                         it refuses (automatic from 56 MiB, a person's from
+                                         60 MiB; a removal, an admission and a delete to the
+                                         bound), the bytes signed in 24 hours with the two
+                                         Macs that signed most, and the time to the bound at
+                                         that rate (`unread` where not measured)
   aterm secrets repair [--json]         migrate outdated managed vault services to this installed
                                          release, with their arguments, health checks and rollback;
                                          explicit pins and off records remain in force
@@ -1007,6 +1013,20 @@ impl ServeRole {
     ) -> (Option<String>, Option<String>) {
         let holds = crate::server::holds_alab(store);
         before_observation();
+        self.decide_holding(advertise, holds, paths, pins, alab_key)
+    }
+
+    /// [`Self::decide`] for a running server, which says whether it holds the ALab vault
+    /// (`holds`, [`crate::server::RoleDecider`]) from what it serves rather than from a read of
+    /// its store file, read before this Mac's role is observed as [`Self::decide`] reads it.
+    pub(crate) fn decide_holding(
+        &mut self,
+        advertise: &Advertise,
+        holds: bool,
+        paths: &crate::client::Paths,
+        pins: &mut Vec<(String, [u8; 32])>,
+        alab_key: Option<[u8; 32]>,
+    ) -> (Option<String>, Option<String>) {
         // Fallback and eligibility must use one observation. In particular, an older ALab
         // config read cannot make a later missing-config observation a standalone server.
         let observation = crate::client::observe_alab_role(paths);
@@ -2730,6 +2750,12 @@ mod unix {
             for line in writes_lines(paths) {
                 println!("{line}");
             }
+            // How full the membership log is, and which classes of write it still takes.
+            match client::log_fill(paths) {
+                Ok(Some(fill)) => println!("{}", fill.line()),
+                Ok(None) => {}
+                Err(error) => println!("log: unreadable ({error})"),
+            }
         }
         match client::swarm_lease_holder(paths) {
             Ok(Some(holder)) => println!("vault steward: {holder}"),
@@ -4052,6 +4078,7 @@ mod unix {
             anchor,
             fleet_reads_anchors: fill.fleet_reads_anchors,
             read_as: None,
+            settles: None,
         };
         let by = std::time::Instant::now() + PERSON_WAIT;
         let written = client::member_set(paths, &entry, client::OnBusy::Refuse(by))?;
@@ -4792,12 +4819,13 @@ mod unix {
         }
         let role_decide: Option<crate::server::RoleDecider> =
             (!matches!(advertise_mode, super::Advertise::Off)).then(|| {
-                let store = store.clone();
                 let paths = paths.clone();
-                Box::new(move |pins: &mut Vec<(String, [u8; 32])>| {
-                    role.decide(&advertise_mode, &store, &paths, pins, alab_key)
-                        .0
-                }) as crate::server::RoleDecider
+                Box::new(
+                    move |pins: &mut Vec<(String, [u8; 32])>, holds_alab: bool| {
+                        role.decide_holding(&advertise_mode, holds_alab, &paths, pins, alab_key)
+                            .0
+                    },
+                ) as crate::server::RoleDecider
             });
         super::keep_network_place();
         crate::server::serve_with_role(

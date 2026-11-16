@@ -166,3 +166,109 @@ fn early_wrap_hole_row_reflects_live_row_zero_edits_without_stale_memo() {
         "mutating live row 0's wide opening background must update the early-wrap history row"
     );
 }
+
+/// The viewport's rows, top first, as `visible_row_view` reads them.
+fn viewport_texts(grid: &Grid) -> Vec<String> {
+    (0..grid.rows()).map(|r| row_text(grid, r)).collect()
+}
+
+#[test]
+fn reserving_older_history_keys_rekeys_the_memoized_rows() {
+    // The reserve raises every retained row's key without moving a row: the viewport shows the
+    // same lines, now under keys the memo filled from the rows one line newer.
+    let mut grid = grid_with_history(40);
+    grid.scroll_display(10);
+    let shown = viewport_texts(&grid);
+    let _claim = grid.reserve_older_history_keys(grid.oldest_absolute_row() + 1);
+    assert_eq!(
+        viewport_texts(&grid),
+        shown,
+        "reserving older history keys moved no row, yet the viewport changed"
+    );
+}
+
+#[test]
+fn continuing_the_numbering_rekeys_the_memoized_rows() {
+    // A checkpoint's counter raises every retained row's key without moving a row, as a
+    // reserve does.
+    let mut grid = grid_with_history(40);
+    grid.scroll_display(10);
+    let shown = viewport_texts(&grid);
+    grid.continue_absolute_numbering(grid.absolute_row_counter() + 1);
+    assert_eq!(
+        viewport_texts(&grid),
+        shown,
+        "continuing the numbering from a checkpoint moved no row, yet the viewport changed"
+    );
+}
+
+#[test]
+fn a_reflow_window_cap_drop_puts_the_marker_where_the_dropped_row_was_memoized() {
+    use crate::grid::lazy_buffer::FLOOD_MARKER_PREFIX;
+    use aterm_scrollback::{Scrollback, ScrollbackStorage};
+
+    let (rows, cols) = (4u16, 80u16);
+    let store: ScrollbackStorage = Scrollback::new(64, 512, 64_000_000).into();
+    let mut grid = Grid::with_tiered_scrollback(rows, cols, 16, store);
+    let line = |grid: &mut Grid, text: &str| {
+        grid.set_cursor(rows - 1, 0);
+        for ch in text.chars() {
+            grid.write_char(ch);
+        }
+        grid.line_feed();
+        grid.carriage_return();
+    };
+    for i in 0..100 {
+        line(&mut grid, &format!("H{i}"));
+    }
+    // A width change detaches the store; the window's lines stage until the job reattaches.
+    let _job = grid
+        .resize_offloading_scrollback(rows, cols - 20)
+        .expect("a width change over a tiered store detaches it");
+    for i in 0..=Grid::DETACHED_LAZY_CAP {
+        line(&mut grid, &format!("W{i}"));
+    }
+    // Every viewport row is memoized: the cut's next drop moves the marker one or two keys up
+    // (two when the last of those line feeds opened the cut), onto a row read here either way.
+    grid.scroll_to_top();
+    let shown = viewport_texts(&grid);
+    assert!(
+        shown[0].starts_with(FLOOD_MARKER_PREFIX),
+        "precondition: the cap opened a cut, whose marker is the oldest row ({shown:?})"
+    );
+    assert!(
+        shown[1..]
+            .iter()
+            .all(|text| !text.is_empty() && !text.starts_with(FLOOD_MARKER_PREFIX)),
+        "precondition: staged lines sit under the marker ({shown:?})"
+    );
+
+    // One more line: the cap drops the oldest staged line(s), and the marker now stands on the
+    // absolute row the newest of them held. That key names other text now, so the drop moves
+    // the renumber epoch every absolute-row-keyed cache reads (the find bar's matches and the
+    // cell frame's scratch, not only the memo).
+    let epoch = grid.history_renumber_epoch();
+    line(&mut grid, "LAST");
+    assert!(
+        grid.history_renumber_epoch() > epoch,
+        "a cap drop renumbered a key without moving history_renumber_epoch"
+    );
+    grid.scroll_to_top();
+    let top = row_text(&grid, 0);
+    assert!(
+        top.starts_with(FLOOD_MARKER_PREFIX),
+        "viewport row 0 shows {top:?} where the marker belongs (before the drop: {shown:?})"
+    );
+    assert_ne!(top, shown[0], "the marker names more dropped lines");
+    let d = grid.display_offset();
+    for v in 0..rows {
+        let fresh = grid
+            .materialize_scrollback_row_full(d - 1 - usize::from(v), grid.cols())
+            .expect("every viewport row is a history row");
+        assert_eq!(
+            *history_row(&grid, v),
+            fresh,
+            "viewport row {v} is not what history holds there"
+        );
+    }
+}

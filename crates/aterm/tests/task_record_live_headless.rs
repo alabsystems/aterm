@@ -122,7 +122,14 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
         .lines()
         .find(|l| l.split_whitespace().nth(1) == Some(a.as_str()))
         .unwrap_or_else(|| panic!("a's row: {roster}"));
-    assert!(row.ends_with(" task_state=done task_rev=2"), "{row}");
+    let (head, opened) = row
+        .rsplit_once(" opened_ms=")
+        .unwrap_or_else(|| panic!("opened_ms= last on a's row: {row}"));
+    assert!(head.ends_with(" task_state=done task_rev=2"), "{row}");
+    assert!(
+        !opened.is_empty() && opened.bytes().all(|b| b.is_ascii_digit()),
+        "{row}"
+    );
 }
 
 fn state_root(inst: &Instance) -> std::path::PathBuf {

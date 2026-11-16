@@ -289,7 +289,16 @@ fn each_checkout_digests_its_own_path_and_clone() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let base = dir.path().canonicalize().expect("canonical");
     let git = |root: &Path, args: &[&str]| {
-        crate::judged::git(root, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        let out = aterm_uds::deadline::output_until(
+            crate::git_provider::command().args(args).current_dir(root),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|e| panic!("git {args:?} within the hang detector: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     };
     for clone in ["one", "two"] {
         git(&base, &["init", "-q", clone]);

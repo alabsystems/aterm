@@ -1394,7 +1394,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         "rank":format!("{:?}",claim.record().need.rank),
         "granted":claim.cores(),
         "waiting_s":claim.waited().as_secs_f64(),
-        "asked_at_unix_ms":claim.record().start_ms,
+        "asked_at_unix_ms":claim.record().laid_ms(),
         "admitted_at_unix_ms":claim.record().held.map(|held|held.admitted_ms),
         "machine_cores":aterm_capacity::Reading::now(&root).cores,
         "records":records.iter().map(|r|aterm_json::json!({"pid":r.pid,"what":r.need.what,"requested":r.need.cores,"granted":r.held.map(|h|h.cores),"rank":format!("{:?}",r.need.rank)})).collect::<Vec<_>>()

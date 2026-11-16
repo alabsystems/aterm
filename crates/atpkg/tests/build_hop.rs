@@ -14,7 +14,22 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use aterm_spec::wait::{MUST_HAPPEN, until_within};
+use aterm_spec::wait::{MUST_HAPPEN, until_while_working, until_within};
+
+fn output_while_working(
+    command: &mut aterm_uds::spawnfd::Command,
+    what: &str,
+) -> std::process::Output {
+    let guard = std::time::Instant::now() + aterm_spec::wait::WORKING_GUARD;
+    aterm_uds::deadline::output_from_while_process_progressing_unless(
+        command,
+        aterm_uds::spawnfd::Stdio::null(),
+        MUST_HAPPEN,
+        what,
+        &mut || std::time::Instant::now() >= guard,
+    )
+    .unwrap_or_else(|error| panic!("{what}: {error:?}"))
+}
 
 /// What the stand-in found at its start, one `name value` line each, and at its end (`$HOP_OUT.end`:
 /// the claim file in its pid, or `none`), then, with `HOP_PROBE=signals`, sends itself SIGPIPE and
@@ -110,7 +125,7 @@ fn whole_normal_reader_preflight_binds_both_real_managed_routes() {
                 "ATPKG_READER_EXPECT",
                 if supported { "supported" } else { "refused" },
             );
-        let output = aterm_uds::deadline::output_within(&mut child, MUST_HAPPEN).unwrap();
+        let output = output_while_working(&mut child, "reader readiness preflight");
         assert!(
             output.status.success(),
             "{}",
@@ -393,8 +408,8 @@ impl Scratch {
     }
 
     /// What the stand-in found, once it said it.
-    fn seen(&self) -> Seen {
-        let text = until_within(MUST_HAPPEN, "the stand-in's report", || {
+    fn seen(&self, owner: u32) -> Seen {
+        let text = until_while_working(owner, "the stand-in's report", || {
             std::fs::read_to_string(self.out()).ok()
         });
         let line = |name: &str| {
@@ -445,7 +460,7 @@ impl Scratch {
                 ("HOP_OUT", report.to_str().expect("UTF-8")),
             ],
         );
-        until_within(MUST_HAPPEN, "the unrelated build's report", || {
+        until_while_working(child.id(), "the unrelated build's report", || {
             if let Some(status) = child.try_wait().expect("the unrelated front's status") {
                 let mut err = String::new();
                 if let Some(mut stderr) = child.stderr.take() {
@@ -608,15 +623,15 @@ fn stem(path: &Path) -> String {
 /// the stand-in holds none of the claim's descriptors and no cover marker was handed it, the claim
 /// is still there at the stand-in's last line, once the holder's meter has read its tree, and once
 /// it exits the claim is let go and its peak kept in the book. NEGATIVE CONTROL (by hand:
-/// `front_exec` execing without `hand_over`, the claim handed off to no holder): the ledger lists
-/// no claim while the stand-in runs; and (by hand: the holder's watch ending at once, as one whose
-/// kevent failed did before) the stand-in finds no claim at its end.
+/// `front_exec_bounded` execing without `hand_over`, the claim handed off to no holder): the ledger
+/// lists no claim while the stand-in runs; and (by hand: the holder's watch ending at once, as one
+/// whose kevent failed did before) the stand-in finds no claim at its end.
 #[test]
 fn a_claimed_build_runs_in_its_fronts_pid_under_its_holders_claim() {
     let s = Scratch::new();
     let child = s.front(&["--unverified", "test", "-p", "a"], &[]);
     let front = child.id();
-    let seen = s.seen();
+    let seen = s.seen(child.id());
     assert_eq!(
         (seen.pid, seen.ppid),
         (front, std::process::id()),
@@ -661,7 +676,7 @@ fn a_killed_build_dies_of_its_signal_and_its_claim_ends() {
         &["--unverified", "build"],
         &[("ATERM_CAPACITY_COVER", "none")],
     );
-    let seen = s.seen();
+    let seen = s.seen(child.id());
     let held = seen.held.clone().expect("a claim in its own pid");
     assert_eq!(seen.cover, stem(&held), "the claim's own marker");
     child.kill().expect("killed");
@@ -682,7 +697,7 @@ fn a_call_that_claims_nothing_becomes_its_program() {
     let s = Scratch::new();
     let child = s.front(&["--unverified", "run", "-p", "a"], &[]);
     let front = child.id();
-    let seen = s.seen();
+    let seen = s.seen(child.id());
     assert_eq!((seen.pid, seen.held.as_deref()), (front, None), "{seen:?}");
     assert!(s.listed().is_empty());
     let (status, err) = finish(child);
@@ -708,7 +723,7 @@ fn a_holder_that_does_not_arm_leaves_the_build_under_its_front() {
             ],
         );
         let front = child.id();
-        let seen = s.seen();
+        let seen = s.seen(child.id());
         assert_eq!(
             seen.ppid, front,
             "{seam}: its parent is the front: {seen:?}"
@@ -741,7 +756,7 @@ fn a_claimed_front_with_a_table_read_in_the_kernel_runs_its_build_under_its_clai
         &[(atpkg::build_admit::READ_HELD_ENV, "1"), ("HOP_EXIT", "3")],
     );
     let front = child.id();
-    let seen = s.seen();
+    let seen = s.seen(child.id());
     assert_eq!(seen.ppid, front, "its parent is the front: {seen:?}");
     assert_ne!(seen.pid, front);
     let listed = s.listed();
@@ -890,7 +905,7 @@ fn an_ordinary_ancestors_unlocked_lock_file_cannot_force_admission() {
         let start = atpkg::platform::Starting::at_defaults(&FRONT_SIGNALS);
         let mut child = start.spawning(|| command.spawn().expect("ordinary ancestor"));
         drop(start);
-        until_within(MUST_HAPPEN, "the ancestor's open descriptor", || {
+        until_while_working(child.id(), "the ancestor's open descriptor", || {
             std::fs::metadata(&ready).ok()
         });
         let unlocked = aterm_uds::ownerlock::probe_any(&lock);
@@ -1058,7 +1073,7 @@ fn a_killed_builds_claim_is_kept_while_its_survivor_works() {
     let mut identity = None;
     let mut tell = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let seen = s.seen();
+        let seen = s.seen(child.id());
         let survivor = seen.child.expect("the stand-in's child");
         let serial = aterm_uds::process::process_serial(i32::try_from(front).expect("front pid"))
             .expect("the live front");
@@ -1066,7 +1081,7 @@ fn a_killed_builds_claim_is_kept_while_its_survivor_works() {
             aterm_uds::process::process_serial(i32::try_from(survivor).expect("child pid"))
                 .expect("the live child");
         identity = Some((survivor, child_serial));
-        until_within(MUST_HAPPEN, "the child's memory touched", || {
+        until_while_working(survivor, "the child's memory touched", || {
             std::fs::metadata(&touched).ok()
         });
         let usage = until_within(MUST_HAPPEN, "the exact child's accounting identity", || {
@@ -1187,7 +1202,7 @@ fn a_killed_builds_claim_is_kept_while_its_survivor_works() {
 fn an_idle_survivor_lets_a_killed_builds_claim_go() {
     let s = Scratch::new();
     let mut child = s.front(&["--unverified", "build"], &[("HOP_CHILD", "idle")]);
-    let seen = s.seen();
+    let seen = s.seen(child.id());
     let idle = seen.child.expect("the stand-in's child");
     s.read_in_tree(idle);
     let tell = child.stdin.take().expect("the child's stdin");
@@ -1218,18 +1233,26 @@ fn a_build_keeps_the_signals_its_front_was_started_ignoring() {
         let mut command = s.front_command(ignored, &["--version"], &[("HOP_PROBE", "signals")]);
         command.stderr(stderr);
         let mut child = started(&mut command);
-        let reported =
-            aterm_spec::wait::within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
+        let reported = aterm_spec::wait::within_while_working(
+            child.id(),
+            MUST_HAPPEN,
+            aterm_spec::wait::WORKING_GUARD,
+            std::time::Duration::from_millis(10),
+            || {
                 let status = child.try_wait().expect("front status");
                 (s.out().exists() || status.is_some()).then_some(status)
-            });
+            },
+        );
         assert!(
             s.out().exists(),
             "front {} ignoring {ignored:?} did not report: {reported:?}; stderr: {}",
             child.id(),
             std::fs::read_to_string(&stderr_path).expect("front stderr")
         );
-        assert!(s.seen().held.is_none(), "this probe needs no admission");
+        assert!(
+            s.seen(child.id()).held.is_none(),
+            "this probe needs no admission"
+        );
         let (status, _) = finish(child);
         let err = std::fs::read_to_string(&stderr_path).expect("front stderr");
         let mut said = s.out().into_os_string();
@@ -1489,7 +1512,7 @@ fn actual_reader_query_reports_its_exact_private_namespace_without_a_claim() {
         .env(atpkg::build_admit::LEDGER_ENV, scratch.ledger())
         .env("HOME", scratch.home())
         .env("ATERM_STATE_HOME", scratch.state());
-    let output = aterm_uds::deadline::output_within(&mut command, MUST_HAPPEN).unwrap();
+    let output = output_while_working(&mut command, "the actual reader namespace");
     assert!(
         output.status.success(),
         "{}",

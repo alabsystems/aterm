@@ -19,6 +19,7 @@ use aterm_mesh_core_islands as _;
 use aterm_mesh_core_islands_no_lost_edit as _;
 use aterm_mesh_core_islands_p1 as _;
 
+mod build_facts;
 mod lab_window;
 
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -508,6 +509,8 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             }
             // Its own pass every minute, and the windows' needs pushes from the first one.
             metrics_publish::start();
+            // The lifts other Macs publish in their quota rows, read beside it.
+            quota_lifts::start();
             node_commons_startup().map(|startup| {
                 let startup = std::sync::Mutex::new(startup);
                 std::sync::Arc::new(move || {
@@ -638,6 +641,8 @@ const COMPILED: aterm_stamp::Stamp = aterm_stamp::Stamp {
     compiler_trust_version: env!("ATERM_COMPILER_TRUST_VERSION"),
     compiler_flavor: env!("ATERM_COMPILER_FLAVOR"),
     build_profile: env!("ATERM_BUILD_PROFILE"),
+    debug_assertions: Some(cfg!(debug_assertions)),
+    target_arch: std::env::consts::ARCH,
     trust_verify: env!("ATERM_TRUST_VERIFY"),
     ..aterm_stamp::Stamp::UNSTAMPED
 };
@@ -724,12 +729,17 @@ fn cpu_policy_hang() -> Option<std::time::Duration> {
 }
 
 pub(crate) fn main() -> ExitCode {
+    let mut argv: Vec<OsString> = std::env::args_os().collect();
+    // This exact request reads only immutable compile data and writes stdout. In particular it
+    // precedes stamp installation, descriptor custody, scheduling, windows and every setup lane.
+    if let Some(code) = build_facts::entry(&argv) {
+        return code;
+    }
     // First: every entry below, the early helper verbs included, reads the installed identity.
     aterm_stamp::install(&STAMP, COMPILED);
     // One clock read: the broker's start stamps count its phases from here (KI-1111-2).
     #[cfg(unix)]
     aterm_link::start_stamps::main_entered();
-    let mut argv: Vec<OsString> = std::env::args_os().collect();
     // Capture before ANY descriptor-opening subscriber/window/front-door setup.
     // SAFETY: stamp installation/args_os above only read in-memory startup data;
     // this executable has started no threads or descriptor-mutating callbacks.
@@ -2261,46 +2271,91 @@ fn network_state_source_with_readers(
         services: unavailable_services.clone(),
         ..NetworkStateSnapshot::default()
     });
-    let current = Mutex::new((
-        fallback.clone(),
-        None::<aterm_db::network_state::Publication>,
-        None::<aterm_db::service_state::Publication>,
-    ));
+    struct Held {
+        snapshot: Arc<NetworkStateSnapshot>,
+        network: Option<Arc<aterm_db::network_state::Publication>>,
+        services: Option<Arc<aterm_db::service_state::Publication>>,
+        projected_at: Option<std::time::Instant>,
+    }
+    let current = Mutex::new(Arc::new(Held {
+        snapshot: fallback,
+        network: None,
+        services: None,
+        projected_at: None,
+    }));
+    // A slow sampler owns no publication lock. Concurrent readers still age the last
+    // original publications, rather than revoking valid evidence or renewing its lease.
+    let sampling = Mutex::new(());
     Arc::new(move |read: aterm_gui::NetworkRead| {
-        // Both the UI and the Commons beacon read this callback. A paused reader
-        // must not pause drawing or masquerade as a new startup observation.
-        let mut current = match current.try_lock() {
-            Ok(current) => current,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
+        // Both the UI and the Commons beacon read this callback. Only one asks the
+        // producers at a time; another reads their retained publications immediately.
+        let sampler = match sampling.try_lock() {
+            Ok(sampler) => Some(sampler),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         };
-        if let Some(publication) = network() {
-            current.1 = Some(publication);
-        }
+        let sampled_network = sampler.as_ref().and_then(|_| network()).map(Arc::new);
         // A services read asks their observer for its next sample, so only a reader that shows
         // their states reads them; any other gets their last sample, aged below as it ages.
-        if read == aterm_gui::NetworkRead::WithServices
-            && let Some(publication) = services()
-        {
-            current.2 = Some(publication);
-        }
+        let sampled_services = sampler
+            .as_ref()
+            .filter(|_| read == aterm_gui::NetworkRead::WithServices)
+            .and_then(|_| services())
+            .map(Arc::new);
         let (now, wall) = clock();
-        let network = current.1.as_ref().map_or_else(
-            || retained.clone(),
-            |publication| publication.current_at(now, wall),
-        );
-        let services = current.2.as_ref().map_or_else(
-            || unavailable_services.clone(),
-            |publication| publication.current_at(now, wall),
-        );
-        if current.0.network != network || current.0.services != services {
-            current.0 = Arc::new(NetworkStateSnapshot {
-                revision: current.0.revision.saturating_add(1),
-                network,
-                services,
+        // This lock only clones or swaps one Arc. Sampling, time reads, projection,
+        // comparisons, allocations and destruction all happen outside it.
+        let lock = || {
+            current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let mut held = Arc::clone(&lock());
+        loop {
+            // A reader paused after its clock read must not replace a newer projection.
+            if held.projected_at.is_some_and(|at| now < at) {
+                return Some(Arc::clone(&held.snapshot));
+            }
+            let network_publication = sampled_network.as_ref().or(held.network.as_ref()).cloned();
+            let service_publication = sampled_services
+                .as_ref()
+                .or(held.services.as_ref())
+                .cloned();
+            let network = network_publication.as_ref().map_or_else(
+                || retained.clone(),
+                |publication| publication.current_at(now, wall),
+            );
+            let services = service_publication.as_ref().map_or_else(
+                || unavailable_services.clone(),
+                |publication| publication.current_at(now, wall),
+            );
+            let snapshot = if held.snapshot.network == network && held.snapshot.services == services
+            {
+                Arc::clone(&held.snapshot)
+            } else {
+                Arc::new(NetworkStateSnapshot {
+                    revision: held.snapshot.revision.saturating_add(1),
+                    network,
+                    services,
+                })
+            };
+            let next = Arc::new(Held {
+                snapshot: Arc::clone(&snapshot),
+                network: network_publication,
+                services: service_publication,
+                projected_at: Some(now),
             });
+            let mut current = lock();
+            if Arc::ptr_eq(&current, &held) {
+                let previous = std::mem::replace(&mut *current, next);
+                drop(current);
+                drop(previous);
+                return Some(snapshot);
+            }
+            let newer = Arc::clone(&current);
+            drop(current);
+            held = newer;
         }
-        Some(current.0.clone())
     })
 }
 
@@ -2480,10 +2535,14 @@ fn first_run_start(
 /// launch the person need not make.
 #[cfg(target_os = "macos")]
 fn apply_first_run_doctor() -> bool {
+    let operation = (setup_io().operation)();
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
-        .spawn(|| {
-            resume_at_the_screen();
+        .spawn(move || {
+            {
+                let _operation = operation;
+                resume_at_the_screen();
+            }
             setup_take_up::take_up_with(&mut LiveTakeUp::default());
         }) {
         Ok(_) => true,
@@ -2498,6 +2557,7 @@ fn apply_first_run_doctor() -> bool {
 /// lock while it prepares, so the login job gives way), returning once that startup ended.
 #[cfg(target_os = "macos")]
 fn resume_at_the_screen() {
+    let _operation = (setup_io().operation)();
     start_at_the_screen(
         aterm_machines::console::remote_here,
         wait_for_setup_wake,
@@ -2595,6 +2655,7 @@ struct Widened {
 #[cfg(target_os = "macos")]
 fn run_startup_setup(mut widened: Option<Widened>) {
     let running = StartupRunning::enter();
+    let _operation = (setup_io().operation)();
     preload_setup_history();
     run_repaired_startups(|reserved| {
         let mut password = None;
@@ -2660,7 +2721,7 @@ fn run_repaired_startups(mut attempt: impl FnMut(Option<StartupSent>) -> Option<
 fn read_again_if_unread() {
     let unread = || {
         matches!(
-            aterm_cli::macos_doctor::initial_setup_snapshot(),
+            (setup_io().snapshot)(),
             Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_))
         )
     };
@@ -3783,19 +3844,19 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     }
 
     fn revision(&mut self) -> Result<u64, String> {
-        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        self.observation = (setup_io().observation)().ok();
         // The revision the review bound, read the same way: a choice cut short after it saved
         // its plan, before its progress, still resumes at this launch.
         aterm_cli::macos_doctor::initial_setup_review_revision()
     }
 
     fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
-        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        self.observation = (setup_io().observation)().ok();
         StartupClaim::claim()
     }
 
     fn finished(&mut self) -> Result<bool, String> {
-        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        self.observation = (setup_io().observation)().ok();
         aterm_cli::macos_doctor::initial_setup_finished()
     }
 
@@ -3814,7 +3875,7 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     }
 
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String> {
-        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        self.observation = (setup_io().observation)().ok();
         // Scoped to this Mac: the whole profile on an ALab Mac, aterm's own
         // permissions elsewhere; its probe of the ALab vault runs on this worker.
         let (plan, provisional) = self
@@ -3844,7 +3905,7 @@ impl<F: FnMut(aterm_types::macos_setup::Plan, StartupHandoff) -> aterm_gui::Setu
     }
 
     fn validate(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<(), String> {
-        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        self.observation = (setup_io().observation)().ok();
         aterm_cli::macos_doctor::validate_initial_setup_plan(plan)
     }
 
@@ -4307,6 +4368,7 @@ fn run_prepared_setup(
     password: Option<aterm_secrets::SecretBytes>,
     sent: StartupSent,
 ) {
+    let _operation = (setup_io().operation)();
     match prepared {
         PreparedSetup::Authorized { claim, revision } => {
             // Registered at once, while the claim makes this revision the one in force and
@@ -4545,6 +4607,7 @@ fn run_first_run_doctor(
     password: Option<aterm_secrets::SecretBytes>,
     busy: InitialSetupBusy,
 ) {
+    let _operation = (setup_io().operation)();
     // A process that may never change the person's profile (its state root, uid
     // and HOME are fixed for its life) has nothing to retry, and an idle
     // session must not wake each minute to learn that again.
@@ -5537,7 +5600,7 @@ struct InitialSetupBusy {
 impl InitialSetupBusy {
     fn new() -> Self {
         Self {
-            observation: aterm_cli::macos_doctor::initial_setup_observation().ok(),
+            observation: (setup_io().observation)().ok(),
         }
     }
 }
@@ -5558,6 +5621,7 @@ fn wait_for_setup_slot<T>(acquired: impl FnOnce() -> T) -> T {
 #[cfg(target_os = "macos")]
 impl Drop for InitialSetupBusy {
     fn drop(&mut self) {
+        let _operation = (setup_io().operation)();
         INITIAL_SETUP_BUSY.store(false, std::sync::atomic::Ordering::Release);
         aterm_gui::publish_initial_setup_status(initial_setup_status());
     }
@@ -6339,6 +6403,20 @@ type KeptReading = (
     aterm_cli::macos_doctor::Fence,
 );
 
+/// Retains the setup I/O provider through an operation's final publication, even after the
+/// operation lets go of its busy slot. The live provider needs no completion callback.
+#[cfg(target_os = "macos")]
+struct SetupIoOperation(Option<fn()>);
+
+#[cfg(target_os = "macos")]
+impl Drop for SetupIoOperation {
+    fn drop(&mut self) {
+        if let Some(finished) = self.0 {
+            finished();
+        }
+    }
+}
+
 /// What System State's worker does outside this process: the doctor's records
 /// and readings of the Mac. A test of this binary puts its own in [`SETUP_IO`],
 /// so it drives the worker's real entry points (a choice, a Stop, a reading)
@@ -6346,12 +6424,33 @@ type KeptReading = (
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct SetupIo {
+    /// Retain this provider until an owned operation and its final publication have ended.
+    /// Scripted providers use the returned guard to finish draining before being replaced.
+    operation: fn() -> SetupIoOperation,
     /// Whether this process may never change the person's profile
     /// (`aterm_cli::macos_doctor::lasting_scope_refusal`).
     scope_refused: fn() -> bool,
     /// Optional display-only storage, resolved by the reading worker or before a restored
     /// System State page is constructed at launch, never on the running GUI loop.
     history_store: fn() -> Option<aterm_cli::macos_doctor::SetupHistoryStore>,
+    /// The saved setup's current status, including its configured vault presentation
+    /// (`aterm_cli::macos_doctor::initial_setup_snapshot`).
+    snapshot: fn() -> Result<
+        aterm_cli::macos_doctor::InitialSetupSnapshot,
+        aterm_cli::macos_doctor::InitialSetupSnapshotError,
+    >,
+    /// The saved setup's identity as a worker or busy slot starts its operation
+    /// (`aterm_cli::macos_doctor::initial_setup_observation`).
+    observation: fn() -> Result<
+        aterm_cli::macos_doctor::InitialSetupObservation,
+        aterm_cli::macos_doctor::InitialSetupSnapshotError,
+    >,
+    /// Current account provisioning evidence, read only when the status selects Secrets
+    /// (`doctor::ai_accounts_setup_observation`).
+    accounts: fn() -> aterm_types::macos_setup::Observation,
+    /// Whether this login's verified vault membership identifies an ALab Mac
+    /// (`aterm_cli::macos_doctor::alab_mac`).
+    alab: fn() -> bool,
     /// Read rows for a plan under their current observation admission, the network's too when
     /// asked (`aterm_cli::macos_doctor::observe_initial_setup`). Plan mode alone permits no
     /// hidden query of another app's data.
@@ -6445,8 +6544,13 @@ struct SetupIo {
 #[cfg(target_os = "macos")]
 impl SetupIo {
     const LIVE: Self = Self {
+        operation: || SetupIoOperation(None),
         scope_refused: || aterm_cli::macos_doctor::lasting_scope_refusal().is_some(),
         history_store: aterm_cli::macos_doctor::SetupHistoryStore::for_person,
+        snapshot: aterm_cli::macos_doctor::initial_setup_snapshot,
+        observation: aterm_cli::macos_doctor::initial_setup_observation,
+        accounts: doctor::ai_accounts_setup_observation,
+        alab: aterm_cli::macos_doctor::alab_mac,
         read: aterm_cli::macos_doctor::observe_initial_setup,
         now_secs: || aterm_time::unix_secs().unwrap_or(0),
         save_stop: aterm_cli::macos_doctor::request_initial_setup_stop,
@@ -7892,6 +7996,7 @@ fn dispatch_observation_publishing(
     now: impl FnOnce() -> u64,
     spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
 ) -> bool {
+    let _operation = (setup_io().operation)();
     let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
         return false;
     };
@@ -7913,9 +8018,11 @@ fn dispatch_observation_publishing(
         return true;
     }
     queue.running = true;
+    let operation = (setup_io().operation)();
     // Keep the finite pending batch in the queue until its worker actually starts.
     // Holding this admission lock also serializes concurrent callers with spawn.
-    let spawned = spawn(Box::new(|| {
+    let spawned = spawn(Box::new(move || {
+        let _operation = operation;
         preload_setup_history();
         loop {
             let batch = {
@@ -8684,6 +8791,7 @@ fn save_wanted_stops() {
             saves.saving = Some(revision);
             revision
         };
+        let _operation = (setup_io().operation)();
         let saved = (setup_io().save_stop)(revision)
             .inspect_err(|why| aterm_log::warn!("System State could not save its Stop: {why}"))
             .is_ok();
@@ -9042,7 +9150,8 @@ impl Drop for InputReadbackActivity {
 
 #[cfg(target_os = "macos")]
 fn initial_setup_status() -> aterm_gui::SetupStatus {
-    let snapshot = aterm_cli::macos_doctor::initial_setup_snapshot();
+    let io = setup_io();
+    let snapshot = (io.snapshot)();
     if matches!(
         snapshot,
         Err(aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_))
@@ -9071,16 +9180,14 @@ fn initial_setup_status() -> aterm_gui::SetupStatus {
         plan.selection
             .contains(aterm_types::macos_setup::Setting::Secrets)
     }) {
-        status
-            .observed
-            .push(doctor::ai_accounts_setup_observation());
+        status.observed.push((io.accounts)());
     }
     add_vault_not_joined(
         &mut status,
         SETUP_VAULT_NOT_JOINED.load(std::sync::atomic::Ordering::Acquire),
     );
     // Only an ALab Mac signs out of Messages and FaceTime: the page says so on that line.
-    status.alab = aterm_cli::macos_doctor::alab_mac();
+    status.alab = (io.alab)();
     status
 }
 
@@ -9657,12 +9764,15 @@ fn spawn_holding_initial_setup_slot(
     name: &str,
     run: impl FnOnce(InitialSetupBusy) + Send + 'static,
 ) -> bool {
+    let _spawning = (setup_io().operation)();
     if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
         *last = InitialSetupRows::default();
     }
+    let operation = (setup_io().operation)();
     match std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
+            let _operation = operation;
             run(InitialSetupBusy::new());
         }) {
         Ok(_) => true,
@@ -9681,6 +9791,7 @@ fn restart_initial_setup(
     password: Option<aterm_secrets::SecretBytes>,
     receipt: aterm_gui::InitialSetupApplyReceipt,
 ) -> bool {
+    let _operation = (setup_io().operation)();
     if (setup_io().scope_refused)() {
         return false;
     }
@@ -9725,9 +9836,11 @@ fn restart_initial_setup(
     let refused = choice.clone();
     stop_runs_sent_through(choice.sent - 1);
     let under_way = UnderWay::new(choice.sent);
+    let operation = (setup_io().operation)();
     let started = std::thread::Builder::new()
         .name("aterm-setup-apply".into())
         .spawn(move || {
+            let _operation = operation;
             let busy = wait_for_initial_setup_slot();
             if setup_choice_overtaken(generation) {
                 return;
@@ -9776,6 +9889,7 @@ fn admit_setup_change(
     awaiting: Option<AwaitingClaim>,
     under_way: UnderWay,
 ) {
+    let _operation = (setup_io().operation)();
     // A group choice makes the plan the person's for good; Set up now leaves a
     // provisional plan provisional (design §3.5). Either takes only what the page
     // changed onto the plan in force as it is admitted (§3.3).
@@ -10190,6 +10304,7 @@ fn run_setup_restore(
         Option<aterm_cli::macos_doctor::Report>,
     >,
 ) {
+    let _operation = (setup_io().operation)();
     // A choice made after this Restore was pressed is the person's latest intent.
     let pressed = SETUP_APPLY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
     let observed = loop {
@@ -10273,10 +10388,13 @@ fn offer_again_after_restore() {
 /// launch starts it.
 #[cfg(target_os = "macos")]
 fn start_startup_again() -> bool {
+    let operation = (setup_io().operation)();
     match std::thread::Builder::new()
         .name("aterm-workstation-setup".into())
-        .spawn(|| run_startup_setup(None))
-    {
+        .spawn(move || {
+            let _operation = operation;
+            run_startup_setup(None);
+        }) {
         Ok(_) => true,
         Err(why) => {
             aterm_log::warn!("first-run macOS doctor worker could not start: {why}");
@@ -11793,6 +11911,10 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ("--help", "print help and exit"),
     ("--version", "print the version and exit"),
     (
+        "--build-facts",
+        "write immutable compile facts before startup",
+    ),
+    (
         "--completions",
         "print the bash, zsh or fish completion script",
     ),
@@ -11837,6 +11959,10 @@ mod alab_update;
 /// The node service's metrics publisher (one-mesh §4.14).
 #[cfg(unix)]
 mod metrics_publish;
+
+/// The node service's reader of the lifts its peers publish in their quota rows (FL-117).
+#[cfg(unix)]
+mod quota_lifts;
 
 /// LabView's cache: the harness's roster source from the lab registry.
 #[cfg(unix)]

@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 mod probe {
-    use aterm_net::lan::{Listener, Multicast, Scope};
+    use aterm_net::lan::{Listener, Multicast, RecheckedListener, Scope};
     use std::{
         fmt::Display,
         io,
@@ -85,7 +85,7 @@ mod probe {
             let std::net::IpAddr::V4(source) = address.ip() else {
                 continue;
             };
-            let listener = match Listener::bind(*address, scope) {
+            let listener = match RecheckedListener::bind(*address, scope) {
                 Ok(listener) => {
                     println!(
                         "source={source} stage=tcp-bind result=bound local={:?}",

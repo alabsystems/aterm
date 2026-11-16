@@ -26,10 +26,6 @@ aterm_durable::plain_durable_flushes_in_tests!();
 // change what its engine fixtures see.
 mod hermetic_git;
 
-#[path = "../../src/main_lane.rs"]
-#[allow(dead_code)]
-mod main_lane;
-
 #[path = "../../src/accepted_measure.rs"]
 #[allow(dead_code)]
 mod accepted_measure;
@@ -221,7 +217,7 @@ mod stage_local;
 #[allow(dead_code)]
 mod tap;
 #[cfg(unix)]
-#[path = "../../src/test_vault_tests.rs"]
+#[path = "test_vault.rs"]
 #[allow(dead_code)]
 mod test_vault;
 #[path = "../../src/transforms.rs"]

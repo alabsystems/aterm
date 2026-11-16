@@ -98,7 +98,7 @@ impl Fixture {
         note_attempt(
             &self.store,
             (&self.path, &self.row, &self.logins),
-            accounts::AttemptOutcome::Failed,
+            (accounts::AttemptOutcome::Failed, None),
             "fixture route",
             NOW,
         )

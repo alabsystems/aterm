@@ -14,7 +14,7 @@ use alab_policy::vocab::{Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 37, "0.37");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 38, "0.38");
 
 /// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought.
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];
@@ -33,12 +33,14 @@ fn is_spinner_glyph(g: char) -> bool {
 
 /// Claude Code's window title says its REPL is busy: one of the two frames it flips while busy
 /// (`title.running`), a blank, then the title. At rest the title leads with `title.rest` (`✳`).
-/// This is the one reading of a running turn that a status line leaves: with one set, the footer
-/// drops `esc to interrupt`, and the spinner row goes once the reply's first line is drawn.
+/// Under a status line a running turn has two signs past its first reply line, this title and the
+/// program-status report ([`report_runs`]): with a status line set, the footer drops
+/// `esc to interrupt`, and the spinner row goes once the reply's first line is drawn.
 /// Claude Code writes no title where its title is off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`),
 /// leads it with no glyph where its status goes to the terminal's tab instead
-/// (`showStatusInTerminalTab`, or a terminal that answers its OSC 7501 program-status probe), and
-/// holds it at `title.rest` under a terminal multiplexer: there no title says it runs.
+/// (`showStatusInTerminalTab`, or a terminal that answers its OSC 7501 program-status query, as
+/// aterm's does, where its report says it runs), and holds it at `title.rest` under a terminal
+/// multiplexer.
 #[must_use]
 pub fn title_runs(title: &str) -> bool {
     let mut chars = title.chars();
@@ -58,6 +60,35 @@ pub fn title_rests(title: &str) -> bool {
         .next()
         .is_some_and(|c| const { crate::anchor!("title.rest") }.contains(c))
         && chars.next() == Some(' ')
+}
+
+/// What Claude Code's own OSC 7501 program-status report says of its run. `report` is the report
+/// standing in the terminal, as the body that says it (`state=<word>:app=<app>[:kind=<kind>]`,
+/// `text --json`'s `program_report`). `working` is `Some(true)`; `idle`, `done`, `error` and
+/// `blocked` are `Some(false)`; a report of another program, or a body this does not read, is
+/// `None`. Claude Code writes one only where the terminal answered its `OSC 7501 ; ?`, and then
+/// its title carries no run glyph ([`title_runs`]). It writes `working` before the frame that
+/// shows its turn and `done` before the frame that draws the reply's last line and its done row,
+/// the order its title kept (measured on 2.1.323).
+#[must_use]
+pub fn report_runs(report: &str) -> Option<bool> {
+    let (mut state, mut app) = (None, None);
+    for item in report.split(':') {
+        match item.split_once('=') {
+            Some(("state", word)) if state.is_none() => state = Some(word),
+            Some(("app", word)) if app.is_none() => app = Some(word),
+            Some(("state" | "app", _)) | None => return None,
+            Some(_) => {}
+        }
+    }
+    if app? != const { crate::anchor!("status.app") } {
+        return None;
+    }
+    match state? {
+        "working" => Some(true),
+        "idle" | "done" | "error" | "blocked" => Some(false),
+        _ => None,
+    }
 }
 
 /// A box-drawing character (U+2500–U+257F: `│`, `─`, `╌`, `╭` …), the layout's own strokes.
@@ -135,8 +166,9 @@ pub enum Zone {
     Footer,
     /// No composer frame on the screen.
     Screen,
-    /// The program's window title, where the screen shows no turn ([`busy_seen`]).
-    Title,
+    /// The program's own run sign beside the screen, its program-status report or else its
+    /// window title, where the screen shows no turn ([`busy_seen`]).
+    RunSign,
 }
 
 /// One busy verdict: where it was read and which rule fired.
@@ -174,7 +206,7 @@ impl fmt::Display for Busy {
             Zone::Hint => "hint",
             Zone::Footer => "footer",
             Zone::Screen => "whole screen, no composer frame",
-            Zone::Title => "title",
+            Zone::RunSign => "run sign",
         };
         write!(f, "{zone}: {}", self.rule)
     }
@@ -881,8 +913,8 @@ pub fn delegated_shown(rows: &[String]) -> bool {
             .any(|r| is_workflow_progress(r) || panel_runs(r))
 }
 
-/// CLAUDE CODE'S TITLE SAYS A TURN RUNS THAT ITS SCREEN DOES NOT SHOW: the title runs (`runs`,
-/// [`crate::ScreenReader::runs`]), the composer's frame is drawn with no box over it, and the
+/// CLAUDE CODE'S RUN SIGN SAYS A TURN RUNS THAT ITS SCREEN DOES NOT SHOW: its report or its title
+/// runs (`runs`, [`crate::ScreenReader::runs`]), the composer's frame is drawn with no box over it, and the
 /// screen shows no end of a turn and nothing else that runs the title. That is no done row
 /// ([`done_row_drawn`]), no wall a turn ends on ([`crate::wall::turn_wall`], which holds every
 /// [`limit_notice`]), no interrupt ([`crate::turn::interrupted`]), no handed-off work
@@ -905,12 +937,12 @@ pub fn title_live(rows: &[String], runs: Option<bool>) -> bool {
         && crate::wall::turn_wall(rows).is_none()
 }
 
-/// [`busy_signal`] read beside the title: a hard busy in [`Zone::Title`] (`title: running`)
+/// [`busy_signal`] read beside the run sign: a hard busy in [`Zone::RunSign`] (`run sign: running`)
 /// where [`title_live`], else the screen's own.
 #[must_use]
 pub fn busy_seen(rows: &[String], runs: Option<bool>) -> Option<Busy> {
     if title_live(rows, runs) {
-        Some(Busy::hard(Zone::Title, "running"))
+        Some(Busy::hard(Zone::RunSign, "running"))
     } else {
         busy_signal(rows)
     }

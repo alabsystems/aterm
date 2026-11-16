@@ -20,6 +20,10 @@ use crate::harness::wake_deadline::SleepSeam;
 
 const EMAIL: &str = "person@example.com";
 
+/// A second account the window's modes sign in as: the token upkeep's spacing between two
+/// accounts' captures (plan package FL-138).
+pub(in crate::harness) const OTHER_EMAIL: &str = "other@example.com";
+
 /// A token in grammar, spelled in halves so no scanner reads it as a key.
 pub(in crate::harness) fn token() -> String {
     format!(
@@ -590,8 +594,10 @@ fn stand_in() {
             std::thread::sleep(Duration::from_millis(500));
         }
         "renew-window-token"
+        | "renew-window-30-days"
         | "renew-window-closed"
         | "window-human-check"
+        | "window-code-no-mailbox"
         | "window-browser-start" => {
             use super::super::open_url::{CODE_ENV, EMAIL_ENV, OUTCOME_ENV, WINDOW_ENV};
             // Each run in the window says it ran, so a test counts the captures that reached
@@ -607,9 +613,13 @@ fn stand_in() {
                 std::env::var_os(WINDOW_ENV).as_deref(),
                 Some(std::ffi::OsStr::new("1"))
             );
-            assert_eq!(
-                std::env::var_os(EMAIL_ENV).as_deref(),
-                Some(std::ffi::OsStr::new(EMAIL))
+            assert!(
+                [EMAIL, OTHER_EMAIL]
+                    .iter()
+                    .any(|email| std::env::var_os(EMAIL_ENV).as_deref()
+                        == Some(std::ffi::OsStr::new(email))),
+                "{:?}",
+                std::env::var_os(EMAIL_ENV)
             );
             let code = PathBuf::from(std::env::var_os(CODE_ENV).expect("private code path"));
             let outcome =
@@ -621,6 +631,8 @@ fn stand_in() {
                 // The consent page's human check, on its host: what the opener met, which no
                 // step record may keep.
                 "window-human-check" => Some("window-human-check claude.ai"),
+                // The code page of a sign-in nobody started, which no mailbox answers.
+                "window-code-no-mailbox" => Some("window-code-no-mailbox"),
                 // A stop that holds no step: another try alone may pass it.
                 "window-browser-start" => Some("browser-start"),
                 _ => None,
@@ -639,7 +651,13 @@ fn stand_in() {
                 .expect("the window's code");
             assert_eq!(line.trim_end(), "test-code#test-state");
             put(&home.join("pasted"), line.trim_end());
-            say(&success_frame(&token(), "1 year"));
+            // A Claude Code that makes a token for 30 days, as one day it may.
+            let lasts = if mode == "renew-window-30-days" {
+                "30 days"
+            } else {
+                "1 year"
+            };
+            say(&success_frame(&token(), lasts));
         }
         "headless-token" | "headless-bot-check" | "headless-unnamed" | "headless-turnstile"
         | "headless-callback" => {
@@ -1110,6 +1128,7 @@ fn window_route(world: &World) -> OpenerRoute {
     OpenerRoute {
         opener: PathBuf::from("/nonexistent/aterm-open-url"),
         page: OpenerPage::Window,
+        unattended: false,
         outcome: world.home().join("outcome"),
         code: world.home().join("outcome.code"),
     }
@@ -1190,6 +1209,23 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
     #[cfg(target_os = "macos")]
     assert_eq!(value("ATERM_SIGN_IN_TRACE").as_deref(), Some("/t/trace"));
     assert_eq!(value(super::super::open_url::TOKEN_ENV), None);
+    assert_eq!(
+        value(super::super::open_url::UNATTENDED_ENV),
+        None,
+        "a capture a person started waits for them on a code page"
+    );
+    // A capture this Mac's upkeep started with nobody there (FL-138) tells the window so.
+    let unattended = OpenerRoute {
+        unattended: true,
+        ..window_route(&world)
+    };
+    let marked = opener_env(&unattended, EMAIL, &|_| None);
+    assert!(
+        marked
+            .iter()
+            .any(|(key, value)| *key == super::super::open_url::UNATTENDED_ENV && value == "1"),
+        "{marked:?}"
+    );
     // The account's headless profile (FL-137): the token's grant and the row's label, never the
     // window's grant or its trace.
     let headless = OpenerRoute {
@@ -1218,6 +1254,16 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
     );
     assert_eq!(value(super::super::open_url::WINDOW_ENV), None);
     assert_eq!(value("ATERM_SIGN_IN_TRACE"), None);
+    let unattended_headless = OpenerRoute {
+        unattended: true,
+        ..headless
+    };
+    assert!(
+        !opener_env(&unattended_headless, EMAIL, &|_| None)
+            .iter()
+            .any(|(key, _)| *key == super::super::open_url::UNATTENDED_ENV),
+        "only the window has a code page to end"
+    );
     // CONTROL: the verb's own environment hands the child no opener and no grant.
     let plain = child_env(&|_| None, Path::new("/scratch"));
     assert!(
@@ -1430,6 +1476,7 @@ fn verb_stand_in() {
     let route = OpenerRoute {
         opener: PathBuf::from("/nonexistent/aterm-open-url"),
         page: OpenerPage::Window,
+        unattended: false,
         outcome: home.join("outcome"),
         code: home.join("outcome.code"),
     };

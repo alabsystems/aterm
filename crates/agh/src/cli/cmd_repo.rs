@@ -158,16 +158,18 @@ pub(crate) fn repo_push(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// Create a public User-owned repository after literal/grant routing and owner proof.
+/// Create a User-owned repository after literal/grant routing and owner proof.
 pub(crate) fn repo_create(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     use super::cmd_release_write::{Write, journaled, one_shot_answer};
     use super::write_out::done;
     use crate::github::repos::{CREATE_KEY, RepoVisibility};
     use crate::write::WriteOp;
 
-    if !inv.has("--public") {
-        return Err(inv.usage("--public is required; only public User-owned creation is supported"));
-    }
+    let visibility = match (inv.has("--public"), inv.has("--private")) {
+        (true, false) => RepoVisibility::Public,
+        (false, true) => RepoVisibility::Private,
+        _ => return Err(inv.usage("exactly one of --public or --private is required")),
+    };
     let dry = inv.has("--dry-run");
     let gh = if dry {
         ctx.github_recorded()?
@@ -190,7 +192,7 @@ pub(crate) fn repo_create(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         let permit = repos.permit_create(
             &w.how
                 .route(crate::policy::RouteTarget::Repo(w.slug.clone())),
-            RepoVisibility::Public,
+            visibility,
         )?;
         if dry {
             #[cfg(unix)]

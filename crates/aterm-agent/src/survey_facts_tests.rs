@@ -76,6 +76,13 @@ fn sample_facts() -> SwarmSurveyFacts {
         home: Some("/Users//a yates".to_owned()),
         home_dir: None,
         home_free_mb: Some(812_345),
+        home_total_mb: Some(1_907_000),
+        home_build: Some(HomeBuild {
+            mb: 84_992,
+            at_ms: 1_793_152_800_000,
+            partial: true,
+        }),
+        store_worst: StoreWorst::new("vault-records", 83),
         machine: Some(sample_machine()),
         repos: Some(HomeRepos {
             read_ms: 1_793_159_000_000,
@@ -108,7 +115,8 @@ fn sample_facts() -> SwarmSurveyFacts {
 }
 
 /// A machine that read every figure, each a different value, so a key read into another's
-/// field shows; its free space is [`sample_facts`]' `home_free_mb`.
+/// field shows; its free space and its size are [`sample_facts`]' `home_free_mb` and
+/// `home_total_mb`.
 fn sample_machine() -> MachineFacts {
     MachineFacts {
         look: MachineLook {
@@ -154,15 +162,21 @@ const SAMPLE_MACHINE_TOKENS: &str = " os=macos target=aarch64-apple-darwin \
      m_at_ms=1793159998500 cores=12 load1_x100=345 load5_x100=280 load15_x100=199 \
      cpu_busy_x100=1130 rate_win_ms=60250 mem_total_mb=65536 mem_used_mb=40100 \
      mem_avail_mb=21900 mem_pressure=warn mem_psi60_x100=1234 swap_used_mb=2048 \
-     swap_total_mb=4096 home_total_mb=1907000 gpu_cores=30 gpu_busy_pct=97 \
-     net_link_kbps=1000000 net_rx_kbps=5120 net_tx_kbps=640 net_other_kbps=17 \
-     up_since_ms=1793100000000 cpu_lim=0 mem_lim=1 disk_lim=0 gpu_lim=1 load=88:21";
+     swap_total_mb=4096 gpu_cores=30 gpu_busy_pct=97 net_link_kbps=1000000 \
+     net_rx_kbps=5120 net_tx_kbps=640 net_other_kbps=17 up_since_ms=1793100000000 cpu_lim=0 \
+     mem_lim=1 disk_lim=0 gpu_lim=1 load=88:21";
+
+/// [`sample_facts`]' home volume tokens, in wire order, right after `ssh_host_key=`: its free
+/// space, its size and its build output with that sizing's time and floor word.
+const SAMPLE_DISK_TOKENS: &str = " home_free_mb=812345 home_total_mb=1907000 \
+     home_build_mb=84992 home_build_at_ms=1793152800000 home_build_partial=1";
 
 /// What a machine's facts read with one key of the look unsent or unreadable: that figure
 /// unread and every other as it was. `m_at_ms` is not among them: its absence is an older
-/// member's header, its damage a look with no time.
+/// member's header, its damage a look with no time. Nor are the volume's free space and size,
+/// which are the header's own keys ([`SAMPLE_DISK_TOKENS`]).
 type Unread = fn(&mut MachineFacts);
-const LOOK_KEYS: [(&str, Unread); 28] = [
+const LOOK_KEYS: [(&str, Unread); 27] = [
     ("os", |m| m.os = None),
     ("target", |m| m.target = None),
     ("cores", |m| m.look.cores = None),
@@ -178,7 +192,6 @@ const LOOK_KEYS: [(&str, Unread); 28] = [
     ("mem_psi60_x100", |m| m.look.mem_psi60_x100 = None),
     ("swap_used_mb", |m| m.look.swap_used_mb = None),
     ("swap_total_mb", |m| m.look.swap_total_mb = None),
-    ("home_total_mb", |m| m.look.disk_total_mb = None),
     ("gpu_cores", |m| m.look.gpu_cores = None),
     ("gpu_busy_pct", |m| m.look.gpu_busy_pct = None),
     ("net_link_kbps", |m| m.look.net_link_kbps = None),
@@ -212,11 +225,11 @@ fn sample_token(key: &str) -> String {
         .unwrap_or_else(|| panic!("the sample sends {key}"))
 }
 
-/// A MACHINE'S LOOK CROSSES THE WIRE: the header carries every key after `home_free_mb=`, at
-/// facts as at content (a resource is no location), still ends with its access and drive words,
-/// and reads back figure for figure. An older member's header, which has none of the keys,
-/// reads as no look at all, and one key left out reads as that figure unread with the rest as
-/// they were.
+/// A MACHINE'S LOOK CROSSES THE WIRE: the header carries every key after `home_build_partial=`,
+/// at facts as at content (a resource is no location), still ends with its access and drive
+/// words, and reads back figure for figure. An older member's header, which has none of the
+/// keys, reads as no look at all, and one key left out reads as that figure unread with the rest
+/// as they were.
 /// NEGATIVE CONTROL (2026-11-12): with a missing key read as 0, the older member's look reads
 /// as a machine with no cores and no memory, and each one-key case fails on its figure.
 #[test]
@@ -229,12 +242,14 @@ fn a_machines_look_crosses_the_wire_and_an_older_member_sends_none() {
     let head = wire.lines().nth(1).expect("the instance line");
     assert!(
         head.contains(&format!(
-            " home_free_mb=812345{SAMPLE_MACHINE_TOKENS} accounts=3 "
+            "{SAMPLE_DISK_TOKENS}{SAMPLE_MACHINE_TOKENS} accounts=3 "
         )),
         "{head}"
     );
     assert!(
-        head.ends_with(" roster_unread=0 access=full drive=1"),
+        head.ends_with(
+            " roster_unread=0 store_worst=vault-records store_worst_pct=83 access=full drive=1"
+        ),
         "{head}"
     );
     let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
@@ -252,7 +267,7 @@ fn a_machines_look_crosses_the_wire_and_an_older_member_sends_none() {
     let head = content.lines().nth(1).expect("the instance line");
     assert!(
         head.contains(&format!(
-            " home_free_mb=812345{SAMPLE_MACHINE_TOKENS} home=/Users//a%20yates "
+            "{SAMPLE_DISK_TOKENS}{SAMPLE_MACHINE_TOKENS} home=/Users//a%20yates "
         )),
         "{head}"
     );
@@ -316,6 +331,21 @@ fn a_machines_look_crosses_the_wire_and_an_older_member_sends_none() {
             ..machine.clone()
         })
     );
+    // So is the size: without it neither the facts nor the look say one.
+    let sizeless = wire.replacen(" home_total_mb=1907000", "", 1);
+    assert_ne!(sizeless, wire);
+    let parsed = SwarmSurveyFacts::from_survey_reply(&sizeless).expect("valid");
+    assert_eq!(parsed.home_total_mb, None);
+    assert_eq!(
+        parsed.machine,
+        Some(MachineFacts {
+            look: MachineLook {
+                disk_total_mb: None,
+                ..machine.look.clone()
+            },
+            ..machine.clone()
+        })
+    );
 }
 
 /// AN UNREAD FIGURE IS A DASH ON THE WIRE: a look that read nothing says `-` under every key
@@ -350,6 +380,9 @@ fn an_unread_figure_is_a_dash_on_the_wire() {
     let facts = SwarmSurveyFacts {
         machine: Some(unread.clone()),
         home_free_mb: None,
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         ..sample_facts()
     };
     let wire = facts.to_survey_reply(
@@ -359,7 +392,13 @@ fn an_unread_figure_is_a_dash_on_the_wire() {
         1,
         (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
     );
-    assert!(wire.contains(" home_free_mb=- os=- "), "{wire}");
+    assert!(
+        wire.contains(
+            " home_free_mb=- home_total_mb=- home_build_mb=- home_build_at_ms=- \
+             home_build_partial=- os=- "
+        ),
+        "{wire}"
+    );
     assert_eq!(
         SwarmSurveyFacts::from_survey_reply(&wire)
             .expect("valid")
@@ -460,11 +499,10 @@ fn a_malformed_machine_figure_is_unread_and_the_reply_still_parses() {
     );
     // In range for a number and out of range for its figure.
     let long_target = format!("a{}", "b".repeat(48));
-    let ranged: [(&str, &str, Unread); 12] = [
+    let ranged: [(&str, &str, Unread); 11] = [
         ("cores", "0", |m| m.look.cores = None),
         ("cores", "4294967296", |m| m.look.cores = None),
         ("mem_total_mb", "0", |m| m.look.mem_total_mb = None),
-        ("home_total_mb", "0", |m| m.look.disk_total_mb = None),
         ("gpu_busy_pct", "101", |m| m.look.gpu_busy_pct = None),
         ("gpu_busy_pct", "256", |m| m.look.gpu_busy_pct = None),
         ("mem_pressure", "urgent", |m| m.look.mem_pressure = None),
@@ -613,10 +651,10 @@ fn a_malformed_load_reads_unread_while_cpu_lim_still_reads() {
 /// THIS MACHINE SAYS ITS OWN LOOK, AND ONLY IN AN ANSWER: the look carries the OS, the target
 /// atpkg selects by and the up-since instant. Collected facts carry none (the 3-minute facts
 /// push sends them as collected, and a look is taken only inside an answer), with the one
-/// volume read they always made; an answer takes the look, and the free space is then the
-/// look's own, of the volume holding the home the facts were collected for, read from its path
-/// even where the path is no UTF-8 that `home` could spell. Facts a listener kept take the look
-/// again. CONTROL: facts with no home read no volume.
+/// volume read they always made; an answer takes the look, and the free space and the size are
+/// then the look's own, of the volume holding the home the facts were collected for, read from
+/// its path even where the path is no UTF-8 that `home` could spell. Facts a listener kept take
+/// the look again. CONTROL: facts with no home read no volume.
 #[test]
 fn only_an_answer_takes_this_machines_look_and_it_reads_the_homes_volume() {
     let now = MachineFacts::now(None);
@@ -651,8 +689,8 @@ fn only_an_answer_takes_this_machines_look_and_it_reads_the_homes_volume() {
         SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
     assert_eq!(facts.machine, None, "collected facts take no look");
     assert!(
-        facts.home_free_mb.is_some(),
-        "the one volume read collected facts make"
+        facts.home_free_mb.is_some() && facts.home_total_mb.is_some(),
+        "the one volume read collected facts make: {facts:?}"
     );
     assert_eq!(facts.home_dir.as_deref(), Some(home.as_path()));
     assert!(
@@ -672,6 +710,7 @@ fn only_an_answer_takes_this_machines_look_and_it_reads_the_homes_volume() {
     let machine = answered.machine.clone().expect("an answer takes a look");
     assert!(machine.look.disk_total_mb.is_some(), "{machine:?}");
     assert_eq!(answered.home_free_mb, machine.look.disk_free_mb);
+    assert_eq!(answered.home_total_mb, machine.look.disk_total_mb);
 
     let mut kept = SwarmSurveyFacts {
         machine: Some(MachineFacts {
@@ -695,37 +734,448 @@ fn only_an_answer_takes_this_machines_look_and_it_reads_the_homes_volume() {
     assert_eq!(taken.target, machine.target);
     assert_eq!(kept.home_free_mb, taken.look.disk_free_mb);
     assert!(taken.look.disk_total_mb.is_some(), "the kept home's volume");
+    assert_eq!(kept.home_total_mb, taken.look.disk_total_mb);
 
     // A home whose path is no UTF-8 has no `home` words; its volume is read from its path.
     let mut unspelled = SwarmSurveyFacts {
         home: None,
         home_free_mb: Some(7),
+        home_total_mb: Some(9),
         ..facts.clone()
     };
     unspelled.take_latest_look();
     let look = unspelled.machine.clone().expect("a look").look;
     assert!(look.disk_total_mb.is_some(), "{look:?}");
     assert_eq!(unspelled.home_free_mb, look.disk_free_mb);
-    unspelled.take_latest_look();
-    assert_eq!(
-        unspelled.machine.map(|m| m.look),
-        Some(look),
-        "asked again within the keep, the one kept look"
-    );
+    assert_eq!(unspelled.home_total_mb, look.disk_total_mb);
 
     let mut homeless = SwarmSurveyFacts {
         home: None,
         home_dir: None,
         home_free_mb: Some(7),
+        home_total_mb: Some(9),
         ..facts
     };
     homeless.take_latest_look();
     let look = homeless.machine.expect("a look").look;
     assert_eq!(
-        (look.disk_total_mb, homeless.home_free_mb),
-        (None, None),
+        (
+            look.disk_total_mb,
+            homeless.home_free_mb,
+            homeless.home_total_mb
+        ),
+        (None, None, None),
         "CONTROL: no home, no volume"
     );
+}
+
+/// A SURVEY HEADER CARRIES THE HOME VOLUME'S TOTAL, FREE AND BUILD BYTES: collected facts say
+/// the size and the free space of the home's volume from their one volume read, and its build
+/// output as the disk watch's record of its last sizing of that volume keeps it (the bytes, when
+/// that sizing ended, whether it was cut short), never from a walk of the home. The header says
+/// all five right after `ssh_host_key=`, at facts as at content, with no path and no volume key,
+/// and they read back. An answer's look makes the size its own, and its header still says it
+/// once. A sizing cut short is said as a floor. A record of another volume, one whose sizing
+/// ended at no time after the epoch, and no record say no build output (`-`), and the size needs
+/// no record.
+/// NEGATIVE CONTROL: with the build output sized from the home (the bytes under its one marked
+/// build folder) instead of read from the record, it says 1 MiB, not 5120; with the record's
+/// volume unchecked, the other volume's 9216 is said; with the record's partial word dropped,
+/// the floor reads as whole; with its time of 0 read as a time, a sizing at the epoch is said;
+/// with the size left among the look's tokens too, the answer's header says `home_total_mb=`
+/// twice.
+#[test]
+fn a_survey_header_carries_the_home_volumes_total_free_and_build_bytes() {
+    use crate::harness::disk::{self, Rebuildable, budget};
+    use aterm_types::fleet_access::FleetAccess;
+
+    const NOW: i64 = 1_793_160_000;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    // A build folder in the home, marked as cargo marks one, which a survey that walked the home
+    // would count.
+    let build = home.join("proj/target/debug");
+    std::fs::create_dir_all(&build).expect("a build folder");
+    std::fs::write(build.join("blob"), vec![0_u8; 1 << 20]).expect("a build file");
+    std::fs::write(
+        build.parent().expect("its target").join(disk::RUSTC_INFO),
+        "{}",
+    )
+    .expect("the build folder's marker");
+    std::fs::create_dir_all(&state).expect("a state folder");
+    let volume =
+        disk::volume_of(&home, &aterm_sysprobe::volumes::table()).expect("the home's volume reads");
+    let spelled = volume.key.spelled();
+    let harness = state.join("harness").join(crate::harness::cli::HARNESS);
+    // The disk watch's record, kept as its own sizing keeps one: claimed, then kept.
+    let seed = |began: i64, key: String, sized: Rebuildable, sized_unix: i64| {
+        assert!(
+            matches!(
+                budget::claim(&harness, began),
+                Ok(budget::Claim::Claimed(_))
+            ),
+            "a sizing is due at {began}"
+        );
+        budget::keep(
+            &harness,
+            began,
+            budget::Sizing {
+                volume: key,
+                total: volume.total,
+                used: volume.total.saturating_sub(volume.free),
+                sized,
+                sized_unix,
+            },
+        )
+        .expect("the record is kept");
+    };
+    let sized = Rebuildable {
+        bytes: 5 << 30,
+        partial: false,
+    };
+    seed(NOW, spelled.clone(), sized, NOW - 7200);
+    let collect =
+        |state: &Path| SwarmSurveyFacts::collect_at(state, Some(&home), None, 0, false, None, NOW);
+    let facts = collect(&state);
+    let total = volume.total >> 20;
+    assert!(total > 0, "{volume:?}");
+    assert_eq!(facts.home_total_mb, Some(total), "{facts:?}");
+    let free = facts
+        .home_free_mb
+        .expect("the free space, read with the size");
+    assert!(free <= total, "{free} MiB free of {total}");
+    assert_eq!(
+        facts.home_build,
+        Some(HomeBuild {
+            mb: 5120,
+            at_ms: 1_793_152_800_000,
+            partial: false,
+        }),
+        "the record's figure, never a walk's"
+    );
+    let said = format!(
+        " home_free_mb={free} home_total_mb={total} home_build_mb=5120 \
+         home_build_at_ms=1793152800000 home_build_partial=0 "
+    );
+    let root = dir.path().to_str().expect("a scratch path in UTF-8");
+    let access = (FleetAccess::ReadOnly, false);
+    for content in [false, true] {
+        let wire =
+            facts.to_survey_reply_at(content, 1, Some("m22.local"), 1_793_160_000_000, 1, access);
+        let head = wire.lines().nth(1).expect("the instance line");
+        let key_at = head.find(" ssh_host_key=").expect("its host key");
+        let after = &head[key_at + 1..];
+        let after = &after[after.find(' ').expect("more after the host key")..];
+        assert!(after.starts_with(&said), "content={content}: {head}");
+        assert!(!head.contains(&spelled), "no volume key: {head}");
+        assert_eq!(
+            head.matches(aterm_codec::pct::encode(root).as_str())
+                .count(),
+            usize::from(content),
+            "no path but the home's own `home=` at content: {head}"
+        );
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
+        assert_eq!(
+            (parsed.home_free_mb, parsed.home_total_mb, parsed.home_build),
+            (facts.home_free_mb, facts.home_total_mb, facts.home_build),
+            "content={content}"
+        );
+    }
+
+    // An answer's look makes the size its own, and says it once.
+    let mut answered = facts.clone();
+    answered.take_latest_look();
+    let look = &answered
+        .machine
+        .as_ref()
+        .expect("an answer takes a look")
+        .look;
+    assert_eq!(answered.home_total_mb, look.disk_total_mb);
+    assert_eq!(answered.home_total_mb, Some(total), "the one volume's size");
+    assert_eq!(
+        answered.home_build, facts.home_build,
+        "the record, as collected"
+    );
+    let wire = answered.to_survey_reply(1, None, 1_793_160_000_000, 1, access);
+    let head = wire.lines().nth(1).expect("the instance line");
+    assert!(head.contains(" m_at_ms="), "{head}");
+    assert_eq!(head.matches(" home_total_mb=").count(), 1, "{head}");
+
+    // Another volume's sizing says nothing of this one.
+    seed(
+        NOW + budget::EVERY_S,
+        format!("{spelled}-elsewhere"),
+        Rebuildable {
+            bytes: 9 << 30,
+            partial: true,
+        },
+        NOW + budget::EVERY_S,
+    );
+    let elsewhere = collect(&state);
+    assert_eq!(elsewhere.home_build, None, "{elsewhere:?}");
+    assert_eq!(elsewhere.home_total_mb, Some(total));
+    assert!(
+        elsewhere
+            .to_survey_reply(1, None, 0, 1, access)
+            .contains(" home_build_mb=- home_build_at_ms=- home_build_partial=- "),
+        "unknown, never 0"
+    );
+
+    // A sizing cut short is a floor, said as one.
+    seed(
+        NOW + 2 * budget::EVERY_S,
+        spelled.clone(),
+        Rebuildable {
+            bytes: 3 << 20,
+            partial: true,
+        },
+        NOW,
+    );
+    assert_eq!(
+        collect(&state).home_build,
+        Some(HomeBuild {
+            mb: 3,
+            at_ms: 1_793_160_000_000,
+            partial: true,
+        }),
+        "a floor"
+    );
+    // A sizing whose end does not read as a time after the epoch says none.
+    seed(NOW + 3 * budget::EVERY_S, spelled, sized, 0);
+    assert_eq!(collect(&state).home_build, None, "a sizing at 0 is none");
+
+    // A state with no record: no build output, and the size needs none.
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir_all(&fresh).expect("a fresh state folder");
+    let sizeless = collect(&fresh);
+    assert_eq!(
+        (sizeless.home_build, sizeless.home_total_mb),
+        (None, Some(total))
+    );
+}
+
+/// AN OLDER HEADER WITHOUT TOTAL OR BUILD BYTES READS UNKNOWN, NEVER ZERO: a fleet runs mixed
+/// versions during an update. A header from an aterm before the size and the build keys (and
+/// before the look) reads no size, no build output and no look, and is said again with `-` under
+/// each new key, never 0. One from the aterm that said the size among the look's keys still
+/// reads its size, into the facts and the look alike, and no build output. A reader of that
+/// aterm finds every key it knows in a newer header, with its value, the size once and the free
+/// space where it stood; the newer header adds the three build keys and nothing else. A new key
+/// that is damaged or unsent reads as unknown alone, and the reply still parses; a size of 0 is
+/// no size, a sizing at time 0 none, and build output of 0 a measured 0.
+/// CONTROL: the same damage to `home_free_mb`, an older key, still refuses the reply.
+/// NEGATIVE CONTROL: with a new figure written or read through `unwrap_or(0)`, the older
+/// header's facts are said again with `=0`; with a new key parsed by `?`, each damaged case is
+/// an `Err`; with the size still among the look's tokens, the newer header says it twice.
+#[test]
+fn an_older_header_without_total_or_build_bytes_reads_unknown_never_zero() {
+    use aterm_types::fleet_access::FleetAccess;
+
+    /// The header of [`sample_wire`] as the aterm before these keys wrote it, frozen: the size
+    /// among the look's keys, after `swap_total_mb=`, and no build output.
+    const SIZED_IN_THE_LOOK: &str = "instance pid=4242 host=m22.local version=0.146.0 sessions=4 \
+         level=facts cut=0 at_ms=1793160000000 node=f1e2d3c4 instances=1 label=m22 window=1 \
+         window_last=1793160000 ssh_host_key=SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU \
+         home_free_mb=812345 os=macos target=aarch64-apple-darwin m_at_ms=1793159998500 \
+         cores=12 load1_x100=345 load5_x100=280 load15_x100=199 cpu_busy_x100=1130 \
+         rate_win_ms=60250 mem_total_mb=65536 mem_used_mb=40100 mem_avail_mb=21900 \
+         mem_pressure=warn mem_psi60_x100=1234 swap_used_mb=2048 swap_total_mb=4096 \
+         home_total_mb=1907000 gpu_cores=30 gpu_busy_pct=97 net_link_kbps=1000000 \
+         net_rx_kbps=5120 net_tx_kbps=640 net_other_kbps=17 up_since_ms=1793100000000 \
+         cpu_lim=0 mem_lim=1 disk_lim=0 gpu_lim=1 load=88:21 accounts=3 \
+         accounts_unread=grok,kimi moves_7d=2 move_tries_7d=3 last_move=1793159000 \
+         roster_unread=0 access=full drive=1";
+
+    let facts = sample_facts();
+    let machine = facts.machine.clone().expect("the sample carries a look");
+    let wire = sample_wire();
+    let read = |wire: &str, why: &str| {
+        SwarmSurveyFacts::from_survey_reply(wire).unwrap_or_else(|err| panic!("{why}: {err}"))
+    };
+    let rest = SwarmSurveyFacts {
+        home: None,
+        repos: None,
+        ..facts.clone()
+    };
+
+    // (a) An aterm before the new keys and before the look.
+    let mut older = wire.replacen(SAMPLE_MACHINE_TOKENS, "", 1);
+    for token in [
+        " home_total_mb=1907000",
+        " home_build_mb=84992",
+        " home_build_at_ms=1793152800000",
+        " home_build_partial=1",
+        " store_worst=vault-records",
+        " store_worst_pct=83",
+    ] {
+        let without = older.replacen(token, "", 1);
+        assert_ne!(without, older, "{token}");
+        older = without;
+    }
+    let parsed = read(&older, "an older aterm's");
+    assert_eq!(
+        parsed,
+        SwarmSurveyFacts {
+            home_total_mb: None,
+            home_build: None,
+            store_worst: None,
+            machine: None,
+            ..rest.clone()
+        },
+        "unknown, never 0, and the rest as it sent it"
+    );
+    let again = parsed.to_survey_reply(
+        4242,
+        Some("m22.local"),
+        1_793_160_000_000,
+        1,
+        (FleetAccess::Full, true),
+    );
+    let head = again.lines().nth(1).expect("the instance line");
+    assert!(
+        head.contains(
+            " home_free_mb=812345 home_total_mb=- home_build_mb=- home_build_at_ms=- \
+             home_build_partial=- accounts=3 "
+        ),
+        "{head}"
+    );
+
+    // (b) The aterm before this one: its size reads, in the facts and the look alike.
+    let new_head = wire.lines().nth(1).expect("the instance line");
+    let sized_in_look = wire.replacen(new_head, SIZED_IN_THE_LOOK, 1);
+    assert_ne!(sized_in_look, wire);
+    let parsed = read(&sized_in_look, "the aterm before this one's");
+    assert_eq!(
+        parsed,
+        SwarmSurveyFacts {
+            home_build: None,
+            store_worst: None,
+            ..rest.clone()
+        },
+        "its size and its look as it sent them, and no build output"
+    );
+    assert_eq!(
+        parsed.machine.and_then(|m| m.look.disk_total_mb),
+        Some(1_907_000)
+    );
+
+    // (c) A reader of that aterm, reading a newer header by key.
+    let keyed = |line: &str| -> Vec<(String, String)> {
+        line.split(' ')
+            .skip(1)
+            .filter_map(|token| token.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect()
+    };
+    let before = keyed(SIZED_IN_THE_LOOK);
+    let after = keyed(new_head);
+    for (key, value) in &before {
+        assert_eq!(
+            after.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            Some(value),
+            "{key}: {new_head}"
+        );
+    }
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(key, _)| key == "home_total_mb")
+            .count(),
+        1,
+        "the size once: {new_head}"
+    );
+    let added: Vec<&str> = after
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| before.iter().all(|(known, _)| known.as_str() != *key))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "home_build_mb",
+            "home_build_at_ms",
+            "home_build_partial",
+            "store_worst",
+            "store_worst_pct"
+        ]
+    );
+    let host_key = after
+        .iter()
+        .position(|(key, _)| key == "ssh_host_key")
+        .expect("its host key");
+    assert_eq!(
+        after[host_key + 1].0,
+        "home_free_mb",
+        "where it stood: {new_head}"
+    );
+
+    // (d) A new key damaged or unsent reads as unknown alone, and the reply still parses.
+    let sizeless = SwarmSurveyFacts {
+        home_total_mb: None,
+        machine: Some(MachineFacts {
+            look: MachineLook {
+                disk_total_mb: None,
+                ..machine.look.clone()
+            },
+            ..machine.clone()
+        }),
+        ..rest.clone()
+    };
+    let unbuilt = SwarmSurveyFacts {
+        home_build: None,
+        ..rest.clone()
+    };
+    for (key, sent, expected) in [
+        ("home_total_mb", "1907000", &sizeless),
+        ("home_build_mb", "84992", &unbuilt),
+        ("home_build_at_ms", "1793152800000", &unbuilt),
+        ("home_build_partial", "1", &unbuilt),
+    ] {
+        let token = format!(" {key}={sent} ");
+        for bad in ["x", "", "-1", "1.5", "99999999999999999999999"] {
+            let broken = wire.replacen(&token, &format!(" {key}={bad} "), 1);
+            assert_ne!(broken, wire, "{key}={bad}");
+            assert_eq!(
+                &read(&broken, &format!("{key}={bad}")),
+                expected,
+                "{key}={bad}"
+            );
+        }
+        let unsent = wire.replacen(&token, " ", 1);
+        assert_ne!(unsent, wire, "{key}");
+        assert_eq!(&read(&unsent, key), expected, "{key} unsent");
+    }
+    let zero = wire.replacen(" home_total_mb=1907000 ", " home_total_mb=0 ", 1);
+    assert_eq!(
+        read(&zero, "a size of 0"),
+        sizeless,
+        "a size of 0 is no size"
+    );
+    let untimed = wire.replacen(
+        " home_build_at_ms=1793152800000 ",
+        " home_build_at_ms=0 ",
+        1,
+    );
+    assert_eq!(
+        read(&untimed, "a time of 0"),
+        unbuilt,
+        "a sizing at 0 is none"
+    );
+    let none_built = wire.replacen(" home_build_mb=84992 ", " home_build_mb=0 ", 1);
+    assert_eq!(
+        read(&none_built, "a measured 0").home_build,
+        Some(HomeBuild {
+            mb: 0,
+            ..facts.home_build.expect("the sample's build output")
+        }),
+        "a measured 0 is 0"
+    );
+
+    // (e) CONTROL: an older key keeps its rule.
+    let free_broken = wire.replacen(" home_free_mb=812345 ", " home_free_mb=x ", 1);
+    assert_ne!(free_broken, wire);
+    assert!(SwarmSurveyFacts::from_survey_reply(&free_broken).is_err());
 }
 
 /// THE HOME'S CHECKOUTS CROSS THE WIRE AT CONTENT AND ARE READ BACK: `home=`,
@@ -1113,6 +1563,7 @@ fn a_pool_that_could_not_be_read_is_named_and_the_others_still_list() {
         pk: None,
         plan: None,
         plan_tier: None,
+        lifts: Vec::new(),
     };
     let claude = SurveyPool {
         moves: Some(PoolMoves {
@@ -1357,6 +1808,7 @@ fn an_account_rows_launch_crosses_the_wire_and_an_older_member_sends_none() {
         pk: None,
         plan: None,
         plan_tier: None,
+        lifts: Vec::new(),
     };
     let (rows, _, _, _) = account_facts_of([(
         Cli::Codex,
@@ -1767,4 +2219,72 @@ fn the_updaters_standing_crosses_the_wire_and_an_older_member_sends_none() {
     assert_eq!((update.checked_at, update.why), (None, None));
     assert_eq!((update.until, update.tries), (held.until, held.tries));
     assert_eq!(parsed.accounts, facts.accounts);
+}
+
+/// THE FULLEST STORE CROSSES THE WIRE as a fixed word and a share, the header's last keys before
+/// its access words, and reads back as sent; a header without them, or with either unreadable
+/// or a name that is no fixed word's shape, reads as none and the rest of the reply still
+/// reads. A share of 0 is a measurement, and one past 100 is a store past its bound.
+/// NEGATIVE CONTROL: with the name taken as sent, `store_worst=a%40b.example` reads as a store
+/// and `aterm fleet` shows an address in its STORE column.
+#[test]
+fn the_fullest_store_crosses_the_wire_as_a_fixed_word_and_a_share_or_not_at_all() {
+    let facts = sample_facts();
+    let wire = sample_wire();
+    let sent = " store_worst=vault-records store_worst_pct=83 ";
+    assert!(wire.contains(sent), "{wire}");
+    let read = |wire: &str| SwarmSurveyFacts::from_survey_reply(wire).expect("the reply reads");
+    assert_eq!(
+        read(&wire).store_worst,
+        StoreWorst::new("vault-records", 83)
+    );
+    let unknown = SwarmSurveyFacts {
+        store_worst: None,
+        home: None,
+        repos: None,
+        ..facts.clone()
+    };
+    for bad in [
+        " store_worst=- store_worst_pct=- ",
+        " store_worst=vault-records store_worst_pct=- ",
+        " store_worst=vault-records store_worst_pct=x ",
+        " store_worst=vault-records ",
+        " store_worst_pct=83 ",
+        " store_worst=a%40b.example store_worst_pct=83 ",
+        " store_worst=Vault store_worst_pct=83 ",
+        " store_worst=--- store_worst_pct=83 ",
+        " store_worst=abcdefghijklmnopqrstuvwxyzabcdefg store_worst_pct=83 ",
+        " ",
+    ] {
+        let broken = wire.replacen(sent, bad, 1);
+        assert_ne!(broken, wire, "{bad}");
+        assert_eq!(read(&broken), unknown, "{bad}");
+    }
+    for (pct, said) in [(0, "0"), (100, "100"), (104, "104")] {
+        let worst = StoreWorst::new("journal-outbox", pct);
+        let facts = SwarmSurveyFacts {
+            store_worst: worst.clone(),
+            ..facts.clone()
+        };
+        let head = facts.header_tokens(false);
+        assert!(
+            head.ends_with(&format!(
+                " store_worst=journal-outbox store_worst_pct={said}"
+            )),
+            "{head}"
+        );
+    }
+    // Collected facts carry none until the answering window or node job sizes the stores: `-`,
+    // never 0.
+    let unread = SwarmSurveyFacts {
+        store_worst: None,
+        ..facts
+    };
+    assert!(
+        unread
+            .header_tokens(false)
+            .ends_with(" store_worst=- store_worst_pct=-"),
+    );
+    assert_eq!(StoreWorst::new("", 1), None);
+    assert_eq!(StoreWorst::new("commons-table", 1).map(|w| w.pct), Some(1));
 }

@@ -165,9 +165,10 @@ impl Provider for Approved {
     ) -> Result<(), String> {
         match self.execute_attempt(context, row, staging, browser) {
             Execution::Completed => Ok(()),
-            Execution::NotStarted(why) | Execution::Unknown(why) | Execution::Deferred(why) => {
-                Err(why)
-            }
+            Execution::NotStarted(why)
+            | Execution::Unknown(why)
+            | Execution::Deferred(why)
+            | Execution::BotCheck(why) => Err(why),
         }
     }
     fn observe(

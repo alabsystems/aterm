@@ -352,7 +352,7 @@ pub fn state_line<V: Host>(slot: &Slot<V>, program: Option<&str>) -> Option<Stri
                 parts.push(context_left_words(pct));
             }
         }
-        None => match slot.program {
+        None => match &slot.program {
             Some((word, _)) => {
                 parts.clear();
                 parts.push(word.to_string());

@@ -180,15 +180,24 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
         (MAILBOX.derive, PHONE.derive),
         (Derive::Composite, Derive::Random)
     );
-    // A mailbox's patterns name address rows; a domain pattern's dots are no key, so they list.
+    // A mailbox's patterns name address rows; its domains are a text set from the fourth
+    // generation, each domain an element keyed by its digest, and one list before it.
     assert!(matches!(
         MAILBOX.column("receives").map(|c| &c.ty),
         Some(Ty::Set(inner)) if matches!(**inner, Ty::Ref("address"))
     ));
-    assert!(matches!(
-        MAILBOX.column("receives_domains").map(|c| &c.ty),
-        Some(Ty::List(..))
-    ));
+    assert_eq!(
+        MAILBOX
+            .column("receives_domains")
+            .and_then(|c| c.ty.text_set()),
+        Some(&Ty::Text(253))
+    );
+    for older in [&registry::MAILBOX_3, &registry::SEALED_MAILBOX] {
+        assert!(matches!(
+            older.column("receives_domains").map(|c| &c.ty),
+            Some(Ty::List(..))
+        ));
+    }
     assert!(matches!(
         MAILBOX.column("login").map(|c| &c.ty),
         Some(Ty::Ref("address"))
@@ -248,7 +257,14 @@ fn registry_secret_cells_name_store_entries_and_contacts_are_plain() {
         "mailbox.mailbox_password",
         "mailbox.totp",
     ];
-    assert_eq!(secret_columns(&registry::REGISTRY_3, &Ty::SecretRef), three);
+    for table in &registry::GENERATIONS[2..] {
+        assert_eq!(
+            secret_columns(table, &Ty::SecretRef),
+            three,
+            "{}",
+            table.role
+        );
+    }
     for table in &registry::GENERATIONS[..2] {
         assert!(
             secret_columns(table, &Ty::SecretRef).is_empty(),
@@ -265,7 +281,7 @@ fn registry_secret_cells_name_store_entries_and_contacts_are_plain() {
     let lab = Lab::new(&[Role::Writer]);
     newest(&lab.paths[0], 1_800_000_000_000);
     let registry = Registry::at(lab.paths[0].clone());
-    assert_eq!(registry.generation().generation, 3);
+    assert_eq!(registry.generation().generation, 4);
     let store = secret::Memory::default();
     let address = "lt04.fixture@example.invalid";
     let number = "2025550149";
@@ -396,7 +412,13 @@ pub(super) fn apply(records: &[Vec<Change>]) -> Cells {
                 id,
             })
             .unwrap();
-        crate::documents::apply(&index, &mut cells, id, changes, false);
+        crate::documents::apply(
+            &|later, earlier| index.observes(later, earlier),
+            &mut cells,
+            id,
+            changes,
+            false,
+        );
         previous = Some(id);
     }
     cells
@@ -1098,7 +1120,10 @@ fn a_reference_or_a_number_never_enters_a_generation_older_builds_read() {
                     )
                 })
                 .to_string();
-            assert!(error.contains("builds up to 0.200.0 read"), "{error}");
+            assert!(
+                error.contains("as the builds that read it know it"),
+                "{error}"
+            );
             assert!(
                 !error.contains(&entry) && !error.contains("2025550149"),
                 "{error}"
@@ -1115,4 +1140,102 @@ fn a_reference_or_a_number_never_enters_a_generation_older_builds_read() {
     assert_eq!(held(&rows[0]), secret::reference(Memory::VAULT, &entry));
     assert_eq!(held(&rows[1]), json!("2025550149"));
     assert!(crate::att::conform(&registry::REGISTRY_3, &mut [sealed]).is_err());
+}
+
+/// Each generation takes a Mac's hosts, its nickname aliases and a mailbox's domains only in the
+/// form the builds reading it know (LT-15B, [`crate::att::conform`]): the first three take the
+/// whole list and refuse an element, the fourth takes the element and refuses the list, and the
+/// refusal names no member. A set every generation holds alike (a Mac's aliases) is carried as it
+/// is, even an element this build's guards would refuse.
+/// NEGATIVE CONTROLS (run 2026-11-15): with `conform` re-typing no `Ty::Set` column, the fourth
+/// generation takes the whole list: `` registry.4 took a list ``; with it re-typing every list
+/// and set column (`set_apart` always true), the stray alias is refused: `` a set every
+/// generation holds alike is carried ``.
+#[test]
+fn each_generation_takes_a_free_text_set_only_in_its_own_form() {
+    let mc = keys::machine_pk("m70");
+    let mb = keys::mailbox_pk(&keys::address_pk("ann@example.invalid").unwrap()).unwrap();
+    let list = |collection: &crate::typed::Collection, pk: &str, col: &str, x: Value| {
+        crate::database::Change {
+            collection: collection.name.to_owned(),
+            key: CellKey {
+                pk,
+                col,
+                elem: None,
+            }
+            .encode()
+            .unwrap(),
+            value: Some(CellValue::owner(1, x).encode()),
+        }
+    };
+    let member = |collection: &crate::typed::Collection, pk: &str, col: &str, text: &str| {
+        cell::member_change(collection, pk, col, text, true, |x| CellValue::owner(1, x)).unwrap()
+    };
+    let lists = [
+        list(
+            &registry::LIST_MACHINE,
+            &mc,
+            "hosts",
+            json!(["studio.local"]),
+        ),
+        list(
+            &registry::LIST_MACHINE,
+            &mc,
+            "nickname_aliases",
+            json!(["Red Balloon"]),
+        ),
+        list(
+            &registry::MAILBOX_3,
+            &mb,
+            "receives_domains",
+            json!(["pm.example"]),
+        ),
+    ];
+    let members = [
+        member(&MACHINE, &mc, "hosts", "studio.local"),
+        member(&MACHINE, &mc, "nickname_aliases", "Red Balloon"),
+        member(&MAILBOX, &mb, "receives_domains", "pm.example"),
+    ];
+    let stray = crate::database::Change {
+        collection: MACHINE.name.to_owned(),
+        key: CellKey {
+            pk: &mc,
+            col: "aliases",
+            elem: Some("not-a-label"),
+        }
+        .encode()
+        .unwrap(),
+        value: Some(CellValue::owner(1, json!(true)).encode()),
+    };
+    for table in registry::GENERATIONS {
+        assert!(
+            crate::att::conform(table, &mut [stray.clone()]).is_ok(),
+            "a set every generation holds alike is carried ({})",
+            table.role
+        );
+    }
+    let (older, newest) = registry::GENERATIONS.split_at(3);
+    let newest = newest[0];
+    for (word, form, taken_by, refused_by) in [
+        ("list", &lists, older, newest),
+        ("member", &members, &[newest][..], older[2]),
+    ] {
+        for change in form {
+            for table in taken_by {
+                crate::att::conform(table, &mut [change.clone()])
+                    .unwrap_or_else(|error| panic!("{} refused its own form: {error}", table.role));
+            }
+            let error = crate::att::conform(refused_by, &mut [change.clone()])
+                .err()
+                .unwrap_or_else(|| panic!("{} took a {word}", refused_by.role))
+                .to_string();
+            assert!(
+                error.contains("as the builds that read it know it"),
+                "{error}"
+            );
+            for text in ["studio", "Balloon", "pm.example"] {
+                assert!(!error.contains(text), "{error}");
+            }
+        }
+    }
 }

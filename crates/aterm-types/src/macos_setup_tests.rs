@@ -11,6 +11,7 @@ use super::*;
 /// no placeholder installs something else.
 /// NEGATIVE CONTROL: the same processes with the installer's or the window's row taken out
 /// hold nothing, placeholder or not.
+#[cfg(unix)]
 #[test]
 fn the_tools_are_held_only_by_their_own_installers() {
     let cli = |exe: &std::path::Path| exe == std::path::Path::new("/stand-in/installs");

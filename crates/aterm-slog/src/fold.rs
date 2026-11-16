@@ -6,12 +6,19 @@
 use crate::field::{Key, Val};
 use crate::rec::Rec;
 
+#[path = "fold_desc.rs"]
+pub mod desc;
 #[path = "fold_mail.rs"]
 pub mod mail;
 #[path = "fold_snap.rs"]
 mod snap;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{BoxWord, Out, StepOut, WallKind, need_rank};
+pub use desc::{
+    DESC_AGENTS, DESC_CARRY_BYTES, DESC_CLAIMS, DESC_CLAIMS_MAX, DESC_HEAP_BYTES, DESC_SLOTS,
+    DESC_TEXT_BYTES, DESC_TURN_RING, DESC_UNKNOWN_SLOTS, DescClaim, DescIdent, DescRow, DescSlot,
+    DescSubject, Described, KNOWN_SLOTS, Rank, Shown, rank_of,
+};
 pub use mail::{
     MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, mail_in_window,
     mail_link_of,
@@ -381,6 +388,8 @@ pub struct SessionState {
     pub closed: Option<ClosedNode>,
     /// The newest record's time (wall ms).
     pub last_t: u64,
+    /// The description claims (`desc` marks) of the session and its agent runs, each with its author: what [`shown`] reads.
+    pub desc: Described,
 }
 
 impl SessionState {
@@ -635,7 +644,7 @@ impl Fold {
         &self.st
     }
 
-    /// The fold's estimated heap: its state, tracked nodes, field slots and owned content in fields, needs and claims.
+    /// The fold's estimated heap: its state, tracked nodes, field slots and owned content in fields, needs and claims, and the description claims' store ([`Described::heap`], at most [`DESC_HEAP_BYTES`]).
     #[must_use]
     pub fn footprint(&self) -> usize {
         let fields = |f: &NodeFields| {
@@ -686,6 +695,7 @@ impl Fold {
                         + c.as_name.as_ref().map_or(0, String::len)
                 })
                 .sum::<usize>()
+            + self.st.desc.heap()
     }
 
     /// Apply one record.
@@ -944,6 +954,7 @@ impl Fold {
                 .cloned()
         };
         self.st.open = [deepest(Lvl::Run), deepest(Lvl::Turn), deepest(Lvl::Step)];
+        self.desc_track();
     }
 
     fn on_open(&mut self, r: &Rec) {
@@ -1110,6 +1121,7 @@ impl Fold {
             Lvl::Turn => {
                 let b = turn_bucket(&mut self.st.totals, out);
                 *b = b.saturating_add(1);
+                self.desc_turn_closed(r, opened.as_ref().and_then(|o| o.par));
                 self.st.last[1] = Some(closed);
             }
             Lvl::Step => {
@@ -1202,6 +1214,7 @@ impl Fold {
                     *any = Some(claim);
                 }
             }
+            Kind::Desc => self.on_desc(r),
             Kind::Mail => match r.f.get_word(Key::Dir) {
                 Some("in") => {
                     self.st.totals.mail_in = self.st.totals.mail_in.saturating_add(1);
@@ -1311,6 +1324,7 @@ impl Fold {
             self.drop_needs(|n| n.node.lvl == Lvl::Step);
             self.mail.clear();
             self.in_since_human = false;
+            self.desc_reset(r);
             self.prune_links();
             self.reproject();
         }
@@ -1537,6 +1551,21 @@ pub fn shown_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
                 .filter(|c| c.by.is_trusted())
                 .filter(live)
         })
+}
+
+/// THE DESCRIPTION A READER IS SHOWN for `slot` (`title`, `description`, any other) at `now_wall`: the claim that stands for the session, or the one that stands for its open agent run (the newest agent run still open) when that one's author outranks the session's. A tie goes to the session.
+#[must_use]
+pub fn shown<'a>(st: &'a SessionState, slot: &str, now_wall: u64) -> Option<Shown<'a>> {
+    let session = st.desc.shown_in(Node::SESSION, slot, now_wall);
+    let agent = st
+        .desc
+        .open_agent()
+        .and_then(|a| st.desc.shown_in(a, slot, now_wall));
+    match (session, agent) {
+        (Some(s), Some(a)) if a.rank < s.rank => Some(a),
+        (None, a) => a,
+        (s, _) => s,
+    }
 }
 
 /// The verdict claims a reader is shown, in order: a proven author's newest (the harness's), the newest trusted one when it is another claim, then the newest of any author when that is yet another.

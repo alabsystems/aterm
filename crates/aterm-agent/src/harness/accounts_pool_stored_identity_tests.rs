@@ -401,6 +401,8 @@ fn polling_checks_identity_and_passes_the_canonical_expectation_to_its_reader() 
                         ..Default::default()
                     },
                     walls: Vec::new(),
+                    refusal: None,
+                    limits: Default::default(),
                 })
             },
         )
@@ -578,6 +580,8 @@ fn cached_usage_identity_case(named: bool) {
                             ..Sample::default()
                         },
                         walls: Vec::new(),
+                        refusal: None,
+                        limits: Default::default(),
                     })
                 },
             )

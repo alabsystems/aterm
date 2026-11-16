@@ -1725,8 +1725,8 @@ fn directory_reopen_fixture() -> (
         .unwrap()
         .point_for(Some(&target));
     let origin = app.document_store.snapshot(document).unwrap().text.len();
-    let Some(crate::native_app::AppViewState::Editor(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Editor(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("editor");
     };
@@ -1737,6 +1737,7 @@ fn directory_reopen_fixture() -> (
         query: "b.txt".into(),
         origin,
     };
+    drop(route_native_guard);
     (scratch, app, path, uri, document, view)
 }
 
@@ -1846,8 +1847,9 @@ fn directory_reopen_refuses_stale_base_or_selection_and_cancellation_keeps_the_l
         drive_until(&mut app, |_| entered_rx.try_recv().ok());
         WORK_OBSERVER.set(None);
         if mode == 0 {
+            let mut route_native_guard = app.native_runtime.view_state_mut(view);
             let Some(crate::native_app::AppViewState::Editor(state)) =
-                app.native_runtime.view_state_mut(view)
+                route_native_guard.as_deref_mut()
             else {
                 panic!("editor");
             };
@@ -2130,8 +2132,9 @@ fn explicit_async_directory_refresh_rejects_stale_state_and_cancellation_without
         drive_until(&mut app, |_| entered_rx.try_recv().ok());
         WORK_OBSERVER.set(None);
         if mode == 0 {
+            let mut route_native_guard = app.native_runtime.view_state_mut(view);
             let Some(crate::native_app::AppViewState::Editor(state)) =
-                app.native_runtime.view_state_mut(view)
+                route_native_guard.as_deref_mut()
             else {
                 panic!("editor");
             };
@@ -2259,14 +2262,16 @@ fn directory_refresh_joins_coordinates_by_view_identity_across_actual_tab_reorde
             .find(|(_, target)| target != &b_uri)
             .map(|(range, uri)| (range.start, uri.clone()))
             .expect("a distinct directory entry");
+        let mut route_native_guard = app.native_runtime.view_state_mut(second.view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            app.native_runtime.view_state_mut(second.view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("editor");
         };
         let buffer = state.buffer.as_mut().unwrap();
         buffer.selections = vec![crate::native_editor::Selection::caret(second_point)];
         buffer.viewport_anchor = second_point;
+        drop(route_native_guard);
         let before_order = app.document_native_views(document);
         let before = app.document_store.snapshot(document).unwrap();
         std::fs::write(path.join("a.txt"), "").unwrap();
@@ -2356,8 +2361,8 @@ fn directory_read_command(
     view: crate::tab_model::ViewId,
     command: crate::native_editor::EditorCommand,
 ) {
-    let Some(crate::native_app::AppViewState::Editor(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Editor(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("editor");
     };
@@ -2375,18 +2380,21 @@ fn directory_refresh_refuses_complete_selection_changes_even_when_head_and_viewp
     use crate::native_editor::{EditorCommand, Minibuffer, Selection};
     for mode in 0..4 {
         let (_scratch, mut app, path, uri, document, view) = directory_reopen_fixture();
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("editor");
         };
         state.buffer.as_mut().unwrap().minibuffer = Minibuffer::Inactive;
         // Prime vertical navigation so the actual mark/movement counterexample
         // also returns to its captured desired column, not just head/viewport.
+        drop(route_native_guard);
         directory_read_command(&mut app, view, EditorCommand::MoveLineUp);
         directory_read_command(&mut app, view, EditorCommand::MoveLineDown);
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("editor");
         };
@@ -2417,6 +2425,7 @@ fn directory_refresh_refuses_complete_selection_changes_even_when_head_and_viewp
                     .unwrap();
             }
         })));
+        drop(route_native_guard);
         let lease = app.prepare_document_open(admitted, GrantAccess::ReadWrite, &uri);
         drive_until(&mut app, |_| entered_rx.try_recv().ok());
         WORK_OBSERVER.set(None);
@@ -2425,8 +2434,9 @@ fn directory_refresh_refuses_complete_selection_changes_even_when_head_and_viewp
             directory_read_command(&mut app, view, EditorCommand::SetMark);
             directory_read_command(&mut app, view, EditorCommand::MoveLineDown);
         } else {
+            let mut route_native_guard = app.native_runtime.view_state_mut(view);
             let Some(crate::native_app::AppViewState::Editor(state)) =
-                app.native_runtime.view_state_mut(view)
+                route_native_guard.as_deref_mut()
             else {
                 panic!("editor");
             };

@@ -1547,3 +1547,226 @@ fn search_budgeted_matches_one_shot_and_restarts_when_superseded() {
     assert!(bad.complete() && bad.matches().is_empty());
     assert!(bad.reset() && bad.search_id().is_none());
 }
+
+#[test]
+fn same_font_size_preserves_settled_and_pending_frames() {
+    let mut t = AtermGpuTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"same px");
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    assert!(!t.needs_frame());
+    t.set_px(14.0).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "an unchanged size must not invalidate a settled frame"
+    );
+    t.render_headless().unwrap();
+    assert!(t.last_render_skipped());
+    t.process(b"!");
+    assert!(t.needs_frame());
+    t.set_px(14.0).unwrap();
+    assert!(
+        t.needs_frame(),
+        "a no-op must preserve pending output damage"
+    );
+    t.render_headless().unwrap();
+    assert!(!t.last_render_skipped());
+    t.set_px(15.0).unwrap();
+    assert!(t.needs_frame(), "a real size change must still invalidate");
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    assert!(!t.needs_frame());
+    assert!(t.set_px(1_000_000.0).is_err());
+    assert!(!t.needs_frame(), "refusal preserves the settled frame");
+}
+
+#[test]
+fn repeating_focus_style_preserves_settled_and_pending_frames() {
+    let mut t = AtermGpuTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"focus style");
+    t.selection_start(0, 0);
+    t.selection_extend(0, 4);
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    assert!(!t.needs_frame());
+    t.set_selection_inactive(false);
+    assert!(
+        !t.needs_frame(),
+        "an identical focus style must not invalidate"
+    );
+    t.set_selection_inactive_bg(None);
+    assert!(
+        !t.needs_frame(),
+        "an identical absent override must not invalidate"
+    );
+    t.set_selection_inactive(true);
+    assert!(t.needs_frame());
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    assert!(!t.needs_frame());
+    t.set_selection_inactive(true);
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    assert!(!t.needs_frame(), "identical inactive values must gate too");
+    t.process(b"!");
+    t.set_selection_inactive(true);
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    assert!(
+        t.needs_frame(),
+        "a no-op must preserve pending output damage"
+    );
+    t.render_headless().unwrap();
+    assert!(!t.last_render_skipped());
+    t.set_selection_inactive_bg(None);
+    assert!(t.needs_frame(), "clearing an override is a real change");
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    t.set_selection_inactive(false);
+    assert!(t.needs_frame(), "returning to focused is a real change");
+}
+
+#[test]
+fn repeating_render_settings_preserves_frame_and_normalization() {
+    let mut t = AtermGpuTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"render settings");
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    t.set_minimum_contrast(0.0);
+    assert!(!t.needs_frame(), "identical contrast must not invalidate");
+    t.set_background_opacity(1.0);
+    assert!(
+        !t.needs_frame(),
+        "identical background opacity must not invalidate"
+    );
+    t.set_cursor_opacity(1.0);
+    assert!(
+        !t.needs_frame(),
+        "identical cursor opacity must not invalidate"
+    );
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(t.needs_frame());
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(!t.needs_frame());
+    t.process(b"!");
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(
+        t.needs_frame(),
+        "identical settings preserve pending output"
+    );
+    t.render_headless().unwrap();
+    assert!(!t.last_render_skipped());
+    for (input, expected) in [
+        (f32::NAN, 1.0_f32),
+        (f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 1.0),
+        (2.0, 1.0),
+        (-1.0, 0.0),
+        (-0.0, -0.0),
+        (0.0, 0.0),
+        (0.25, 0.25),
+    ] {
+        t.set_background_opacity(input);
+        t.set_cursor_opacity(input);
+        assert_eq!(t.cpu.background_opacity().to_bits(), expected.to_bits());
+        assert_eq!(t.cpu.cursor_opacity().to_bits(), expected.to_bits());
+    }
+    t.set_minimum_contrast(f32::NAN);
+    assert!(t.cpu.minimum_contrast().is_nan());
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    t.set_minimum_contrast(f32::NAN);
+    assert!(
+        t.needs_frame(),
+        "nonfinite requests keep the existing forwarding path"
+    );
+}
+
+#[test]
+fn same_chrome_geometry_preserves_frames_and_refusals() {
+    let mut t = AtermGpuTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.set_chrome(0, 0).unwrap();
+    t.process(b"chrome geometry");
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    let plain = t.checked_surface_size().unwrap();
+    t.set_chrome(0, 0).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "identical exact-fit chrome must not invalidate"
+    );
+    t.set_chrome(4, 6).unwrap();
+    assert!(t.needs_frame());
+    t.render_headless().unwrap();
+    t.render_headless().unwrap();
+    assert_eq!(
+        t.checked_surface_size().unwrap(),
+        (plain.0 + 8, plain.1 + 14)
+    );
+    assert_eq!((t.chrome_pad(), t.chrome_head()), (4, 6));
+    t.set_chrome(4, 6).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "identical installed chrome must not invalidate"
+    );
+    t.process(b"!");
+    t.set_chrome(4, 6).unwrap();
+    assert!(t.needs_frame(), "same geometry preserves pending output");
+    t.render_headless().unwrap();
+    assert!(!t.last_render_skipped());
+    t.render_headless().unwrap();
+    assert!(t.set_chrome(u16::MAX, u16::MAX).is_err());
+    assert_eq!((t.chrome_pad(), t.chrome_head()), (4, 6));
+    assert!(!t.needs_frame(), "refusal must preserve the settled frame");
+    t.set_chrome(0, 0).unwrap();
+    assert!(t.needs_frame());
+    t.render_headless().unwrap();
+    assert_eq!(t.checked_surface_size().unwrap(), plain);
+}

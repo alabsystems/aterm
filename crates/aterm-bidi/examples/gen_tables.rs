@@ -59,7 +59,7 @@ fn main() -> ExitCode {
     let crate_dir = aterm_tempfile::manifest_dir();
     let done = match args.as_slice() {
         [verb, derived, brackets] if verb == "tables" => tables(&read(derived), &read(brackets))
-            .and_then(|text| aterm_census::seal::stamp(&text))
+            .and_then(|text| aterm_seal::stamp(&text))
             .and_then(|text| write(&crate_dir.join("src/tables.rs"), &text)),
         [verb, bidi_test, character_test] if verb == "subset" => {
             let data = crate_dir.join("tests/data");
@@ -173,7 +173,7 @@ fn tables(
     }
     let mut out = format!(
         "{LICENCE_HEADER}{}\n{HEADER}",
-        aterm_census::seal::line("//", GENERATOR)
+        aterm_seal::line("//", GENERATOR)
     );
     out.push_str(&format!(
         "// Generated from the Unicode Character Database {version} (extracted/DerivedBidiClass.txt,\n\

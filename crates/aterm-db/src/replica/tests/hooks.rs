@@ -268,8 +268,8 @@ fn an_audit_takes_the_regular_turn_where_an_ask_keeps_a_follow_up() {
         // The peer answers no ask, as a build from before CR1: the follow-up alone names the
         // table, not the tables whose witnesses differ.
         let endpoints = [
-            endpoint(&lab, &tables, 0),
-            endpoint(&lab, &tables, 1).with_witnesses(false),
+            endpoint(&lab, &tables, 0).duplex(),
+            endpoint(&lab, &tables, 1).duplex().with_witnesses(false),
         ];
         let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
         assert_eq!(

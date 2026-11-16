@@ -263,13 +263,8 @@ fn the_drain_stamps_each_echo_cue_at_its_own_instant() {
     let _ = app.trail_audio.take_captured_with_meta_for_test();
 
     {
-        let glow = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .cursor_mut()
-            .glow;
+        let mut payload_guard_glow = app.windows.get_mut(&wid).expect("window");
+        let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
         for i in 0..3u64 {
             assert!(
                 glow.cue_keystroke(t0 + Duration::from_millis(1 + i)),
@@ -335,21 +330,16 @@ fn the_drain_marks_the_enter_that_ran_a_command_at_the_prompt_and_no_other() {
     app.cursor_frame(wid, super::CursorFxInputs::sample_for_test(t0))
         .expect("the fixture window ticks");
     let _ = app.trail_audio.take_captured_with_meta_for_test();
-
     let frame = |app: &mut crate::App, at_ms: u64, kinds: &[SoundKind]| -> Vec<(bool, bool)> {
-        let glow = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .cursor_mut()
-            .glow;
+        let mut payload_guard_glow = app.windows.get_mut(&wid).expect("window");
+        let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
         for (i, kind) in kinds.iter().enumerate() {
             assert!(
                 glow.cue_keystroke_kind(t0 + Duration::from_millis(at_ms + i as u64), *kind),
                 "the backlog takes cue {i}"
             );
         }
+        drop(payload_guard_glow);
         app.cursor_frame(
             wid,
             super::CursorFxInputs::sample_for_test(t0 + Duration::from_millis(at_ms + 16)),

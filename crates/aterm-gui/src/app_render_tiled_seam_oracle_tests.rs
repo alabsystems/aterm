@@ -283,7 +283,7 @@ impl Corpus {
 
     fn resize(&mut self, rows: u16, cols: u16) {
         {
-            let ws = self.app.windows.get_mut(&self.wid).expect("test window");
+            let mut ws = self.app.windows.get_mut(&self.wid).expect("test window");
             ws.rows = rows;
             ws.cols = cols;
         }
@@ -320,7 +320,7 @@ impl Corpus {
         self.feed(session, b"x");
         let (rows, cols) = self.dims();
         if self.poison {
-            let ws = self.app.windows.get_mut(&self.wid).expect("test window");
+            let mut ws = self.app.windows.get_mut(&self.wid).expect("test window");
             for row in &mut ws.input_scratch.cells {
                 row.fill(poison_cell());
             }
@@ -512,19 +512,19 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("settled with every pane live again");
 
     {
-        let ws = c.app.windows.get_mut(&wid).expect("test window");
+        let mut ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.preedit = "\u{3053}\u{3093}".to_string();
         ws.preedit_caret = Some(1);
     }
     c.step("IME preedit on the focused pane");
     {
-        let ws = c.app.windows.get_mut(&wid).expect("test window");
+        let mut ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.preedit = "\u{3053}\u{3093}\u{306b}\u{3061}".to_string();
         ws.preedit_caret = Some(3);
     }
     c.step("IME preedit grown");
     {
-        let ws = c.app.windows.get_mut(&wid).expect("test window");
+        let mut ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.preedit.clear();
         ws.preedit_caret = None;
     }
@@ -542,7 +542,7 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
             )
         };
         let now = c.now + FRAME;
-        let ws = c.app.windows.get_mut(&wid).expect("test window");
+        let mut ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.predictor.set_mode(crate::predict::PredictMode::Always);
         let cols = ws.cols;
         assert!(
@@ -776,7 +776,7 @@ fn a_host_write_into_the_composite_revokes_the_retention_only_when_it_says_so() 
              revoke below would prove nothing"
         );
         {
-            let ws = c.app.windows.get_mut(&c.wid).expect("test window");
+            let mut ws = c.app.windows.get_mut(&c.wid).expect("test window");
             for row in &mut ws.input_scratch.cells {
                 row.fill(poison_cell());
             }

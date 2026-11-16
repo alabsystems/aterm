@@ -52,6 +52,7 @@ pub fn header() -> Header {
         build: 9,
         exposes: vec!["ay".into(), "ay-lsp".into()],
         shim_env: Vec::new(),
+        harness: None,
     }
 }
 
@@ -404,4 +405,38 @@ fn bottle_environment_is_validated_preserved_and_checked() {
     }
     h.shim_env = vec!["PATH=/tmp".into()];
     assert!(pkgdoc::fresh_bottle(&h, &a).is_err());
+}
+
+/// A harness's declaration rides inside the signed bytes, the client parses it back as packed,
+/// and a merge refuses a base whose declaration differs.
+#[test]
+fn a_harness_declaration_is_signed_into_the_manifest_and_read_back() {
+    let tmp = scratch("pkgdoc-harness");
+    let keys = Keys::mint("m3", &[]);
+    let q = head(&keys, tmp.path());
+    let declared = atpkg::harness_record::harness_table_of(
+        "[harness]\nid = \"kimi-alab\"\ntool = \"kimi-alab\"\nleads = [\"kimi\"]\n\
+         name = \"Kimi Code\"\nenv_strip = [\"KIMI_\"]\n",
+    )
+    .expect("a declaration");
+    let mut h = header();
+    h.program = "kimi-alab".into();
+    h.exposes = vec!["kimi-alab".into()];
+    h.harness = Some(declared.clone());
+    let mut r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
+    r.asset = pkgdoc::asset_name("kimi-alab", 9, AARCH64_APPLE_DARWIN);
+    let doc = pkgdoc::fresh(&h, &r).expect("render");
+    let parsed = verified(&keys, &q, &doc);
+    pkgdoc::check_parsed(&parsed, &h, &r).expect("the declaration reads back as packed");
+    assert_eq!(parsed.harness.as_ref(), Some(&declared));
+    let d = atpkg::harness_record::Declaration::from_table(&declared, true).expect("strict");
+    assert_eq!(d.leads, ["kimi"]);
+
+    let mut other = h.clone();
+    other.harness = None;
+    let second = row(X86_64_APPLE_DARWIN, Kind::Binary);
+    assert!(
+        pkgdoc::merge(doc.bytes().to_vec(), &other, &second).is_err(),
+        "a base whose declaration differs is refused"
+    );
 }

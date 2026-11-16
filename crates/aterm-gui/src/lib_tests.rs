@@ -570,7 +570,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     let blink_deadline = now + Duration::from_secs(2);
     let mut trail_cfg = app.trail_config();
     trail_cfg.intensity = 1.0;
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx.cursor_mut().glow.note_kill(now, true);
     let mut emitted_trail = Vec::new();
     ws.fx
@@ -612,7 +612,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         "negative-control live notes"
     );
     let pet = crate::app_render::pet_tick_for_test(
-        ws,
+        &mut ws,
         aterm_effects::host::CaptureMode::StaticCapture,
         aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
@@ -676,11 +676,14 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         ..Default::default()
     };
     let body = tiles.tile(1).expect("baked").clone();
-    ws.fx.publish_for_test(
-        &[aterm_render::sprites::FreeSprite::whole(0, 0, body)],
-        (&[cell], &tiles),
-        &mut ws.input_scratch,
-    );
+    {
+        let ws = &mut **ws;
+        ws.fx.publish_for_test(
+            &[aterm_render::sprites::FreeSprite::whole(0, 0, body)],
+            (&[cell], &tiles),
+            &mut ws.input_scratch,
+        );
+    }
     let rain_rows = |input: &aterm_render::RenderInput| {
         let layers = input.fx_layers.iter();
         layers
@@ -703,6 +706,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     ws.pill_shown = true;
     ws.focused = false;
     ws.last_key_at = Some(now);
+    drop(ws);
 
     assert!(app.set_serious_mode(true));
     assert!(app.serious_mode_enabled());
@@ -758,7 +762,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
         "serious mode is not reduced motion; smooth functional UI remains enabled"
     );
 
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.drain_serious_effects();
     assert_eq!(
         ws.last_key_at,
@@ -784,7 +788,7 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
 fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     use aterm_effects::companion::RESIDENT_SHED_CADENCE;
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = true;
     let mut now = Instant::now();
     let present = |ws: &mut crate::WindowState, now, col, shed| {
@@ -794,17 +798,17 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     };
     for _ in 0..40 {
         now += Duration::from_millis(16);
-        present(ws, now, 10, (1.0, false));
+        present(&mut ws, now, 10, (1.0, false));
     }
     now += Duration::from_millis(16);
-    present(ws, now, 60, (1.0, false));
+    present(&mut ws, now, 60, (1.0, false));
     assert!(
         ws.fx.companion().needs_frames() && ws.cursor_dependents_need_frame_cadence(now, true),
         "fixture: a resident running after a far caret claims the train"
     );
 
     now += Duration::from_millis(16);
-    present(ws, now, 60, (1.0, true));
+    present(&mut ws, now, 60, (1.0, true));
     assert!(
         ws.fx.companion().brain().needs_frames(),
         "the body is still moving"
@@ -838,7 +842,7 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
             .companion()
             .next_change_deadline(now)
             .expect("a moving pet is offered");
-        present(ws, now, 60, (0.0, true));
+        present(&mut ws, now, 60, (0.0, true));
     }
     assert!(settled, "fixture: the offers carry it home");
     assert!(!ws.fx.companion().needs_frames());
@@ -854,7 +858,7 @@ fn a_shed_resident_keeps_moving_on_its_coarse_offer_never_the_train() {
     );
 
     now += Duration::from_millis(16);
-    present(ws, now, 30, (0.4, false));
+    present(&mut ws, now, 30, (0.4, false));
     assert!(
         ws.fx.companion().needs_frames() && ws.cursor_dependents_need_frame_cadence(now, true),
         "the cleared latch hands the resident its train back"
@@ -868,7 +872,7 @@ fn wake_expiry_preserves_exactly_one_cursor_effect_settle_present() {
     let mut app = App::headless_for_test();
     let now = Instant::now();
     let deadline = now + Duration::from_millis(12);
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = false;
     ws.last_key_at =
         now.checked_sub(crate::app_render::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1));
@@ -1009,7 +1013,7 @@ fn lane_wake_census() -> LaneCensus {
         win_h: 1040,
         head: 0,
     };
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let mut census = LaneCensus::default();
     let script = lane_census_schedule();
     let t0 = Instant::now();
@@ -1068,7 +1072,7 @@ fn lane_wake_census() -> LaneCensus {
             next_ev += 1;
         }
         ws.service_due_terminal_effect_tick(now);
-        let a = charge(ws, now);
+        let a = charge(&mut ws, now);
         ws.fx
             .cursor_mut()
             .glow
@@ -1102,7 +1106,7 @@ fn lane_wake_census() -> LaneCensus {
             &caret_cfg,
             &mut out,
         );
-        let b = charge(ws, now);
+        let b = charge(&mut ws, now);
         if now >= last_at {
             let since = now.saturating_duration_since(last_at).as_millis() as u64;
             census.tail_arms += u32::from(a) + u32::from(b);
@@ -1163,7 +1167,7 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
 
     let mut app = App::headless_for_test();
     let t0 = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = true;
     ws.frame_interval = Some(Duration::from_nanos(8_333_333));
     let interval = ws.effect_present_interval();
@@ -1195,7 +1199,7 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
 
     let mut t = t0;
     loop {
-        tick_caret(ws, t, &mut halo);
+        tick_caret(&mut ws, t, &mut halo);
         if ws.fx.cursor().rainbow.settling() {
             break;
         }
@@ -1230,7 +1234,7 @@ fn the_settling_rainbow_caret_keeps_the_lane_to_its_last_step() {
             ws.service_due_terminal_effect_tick(deadline),
             "the armed clock is due at its deadline"
         );
-        tick_caret(ws, deadline, &mut halo);
+        tick_caret(&mut ws, deadline, &mut halo);
         wakes += 1;
         match ws.plan_terminal_effect_lane(deadline, false, true) {
             Some(next) => {
@@ -1298,7 +1302,7 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
     };
     let mut app = App::headless_for_test();
     let t0 = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.focused = true;
     ws.frame_interval = Some(Duration::from_nanos(8_333_333));
     let interval = ws.effect_present_interval();
@@ -1321,12 +1325,12 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
         t = t0 + Duration::from_millis(60 * u64::from(k));
         col = 10 + k;
         ws.fx.cursor_mut().momentum.on_key(t, MOMENTUM_GLOW_TAU_S);
-        tick(ws, t, col, &mut halo);
+        tick(&mut ws, t, col, &mut halo);
     }
     let last_key = t;
     while !ws.fx.cursor().momentum.settling() {
         t += interval;
-        tick(ws, t, col, &mut halo);
+        tick(&mut ws, t, col, &mut halo);
         assert!(
             t.saturating_duration_since(t0) < Duration::from_secs(10),
             "fixture: the glow's frames never stopped moving"
@@ -1358,7 +1362,7 @@ fn the_settling_momentum_glow_keeps_the_lane_to_its_last_frame() {
             ws.service_due_terminal_effect_tick(deadline),
             "the armed clock is due at its deadline"
         );
-        let frame = tick(ws, deadline, col, &mut halo);
+        let frame = tick(&mut ws, deadline, col, &mut halo);
         wakes += 1;
         match ws.plan_terminal_effect_lane(deadline, false, true) {
             Some(next) => {
@@ -1392,7 +1396,7 @@ fn static_collection_hello_uses_cursor_effect_presentability() {
     let wid = WindowId(0);
     let now = std::time::Instant::now();
     {
-        let ws = app.windows.get_mut(&wid).expect("test window");
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -1421,7 +1425,7 @@ fn static_collection_hello_uses_cursor_effect_presentability() {
 
     let mut paused = App::headless_for_test();
     {
-        let ws = paused.windows.get_mut(&wid).expect("test window");
+        let mut ws = paused.windows.get_mut(&wid).expect("test window");
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -2426,13 +2430,13 @@ fn two_windows_mixed_dpi_each_resolve_their_own_cell_size() {
     use super::{App, MetricsView, WindowId};
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&w0) {
+    if let Some(mut ws) = app.windows.get_mut(&w0) {
         ws.scale = 1.0;
         ws.metrics = MetricsView::for_scale(1.0);
     }
     let w1 = WindowId(1);
     app.install_window_state(w1, super::stub_session(1), 24, 80);
-    if let Some(ws) = app.windows.get_mut(&w1) {
+    if let Some(mut ws) = app.windows.get_mut(&w1) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
     }
@@ -2487,13 +2491,13 @@ fn reload_refreshes_every_window_metric_to_the_new_font_size() {
     use super::{App, MetricsView, WindowId};
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&w0) {
+    if let Some(mut ws) = app.windows.get_mut(&w0) {
         ws.scale = 1.0;
         ws.metrics = MetricsView::for_scale(1.0);
     }
     let w1 = WindowId(1);
     app.install_window_state(w1, super::stub_session(1), 24, 80);
-    if let Some(ws) = app.windows.get_mut(&w1) {
+    if let Some(mut ws) = app.windows.get_mut(&w1) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
     }
@@ -2530,7 +2534,7 @@ fn live_font_zoom_refreshes_per_window_metrics() {
     let w0 = WindowId(0);
     let w1 = WindowId(1);
     app.install_window_state(w1, super::stub_session(1), 24, 80);
-    if let Some(ws) = app.windows.get_mut(&w1) {
+    if let Some(mut ws) = app.windows.get_mut(&w1) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
     }
@@ -2588,7 +2592,7 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     let mut app = App::headless_for_test();
     let w0 = WindowId(0);
     let win = PhysicalSize::new(1808u32, 1452u32);
-    if let Some(ws) = app.windows.get_mut(&w0) {
+    if let Some(mut ws) = app.windows.get_mut(&w0) {
         ws.scale = 2.0;
         ws.metrics = MetricsView::for_scale(2.0);
         ws.win_px = Some(win);

@@ -264,6 +264,69 @@ fn no_broker_is_not_installed_and_says_what_installs_it() {
     ));
 }
 
+/// Where no broker answers, a dial names why from what it reads: no plist is a broker not
+/// installed, which launchd is never asked about; an installed job launchd lists switched off
+/// (aterm's background item off in Login Items, or `launchctl disable`) says so and names what
+/// puts it back, never setup's elevation, which leaves that job alone; any other installed job,
+/// one whose switch launchd cannot say included, is not running, which the elevation starts.
+/// MUTANT: an `absent` that reads no switch names the switched-off job `NotRunning` or
+/// `NotInstalled`; one that asks launchd about a job not installed calls the panicking reading.
+#[test]
+fn a_broker_switched_off_in_launchd_says_so_and_what_puts_it_back() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let hello = |installed_job| {
+        let seam = Seam {
+            socket: Some(root.path().join("absent.sock")),
+            installed_job,
+            ..Seam::default()
+        };
+        seam_here(seam, broker::hello).unwrap_err()
+    };
+    let off = hello(Some(Some(true)));
+    assert!(
+        matches!(off, LanError::Unavailable(Unavailable::SwitchedOff)),
+        "{off:?}"
+    );
+    assert!(
+        off.to_string()
+            .contains("`sudo launchctl enable system/systems.alab.aterm-lan`"),
+        "{off}"
+    );
+    for switch in [Some(false), None] {
+        let stopped = hello(Some(switch));
+        assert!(
+            matches!(stopped, LanError::Unavailable(Unavailable::NotRunning)),
+            "{switch:?}: {stopped:?}"
+        );
+        assert!(
+            stopped
+                .to_string()
+                .contains("`sudo aterm machines here apply --plain`"),
+            "{stopped}"
+        );
+    }
+    assert!(matches!(
+        hello(None),
+        LanError::Unavailable(Unavailable::NotInstalled)
+    ));
+    assert_eq!(
+        absent_given(
+            || false,
+            || panic!("a job not installed asks launchd nothing")
+        ),
+        Unavailable::NotInstalled
+    );
+    assert_eq!(
+        absent_given(|| true, || Some(true)),
+        Unavailable::SwitchedOff
+    );
+    assert_eq!(
+        absent_given(|| true, || Some(false)),
+        Unavailable::NotRunning
+    );
+    assert_eq!(absent_given(|| true, || None), Unavailable::NotRunning);
+}
+
 #[test]
 fn a_broker_of_another_protocol_is_outdated() {
     let (seam, _root, served) = stand_in(PROTOCOL + 1, |_, _| {});

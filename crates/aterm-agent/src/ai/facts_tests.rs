@@ -2392,6 +2392,7 @@ fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
 /// pool's `next` and `next_sign_in` and Claude Code's `next_sign_in`, leaves out a row whose account
 /// the sheet gives m22, since nobody named it and that command also runs with nobody at the Mac.
 /// `CONTROL`: the sheet naming this Mac.
+#[cfg(unix)]
 #[test]
 fn the_next_sign_in_is_never_another_macs_account() {
     use crate::harness::accounts;
@@ -2528,6 +2529,7 @@ fn another_macs_refusal_names_each_clis_own_sign_in() {
 /// would be the target. It is refused instead, naming whose it is and the verb that borrows it,
 /// for Claude Code and a pool. `CONTROL`: a person's pin is that person naming the row, and the
 /// sheet naming this Mac leaves it the target.
+#[cfg(unix)]
 #[test]
 fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     use crate::harness::accounts;

@@ -27,8 +27,8 @@ fn find_again_actions_step_an_open_bar_and_resume_a_closed_one() {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .query = "hit".into();
     app.search_recompute();
@@ -74,8 +74,8 @@ fn select_all_action_selects_the_screen_and_defers_to_an_open_find() {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .query = "hit one".into();
     app.search_recompute();

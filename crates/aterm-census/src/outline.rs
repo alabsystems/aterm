@@ -155,7 +155,7 @@ pub fn plan(
     if source.whole() {
         out.refused.push((String::new(), Refusal::Whole));
     }
-    if !matches!(crate::seal::check(text), crate::seal::Seal::Absent) {
+    if !matches!(aterm_seal::check(text), aterm_seal::Seal::Absent) {
         for module in source.test_modules() {
             out.refused.push((module.name.clone(), Refusal::Generated));
         }

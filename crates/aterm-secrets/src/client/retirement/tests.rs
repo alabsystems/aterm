@@ -1909,3 +1909,126 @@ fn a_plain_removal_rotates_the_fleet_code_and_denies_nothing() {
     assert!(after.deny_labels.is_empty() && after.deny_nodes.is_empty());
     assert!(after.members.is_empty(), "its roster row goes");
 }
+
+/// A pool file of `accounts` accounts, each warm on m2 and m1: over 64 KiB from some 700 of them.
+fn pool_of(accounts: usize) -> String {
+    let mut pool = "version = 1\n".to_owned();
+    for n in 0..accounts {
+        pool.push_str(&format!(
+            "\n[[account]]\nprovider = \"claude\"\nemail = \"account-{n:04}@example.test\"\nwarm = [\"m2\", \"m1\"]\n"
+        ));
+    }
+    pool
+}
+
+/// The vault text's 64 KiB door holds back no removal. A removal rewrites `ai-pool.toml`, fleet
+/// configuration, without the removed Mac's labels; where the vault holds a pool file over
+/// 64 KiB (an older build wrote it) the rewrite is over it too, and both the admin's revoke
+/// cascade and the repair of a half-done revoke write it. Held to the door, a removal from a
+/// lab with a large pool file would be refused for a size no removal chose.
+///
+/// CONTROL, in the test: the rewritten value, set by an author into the text that held the
+/// file before, is refused.
+#[test]
+fn vault_fill_door_holds_back_no_removals_rewrite_of_a_large_pool_file() {
+    use crate::text::MAX_CONFIGURATION_VALUE;
+    let pool = pool_of(900);
+    assert!(pool.len() > MAX_CONFIGURATION_VALUE + 4096, "CONTROL");
+    let rewritten = |doc: &Document| {
+        let entry = doc.entry(&Audience::Everyone, AI_POOL_ENTRY).unwrap();
+        std::str::from_utf8(entry.value.as_slice())
+            .unwrap()
+            .to_owned()
+    };
+
+    // The repair of a half-done revoke: m2's roster row names a node the roster denies.
+    let r1 = Identity::generate().unwrap().recipient().to_bech32();
+    let r2 = Identity::generate().unwrap().recipient().to_bech32();
+    let mut doc = Document::new_vault("m1", &r1);
+    doc.add_machine("m2", &r2).unwrap();
+    let nk2 = "dd".repeat(32);
+    let member =
+        |label: &str, recipient: &str, node_key: Option<String>| crate::swarm_roster::SwarmMember {
+            label: label.to_owned(),
+            vault_name: label.to_owned(),
+            recipient: recipient.to_owned(),
+            node_id: None,
+            node_key,
+            hint: None,
+            hw_hint: None,
+            admitted_ms: 1000,
+            aliases: Vec::new(),
+            claimed_label: None,
+            claimed_at_ms: None,
+        };
+    let roster = crate::swarm_roster::SwarmRoster {
+        members: vec![
+            member("m1", &r1, None),
+            member("m2", &r2, Some(nk2.clone())),
+        ],
+        deny_labels: Vec::new(),
+        deny_nodes: vec![nk2],
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    doc.hold_entry_with(
+        &Audience::Everyone,
+        AI_POOL_ENTRY,
+        pool.as_bytes(),
+        false,
+        None,
+    )
+    .expect("the pool file, as an older build wrote it");
+    let held = doc.clone();
+    let summary = repair_half_done_revokes(&mut doc)
+        .expect("the repair is held to no size")
+        .expect("m2 is retired");
+    assert!(
+        summary.contains("released denied warm slots"),
+        "summary: {summary}"
+    );
+    let after = rewritten(&doc);
+    assert!(
+        !after.contains("\"m2\"") && after.len() > MAX_CONFIGURATION_VALUE,
+        "the rewrite drops m2 and is still over 64 KiB: {}",
+        after.len()
+    );
+    assert!(
+        held.clone()
+            .set_entry(&Audience::Everyone, AI_POOL_ENTRY, after.as_bytes())
+            .is_err(),
+        "CONTROL: an author's set of that value is refused"
+    );
+
+    // The admin's revoke cascade, over a vault whose published text holds the large file.
+    let lab = Lab::new(true, Custody::Founded);
+    let paths = &lab.paths[0];
+    seed_vault_genesis(paths, &lab.root.path().join("pool.genesis")).unwrap();
+    let admin = admin_cached(paths).unwrap();
+    let mut doc = admin.published_doc.clone();
+    doc.hold_entry_with(
+        &Audience::Everyone,
+        AI_POOL_ENTRY,
+        pool.as_bytes(),
+        false,
+        None,
+    )
+    .expect("the pool file, as an older build wrote it");
+    admin_publish(paths, &admin, &doc).expect("published");
+    let admin = admin_cached(paths).unwrap();
+    let recipient = read_identity(&lab.paths[1]).unwrap().unwrap().recipient();
+    let mut doc = admin.published_doc.clone();
+    doc.remove_machine("m2", false).unwrap();
+    apply_swarm_revoke_cascade(paths, &admin, &mut doc, "m2", &recipient)
+        .expect("the cascade is held to no size");
+    let after = rewritten(&doc);
+    assert!(
+        !after.contains("\"m2\"") && after.len() > MAX_CONFIGURATION_VALUE,
+        "the rewrite drops m2 and is still over 64 KiB: {}",
+        after.len()
+    );
+}

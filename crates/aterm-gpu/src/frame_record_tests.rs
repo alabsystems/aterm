@@ -790,13 +790,20 @@ fn twin_uniform(
     crop: Option<PresentCrop>,
     (sw, sh): (u32, u32),
     (dw, dh): (u32, u32),
+    inset: u32,
 ) -> BlitUniform {
     let unit = |packed: u32, shift: u32| ((packed >> shift) & 0xff) as f32 / 255.0;
     let (visible_y, visible_h) = crop.map_or((0, sh), |c| {
         let y = c.source_y.min(sh);
         (y, c.height.min(sh - y))
     });
-    let place = aterm_render::frame_placement(dw as usize, dh as usize, sw as usize, sh as usize);
+    let place = aterm_render::frame_placement(
+        dw as usize,
+        dh as usize,
+        sw as usize,
+        sh as usize,
+        aterm_render::SideInsetPx(inset as usize),
+    );
     let band = if input.default_bg == aterm_core::render::COLOR_UNSET {
         gpu.theme.bg
     } else {
@@ -972,7 +979,7 @@ fn present_twin(
     let (fw, fh) = gpu.frame_size(input.rows, input.cols);
     let size = (fw as u32, fh as u32);
     let src = layered_source(gpu, input, tray, mutant);
-    let mut u = twin_uniform(gpu, input, effects, crop, size, dest);
+    let mut u = twin_uniform(gpu, input, effects, crop, size, dest, 0);
     if mutant == Mutant::WideBorder {
         u.border_px += 2.0;
     }
@@ -1109,7 +1116,7 @@ fn window_layer_frames(d: &mut Drawing, family: Option<&str>) {
         };
         let src = layered_source(&mut gpu, &input, None, Mutant::Law);
         let size = (src.width as u32, src.height as u32);
-        let mut u = twin_uniform(&gpu, &input, (false, None), None, size, (dw, dh));
+        let mut u = twin_uniform(&gpu, &input, (false, None), None, size, (dw, dh), 0);
         if translucent {
             u.translucent = 1.0;
             u.band[3] = gpu.backdrop_margin_alpha();
@@ -1192,7 +1199,7 @@ fn video_take_frames(d: &mut Drawing, family: Option<&str>) {
         }
         let src = layered_source(&mut gpu, input, None, Mutant::Law);
         let size = (src.width as u32, src.height as u32);
-        let u = twin_uniform(&gpu, input, (false, None), None, size, (f.w, f.h));
+        let u = twin_uniform(&gpu, input, (false, None), None, size, (f.w, f.h), 0);
         let texels = blit_twin(&src.rgba_bytes(), size, &u, (f.w, f.h));
         let twin = Drawn::twin(f.w as usize, f.h as usize, &texels, Dest::Rgba8);
         d.push(name, drawn, twin);
@@ -1313,7 +1320,7 @@ fn edr_twin(
     let size = (fw as u32, fh as u32);
     let src = gpu.cpu.render_input(input);
     let scale = win.sdr_white_scale.max(1.0);
-    let mut u = twin_uniform(gpu, input, (false, None), None, size, dest);
+    let mut u = twin_uniform(gpu, input, (false, None), None, size, dest, 0);
     u.hdr = 1.0;
     u.sdr_white_scale = scale;
     let mut texels = blit_twin(&src.rgba_bytes(), size, &u, dest);
@@ -1424,6 +1431,7 @@ fn edr_present(
 /// its source, and how far the destination outgrows the source (the bands).
 #[cfg(target_os = "macos")]
 struct BlitCase {
+    inset: u32,
     name: &'static str,
     target: crate::metal::ffi::PixelFormat,
     invert: bool,
@@ -1443,6 +1451,7 @@ struct BlitCase {
 #[cfg(target_os = "macos")]
 impl BlitCase {
     const PLAIN: Self = Self {
+        inset: 0,
         name: "",
         target: crate::metal::ffi::PixelFormat::Rgba8Unorm,
         invert: false,
@@ -1512,7 +1521,17 @@ fn blit_uniform(
     (sw, sh): (u32, u32),
     (dw, dh): (u32, u32),
 ) -> BlitUniform {
-    let mut want = present_blit_uniform(c.invert, c.overlay, c.crop, sw, sh, dw, dh, gpu.theme.bg);
+    let mut want = present_blit_uniform(
+        c.invert,
+        c.overlay,
+        c.crop,
+        sw,
+        sh,
+        dw,
+        dh,
+        c.inset,
+        gpu.theme.bg,
+    );
     want.chrome_y0 = win.chrome_y0 as f32;
     want.chrome_y1 = win.chrome_y1 as f32;
     if let Some((band_a, premult)) = c.translucent {
@@ -1541,7 +1560,15 @@ fn blit_twin_uniform(
     source: (u32, u32),
     dest: (u32, u32),
 ) -> BlitUniform {
-    let mut u = twin_uniform(gpu, input, (c.invert, c.overlay), c.crop, source, dest);
+    let mut u = twin_uniform(
+        gpu,
+        input,
+        (c.invert, c.overlay),
+        c.crop,
+        source,
+        dest,
+        c.inset,
+    );
     if let Some((band_a, premult)) = c.translucent {
         u.translucent = 1.0;
         u.band[3] = band_a;
@@ -1611,6 +1638,13 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
     let p = BlitCase::PLAIN;
     let cases = [
         BlitCase { name: "exact", ..p },
+        BlitCase {
+            name: "side-inset",
+            inset: 40,
+            extra: (47, 3),
+            source: "chrome",
+            ..p
+        },
         BlitCase {
             name: "exact-invert",
             invert: true,
@@ -1698,6 +1732,14 @@ fn blit_frames(d: &mut Drawing, family: Option<&str>) {
         assert_eq!((src.width as u32, src.height as u32), (sw, sh));
         let (dw, dh) = (sw + c.extra.0, sh + c.extra.1);
         let uniform = blit_uniform(&gpu, &win, c, (sw, sh), (dw, dh));
+        assert_eq!(
+            uniform.content_off[0],
+            (i64::from(c.inset)
+                + (i64::from(dw.saturating_sub(c.inset)) - i64::from(sw)).div_euclid(2))
+                as f32,
+            "{} carries its inset into the arm",
+            c.name
+        );
         let bytes = crate::metal::blit::MetalBlit::new(c.target)
             .and_then(|b| {
                 b.run(

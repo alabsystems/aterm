@@ -473,7 +473,7 @@ fn the_loop_asks_for_split_ticks_only_while_a_window_in_view_shows_the_bars() {
         assert_eq!(deck(&app), shown, "{word}");
     }
     form(&mut app, "deck");
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.occluded = true;
     }
     assert!(!deck(&app), "every window occluded");

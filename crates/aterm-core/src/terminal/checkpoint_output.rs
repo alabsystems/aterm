@@ -121,6 +121,14 @@ pub struct OutputStateRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub program_state: Option<String>,
+    /// Another program's report standing beside it (OSC 7501 `app=` a word none of the known
+    /// programs uses), as the body that says it: a restore installs it in its own slot, where
+    /// nothing that decides reads it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub other_program_state: Option<String>,
 }
 
 impl OutputStateRepr {
@@ -201,6 +209,7 @@ impl Terminal {
                 saved
             },
             program_state: self.program_state.carried(),
+            other_program_state: self.program_state.carried_other(),
         }
     }
 
@@ -250,6 +259,9 @@ impl Terminal {
             .map(|SavedModeRepr { mode, set }| (mode, set))
             .collect();
         self.transient.update_has_transient_extras();
-        self.program_state.restore(repr.program_state.as_deref());
+        self.program_state.restore(
+            repr.program_state.as_deref(),
+            repr.other_program_state.as_deref(),
+        );
     }
 }

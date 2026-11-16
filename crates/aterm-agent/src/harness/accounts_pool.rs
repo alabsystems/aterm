@@ -577,30 +577,22 @@ pub fn prepare_google_worker_scoped(
             if scope.cancelled() {
                 return Err("account work was cancelled".into());
             }
-            let raw = seat.roster(Cli::Agy)?;
-            let own_dir = raw
-                .row(&row.label)
-                .ok_or("Native Google account was removed")?
-                .dir
-                .as_deref();
-            let path = seat.config_dir.join(Cli::Agy.accounts().roster_file);
-            // The session about to start on this row is the use that lets it sign in.
-            let sign_in =
-                super::sign_in_ladder::SignIn::launch_sign_in(LaunchUse(()), Cli::Agy, &row.label);
-            let result = super::cli::renew_one_for(
-                Cli::Agy,
-                seat.now,
-                &super::cli::LiveAccounts::with_work(scope.clone()),
-                &seat.store(Cli::Agy),
-                (row, &path, logins),
-                (own_dir, sign_in),
-                &mut io::sink(),
-                &mut io::sink(),
-            );
-            if scope.cancelled() {
-                return Err("account work was cancelled".into());
-            }
-            renewal_refused(result)
+            launch_renewal(seat, row, logins, |path, own_dir, sign_in| {
+                let result = super::cli::renew_one_for(
+                    Cli::Agy,
+                    seat.now,
+                    &super::cli::LiveAccounts::with_work(scope.clone()),
+                    &seat.store(Cli::Agy),
+                    (row, path, logins),
+                    (own_dir, sign_in),
+                    &mut io::sink(),
+                    &mut io::sink(),
+                );
+                if scope.cancelled() {
+                    return Err("account work was cancelled".into());
+                }
+                renewal_refused(result)
+            })
         },
     );
     if scope.cancelled() {
@@ -609,10 +601,52 @@ pub fn prepare_google_worker_scoped(
     result
 }
 
+/// A launch's renewal of agy's signed-out row `row`: `renew` runs its sign-in with the roster's
+/// path, the row's own directory and the launch's use. A launch is nobody at this Mac: a row a
+/// bot protection stopped, or one of its pool here ([`super::accounts_sync::person_hold`]), loads
+/// no page for it, however often a session starts on it, and the launch names the person's step
+/// (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+///
+/// # Errors
+///
+/// The roster could not be read or no longer has the row, the row is held for a person
+/// ([`super::worker::Refused::SignedOut`], naming the person's step), or `renew`'s own.
+#[cfg(unix)]
+fn launch_renewal(
+    seat: &Seat<'_>,
+    row: &Row,
+    logins: &accounts::Logins,
+    renew: impl FnOnce(
+        &Path,
+        Option<&str>,
+        super::sign_in_ladder::SignIn,
+    ) -> Result<(), super::worker::Refused>,
+) -> Result<(), super::worker::Refused> {
+    let raw = seat.roster(Cli::Agy)?;
+    let raw_row = raw
+        .row(&row.label)
+        .ok_or("Native Google account was removed")?;
+    if let Some(hold) =
+        super::accounts_sync::person_hold(&seat.store(Cli::Agy), &raw, raw_row, logins)
+    {
+        return Err(super::worker::Refused::SignedOut(super::cli::held_words(
+            Cli::Agy,
+            &row.label,
+            &hold,
+        )));
+    }
+    let path = seat.config_dir.join(Cli::Agy.accounts().roster_file);
+    // The session about to start on this row is the use that lets it sign in.
+    let sign_in =
+        super::sign_in_ladder::SignIn::launch_sign_in(LaunchUse(()), Cli::Agy, &row.label);
+    renew(&path, raw_row.dir.as_deref(), sign_in)
+}
+
 /// What a renewal of a login signed out here leaves of a worker's launch. A
-/// sign-in that failed or wants a person, one onto the wrong account, and one that renewed another
-/// account all leave the login signed out, and read `why=signin`. One that could not run (a
-/// failure, a busy sign-in, a deferral or a bot check) leaves it signed out too, but reads
+/// sign-in that failed or wants a person, one a bot protection stopped (which no later launch
+/// tries again: its account's check waits for a person), one onto the wrong account, and one that
+/// renewed another account all leave the login signed out, and read `why=signin`. One that could
+/// not run (a failure, a busy sign-in, a deferral) leaves it signed out too, but reads
 /// `why=startup`: a later launch tries the renewal again, so no person is asked yet.
 ///
 /// # Errors
@@ -627,8 +661,9 @@ fn renewal_refused(result: super::cli::Renewal) -> Result<(), super::worker::Ref
         Renewal::AuthFailed
         | Renewal::WrongAccount
         | Renewal::OtherRenewed
-        | Renewal::NeedsPerson => Err(super::worker::Refused::SignedOut(words)),
-        Renewal::Failed | Renewal::SigninHeld | Renewal::Deferred | Renewal::BotCheck => {
+        | Renewal::NeedsPerson
+        | Renewal::BotCheck => Err(super::worker::Refused::SignedOut(words)),
+        Renewal::Failed | Renewal::SigninHeld | Renewal::Deferred => {
             Err(super::worker::Refused::Preparation(words))
         }
     }
@@ -1707,7 +1742,11 @@ pub(super) fn ladder_within(wait: std::time::Duration) -> Vec<std::time::Duratio
 /// its login read signed out, or a read that answered no figure as one more in its row's run
 /// ([`accounts::note_unanswered`]). A row whose credential changed during its read or that is
 /// gone keeps what it had. Only a read that answered no figure is kept where no credential could
-/// be captured, before the read and now: such a login fails locally at every ask.
+/// be captured, before the read and now: such a login fails locally at every ask. What a read
+/// shows of each limit other than the codex bucket goes to that row's limit walls alone
+/// ([`accounts::note_limits`]), which only a handoff asked about that limit reads; `asked` is the
+/// limit the handoff that made the reads asked about, where it asked about one, so a read that
+/// does not list it is recorded so too.
 ///
 /// # Errors
 /// The records could not be locked or written.
@@ -1715,6 +1754,7 @@ pub(super) fn note_fresh_reads(
     seat: &Seat<'_>,
     cli: Cli,
     reads: &[FreshRead],
+    asked: Option<&str>,
     wait: std::time::Duration,
 ) -> Result<(), String> {
     if reads.is_empty() {
@@ -1797,6 +1837,14 @@ pub(super) fn note_fresh_reads(
                             seat.now,
                         ));
                     }
+                    events.extend(accounts::note_limits(
+                        state,
+                        &read.label,
+                        &usage.limits,
+                        asked,
+                        seat.now,
+                        seat.now,
+                    ));
                 }
                 Ok(events)
             },
@@ -2264,6 +2312,30 @@ pub fn token_serves_here<'a>(
         home.zip(store).is_some_and(|(home, store)| {
             super::token_route::row_token_serves_at(home, store, roster, row, now)
         })
+    }
+}
+
+/// Whether this Mac's claim touch of a launch's or a move's row (`claim`, its
+/// [`super::claims::Act::Claim`]) admits starting on it: another Mac's senior claim or a
+/// preparation hold refuses it; a claim this Mac could not record refuses a row that is not one of
+/// its home accounts ([`accounts::State::home_accounts`]); and a row only its vault token runs
+/// here (`token_only`, [`accounts::token_only`]) needs a claim this Mac recorded, since nothing
+/// else keeps a second Mac off an account whose login was never made here (FL-135): where claims
+/// do not apply to its account ([`super::claims::Touched::NotApplicable`]: no pool file, and no lab
+/// naming this Mac its home) or could not be recorded, it is refused.
+#[must_use]
+pub fn claim_admits(
+    claim: &super::claims::Touched,
+    state: &accounts::State,
+    label: &str,
+    token_only: bool,
+) -> bool {
+    use super::claims::Touched;
+    match claim {
+        Touched::HeldElsewhere(_) | Touched::PreparationOnly => false,
+        Touched::Unrecorded(_) => !token_only && state.home_accounts.contains(label),
+        Touched::NotApplicable => !token_only,
+        Touched::Looked | Touched::Held | Touched::Claimed | Touched::Quieted => true,
     }
 }
 
@@ -2869,7 +2941,9 @@ fn launch_env_reading_capturing(
             .lease_verdict(&pinned.label, seat.now)
             .map_err(held)?;
         let env = prepare(pinned).map_err(|why| why.to_string())?;
-        match seat.claim(cli, super::claims::Act::Claim(&pinned.label)) {
+        let claim = seat.claim(cli, super::claims::Act::Claim(&pinned.label));
+        let token_only = accounts::token_only(pinned, &snapshot.state, &enrolled, seat.now);
+        match claim {
             super::claims::Touched::PreparationOnly => {
                 return Err(held(accounts::WhyNot::PreparationOnly));
             }
@@ -2878,9 +2952,7 @@ fn launch_env_reading_capturing(
                     until: holder.until,
                 }));
             }
-            super::claims::Touched::Unrecorded(_)
-                if !snapshot.state.home_accounts.contains(&pinned.label) =>
-            {
+            ref claim if !claim_admits(claim, &snapshot.state, &pinned.label, token_only) => {
                 return Err(held(accounts::WhyNot::Unclaimed));
             }
             _ => {}
@@ -2977,17 +3049,14 @@ fn launch_env_reading_capturing(
             Ok(env) => {
                 // The row's claim is recorded before its session starts. Where another Mac's
                 // claim reached this one since the look, or this Mac could not record its claim
-                // on a row that is not its home, the launch picks again.
+                // on a row that is not its home or that only its vault token runs here
+                // ([`claim_admits`]), the launch picks again.
                 let claim = seat.claim(cli, super::claims::Act::Claim(&row.label));
-                let refused = match claim {
-                    super::claims::Touched::HeldElsewhere(_)
-                    | super::claims::Touched::PreparationOnly => true,
-                    super::claims::Touched::Unrecorded(_) => {
-                        state.unrecorded = true;
-                        !state.home_accounts.contains(&row.label)
-                    }
-                    _ => false,
-                };
+                if matches!(claim, super::claims::Touched::Unrecorded(_)) {
+                    state.unrecorded = true;
+                }
+                let token_only = accounts::token_only(row, &state, &enrolled, seat.now);
+                let refused = !claim_admits(&claim, &state, &row.label, token_only);
                 if refused {
                     if !excluded.insert(row.label.clone()) {
                         return Err(unusable(cli));
@@ -3409,15 +3478,8 @@ fn cold_launch_who_capturing(
     }
     if usable {
         let claim = seat.claim(cli, super::claims::Act::Claim(&ran.label));
-        let refused = match claim {
-            super::claims::Touched::HeldElsewhere(_) | super::claims::Touched::PreparationOnly => {
-                true
-            }
-            super::claims::Touched::Unrecorded(_) => {
-                !snapshot.state.home_accounts.contains(&ran.label)
-            }
-            _ => false,
-        };
+        let token_only = accounts::token_only(&ran, &snapshot.state, &enrolled, seat.now);
+        let refused = !claim_admits(&claim, &snapshot.state, &ran.label, token_only);
         if !refused {
             return finish_cold_login(
                 seat,
@@ -3521,16 +3583,12 @@ fn asked_cold_login(
     // claim on a row no session here starts on, which other Macs would read as held.
     let login = finish_cold_login(seat, cli, snapshot, &target, (mode, true), program, capture)?
         .ok_or_else(|| "the asked account's login was not prepared".to_owned())?;
-    match seat.claim(cli, super::claims::Act::Claim(&target.label)) {
-        super::claims::Touched::HeldElsewhere(_) | super::claims::Touched::PreparationOnly => {
-            Err(MOVE_HELD.to_owned())
-        }
-        super::claims::Touched::Unrecorded(_)
-            if !snapshot.state.home_accounts.contains(&target.label) =>
-        {
-            Err(MOVE_HELD.to_owned())
-        }
-        _ => Ok(login),
+    let claim = seat.claim(cli, super::claims::Act::Claim(&target.label));
+    let token_only = accounts::token_only(&target, &snapshot.state, &enrolled, seat.now);
+    if claim_admits(&claim, &snapshot.state, &target.label, token_only) {
+        Ok(login)
+    } else {
+        Err(MOVE_HELD.to_owned())
     }
 }
 
@@ -3864,14 +3922,15 @@ fn finish_cold_login(
         ));
     }
     let prepared = login_env(cli, row, seat.home).map_err(|why| why.to_string())?;
+    let enrolled = accounts::enrolled_in(cli, &before.roster, seat.home);
     if mode == Mode::Off {
-        match seat.claim(cli, super::claims::Act::Claim(&row.label)) {
+        let claim = seat.claim(cli, super::claims::Act::Claim(&row.label));
+        let token_only = accounts::token_only(row, &before.state, &enrolled, seat.now);
+        match claim {
             super::claims::Touched::PreparationOnly | super::claims::Touched::HeldElsewhere(_) => {
                 return Err("cold login claim was refused".into());
             }
-            super::claims::Touched::Unrecorded(_)
-                if !before.state.home_accounts.contains(&row.label) =>
-            {
+            ref claim if !claim_admits(claim, &before.state, &row.label, token_only) => {
                 return Err("cold login claim could not be recorded".into());
             }
             _ => {}
@@ -3881,7 +3940,6 @@ fn finish_cold_login(
     // The token judgment of a row only its vault token keeps running here, made before the
     // writer's lock (it reads the vault, the token table and the accounts state): `None` where
     // the records before named no such row.
-    let enrolled = accounts::enrolled_in(cli, &before.roster, seat.home);
     let token_served =
         (accounts::login_here(row, &before.state, enrolled.contains(&row.label), seat.now)
             == accounts::LoginHere::OnToken)
@@ -4102,6 +4160,44 @@ fn without_failed_preparations(
         .excluded_accounts
         .extend(excluded.iter().cloned());
     candidates
+}
+
+/// [`without_failed_preparations`] for a session at `point`, which a row of its own (`from`) leaves:
+/// at a limit wall ([`accounts::limit_of`]) every other row that limit holds on the records
+/// ([`limit_holds`]) is ineligible too, as a candidate read walled on it would be, so the plan,
+/// its forecast and its commit judge each row alike. At any other point it is that alone, and no
+/// limit wall on record is read.
+fn handoff_candidates(
+    state: &accounts::State,
+    excluded: &std::collections::BTreeSet<String>,
+    point: &Point,
+    from: Option<&str>,
+    now: i64,
+) -> accounts::State {
+    let mut candidates = without_failed_preparations(state, excluded);
+    if let Point::Wall { window, .. } = point {
+        candidates.excluded_accounts.extend(
+            state
+                .accounts
+                .keys()
+                .filter(|label| Some(label.as_str()) != from)
+                .filter(|label| limit_holds(label, state, window, now))
+                .cloned(),
+        );
+    }
+    candidates
+}
+
+/// Whether the records hold the row `label` off a handoff at a wall of `window` at `now`: where
+/// it is a limit wall's ([`accounts::limit_of`]), a wall of that limit stands on the row
+/// ([`accounts::Account::limit_wall_until`]). A window of any other kind holds no row so.
+pub(super) fn limit_holds(label: &str, state: &accounts::State, window: &str, now: i64) -> bool {
+    accounts::limit_of(window).is_some_and(|id| {
+        state
+            .accounts
+            .get(label)
+            .is_some_and(|account| account.limit_wall_until(id, now).is_some())
+    })
 }
 
 fn check_failed_preparations(
@@ -4809,10 +4905,13 @@ fn native_quota_plan_preparing<T, R>(
     if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
         return SessionPlan::stay(StayWhy::OtherSupervisor);
     }
-    // A stamped wall of one of the two windows a Codex login's usage read names: the plan records
-    // it under that window, so a wall of no window, or of one no read names, is none to plan at.
+    // A stamped wall of one of the two windows a Codex login's usage read names, or of a limit
+    // other than the codex bucket that read lists ([`accounts::limit_wall`]): the plan records it
+    // under that window (a limit's in its own record, [`accounts::Account::limit_walls`]), so a
+    // wall of no window, or of one no read names, is none to plan at.
     if !matches!(&session.point, Point::Wall { window, at: Some(at) }
-        if matches!(window.as_str(), accounts::WEEK_LIMIT | accounts::SESSION_LIMIT)
+        if (matches!(window.as_str(), accounts::WEEK_LIMIT | accounts::SESSION_LIMIT)
+            || accounts::limit_of(window).is_some())
             && *at <= seat.now)
     {
         return SessionPlan::stay(StayWhy::NothingDue);
@@ -4945,8 +5044,9 @@ pub fn native_quota_target(
 }
 
 /// The row a Codex session on `from` moves to at a wall of its `window` (the week's or the
-/// five-hour one, [`accounts::WEEK_LIMIT`] or [`accounts::SESSION_LIMIT`]) as the records stand,
-/// or `None` where nothing moves it: what [`native_quota_plan`] selects where each provider read
+/// five-hour one, [`accounts::WEEK_LIMIT`] or [`accounts::SESSION_LIMIT`], or a limit's,
+/// [`accounts::limit_wall`], which passes over each row that limit holds, [`limit_holds`]) as the
+/// records stand, or `None` where nothing moves it: what [`native_quota_plan`] selects where each provider read
 /// admits its candidate, passing over a candidate the handoff does not read yet
 /// ([`handoff_reads`]), as its plan's reads do. The window is the wall this forecast stands on
 /// `from`, as the plan's record of it would; which row takes the session is judged of the other
@@ -5006,7 +5106,7 @@ pub fn native_quota_target_at(
     };
     let mut excluded = std::collections::BTreeSet::new();
     loop {
-        let candidates = without_failed_preparations(&state, &excluded);
+        let candidates = handoff_candidates(&state, &excluded, &point, Some(&from.label), now);
         let Advice::Move { to, .. } =
             accounts::advise_for(cli, roster, &candidates, enrolled, &me, &point, mode, now)
         else {
@@ -5135,7 +5235,7 @@ fn session_plan_with<T, R>(
         }
     };
     let (advice, line) = loop {
-        let candidates = without_failed_preparations(state, &excluded);
+        let candidates = handoff_candidates(state, &excluded, &point, me.label(), seat.now);
         let advice = if native {
             accounts::advise_for(
                 s.cli,
@@ -5384,9 +5484,20 @@ fn finish_move<T>(
     {
         return Err("active account changed to a failed preparation".into());
     }
-    let candidates = without_failed_preparations(&current.state, excluded);
-    let enrolled = accounts::enrolled_in(session.cli, &current.roster, seat.home);
     let me = accounts::observed_me(&current.roster, who, &prepared.seen);
+    let candidates = handoff_candidates(
+        &current.state,
+        excluded,
+        &session.point,
+        me.label(),
+        seat.now,
+    );
+    // A move off a wall of another limit rotates past an `active` the records hold off it.
+    let asked = match &session.point {
+        Point::Wall { window, .. } => accounts::limit_of(window),
+        _ => None,
+    };
+    let enrolled = accounts::enrolled_in(session.cli, &current.roster, seat.home);
     let fresh = if matches!(session.authority, MoveAuthority::NativeCodexQuota) {
         accounts::advise_for(
             session.cli,
@@ -5454,7 +5565,7 @@ fn finish_move<T>(
                 current.require_policy(raw, logins)?;
                 let event = if *rotates {
                     Some(
-                        accounts::begin_rotation(
+                        accounts::begin_rotation_for(
                             state,
                             &current.roster,
                             &enrolled,
@@ -5464,6 +5575,7 @@ fn finish_move<T>(
                                 account: from,
                             },
                             to,
+                            asked,
                             seat.now,
                         )
                         .map_err(|lost| format!("{lost:?}"))?,
@@ -5753,8 +5865,9 @@ fn note_session_login(
 /// switches say and whoever answers its walls; a failed sign-in is a fact of the account, not
 /// a decision about it. Returns whether an event was written. `Ok(false)` where the process is
 /// on no row's own login (no roster, another home, an environment credential), the row is
-/// another supervisor's, the row already says so, or a renewal replaced the login the process
-/// holds.
+/// another supervisor's, no login of the row was made here (a session on its empty directory
+/// signs nothing out, and a sign-in wall there is no login of the row's ending: FL-135), the row
+/// already says so, or a renewal replaced the login the process holds.
 ///
 /// # Errors
 /// The roster or store cannot be read or written, or the login changed under the observation.
@@ -5776,6 +5889,7 @@ pub fn session_seen<R>(
         .filter(|_| me.default_home && me.route.on_account())
         .and_then(|label| roster.row(label))
         .filter(|row| !held_source(row))
+        .filter(|row| accounts::enrolled_in(session.cli, &roster, seat.home).contains(&row.label))
     else {
         return Ok(false);
     };

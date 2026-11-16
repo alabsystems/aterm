@@ -49,6 +49,19 @@ fn only_an_external_frontend_loses_the_config_words() {
 
 use super::*;
 
+fn none_set(_: &str) -> Option<OsString> {
+    None
+}
+
+fn none_told(_: &[String]) -> Option<PathBuf> {
+    None
+}
+
+/// A [`Miri`] that reads no variable and tells no metadata target.
+const NO_MIRI: Miri<'static> = Miri {
+    env: &none_set,
+    metadata_target: &none_told,
+};
 #[test]
 fn unreadable_initial_manifests_do_not_select_a_compatibility_file_or_parent() {
     for (name, directory) in [
@@ -407,7 +420,7 @@ fn proof_frontend_output_selection_requires_its_own_provenance() {
 /// A configured target is the one every Targo reads ([`package_homes`]: the store's reads
 /// `~/.cargo`, Trust's main a `TARGO_HOME` where `CARGO_HOME` is unset, and both walk `~/.cargo`
 /// first as an ancestor's): `~/.cargo`'s wins over a twin home's. NEGATIVE CONTROL: a target only
-/// the twin home names, which the store's Targo would not build into, is none.
+/// the twin home names, which Targo 16387 would not build into, is none.
 #[test]
 fn a_configured_target_is_the_one_every_targo_reads() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -469,42 +482,360 @@ fn a_configured_target_is_the_one_every_targo_reads() {
     }
 }
 
+/// THE CONFIG WALK STOPS WHERE TARGO STOPS IT: `__CARGO_TEST_ROOT`, which Targo reads in every
+/// call (`paths::ancestors`), ends the walk at the folder it names, after that folder's own
+/// `.cargo`, and the package home is read after it, so a farther ancestor's config is none
+/// Targo loads: neither its target nor its build directory is the call's. A value that names
+/// no ancestor, or is no UTF-8 text (Targo's `env::var` does not see it), stops nothing.
+/// NEGATIVE CONTROL: a walk past the folder owns the farther ancestor's target where Targo
+/// builds into the home's, and owes custody for a build directory Targo never reads.
+#[test]
+fn the_config_walk_stops_where_targo_stops_it() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    let cwd = root.join("member");
+    let config = root.join(".cargo/config.toml");
+    let outer = home.join(".cargo/config.toml");
+    let manifest = root.join("Cargo.toml");
+    let args = ["--unverified".into(), "build".into()];
+    let mut rows = vec![
+        (None, root.join("near")),
+        (Some(cwd.clone().into_os_string()), home.join("outer")),
+        (Some(root.clone().into_os_string()), root.join("near")),
+        (Some(OsString::from("member")), root.join("near")),
+    ];
+    #[cfg(unix)]
+    rows.push((
+        Some(std::os::unix::ffi::OsStringExt::from_vec({
+            let mut bytes = cwd.clone().into_os_string().into_encoded_bytes();
+            bytes.push(0xff);
+            bytes
+        })),
+        root.join("near"),
+    ));
+    // Where the nearer config names none, every walk reaches the home's.
+    for near in ["build.target-dir = 'near'", ""] {
+        for (stop, expected) in &rows {
+            let read = |path: &Path| {
+                Ok(if path == config {
+                    Some(near.to_owned())
+                } else if path == outer {
+                    Some("build.target-dir = 'outer'".into())
+                } else if path == manifest {
+                    Some("[workspace]".into())
+                } else {
+                    None
+                })
+            };
+            let env = |key: &str| (key == "__CARGO_TEST_ROOT").then(|| stop.clone()).flatten();
+            let machine = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &env,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let want = if near.is_empty() {
+                home.join("outer")
+            } else {
+                expected.clone()
+            };
+            assert_eq!(
+                selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+                    .map(|c| c.target.explicit_path()),
+                Some(want.clone()),
+                "{stop:?} {near:?}"
+            );
+            assert_eq!(
+                target_hint(&machine, Tool::Cargo),
+                Ok(Some(want)),
+                "{stop:?} {near:?}"
+            );
+        }
+    }
+    // A build directory only a farther ancestor's config names owes no custody where the walk
+    // stops before it, and does where it does not.
+    for (stop, owed) in [(None, true), (Some(cwd.clone().into_os_string()), false)] {
+        let read = |path: &Path| Ok((path == config).then(|| "build.build-dir = 'b'".to_owned()));
+        let env = |key: &str| (key == "__CARGO_TEST_ROOT").then(|| stop.clone()).flatten();
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        assert_eq!(
+            configs_unresolved(&cwd, Tool::Targo, &machine, true),
+            owed,
+            "{stop:?}"
+        );
+    }
+}
+
+/// A CONFIGURED TARGET FOLLOWS CARGO'S PRECEDENCE WITHOUT GUESSING: the nearest config's (the
+/// legacy `config` over `config.toml` beside it), its includes merged as Targo merges them
+/// (`load_includes`: the file's own value over a later include's, over an earlier one's; an
+/// optional include where nothing stands skipped), each read as TOML 1.1, and a relative target
+/// resolved against the folder above the one the defining file is in (`Definition::root`). Only
+/// the winning value is judged among the scalars Targo's merge swaps (an integer outranked by a
+/// string). A config Targo refuses (a missing include, a cycle or a diamond, an `include` that is
+/// no list, a file with no grandparent, absolute target or not, a list, table or float its merge
+/// meets, a `build` that is no table) grants none; the first four, and an include path holding a
+/// control character, name both directories, so even a caller's choice is not owned for them. Nor
+/// is it for a file whose includes give a winning target of no string, or a list, table or float
+/// its merge meets: Targo loads the whole `build` table (`build_config`), an outranked target
+/// with it, and fails the call.
+/// NEGATIVE CONTROL: before includes were followed and TOML 1.1 read, each include row but the
+/// two whose own target wins, and the two TOML 1.1 rows, granted none; a reader resolving against
+/// the including file's root or the defining file's own folder, or keeping the last include's
+/// value even where it names none, owns another folder than the one Targo writes; one that skips
+/// the grandparent of an absolute target, or keeps a later string over a list, table or float,
+/// owns a folder Targo never builds into. The two rows whose own target wins guard that the
+/// integer an include gives is not judged.
 #[test]
 fn configured_final_targets_follow_cargo_precedence_without_guessing() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let home = scratch.path().join("home");
     let root = home.join("project");
     let cwd = root.join("member");
-    let config = root.join(".cargo/config.toml");
-    let legacy = root.join(".cargo/config");
+    let dot = root.join(".cargo");
+    let config = dot.join("config.toml");
+    let legacy = dot.join("config");
     let outer = home.join(".cargo/config.toml");
-    // The included file is present and neutral. Known Trust compile fronts can resolve
-    // the outer target through it; the upstream target hint still has no include capability.
-    let layout = root.join(".cargo/layout.toml");
     let manifest = root.join("Cargo.toml");
     let args = ["--unverified".into(), "build".into()];
-    for (text, legacy_text, expected) in [
+    let named = |target: &str| format!("build.target-dir = '{target}'");
+    let (early, later, opt, rel) = (named("early"), named("later"), named("opt"), named("rel"));
+    let (from_include, four) = (named("from-include"), "build.target-dir = 4".to_owned());
+    #[expect(
+        clippy::type_complexity,
+        reason = "a row: config, legacy config, included files, target, overridable"
+    )]
+    let rows: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<PathBuf>, bool)> = vec![
         (
             "[build]\ntarget-dir = 'target/.ubd/main.noindex'",
             None,
+            vec![],
             Some(root.join(DEFAULT_TARGET)),
+            true,
         ),
-        ("build.target-dir = 'inner'", None, Some(root.join("inner"))),
+        (
+            "build.target-dir = 'inner'",
+            None,
+            vec![],
+            Some(root.join("inner")),
+            true,
+        ),
         (
             "build.target-dir = 'inner'",
             Some("build.target-dir = 'legacy'"),
+            vec![],
             Some(root.join("legacy")),
+            true,
         ),
-        ("# target-dir = 'comment'", None, Some(home.join("outer"))),
-        ("build.target-dir = 4", None, None),
-        ("build.target-dir = [", None, None),
-        ("include = ['layout.toml']", None, None),
+        (
+            "# target-dir = 'comment'",
+            None,
+            vec![],
+            Some(home.join("outer")),
+            true,
+        ),
+        ("build.target-dir = 4", None, vec![], None, true),
+        ("build.target-dir = [", None, vec![], None, true),
+        // An include that names none leaves the walk to a farther config.
+        (
+            "include = ['layout.toml']",
+            None,
+            vec![("layout.toml", "")],
+            Some(home.join("outer")),
+            true,
+        ),
+        (
+            "include = ['layout.toml']",
+            None,
+            vec![("layout.toml", &from_include)],
+            Some(root.join("from-include")),
+            true,
+        ),
         (
             "include = ['layout.toml']\nbuild.target-dir = 'local'",
             None,
+            vec![("layout.toml", &from_include)],
             Some(root.join("local")),
+            true,
         ),
-    ] {
+        // Only the winning value is judged: the own target outranks an include's of no string.
+        (
+            "include = ['layout.toml']\nbuild.target-dir = 'local'",
+            None,
+            vec![("layout.toml", &four)],
+            Some(root.join("local")),
+            true,
+        ),
+        (
+            "include = ['layout.toml']",
+            None,
+            vec![("layout.toml", &four)],
+            None,
+            false,
+        ),
+        // A later include over an earlier one, and an earlier one where the later names none.
+        (
+            "include = ['layout.toml', 'later.toml']",
+            None,
+            vec![("layout.toml", &early), ("later.toml", &later)],
+            Some(root.join("later")),
+            true,
+        ),
+        (
+            "include = ['layout.toml', 'later.toml']",
+            None,
+            vec![("layout.toml", &early), ("later.toml", "")],
+            Some(root.join("early")),
+            true,
+        ),
+        // An optional include is read where it stands and skipped where nothing does.
+        (
+            "include = [{ path = 'opt.toml', optional = true }]",
+            None,
+            vec![("opt.toml", &opt)],
+            Some(root.join("opt")),
+            true,
+        ),
+        (
+            "include = [{ path = 'absent.toml', optional = true }]",
+            None,
+            vec![],
+            Some(home.join("outer")),
+            true,
+        ),
+        // A relative target is the defining file's grandparent's: `.cargo` for `.cargo/sub`'s,
+        // `.cargo/sub` for a nested include's in `.cargo/sub/more`.
+        (
+            "include = ['sub/deep.toml']",
+            None,
+            vec![("sub/deep.toml", &rel)],
+            Some(dot.join("rel")),
+            true,
+        ),
+        (
+            "include = ['layout.toml']",
+            None,
+            vec![
+                ("layout.toml", "include = ['sub/deep.toml']"),
+                ("sub/deep.toml", "include = ['more/deeper.toml']"),
+                ("sub/more/deeper.toml", &rel),
+            ],
+            Some(dot.join("sub/rel")),
+            true,
+        ),
+        // What Targo refuses: a missing include, a cycle, a diamond (one cycle check spans the
+        // file's includes), an `include` that is no list, and an included file with no
+        // grandparent (`Definition::root` unwraps it, and Targo panics).
+        ("include = ['absent.toml']", None, vec![], None, false),
+        (
+            "include = ['layout.toml']",
+            None,
+            vec![("layout.toml", "include = ['config.toml']")],
+            None,
+            false,
+        ),
+        (
+            "include = ['layout.toml', 'later.toml']",
+            None,
+            vec![
+                ("layout.toml", "include = ['sub/deep.toml']"),
+                ("later.toml", "include = ['sub/deep.toml']"),
+                ("sub/deep.toml", &rel),
+            ],
+            None,
+            false,
+        ),
+        (
+            "include = 'layout.toml'",
+            None,
+            vec![("layout.toml", "")],
+            None,
+            false,
+        ),
+        (
+            "include = ['../../../../../../../../../../../../../../../../../../../../x.toml']",
+            None,
+            vec![],
+            None,
+            true,
+        ),
+        // `Definition::root` unwraps the defining file's grandparent before Targo asks whether
+        // the target is absolute, so an absolute one there panics too.
+        ("include = ['/y.toml']", None, vec![], None, true),
+        // What Targo's merge refuses (`merge_helper`: a list or a table meets another value) or
+        // cannot load (a float or a date): such a value anywhere in a file's chain, though a
+        // later or the file's own value is a string.
+        (
+            "include = ['layout.toml', 'later.toml']",
+            None,
+            vec![
+                ("layout.toml", "build.target-dir = ['x']"),
+                ("later.toml", &later),
+            ],
+            None,
+            false,
+        ),
+        (
+            "include = ['layout.toml']\nbuild.target-dir = 'local'",
+            None,
+            vec![("layout.toml", "build.target-dir = { a = 'x' }")],
+            None,
+            false,
+        ),
+        (
+            "include = ['layout.toml']\nbuild.target-dir = 'local'",
+            None,
+            vec![("layout.toml", "build.target-dir = 4.5")],
+            None,
+            false,
+        ),
+        // A nearer `build` that is no table Targo cannot merge with a farther one's table.
+        ("build = 4", None, vec![], None, true),
+        // An include path holding a control character is refused, and names both.
+        (
+            "include = [\"a\\tb.toml\"]",
+            None,
+            vec![("a\tb.toml", &rel)],
+            None,
+            false,
+        ),
+        // TOML 1.1, which Targo parses: an inline table's newline, a key `\x` spells.
+        (
+            "build = { target-dir = 'inline',\n}",
+            None,
+            vec![],
+            Some(root.join("inline")),
+            true,
+        ),
+        (
+            "build.\"target\\x2ddir\" = 'escaped'",
+            None,
+            vec![],
+            Some(root.join("escaped")),
+            true,
+        ),
+    ];
+    for (text, legacy_text, files, expected, overridable) in rows {
+        let files: BTreeMap<PathBuf, String> = files
+            .iter()
+            .map(|&(name, text)| (dot.join(name), text.to_owned()))
+            .chain([
+                (PathBuf::from("/x.toml"), rel.clone()),
+                (PathBuf::from("/y.toml"), named("/abs/out")),
+            ])
+            .collect();
         let read = |path: &Path| {
             Ok(if path == config {
                 Some(text.into())
@@ -512,12 +843,10 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
                 legacy_text.map(str::to_owned)
             } else if path == outer {
                 Some("build.target-dir = 'outer'".into())
-            } else if path == layout {
-                Some(String::new())
             } else if path == manifest {
                 Some("[workspace]".into())
             } else {
-                None
+                files.get(path).cloned()
             })
         };
         let machine = Machine {
@@ -529,24 +858,22 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
             read_manifest: &read,
             writable: &|_| Some(true),
         };
-        let trust_expected = if text == "include = ['layout.toml']" {
-            Some(home.join("outer"))
-        } else {
-            expected.clone()
-        };
+        let row = format!("{text:?} {files:?}");
         assert_eq!(
             selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None)
                 .map(|c| c.target.explicit_path()),
-            trust_expected,
-            "{text}"
+            expected,
+            "{row}"
         );
         match &expected {
             Some(path) => assert_eq!(
-                target_hint(&machine, Tool::Cargo).unwrap().as_ref(),
-                Some(path)
+                target_hint(&machine, Tool::Cargo),
+                Ok(Some(path.clone())),
+                "{row}"
             ),
-            None => assert!(target_hint(&machine, Tool::Cargo).is_err(), "{text}"),
+            None => assert!(target_hint(&machine, Tool::Cargo).is_err(), "{row}"),
         }
+        // A caller's choice is owned where no config names a build directory, or may.
         let overridden = root.join("caller-choice");
         let env =
             |key: &str| (key == "CARGO_TARGET_DIR").then(|| overridden.clone().into_os_string());
@@ -560,12 +887,1017 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
                 },
                 &|_| UserAlias::None,
             )
-            .unwrap()
-            .target
-            .explicit_path(),
-            overridden
+            .map(|c| c.target.explicit_path()),
+            overridable.then(|| overridden.clone()),
+            "{row}"
         );
     }
+}
+
+/// An upstream cargo reads `include` only from 1.93, and before it under `-Zconfig-include`
+/// alone, so the front never follows one for it: a config whose include names the target grants
+/// none, and its own target is the one granted. NEGATIVE CONTROL: Targo, which always loads
+/// includes, gets the include's target.
+#[test]
+fn an_upstream_cargo_follows_no_include() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    let config = root.join(".cargo/config.toml");
+    let layout = root.join(".cargo/layout.toml");
+    let manifest = root.join("Cargo.toml");
+    for (text, cargo, targo) in [
+        (
+            "include = ['layout.toml']",
+            None,
+            Some(root.join("from-include")),
+        ),
+        (
+            "include = ['layout.toml']\nbuild.target-dir = 'own'",
+            Some(root.join("own")),
+            Some(root.join("own")),
+        ),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(text.to_owned())
+            } else if path == layout {
+                Some("build.target-dir = 'from-include'".to_owned())
+            } else if path == manifest {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        for (tool, words, want) in [
+            (Tool::Cargo, vec!["build".to_owned()], &cargo),
+            (
+                Tool::Targo,
+                vec!["--unverified".to_owned(), "build".to_owned()],
+                &targo,
+            ),
+        ] {
+            assert_eq!(
+                &selected_outputs(&words, tool, &machine, &|_| UserAlias::None)
+                    .map(|c| c.target.explicit_path()),
+                want,
+                "{tool:?} {text:?}"
+            );
+        }
+    }
+}
+
+/// [`config_dirs`] READS EACH FILE AS TARGO PARSES IT, as TOML 1.1, wherever its lines cannot
+/// tell (an include, an escape that can spell a key, a multi-line string): a key `\x` spells is
+/// the key it decodes to, and a file whose include holds TOML 1.1 is read for what it names.
+/// Text neither reader parses names both; a file whose lines tell is told by its lines.
+/// NEGATIVE CONTROL: the TOML 1.0 reader named both directories for each of the first five
+/// rows (the fifth's included file holds a multi-line string, so it is parsed, not scanned).
+#[test]
+fn config_dirs_read_each_file_as_targo_parses_it() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let dir = home.join("project/.cargo");
+    let config = dir.join("config.toml");
+    let more = dir.join("more.toml");
+    let inline = "include = [\"more.toml\"]\nenv = { A = \"1\",\n}\n";
+    for (text, included, expected) in [
+        (
+            "[build]\n\"target\\x2ddir\" = \"/t\"\n",
+            None,
+            (true, false),
+        ),
+        (
+            "[build]\n\"target\\x2edir\" = \"/t\"\n",
+            None,
+            (false, false),
+        ),
+        (inline, Some("[build]\njobs = 4\n"), (false, false)),
+        (inline, Some("[build]\nbuild-dir = \"/b\"\n"), (false, true)),
+        (
+            "include = [\"more.toml\"]\n",
+            Some("build = {\n  target-dir = \"/t\", x = '''a''', # here\n}\n"),
+            (true, false),
+        ),
+        ("x = '''a'''\nt = { a = 1 b = 2 }\n", None, (true, true)),
+        ("[env]\nE = \"\\e\"\n", None, (false, false)),
+        ("build.target-dir = [\n", None, (true, false)),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(text.to_owned())
+            } else if path == more {
+                included.map(str::to_owned)
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&home),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let named = config_dirs(&dir, &machine);
+        assert_eq!(
+            (named.target, named.build),
+            expected,
+            "{text:?} {included:?}"
+        );
+    }
+}
+
+/// A `--config` VALUE IS READ AS TARGO READS IT (`context/mod.rs`'s `cli_args_as_table`): the
+/// config file standing at its path against the working directory, parsed whole with the files
+/// it includes against its own folder, or else an inline dotted key, with an `include` against
+/// the working directory, each read where Targo reads it. A target directory it selects is the
+/// call's where neither a typed `--target-dir` nor `CARGO_TARGET_DIR` (or its twin) outranks it
+/// (`target_dir`: a `--config` value outranks `CARGO_BUILD_TARGET_DIR`), and a build directory
+/// it selects is the call's too, each against its definition base: the folder above the
+/// defining file's, the working directory for an inline value's. NEGATIVE CONTROL: each refused
+/// row is a text this reader cannot read (a cycle, a value naming no file that is no dotted key,
+/// a file the reader fails on or says is none where something stands, text no TOML 1.1 reader
+/// parses), one whose directory Targo refuses (a control character, here `\e`'s), or one Targo
+/// refuses (no one dotted key); each owned row was refused before the reading (the TOML 1.1 rows
+/// before it read TOML 1.1, the rows that name a directory before it read one with its
+/// definition base), the walk's for a folder its reader says is none, and each row Targo
+/// refuses was owned.
+#[test]
+fn a_config_value_is_read_as_targo_reads_it() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let fresh = Some(root.join("fresh"));
+    let env_target = root.join("env");
+    let jobs = "[build]\njobs = 2\n";
+    let named_target = "[build]\ntarget-dir = 'elsewhere'\n";
+    let named_build = "[build]\nbuild-dir = 'b'\n";
+    let hidden_build = "build = { x = \"\"\"\n#\"\"\", build-dir = 'b' }\n";
+    let hidden_target = "build = { x = '''\n#''', target-dir = 'elsewhere' }\n";
+    // Something stands at `o=5` that the reader says is no file (a folder, a FIFO, a device
+    // `read_config` declines): Targo loads it as a config file all the same.
+    std::fs::create_dir(root.join("o=5")).unwrap();
+    // A file stands at `o=4` that the reader fails on; nothing can stand at a name longer than
+    // a path component may be, which the reader fails on too (atpkg's does, ENAMETOOLONG), and
+    // Targo, whose `Path::exists` finds nothing there, parses inline.
+    std::fs::write(root.join("o=4"), "").unwrap();
+    let long = format!("env.LONG=\"{}\"", "x".repeat(300));
+    // A file whose only mentions of a directory's key are an alias's words and a comment.
+    let mentions = "[alias]\ndist = \"build --artifact-dir dist\"\n[build]\njobs = 4 # build-dir\n";
+    let words = |line: &str| {
+        line.split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let f = "--target-dir fresh";
+    #[expect(
+        clippy::type_complexity,
+        reason = "a row: words, files, environment, the target owned and the build directory"
+    )]
+    let rows: Vec<(
+        String,
+        Vec<(&str, Result<&str, ()>)>,
+        Option<&str>,
+        Option<PathBuf>,
+        Option<PathBuf>,
+    )> = vec![
+        // A file the call's target outranks, or that names nothing.
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok(jobs))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok(named_target))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(named_target))],
+            Some("CARGO_TARGET_DIR"),
+            Some(env_target.clone()),
+            None,
+        ),
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(named_target))],
+            Some("TARGO_TARGET_DIR"),
+            Some(env_target.clone()),
+            None,
+        ),
+        // A `--config` outranks `CARGO_BUILD_TARGET_DIR`, in either spelling.
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(named_target))],
+            Some("CARGO_BUILD_TARGET_DIR"),
+            Some(home.join("elsewhere")),
+            None,
+        ),
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(named_target))],
+            Some("TARGO_BUILD_TARGET_DIR"),
+            Some(home.join("elsewhere")),
+            None,
+        ),
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(jobs))],
+            Some("CARGO_BUILD_TARGET_DIR"),
+            Some(env_target.clone()),
+            None,
+        ),
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok(named_build))],
+            None,
+            fresh.clone(),
+            Some(home.join("b")),
+        ),
+        // A key a multi-line string hides from a line scan; a file in TOML 1.1, which Targo
+        // reads, that names nothing; and text no reader parses.
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok(hidden_build))],
+            None,
+            fresh.clone(),
+            Some(home.join("b")),
+        ),
+        (
+            "--config extra.toml --unverified build".into(),
+            vec![("extra.toml", Ok(hidden_target))],
+            Some("CARGO_BUILD_TARGET_DIR"),
+            Some(home.join("elsewhere")),
+            None,
+        ),
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok("t = { a = 1, }\n"))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok("t = { a = 1 b = 2 }\n"))],
+            None,
+            None,
+            None,
+        ),
+        // A file's include is read against its own folder.
+        (
+            format!("--config conf/extra.toml --unverified build {f}"),
+            vec![
+                ("conf/extra.toml", Ok("include = ['more.toml']\n")),
+                ("conf/more.toml", Ok(named_build)),
+            ],
+            None,
+            fresh.clone(),
+            Some(root.join("b")),
+        ),
+        (
+            format!("--config conf/extra.toml --unverified build {f}"),
+            vec![
+                ("conf/extra.toml", Ok("include = ['more.toml']\n")),
+                ("conf/more.toml", Ok(jobs)),
+                ("more.toml", Ok(named_build)),
+            ],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        // One cycle check spans the list, as Targo's one set does.
+        (
+            format!("--config extra.toml --config extra.toml --unverified build {f}"),
+            vec![("extra.toml", Ok(jobs))],
+            None,
+            None,
+            None,
+        ),
+        // Every value is read, before and after the verb.
+        (
+            format!("--config bd.toml --unverified build {f} --config build.jobs=1"),
+            vec![("bd.toml", Ok(named_build))],
+            None,
+            fresh.clone(),
+            Some(home.join("b")),
+        ),
+        // A value naming no file that is no dotted key, one the reader fails on, and one where
+        // something stands that the reader says is none.
+        (
+            format!("--config other.toml --unverified build {f}"),
+            vec![],
+            None,
+            None,
+            None,
+        ),
+        (
+            format!("--config o=4 --unverified build {f}"),
+            vec![("o=4", Err(()))],
+            None,
+            None,
+            None,
+        ),
+        (
+            format!("--config o=5 --unverified build {f}"),
+            vec![],
+            None,
+            None,
+            None,
+        ),
+        (
+            format!("--config {long} --unverified build {f}"),
+            vec![(long.as_str(), Err(()))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        // A file is read whole: what its parse names, not what its lines mention.
+        (
+            format!("--config ci.toml --unverified build {f}"),
+            vec![("ci.toml", Ok(mentions))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        // A value read as TOML 1.1, as Targo reads it (`\e`, `\x`, an inline table's trailing
+        // comma, here in a list of include tables), and one no reader parses that spells a
+        // directory's key by its letters.
+        (
+            format!("--config build.build-dir=\"b\\e\" --unverified build {f}"),
+            vec![],
+            None,
+            None,
+            None,
+        ),
+        (
+            format!("--config include=[{{path=\"more.toml\",}}] --unverified build {f}"),
+            vec![("more.toml", Ok(named_build))],
+            None,
+            fresh.clone(),
+            Some(home.join("b")),
+        ),
+        (
+            format!("--config env.X=\"\\x41\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config build.\"target\\x2ddir\"=\"x\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config build.build-dir=\"b\\q\" --unverified build {f}"),
+            vec![],
+            None,
+            None,
+            None,
+        ),
+        // Inline values: a backslash escapes no key, a quoted key is its name, an include is
+        // read against the working directory.
+        (
+            format!("--config env.X=\"a\\\\b\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config env.X=\"\\e\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config build.\"build-dir\"=\"b\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            Some(root.join("b")),
+        ),
+        (
+            "--config build.\"target-dir\"=\"x\" --unverified build".into(),
+            vec![],
+            Some("CARGO_BUILD_TARGET_DIR"),
+            Some(root.join("x")),
+            None,
+        ),
+        (
+            format!("--config build.\"target-dir\"=\"x\" --unverified build {f}"),
+            vec![],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            "--config build.\"target\\x2ddir\"=\"x\" --unverified build".into(),
+            vec![],
+            Some("CARGO_BUILD_TARGET_DIR"),
+            Some(root.join("x")),
+            None,
+        ),
+        (
+            format!("--config include=[\"more.toml\"] --unverified build {f}"),
+            vec![("more.toml", Ok(named_build))],
+            None,
+            fresh.clone(),
+            Some(home.join("b")),
+        ),
+        (
+            format!("--config include=[\"more.toml\"] --unverified build {f}"),
+            vec![("more.toml", Ok(jobs))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        // Each inline value's includes load with a cycle check of their own, apart from the one
+        // the file values share (`cli_args_as_table`'s fresh `HashSet` per value): a file two
+        // values include, or one a file value already loaded, is no cycle.
+        (
+            format!(
+                "--config include=[\"more.toml\"] --config include=[\"more.toml\"] \
+                 --unverified build {f}"
+            ),
+            vec![("more.toml", Ok(jobs))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config more.toml --config include=[\"more.toml\"] --unverified build {f}"),
+            vec![("more.toml", Ok(jobs))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        (
+            format!("--config include=[\"more.toml\"] --config more.toml --unverified build {f}"),
+            vec![("more.toml", Ok(jobs))],
+            None,
+            fresh.clone(),
+            None,
+        ),
+        // A walk config's hidden build directory, beside a value the shim leaves as typed.
+        (
+            format!("--config env.X=\"a\\\\b\" --unverified build {f}"),
+            vec![(".cargo/config.toml", Ok(hidden_build))],
+            None,
+            fresh.clone(),
+            Some(root.join("b")),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (line, files, var, expected, intermediates) in rows {
+        let files: BTreeMap<PathBuf, Result<String, ()>> = files
+            .iter()
+            .map(|&(name, text)| (root.join(name), text.map(str::to_owned)))
+            .chain([(root.join("Cargo.toml"), Ok("[workspace]".to_owned()))])
+            .collect();
+        let read = |path: &Path| files.get(path).cloned().transpose();
+        let env = |name: &str| (Some(name) == var).then(|| env_target.clone().into_os_string());
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let got = selected_outputs(&words(&line), Tool::Targo, &machine, &|_| UserAlias::None)
+            .map(|c| (c.target.explicit_path(), c.intermediates));
+        let expected = expected.map(|target| (target, intermediates));
+        if got != expected {
+            wrong.push(format!("{line} {var:?}: {got:?}, not {expected:?}"));
+        }
+    }
+    // An inline value that is no one dotted key and its value, which Targo refuses
+    // (`toml_dotted_keys`): an empty one, blank, a comment, a table's header.
+    let read = |path: &Path| Ok((path == root.join("Cargo.toml")).then(|| "[workspace]".into()));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&root),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    for value in ["", " ", "#", "[build]", "a = 1\nb = 2"] {
+        let line = [
+            "--unverified",
+            "build",
+            "--target-dir",
+            "fresh",
+            "--config",
+            value,
+        ];
+        let line = line.map(str::to_owned);
+        let got = selected_outputs(&line, Tool::Targo, &machine, &|_| UserAlias::None);
+        if let Some(got) = got {
+            wrong.push(format!("--config {value:?}: {:?}, not None", got.target));
+        }
+    }
+    // The configs a walk finds are the reader's to read: what stands on the disk beside them
+    // is no file to it (atpkg's reader fails on a folder there, and so names both).
+    std::fs::create_dir_all(root.join(".cargo/config.toml")).unwrap();
+    let line = words(&format!("--unverified build {f}"));
+    let got = selected_outputs(&line, Tool::Targo, &machine, &|_| UserAlias::None)
+        .map(|c| c.target.explicit_path());
+    if got != fresh {
+        wrong.push(format!(
+            "a walk read past its reader: {got:?}, not {fresh:?}"
+        ));
+    }
+    std::fs::remove_dir(root.join(".cargo/config.toml")).unwrap();
+    // The words alone: a file's target directory moves a build no typed target outranks, the
+    // program's `--target-dir` among them; an empty one is the working directory, which
+    // outranks it.
+    for (line, text, unresolved) in [
+        ("--unverified build --config extra.toml", jobs, false),
+        ("--unverified build --config extra.toml", named_target, true),
+        (
+            "--unverified build --target-dir x --config extra.toml",
+            named_target,
+            false,
+        ),
+        (
+            "--unverified run --config extra.toml serve --target-dir x",
+            named_target,
+            true,
+        ),
+        (
+            "--unverified build --target-dir= --config extra.toml",
+            named_target,
+            false,
+        ),
+    ] {
+        let extra = root.join("extra.toml");
+        let read = |path: &Path| Ok((path == extra).then(|| text.to_owned()));
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        if unresolved_words(&words(line), Tool::Targo, &machine) != unresolved {
+            wrong.push(format!("{line} {text:?}: unresolved is not {unresolved}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A line that starts with `#` is a comment only outside a multi-line string: one that closes the
+/// string there can go on to name a directory, which Targo reads and the line scan skips, so a
+/// file holding a multi-line string is parsed, and one the parser cannot read names both. A file
+/// it includes is read the same way, as TOML 1.1. NEGATIVE CONTROL: the first four rows read as
+/// naming nothing without the parse, and the unparseable row too, though Targo may build into
+/// what it names; a TOML 1.1 row that names nothing, a `#` line inside the string, and one with
+/// no string, still name nothing.
+#[test]
+fn config_dirs_read_a_key_a_multiline_string_hides_from_the_line_scan() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let dir = home.join("project/.cargo");
+    let config = dir.join("config.toml");
+    let more = dir.join("more.toml");
+    let hidden_target = "build = { dep-info-basedir = \"\"\"\n#\"\"\", target-dir = \"/t\" }\n";
+    for (text, included, expected) in [
+        (hidden_target, None, (true, false)),
+        (
+            "build = { dep-info-basedir = \"\"\"\n#\"\"\", build-dir = \"/b\" }\n",
+            None,
+            (false, true),
+        ),
+        (
+            "build = { dep-info-basedir = '''\n  #''', target-dir = '/t' }\n",
+            None,
+            (true, false),
+        ),
+        (
+            "include = [\"more.toml\"]\n",
+            Some(hidden_target),
+            (true, false),
+        ),
+        // TOML 1.1's trailing comma, which Targo parses, names nothing; text no reader parses
+        // may name either.
+        ("x = '''a'''\nt = { a = 1, }\n", None, (false, false)),
+        ("x = '''a'''\nt = { a = 1 b = 2 }\n", None, (true, true)),
+        (
+            "x = \"\"\"\n# target-dir = \"/t\"\n\"\"\"\n",
+            None,
+            (false, false),
+        ),
+        ("# target-dir = \"/t\"\n", None, (false, false)),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(text.to_owned())
+            } else if path == more {
+                included.map(str::to_owned)
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&home),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let named = config_dirs(&dir, &machine);
+        assert_eq!(
+            (named.target, named.build),
+            expected,
+            "{text:?} {included:?}"
+        );
+    }
+}
+
+/// An artifact directory (`--artifact-dir`, `build.artifact-dir` in a `--config`, the
+/// environment or a config file) is a folder Targo creates and links final artifacts into
+/// (`commands/build.rs`, `compiler/mod.rs`), which no target this front grants holds: it leaves
+/// the call's directories unresolved, so the call owes custody and no explicit target is granted.
+/// Only `build` reads one (`commands/build.rs` alone sets `export_dir`): another command Targo
+/// runs itself (`check`, `test`, `doc`) reads no config, variable or `--config` value naming one,
+/// while `b` (`build`'s alias) and an external command, which may run `build`, do; a typed
+/// `--artifact-dir`, which only `build` takes (clap refuses it elsewhere), leaves any call
+/// unresolved. NEGATIVE CONTROL: the same words after `--` or in a trailing verb's program are
+/// the program's, and a config naming none names none.
+#[test]
+fn an_artifact_directory_leaves_the_call_unresolved() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    let config = root.join(".cargo/config.toml");
+    let manifest = root.join("Cargo.toml");
+    let words = |line: &str| {
+        line.split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let target = ("CARGO_TARGET_DIR", "/t");
+    for (line, var, text, unresolved) in [
+        (
+            "-Zunstable-options --unverified build --artifact-dir out",
+            None,
+            None,
+            true,
+        ),
+        (
+            "-Zunstable-options --unverified build --artifact-dir=out",
+            None,
+            None,
+            true,
+        ),
+        (
+            "--unverified build --config build.artifact-dir='out'",
+            None,
+            None,
+            true,
+        ),
+        (
+            "--unverified --config=build.artifact-dir=\"out\" build",
+            None,
+            None,
+            true,
+        ),
+        (
+            "--unverified build",
+            Some("CARGO_BUILD_ARTIFACT_DIR"),
+            None,
+            true,
+        ),
+        (
+            "--unverified build",
+            Some("TARGO_BUILD_ARTIFACT_DIR"),
+            None,
+            true,
+        ),
+        (
+            "--unverified build",
+            None,
+            Some("[build]\nartifact-dir = \"out\"\n"),
+            true,
+        ),
+        (
+            "--unverified build",
+            None,
+            Some("build.artifact-dir = 'out'\n"),
+            true,
+        ),
+        (
+            "--unverified build",
+            None,
+            Some("[build]\n\"artifact\\u002ddir\" = \"o\"\n"),
+            true,
+        ),
+        ("--unverified run -- --artifact-dir out", None, None, false),
+        (
+            "--unverified run serve --artifact-dir out",
+            None,
+            None,
+            false,
+        ),
+        (
+            "--unverified build",
+            None,
+            Some("[build]\njobs = 2\n"),
+            false,
+        ),
+        (
+            "--unverified check",
+            None,
+            Some("[build]\nartifact-dir = \"out\"\n"),
+            false,
+        ),
+        (
+            "--unverified test",
+            Some("CARGO_BUILD_ARTIFACT_DIR"),
+            None,
+            false,
+        ),
+        (
+            "--unverified doc --config build.artifact-dir='out'",
+            None,
+            None,
+            false,
+        ),
+        (
+            "--unverified b",
+            None,
+            Some("[build]\nartifact-dir = \"out\"\n"),
+            true,
+        ),
+        (
+            "--unverified xtask",
+            None,
+            Some("[build]\nartifact-dir = \"out\"\n"),
+            true,
+        ),
+        (
+            "-Zunstable-options --unverified check --artifact-dir out",
+            None,
+            None,
+            true,
+        ),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                text.map(str::to_owned)
+            } else if path == manifest {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let env = |name: &str| {
+            if name == target.0 {
+                Some(target.1.into())
+            } else {
+                (Some(name) == var).then(|| "out".into())
+            }
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = words(line);
+        let named = unresolved_words(&args, Tool::Targo, &machine)
+            || configs_unresolved(&root, Tool::Targo, &machine, reads_artifacts(&args));
+        assert_eq!(named, unresolved, "{line} {var:?} {text:?}");
+        assert_eq!(
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none(),
+            unresolved,
+            "{line} {var:?} {text:?}"
+        );
+    }
+    // A `TARGO_HOME`'s config is the home Trust's main reads where `CARGO_HOME` is unset: an
+    // artifact or build directory it names leaves the call unresolved, whichever build runs it.
+    // NEGATIVE CONTROL: a set `CARGO_HOME` outranks it, and a config naming none names none.
+    let twin_config = scratch.path().join("th/config.toml");
+    for (text, cargo_home, unresolved) in [
+        ("[build]\nartifact-dir = \"out\"\n", None, true),
+        ("[build]\nbuild-dir = \"bd\"\n", None, true),
+        ("[build]\nartifact-dir = \"out\"\n", Some("/ch"), false),
+        ("[build]\njobs = 2\n", None, false),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == twin_config {
+                Some(text.to_owned())
+            } else if path == manifest {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let twin_home = scratch.path().join("th").into_os_string();
+        let env = |name: &str| match name {
+            "CARGO_TARGET_DIR" => Some(target.1.into()),
+            "TARGO_HOME" => Some(twin_home.clone()),
+            "CARGO_HOME" => cargo_home.map(OsString::from),
+            _ => None,
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = words("--unverified build");
+        assert_eq!(
+            configs_unresolved(&root, Tool::Targo, &machine, true),
+            unresolved,
+            "{text} {cargo_home:?}"
+        );
+        assert_eq!(
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None).is_none(),
+            unresolved,
+            "{text} {cargo_home:?}"
+        );
+    }
+}
+
+/// Targo loads one config file per folder: the legacy `config` wherever one stands, else
+/// `config.toml` (`context/mod.rs`'s `get_file_path`), so a `config.toml` beside a `config` names
+/// nothing, even one this reader cannot parse. NEGATIVE CONTROL: with no `config` there, the
+/// same `config.toml` names what it names, and a `config` read as text names its own keys.
+#[test]
+fn config_dirs_read_only_the_config_file_targo_loads() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let dir = home.join("project/.cargo");
+    let legacy = dir.join("config");
+    let config = dir.join("config.toml");
+    for (shadowed, beside, expected) in [
+        (
+            "x = '''a'''\nt = { a = 1 b = 2 }\n",
+            Some("[env]\nA = \"1\"\n"),
+            (false, false),
+        ),
+        (
+            "[build]\ntarget-dir = \"/t\"\n",
+            Some("[env]\nA = \"1\"\n"),
+            (false, false),
+        ),
+        ("x = '''a'''\nt = { a = 1 b = 2 }\n", None, (true, true)),
+        ("[build]\ntarget-dir = \"/t\"\n", None, (true, false)),
+        (
+            "[env]\nA = \"1\"\n",
+            Some("[build]\nbuild-dir = \"/b\"\n"),
+            (false, true),
+        ),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(shadowed.to_owned())
+            } else if path == legacy {
+                beside.map(str::to_owned)
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&home),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let named = config_dirs(&dir, &machine);
+        assert_eq!(
+            (named.target, named.build),
+            expected,
+            "{shadowed:?} {beside:?}"
+        );
+    }
+}
+
+/// A configured target holding a control character is refused, as [`decide`] refuses to place
+/// under one: a string this reader cannot decode as Targo does (a multi-line string's CRLF, which
+/// `toml` keeps and `aterm_toml` folds) is not read at all ([`config_toml`]), which refuses too.
+/// NEGATIVE CONTROL: without the refusal each row but the CRLF one owns the folder it names.
+#[test]
+fn a_configured_target_holding_a_control_character_is_refused() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let root = home.join("project");
+    let config = root.join(".cargo/config.toml");
+    let manifest = root.join("Cargo.toml");
+    let args = ["--unverified".into(), "build".into()];
+    for text in [
+        "build.target-dir = \"\"\"\r\nx\r\ny\"\"\"\n",
+        "build.target-dir = '''\nx\ny'''\n",
+        "build.target-dir = \"x\\ny\"\n",
+        "build.target-dir = \"x\\ty\"\n",
+        "build.target-dir = \"x\\u007fy\"\n",
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(text.to_owned())
+            } else if path == manifest {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&root),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        assert_eq!(
+            selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None),
+            None,
+            "{text:?}"
+        );
+        assert!(target_hint(&machine, Tool::Cargo).is_err(), "{text:?}");
+        // The config names a target, so the call stays one whose directories need custody.
+        assert!(
+            configs_unresolved(&root, Tool::Targo, &machine, true),
+            "{text:?}"
+        );
+    }
+    // Only the target Targo takes is judged: the nearest config's, which outranks a farther one
+    // holding a control character, so the call keeps the target it names.
+    let shadowed = home.join(".cargo/config.toml");
+    let read = |path: &Path| {
+        Ok(if path == config {
+            Some("[build]\ntarget-dir = \"out\"\n".to_owned())
+        } else if path == shadowed {
+            Some("[build]\ntarget-dir = \"a\\tb\"\n".to_owned())
+        } else if path == manifest {
+            Some("[workspace]".into())
+        } else {
+            None
+        })
+    };
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&root),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    assert_eq!(
+        selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None),
+        Some(SelectedOutputs {
+            target: FinalTarget::Explicit(root.join("out")),
+            manifests: vec![manifest.clone()],
+            within: None,
+            intermediates: None,
+        })
+    );
+    assert_eq!(
+        target_hint(&machine, Tool::Cargo),
+        Ok(Some(root.join("out")))
+    );
 }
 
 #[test]
@@ -971,7 +2303,7 @@ fn targo_runs_the_line_its_aliases_expand_to() {
     };
     let line = |tool, words: &str| {
         let args: Vec<String> = words.split_whitespace().map(str::to_owned).collect();
-        targo_line(&args, tool, &alias).map(|line| line.join(" "))
+        targo_line(&args, tool, &alias, &NO_MIRI).map(|line| line.join(" "))
     };
     let t = Tool::Targo;
     // `cargo-miri` pushes `miri` onto the directory (`get_target_dir`): the host's separator.
@@ -1040,6 +2372,27 @@ fn targo_runs_the_line_its_aliases_expand_to() {
             "miri run --target-dir= x",
             "--unverified run --target-dir miri x",
         ),
+        // With no `--target-dir`, the target is `cargo metadata`'s, which reads every
+        // `--config` before `--` (`cargo_extra_flags`): one past `run`'s program joins Targo's
+        // own words, before the program; a typed target, and a `--config` with no value, leave
+        // the program's words its own.
+        (
+            "miri run demo --config a.toml",
+            "--unverified run --config a.toml demo --config a.toml",
+        ),
+        (
+            "miri r --config=k=v demo --config=a.toml -- --config b",
+            "run --config=k=v --config a.toml demo --config=a.toml -- --config b",
+        ),
+        (
+            "miri test demo --config a.toml",
+            "--unverified test demo --config a.toml",
+        ),
+        (
+            "miri run --target-dir t demo --config a.toml",
+            "--unverified run --target-dir t/miri demo --config a.toml",
+        ),
+        ("miri run demo --config", "--unverified run demo --config"),
         ("-v miri t -q", "run -q -- -q"),
         ("--config k=v -Zx miri run x", "--unverified run x"),
         ("-qC d miri run x", "-qC d --unverified run x"),
@@ -1064,7 +2417,7 @@ fn targo_runs_the_line_its_aliases_expand_to() {
         }
     };
     let args: Vec<String> = ["--unverified", "r", "-h"].map(str::to_owned).to_vec();
-    assert_eq!(targo_line(&args, Tool::Targo, &looping), None);
+    assert_eq!(targo_line(&args, Tool::Targo, &looping, &NO_MIRI), None);
     assert_eq!(line(Tool::Tippy, "b -m x").as_deref(), Some("b -m x"));
     // Targo refuses any word after a builtin command it runs itself a `--` hands it where no
     // user alias of the name stands (`weird_check`).
@@ -1098,6 +2451,798 @@ fn targo_runs_the_line_its_aliases_expand_to() {
     assert_eq!(read("outer -m x"), ["--unverified", "-q", "-m"]);
 }
 
+/// MIRI HANDS BACK ITS METADATA TARGET, joined with `miri` (`get_target_dir`), where none is
+/// typed, ahead of the words it forwards, as it puts it there (`phase_cargo_miri`), and says
+/// where it sets up first (`setup.rs`): on `miri setup`, and on a verb it hands back where
+/// `MIRI_SYSROOT` is unset; a call that inherits the lane (Targo's nested-unverified endpoint)
+/// runs `miri` as one that types `--unverified` does, and `nextest` is handed back with its
+/// target too. NEGATIVE CONTROL: a typed target, a help option, `setup` and `clean` never ask the
+/// metadata target; a call in no lane, which Targo refuses before `targo-miri` runs, keeps the
+/// line the words alone give; `build` is handed back only under
+/// `MIRI_BUILD_TEST_DEPS`; a target the reader cannot tell names none and says so.
+#[test]
+fn miri_hands_back_its_metadata_target_and_says_where_it_sets_up() {
+    let alias = |verb: &str| match verb {
+        "t" => UserAlias::Words(["run", "-q", "--"].map(str::to_owned).to_vec()),
+        "nextest" => UserAlias::Words(vec!["test".to_owned()]),
+        "unknown" => UserAlias::Unknown,
+        _ => UserAlias::None,
+    };
+    let told = |_: &[String]| Some(PathBuf::from("/m"));
+    let asked = |_: &[String]| -> Option<PathBuf> { panic!("the metadata target is not read") };
+    let read = |typed: &str,
+                env: &[(&str, &str)],
+                metadata_target: &dyn Fn(&[String]) -> Option<PathBuf>| {
+        let args: Vec<String> = typed.split_whitespace().map(str::to_owned).collect();
+        let env = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        let miri = Miri {
+            env: &env,
+            metadata_target,
+        };
+        let line = targo_line(&args, Tool::Targo, &alias, &miri).map(|line| line.join(" "));
+        (line, miri_call(&args, Tool::Targo, &alias, &miri))
+    };
+    let call = |setup: bool, target_unread: bool, base: Option<&str>| MiriCall {
+        setup,
+        target_unread,
+        base: base.map(str::to_owned),
+    };
+    let sysroot = [("MIRI_SYSROOT", "")];
+    let deps = [("MIRI_BUILD_TEST_DEPS", "1")];
+    let inherited = [(NESTED_UNVERIFIED_ENDPOINT, "endpoint")];
+    #[expect(
+        clippy::type_complexity,
+        reason = "a row: the words typed, the variables set, the metadata target, the line, and \
+                  what miri does besides"
+    )]
+    let rows: Vec<(
+        &str,
+        &[(&str, &str)],
+        &dyn Fn(&[String]) -> Option<PathBuf>,
+        Option<&str>,
+        MiriCall,
+    )> = vec![
+        (
+            "--unverified miri run x",
+            &[],
+            &told,
+            Some("--unverified run --target-dir /m/miri x"),
+            call(true, false, Some("/m")),
+        ),
+        // A `--config` past the program is the program's in the line Targo runs: only
+        // `cargo metadata` reads it, and the metadata target says what it made of it.
+        (
+            "--unverified miri run demo --config a.toml -- --config b",
+            &[],
+            &told,
+            Some("--unverified run --target-dir /m/miri demo --config a.toml -- --config b"),
+            call(true, false, Some("/m")),
+        ),
+        (
+            "-qC d --unverified miri test x",
+            &sysroot,
+            &told,
+            Some("-qC d --unverified test --target-dir /m/miri x"),
+            call(false, false, Some("/m")),
+        ),
+        // An alias of the verb handed back moves the flag as Targo expands it: past its `--`,
+        // among the program's words.
+        (
+            "--unverified -v miri t -q",
+            &[],
+            &told,
+            Some("run -q -- --target-dir /m/miri -q"),
+            call(true, false, Some("/m")),
+        ),
+        (
+            "--unverified miri run x",
+            &[],
+            &none_told,
+            Some("--unverified run x"),
+            call(true, true, None),
+        ),
+        (
+            "--unverified miri run --target-dir t x",
+            &[],
+            &asked,
+            Some("--unverified run --target-dir t/miri x"),
+            call(true, false, Some("t")),
+        ),
+        (
+            "--unverified miri run x -h",
+            &[],
+            &asked,
+            Some("--unverified run x -h"),
+            call(false, false, None),
+        ),
+        (
+            "--unverified miri setup",
+            &sysroot,
+            &asked,
+            Some("--unverified miri setup"),
+            call(true, false, None),
+        ),
+        (
+            "--unverified miri setup --print-sysroot",
+            &[],
+            &asked,
+            Some("--unverified miri setup --print-sysroot"),
+            call(true, false, None),
+        ),
+        (
+            "--unverified miri setup -h",
+            &[],
+            &asked,
+            Some("--unverified miri setup -h"),
+            call(false, false, None),
+        ),
+        (
+            "--unverified miri clean",
+            &[],
+            &asked,
+            Some("--unverified miri clean"),
+            call(false, false, None),
+        ),
+        // `nextest` is handed back with its target as the other verbs are: a user alias of it
+        // Targo expands (`nextest = "test"`) builds into that target.
+        (
+            "--unverified miri nextest run x",
+            &[],
+            &told,
+            Some("test run --target-dir /m/miri x"),
+            call(true, false, Some("/m")),
+        ),
+        (
+            "--unverified miri build x",
+            &[],
+            &asked,
+            Some("--unverified miri build x"),
+            call(false, false, None),
+        ),
+        (
+            "--unverified miri build x",
+            &deps,
+            &told,
+            Some("--unverified build --target-dir /m/miri x"),
+            call(true, false, Some("/m")),
+        ),
+        (
+            "miri run x",
+            &[],
+            &asked,
+            Some("--unverified run x"),
+            call(false, false, None),
+        ),
+        (
+            "miri setup",
+            &[],
+            &asked,
+            Some("miri setup"),
+            call(false, false, None),
+        ),
+        // An alias the reader cannot tell may run `miri`, and set up, on a call that consents.
+        (
+            "--unverified unknown x",
+            &[],
+            &asked,
+            None,
+            call(true, false, None),
+        ),
+        ("unknown x", &[], &asked, None, call(false, false, None)),
+        // A Targo's child inherits its unverified lane (`TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT`,
+        // which Targo authenticates and the reader cannot): Targo runs `miri` with none typed.
+        (
+            "miri run x",
+            &inherited,
+            &told,
+            Some("--unverified run --target-dir /m/miri x"),
+            call(true, false, Some("/m")),
+        ),
+        (
+            "miri setup",
+            &inherited,
+            &asked,
+            Some("miri setup"),
+            call(true, false, None),
+        ),
+        (
+            "unknown x",
+            &inherited,
+            &asked,
+            None,
+            call(true, false, None),
+        ),
+    ];
+    for (typed, env, metadata_target, runs, does) in rows {
+        assert_eq!(
+            read(typed, env, metadata_target),
+            (runs.map(str::to_owned), does),
+            "{typed} {env:?}"
+        );
+    }
+}
+
+/// THE METADATA TARGET `cargo-miri` READS (`get_cargo_metadata`: `targo metadata --no-deps`, with
+/// every `--config` and the first `--manifest-path` before `--`, where Targo works) is Targo's
+/// target for that workspace (`GlobalContext::target_dir`, `Workspace::target_dir`):
+/// `CARGO_TARGET_DIR` (or its twin) against the working directory, else `build.target-dir`
+/// (`CARGO_BUILD_TARGET_DIR`, then the configs), else the workspace root's `target`, the root
+/// found as `find_root` finds it. NEGATIVE CONTROL: a member a root excludes is its own root, a
+/// `members` entry cancelling that; `-m` is no flag `cargo-miri` forwards; a pointer met first
+/// wins over a farther root; the walk stops at `target/package` and after the package home, and
+/// goes on past HOME; `Targo.toml` is the working directory's manifest before `Cargo.toml`; a
+/// manifest holding a time without seconds (TOML 1.1) is read, as Targo reads it, where a
+/// reading that refuses one tells none. A `--config` that names a target, a config or manifest
+/// this reader cannot read, an empty
+/// target, `__CARGO_TEST_ROOT`, and a `--manifest-path` Targo refuses tell none.
+#[test]
+fn the_metadata_target_is_the_one_targo_metadata_names() {
+    let w = Path::new("/w");
+    let home = w.join("home");
+    let root = home.join("root");
+    let base: Vec<(PathBuf, &str)> = vec![
+        (
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\nexclude = [\"away\"]\n",
+        ),
+        (root.join("member/Cargo.toml"), "[package]\nname = \"m\"\n"),
+        (root.join("away/Cargo.toml"), "[package]\nname = \"a\"\n"),
+        (
+            home.join("other/Cargo.toml"),
+            "[workspace]\nmembers = [\"../p\", \"../root/mid/inner/x\"]\n",
+        ),
+        (
+            home.join("p/Cargo.toml"),
+            "[package]\nname = \"p\"\nworkspace = \"../other\"\n",
+        ),
+        (
+            root.join("target/package/q/Cargo.toml"),
+            "[package]\nname = \"q\"\n",
+        ),
+        (
+            root.join("ch/reg/r/Cargo.toml"),
+            "[package]\nname = \"r\"\n",
+        ),
+        (
+            home.join("both/Targo.toml"),
+            "[package]\nname = \"b\"\nworkspace = \"../other\"\n",
+        ),
+        (home.join("both/Cargo.toml"), "[package]\nname = \"b\"\n"),
+        (
+            root.join("mid/Cargo.toml"),
+            "[package]\nname = \"mid\"\nworkspace = \"../../other\"\n",
+        ),
+        (
+            root.join("mid/inner/x/Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        ),
+        (home.join("solo/Cargo.toml"), "[package]\nname = \"s\"\n"),
+    ];
+    let target = |files: &[(PathBuf, &str)],
+                  cwd: &Path,
+                  env: &[(&str, &str)],
+                  words: &str|
+     -> Option<PathBuf> {
+        let files: BTreeMap<PathBuf, String> = base
+            .iter()
+            .chain(files)
+            .map(|(path, text)| (path.clone(), (*text).to_owned()))
+            .collect();
+        let read = |path: &Path| Ok(files.get(path).cloned());
+        let env = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let words: Vec<String> = words.split_whitespace().map(str::to_owned).collect();
+        miri_metadata_target(&words, Tool::Targo, &machine)
+    };
+    let member = root.join("member");
+    let away = root.join("away");
+    let none: &[(PathBuf, &str)] = &[];
+    assert_eq!(
+        target(none, &member, &[], "run x"),
+        Some(root.join("target"))
+    );
+    assert_eq!(target(none, &away, &[], "run x"), Some(away.join("target")));
+    let listed = [(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\", \"away\"]\nexclude = [\"away\"]\n",
+    )];
+    assert_eq!(
+        target(&listed, &away, &[], "run"),
+        Some(root.join("target"))
+    );
+    assert_eq!(
+        target(none, &home.join("p"), &[], "run"),
+        Some(home.join("other/target"))
+    );
+    for (name, value, at) in [
+        ("CARGO_TARGET_DIR", "rel", member.join("rel")),
+        ("TARGO_TARGET_DIR", "rel", member.join("rel")),
+        ("CARGO_BUILD_TARGET_DIR", "b", member.join("b")),
+        ("CARGO_TARGET_DIR", "/abs", PathBuf::from("/abs")),
+    ] {
+        assert_eq!(
+            target(none, &member, &[(name, value)], "run"),
+            Some(at),
+            "{name}"
+        );
+    }
+    // `CARGO_TARGET_DIR` outranks a `--config` target, which outranks `CARGO_BUILD_TARGET_DIR`.
+    assert_eq!(
+        target(
+            none,
+            &member,
+            &[("CARGO_TARGET_DIR", "e")],
+            "run --config build.target-dir='x'"
+        ),
+        Some(member.join("e"))
+    );
+    let config = [(root.join(".cargo/config.toml"), "build.target-dir = 't'\n")];
+    assert_eq!(target(&config, &member, &[], "run"), Some(root.join("t")));
+    assert_eq!(
+        target(none, &member, &[], "run --manifest-path ../away/Cargo.toml"),
+        Some(away.join("target"))
+    );
+    assert_eq!(
+        target(
+            none,
+            &member,
+            &[],
+            "run x --manifest-path=../away/Cargo.toml"
+        ),
+        Some(away.join("target"))
+    );
+    assert_eq!(
+        target(none, &member, &[], "run -m ../away/Cargo.toml"),
+        Some(root.join("target"))
+    );
+    // Each flag is scanned apart: a `--config` whose value is spelled as a manifest flag is
+    // both.
+    assert_eq!(
+        target(
+            none,
+            &member,
+            &[],
+            "run --config --manifest-path=../away/Cargo.toml"
+        ),
+        None
+    );
+    assert_eq!(
+        target(none, &member, &[], "run demo --config build.target-dir='x'"),
+        None
+    );
+    assert_eq!(
+        target(none, &member, &[], "run --config build.jobs=2"),
+        Some(root.join("target"))
+    );
+    assert_eq!(
+        target(none, &member, &[], "run -- --config build.target-dir='x'"),
+        Some(root.join("target"))
+    );
+    // Manifests are read as Targo parses them, as TOML 1.1 (`parse_document`, `toml` 1.1.5): a
+    // metadata time without seconds, in the root's and the member's, is read, the root told.
+    let seconds_less = [
+        (
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"member\"]\n[workspace.metadata]\nat = 07:32\n",
+        ),
+        (
+            root.join("member/Cargo.toml"),
+            "[package]\nname = \"m\"\n[package.metadata]\nat = 1979-05-27T07:32Z\n",
+        ),
+    ];
+    assert_eq!(
+        target(&seconds_less, &member, &[], "run"),
+        Some(root.join("target"))
+    );
+    let broken = [(home.join("Cargo.toml"), "[")];
+    assert_eq!(target(&broken, &home.join("solo"), &[], "run"), None);
+    let include = [(
+        root.join(".cargo/config.toml"),
+        "include = ['missing.toml']\n",
+    )];
+    assert_eq!(target(&include, &member, &[], "run"), None);
+    assert_eq!(
+        target(none, &member, &[("CARGO_TARGET_DIR", "")], "run"),
+        None
+    );
+    assert_eq!(
+        target(none, &member, &[("CARGO_BUILD_TARGET_DIR", "")], "run"),
+        None
+    );
+    assert_eq!(
+        target(none, &member, &[("__CARGO_TEST_ROOT", "/w")], "run"),
+        None
+    );
+    let packaged = root.join("target/package/q");
+    assert_eq!(
+        target(none, &packaged, &[], "run"),
+        Some(packaged.join("target"))
+    );
+    let registry = root.join("ch/reg/r");
+    for cargo_home in ["/w/home/root/ch", "../.."] {
+        assert_eq!(
+            target(none, &registry, &[("CARGO_HOME", cargo_home)], "run"),
+            Some(registry.join("target")),
+            "{cargo_home}"
+        );
+    }
+    let registered = [(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\", \"ch/reg/r\"]\nexclude = [\"away\"]\n",
+    )];
+    assert_eq!(
+        target(&registered, &registry, &[], "run"),
+        Some(root.join("target"))
+    );
+    // A `TARGO_HOME` is the home Trust's main reads where `CARGO_HOME` is unset (Targo 16387
+    // reads `~/.cargo`): the root walk stops after it for one build, not the other, so a
+    // manifest under it tells no root, and a target its config names none, whichever build a
+    // lock runs. NEGATIVE CONTROL: a set `CARGO_HOME` outranks it for both.
+    let twin = [("TARGO_HOME", "/w/home/root/ch")];
+    assert_eq!(target(&registered, &registry, &twin, "run"), None);
+    let named = [(
+        PathBuf::from("/w/twin/config.toml"),
+        "build.target-dir = 'x'\n",
+    )];
+    assert_eq!(
+        target(&named, &member, &[("TARGO_HOME", "/w/twin")], "run"),
+        None
+    );
+    for both in [
+        [
+            ("CARGO_HOME", "/w/home/.cargo"),
+            ("TARGO_HOME", "/w/home/root/ch"),
+        ],
+        [("CARGO_HOME", "/w/home/.cargo"), ("TARGO_HOME", "/w/twin")],
+    ] {
+        assert_eq!(
+            target(&registered, &registry, &both, "run"),
+            Some(root.join("target"))
+        );
+        assert_eq!(
+            target(&named, &member, &both, "run"),
+            Some(root.join("target"))
+        );
+    }
+    // A package its workspace's root does not list, nor reaches through a path dependency, is
+    // no member: Targo's metadata fails (`error_if_manifest_not_in_members`), building nothing.
+    assert_eq!(target(none, &registry, &[], "run"), None);
+    // `Targo.toml` is read first, and Targo's members are each folder's `Cargo.toml`, so a
+    // `Targo.toml` that is not its own root is no member.
+    assert_eq!(target(none, &home.join("both"), &[], "run"), None);
+    assert_eq!(
+        target(none, &root.join("mid/inner/x"), &[], "run"),
+        Some(home.join("other/target"))
+    );
+    let unlisted = [(home.join("other/Cargo.toml"), "[workspace]\n")];
+    assert_eq!(target(&unlisted, &home.join("p"), &[], "run"), None);
+    assert_eq!(
+        target(&unlisted, &root.join("mid/inner/x"), &[], "run"),
+        None
+    );
+    // A pointer to a manifest that is no root, or a member the root excludes, is refused.
+    let pointed = [(home.join("other/Cargo.toml"), "[package]\nname = \"o\"\n")];
+    assert_eq!(target(&pointed, &home.join("p"), &[], "run"), None);
+    let excluded = [(
+        home.join("other/Cargo.toml"),
+        "[workspace]\nexclude = [\"../p\"]\n",
+    )];
+    assert_eq!(target(&excluded, &home.join("p"), &[], "run"), None);
+    let above = [(
+        w.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"home/solo\"]\n",
+    )];
+    assert_eq!(
+        target(&above, &home.join("solo"), &[], "run"),
+        Some(w.join("target"))
+    );
+    let bare_above = [(w.join("Cargo.toml"), "[workspace]\n")];
+    assert_eq!(target(&bare_above, &home.join("solo"), &[], "run"), None);
+    // Members as Targo finds them (`find_members`): a `members` glob, one component per `*`, and
+    // the path dependencies of the root and of each member, followed from one to the next, a
+    // `workspace = true` one through the root's `[workspace.dependencies]`.
+    let globbed = root.join("crates/c");
+    let deep = root.join("crates/c/d");
+    let depended = root.join("deps/a");
+    let transitive = root.join("deps/b");
+    let inherited = root.join("deps/i");
+    let unreached = root.join("deps/u");
+    let workspace = [
+        (
+            root.join("Cargo.toml"),
+            "[package]\nname = \"root\"\n[workspace]\nmembers = [\"crates/*\"]\n\
+             [workspace.dependencies]\ni = { path = \"deps/i\" }\n\
+             [dependencies]\na = { path = \"deps/a\" }\n\
+             [target.'cfg(unix)'.dev-dependencies]\ni = { workspace = true }\n",
+        ),
+        (globbed.join("Cargo.toml"), "[package]\nname = \"c\"\n"),
+        (deep.join("Cargo.toml"), "[package]\nname = \"d\"\n"),
+        (
+            depended.join("Cargo.toml"),
+            "[package]\nname = \"a\"\n[build-dependencies]\nb = { path = \"../b\" }\n",
+        ),
+        (transitive.join("Cargo.toml"), "[package]\nname = \"b\"\n"),
+        (inherited.join("Cargo.toml"), "[package]\nname = \"i\"\n"),
+        (unreached.join("Cargo.toml"), "[package]\nname = \"u\"\n"),
+    ];
+    for (cwd, told) in [
+        (&globbed, true),
+        (&depended, true),
+        (&transitive, true),
+        (&inherited, true),
+        (&deep, false),
+        (&unreached, false),
+    ] {
+        assert_eq!(
+            target(&workspace, cwd, &[], "run"),
+            told.then(|| root.join("target")),
+            "{}",
+            cwd.display()
+        );
+    }
+    assert_eq!(
+        target(none, &home.join("solo"), &[], "run"),
+        Some(home.join("solo/target"))
+    );
+    for manifest in [
+        "../missing/Cargo.toml",
+        "../away/main.rs",
+        "../../both/Targo.toml",
+        "../away",
+    ] {
+        assert_eq!(
+            target(
+                none,
+                &member,
+                &[],
+                &format!("run --manifest-path {manifest}")
+            ),
+            None,
+            "{manifest}"
+        );
+    }
+    // A manifest with neither a package nor a workspace, or with both keys, Targo refuses.
+    let virtual_less = [(root.join("member/Cargo.toml"), "[dependencies]\n")];
+    assert_eq!(target(&virtual_less, &member, &[], "run"), None);
+    let both_keys = [(
+        root.join("member/Cargo.toml"),
+        "[package]\nname = \"m\"\nworkspace = \"..\"\n[workspace]\n",
+    )];
+    assert_eq!(target(&both_keys, &member, &[], "run"), None);
+}
+
+/// A `members` GLOB NAMES THE FOLDERS `glob` LISTS, and the root Targo finds holds each
+/// package `find_members` reaches through them (laid on disk: a glob is listed there, whatever
+/// reader the machine holds for its manifests). A folder a glob names that the root's
+/// `exclude` takes is no member, its manifest never read (Targo returns before it loads one);
+/// a trailing `**` names every folder below its base, never the base; a `*` matches a leading
+/// `.`; a glob's folders are listed through their links; and a glob this reader cannot list (a
+/// `[` class, a leading `.` component, past its listing bound) adds nothing, while a literal
+/// entry or a path dependency still proves its member. Every package is read before a budget
+/// stops the walk, the root's first. NEGATIVE CONTROL: a package reached only through a
+/// member past the listing bound is not told. Unix: one folder is a symbolic link.
+#[cfg(unix)]
+#[test]
+fn a_members_glob_names_the_folders_glob_lists() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(scratch.path()).unwrap();
+    let home = base.join("home");
+    let package = |dir: &Path, text: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+    };
+    let named = |name: &str| format!("[package]\nname = \"{name}\"\n");
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let root_of = |dir: &Path| {
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(dir),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        workspace_root(&dir.join("Cargo.toml"), Tool::Targo, &machine)
+    };
+
+    // An excluded glob folder with no manifest, which Targo never loads; the root's own path
+    // dependency is its member.
+    let w = home.join("excluded");
+    package(
+        &w,
+        "[package]\nname = \"w\"\n[dependencies]\nb = { path = \"libs/b\" }\n\
+         [workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/old\", \"crates/gone\"]\n",
+    );
+    package(&w.join("crates/a"), &named("a"));
+    std::fs::create_dir_all(w.join("crates/old")).unwrap();
+    package(
+        &w.join("crates/gone"),
+        "[package]\nname = \"g\"\n[dependencies]\no = { path = \"../../libs/o\" }\n",
+    );
+    package(&w.join("libs/b"), &named("b"));
+    package(&w.join("libs/o"), &named("o"));
+    assert_eq!(root_of(&w.join("libs/b")), Some(w.clone()), "excluded");
+    assert_eq!(root_of(&w.join("crates/a")), Some(w.clone()), "excluded");
+    // An excluded folder's own dependency is none: its manifest is never loaded.
+    assert_eq!(root_of(&w.join("libs/o")), None, "excluded dependency");
+
+    // A `[` class this reader does not list, beside a literal member and a root dependency.
+    let w = home.join("class");
+    package(
+        &w,
+        "[package]\nname = \"w\"\n[dependencies]\nr = { path = \"libs/r\" }\n\
+         [workspace]\nmembers = [\"crates/[ab]*\", \"tools/x\"]\n",
+    );
+    package(&w.join("crates/a"), &named("a"));
+    package(&w.join("tools/x"), &named("x"));
+    package(&w.join("libs/r"), &named("r"));
+    assert_eq!(
+        root_of(&w.join("tools/x")),
+        Some(w.clone()),
+        "class literal"
+    );
+    assert_eq!(
+        root_of(&w.join("libs/r")),
+        Some(w.clone()),
+        "class dependency"
+    );
+
+    // A trailing `**` names the folders below `crates`, not `crates` itself, which holds no
+    // manifest: a glob member's path dependency is a member.
+    let w = home.join("recursive");
+    package(&w, "[workspace]\nmembers = [\"crates/**\"]\n");
+    package(
+        &w.join("crates/a"),
+        "[package]\nname = \"a\"\n[lib]\npath = \"lib.rs\"\n\
+         [dependencies]\nx = { path = \"../../libs/x\" }\n",
+    );
+    package(
+        &w.join("crates/b"),
+        "[package]\nname = \"b\"\n[lib]\npath = \"lib.rs\"\n",
+    );
+    package(
+        &w.join("crates/b/inner"),
+        "[package]\nname = \"inner\"\n[dependencies]\nv = { path = \"../../../libs/v\" }\n",
+    );
+    package(&w.join("libs/x"), &named("x"));
+    package(&w.join("libs/v"), &named("v"));
+    assert_eq!(root_of(&w.join("libs/x")), Some(w.clone()), "trailing **");
+    assert_eq!(
+        root_of(&w.join("libs/v")),
+        Some(w.clone()),
+        "** below a member"
+    );
+    // The base is no member, so a package there has its dependencies none.
+    package(
+        &w.join("crates"),
+        "[package]\nname = \"base\"\n[lib]\npath = \"lib.rs\"\n\
+         [dependencies]\nn = { path = \"../libs/n\" }\n",
+    );
+    package(&w.join("libs/n"), &named("n"));
+    assert_eq!(
+        root_of(&w.join("libs/n")),
+        None,
+        "the base of a trailing **"
+    );
+
+    // A `*` matches a leading `.`; a folder a glob names through a link is listed through it.
+    let w = home.join("dots");
+    package(&w, "[workspace]\nmembers = [\"crates/*\"]\n");
+    package(
+        &w.join("crates/.hidden"),
+        "[package]\nname = \"h\"\n[dependencies]\nz = { path = \"../../libs/z\" }\n",
+    );
+    package(
+        &home.join("elsewhere/l"),
+        "[package]\nname = \"l\"\n[dependencies]\ny = { path = \"../../libs/y\" }\n",
+    );
+    std::os::unix::fs::symlink(home.join("elsewhere/l"), w.join("crates/l")).unwrap();
+    package(&w.join("libs/z"), &named("z"));
+    package(&w.join("libs/y"), &named("y"));
+    assert_eq!(root_of(&w.join("crates/.hidden")), Some(w.clone()), "dot");
+    assert_eq!(
+        root_of(&w.join("libs/z")),
+        Some(w.clone()),
+        "dot dependency"
+    );
+    assert_eq!(root_of(&w.join("libs/y")), Some(w.clone()), "linked");
+
+    // A leading `.` component, which `glob` also expands to `.` and `..`, is not listed here:
+    // only a literal member proves one.
+    let w = home.join("special");
+    package(&w, "[workspace]\nmembers = [\"crates/.*\", \"tools/t\"]\n");
+    package(
+        &w.join("crates/.h"),
+        "[package]\nname = \"h\"\n[dependencies]\nq = { path = \"../../libs/q\" }\n",
+    );
+    package(&w.join("crates"), &named("c"));
+    package(&w.join("tools/t"), &named("t"));
+    package(&w.join("libs/q"), &named("q"));
+    assert_eq!(
+        root_of(&w.join("crates/.h")),
+        Some(w.clone()),
+        "special match"
+    );
+    assert_eq!(
+        root_of(&w.join("tools/t")),
+        Some(w.clone()),
+        "special literal"
+    );
+    assert_eq!(root_of(&w.join("libs/q")), None, "special unlisted");
+
+    // Past the listing bound, a glob adds nothing: the root's dependency is still read first
+    // and told, and a package reached only through a member that glob names is not.
+    let w = home.join("bounded");
+    package(
+        &w,
+        "[package]\nname = \"w\"\n[dependencies]\nr = { path = \"libs/r\" }\n\
+         [workspace]\nmembers = [\"crates/**/pkg\"]\n",
+    );
+    for i in 0..300 {
+        std::fs::create_dir_all(w.join(format!("crates/d{i}"))).unwrap();
+    }
+    package(
+        &w.join("crates/d0/pkg"),
+        "[package]\nname = \"p\"\n[dependencies]\nq = { path = \"../../../libs/q\" }\n",
+    );
+    package(&w.join("libs/r"), &named("r"));
+    package(&w.join("libs/q"), &named("q"));
+    assert_eq!(
+        root_of(&w.join("crates/d0/pkg")),
+        Some(w.clone()),
+        "bounded match"
+    );
+    assert_eq!(
+        root_of(&w.join("libs/r")),
+        Some(w.clone()),
+        "bounded root dependency"
+    );
+    assert_eq!(root_of(&w.join("libs/q")), None, "bounded unlisted");
+    // More members than the read budget: the root is read first, so its dependency is told.
+    let w = home.join("many");
+    package(
+        &w,
+        "[package]\nname = \"w\"\n[dependencies]\nr = { path = \"libs/r\" }\n\
+         [workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    for i in 0..300 {
+        package(&w.join(format!("crates/m{i}")), &named(&format!("m{i}")));
+    }
+    package(&w.join("libs/r"), &named("r"));
+    assert_eq!(root_of(&w.join("libs/r")), Some(w.clone()), "many");
+    // NEGATIVE CONTROL: within the bound, the same member's dependency is told.
+    let w = home.join("bounded");
+    for i in 1..300 {
+        std::fs::remove_dir(w.join(format!("crates/d{i}"))).unwrap();
+    }
+    assert_eq!(
+        root_of(&w.join("libs/q")),
+        Some(w.clone()),
+        "within the bound"
+    );
+}
+
 /// TARGO ANSWERS HELP AND ITS VERSION WHERE CLAP READS THEM, and builds nothing: a help
 /// option (or a cluster's `-h`) before the verb of any line it reads or among the final
 /// builtin verb's own words, the `help` verb, a line with no verb, a version option (or a
@@ -1118,7 +3263,7 @@ fn targo_answers_help_and_version_where_clap_reads_them() {
     };
     let query = |tool, words: &str| {
         let args: Vec<String> = words.split_whitespace().map(str::to_owned).collect();
-        targo_reading(&args, tool, &alias).map(|reading| reading.query)
+        targo_reading(&args, tool, &alias, &NO_MIRI).map(|reading| reading.query)
     };
     let t = Tool::Targo;
     for typed in [
@@ -1205,8 +3350,8 @@ fn targo_answers_help_and_version_where_clap_reads_them() {
 
 /// A `-C` BEFORE THE VERB NAMES TARGO'S DIRECTORY in each spelling clap reads, past the
 /// values before it (a `-Z` takes no word that starts with `-`); one after the verb or `--`
-/// is none of Targo's, and one whose value is missing names none. NEGATIVE CONTROL: in `-pC`
-/// the `C` is `-p`'s value.
+/// is none of Targo's, and one whose value is missing names none, as does a second one before
+/// the verb, which clap refuses. NEGATIVE CONTROL: in `-pC` the `C` is `-p`'s value.
 #[test]
 fn a_directory_before_the_verb_is_targos() {
     let dir = |line: &str| {
@@ -1228,8 +3373,473 @@ fn a_directory_before_the_verb_is_targos() {
     }
     assert_eq!(dir("-C -q build"), Some(None));
     assert_eq!(dir("-C"), Some(None));
+    // A second `-C` before the verb is one clap's Set action refuses, the same directory twice
+    // too: it names none.
+    for line in ["-C d -C e build", "-Cd -qC=e build", "-C d -C d build"] {
+        assert_eq!(dir(line), Some(None), "{line}");
+    }
     for line in ["build -C d", "-- -C d", "-pC build", "-Z -C"] {
         assert_eq!(dir(line).flatten(), None, "{line}");
+    }
+}
+
+/// AN ALIAS'S OWN DIRECTORY IS NONE, A TYPED ONE THE CALLER'S. Targo changes directory only from
+/// the `-C` typed before the verb (`cli.rs` reads `directory` once, before it expands an alias):
+/// a `-C` an alias puts before its verb, or one typed after the name of an alias whose words
+/// name no verb, it parses and ignores, so the target is the launcher's. A `-C` typed before the
+/// verb names a directory only the caller resolves, so [`selected_outputs`] grants none for it.
+/// An alias whose words, with those typed after its name, hold a `-C` clap refuses when it parses
+/// them again (a second one, one with no value) is a line the reader does not tell: Targo builds
+/// nothing, and the call is kept as wary as one whose alias is unknown ([`untold_lines`]).
+/// NEGATIVE CONTROL: a typed `-C`, alone or in a cluster, grants none; read as the alias's, the
+/// strip would grant the launcher's `t` for each. A `-C` after the verb, which clap refuses,
+/// grants none either (`Line::read` refuses it, with or without the typed one's rule). A refused
+/// alias `-C`, nested a level too, grants none; stripped as a well-formed one is, it would grant
+/// `t`.
+#[test]
+fn an_aliases_own_directory_is_none_and_a_typed_one_is_the_callers() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let cwd = home.join("project");
+    let manifest = cwd.join("Cargo.toml");
+    let read = |path: &Path| Ok((path == manifest).then(|| "[workspace]".to_owned()));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let words =
+        |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+    let alias = |verb: &str| match verb {
+        "ob" => UserAlias::Words(words("-C ../elsewhere build")),
+        "pre" => UserAlias::Words(words("--locked")),
+        "twice" => UserAlias::Words(words("-C ../a -C ../b build")),
+        "same" => UserAlias::Words(words("-C ../a -qC../a build")),
+        "bare" => UserAlias::Words(words("-C= build")),
+        "dashed" => UserAlias::Words(words("-C -q build")),
+        "empty" => UserAlias::Words(vec!["-C".to_owned(), String::new(), "build".to_owned()]),
+        "outer" => UserAlias::Words(words("-C ../a -C ../b inner")),
+        "inner" => UserAlias::Words(words("build")),
+        _ => UserAlias::None,
+    };
+    let chosen = Some(SelectedOutputs {
+        target: FinalTarget::Explicit(cwd.join("t")),
+        manifests: vec![manifest.clone()],
+        within: None,
+        intermediates: None,
+    });
+    for line in [
+        "--unverified ob --target-dir t",
+        "--unverified pre -C ../elsewhere build --target-dir t",
+    ] {
+        assert_eq!(
+            selected_outputs(&words(line), Tool::Targo, &machine, &alias),
+            chosen,
+            "{line}"
+        );
+    }
+    for line in [
+        "-Zunstable-options -C ../elsewhere --unverified build --target-dir t",
+        "-qC../elsewhere --unverified build --target-dir t",
+        "--unverified build --target-dir t -C x",
+    ] {
+        assert_eq!(
+            selected_outputs(&words(line), Tool::Targo, &machine, &alias),
+            None,
+            "{line}"
+        );
+    }
+    for line in [
+        "--unverified twice --target-dir t",
+        "--unverified same --target-dir t",
+        "--unverified bare --target-dir t",
+        "--unverified dashed --target-dir t",
+        "--unverified empty --target-dir t",
+        "--unverified outer --target-dir t",
+        "--unverified pre -C ../a -C ../b build --target-dir t",
+        "--unverified pre -C= build --target-dir t",
+    ] {
+        let args = words(line);
+        assert_eq!(
+            selected_outputs(&args, Tool::Targo, &machine, &alias),
+            None,
+            "{line}"
+        );
+        assert_eq!(
+            targo_line(&args, Tool::Targo, &alias, &NO_MIRI),
+            None,
+            "{line}"
+        );
+        assert!(
+            untold_lines(&args, Tool::Targo, &alias, &NO_MIRI).is_some(),
+            "{line}"
+        );
+    }
+}
+
+/// TARGO MERGES THE `--config` LIST CLAP KEEPS (`cli.rs`'s `configure_gctx`, clap's
+/// `fill_in_global_values`), ON THE WORDS IT RUNS: by Targo's name the hop's, every `--config`
+/// before the verb moved behind it where the words after it hold one ([`configs_after_subcommand`]).
+/// Targo merges the typed globals an alias expanded past, then the final parse's list at its
+/// deepest level: the verb's own `--config`s replace those before it, so the line keeps none of
+/// the final parse before such a verb; one the hop moves past an alias's `--` is its program's;
+/// a nested alias's own `--config`s stay in order with the moved ones. NEGATIVE CONTROLS: a verb
+/// with no `--config` of its own keeps those before it (the alias's, as a help call reads it too),
+/// and the typed globals an alias expands past are kept ahead of its own.
+#[test]
+fn targo_keeps_the_config_list_clap_keeps() {
+    let aliases = [
+        ("pre", "--config build.target-dir='a' build"),
+        ("own", "build --config build.target-dir='a'"),
+        ("xtask", "run --package xtask --"),
+        ("xo", "--offline"),
+        ("nest", "b --config build.target-dir='a'"),
+    ];
+    let alias = |verb: &str| {
+        aliases
+            .iter()
+            .find(|(name, _)| *name == verb)
+            .map_or(UserAlias::None, |(_, words)| {
+                UserAlias::Words(words.split_whitespace().map(str::to_owned).collect())
+            })
+    };
+    let args =
+        |words: &str| -> Vec<String> { words.split_whitespace().map(str::to_owned).collect() };
+    let line = |tool, words: &str| {
+        targo_line(&args(words), tool, &alias, &NO_MIRI).map(|line| line.join(" "))
+    };
+    let t = "--config build.target-dir='t'";
+    let x = "--config net.offline=true";
+    for (tool, typed, runs) in [
+        // A typed line: by a Cargo name as typed, by Targo's through the hop.
+        (Tool::Cargo, format!("{t} build {x}"), format!("build {x}")),
+        (
+            Tool::CargoCompat,
+            format!("{t} build {x}"),
+            format!("build {x}"),
+        ),
+        (
+            Tool::Targo,
+            format!("{t} --unverified build {x}"),
+            format!("--unverified build {t} {x}"),
+        ),
+        (Tool::Cargo, format!("{t} build"), format!("{t} build")),
+        (
+            Tool::Targo,
+            format!("{t} --unverified build"),
+            format!("{t} --unverified build"),
+        ),
+        // An alias's `--config` before its verb: replaced by the verb's own, else kept.
+        (
+            Tool::Targo,
+            format!("--unverified pre {x}"),
+            format!("build {x}"),
+        ),
+        (Tool::CargoCompat, format!("pre {x}"), format!("build {x}")),
+        (
+            Tool::Targo,
+            "--unverified pre".to_owned(),
+            "--config build.target-dir='a' build".to_owned(),
+        ),
+        // The typed globals ahead of an alias's own, unless the hop moves them behind it.
+        (
+            Tool::Targo,
+            format!("{x} --unverified own"),
+            format!("{x} build --config build.target-dir='a'"),
+        ),
+        (
+            Tool::Targo,
+            format!("{t} --unverified own {x}"),
+            format!("build --config build.target-dir='a' {t} {x}"),
+        ),
+        // Moved past an alias's `--`, the program's; behind a verb-less alias, before the verb.
+        (
+            Tool::Targo,
+            format!("{t} --unverified xtask dist {x}"),
+            format!("run --package xtask -- {t} dist {x}"),
+        ),
+        (
+            Tool::Targo,
+            format!("{t} --unverified xo build {x}"),
+            format!("--offline build {x}"),
+        ),
+        // A nested alias's own `--config`, then the moved and the typed ones.
+        (
+            Tool::Targo,
+            format!("{t} --unverified nest {x}"),
+            format!("build --config build.target-dir='a' {t} {x}"),
+        ),
+    ] {
+        assert_eq!(
+            line(tool, &typed).as_deref(),
+            Some(runs.as_str()),
+            "{tool:?} {typed}"
+        );
+    }
+    // A help call through an alias with a `--config` before its verb is read, as a query.
+    let help = args("--unverified pre --help");
+    assert!(
+        targo_reading(&help, Tool::Targo, &alias, &NO_MIRI).is_some_and(|reading| reading.query)
+    );
+}
+
+/// A `-C` BEFORE THE VERB IS HONOURED ONLY BEHIND ITS GATE (`cli.rs`'s `main`, measured on Trust
+/// 16387): on a channel that allows nightly features (Trust's own, a `+nightly` toolchain's,
+/// or any under `RUSTC_BOOTSTRAP=1`), where the `-Z` values clap keeps hold `unstable-options`.
+/// Those are a builtin verb's own where it has any (a global option's values after the verb
+/// replace those before it), else those before the verb, each cluster read with the verb's own
+/// value-less letters (`install`'s `-f` is a flag, `tree`'s takes the rest of the word); after an
+/// alias's or an external command's name nothing is parsed at the gate. NEGATIVE CONTROL: each
+/// refused row is honoured once the gate is read from every `-Z` typed, or from no channel.
+#[test]
+fn a_directory_is_honoured_only_behind_its_gate() {
+    let words =
+        |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+    let honoured = |tool: Tool, env: &[(&str, &str)], line: &str| {
+        let env = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        let machine = Machine {
+            home: None,
+            root: None,
+            cwd: None,
+            env: &env,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &|_| None,
+        };
+        directory_honoured(&words(line), tool, &machine)
+    };
+    let bootstrap = [("RUSTC_BOOTSTRAP", "1")];
+    for (tool, env, line) in [
+        (Tool::Targo, &[][..], "-Zunstable-options -C d build"),
+        (Tool::Targo, &[], "-Z unstable-options -C d build"),
+        (Tool::Targo, &[], "-Z=unstable-options -C d build"),
+        (Tool::Targo, &[], "-qZunstable-options -C d build"),
+        (
+            Tool::Targo,
+            &[],
+            "-Zno-index-update -Zunstable-options -C d build",
+        ),
+        (Tool::Targo, &[], "-C d build -Zunstable-options"),
+        (Tool::Targo, &[], "-C d build -j -1 -Zunstable-options"),
+        (Tool::Targo, &[], "-Zunstable-options -C d b"),
+        (Tool::Cargo, &[], "+nightly -Zunstable-options -C d build"),
+        (
+            Tool::Cargo,
+            &[],
+            "+nightly-2026-10-01 -Zunstable-options -C d build",
+        ),
+        (
+            Tool::Cargo,
+            &bootstrap,
+            "+stable -Zunstable-options -C d build",
+        ),
+        (Tool::Cargo, &bootstrap, "-Zunstable-options -C d build"),
+        (
+            Tool::CargoCompat,
+            &[],
+            "+trust -Zunstable-options -C d build",
+        ),
+        (
+            Tool::CargoCompat,
+            &[],
+            "+trust -C d build -Zunstable-options",
+        ),
+        (Tool::CargoCompat, &[], "-Zunstable-options -C d build"),
+        (
+            Tool::Targo,
+            &[],
+            "-C d install -fZunstable-options --path .",
+        ),
+        (
+            Tool::Targo,
+            &[],
+            "-C d install -qfZunstable-options --path .",
+        ),
+    ] {
+        assert!(honoured(tool, env, line), "{tool:?} {env:?} {line}");
+    }
+    let stable = [("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")];
+    for (tool, env, line) in [
+        (Tool::Targo, &[][..], "-C d build"),
+        (Tool::Targo, &[], "-Zno-index-update -C d build"),
+        (
+            Tool::Targo,
+            &[],
+            "-Zunstable-options -C d build -Zno-index-update",
+        ),
+        (Tool::Targo, &[], "-C d b -Zunstable-options"),
+        (Tool::Targo, &[], "-C d run prog -Zunstable-options"),
+        (Tool::Targo, &[], "-C d build -- -Zunstable-options"),
+        (Tool::Targo, &[], "-C d build --jobs -Zunstable-options"),
+        (Tool::Targo, &[], "-C d tree -fZunstable-options"),
+        (Tool::Targo, &stable, "-Zunstable-options -C d build"),
+        (Tool::Cargo, &[], "+stable -Zunstable-options -C d build"),
+        (Tool::Cargo, &[], "+beta -Zunstable-options -C d build"),
+        (Tool::Cargo, &[], "-Zunstable-options -C d build"),
+        (
+            Tool::Cargo,
+            &[("RUSTC_BOOTSTRAP", "0")],
+            "+stable -Zunstable-options -C d build",
+        ),
+        (Tool::CargoCompat, &[], "+trust -C d build"),
+        (
+            Tool::CargoCompat,
+            &stable,
+            "+trust -Zunstable-options -C d build",
+        ),
+    ] {
+        assert!(!honoured(tool, env, line), "{tool:?} {env:?} {line}");
+    }
+}
+
+/// A `-C` IS REFUSED ONLY WHERE THE PROGRAM SURELY REFUSES IT: its gate is not kept, or its
+/// channel allows no nightly feature (`+stable`, `+beta`, a release number, a stable override).
+/// An upstream cargo whose channel is untold (`+trust` by the cargo name, or no `+toolchain`)
+/// checks the gate before it changes directory or reads anything, so it refuses or runs from
+/// the directory: it is not refused, though it is not honoured either, and so is one whose
+/// `+toolchain` is a custom name rustup may link to a nightly cargo (`+1dev`, `+stable-mine`),
+/// or an official one this reader does not tell (a host triple after the channel). NEGATIVE
+/// CONTROL: the same untold channels with no gate are refused, and a nightly one is honoured.
+#[test]
+fn a_directory_is_refused_only_where_its_program_refuses_it() {
+    let words =
+        |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+    let read = |env: &[(&str, &str)], line: &str| {
+        let env = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        let machine = Machine {
+            home: None,
+            root: None,
+            cwd: None,
+            env: &env,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &|_| None,
+        };
+        (
+            directory_refused(&words(line), Tool::Cargo, &machine),
+            directory_honoured(&words(line), Tool::Cargo, &machine),
+        )
+    };
+    let stable = [("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")];
+    for (env, line, refused, honoured) in [
+        (
+            &[][..],
+            "+trust -Zunstable-options -C d build",
+            false,
+            false,
+        ),
+        (&[], "-Zunstable-options -C d build", false, false),
+        (&[], "+nightly -Zunstable-options -C d build", false, true),
+        (&[], "+trust -C d build", true, false),
+        (&[], "-C d build", true, false),
+        (&[], "+stable -Zunstable-options -C d build", true, false),
+        (
+            &[],
+            "+beta-2026-10-01 -Zunstable-options -C d build",
+            true,
+            false,
+        ),
+        (&[], "+1.91.0 -Zunstable-options -C d build", true, false),
+        (&stable, "+trust -Zunstable-options -C d build", true, false),
+        (&[], "+1dev -Zunstable-options -C d build", false, false),
+        (
+            &[],
+            "+stable-mine -Zunstable-options -C d build",
+            false,
+            false,
+        ),
+        (&[], "+beta-x -Zunstable-options -C d build", false, false),
+        (
+            &[],
+            "+stable-aarch64-apple-darwin -Zunstable-options -C d build",
+            false,
+            false,
+        ),
+        (&[], "+1dev -C d build", true, false),
+    ] {
+        assert_eq!(read(env, line), (refused, honoured), "{env:?} {line}");
+    }
+}
+
+/// A RELEASED TOOLCHAIN IS ONE RUSTUP NEVER LINKS A CUSTOM BUILD AS: each name counted is one
+/// `rustup toolchain link` refused as "invalid custom toolchain name" (rustup 1.29.0, measured
+/// in a scratch `RUSTUP_HOME`), so its cargo is the released channel's. NEGATIVE CONTROL: each
+/// name that rustup linked (a leading digit alone, a leading zero, a part too long, a word
+/// after the channel) is not counted, nor is an official name with a host triple after it, nor
+/// a nightly one.
+#[test]
+fn a_released_toolchain_is_one_rustup_never_links_a_custom_build_as() {
+    for name in [
+        "stable",
+        "beta",
+        "stable-2026-10-01",
+        "beta-2026-10-01",
+        "stable-0000-00-00",
+        "0.1",
+        "1.0",
+        "1.91",
+        "1.91.0",
+        "1.0.0",
+        "1.10.10",
+        "1.100.0",
+        "9.999.99",
+        "1.91-beta",
+        "1.91.0-beta",
+        "1.91.0-beta.0",
+        "1.91.0-beta.2",
+        "1.91.0-beta.12",
+        "1.91.0-2026-10-01",
+        "1.91.0-beta-2026-10-01",
+        "1.91-beta.1-2026-10-01",
+    ] {
+        assert!(released_toolchain(name), "{name}");
+    }
+    for name in [
+        "1dev",
+        "1",
+        "1.x",
+        "12.0",
+        "01.91",
+        "1.09",
+        "1.091",
+        "1.1000",
+        "1.91.00",
+        "1.91.05",
+        "1.91.123",
+        "1.91.0.1",
+        "1.91.0-mine",
+        "1.91.0-beta.",
+        "1.91.0-beta.01",
+        "1.91.0-beta.123",
+        "1.91.0-beta.2-mine",
+        "1.91.0-2026-10-01-beta",
+        "stable-mine",
+        "beta-x",
+        "beta.2",
+        "Stable",
+        "stable-2026",
+        "stable-2026-10-1",
+        "stable-2026-10-01-2026-10-01",
+        "beta-2026-10-01-mine",
+        "stable-aarch64-apple-darwin",
+        "1.91-aarch64-apple-darwin",
+        "nightly",
+        "nightly-2026-10-01",
+        "",
+    ] {
+        assert!(!released_toolchain(name), "{name}");
     }
 }
 
@@ -1255,7 +3865,7 @@ fn with_env<R>(env: &[(&str, &str)], cwd: Option<&Path>, f: impl FnOnce(&Machine
 
 /// TARGO READS EACH TWIN WHERE ITS CARGO SPELLING IS UNSET: `TARGO_<X>` stands for an unset
 /// `CARGO_<X>`, a set one wins even empty, and the package homes add a non-empty `TARGO_HOME`
-/// beside `~/.cargo` where `CARGO_HOME` is unset (the store's Targo reads only the first,
+/// beside `~/.cargo` where `CARGO_HOME` is unset (Targo 16387 reads only the first,
 /// Trust's main only the second, so both are scanned). NEGATIVE CONTROL: an upstream cargo
 /// reads no twin, and a name
 /// outside `CARGO_` has none.
@@ -1305,6 +3915,69 @@ fn targo_reads_each_twin_where_its_cargo_spelling_is_unset() {
     assert_eq!(homes(&emptied, Tool::Targo), [at("/h/.cargo")]);
     assert_eq!(homes(&[("TARGO_HOME", "")], Tool::Targo), [at("/h/.cargo")]);
     assert_eq!(homes(&th, Tool::Cargo), [at("/h/.cargo")]);
+    // Each home's `.` and `..` folded as written, as Targo's `homedir` folds its own
+    // (`normalize_path`), never through a link the kernel would follow.
+    let folded = [("CARGO_HOME", "/l/../ch/.")];
+    assert_eq!(homes(&folded, Tool::Targo), [at("/ch")]);
+    assert_eq!(homes(&[("CARGO_HOME", "../ch")], Tool::Cargo), [at("/ch")]);
+    assert_eq!(
+        homes(&[("TARGO_HOME", "/l/../th")], Tool::Targo),
+        [at("/h/.cargo"), at("/th")]
+    );
+}
+
+/// A PACKAGE HOME'S `..` IS FOLDED AS TARGO FOLDS IT, NEVER THROUGH A LINK: a relative
+/// `CARGO_HOME` of `link/../h` is the working directory's `h` to Targo (`homedir` joins it to the
+/// working directory, `normalize_path` folds it as written), whatever `link` points at, so the
+/// target that home's config names is the one Targo builds into, and the one every reader of the
+/// front takes (the target an explicit cache owns, the target hint, the target `cargo metadata`
+/// names for a `miri` line). NEGATIVE CONTROL: the kernel's resolution, `link`'s target's
+/// sibling `h`, names another target, which a reader that opened the home as written would take.
+#[cfg(unix)]
+#[test]
+fn a_package_home_climbing_through_a_link_is_the_folded_one_targo_reads() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let cwd = home.join("project");
+    std::fs::create_dir_all(cwd.join("z/y")).unwrap();
+    std::fs::create_dir_all(cwd.join("z/h")).unwrap();
+    std::fs::create_dir_all(cwd.join("h")).unwrap();
+    std::os::unix::fs::symlink(cwd.join("z/y"), cwd.join("link")).unwrap();
+    let folded = home.join("folded");
+    let linked = home.join("linked");
+    let named = |target: &Path| format!("build.target-dir = '{}'\n", target.display());
+    std::fs::write(cwd.join("h/config.toml"), named(&folded)).unwrap();
+    std::fs::write(cwd.join("z/h/config.toml"), named(&linked)).unwrap();
+    std::fs::write(cwd.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    let env = |name: &str| (name == "CARGO_HOME").then(|| OsString::from("link/../h"));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &env,
+        read: &read_config,
+        read_manifest: &read_config,
+        writable: &|_| Some(true),
+    };
+    let args = ["--unverified".into(), "build".into()];
+    assert_eq!(
+        selected_outputs(&args, Tool::Targo, &machine, &|_| UserAlias::None)
+            .map(|c| c.target.explicit_path()),
+        Some(folded.clone())
+    );
+    assert_eq!(
+        miri_metadata_target(&["test".into()], Tool::Targo, &machine),
+        Some(folded.clone())
+    );
+    for tool in [Tool::Targo, Tool::Cargo] {
+        assert_eq!(
+            target_hint(&machine, tool),
+            Ok(Some(folded.clone())),
+            "{tool:?}"
+        );
+        assert_eq!(package_homes(tool, &machine), [cwd.join("h")], "{tool:?}");
+    }
+    assert_eq!(cargo_home_hint_with(&machine), Ok(Some(cwd.join("h"))));
 }
 
 #[test]
@@ -1374,6 +4047,86 @@ fn caller_intermediates_follow_cargo_precedence_and_original_config_bases() {
             })
         );
     }
+}
+
+/// The caller's build directory is read as Targo loads its configs ([`discovered_config_outputs`]):
+/// an included file's value, resolved against that file's own `Definition::root`, and the
+/// including file's own value over it; the package home is the one Targo folds
+/// ([`cargo_home_hint_with`]). NEGATIVE CONTROL: an include that names nothing, though not
+/// optional, refuses, and so does an included `build-dir` Targo cannot merge.
+#[test]
+fn caller_intermediates_follow_includes_and_a_folded_home() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = home.join("project");
+    let cwd = root.join("member");
+    let config = root.join(".cargo/config.toml");
+    let layout = root.join(".cargo/sub/layout.toml");
+    for (near, included, expected) in [
+        (
+            "include = ['sub/layout.toml']",
+            Some("build.build-dir = 'out'"),
+            Ok(Some(root.join(".cargo/out"))),
+        ),
+        (
+            "include = ['sub/layout.toml']\nbuild.build-dir = 'mine'",
+            Some("build.build-dir = 'out'"),
+            Ok(Some(root.join("mine"))),
+        ),
+        ("include = ['sub/layout.toml']", None, Err(())),
+        (
+            "include = ['sub/layout.toml']\nbuild.build-dir = 'mine'",
+            Some("build.build-dir = ['out']"),
+            Err(()),
+        ),
+    ] {
+        let read = |path: &Path| {
+            Ok(if path == config {
+                Some(near.to_owned())
+            } else if path == layout {
+                included.map(str::to_owned)
+            } else {
+                None
+            })
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| None,
+        };
+        let hint = cargo_build_dir_hint_with(&machine)
+            .map(|hint| hint.and_then(|hint| hint.path().map(Path::to_path_buf)))
+            .map_err(|_| ());
+        assert_eq!(hint, expected, "{near:?} {included:?}");
+    }
+    let folded = cwd.join("cache-home");
+    let env = |name: &str| (name == "CARGO_HOME").then(|| OsString::from("tool/../cache-home"));
+    let read = |path: &Path| {
+        Ok((path == folded.join("config.toml")).then(|| "build.build-dir = 'global'".to_owned()))
+    };
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &env,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| None,
+    };
+    assert_eq!(
+        cargo_home_hint_with(&machine).unwrap(),
+        Some(folded.clone())
+    );
+    assert_eq!(
+        cargo_build_dir_hint_with(&machine)
+            .unwrap()
+            .and_then(|hint| hint.path().map(Path::to_path_buf)),
+        Some(cwd.join("global"))
+    );
 }
 
 #[test]
@@ -2068,19 +4821,38 @@ fn explicit_targets_accept_only_proven_directory_neutral_config_files() {
     }
 }
 
+/// A CLI file whose output choice this reader cannot read, or that Targo refuses, grants no
+/// explicit target: an `include` that names a file absent and not optional or is no list of
+/// paths, text Targo cannot parse, a `build` that is no table, an output value Targo's `build`
+/// table cannot take (though the typed target outranks it), and a file the reader cannot read.
+/// A build directory the file names (spelled by an escape too) is read with the file's
+/// definition base, the folder above its own, and both outputs are the call's. NEGATIVE
+/// CONTROL: a target directory in the file, spelled either way, is outranked by the typed
+/// `--target-dir` (Targo's `target_dir` takes that word before `CARGO_TARGET_DIR` and every
+/// config), and an empty `include` loads nothing, so each keeps the typed target.
 #[test]
 fn config_files_with_unresolved_output_choices_grant_no_explicit_target() {
     let home = PathBuf::from(native("/home/person"));
     let cwd = home.join("workspace");
     let file = cwd.join("settings.toml");
-    for text in [
-        Some("[build]\ntarget-dir = false"),
-        Some("[build]\nbuild-dir = false"),
-        Some("include = [3]"),
-        Some("[build"),
-        Some("build = 3"),
-        Some(r#"build."target\u002ddir" = false"#),
-        None,
+    for (text, granted, intermediates) in [
+        (Some("[build]\ntarget-dir = 'other'"), true, None),
+        (Some(r#"build."target-dir" = 'other'"#), true, None),
+        (Some("include = []"), true, None),
+        // A build directory the file names is read with its definition base, the folder above
+        // the file's: both outputs are the call's.
+        (Some("[build]\nbuild-dir = 'other'"), true, Some("other")),
+        (Some(r#"build."build-dir" = 'other'"#), true, Some("other")),
+        (Some("include = ['absent.toml']"), false, None),
+        (Some("include = 3"), false, None),
+        (Some("include = [3]"), false, None),
+        (Some("[build"), false, None),
+        (Some("build = 3"), false, None),
+        // A value Targo's `build` table cannot take, though outranked or unused.
+        (Some("[build]\ntarget-dir = false"), false, None),
+        (Some(r#"build."target-dir" = false"#), false, None),
+        (Some("[build]\nbuild-dir = false"), false, None),
+        (None, false, None),
     ] {
         let read = |path: &Path| {
             if path == file {
@@ -2109,8 +4881,13 @@ fn config_files_with_unresolved_output_choices_grant_no_explicit_target() {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-        assert!(
-            selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+        let selected = selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None);
+        assert_eq!(
+            selected.as_ref().map(|chosen| (
+                chosen.target.clone().explicit_path(),
+                chosen.intermediates.clone()
+            )),
+            granted.then(|| (cwd.join("fresh"), intermediates.map(|dir| home.join(dir)))),
             "{text:?}"
         );
     }
@@ -2318,6 +5095,12 @@ fn neutral_or_overridden_cli_files_need_no_target_path_base() {
     }
 }
 
+/// A CLI include graph this reader cannot resolve, or that Targo refuses, grants no custody: an
+/// `include` that is no list, an entry Targo refuses, a glob or template path, a file two entries
+/// load, and a target no include outranks that is no string. Only the winning value is judged
+/// (`merge_helper` swaps a boolean for a string): a file's own target over an include's `false`
+/// is the call's, against the file's definition base. NEGATIVE CONTROL: the same include with no
+/// target of the file's own over it leaves `false` the winner, which Targo cannot load.
 #[test]
 fn unresolved_cli_include_graphs_never_grant_custody() {
     let home = PathBuf::from(native("/home/person"));
@@ -2331,8 +5114,12 @@ fn unresolved_cli_include_graphs_never_grant_custody() {
             "['target.toml']",
             "['neutral.toml','neutral.toml']",
             "['left.toml','right.toml']",
+            "['target.toml'] # none of its own",
         ] {
-            let text = format!("include={include}\nbuild.target-dir='root.noindex'");
+            let text = match include.strip_suffix(" # none of its own") {
+                Some(include) => format!("include={include}"),
+                None => format!("include={include}\nbuild.target-dir='root.noindex'"),
+            };
             let read = |p: &Path| {
                 Ok(if p == cwd.join("settings.toml") {
                     Some(text.clone())
@@ -2366,8 +5153,17 @@ fn unresolved_cli_include_graphs_never_grant_custody() {
             if direct {
                 args.extend(["--target-dir".into(), "chosen".into()]);
             }
-            assert!(
-                selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+            let granted = (include == "['target.toml']").then(|| {
+                if direct {
+                    cwd.join("chosen")
+                } else {
+                    home.join("root.noindex")
+                }
+            });
+            assert_eq!(
+                selected_outputs(&args, Tool::Targo, &m, &|_| UserAlias::None)
+                    .map(|c| c.target.explicit_path()),
+                granted,
                 "{include} direct={direct}"
             );
         }
@@ -2862,9 +5658,25 @@ fn discovered_output_precedence_is_independent_for_each_selected_path() {
             };
             let mut args = vec!["--unverified".into(), "build".into()];
             if level >= 2 {
+                // Targo takes one dotted key per inline value (`toml_dotted_keys`): two keys in
+                // one value fail the call, so grant nothing.
+                let two_keys = [
+                    args.clone(),
+                    vec![
+                        "--config".into(),
+                        "build.target-dir='cli-final'\nbuild.build-dir='cli-build'".into(),
+                    ],
+                ]
+                .concat();
+                assert!(
+                    selected_outputs(&two_keys, tool, &m, &|_| UserAlias::None).is_none(),
+                    "{tool:?} level={level}"
+                );
                 args.extend([
                     "--config".into(),
-                    "build.target-dir='cli-final'\nbuild.build-dir='cli-build'".into(),
+                    "build.target-dir='cli-final'".into(),
+                    "--config".into(),
+                    "build.build-dir='cli-build'".into(),
                 ]);
             }
             if level >= 4 {
@@ -3317,7 +6129,7 @@ fn config_targets_preserve_higher_override_and_program_boundaries() {
 
 #[test]
 fn initial_manifest_readings_preserve_frontend_grammar() {
-    let home = Path::new("/home/me");
+    let home = PathBuf::from(native("/home/me"));
     let cwd = home.join("workspace");
     for unreadable_native in [false, true] {
         let read = |path: &Path| {
@@ -3332,7 +6144,7 @@ fn initial_manifest_readings_preserve_frontend_grammar() {
             }
         };
         let machine = Machine {
-            home: Some(home),
+            home: Some(&home),
             root: None,
             cwd: Some(&cwd),
             env: &|_| None,

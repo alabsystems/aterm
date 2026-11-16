@@ -252,7 +252,7 @@ fn sessions(instance: &Instance) -> Result<Vec<String>, Fail> {
             let mut words = line.split_whitespace();
             words.next()?.parse::<u64>().ok()?;
             let sid = words.next()?;
-            aterm_types::tab_id::is_tab_id(sid).then(|| sid.to_string())
+            aterm_types::control_verbs::is_minted_sid(sid).then(|| sid.to_string())
         })
         .collect();
     println!("sessions {rows}");

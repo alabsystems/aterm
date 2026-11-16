@@ -2350,7 +2350,7 @@ fn persistent_failure_notice(
         ),
         "stage" if is_passing_refusal(stage_reason) => {
             let step = passing_step(stage_reason);
-            if step.contains("free some space") {
+            if step.contains(crate::install::FREE_SPACE_REMEDY) {
                 format!("the update could not be staged on this Mac: {step}")
             } else {
                 format!(

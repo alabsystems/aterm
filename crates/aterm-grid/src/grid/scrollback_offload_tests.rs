@@ -1860,6 +1860,59 @@ fn a_setting_changed_inside_the_offload_window_keeps_history_in_order() {
 }
 
 #[test]
+fn lowering_an_attached_limit_fills_the_ring_before_store_eviction() {
+    for staged in [false, true] {
+        for wrapped in [false, true] {
+            for limit in [5, 20, 32] {
+                let make = || {
+                    let mut grid = tiered_grid(3, 8, 20);
+                    let mut twin = Grid::with_scrollback(3, 8, 200);
+                    for i in 0..60 {
+                        for g in [&mut grid, &mut twin] {
+                            logical_line(
+                                g,
+                                &format!("H{i}{}", if wrapped { "-abcdefghijk" } else { "" }),
+                            );
+                        }
+                    }
+                    if !staged {
+                        grid.drain_lazy_buffer();
+                    }
+                    grid.resize(8, 8);
+                    twin.resize(8, 8);
+                    assert!(grid.storage.ring_buffer_scrollback() < 20);
+                    (grid, twin)
+                };
+                let (mut grid, mut twin) = make();
+                twin.set_scrollback_line_limit(Some(limit));
+                grid.set_scrollback_line_limit(Some(limit));
+                assert_eq!(
+                    history_seq(&grid),
+                    history_seq(&twin),
+                    "staged={staged}, wrapped={wrapped}, limit={limit}"
+                );
+                assert_eq!(screen_rows(&grid), screen_rows(&twin));
+                grid.assert_invariants();
+
+                // Negative control: the old setter evicts the store's share before
+                // seating any history in the room opened by the rows grow.
+                let (mut old, _) = make();
+                old.storage
+                    .scrollback
+                    .as_mut()
+                    .unwrap()
+                    .set_line_limit(Some(limit.saturating_sub(20)));
+                old.drain_lazy_buffer();
+                old.set_scrollback_line_limit(Some(limit));
+                if limit >= 20 {
+                    assert_ne!(history_seq(&old), history_seq(&twin));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn a_converging_drag_keeps_the_same_total_as_a_ring_only_twin() {
     let (rows, start, first, settled) = (3, 8, 7, 6);
     let total = 32;

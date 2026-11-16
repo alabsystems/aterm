@@ -278,7 +278,7 @@ mod dogs {
                 ),
                 String::new(),
                 format!("# {}", self.note),
-                aterm_census::seal::line("#", "aterm-effects' `art_rig dogs` example"),
+                aterm_seal::line("#", "aterm-effects' `art_rig dogs` example"),
             ];
             for (role, fill, recolor, paths) in &self.layers {
                 layer_block(&mut out, role, fill, recolor, paths);
@@ -686,10 +686,7 @@ mod dogs {
     pub fn main(dir: &std::path::Path) -> Result<(), String> {
         for breed in breeds() {
             let name = format!("{}.toml", breed.id);
-            write(
-                &dir.join(&name),
-                &aterm_census::seal::stamp(&build(&breed).toml())?,
-            )?;
+            write(&dir.join(&name), &aterm_seal::stamp(&build(&breed).toml())?)?;
             println!("wrote {name}");
         }
         Ok(())

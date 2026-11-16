@@ -40,6 +40,17 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
+/// What [`Log::heads_digest`] hashes ahead of the heads.
+const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
+
+/// The heads digest a records store that holds no genesis states
+/// ([`store::Store::records_digest`]): [`HEADS_DIGEST_MAGIC`] with no head after it, which no
+/// log's digest ([`Log::heads_digest`]) equals, since every log has at least one head.
+#[must_use]
+pub fn empty_heads_digest() -> [u8; 32] {
+    Sha256::digest(HEADS_DIGEST_MAGIC)
+}
+
 pub mod admission;
 pub mod budgets;
 pub mod entries;
@@ -59,8 +70,8 @@ pub(crate) mod untaken;
 pub use admission::{Gap, SeatAudience, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
 pub use budgets::{
-    AUTOMATIC_KEYED_STOP, Budget, LEGACY_RECORDS, MAX_HELD_RECORDS, MAX_KEYED_RECORDS,
-    MAX_WEIGHED_RECORDS, RecordBudgets, RecordCounts,
+    AUTOMATIC_KEYED_STOP, Author, Authoring, Budget, Class, Fill, LEGACY_RECORDS, MAX_HELD_RECORDS,
+    MAX_KEYED_RECORDS, MAX_WEIGHED_RECORDS, RecordBudgets, RecordCounts,
 };
 pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
@@ -1750,6 +1761,21 @@ impl Log {
         self.heads.iter().copied().collect()
     }
 
+    /// SHA-256 of `ALHD1` followed by [`Log::heads`], in their sorted order: one value for the
+    /// whole held log. A log only grows and holds a record only after its parents, so two logs
+    /// with equal heads hold the same records. A vault server advertises it as its TXT `rec=`
+    /// (`crate::server::VaultTxt::rec`) and states it on each records reply, and a Mac keeps it
+    /// as the records digest its applied state was read from.
+    #[must_use]
+    pub fn heads_digest(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(HEADS_DIGEST_MAGIC.len() + self.heads.len() * 32);
+        buf.extend_from_slice(HEADS_DIGEST_MAGIC);
+        for id in &self.heads {
+            buf.extend_from_slice(id);
+        }
+        Sha256::digest(&buf)
+    }
+
     /// A draft by `actor` that follows the heads: its sequence one past `actor`'s highest held
     /// record, whose id is its previous and one of its parents. Past [`MAX_PARENTS`] parents it
     /// follows the lowest heads, and the next draft takes up the rest. [`Draft::sign`] it with
@@ -2349,6 +2375,153 @@ impl Log {
     /// server's records file of complete records holds (`server::apply_records`).
     pub(crate) const fn held_bytes(&self) -> usize {
         self.held_bytes
+    }
+
+    /// The wire bytes of the held `Put`s `actor` signed at or after `since_ms`, by the clock each
+    /// carries in its header: what an automatic writer's budget counts
+    /// ([`budgets::AUTOMATIC_PUT_BUDGET`]). A record whose signer read no clock (`0`) counts only
+    /// from `since_ms` `0`.
+    #[must_use]
+    pub fn authored_bytes_since(&self, actor: &MemberId, since_ms: u64) -> usize {
+        self.authored_bytes_in(actor, since_ms, u64::MAX)
+    }
+
+    /// [`Log::authored_bytes_since`], of the `Put`s whose clock is also no later than
+    /// `until_ms`.
+    fn authored_bytes_in(&self, actor: &MemberId, since_ms: u64, until_ms: u64) -> usize {
+        self.order
+            .iter()
+            .filter(|record| {
+                record.kind() == Kind::Put
+                    && record.actor() == actor
+                    && (since_ms..=until_ms).contains(&record.authored_ms())
+            })
+            .fold(0, |sum, record| sum.saturating_add(record.bytes().len()))
+    }
+
+    /// How full the log is at `now_ms` ([`budgets::Fill`]), from the held records' headers alone:
+    /// their bytes of the bound, by kind, what each seat signed in the last
+    /// [`budgets::AUTOMATIC_WINDOW_MS`], and where each class stops. The window ends at `now_ms`
+    /// and [`budgets::WINDOW_SKEW_MS`]: a record whose signer's clock ran further ahead is in no
+    /// day's count, so one peer's wrong clock does not read as a rate until it is compacted
+    /// away. What was signed is not measured (`None`) where the clock did not read (`now_ms`
+    /// `None` or `0`) or no held record carries a time.
+    #[must_use]
+    pub fn fill(&self, now_ms: Option<u64>) -> budgets::Fill {
+        let mut by_kind = Kind::ALL.map(|kind| (kind, 0usize, 0usize));
+        for record in self.order.iter() {
+            if let Some(row) = by_kind.iter_mut().find(|row| row.0 == record.kind()) {
+                row.1 = row.1.saturating_add(1);
+                row.2 = row.2.saturating_add(record.bytes().len());
+            }
+        }
+        let clocked = self.order.iter().any(|record| record.authored_ms() != 0);
+        let signed = now_ms.filter(|now| *now != 0 && clocked).map(|now| {
+            let window = now.saturating_sub(budgets::AUTOMATIC_WINDOW_MS)
+                ..=now.saturating_add(budgets::WINDOW_SKEW_MS);
+            let mut seats: BTreeMap<MemberId, usize> = BTreeMap::new();
+            for record in self.order.iter().filter(|record| {
+                record.kind() != Kind::Genesis && window.contains(&record.authored_ms())
+            }) {
+                let bytes = seats.entry(*record.actor()).or_default();
+                *bytes = bytes.saturating_add(record.bytes().len());
+            }
+            let mut seats: Vec<budgets::SeatBytes> = seats
+                .into_iter()
+                .map(|(seat, bytes)| budgets::SeatBytes { seat, bytes })
+                .collect();
+            seats.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.seat.cmp(&b.seat)));
+            budgets::Signed {
+                bytes: seats
+                    .iter()
+                    .fold(0, |sum, seat| sum.saturating_add(seat.bytes)),
+                seats,
+            }
+        });
+        budgets::Fill {
+            bytes: self.held_bytes,
+            bound: budgets::held_bytes_bound(),
+            by_kind,
+            stops: budgets::Class::ALL.map(budgets::author_stop),
+            signed,
+        }
+    }
+
+    /// Ask the class stops and an automatic writer's size limit and day budget before this Mac
+    /// authors `batch` over this log, signed by `signer` at `now_ms`
+    /// ([`budgets::Authoring::refusal`]). Only an authoring site asks: [`Log::insert`] and every
+    /// ingest take a valid record at any fill.
+    ///
+    /// # Errors
+    /// [`crate::ErrorKind::MembershipCapacity`]: naming the class, the fill and what still
+    /// fits, where the batch would pass its class's stop; or, from an automatic writer, naming
+    /// the size and the limit where a `Put` it changed is over
+    /// [`budgets::AUTOMATIC_PUT_LIMIT`], or what the seat signed where the batch would pass its
+    /// day budget.
+    pub fn author_ask(
+        &self,
+        batch: &budgets::Authoring,
+        author: budgets::Author<'_>,
+        signer: &MemberId,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.asked(batch, author, signer, now_ms, false)
+    }
+
+    /// [`Log::author_ask`] where this log is a draft's clone that holds `batch` already: the
+    /// fill and the seat's `Put`s are weighed as they were before it.
+    ///
+    /// # Errors
+    /// As [`Log::author_ask`].
+    pub fn authored_ask(
+        &self,
+        batch: &budgets::Authoring,
+        author: budgets::Author<'_>,
+        signer: &MemberId,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.asked(batch, author, signer, now_ms, true)
+    }
+
+    fn asked(
+        &self,
+        batch: &budgets::Authoring,
+        author: budgets::Author<'_>,
+        signer: &MemberId,
+        now_ms: u64,
+        holds_batch: bool,
+    ) -> Result<()> {
+        let less = |of: usize, by: usize| {
+            if holds_batch {
+                of.saturating_sub(by)
+            } else {
+                of
+            }
+        };
+        // The seat's day ends at `now_ms` and the skew, as a `Fill`'s does: a `Put` this seat
+        // signed while its clock ran ahead is not held against the writer until the clock
+        // catches up. A clock that did not read (`0`) counts every `Put` the seat ever signed:
+        // an automatic writer with no clock is refused, never unbounded.
+        let until = if now_ms == 0 {
+            u64::MAX
+        } else {
+            now_ms.saturating_add(budgets::WINDOW_SKEW_MS)
+        };
+        let signed = match author {
+            budgets::Author::Person => 0,
+            budgets::Author::Automatic(_) => less(
+                self.authored_bytes_in(
+                    signer,
+                    now_ms.saturating_sub(budgets::AUTOMATIC_WINDOW_MS),
+                    until,
+                ),
+                batch.put_bytes,
+            ),
+        };
+        match batch.refusal(less(self.held_bytes, batch.bytes), signed, author) {
+            Some(why) => Err(Error::of_kind(crate::ErrorKind::MembershipCapacity, why)),
+            None => Ok(()),
+        }
     }
 
     /// The bytes of every record waiting on a parent.

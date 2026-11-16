@@ -631,6 +631,17 @@ fn exec_now_us() -> io::Result<u64> {
     valid.ok_or_else(|| io::Error::other("invalid native exec clock"))
 }
 
+/// Exclude this process's table reads before an in-place Darwin exec changes any state.
+#[cfg(target_vendor = "apple")]
+fn close_exec_gate() -> io::Result<aterm_sysprobe::exec_gate::Closed> {
+    aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN).map_err(|reading| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("refusing exec while {reading}"),
+        )
+    })
+}
+
 /// Enter the actual dispatch gate before checking the original deadline. Nothing between a
 /// successful check and `dispatch` allocates, resolves paths, or waits for another lock.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -2221,6 +2232,10 @@ mod signal_tests;
 #[cfg(test)]
 #[path = "spawnfd_transparent_tests.rs"]
 mod transparent_tests;
+
+#[cfg(all(test, target_vendor = "apple"))]
+#[path = "spawnfd_exec_gate_tests.rs"]
+mod exec_gate_tests;
 
 /// Test-only, deliberately leaky spawns that owe nothing to std's.
 #[cfg(test)]

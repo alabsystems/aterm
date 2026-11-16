@@ -18,6 +18,7 @@ fn sources() -> Sources {
         tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string(),
         stock: fixture::STOCK.to_string(),
         trust_commit: Some(TRUST_COMMIT.to_string()),
+        builders: None,
     }
 }
 
@@ -729,4 +730,97 @@ fn the_windows_digest_is_named_once_in_lowercase_and_travels_with_the_release() 
     let back: crate::release::Journal =
         aterm_toml::from_str(&aterm_toml::to_string(&named).unwrap()).unwrap();
     assert_eq!(back, named);
+}
+
+/// A PULLED PAIR'S ANCHOR IS `--windows-attested`, OF A DECLARED DIRECTORY, AND NEVER BESIDE A
+/// DIGEST: the cut takes it once, with `--windows-artifacts`, before any resume or abandon; the
+/// pump takes no Windows flag at all, since its zip comes only through the pull lane; and the
+/// handoff a cut declares with it is attested and journals so, a carried one's bytes unchanged.
+/// NEGATIVE CONTROL: a pulled pair declared with a typed digest beside its attestation was
+/// admitted by whichever anchor the sign step happened to read.
+#[test]
+fn the_attestation_anchors_a_pulled_pair_alone() {
+    use crate::cli::{Cmd, parse};
+    let parse = |args: &[&str]| parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let lower = "ab".repeat(32);
+    match parse(&[
+        "cut",
+        "--sign",
+        "--windows-artifacts",
+        "/w",
+        "--windows-attested",
+    ]) {
+        Ok(Cmd::Cut { opts, .. }) => {
+            assert!(opts.windows_attested && opts.windows_sha256.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    for refused in [
+        &["cut", "--mac-only", "--windows-attested"][..],
+        &[
+            "cut",
+            "--mac-only",
+            "--windows-artifacts",
+            "/w",
+            "--windows-attested",
+            "--windows-sha256",
+            &lower,
+        ],
+        &[
+            "cut",
+            "--mac-only",
+            "--windows-artifacts",
+            "/w",
+            "--windows-attested",
+            "--windows-attested",
+        ],
+        &["cut", "--resume", "--windows-attested"],
+        &["cut", "--abandon", "v0.100.0", "--windows-attested"],
+        &["release", "--windows-attested"],
+        &[
+            "release",
+            "--pump",
+            "--mac-only",
+            "--windows-artifacts",
+            "/w",
+        ],
+        &[
+            "release",
+            "--pump",
+            "--mac-only",
+            "--windows-sha256",
+            &lower,
+        ],
+    ] {
+        assert!(parse(refused).is_err(), "{refused:?}");
+    }
+    assert!(parse(&["release", "--pump", "--mac-only"]).is_ok());
+
+    let source = scratch();
+    let attested = Handoff::declared(source.path(), None, true).unwrap();
+    assert!(attested.attested && attested.sha256.is_none());
+    let err = Handoff::declared(source.path(), Some(&lower), true).unwrap_err();
+    assert!(
+        err.contains("--windows-attested") && err.contains("--windows-sha256"),
+        "{err}"
+    );
+    let text = aterm_toml::to_string(&attested).unwrap();
+    assert!(text.contains("attested = true"), "{text}");
+    let back: Handoff = aterm_toml::from_str(&text).unwrap();
+    assert_eq!(back, attested);
+    let carried = aterm_toml::to_string(&bound(source.path())).unwrap();
+    assert!(
+        !carried.contains("attested") && !carried.contains("attester"),
+        "{carried}"
+    );
+    // An attested handoff that names a digest too is no handoff a resume reads.
+    let both = Handoff {
+        sha256: Some(lower),
+        ..attested
+    };
+    assert!(
+        both.validate_identity(VERSION, BUILD, &commit(), false)
+            .unwrap_err()
+            .contains("one anchor")
+    );
 }

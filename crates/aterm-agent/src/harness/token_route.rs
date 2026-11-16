@@ -602,7 +602,8 @@ pub fn token_refused(
                 .as_ref()
                 .is_some_and(|meta| served.on(meta.minted_at) != OnToken::Other) =>
         {
-            super::accounts_tokens::note_rejected(paths, store, &standing, now).unwrap_or(false)
+            super::accounts_tokens::note_rejected(paths, store, &standing, REFUSED_STATUS, now)
+                .unwrap_or(false)
         }
         Ok(Lookup::Found(_) | Lookup::Absent | Lookup::Unknown) | Err(_) => false,
     })

@@ -294,7 +294,11 @@ fn physical_memory_pressure_and_paging_are_read() {
     println!("physical {mib} MiB (oracle {oracle_mib}), pressure {level:?}, paged {paged} KiB");
     // Read after the figure: the page files only grow between the two reads if the machine is
     // paging, and their size is the bound either way.
-    let total_kib = crate::memory_detail().expect("memory detail").swap_total / 1024;
+    let total_kib = crate::memory_detail()
+        .expect("memory detail")
+        .swap_total
+        .expect("page-file capacity")
+        / 1024;
     assert!(paged <= total_kib, "{paged} KiB in use of {total_kib} KiB");
 }
 

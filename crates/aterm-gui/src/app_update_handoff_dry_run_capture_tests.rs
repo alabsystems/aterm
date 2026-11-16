@@ -454,7 +454,7 @@ fn the_park_carries_which_done_the_owner_saw() {
         let pty = quiet_pty(&mut app);
         let wid = crate::WindowId(0);
         {
-            let ws = app.windows.get_mut(&wid).expect("window 0");
+            let mut ws = app.windows.get_mut(&wid).expect("window 0");
             ws.window_on_screen_for_test = true;
             ws.occluded = !looked;
         }

@@ -316,7 +316,7 @@ fn terminal_present_visuals_equal_host_visual_state() {
     let after = rung + aterm_core::bell::FLASH_DURATION + Duration::from_millis(50);
     app.level_up = Some(crate::level_up::LevelUp::charging_continued(7, rung, 0.0));
     {
-        let ws = app.windows.get_mut(&WID).expect("window");
+        let mut ws = app.windows.get_mut(&WID).expect("window");
         ws.bell_flash.ring(rung);
         ws.drag_hover = true;
     }
@@ -355,10 +355,11 @@ fn terminal_present_visuals_equal_host_visual_state() {
     assert!(!painted.invert && painted.overlay.is_some() && painted.overlay != wash);
 
     app.palette_exit();
-    let ws = app.windows.get_mut(&WID).expect("window");
+    let mut ws = app.windows.get_mut(&WID).expect("window");
     assert!(!ws.overlay_open());
     ws.drag_hover = false;
     assert!(ws.bell_flash.is_active(Instant::now()));
+    drop(ws);
     let (painted, policy) = present_at(&mut app, after);
     assert_eq!(painted, policy);
     assert!(!painted.invert, "the bell is judged at the frame clock");

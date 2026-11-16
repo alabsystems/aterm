@@ -210,3 +210,134 @@ fn owned_mac_setup_password_requires_current_receipt_child_and_fenced_prompt() {
         assert!(delivered.is_none(), "no full-delivery receipt: {ack}");
     }
 }
+
+#[test]
+fn current_mac_setup_receipts_require_the_whole_held_claim_and_live_child() {
+    use aterm_types::clt_mark::{self, Asker};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mark = root.path().join(clt_mark::FILE);
+    let directory = children(&mark).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let exe = root.path().join("aterm");
+    let child = Process {
+        identity: Identity {
+            pid: 42,
+            birth: aterm_uds::process::Birth(700),
+            idversion: Some(3),
+        },
+        image: exe.clone(),
+        argv: std::iter::once(exe.to_str().unwrap())
+            .chain(COMMAND_LINE_TOOLS_ARGS)
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect(),
+    };
+    // The GUI can retain its window's claim when handing it to the child failed. The receipt
+    // must match the held claim, while the separately named live child remains the input target.
+    let asker = Asker {
+        build: "1.0.0+gfixture".to_owned(),
+        pid: 900,
+        birth: 1_200,
+    };
+    let claim = clt_mark::explicit(&clt_mark::Live, &mark, &asker, 800).unwrap();
+    let current_record = std::fs::read(&mark).unwrap();
+    let claim_line = claim.receipt_line().unwrap();
+    let receipt = |sid: &str, line: &str| format!("v3\n{sid}\n42\n700\n{line}\n");
+    for sid in ["tabcdef0123", "s-0123456789abcdef0123"] {
+        let name = format!("{sid}-42-700");
+        let text = receipt(sid, &claim_line);
+        let write = |text: &str| {
+            aterm_uds::private_file::write_private(&directory, &name, text.as_bytes()).unwrap();
+        };
+        let admitted = || Binding::read(&mark, &name, &exe, &|_| Some(child.clone()));
+        write(&text);
+        let target = admitted().expect("current GUI receipt and held claim");
+        assert_eq!(target.sid, sid);
+        assert_eq!(target.claim, ReceiptClaim::Current(claim.clone()));
+        for changed in ["pid", "birth", "image", "argv"] {
+            let mut other = child.clone();
+            match changed {
+                "pid" => other.identity.pid += 1,
+                "birth" => other.identity.birth.0 += 1,
+                "image" => other.image = root.path().join("another-app"),
+                _ => other.argv[1].push(b'x'),
+            }
+            assert!(
+                Binding::read(&mark, &name, &exe, &|_| Some(other.clone())).is_none(),
+                "the receipt does not authorize another child's {changed}"
+            );
+        }
+        for field in ["build", "pid", "birth", "at", "n"] {
+            let mut wrong = claim.clone();
+            match field {
+                "build" => wrong.asker.build.push('x'),
+                "pid" => wrong.asker.pid += 1,
+                "birth" => wrong.asker.birth += 1,
+                "at" => wrong.at += 1,
+                _ => wrong.n += 1,
+            }
+            write(&receipt(sid, &wrong.receipt_line().unwrap()));
+            assert!(
+                admitted().is_none(),
+                "the whole held claim's {field} must match"
+            );
+        }
+        for malformed in [
+            text.replace("v3\n", "v4\n"),
+            text.replace("v3\n", "v2\n"),
+            text.trim_end().to_owned(),
+            format!("{text}\n"),
+            format!("{text}extra\n"),
+            text.replace("\n42\n", "\n042\n"),
+            text.replace("\n700\n", "\n0700\n"),
+            receipt(sid, "unclaimed"),
+            receipt(sid, "claimed 1.0.0+gfixture"),
+            receipt(sid, &format!("{claim_line} 1")),
+            receipt("t0000000001", &claim_line),
+        ] {
+            write(&malformed);
+            assert!(admitted().is_none(), "{malformed:?}");
+        }
+        write(&text);
+        aterm_uds::private_file::write_private(
+            root.path(),
+            clt_mark::FILE,
+            b"opened 1.0.0+gfixture\n",
+        )
+        .unwrap();
+        assert!(
+            admitted().is_none(),
+            "a matching build alone is no current claim"
+        );
+        aterm_uds::private_file::write_private(root.path(), clt_mark::FILE, &current_record)
+            .unwrap();
+        assert!(admitted().is_some());
+        std::fs::remove_file(directory.join(name)).unwrap();
+    }
+
+    let sid = "tabcdef0123";
+    let name = format!("{sid}-42-700");
+    aterm_uds::private_file::write_private(&directory, &name, receipt(sid, &claim_line).as_bytes())
+        .unwrap();
+    let admitted = || Binding::read(&mark, &name, &exe, &|_| Some(child.clone()));
+    let newer = clt_mark::explicit(&clt_mark::Live, &mark, &asker, 801).unwrap();
+    assert!(
+        admitted().is_some(),
+        "a newer attempt does not revoke a still-held one"
+    );
+    assert!(
+        clt_mark::end(&clt_mark::Live, &mark, &claim, clt_mark::End::Released, 802)
+            .unwrap()
+            .held()
+    );
+    assert!(
+        admitted().is_none(),
+        "an ended claim must not receive input"
+    );
+    let newer_record = std::fs::read_to_string(&mark).unwrap();
+    assert!(
+        newer.is_held_in(&newer_record),
+        "the other attempt remains held"
+    );
+}

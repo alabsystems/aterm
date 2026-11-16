@@ -72,12 +72,13 @@ pub fn words(speaker: Speaker, path: &Path, failure: &Failure<'_>) -> String {
         Failure::Begin(error) => begin_words(&file, error),
         Failure::Write { stage, cause } => {
             let kind = cause.map(|cause| cause.kind);
-            medium_words(&folder, kind)
+            medium_words(&folder, kind, Act::Save)
                 .or_else(|| cause.and_then(|cause| caused_words(who, path, &file, &folder, cause)))
                 .unwrap_or_else(|| step_words(who, &file, &folder, *stage))
         }
         Failure::Unconfirmed { stage, cause } => {
-            medium_words(&folder, cause.map(|cause| cause.kind))
+            let kind = cause.map(|cause| cause.kind);
+            medium_words(&folder, kind, Act::Unconfirmed)
                 .unwrap_or_else(|| unconfirmed_words(who, &file, *stage))
         }
     }
@@ -119,15 +120,34 @@ fn begin_words(file: &str, error: &PersistenceError) -> String {
     }
 }
 
-fn medium_words(folder: &str, kind: Option<ErrorKind>) -> Option<String> {
+/// What a full disk or a used-up quota cost, as [`medium_words`] says it: each says what
+/// happened to the file and what doing it again does, and none tells anyone to free space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Act {
+    /// A save that stopped before the file was replaced ([`Failure::Write`], or the read before
+    /// it, [`Failure::Read`]).
+    Save,
+    /// A save whose file was, or may have been, replaced ([`Failure::Unconfirmed`]).
+    Unconfirmed,
+    /// An open or reload ([`Failure::Open`]): nothing was being saved.
+    Open,
+}
+
+impl Act {
+    const fn outcome(self) -> &'static str {
+        match self {
+            Self::Save => "not saved; saving again retries it",
+            Self::Unconfirmed => "the save wasn\u{2019}t confirmed; saving again retries it",
+            Self::Open => "not opened; opening it again retries it",
+        }
+    }
+}
+
+fn medium_words(folder: &str, kind: Option<ErrorKind>, act: Act) -> Option<String> {
     Some(match kind? {
         ErrorKind::ReadOnlyFilesystem => format!("the disk holding {folder} is read-only"),
-        ErrorKind::StorageFull => {
-            "the disk is full \u{b7} free some space, then try again".to_string()
-        }
-        ErrorKind::QuotaExceeded => {
-            "your disk quota is used up \u{b7} free some space, then try again".to_string()
-        }
+        ErrorKind::StorageFull => format!("the disk is full \u{b7} {}", act.outcome()),
+        ErrorKind::QuotaExceeded => format!("your disk quota is used up \u{b7} {}", act.outcome()),
         ErrorKind::TimedOut
         | ErrorKind::StaleNetworkFileHandle
         | ErrorKind::NetworkDown
@@ -230,6 +250,7 @@ fn read_words(
         }
         _ => {}
     }
+    let act = if opening { Act::Open } else { Act::Save };
     match error.refusal_word() {
         "not-regular" => format!("{file} isn\u{2019}t a regular file"),
         "too-large" => format!("{file} is too large for {who} to read"),
@@ -240,7 +261,7 @@ fn read_words(
         ),
         "missing" if opening => format!("{folder} doesn\u{2019}t exist"),
         "missing" => format!("{folder} went missing while saving \u{b7} try again"),
-        _ => medium_words(folder, error.io_kind()).unwrap_or_else(|| match error.io_kind() {
+        _ => medium_words(folder, error.io_kind(), act).unwrap_or_else(|| match error.io_kind() {
             Some(ErrorKind::PermissionDenied) => {
                 format!("{file} isn\u{2019}t readable \u{b7} check its permissions")
             }

@@ -188,6 +188,9 @@ fn actual_fixed_metadata_owner_preserves_original_resources_and_drains() {
     let store_path = scratch.path().join("host");
     let store = ImageStore::prepare_at(&store_path).unwrap();
     let program = store.cache_current().unwrap();
+    // Qualify the copied host before measuring its controller progress: macOS's first-exec
+    // assessment is a separate bounded stage, with no owner journal to advance yet.
+    crate::native_fixture::qualify_image(program.path());
     let mut command = spawnfd::command(program.path());
     command
         .args(["--exact", EXACT, "--nocapture"])

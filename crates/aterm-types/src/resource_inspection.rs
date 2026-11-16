@@ -93,7 +93,7 @@ pub struct Memory {
 /// arbitrary JSON with this shape is not evidence of admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inspection {
-    /// Exact canonical session identity.
+    /// Exact local session identity, including the legacy ID of a session this Mac holds.
     pub session: String,
     /// Original nonreused submission attempt.
     pub attempt: [u8; 16],

@@ -48,10 +48,37 @@ fn server(store: &Path, seq: u64) -> Running {
     running
 }
 
+/// [`server`], resolving `alab-secrets.local` to loopback and no other host.
+fn server_resolving_holders(store: &Path, seq: u64) -> Running {
+    let running = launch(
+        TcpListener::bind("127.0.0.1:0").expect("bind"),
+        &alab_options(store),
+        Tuning {
+            resolve: |host, _| {
+                (host == "alab-secrets.local").then(|| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            },
+            ..Tuning::default()
+        },
+    )
+    .expect("started");
+    publish(&running, seq);
+    running
+}
+
 /// A vault server on loopback that pins the ALab vault to [`SIGNER`] and holds no version of
 /// it yet: nothing has connected to it.
 fn unpublished(store: &Path) -> Running {
-    let options = Options {
+    start(
+        TcpListener::bind("127.0.0.1:0").expect("bind"),
+        &alab_options(store),
+    )
+    .expect("started")
+}
+
+/// The options of a server on loopback storing at `store` that pins the ALab vault to
+/// [`SIGNER`].
+fn alab_options(store: &Path) -> Options {
+    Options {
         listen: "127.0.0.1:0".parse().expect("addr"),
         store: store.to_path_buf(),
         advertise: None,
@@ -61,8 +88,7 @@ fn unpublished(store: &Path) -> Running {
         )],
         hold: Duration::from_millis(100),
         keep_awake: false,
-    };
-    start(TcpListener::bind("127.0.0.1:0").expect("bind"), &options).expect("started")
+    }
 }
 
 fn publish(running: &Running, seq: u64) {
@@ -77,7 +103,7 @@ fn publish_bytes(running: &Running, envelope: &[u8]) {
 /// What member `m5`'s `vault-tend` thread keeps, before its first round: it advertises for
 /// `own`, under the name `m5`.
 fn tending(own: &Running, bell: &Arc<Bell>) -> Tending {
-    let decide: RoleDecider = Box::new(|_| Some("m5".to_owned()));
+    let decide: RoleDecider = Box::new(|_, _| Some("m5".to_owned()));
     Tending::begin(
         Arc::default(),
         Arc::new(AtomicBool::new(false)),
@@ -97,8 +123,19 @@ fn tending(own: &Running, bell: &Arc<Bell>) -> Tending {
 
 /// A round's seams in these laws: the standing browse is `watch`, sharing is what `sharing`
 /// says, this Mac has no address (so a round registers no advert and starts no child), nothing
-/// answers a probe, and the pull is `pull`.
+/// answers a probe, the pull is `pull`, and each round starts [`PULL_SPACING`] after the one
+/// before, so no round's pulls are held back by the last's.
 fn seams(watch: &Arc<Watch>, sharing: &Arc<AtomicBool>, pull: PullPeers) -> Seams {
+    seams_probing(watch, sharing, pull, |_, _, _, _, _, _| None)
+}
+
+/// [`seams`], with `probe` the probe.
+fn seams_probing(
+    watch: &Arc<Watch>,
+    sharing: &Arc<AtomicBool>,
+    pull: PullPeers,
+    probe: ProbeAlab,
+) -> Seams {
     let watch = Arc::clone(watch);
     let sharing = Arc::clone(sharing);
     Seams {
@@ -110,28 +147,42 @@ fn seams(watch: &Arc<Watch>, sharing: &Arc<AtomicBool>, pull: PullPeers) -> Seam
         power: Box::new(|_| None),
         end_for_sleep: Arc::new(Registered::end),
         sleep_bound: SLEEP_YIELD_BOUND,
-        probe: |_, _, _, _, _, _| None,
+        probe,
         pull,
         name_answered: Box::new(|_, _| false),
         sharing: Box::new(move || sharing.load(Ordering::SeqCst)),
+        now: Box::new({
+            let start = Instant::now();
+            let mut rounds = 0u32;
+            move || {
+                rounds += 1;
+                start + PULL_SPACING * rounds
+            }
+        }),
     }
 }
 
 /// A watch that heard `names` and `alab-secrets`, and resolves each of `names` to the vault at
-/// the same place of `peers` (`alab-secrets` to none), counting the names it is handed in
-/// `handed`. As the production resolver does, it starts one thread for each name it is handed,
-/// each run as a round's resolve thread is ([`crate::serve_counts::resolving`]).
+/// the same place of `peers`, its TXT naming the `seq` at that place of `seqs` as it resolves and
+/// the records the servers here hold (none: the empty log's digest), and `alab-secrets` to the
+/// holder at `holder` (by the host `alab-secrets.local`, its TXT naming `seq` 5 and, as every
+/// `alab-secrets` TXT, no records) or to none, counting the names it is handed in `handed`. As
+/// the production resolver does, it starts one thread for each name it is handed, each run as a
+/// round's resolve thread is ([`crate::serve_counts::resolving`]).
 fn watching(
     bell: &Arc<Bell>,
     names: &[&str],
     peers: &[SocketAddr],
+    seqs: &Arc<Vec<AtomicU64>>,
     handed: &Arc<AtomicU64>,
+    holder: Option<SocketAddr>,
 ) -> Arc<Watch> {
     let at: Vec<(String, SocketAddr)> = names
         .iter()
         .map(|name| (*name).to_owned())
         .zip(peers.iter().copied())
         .collect();
+    let seqs = Arc::clone(seqs);
     let handed = Arc::clone(handed);
     let watch = Watch::idle_resolving_vaults(bell, &[], move |asked, _| {
         handed.fetch_add(asked.len() as u64, Ordering::SeqCst);
@@ -141,18 +192,39 @@ fn watching(
                 scope.spawn(|| resolving.run(|| ()));
             }
         });
+        let txt = |seq, label: Option<&str>, rec| {
+            Some(VaultTxt {
+                vault: crate::ALAB_VAULT.to_owned(),
+                signer: crate::envelope::fingerprint(&signer_public(&SIGNER).expect("public")),
+                seq,
+                head: [0; 32],
+                label: label.map(str::to_owned),
+                rec,
+            })
+        };
+        let none_held = Some(crate::membership_log::empty_heads_digest());
         asked
             .iter()
-            .filter_map(|name| at.iter().find(|(known, _)| known == name))
-            .map(|(_, addr)| DiscoveredVault {
-                url: format!("http://{addr}/v1/{}", crate::ALAB_VAULT),
-                txt: Some(VaultTxt {
-                    vault: crate::ALAB_VAULT.to_owned(),
-                    signer: crate::envelope::fingerprint(&signer_public(&SIGNER).expect("public")),
-                    seq: 1,
-                    head: [0; 32],
-                    label: None,
-                }),
+            .filter_map(|name| {
+                if let Some(holder) = holder.filter(|_| name == crate::alab_advertised()) {
+                    return Some(DiscoveredVault {
+                        url: format!(
+                            "http://alab-secrets.local:{}/v1/{}",
+                            holder.port(),
+                            crate::ALAB_VAULT
+                        ),
+                        txt: txt(5, Some("m9"), None),
+                    });
+                }
+                let place = at.iter().position(|(known, _)| known == name)?;
+                Some(DiscoveredVault {
+                    url: format!("http://{}/v1/{}", at[place].1, crate::ALAB_VAULT),
+                    txt: txt(
+                        seqs.get(place).map_or(1, |seq| seq.load(Ordering::SeqCst)),
+                        None,
+                        none_held,
+                    ),
+                })
             })
             .collect()
     });
@@ -173,24 +245,31 @@ fn counted(counts: &ServeCounts) -> Vec<(&'static str, u64)> {
 
 /// The law of a server's round counts, through the production round and the pull arm a real
 /// server's rounds are given (the one [`Seams::this_mac`] names, taken from it here) against 3
-/// vault servers on loopback. A round whose 3 peers hold the version this server holds counts
-/// 3 pulls, 3 envelope 204s, 3 records fetches, no body and nothing stored, the 4 names it
-/// handed its resolver for peers and the 1 for the `alab-secrets` holders with the 5 threads
-/// that resolved them, 1 probe for the ALab name (this server does not hold it, and looks for
-/// who does once a round), and 3 `vault-peer-pull` threads ended. With one peer a version
-/// ahead, its envelope longer than the first read's bound, the next round counts 1 envelope
-/// asked a second time and read whole, 1 body, 1 envelope stored and 1 pull that stored. Each
-/// round is counted by what ended the nap before it, a round that finds sharing off pulls
-/// nothing, and the counts' line is said as the 1st, 2nd and 4th round end.
+/// vault servers on loopback. The first round, which sweeps each peer it sees for the first time
+/// whatever its TXT says ([`PullGate::sweep_due`]), with its 3 peers holding the version this
+/// server holds, counts 3
+/// pulls, 3 envelope 204s, 3 records fetches, no body and nothing stored, the 4 names it handed
+/// its resolver for peers and the 1 for the `alab-secrets` holders with the 5 threads that
+/// resolved them, 1 probe for the ALab name (this server does not hold it, and looks for who
+/// does once a round), and 3 `vault-peer-pull` threads ended. The rounds after it are gated
+/// ([`pull_due`]): with one peer a version ahead and its TXT saying so, its envelope longer
+/// than the first read's bound, the next round pulls that peer alone, counting 1 pull, 1
+/// envelope asked a second time and read whole, 1 body, 1 envelope stored and 1 pull that
+/// stored, and no records fetch (its TXT names the records this server holds); once every TXT
+/// names what this server holds, a round makes no request at all (ATERM-KI-1108-2). Each round is counted by what ended the nap before it, a round that
+/// finds sharing off pulls nothing, and the counts' line is said as the 1st, 2nd and 4th round
+/// end.
 ///
 /// Negative controls: delete `shared.counts.add(Count::Envelope204)` in `pull_from_peer`
 /// (`envelope_204` is absent, wants 3); return 0 from a storing pull (delete the `stored += 1`
 /// beside `Count::EnvelopesStored`: `pulls_stored` is absent, wants 1); spawn each pull without
 /// `pull_threads.ending` (0 threads ended, wants 3); name a pull that pulls nothing in
-/// `Seams::this_mac` (`pull: |_, _, _, _, _| 0`: `pulls`, `envelope_204` and `records_fetches`
-/// are absent); delete `shared.counts.add(Count::EnvelopeWholeReads)` in `pull_from_peer`
-/// (`envelope_whole_reads` is absent, wants 1); delete the `serve_counts::tending` guard in
-/// `Tending::round` (0 resolve threads ended, wants 5).
+/// `Seams::this_mac` (`pull: |_, _, _, _, _, _| 0`: `pulls`, `envelope_204` and
+/// `records_fetches` are absent); delete `shared.counts.add(Count::EnvelopeWholeReads)` in
+/// `pull_from_peer` (`envelope_whole_reads` is absent, wants 1); delete the
+/// `serve_counts::tending` guard in `Tending::round` (0 resolve threads ended, wants 5); open
+/// the gate (`pull_due` returning [`Due::BOTH`]: the second round pulls all 3 peers, `pulls`
+/// 6, wants 4).
 #[test]
 fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -201,7 +280,8 @@ fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
     let addrs: Vec<SocketAddr> = peers.iter().map(|peer| peer.addr).collect();
     let bell = Arc::new(Bell::default());
     let handed = Arc::new(AtomicU64::new(0));
-    let watch = watching(&bell, &["m10", "m11", "m12"], &addrs, &handed);
+    let seqs: Arc<Vec<AtomicU64>> = Arc::new((0..3).map(|_| AtomicU64::new(5)).collect());
+    let watch = watching(&bell, &["m10", "m11", "m12"], &addrs, &seqs, &handed, None);
     let sharing = Arc::new(AtomicBool::new(true));
     // The arm a real server's rounds pull through: nothing else of this Mac's own is used.
     let mut seams = seams(&watch, &sharing, Seams::this_mac().pull);
@@ -243,11 +323,12 @@ fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
     );
     assert!(line.contains(" process_cpu_ns="), "{line}");
 
-    // One peer is a version ahead, its envelope longer than a pull's first read: it is asked
-    // again, read whole and stored.
+    // One peer is a version ahead and its TXT says so, its envelope longer than a pull's first
+    // read: the gated round pulls it alone, asks again, reads it whole and stores it.
     let longer = alab_holding(6, ENVELOPE_PEEK);
     assert!(longer.len() > ENVELOPE_PEEK);
     publish_bytes(&peers[1], &longer);
+    seqs[1].store(6, Ordering::SeqCst);
     tending.why = Some(Wake::Timer);
     let second = tending.round(&mut seams);
     assert_eq!(
@@ -258,30 +339,34 @@ fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
             ("nap_timer", 1),
             ("peer_names", 8),
             ("alab_names", 2),
-            ("pulls", 6),
+            ("pulls", 4),
             ("pulls_stored", 1),
             ("envelope_whole_reads", 1),
-            ("envelope_204", 5),
+            ("envelope_204", 3),
             ("envelope_bodies", 1),
             ("envelopes_stored", 1),
-            ("records_fetches", 6),
+            ("records_fetches", 3),
             ("alab_probes", 2),
         ]
     );
-    assert_eq!(threads(), 6);
+    assert_eq!(threads(), 4);
     assert_eq!(resolves(), 10);
     assert!(second.said.is_some(), "the second round's line");
 
-    // After the PUT that stored it, every peer holds nothing newer.
+    // After the PUT that stored it, every TXT names what this server holds or older: the round
+    // asks no peer anything.
     tending.why = Some(Wake::Put);
     let third = tending.round(&mut seams);
     assert!(third.said.is_none(), "no line as the third round ends");
     assert_eq!(counts.get(Count::NapPut), 1);
-    assert_eq!(counts.get(Count::Envelope204), 8);
+    assert_eq!(counts.get(Count::Pulls), 4, "an idle round pulls nothing");
+    assert_eq!(counts.get(Count::Envelope204), 3);
+    assert_eq!(counts.get(Count::RecordsFetches), 3);
     assert_eq!(counts.get(Count::EnvelopeBodies), 1);
     assert_eq!(counts.get(Count::EnvelopeWholeReads), 1);
     assert_eq!(counts.get(Count::PullsStored), 1);
     assert_eq!(counts.get(Count::AlabProbes), 3);
+    assert_eq!(threads(), 4);
 
     // Sharing is off: the round resolves and pulls nothing.
     sharing.store(false, Ordering::SeqCst);
@@ -292,9 +377,9 @@ fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
     assert_eq!(counts.get(Count::NapBrowse), 1);
     assert_eq!(counts.get(Count::RoundsHeld), 1);
     assert_eq!(counts.get(Count::PeerNames), 12);
-    assert_eq!(counts.get(Count::Pulls), 9);
+    assert_eq!(counts.get(Count::Pulls), 4);
     assert_eq!(counts.get(Count::AlabProbes), 3);
-    assert_eq!(threads(), 9);
+    assert_eq!(threads(), 4);
     assert_eq!(resolves(), 15);
 
     for server in peers.into_iter().chain([own]) {
@@ -303,27 +388,39 @@ fn a_round_counts_its_names_its_pulls_and_what_each_peer_answered() {
 }
 
 /// What the pull arm of [`the_round_hands_its_pull_arm_every_peer_it_resolved`] was handed, a
-/// round at a time.
-static HANDED_TO_THE_ARM: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// round at a time: how many peers, and how many catch-ups the server's gate had counted
+/// ([`PullGate::catch_up`]).
+static HANDED_TO_THE_ARM: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 
 fn recording_pull(
-    _: &Shared,
+    shared: &Shared,
     peers: &[DiscoveredVault],
     _: u16,
     _: Option<&str>,
     _: &[Target],
+    _: Pass,
 ) -> usize {
-    HANDED_TO_THE_ARM.lock().expect("handed").push(peers.len());
+    let catch_ups = shared.lock_gate().catch_ups;
+    HANDED_TO_THE_ARM
+        .lock()
+        .expect("handed")
+        .push((peers.len(), catch_ups));
     0
 }
 
-/// Three rounds over a watch that resolves 5 names hand the pull arm 5 peers each, and count
-/// the 15 names for peers and the 3 for holders that the resolver was handed, with no request
-/// made: the arm is a test's, so the pulls the default arm counts stay 0.
+/// Three rounds over a watch that resolves 5 names and a holder hand the pull arm 7 peers each
+/// (the 5, and the holder once as a peer and once as a holder, whatever the round's cut of its
+/// peers), the first a catch-up ([`CatchUp`]) and the others not, and count the 18 names for
+/// peers and the 3 for holders that the resolver was handed, with no request made: the arm is a
+/// test's, so the pulls the default arm counts stay 0. A round with sharing off hands the arm
+/// nothing, and the first round with it on again catches up on what it did not pull meanwhile.
 ///
 /// Negative controls: delete `counts.add_n(Count::PeerNames, peer_names)` in `Tending::round`
 /// (`peer_names` reads 0, wants 18); delete the `serve_counts::tending` guard there (0 resolve
-/// threads ended, wants 21).
+/// threads ended, wants 21); keep the catch-up state while sharing is off (drop
+/// `self.catch_up = CatchUp::default()` in `Tending::round`: the round after it catches up
+/// nothing, `(7, 1)` for `(7, 2)`); hand the arm the round's peers alone, without its holders
+/// (`(6, 1)` for `(7, 1)`).
 #[test]
 fn the_round_hands_its_pull_arm_every_peer_it_resolved() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -335,7 +432,15 @@ fn the_round_hands_its_pull_arm_every_peer_it_resolved() {
         .collect();
     let bell = Arc::new(Bell::default());
     let handed = Arc::new(AtomicU64::new(0));
-    let watch = watching(&bell, &names, &addrs, &handed);
+    let holder = SocketAddr::from(([127, 0, 0, 1], 14));
+    let watch = watching(
+        &bell,
+        &names,
+        &addrs,
+        &Arc::new(Vec::new()),
+        &handed,
+        Some(holder),
+    );
     let sharing = Arc::new(AtomicBool::new(true));
     let mut seams = seams(&watch, &sharing, recording_pull);
     let mut tending = tending(&own, &bell);
@@ -343,7 +448,10 @@ fn the_round_hands_its_pull_arm_every_peer_it_resolved() {
         assert!(!tending.round(&mut seams).closed);
         tending.why = Some(Wake::Timer);
     }
-    assert_eq!(*HANDED_TO_THE_ARM.lock().expect("handed"), [5, 5, 5]);
+    assert_eq!(
+        *HANDED_TO_THE_ARM.lock().expect("handed"),
+        [(7, 1), (7, 1), (7, 1)]
+    );
     let counts = &own.shared.counts;
     // Each round hands its resolver the 5 names and `alab-secrets` for peers, and
     // `alab-secrets` for holders.
@@ -353,7 +461,152 @@ fn the_round_hands_its_pull_arm_every_peer_it_resolved() {
     assert_eq!(counts.resolve_threads.ended.load(Ordering::Relaxed), 21);
     assert_eq!(counts.get(Count::Pulls), 0);
     assert_eq!(counts.get(Count::NapTimer), 2);
+    sharing.store(false, Ordering::SeqCst);
+    assert!(!tending.round(&mut seams).closed);
+    sharing.store(true, Ordering::SeqCst);
+    assert!(!tending.round(&mut seams).closed);
+    assert_eq!(
+        HANDED_TO_THE_ARM.lock().expect("handed")[3..],
+        [(7, 2)],
+        "sharing on again: a catch-up"
+    );
     own.stop();
+}
+
+/// Where [`probing_holder`] finds the holder.
+static PROBED_HOLDER: Mutex<Option<SocketAddr>> = Mutex::new(None);
+
+/// A probe of `alab-secrets` made as the production probe makes one ([`probe_verified`]), at the
+/// holder [`PROBED_HOLDER`] names.
+fn probing_holder(
+    target: &str,
+    _: u16,
+    _: Option<&str>,
+    _: &[Target],
+    _: bool,
+    shared: &Shared,
+) -> Option<u64> {
+    let at = (*PROBED_HOLDER.lock().expect("holder"))?;
+    if target != crate::alab_advertised() {
+        return None;
+    }
+    probe_verified(&format!("http://{at}/v1/{}", crate::ALAB_VAULT), shared)
+}
+
+/// An idle lab with a holder (ATERM-KI-1108-2): through the production round and pull, against
+/// a holder and a peer on loopback holding what this server holds, the first round sweeps both,
+/// and each round after it asks the holder one conditional request, the probe that looks for who
+/// holds `alab-secrets` (`?after=<seq>`, answered 204), and nothing else: no pull of the holder,
+/// whose `alab-secrets` TXT names what this server holds and no records, nor of the peer.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with step 6's holder edge (a group holding an `alab-secrets`
+/// instance pulled whatever its TXT says), each idle round asks the holder its envelope and its
+/// records as well (`left: (4, 2)`, `right: (3, 1)`); with the rec-less `alab-secrets` TXT read
+/// as an older build's, it asks its records (`left: (3, 2)`).
+#[test]
+fn an_idle_round_asks_the_holder_nothing_beyond_its_probe() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = server_resolving_holders(&root.path().join("own"), 5);
+    let holder = server(&root.path().join("holder"), 5);
+    let peer = server(&root.path().join("peer"), 5);
+    *PROBED_HOLDER.lock().expect("holder") = Some(holder.addr);
+    let bell = Arc::new(Bell::default());
+    let handed = Arc::new(AtomicU64::new(0));
+    let seqs: Arc<Vec<AtomicU64>> = Arc::new(vec![AtomicU64::new(5)]);
+    let watch = watching(
+        &bell,
+        &["m10"],
+        &[peer.addr],
+        &seqs,
+        &handed,
+        Some(holder.addr),
+    );
+    let sharing = Arc::new(AtomicBool::new(true));
+    let mut seams = seams_probing(&watch, &sharing, Seams::this_mac().pull, probing_holder);
+    let mut tending = tending(&own, &bell);
+    let counts = Arc::clone(&own.shared.counts);
+    let asked = |server: &Running| (server.envelope_gets(), server.records_gets());
+
+    // The first round sweeps both, then probes the holder, reading its version whole.
+    assert!(!tending.round(&mut seams).closed);
+    assert_eq!(counts.get(Count::Pulls), 2);
+    assert_eq!(asked(&peer), (1, 1));
+    assert_eq!(
+        asked(&holder),
+        (2, 1),
+        "its sweep and the probe's whole read"
+    );
+
+    for round in 2..=3 {
+        tending.why = Some(Wake::Timer);
+        assert!(!tending.round(&mut seams).closed);
+        assert_eq!(
+            asked(&holder),
+            (round + 1, 1),
+            "round {round}: the probe alone"
+        );
+        assert_eq!(asked(&peer), (1, 1), "round {round}");
+    }
+    assert_eq!(
+        counts.get(Count::Pulls),
+        2,
+        "the idle rounds pulled nothing"
+    );
+    assert_eq!(counts.get(Count::AlabProbes), 3);
+    for server in [own, holder, peer] {
+        server.stop();
+    }
+}
+
+/// A first round that resolves no peer (its browse heard nothing yet, as every server's first
+/// round after a fleet-wide update does) leaves each server to be swept by the first round that
+/// resolves it, there a later round's (step 6 spent its catch-up on the empty round).
+///
+/// NEGATIVE CONTROL (2026-11-15): with a server first seen swept never (`sweep_due` false where
+/// no sweep of it finished), the round that first resolves the peers pulls neither
+/// (`left: 0`, `right: 2`).
+#[test]
+fn a_server_first_heard_after_an_empty_first_round_is_swept() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let own = server(&root.path().join("own"), 5);
+    let peers: Vec<Running> = (0..2)
+        .map(|n| server(&root.path().join(format!("peer{n}")), 5))
+        .collect();
+    let addrs: Vec<SocketAddr> = peers.iter().map(|peer| peer.addr).collect();
+    let bell = Arc::new(Bell::default());
+    let handed = Arc::new(AtomicU64::new(0));
+    let seqs: Arc<Vec<AtomicU64>> = Arc::new((0..2).map(|_| AtomicU64::new(5)).collect());
+    let names = ["m10", "m11"];
+    let watch = watching(&bell, &names, &addrs, &seqs, &handed, None);
+    for name in names {
+        watch.hear(false, 4, name);
+    }
+    let sharing = Arc::new(AtomicBool::new(true));
+    let mut seams = seams(&watch, &sharing, Seams::this_mac().pull);
+    let mut tending = tending(&own, &bell);
+    let counts = Arc::clone(&own.shared.counts);
+    assert!(!tending.round(&mut seams).closed);
+    assert_eq!(
+        counts.get(Count::Pulls),
+        0,
+        "the first round resolved no peer"
+    );
+    for name in names {
+        watch.hear(true, 4, name);
+    }
+    tending.why = Some(Wake::Browse);
+    assert!(!tending.round(&mut seams).closed);
+    assert_eq!(
+        counts.get(Count::Pulls),
+        2,
+        "each swept as it is first resolved"
+    );
+    for peer in &peers {
+        assert_eq!((peer.envelope_gets(), peer.records_gets()), (1, 1));
+    }
+    for server in peers.into_iter().chain([own]) {
+        server.stop();
+    }
 }
 
 /// Each `vault-conn` thread is counted as it ends: a server tells this law as each of its
@@ -415,7 +668,8 @@ fn a_tend_thread_that_advertises_nothing_counts_into_its_servers_counts() {
         end_for_sleep: Arc::new(Registered::end),
         sleep_bound: SLEEP_YIELD_BOUND,
         probe: |_, _, _, _, _, _| None,
-        pull: |_, _, _, _, _| 0,
+        pull: |_, _, _, _, _, _| 0,
+        now: Box::new(Instant::now),
         name_answered: Box::new(|_, _| false),
         // A round reads this once it has counted itself.
         sharing: Box::new(move || {

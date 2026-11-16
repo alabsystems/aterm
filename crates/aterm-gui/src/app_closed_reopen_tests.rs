@@ -976,13 +976,13 @@ fn publication_applies_saved_offsets_to_the_head_edited_while_a_later_leaf_waite
                         .then_some(view)
                     })
                     .unwrap();
-                let crate::native_app::AppViewState::Editor(state) =
-                    app.native_runtime.view_state_mut(live_view).unwrap()
-                else {
+                let mut view_guard = app.native_runtime.view_state_mut(live_view).unwrap();
+                let crate::native_app::AppViewState::Editor(state) = &mut *view_guard else {
                     panic!("live Editor")
                 };
                 state.buffer.as_mut().unwrap().selections =
                     vec![crate::native_editor::Selection { anchor: 0, head: 6 }];
+                drop(view_guard);
                 app.dispatch_native_event(
                     WID,
                     AppEvent::TextInput(TextInputEvent::Commit("é".into())),

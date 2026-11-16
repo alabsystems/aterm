@@ -93,11 +93,20 @@ pub(crate) const PAGE: Page = Page {
                      enabled`), for the agent a rostered harness runs when one leads the session \
                      (Grok Build under grok-alab); `contract=` is the set of harness contracts \
                      served (2: codex-alab's self-claim, 3: a rostered harness's scoped `meta set \
-                     supervisor`); ` codex_rotation=1` follows while the native policy's quota \
+                     supervisor`, 4: any registry row's claim); ` codex_rotation=1` follows while the native policy's quota \
                      rotation is on, and with it ` codex_rotation_five_hour=<seconds>`, a plain \
                      decimal count: this host hands a codex-alab session off at a five-hour \
                      limit only where that limit's reset is more than that many seconds away \
-                     (nearer, `codex-rotation prepare` answers `state=not-needed`); \
+                     (nearer, `codex-rotation prepare` answers `state=not-needed`), and \
+                     ` codex_rotation_refusal=1`: it also hands one off where its fresh read of \
+                     the session's login refuses ordinary use that no window's reset ends (a \
+                     spend control, a workspace's spent credits or usage limit, a credit-only \
+                     plan out of credits), to an account whose own read allows it, and \
+                     ` codex_rotation_limits=1`: `codex-rotation prepare` takes a fifth key, \
+                     `limit=<id>` (`[a-z0-9_]{1,64}`, never `codex`), naming a model's own usage \
+                     limit; the host judges that limit's entry in the session's fresh read alone \
+                     (`state=not-needed` where it shows no wall to leave or lists no such limit) \
+                     and moves the session only to an account whose read lists it with room; \
                      ` codex_rotation_login=1` follows, apart from those, while this host moves a \
                      codex-alab session whose login was lost to another account already signed \
                      in here (`codex-login-rotation prepare`, the rotation's four keys): only a \

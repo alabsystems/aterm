@@ -68,7 +68,7 @@ fn frame_with(
         )
     });
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.input_scratch.clone_from(base);
         install(&mut ws.input_scratch, clip);
     }

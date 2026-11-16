@@ -150,7 +150,7 @@ fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
     let mut app = lit_app();
     app.config.motion = Some("full".into());
     let (first_source, second_source) = {
-        let ws = app.windows.get_mut(&wid).expect("scripted window");
+        let mut ws = app.windows.get_mut(&wid).expect("scripted window");
         ws.focused = true;
         ws.fx.cursor_mut().glow_scratch.reserve(16_384);
         ws.input_scratch.cursor_glow_add.reserve(16_384);
@@ -228,7 +228,7 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
         )
     };
     {
-        let ws = app.windows.get_mut(&wid).expect("scripted window");
+        let mut ws = app.windows.get_mut(&wid).expect("scripted window");
         ws.predictor.set_mode(crate::predict::PredictMode::Always);
         assert!(ws.predictor.predict_char_in_grid(
             'k',
@@ -371,7 +371,7 @@ fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
     );
     feed(&app, "ג".as_bytes());
     app.redraw_window_at(wid, born);
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     assert_eq!(
         ws.input_scratch.cells[0][0].ch, 'ג',
         "RTL echo is in visual order"
@@ -400,7 +400,7 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     let unmeasured = arm_prediction(&mut app, 'k', born);
     app.on_ime_preedit(wid, "k".into(), Some((1, 1)));
     app.redraw_window_at(wid, born);
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     assert!(!ws.predictor.idle(), "IME preedit has not reached the PTY");
     let estimate = ws.predictor.take_link_estimate();
     assert!(

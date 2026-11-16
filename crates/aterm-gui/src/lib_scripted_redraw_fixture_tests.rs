@@ -29,7 +29,7 @@ pub(crate) fn gallery_directory(
 /// as a live change of display scale does and a cold launch never does.
 pub(crate) fn at_scale(app: &mut App, wid: WindowId, scale: f64) {
     app.headless_scale = scale;
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     assert!(ws.os_window.is_none(), "a window with no OS window");
     assert!(
         ws.last_layout_coordinate_space.is_none(),
@@ -45,6 +45,7 @@ pub(crate) fn at_scale(app: &mut App, wid: WindowId, scale: f64) {
         at(m.pad_top),
         at(m.head),
     );
+    drop(ws);
     app.apply_window_scale(wid);
     let px = app.window_frame_px_for(wid, grid.0, grid.1);
     app.note_headless_px_for(wid, px, grid);
@@ -581,24 +582,39 @@ pub(crate) fn scripted_app_with_sink(sink: std::sync::Arc<aterm_session::sink::S
     });
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window");
     ws.present = Some(crate::PresentTarget::Cpu {
         surface: crate::present::CpuSurface::Scripted(Default::default()),
     });
+    drop(ws);
     app
 }
 
-pub(crate) fn surface(app: &mut App) -> &mut crate::present::scripted::ScriptedPresenter {
-    match app
-        .windows
-        .get_mut(&WindowId(0))
-        .and_then(|ws| ws.present.as_mut())
-    {
-        Some(crate::PresentTarget::Cpu { surface }) => {
-            surface.scripted_mut().expect("scripted surface")
+/// Caller-owned window custody for the scripted presenter fixture.
+pub(crate) struct SurfaceMutation<'a>(crate::option_routing::WindowMutation<'a>);
+impl std::ops::Deref for SurfaceMutation<'_> {
+    type Target = crate::present::scripted::ScriptedPresenter;
+    fn deref(&self) -> &Self::Target {
+        match self.0.present.as_ref() {
+            Some(crate::PresentTarget::Cpu {
+                surface: crate::present::CpuSurface::Scripted(surface),
+            }) => surface,
+            _ => panic!("the fixture presents through its scripted CPU surface"),
         }
-        _ => panic!("the fixture presents through its scripted CPU surface"),
     }
+}
+impl std::ops::DerefMut for SurfaceMutation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self.0.present.as_mut() {
+            Some(crate::PresentTarget::Cpu {
+                surface: crate::present::CpuSurface::Scripted(surface),
+            }) => surface,
+            _ => panic!("the fixture presents through its scripted CPU surface"),
+        }
+    }
+}
+pub(crate) fn surface(app: &mut App) -> SurfaceMutation<'_> {
+    SurfaceMutation(app.windows.get_mut(&WindowId(0)).expect("window"))
 }
 
 pub(crate) fn glass(app: &mut App) -> ((usize, usize), Vec<u32>) {
@@ -611,9 +627,10 @@ pub(crate) fn headless<R>(app: &mut App, capture: impl FnOnce(&mut App) -> R) ->
     let target = app
         .windows
         .get_mut(&WindowId(0))
+        .as_deref_mut()
         .and_then(|ws| ws.present.take());
     let out = capture(app);
-    if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+    if let Some(mut ws) = app.windows.get_mut(&WindowId(0)) {
         ws.present = target;
     }
     out

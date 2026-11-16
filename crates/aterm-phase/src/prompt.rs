@@ -3052,6 +3052,8 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.311-lab-statusline-last-line-held.txt");
     pub const STATUSLINE_REPLY_DONE_2_1_311: &str =
         include_str!("fixtures/claude-2.1.311-lab-statusline-reply-done.txt");
+    pub const STATUSLINE_MIDREPLY_ANSWERED_2_1_323: &str =
+        include_str!("fixtures/claude-2.1.323-lab-statusline-midreply-answered.txt");
     pub const IDLE_AFTER_LIMIT_AND_MODEL_SWITCH: &str =
         include_str!("fixtures/idle-after-limit-and-model-switch.txt");
 

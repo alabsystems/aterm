@@ -1323,99 +1323,189 @@ fn tty_table() -> Vec<(u32, u32, String, String)> {
         .collect()
 }
 
+/// A process fact the kernel was asked for that it did not answer: the read timed out, failed or
+/// was refused, or a row it rests on was missing from what it returned. Never a negative answer:
+/// [`Fact`] keeps "read, and none" (`Ok(None)`) apart from it (LS-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NotRead;
+
+/// A process fact as a read came to it: `Ok(Some(_))` read, `Ok(None)` read and none (a genuine
+/// negative), [`NotRead`] not read at all.
+pub(super) type Fact<T> = Result<Option<T>, NotRead>;
+
+/// Whether `e` failed a file read that was not made: interrupted, out of descriptors, memory or
+/// kernel buffers, an I/O fault, or (Windows) a file another process holds shut, each of which a
+/// later read may get past. Every other error (a permission, a path component that is no
+/// directory, a link loop, a name too long, a non-file, a size past its bound) is a lasting state
+/// of the path that every later read finds again: it is that read's answer, never a read not made,
+/// or a fact resting on the path would stay [`NotRead`] for as long as the path stands (LS-72).
+pub(super) fn read_not_made(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    if matches!(
+        e.kind(),
+        K::Interrupted | K::WouldBlock | K::TimedOut | K::OutOfMemory | K::ResourceBusy
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(
+            e.raw_os_error(),
+            Some(
+                libc::EINTR
+                    | libc::EAGAIN
+                    | libc::EMFILE
+                    | libc::ENFILE
+                    | libc::ENOMEM
+                    | libc::ENOBUFS
+                    | libc::EIO
+                    | libc::EDEADLK
+                    | libc::ETIMEDOUT
+            )
+        )
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION: another process has the file open now.
+        matches!(e.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// How long a file's last write may still be in progress. A record or manifest whose text is not
+/// whole (not UTF-8, or not JSON) is one caught mid-write only while its file was written this
+/// recently; older, that text is its lasting content (one left by a writer that was killed, or a
+/// file of another kind under its name), which says it holds nothing ([`unfinished`]).
+pub(super) const WRITE_SETTLE: Duration = Duration::from_secs(10);
+
+/// What the file at `path`, whose text is not whole, says: [`NotRead`] while its last write is
+/// within [`WRITE_SETTLE`] of now (a write in progress), or where the stat of it was not made
+/// ([`read_not_made`]); `Ok(None)` where that text has stood longer, or the file is gone or its
+/// stat answers with a lasting state: a later read would find the same text, so it is the read's
+/// answer (LS-72).
+pub(super) fn unfinished<T>(path: &Path) -> Fact<T> {
+    let modified = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(modified) => modified,
+        Err(e) if read_not_made(&e) => return Err(NotRead),
+        Err(_) => return Ok(None),
+    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_else(|ahead| ahead.duration());
+    if age <= WRITE_SETTLE {
+        Err(NotRead)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The process outside `pid`'s controlling terminal that holds it, by table `t`: `Ok(None)` only
+/// where `pid`'s row says it has no controlling terminal; a row the walk needs that `t` lacks
+/// (an empty or partial table, a process gone since it was read) or a walk that does not end is
+/// [`NotRead`], never a terminal nobody opened.
 #[cfg(not(windows))]
-fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &str)> {
-    let row = |p: u32| t.iter().find(|(q, _, _, _)| *q == p);
+fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Fact<(u32, &str)> {
+    let row = |p: u32| t.iter().find(|(q, _, _, _)| *q == p).ok_or(NotRead);
     let tty = row(pid)?.2.as_str();
     if !tty.chars().any(|c| c.is_ascii_digit()) {
-        return None; // `??`, `?`, `-`: no controlling terminal at all.
+        return Ok(None); // `??`, `?`, `-`: no controlling terminal at all.
     }
     let mut p = pid;
     for _ in 0..64 {
         let (_, pp, _, _) = row(p)?;
         let (q, _, qtty, name) = row(*pp)?;
         if qtty != tty {
-            return Some((*q, name.as_str()));
+            return Ok(Some((*q, name.as_str())));
         }
         p = *q;
     }
-    None
+    Err(NotRead)
 }
 
-/// What a read of the process that opened a process's terminal found ([`Kernel::terminal_read`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TerminalRead {
-    /// The process table, or the process's own row in it, was not read (unreadable, held past
-    /// its wait by a process in the middle of an exec, or the process gone since it was named):
-    /// nothing is known of its terminal, and a caller never takes this for a terminal nobody
-    /// opened (LS-15).
-    Unread,
-    /// The process's row was read: the process that opened its terminal and that one's name, or
-    /// `None` where it has no controlling terminal or no opener was found above it.
-    Read(Option<(u32, String)>),
-}
-
-impl TerminalRead {
-    /// The opener read, an unread table giving none ([`Kernel::terminal`]'s answer).
-    fn opener(self) -> Option<(u32, String)> {
-        match self {
-            Self::Read(opener) => opener,
-            Self::Unread => None,
-        }
-    }
-}
-
-fn live_terminal_read(pid: u32) -> TerminalRead {
+/// Who holds `pid`'s controlling terminal ([`terminal_owner`]). On macOS a table the kernel
+/// did not answer within its bound ([`aterm_sysprobe::kproc::records`]: a process in the middle of
+/// an exec holds every read of it) is [`NotRead`], never a terminal aterm did not open.
+fn live_terminal(pid: u32) -> Fact<(u32, String)> {
     #[cfg(target_os = "macos")]
     {
-        let Some(rows) = aterm_sysprobe::kproc::records() else {
-            return TerminalRead::Unread;
-        };
-        if !rows.iter().any(|r| r.pid == pid) {
-            return TerminalRead::Unread;
-        }
-        let walk: Vec<(u32, u32, String, String)> = rows
-            .iter()
-            .map(|r| (r.pid, r.ppid, tty_word(r.tty), String::new()))
-            .collect();
-        TerminalRead::Read(terminal_owner(pid, &walk).and_then(|(owner, _)| {
-            let r = rows.iter().find(|r| r.pid == owner)?;
-            Some((owner, comm_name(r)))
-        }))
+        let rows = aterm_sysprobe::kproc::records().ok_or(NotRead)?;
+        terminal_of_records(pid, &rows, comm_fact)
     }
     // No process on Windows has a controlling terminal: a pseudoconsole is not an identity the
     // kernel records against the processes attached to it.
     #[cfg(windows)]
     {
-        // A missing or unreadable process is not an observed terminal owner.
+        // A missing or unreadable process is not an observed terminal owner: only a process whose
+        // creation time was read is known to hold no terminal.
         if kernel_start(pid).is_none() {
-            return TerminalRead::Unread;
+            return Err(NotRead);
         }
-        TerminalRead::Read(None)
+        Ok(None)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
+        // `tty_table` is empty where `ps` did not answer: every row is then missing, not read.
         let table = tty_table();
-        if !table.iter().any(|(listed, _, _, _)| *listed == pid) {
-            return TerminalRead::Unread;
-        }
-        TerminalRead::Read(
-            terminal_owner(pid, &table).map(|(owner, name)| (owner, name.to_string())),
-        )
+        Ok(terminal_owner(pid, &table)?.map(|(owner, name)| (owner, name.to_string())))
     }
 }
 
-fn opener(agent: u32, parent: u32) -> Option<String> {
+/// [`live_terminal`] over the records `rows`, the owner named by `name` ([`comm_fact`]): an owner
+/// whose name was not read is [`NotRead`], never a terminal another program opened (LS-15).
+#[cfg(target_os = "macos")]
+fn terminal_of_records(
+    pid: u32,
+    rows: &[aterm_sysprobe::kproc::Record],
+    name: impl Fn(&aterm_sysprobe::kproc::Record) -> Fact<String>,
+) -> Fact<(u32, String)> {
+    let walk: Vec<(u32, u32, String, String)> = rows
+        .iter()
+        .map(|r| (r.pid, r.ppid, tty_word(r.tty), String::new()))
+        .collect();
+    let Some((owner, _)) = terminal_owner(pid, &walk)? else {
+        return Ok(None);
+    };
+    let r = rows.iter().find(|r| r.pid == owner).ok_or(NotRead)?;
+    Ok(Some((owner, name(r)?.ok_or(NotRead)?)))
+}
+
+/// The name `ps -o comm=` gives `r` where it was read ([`aterm_sysprobe::kproc::comm_read`]):
+/// [`NotRead`] where its arguments were not, whose placeholder `(comm)` names no program, so
+/// never aterm's (LS-15).
+#[cfg(target_os = "macos")]
+fn comm_fact(r: &aterm_sysprobe::kproc::Record) -> Fact<String> {
+    aterm_sysprobe::kproc::comm_read(r, aterm_sysprobe::kproc::Locale::C)
+        .map(|comm| Some(base_name(&squash(&comm))))
+        .ok_or(NotRead)
+}
+
+/// The name of `parent` where it opened `agent`'s terminal (holds it from outside), `Ok(None)`
+/// where it did not or `agent` has no terminal, and [`NotRead`] where either record was not read.
+fn opener(agent: u32, parent: u32) -> Fact<String> {
     #[cfg(target_os = "macos")]
     {
-        let tty = aterm_sysprobe::kproc::record(agent)?.tty?;
-        let parent = aterm_sysprobe::kproc::record(parent)?;
-        (parent.tty != Some(tty)).then(|| comm_name(&parent))
+        let read = |pid| {
+            aterm_sysprobe::kproc::record_read(pid)
+                .ok()
+                .flatten()
+                .ok_or(NotRead)
+        };
+        let Some(tty) = read(agent)?.tty else {
+            return Ok(None);
+        };
+        let parent = read(parent)?;
+        if parent.tty == Some(tty) {
+            return Ok(None);
+        }
+        comm_fact(&parent)
     }
     #[cfg(windows)]
     {
         let _ = (agent, parent);
-        None
+        Ok(None)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -1424,13 +1514,14 @@ fn opener(agent: u32, parent: u32) -> Option<String> {
 }
 
 #[cfg(all(not(windows), any(not(target_os = "macos"), test)))]
-fn ps_opener(agent: u32, parent: u32) -> Option<String> {
+fn ps_opener(agent: u32, parent: u32) -> Fact<String> {
     // One pid per `ps`: asked for two or more at once, a `ps` whose own device read is
     // wedged never returns, while each pid asked alone answers — the oracle is the same
     // `ps`, read a pid at a time.
     let mut rows: Vec<(u32, String, String)> = Vec::new();
     for p in [agent, parent] {
-        let out = ps(&["-o", &format!("pid=,{PS_TTY}=,comm="), "-p", &p.to_string()])?;
+        let out =
+            ps(&["-o", &format!("pid=,{PS_TTY}=,comm="), "-p", &p.to_string()]).ok_or(NotRead)?;
         rows.extend(out.lines().filter_map(|l| {
             let mut it = l.split_whitespace();
             let pid = crate::parse_uint(it.next()?)?;
@@ -1438,14 +1529,18 @@ fn ps_opener(agent: u32, parent: u32) -> Option<String> {
             Some((pid, tty, base_name(&it.collect::<Vec<_>>().join(" "))))
         }));
     }
-    let row = |p: u32| rows.iter().find(|(q, _, _)| *q == p);
+    let row = |p: u32| rows.iter().find(|(q, _, _)| *q == p).ok_or(NotRead);
     let (_, tty, _) = row(agent)?;
     if !tty.chars().any(|c| c.is_ascii_digit()) {
-        return None; // `??`, `?`, `-`: no controlling terminal at all.
+        return Ok(None); // `??`, `?`, `-`: no controlling terminal at all.
     }
     let (_, parent_tty, name) = row(parent)?;
-    (parent_tty != tty).then(|| name.clone())
+    Ok((parent_tty != tty).then(|| name.clone()))
 }
+
+/// The refusal and wait code of a terminal whose owner was not read ([`Kernel::terminal`]'s
+/// [`NotRead`]): never `terminal`, which says it was read and is not aterm's (LS-15).
+pub(super) const TERMINAL_UNREAD: &str = "terminal-unread";
 
 pub(super) fn owned_by_aterm(owner: (u32, &str)) -> bool {
     owner.0 == 1 || owner.1 == "aterm" || owner.1.starts_with("aterm-")
@@ -1490,12 +1585,16 @@ fn job(agent: u32, agent_pgid: i64, tpgid: i64, parent_pgid: i64, aterm_opened: 
     }
 }
 
+/// `agent`'s job, `None` where a fact it rests on was not read: either process's ids, or, for a
+/// group leader, whether aterm opened its terminal ([`Kernel::opener`]). An opener not read is
+/// never "not aterm's": that would make a tab's own program a job no shell runs.
 fn job_of<K: Kernel + ?Sized>(k: &K, agent: u32) -> Option<(Job, u32)> {
     let (parent, pgid, tpgid) = k.ids(agent)?;
     let (_, parent_pgid, _) = k.ids(parent)?;
-    let opened = k
-        .opener(agent, parent)
-        .is_some_and(|name| owned_by_aterm((parent, name.as_str())));
+    let opened = pgid == i64::from(agent)
+        && k.opener(agent, parent)
+            .ok()?
+            .is_some_and(|name| owned_by_aterm((parent, name.as_str())));
     Some((job(agent, pgid, tpgid, parent_pgid, opened), parent))
 }
 
@@ -1532,17 +1631,15 @@ pub(super) trait Kernel {
         ids(pid)
     }
     fn parent(&self, pid: u32) -> Option<u32>;
-    fn terminal(&self, pid: u32) -> Option<(u32, String)>;
-    /// [`Self::terminal`] with a read that was not made told apart from a terminal nobody opened
-    /// ([`TerminalRead`]). An injected kernel's answer counts as read; the live kernel says where
-    /// the process table or the process's row was not read.
-    fn terminal_read(&self, pid: u32) -> TerminalRead {
-        TerminalRead::Read(self.terminal(pid))
-    }
-    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
-        self.terminal(agent)
+    /// Who holds `pid`'s controlling terminal from outside it: `Ok(None)` read and none,
+    /// [`NotRead`] where the table or a row it rests on was not read.
+    fn terminal(&self, pid: u32) -> Fact<(u32, String)>;
+    /// The name of `parent` where it opened `agent`'s terminal ([`Fact`], as [`Self::terminal`]).
+    fn opener(&self, agent: u32, parent: u32) -> Fact<String> {
+        Ok(self
+            .terminal(agent)?
             .filter(|(owner, _)| *owner == parent)
-            .map(|(_, name)| name)
+            .map(|(_, name)| name))
     }
     /// `pid`'s kernel start ([`kernel_start`]; `None`: gone or unread), which the last look before
     /// a signal holds to the start its session file names. Required, as
@@ -1558,6 +1655,9 @@ pub(super) trait Kernel {
     fn shell_dialect(&self, shell: u32, processes: &[ProcRow]) -> Option<super::upgrade::Dialect> {
         super::relaunch::shell_dialect(shell, processes)
     }
+    /// Settle the folder trust of the relaunch line `line` before it is built
+    /// ([`super::launch_trust::settle_relaunch`]). A kernel that reads no machine settles nothing.
+    fn settle_trust(&self, _opts: &Opts, _line: &super::launch_trust::Line<'_>) {}
     /// The work under `pid` a restart would end ([`live_background`]; [`UNREADABLE_TABLE`] where
     /// its processes were not read), which the last look before a signal requires to be none
     /// unless the owner pressed the restart.
@@ -1570,6 +1670,11 @@ pub(super) trait Kernel {
     fn restart_held(&self, pid: u32) -> Option<Vec<upgrade::Held>>;
     fn image(&self, pid: u32) -> Option<PathBuf> {
         exe_of(pid)
+    }
+    /// `pid`'s executable, argv and environment ([`args_of`]): `Ok(None)` withheld from this
+    /// process for good, [`NotRead`] where the read failed.
+    fn args_read(&self, pid: u32) -> Fact<atpkg::caller_shell::ProcArgs> {
+        args_of(pid)
     }
     fn shell_holds_tab(&self, shell: u32) -> Option<bool> {
         if shell == 0 {
@@ -1636,15 +1741,19 @@ impl Kernel for Live {
         parent_of(pid)
     }
 
-    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
-        live_terminal_read(pid).opener()
+    /// For the tab the drive names, on this machine ([`super::launch_trust::settle_relaunch_live`]):
+    /// a sweep that names no tab settles nothing.
+    fn settle_trust(&self, opts: &Opts, line: &super::launch_trust::Line<'_>) {
+        if let Some(tab) = opts.only_sid.as_deref() {
+            let _ = super::launch_trust::settle_relaunch_live(opts, tab, line);
+        }
     }
 
-    fn terminal_read(&self, pid: u32) -> TerminalRead {
-        live_terminal_read(pid)
+    fn terminal(&self, pid: u32) -> Fact<(u32, String)> {
+        live_terminal(pid)
     }
 
-    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
+    fn opener(&self, agent: u32, parent: u32) -> Fact<String> {
         opener(agent, parent)
     }
 
@@ -2279,6 +2388,45 @@ fn link_above(p: u32) -> Option<u32> {
 
 pub(super) fn cwd_of(pid: u32) -> Option<String> {
     aterm_sysprobe::process_cwd(pid).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// `pid`'s executable, argv and environment as a read came to them ([`Fact`]): `Ok(Some(_))`
+/// read; `Ok(None)` read and withheld, the kernel answering them to no process of this one's
+/// user for as long as `pid` runs (another user's process, this one not root), a lasting state
+/// every later read finds again; [`NotRead`] where the read failed and nothing says it will fail
+/// again (the process exiting or exec'ing, a busy kernel).
+pub(super) fn args_of(pid: u32) -> Fact<atpkg::caller_shell::ProcArgs> {
+    if let Some(args) = atpkg::caller_shell::process_args(pid) {
+        return Ok(Some(args));
+    }
+    match args_withheld(pid) {
+        Some(true) => Ok(None),
+        Some(false) | None => Err(NotRead),
+    }
+}
+
+/// Whether the kernel withholds `pid`'s arguments from this process for good (`None`: its owner
+/// not read): on macOS by `KERN_PROCARGS2`'s own rule ([`aterm_sysprobe::kproc::withholds_args`]);
+/// on Linux a process another effective user owns (its `/proc` directory's owner, which is root's
+/// for one not dumpable) is never this one's to trace, unless this one is root.
+fn args_withheld(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        aterm_sysprobe::kproc::record(pid).map(|r| aterm_sysprobe::kproc::withholds_args(&r))
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+        // SAFETY: `geteuid` reads this process's effective uid.
+        let me = unsafe { libc::geteuid() };
+        Some(owner != me && me != 0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 pub(super) fn exe_of(pid: u32) -> Option<PathBuf> {
@@ -2970,7 +3118,7 @@ pub(super) fn roster(c: &mut Client) -> Vec<String> {
     body.lines()
         .filter_map(|l| {
             l.split_whitespace()
-                .find(|t| aterm_types::control_verbs::is_minted_sid(t))
+                .find(|t| aterm_types::control_request::Sid::parse(t).is_some())
                 .map(str::to_owned)
         })
         .collect()
@@ -3002,7 +3150,7 @@ pub(super) fn aside_read(c: &mut Client, agents_off: &[aterm_phase::Program]) ->
         let mut words = row.split_whitespace();
         let Some(sid) = words
             .nth(1)
-            .filter(|s| aterm_types::control_verbs::is_minted_sid(s))
+            .filter(|s| aterm_types::control_request::Sid::parse(s).is_some())
         else {
             continue;
         };
@@ -3084,7 +3232,7 @@ pub(crate) fn roster_rows(body: &str) -> Option<Vec<(u64, LiveTab)>> {
         let mut words = row.split_whitespace();
         let local = crate::parse_uint::<u64>(words.next()?)?;
         let sid = words.next()?.to_string();
-        if !aterm_types::control_verbs::is_minted_sid(&sid)
+        if aterm_types::control_request::Sid::parse(&sid).is_none()
             || rows.iter().any(|(_, t)| t.sid == sid)
         {
             return None;
@@ -3146,6 +3294,11 @@ pub(super) struct Screen {
     /// The program's title read with `rows` (`"title"`); `None` where the host sent no such string.
     /// Claude Code's `◐`/`◑` there runs a turn its screen may not show ([`turn_shown`]).
     pub(super) title: Option<String>,
+    /// The program-status report standing with `rows` (`"program_report"`, the body that says it);
+    /// `None` while none stands or where the host sent no such string. Claude Code's `working`
+    /// there runs a turn its screen may not show, where its answered query left its title no
+    /// glyph ([`turn_shown`]).
+    pub(super) program_report: Option<String>,
     /// The person's input count the host took with `rows` (`"human_seq"`), which a turn fences on
     /// (`turn if-human=`): a key since that moves no fenced row stops it. `None` where the host sent
     /// none.
@@ -3210,6 +3363,10 @@ fn parse_screen(json: &str) -> Option<Screen> {
         generation,
         human,
         title: v.get("title").and_then(Value::as_str).map(str::to_owned),
+        program_report: v
+            .get("program_report")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         human_seq: v.get("human_seq").and_then(Value::as_u64),
     })
 }
@@ -6808,9 +6965,7 @@ pub(super) fn registry_life<'a>(
     known_live: &'a [String],
 ) -> impl Fn(&str) -> TabLife + 'a {
     fn entry(graph: &Path, sid: &str) -> Option<bool> {
-        if !aterm_types::control_verbs::is_minted_sid(sid) {
-            return None;
-        }
+        aterm_types::control_request::Sid::parse(sid)?;
         match std::fs::symlink_metadata(graph.join(sid)) {
             Ok(_) => Some(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
@@ -7882,12 +8037,37 @@ pub(super) fn session_file_of(home: &Path, pid: u32) -> Option<SessionFile> {
 }
 
 pub(super) fn session_file_in(claude_dir: &Path, pid: u32) -> Option<SessionFile> {
-    let t = read_record_text(&claude_dir.join(format!("sessions/{pid}.json"))).ok()??;
-    let file = upgrade::parse_session_file(&t).ok()?;
-    Some(SessionFile {
+    session_file_read_in(claude_dir, pid).ok().flatten()
+}
+
+/// `pid`'s session record under `claude_dir`: `Ok(None)` where there is none, or where what is
+/// there is lastingly no record (an open refused for a permission or a path component that is no
+/// directory, a non-file, one past its bound, JSON that is not a record, or text that is not whole
+/// and has stood past [`WRITE_SETTLE`]); [`NotRead`] only where the read was not made
+/// ([`read_not_made`]) or the text is not whole within [`WRITE_SETTLE`] of its last write (a
+/// write in progress, [`unfinished`]). A state that every later read finds again is never
+/// [`NotRead`], which no read could then clear (LS-72).
+pub(super) fn session_file_read_in(claude_dir: &Path, pid: u32) -> Fact<SessionFile> {
+    let path = claude_dir.join(format!("sessions/{pid}.json"));
+    let t = match read_record_text(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return unfinished(&path),
+        Err(e) if read_not_made(&e) => return Err(NotRead),
+        Err(_) => return Ok(None),
+    };
+    let Ok(file) = upgrade::parse_session_file(&t) else {
+        // Whole JSON that is no record is that file's content, as a record of another schema is.
+        return if aterm_json::from_str::<Value>(&t).is_ok() {
+            Ok(None)
+        } else {
+            unfinished(&path)
+        };
+    };
+    Ok(Some(SessionFile {
         claude_dir: Some(claude_dir.to_path_buf()),
         ..file
-    })
+    }))
 }
 
 pub(super) fn transcript_exists(home: &Path, session: &str) -> Option<bool> {
@@ -8019,10 +8199,17 @@ impl Records {
         let start = std::cell::OnceCell::new();
         for base in [now.clone(), started].into_iter().flatten() {
             let records = Self::at(user_home, vars, || Some(base));
-            let its_own = records.session_file(pid).is_some_and(|sf| {
-                start.get_or_init(|| kernel_start(pid)).as_deref()
-                    == Some(squash(&sf.proc_start).as_str())
-            });
+            let its_own = match records.session_file_read(pid) {
+                Ok(sf) => sf.is_some_and(|sf| {
+                    start.get_or_init(|| kernel_start(pid)).as_deref()
+                        == Some(squash(&sf.proc_start).as_str())
+                }),
+                // A record there and not read (a write in progress) may be its own: its folder
+                // is kept, so the read that follows is of that record and says it was not read.
+                // Passed over as none, the folder with no record would answer that nothing
+                // registers the process.
+                Err(NotRead) => records.dir().is_some(),
+            };
             if its_own {
                 return records;
             }
@@ -8106,6 +8293,13 @@ impl Records {
 
     pub(super) fn session_file(&self, pid: u32) -> Option<SessionFile> {
         session_file_in(self.dir.as_deref()?, pid).map(|sf| self.stamped(sf))
+    }
+
+    /// [`Self::session_file`] with a record not read kept apart from none ([`Fact`]); records
+    /// whose folder was not resolved are [`NotRead`].
+    pub(super) fn session_file_read(&self, pid: u32) -> Fact<SessionFile> {
+        let dir = self.dir.as_deref().ok_or(NotRead)?;
+        Ok(session_file_read_in(dir, pid)?.map(|sf| self.stamped(sf)))
     }
 
     pub(super) fn session_files(&self) -> Option<Vec<SessionFile>> {
@@ -8310,7 +8504,7 @@ pub(super) fn ledger_tabs(body: &str, session: &str, tab: &str) -> Vec<(String, 
         .collect();
     let mut last: Vec<(String, usize)> = Vec::new();
     for (i, (_, t, s)) in rows.iter().enumerate() {
-        if s == session && t != tab && aterm_types::control_verbs::is_minted_sid(t) {
+        if s == session && t != tab && aterm_types::control_request::Sid::parse(t).is_some() {
             last.retain(|(x, _)| x != t);
             last.push((t.clone(), i));
         }
@@ -8498,7 +8692,7 @@ fn noted_earlier_tabs_read(
     read(&earlier_tabs_path(root, tab))
         .map(|body| {
             body.lines()
-                .filter(|t| aterm_types::control_verbs::is_minted_sid(t) && *t != tab)
+                .filter(|t| aterm_types::control_request::Sid::parse(t).is_some() && *t != tab)
                 .map(str::to_string)
                 .collect()
         })
@@ -8513,8 +8707,8 @@ pub fn note_earlier_tab(opts: &Opts, tab: &str, was: &str) {
 }
 
 pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
-    if !aterm_types::control_verbs::is_minted_sid(tab)
-        || !aterm_types::control_verbs::is_minted_sid(was)
+    if aterm_types::control_request::Sid::parse(tab).is_none()
+        || aterm_types::control_request::Sid::parse(was).is_none()
         || was == tab
     {
         return;
@@ -8526,8 +8720,8 @@ pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
 }
 
 fn earlier_tab_note(tab: &str, was: &str, mut noted: Vec<String>) -> Option<String> {
-    if !aterm_types::control_verbs::is_minted_sid(tab)
-        || !aterm_types::control_verbs::is_minted_sid(was)
+    if aterm_types::control_request::Sid::parse(tab).is_none()
+        || aterm_types::control_request::Sid::parse(was).is_none()
         || was == tab
         || noted.iter().any(|t| t == was)
     {
@@ -8545,7 +8739,7 @@ pub(super) fn earlier_tabs<'a>(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in tabs {
-        if !aterm_types::control_verbs::is_minted_sid(t) || t == current {
+        if aterm_types::control_request::Sid::parse(t).is_none() || t == current {
             continue;
         }
         out.retain(|o| o != t);
@@ -11506,7 +11700,12 @@ fn visit_build(
             save(opts, &sf.session_id, &st);
             return said(r, format!("wait:{why}"));
         }
-        let owner = k.terminal(sf.pid);
+        // A terminal not read is waited on, never held back as another program's pane.
+        let Ok(owner) = k.terminal(sf.pid) else {
+            st.note_wait(TERMINAL_UNREAD, now);
+            save(opts, &sf.session_id, &st);
+            return said(r, format!("wait:{TERMINAL_UNREAD}"));
+        };
         let owner = owner.as_ref().map(|(pid, name)| (*pid, name.as_str()));
         if !owner.is_some_and(owned_by_aterm) {
             let why = format!("terminal:{}", owner_word(owner));
@@ -12060,6 +12259,7 @@ pub(super) fn ladder_look(
         scr.cursor.map(|(row, _)| row),
         scr.cursor.map(|(_, col)| col),
         scr.title.as_deref(),
+        scr.program_report.as_deref(),
     );
     let idle_read = reading.phase == alab_policy::vocab::Phase::Idle
         && reading.phase_authoritative
@@ -12095,20 +12295,26 @@ pub(super) struct LadderLook {
     pub(super) still_s: u64,
 }
 
-/// Whether `scr` shows a Claude Code turn running ([`turn_runs`] over its rows and title).
+/// Whether `scr` shows a Claude Code turn running ([`turn_runs`] over its rows, title and report).
 pub(super) fn turn_shown(scr: &Screen) -> bool {
-    turn_runs(&scr.rows, scr.title.as_deref())
+    turn_runs(
+        &scr.rows,
+        scr.title.as_deref(),
+        scr.program_report.as_deref(),
+    )
 }
 
-/// Whether Claude Code's screen `rows` under window title `title` show a turn running: its busy
-/// footer ([`busy_footer`]), or its title running one the screen does not show
-/// (`aterm_phase::phase::title_live`: a reply drawn under a status line, which hides the footer).
-/// A done row, a wall, a box or delegated work leave it to the footer, so a finished turn never
-/// reads as running for the title.
+/// Whether Claude Code's screen `rows`, under window title `title` and with program-status report
+/// `report` standing, show a turn running: its busy footer ([`busy_footer`]), or its run sign
+/// (`aterm_phase::ScreenReader::runs`: the report where it says, else the title) running one the
+/// screen does not show (`aterm_phase::phase::title_live`: a reply drawn under a status line,
+/// which hides the footer). A done row, a wall, a box or delegated work leave it to the footer,
+/// so a finished turn never reads as running for the run sign.
 #[must_use]
-pub fn turn_runs(rows: &[String], title: Option<&str>) -> bool {
+pub fn turn_runs(rows: &[String], title: Option<&str>, report: Option<&str>) -> bool {
     use aterm_phase::ScreenReader as _;
-    busy_footer(rows) || aterm_phase::phase::title_live(rows, aterm_phase::ClaudeReader.runs(title))
+    busy_footer(rows)
+        || aterm_phase::phase::title_live(rows, aterm_phase::ClaudeReader.runs(title, report))
 }
 
 /// Whether Claude Code's footer shows its turn running: the interrupt hint on its status line,
@@ -12474,7 +12680,9 @@ fn release(
     if let Err(why) = leads_terminal(k.job(sf.pid)) {
         return owed(r, why);
     }
-    let owner = k.terminal(sf.pid);
+    let Ok(owner) = k.terminal(sf.pid) else {
+        return owed(r, TERMINAL_UNREAD);
+    };
     if !owner
         .as_ref()
         .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
@@ -12583,6 +12791,8 @@ fn tell(
     if leads_terminal(k.job(sf.pid)).is_err()
         || !k
             .terminal(sf.pid)
+            .ok()
+            .flatten()
             .as_ref()
             .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
         || require_unique_owner(&opts.home, sf).is_err()
@@ -13503,6 +13713,7 @@ fn reads_idle(read: &Screen) -> bool {
         read.cursor.map(|(row, _)| row),
         read.cursor.map(|(_, col)| col),
         read.title.as_deref(),
+        read.program_report.as_deref(),
     );
     reading.phase == alab_policy::vocab::Phase::Idle
         && reading.phase_authoritative
@@ -13972,7 +14183,8 @@ fn restart(
                 && ours(st, a)
                 && k.process_start(sf.pid).as_deref() == Some(squash(&a.proc_start).as_str())
         });
-        let owner = k.terminal(sf.pid);
+        // Not read and not aterm's both stop the signal: neither is a terminal it may type into.
+        let owner = k.terminal(sf.pid).ok().flatten();
         let owner = owner.as_ref().map(|(pid, name)| (*pid, name.as_str()));
         if !owns_notice
             || require_unique_owner(&opts.home, sf).is_err()

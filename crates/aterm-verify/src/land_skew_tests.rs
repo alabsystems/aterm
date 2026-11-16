@@ -295,6 +295,7 @@ impl Landing<'_> {
         let own = Own {
             words: &land_words,
             image: &own_image.digest,
+            at: None,
         };
         match entry {
             Entry::Start(_) => land(&self.world.work, &own, &mut seams),
@@ -1054,9 +1055,9 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
             cause: None,
         }),
     };
-    let passed = aterm_types::land_trailer::Checked {
+    let passed = aterm_land_trailer::Checked {
         tree: git(&world.work, &["rev-parse", "HEAD^{tree}"]),
-        rows: vec![aterm_types::land_trailer::Row {
+        rows: vec![aterm_land_trailer::Row {
             check: "test".into(),
             word: "ok".into(),
         }],

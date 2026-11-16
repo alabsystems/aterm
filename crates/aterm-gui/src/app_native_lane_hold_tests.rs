@@ -19,7 +19,7 @@ fn app_nobody_at_the_mac() -> App {
         .get_mut(&WindowId(0))
         .expect("the test App has window 0")
         .os_window_for_test = true;
-    for window in app.windows.values_mut() {
+    for mut window in app.windows.values_mut() {
         window.focused = false;
     }
     app

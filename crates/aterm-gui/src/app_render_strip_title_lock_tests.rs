@@ -144,7 +144,7 @@ fn tab_titles_keep_stale_on_contention_and_never_block() {
             vec!["hello".to_string()],
             "warm cache keeps the last-read title under contention"
         );
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.tab_title_cache.clear();
         }
         assert_eq!(

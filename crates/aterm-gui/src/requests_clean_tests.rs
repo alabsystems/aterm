@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
-const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+const BY: &str = "fleet:87be5228:tqn5r6e0148";
 const TAB: &str = "s-aaaaaaaaaaaaaaaaaaaa";
 /// A hang detector for the requests' writer thread.
 const MUST: Duration = Duration::from_secs(60);
@@ -26,8 +26,10 @@ struct Here {
 impl Here {
     fn new() -> Self {
         let root = aterm_tempfile::tempdir().expect("a folder");
-        // A claim records a folder's path with no link on the way (`/var` is one on macOS).
-        let real = std::fs::canonicalize(root.path()).expect("its real path");
+        // A claim records a folder's path with no link on the way (`/var` is one on macOS), each
+        // followed by hand (`requests_footprint::walk`): `canonicalize` would spell a Windows
+        // path verbatim (`\\?\`), which no claim or tab's folder is.
+        let real = crate::requests_footprint::walk(None, root.path()).expect("its real path");
         let (dir, home, work) = (real.join("requests"), real.join("home"), real.join("work"));
         for folder in [&dir, &home, &work] {
             std::fs::create_dir_all(folder).expect("a folder");
@@ -510,7 +512,7 @@ fn clean_deletes_born_alone_measured_claims_and_keeps_unpushed_touched_in_use_re
             &[Touch {
                 id: id.clone(),
                 path: touched.clone(),
-                tab: "s-bbbbbbbbbbbbbbbbbbbb".to_owned(),
+                tab: "tbbbbbbbbbb".to_owned(),
                 blk: 1,
                 why: TouchWhy::PersonTab,
             }],
@@ -790,7 +792,14 @@ fn close_request_tabs_closes_the_asked_and_reports_remaining_cwds() {
     let wid = crate::WindowId(0);
     app.push_stub_tab(wid, crate::stub_session(1));
     app.push_stub_tab(wid, crate::stub_session(2));
-    crate::feed_session_for_test(&app, 2, b"\x1b]7;file:///Users//a/work/stays\x07");
+    // A folder this host spells absolute (Windows' names a drive), as the tab reports it and as a
+    // claim records it.
+    let (reported, stays) = if cfg!(windows) {
+        ("file:///C:/Users//a/work/stays", r"C:\Users\a\work\stays")
+    } else {
+        ("file:///Users//a/work/stays", "/Users//a/work/stays")
+    };
+    crate::feed_session_for_test(&app, 2, format!("\x1b]7;{reported}\x07").as_bytes());
     let sid = |app: &crate::App, session: u64| {
         app.store
             .read()
@@ -808,7 +817,7 @@ fn close_request_tabs_closes_the_asked_and_reports_remaining_cwds() {
         "{closed:?}"
     );
     assert!(
-        closed.cwds.iter().any(|cwd| cwd == "/Users//a/work/stays"),
+        closed.cwds.iter().any(|cwd| cwd == stays),
         "{:?}",
         closed.cwds
     );

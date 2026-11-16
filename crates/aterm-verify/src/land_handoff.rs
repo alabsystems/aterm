@@ -32,7 +32,7 @@
 use crate::exit;
 use aterm_json::{Map, Value};
 use aterm_land::Step;
-use aterm_types::land_trailer::{self, Stated};
+use aterm_land_trailer::{self as land_trailer, Stated};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

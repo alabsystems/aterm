@@ -196,7 +196,7 @@ pub(super) fn child_pids(pid: u32) -> Option<Vec<u32>> {
 }
 
 /// `pid`'s thread handles, at most `room` of them (`PROC_PIDLISTTHREADS`); `None` when refused.
-fn thread_handles(pid: c_int, room: usize) -> Option<Vec<u64>> {
+pub(super) fn thread_handles(pid: c_int, room: usize) -> Option<Vec<u64>> {
     let mut handles = vec![0u64; room];
     let bytes = c_int::try_from(handles.len() * 8).ok()?;
     // SAFETY: `handles` is `bytes` writable bytes; the call returns how many bytes it wrote.
@@ -250,6 +250,20 @@ fn threads(pid: c_int, listed: &[u64]) -> (Vec<ThreadReading>, bool) {
     (out, truncated)
 }
 
+/// The census's read of `pid`'s `listed` threads (of up to `MAX_THREADS + 1`): those read, how
+/// many wait uninterruptibly, and whether the list was cut.
+pub(super) fn census_of(pid: c_int, listed: &[u64]) -> crate::dstate::Read {
+    let (ts, cut) = threads(pid, listed);
+    let count = |f: fn(&ThreadReading) -> bool| {
+        u32::try_from(ts.iter().filter(|t| f(t)).count()).unwrap_or(u32::MAX)
+    };
+    crate::dstate::Read::Threads {
+        threads: count(|_| true),
+        uninterruptible: count(|t| t.state == RunState::Uninterruptible),
+        cut,
+    }
+}
+
 /// [`super::census_read`] on macOS: the thread list and each thread's state by the readers a
 /// member's facts use ([`thread_handles`], [`threads`]). An empty or refused list is a zombie
 /// (which has no threads), a process the kernel refuses, or one gone, told apart by `kill(0)`.
@@ -259,16 +273,7 @@ pub(super) fn census_read(pid: u32) -> crate::dstate::Read {
         return Read::Gone;
     };
     match thread_handles(p, MAX_THREADS + 1) {
-        Some(list) if !list.is_empty() => {
-            let (ts, _cut) = threads(p, &list);
-            let count = |f: fn(&ThreadReading) -> bool| {
-                u32::try_from(ts.iter().filter(|t| f(t)).count()).unwrap_or(u32::MAX)
-            };
-            Read::Threads {
-                threads: count(|_| true),
-                uninterruptible: count(|t| t.state == RunState::Uninterruptible),
-            }
-        }
+        Some(list) if !list.is_empty() => census_of(p, &list),
         _ => {
             // SAFETY: signal 0 sends nothing; it asks whether `p` exists. `errno` is this
             // thread's, read straight after.

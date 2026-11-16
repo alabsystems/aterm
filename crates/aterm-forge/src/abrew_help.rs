@@ -6,8 +6,8 @@
 mod legacy;
 
 use crate::Outcome;
-use aterm_census::seal;
 use aterm_json::{Value, json};
+use aterm_seal as seal;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

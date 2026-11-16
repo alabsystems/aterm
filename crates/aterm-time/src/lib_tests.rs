@@ -23,7 +23,8 @@ fn the_epoch_accessors_read_the_wall_clock() {
     assert_eq!(super::unix_secs_at(UNIX_EPOCH), Some(0));
     assert_eq!(super::unix_millis_at(UNIX_EPOCH), Some(0));
 
-    let sample = Duration::new(1_790_000_000, 123_456_789);
+    // Whole 100 ns ticks: Windows' SystemTime counts no finer, and drops the rest of an add.
+    let sample = Duration::new(1_790_000_000, 123_456_700);
     let at_sample = UNIX_EPOCH.checked_add(sample).expect("post-epoch sample");
     assert_eq!(super::since_epoch_at(at_sample), Some(sample));
     assert_eq!(super::unix_secs_at(at_sample), Some(1_790_000_000));

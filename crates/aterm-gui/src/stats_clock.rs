@@ -463,9 +463,10 @@ impl App {
                 continue;
             };
             let period = self.deck_clock_period(ws);
-            let Some(ws) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                 continue;
             };
+            let ws = &mut **route_guard_ws;
             let window = ws.os_window.as_deref();
             let clock = &mut ws.deck_clock;
             match (due, clock.since) {
@@ -578,7 +579,8 @@ impl App {
         period: Duration,
         now: Instant,
     ) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let _ = ws.deck_clock.link_ticked(now);
         }
         self.deck_clock_tick(wid, target, period, now);
@@ -604,9 +606,10 @@ impl App {
                 .and_then(|ws| ws.deck_needle_drawn.get());
             crate::stats_live::shows(facts.needle_at(target)) != crate::stats_live::shows(drawn)
         });
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let clock = &mut ws.deck_clock;
         clock.last = Some((target, period));
         clock.heard = Some(now);
@@ -627,6 +630,7 @@ impl App {
             return;
         }
         if matches!(ws.present, Some(crate::PresentTarget::Virtual { .. })) {
+            drop(route_guard_ws);
             self.redraw_window(wid);
         } else {
             ws.request_redraw();
@@ -710,9 +714,10 @@ impl App {
                 gpu.tray_compare_bytes(),
             );
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let ticked = ws.deck_clock.asked;
         ws.deck_clock.served();
         if ws.deck_card.is_some() && ws.deck_motion.take_unbooked() {

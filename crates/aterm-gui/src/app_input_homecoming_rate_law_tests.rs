@@ -23,10 +23,10 @@ fn exit_to_prompt(app: &mut App) {
 
 /// Tick the pet brain until its fade envelope is on glass (`alpha > 0`).
 fn tick_pet_on_glass(app: &mut App, wid: WindowId, t: Instant) {
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     for step in 0..100u64 {
         let frame = crate::app_render::pet_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::Present,
             aterm_effects::kitty_pet::PetSense {
                 caret_drawn: true,
@@ -58,14 +58,14 @@ fn at_prompt(app: &mut App) {
 
 /// Emit the resident pet with `present = true` and return its worn pair.
 fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -> (u8, u8) {
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     let capture = if ws.fx.companion_mut().alpha() > 0 {
         aterm_effects::host::CaptureMode::Present
     } else {
         aterm_effects::host::CaptureMode::StaticCapture
     };
     let pet = crate::app_render::pet_owner_tick_for_test(
-        ws,
+        &mut ws,
         capture,
         aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
@@ -83,7 +83,7 @@ fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -
     );
     assert!(pet.on_glass, "fixture: the performance is a drawn frame");
     let _ = crate::app_render::emit_resident_pet(
-        ws,
+        &mut ws,
         &pet,
         look.normalized(),
         crate::app_render::CompanionInk::Single,

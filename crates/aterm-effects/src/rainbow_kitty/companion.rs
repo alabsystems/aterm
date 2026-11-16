@@ -252,6 +252,37 @@ pub struct SeatQuery {
     pub lead_px: i32,
     /// The head sat in the sky seat (step 3, clear) on this caret row last frame.
     pub held_sky: bool,
+    /// The cells the body moves at a time ([`stride_ahead`], [`stride_behind`]): 1 for the head,
+    /// the glide's stride for the glide, whose rest `rest` is already read off it.
+    pub stride: u16,
+}
+
+/// The column a body that moves `stride` cells at a time stands ahead of for the caret at
+/// `col`: `col` rounded up to the stride, so the body is never nearer the caret than at the
+/// caret's own column and steps `stride` cells every `stride` keys (the glide's
+/// `GLIDE_STRIDE`); the caret's own column for a stride of 1.
+#[must_use]
+#[inline]
+pub const fn stride_ahead(col: u16, stride: u16) -> u16 {
+    if stride <= 1 {
+        return col;
+    }
+    let rem = col % stride;
+    if rem == 0 {
+        col
+    } else {
+        col.saturating_add(stride - rem)
+    }
+}
+
+/// [`stride_ahead`]'s twin for a seat behind the caret: `col` rounded down to the stride.
+#[must_use]
+#[inline]
+pub const fn stride_behind(col: u16, stride: u16) -> u16 {
+    if stride <= 1 {
+        return col;
+    }
+    col - col % stride
 }
 
 /// THE HEAD FITS ITS ROW WHERE NO SEAT HOLDS IT WHOLE. The head is taller than its row, so with
@@ -325,22 +356,56 @@ impl HeadFit {
     }
 }
 
+/// Where [`head_fit_seat`] stands a head fitted to its row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeadFitSeat {
+    /// At this share of its whole size, in this box `(x, y, w, h)`, px.
+    Fit(f32, (i32, i32, i32, i32)),
+    /// Nowhere: a body that rises (the glide) found no room past the caret on its row with a
+    /// stride to spare and no blank row within [`FIT_ABOVE_REACH`] above or below it, so it
+    /// leaves the wall ([`crate::word_decorations::WordDecorations::veil_kitty_cursor`]), never
+    /// shrunk onto the caret or the letters behind it.
+    Leave,
+}
+
+impl HeadFitSeat {
+    /// The share and the box, where it is fitted.
+    #[must_use]
+    #[inline]
+    pub const fn fit(self) -> Option<(f32, (i32, i32, i32, i32))> {
+        match self {
+            Self::Fit(goal, rect) => Some((goal, rect)),
+            Self::Leave => None,
+        }
+    }
+}
+
 /// The size [`HeadFit`] takes the head to for the caret at `caret` and a whole head `rest`, and the
 /// box `(x, y, w, h)` it stands in at that size: on the caret's row, its middle on the row's, as
-/// near the caret as the head's ring of air allows and no further than the grid's end, which at
-/// the last columns lays it across the caret and the letter behind it: fewer letters than the whole
-/// head lies on there, over two rows. No smaller than `floor` of `rest`
-/// ([`HEAD_FIT_FLOOR`] for the head; `WordDecorations::kitty_cursor_fit_floor`). `None` where the
-/// cells ahead of the caret hold letters (a line edited in the middle), which fitting would not
-/// clear.
+/// near the caret as the head's ring of air allows and no further than the grid's end. No smaller
+/// than [`HEAD_FIT_FLOOR`] of `rest`, the head's and the glide's alike: the glide, wider for its
+/// height, was fitted down to the head's floor width, a quarter of itself, to keep off the caret
+/// by the wall, a smaller pet bought for the caret's law. The box and its room are read off the
+/// caret's column rounded up to the body's `stride` ([`stride_ahead`]), as its whole rest is, so
+/// the glide fitted to its row steps once every stride, never a cell a key. `None` where the cells
+/// ahead of the caret hold letters (a line edited in the middle), which fitting would not clear.
+///
+/// The head shrinks with the room left by the wall, to its floor. A body that `rises` (the glide)
+/// does not: at its row's size, where the grid's end leaves it no room past the caret's ring with
+/// a stride to spare (the caret's next keys, while it moves), it stands on the nearest row above,
+/// no more than [`FIT_ABOVE_REACH`] up, whose cells under it are blank, at the grid's end, or
+/// failing that the nearest such row below (the fold's next row); where neither is, it leaves
+/// the wall ([`HeadFitSeat::Leave`]): shrunk with the room as the head is, it lay on the caret's
+/// cell and the letters behind it once the room ran out (`full-above-wall`, a screen of output
+/// with the prompt on its last row: 41 frames at a 26 px row, 38 at 0a12236dc7b).
 #[must_use]
 pub fn head_fit_seat<F>(
     caret: (u16, u16),
     rest: CatFootprint,
-    (cw, ch, cols): (i32, i32, u16),
-    (gap, floor): (i32, f32),
+    (cw, ch, rows, cols): (i32, i32, u16, u16),
+    (gap, stride, rises): (i32, u16, bool),
     ink: &F,
-) -> Option<(f32, (i32, i32, i32, i32))>
+) -> Option<HeadFitSeat>
 where
     F: Fn(u16, u16) -> Option<bool>,
 {
@@ -352,20 +417,95 @@ where
         return None;
     }
     let grid_w = i32::from(cols).saturating_mul(cw);
-    let caret_right = (i32::from(caret.1) + 1).saturating_mul(cw);
+    let anchor_right = (i32::from(stride_ahead(caret.1, stride)) + 1).saturating_mul(cw);
     let (rest_w, rest_h) = (f32::from(rest.w), f32::from(rest.h));
     let by_row = HEAD_ROW_SHARE * ch as f32 / rest_h;
-    let by_room = (grid_w - caret_right - gap) as f32 / rest_w;
-    let goal = by_row.min(by_room).clamp(floor.min(1.0), 1.0);
-    let (w, h) = (
-        (rest_w * goal).round() as i32,
-        (rest_h * goal).round() as i32,
-    );
-    let x = (caret_right + gap).min(grid_w - w).max(0);
-    let y = i32::from(caret.0) * ch + (ch - h) / 2;
-    let (_, last) = cell_span(x, w, cw, cols);
-    let lettered = (caret.1.saturating_add(1)..=last).any(|c| ink(caret.0, c) == Some(true));
-    (!lettered).then_some((goal, (x, y, w, h)))
+    let by_room = (grid_w - anchor_right - gap) as f32 / rest_w;
+    let lettered = |rect: (i32, i32, i32, i32)| {
+        let (_, last) = cell_span(rect.0, rect.2, cw, cols);
+        (caret.1.saturating_add(1)..=last).any(|c| ink(caret.0, c) == Some(true))
+    };
+    let shrunk = || {
+        let goal = by_row.min(by_room).clamp(HEAD_FIT_FLOOR, 1.0);
+        let rect = fitted_head(caret, rest, goal, (cw, ch, cols), (gap, stride), 0).rect;
+        (!lettered(rect)).then_some(HeadFitSeat::Fit(goal, rect))
+    };
+    #[cfg(any(test, debug_assertions))]
+    let rises = rises && !FIT_RISES_OFF.with(std::cell::Cell::get);
+    if !rises {
+        return shrunk();
+    }
+    let goal = by_row.clamp(HEAD_FIT_FLOOR, 1.0);
+    let rect = fitted_head(caret, rest, goal, (cw, ch, cols), (gap, stride), 0).rect;
+    if lettered(rect) {
+        return None;
+    }
+    #[cfg(any(test, debug_assertions))]
+    let below_off = FIT_BELOW_OFF.with(std::cell::Cell::get);
+    #[cfg(not(any(test, debug_assertions)))]
+    let below_off = false;
+    // The seat for the caret at column `col` of its row: on that row with a stride to spare,
+    // else on a blank row above or below by the wall, else none.
+    let seat_at = |col: u16| -> Option<HeadFitSeat> {
+        let at = (caret.0, col);
+        let anchor_right = (i32::from(stride_ahead(col, stride)) + 1).saturating_mul(cw);
+        let rect = fitted_head(at, rest, goal, (cw, ch, cols), (gap, stride), 0).rect;
+        if grid_w - anchor_right - gap >= rect.2 + i32::from(stride) * cw {
+            return Some(HeadFitSeat::Fit(goal, rect));
+        }
+        let on_row = |row: u16| {
+            let fitted = fitted_head((row, col), rest, goal, (cw, ch, cols), (gap, stride), 0);
+            box_clear(fitted.rect, at, (cw, ch, rows, cols), 0, ink)
+                .then_some(HeadFitSeat::Fit(goal, fitted.rect))
+        };
+        let above = (1..=FIT_ABOVE_REACH.min(caret.0)).find_map(|up| on_row(caret.0 - up));
+        let below = || {
+            (1..=FIT_ABOVE_REACH)
+                .map(|down| caret.0.saturating_add(down))
+                .filter(|&row| !below_off && row < rows)
+                .find_map(on_row)
+        };
+        above.or_else(below)
+    };
+    #[cfg(any(test, debug_assertions))]
+    let stays = WALL_LEAVE_OFF.with(std::cell::Cell::get);
+    #[cfg(not(any(test, debug_assertions)))]
+    let stays = false;
+    match seat_at(caret.1) {
+        // It leaves a stride before the caret's row runs out of room with nowhere to go, where
+        // it was drawn: the fade's way out takes less than the caret's next two keys, so the
+        // caret never reaches it there.
+        Some(seat @ HeadFitSeat::Fit(_, rect))
+            if stays
+                || fit_row(rect, ch) != caret.0
+                || seat_at(caret.1.saturating_add(stride)).is_some() =>
+        {
+            Some(seat)
+        }
+        Some(_) | None if stays => shrunk(),
+        _ => Some(HeadFitSeat::Leave),
+    }
+}
+
+/// The rows above the caret's a head fitted by the wall looks to for a blank row to stand on
+/// ([`head_fit_seat`]): no further than the sky seat's row and the one over it.
+pub const FIT_ABOVE_REACH: u16 = 2;
+
+/// The row a box `rect` from [`head_fit_seat`] stands on, at a `ch` px row.
+#[must_use]
+#[inline]
+pub const fn fit_row((_, y, _, h): (i32, i32, i32, i32), ch: i32) -> u16 {
+    if ch <= 0 {
+        return 0;
+    }
+    let row = (y + h / 2) / ch;
+    if row < 0 {
+        0
+    } else if row > u16::MAX as i32 {
+        u16::MAX
+    } else {
+        row as u16
+    }
 }
 
 /// Where a head fitted to its row stands at `fit` of its whole `rest`, and how a frame is laid
@@ -374,7 +514,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FittedHead {
     /// The box `(x, y, w, h)`, px: on the caret's row, its middle on the row's, `gap` px past the
-    /// caret and no further than the grid's end.
+    /// caret's column rounded up to the body's stride and no further than the grid's end.
     pub rect: (i32, i32, i32, i32),
     /// The layout's lift, cells: it takes the whole head's rise off its row (and the frame's
     /// hover, which a fitted head drops: a box with a pixel to spare in its row would bob out of
@@ -384,14 +524,15 @@ pub struct FittedHead {
     pub lead_px: i32,
 }
 
-/// [`FittedHead`] for the caret at `caret`, a whole head `rest` and the frame's hover `bob_px`.
+/// [`FittedHead`] for the caret at `caret`, a whole head `rest` and the frame's hover `bob_px`,
+/// `gap` px past the caret's column rounded up to the body's `stride` ([`stride_ahead`]).
 #[must_use]
 pub fn fitted_head(
     caret: (u16, u16),
     rest: CatFootprint,
     fit: f32,
     (cw, ch, cols): (i32, i32, u16),
-    gap: i32,
+    (gap, stride): (i32, u16),
     bob_px: i32,
 ) -> FittedHead {
     let (w, h) = (
@@ -399,8 +540,8 @@ pub fn fitted_head(
         (f32::from(rest.h) * fit).round() as i32,
     );
     let grid_w = i32::from(cols).saturating_mul(cw);
-    let caret_right = (i32::from(caret.1) + 1).saturating_mul(cw);
-    let x = (caret_right + gap).min(grid_w - w).max(0);
+    let anchor_right = (i32::from(stride_ahead(caret.1, stride)) + 1).saturating_mul(cw);
+    let x = (anchor_right + gap).min(grid_w - w).max(0);
     let y = i32::from(caret.0) * ch + (ch - h) / 2;
     let row_top = i32::from(caret.0) * ch + ch / 2 - i32::from(rest.h) / 2;
     FittedHead {
@@ -414,6 +555,26 @@ pub fn fitted_head(
 thread_local! {
     /// Tests' negative control over [`head_fit_seat`]: on, the head is never fitted to its row.
     static HEAD_FIT_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a fitted glide's rise ([`head_fit_seat`]): it stays on the caret's
+    /// row by the wall and shrinks with the room, as the head does.
+    pub static FIT_RISES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a head fitted on the frame it comes on glass
+    /// (`EffectsPipeline::route_flying_head`): it is drawn whole there and fitted from the next,
+    /// as at 0a12236dc7b.
+    pub static FIT_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the glide's rise with its last stride step into the wall
+    /// (`EffectsPipeline::route_flying_head`): its seat ahead stays on the caret's row there.
+    pub static WALL_RISE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the glide held up by the wall
+    /// (`EffectsPipeline::route_flying_head`): lifted over the rows above, it comes down to its
+    /// row's seat where their letters end, though its seat a stride on lifts it again.
+    pub static WALL_HOLD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a fitted glide's seat on a blank row below the caret's by the
+    /// wall ([`head_fit_seat`]): it looks only above.
+    pub static FIT_BELOW_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a glide leaving a wall with no seat for it ([`head_fit_seat`]):
+    /// it shrinks with the room on the caret's row there, as the head does, as before.
+    pub static WALL_LEAVE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Tests' negative control over [`head_fit_seat`] on this thread: `true` keeps the head whole.
@@ -602,7 +763,10 @@ where
         sky_census = Some(sky);
     }
 
-    let behind_x = caret_left
+    // Behind the caret, read off its column rounded down to the body's stride: a glide seated
+    // there steps its stride every stride's keys, as it does ahead, never a cell a key.
+    let behind_left = i32::from(stride_behind(caret_col, query.stride)).saturating_mul(cw);
+    let behind_x = behind_left
         .saturating_sub(query.lead_px)
         .saturating_sub(w)
         .clamp(0, (grid_w - w).max(0));

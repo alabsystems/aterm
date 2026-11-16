@@ -377,12 +377,7 @@ fn run_registered_command_with_original_store(
 fn exec_command(command: &[OsString]) -> io::Result<ExitCode> {
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
-        #[expect(
-            clippy::disallowed_types,
-            reason = "a registered pass-through becomes its command; exec preserves all caller descriptors and process identity"
-        )]
-        let error = std::process::Command::new(&command[0])
+        let error = aterm_uds::spawnfd::transparent(&command[0])
             .args(&command[1..])
             .exec();
         Err(error)

@@ -391,22 +391,25 @@ pub(super) fn restore(
     // `catalog` is whether `scope` is the catalog, which the open judged once.
     let envelope = Envelope::parse_identified(scope, &wire)?;
     super::operation_policy_in(catalog, &envelope.header, envelope.body.len() - 16)?;
-    let (payload, cut) = if aterm_db_core::quarantine_eligible(
+    let (payload, control) = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,
         batch.discarded_source(&envelope)?,
     ) {
         (
             super::PayloadState::Quarantined(envelope.roster, envelope.epoch, envelope.authored_ms),
-            None,
+            super::Control::default(),
         )
     } else {
         match batch.replay_metadata(&wire, &envelope) {
-            Ok(cut) => (super::PayloadState::Ready, cut),
+            Ok(control) => (super::PayloadState::Ready, control),
             Err(error)
                 if read_only && receipt.offset < acknowledged && error.is_awaiting_membership() =>
             {
-                (super::PayloadState::AwaitingMembership, None)
+                (
+                    super::PayloadState::AwaitingMembership,
+                    super::Control::default(),
+                )
             }
             Err(error) => return Err(error),
         }
@@ -420,7 +423,8 @@ pub(super) fn restore(
         header,
         receipt,
         payload,
-        cut,
+        cut: control.cut,
+        checkpoint: control.checkpoint,
     })
 }
 

@@ -78,7 +78,7 @@ const SCRIPTED_GOLDEN: &str = concat!(
     "agent-change idle rev=4 gen=0.4 fp=000000000000002a\n",
     "human \n",
     "inbox 1 from=h-andrew kind=task off=7\n",
-    "inbox 2 from=s-peer@n-lab kind=ask off=8\n",
+    "inbox 2 from=tpeer000001@n-lab kind=ask off=8\n",
     "task-change rev=1 state=working attention=0\n",
     "task-change rev=2 state=done attention=0 why=marker\n",
     "task-change rev=3 state=exited attention=0 why=marker exit=2\n",
@@ -188,7 +188,7 @@ fn the_scripted_session_writes_its_exact_kinds_through_their_writers() {
     for line in [
         format!("{sid} off=7 from=h-andrew kind=task trust=human text=SENTINEL%20BODY"),
         format!("{sid} off=7 from=h-andrew kind=task trust=human text=SENTINEL%20BODY"),
-        format!("{sid} off=8 from=s-peer@n-lab kind=ask trust=agent text=SENTINEL"),
+        format!("{sid} off=8 from=tpeer000001@n-lab kind=ask trust=agent text=SENTINEL"),
     ] {
         let reply = crate::fabric::cmd_deliver_waking(&app.store, &line, &wake);
         assert!(reply.starts_with("OK "), "{reply}");
@@ -881,7 +881,7 @@ fn delivered(local: u64) -> (SessionHandle, Store) {
 fn drive_inbox_seen() -> Seen {
     let (h, store) = delivered(54);
     let line = format!(
-        "{} off=9 from=s-peer@n-lab kind=ask trust=agent text=SENTINEL",
+        "{} off=9 from=tpeer000001@n-lab kind=ask trust=agent text=SENTINEL",
         h.ctx.self_id.as_str()
     );
     assert_eq!(
@@ -902,7 +902,7 @@ fn drive_inbox_seen() -> Seen {
 fn post(h: &SessionHandle) {
     let reply = crate::fabric::cmd_post(
         &h.ctx,
-        "to=@s-peer kind=ask dl=60000 key=k1 --wait=0 SENTINEL-POST",
+        "to=@tpeer000001 kind=ask dl=60000 key=k1 --wait=0 SENTINEL-POST",
         None,
     );
     assert!(queued(&reply, 1), "{reply}");
@@ -935,7 +935,8 @@ fn drive_landed() -> Seen {
 }
 
 fn post_again(h: &SessionHandle) {
-    let reply = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=note --wait=0 SENTINEL", None);
+    let reply =
+        crate::fabric::cmd_post(&h.ctx, "to=@tpeer000001 kind=note --wait=0 SENTINEL", None);
     assert!(queued(&reply, 2), "{reply}");
 }
 
@@ -1048,7 +1049,7 @@ fn longest(class: &str, fill: &str) -> String {
 
 fn drive_mail_at_its_bounds() -> Seen {
     let (h, store) = rig(66);
-    let from = format!("{}@{}", longest("s", "c"), longest("n", "d"));
+    let from = format!("{}@{}", longest("a", "c"), longest("n", "d"));
     let line = format!(
         "{} off=7 from={from} kind=ask trust=agent text=SENTINEL",
         h.ctx.self_id.as_str()
@@ -1066,7 +1067,7 @@ fn drive_mail_at_its_bounds() -> Seen {
 }
 
 /// A POST AT ITS PRODUCER'S BOUNDS (the review of 6F-6): to the longest
-/// address (`@s-<32>@n-<32>`), of the longest kind, `re=` and `dl=` at their
+/// address (`@a-<32>@n-<32>`), of the longest kind, `re=` and `dl=` at their
 /// widest, through sixteen hops of the longest principal (559 bytes) and
 /// with a 64-byte key — a record the hops leave no room in, so they are cut
 /// there, its row cut by the timeline's 256-byte payload rule — then a broadcast whose row
@@ -1079,7 +1080,7 @@ fn drive_post_at_its_bounds() -> Seen {
             &h.ctx,
             &format!(
                 "to=@{}@{} kind=control re={max} dl={max} via={via} key={} --wait=0 SENTINEL",
-                longest("s", "a"),
+                longest("a", "a"),
                 longest("n", "b"),
                 "k".repeat(crate::fabric::KEY_MAX),
                 max = u64::MAX
@@ -1225,7 +1226,7 @@ const DRIVEN: &[Driven] = &[
         drive: drive_post,
         needs: Key::Idem,
         golden: concat!(
-            "post 1 to=@s-peer kind=ask dl=60000 key=k1\n",
+            "post 1 to=@tpeer000001 kind=ask dl=60000 key=k1\n",
             "post 2 to=say:builds kind=note re=7 via=n-lab\n"
         ),
     },
@@ -1377,8 +1378,8 @@ const DRIVEN: &[Driven] = &[
         drive: drive_mail_at_its_bounds,
         needs: Key::From,
         golden: concat!(
-            "inbox 1 from=s-cccccccccccccccccccccccccccccccc@n-dddddddddddddddddddddddddddddddd kind=ask off=7\n",
-            "inbox-seen 1 off=7 floor=8 seen=1 verdict=handled kind=ask from=s-cccccccccccccccccccccccccccccccc@n-dddddddddddddddddddddddddddddddd\n"
+            "inbox 1 from=a-cccccccccccccccccccccccccccccccc@n-dddddddddddddddddddddddddddddddd kind=ask off=7\n",
+            "inbox-seen 1 off=7 floor=8 seen=1 verdict=handled kind=ask from=a-cccccccccccccccccccccccccccccccc@n-dddddddddddddddddddddddddddddddd\n"
         ),
     },
     Driven {
@@ -1386,7 +1387,7 @@ const DRIVEN: &[Driven] = &[
         drive: drive_post_at_its_bounds,
         needs: Key::Via,
         golden: concat!(
-            "post 1 to=@s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@n-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb kind=control re=18446744073709551615 dl=18446744073709551615 via=n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvv\n",
+            "post 1 to=@a-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@n-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb kind=control re=18446744073709551615 dl=18446744073709551615 via=n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvv\n",
             "post 2 to=say kind=note via=n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv,n-vvvvvvvvvvvvvvvvvvvvv\n"
         ),
     },
@@ -1667,7 +1668,7 @@ fn every_writer(h: &SessionHandle, store: &Store, round: u64) {
     );
     let wake = |_: &aterm_session::SessionId| {};
     let line = format!(
-        "{} off={} from=s-a kind=ask trust=agent text=SENTINEL",
+        "{} off={} from=t000000000a kind=ask trust=agent text=SENTINEL",
         h.ctx.self_id.as_str(),
         10 + round
     );

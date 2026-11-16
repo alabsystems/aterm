@@ -274,9 +274,10 @@ impl App {
         if placement.outer.is_none() && !placement.maximized {
             return false;
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         ws.restore_placement = Some(placement);
         true
     }
@@ -474,9 +475,7 @@ impl App {
 
     /// The frontmost logical window's state.
     pub(crate) fn front(&self) -> Option<&WindowState> {
-        self.frontmost_window
-            .and_then(|id| self.windows.get(&id))
-            .map(Box::as_ref)
+        self.frontmost_window.and_then(|id| self.windows.get(&id))
     }
 
     /// The window-chrome theme from config `window_theme`.
@@ -529,10 +528,8 @@ impl App {
         )
     }
 
-    pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
-        self.frontmost_window
-            .and_then(move |id| self.windows.get_mut(&id))
-            .map(Box::as_mut)
+    pub(crate) fn front_mut(&mut self) -> Option<crate::option_routing::WindowMutation<'_>> {
+        self.windows.get_mut(&self.frontmost_window?)
     }
 
     /// Logical window creation (no winit).
@@ -727,7 +724,8 @@ impl App {
             observe,
         )?;
         self.frontmost_window = previous_front;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.take_carried_frame(carried_inner_px);
         }
         #[cfg(any(windows, target_os = "linux"))]
@@ -998,7 +996,8 @@ impl App {
     /// and [`Self::regrid_to_attach_frame`] re-grids to it.
     pub(crate) fn attach_deck_head(&mut self, wid: WindowId, head_pts: f64, scale: f64) -> usize {
         let form = crate::stats_plan::deck_form_for(self.deck_size_pref());
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.deck_form = form;
         }
         let head = self.deck_head_px(wid, head_pts, scale, 0);
@@ -1022,7 +1021,8 @@ impl App {
         el: &ActiveEventLoop,
         wid: WindowId,
     ) -> bool {
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.passive_reveal = true;
         }
         self.attach_os_window(el, wid)
@@ -1035,6 +1035,7 @@ impl App {
             .windows
             .get(&wid)
             .map_or((0, 0), |ws| (ws.rows, ws.cols));
+        let side_inset_cells = self.windows.get(&wid).map_or(0, |ws| ws.side_inset_cells);
         let pending_join = self.backend.is_pending();
         let startup_attach_entry = Instant::now();
         let mut size = if pending_join {
@@ -1043,7 +1044,8 @@ impl App {
             let vertical_pad = pad.saturating_add(self.cfg_pad_top_for_scale(1.0));
             let total_rows = rows.saturating_add(self.chrome_rows(wid));
             PhysicalSize::new(
-                (cols as usize * cw + pad.saturating_mul(2)) as u32,
+                (cols as usize * cw + pad.saturating_mul(2) + usize::from(side_inset_cells) * cw)
+                    as u32,
                 (total_rows as usize * ch + vertical_pad) as u32,
             )
         } else {
@@ -1092,7 +1094,7 @@ impl App {
             }
         };
         let defer_reveal = self.handoff_ready.is_some();
-        if defer_reveal && let Some(window) = self.windows.get_mut(&wid) {
+        if defer_reveal && let Some(mut window) = self.windows.get_mut(&wid) {
             window.passive_reveal = true;
         }
         let passive_reveal = self
@@ -1226,6 +1228,7 @@ impl App {
                     .max(0.0) as usize
                     + self.synthetic_strip_head_px(scale, cell_h);
                 let total_rows = rows.saturating_add(self.chrome_rows(wid)) as usize;
+                let inset = usize::from(side_inset_cells) * cell_w;
                 let frame = |head: usize| {
                     let (width, raw_height) = aterm_render::frame_size_px(
                         total_rows,
@@ -1236,10 +1239,13 @@ impl App {
                         head,
                     );
                     let height = crate::visible_frame_height(raw_height, pad, pad_top);
-                    PhysicalSize::new(width as u32, height as u32)
+                    PhysicalSize::new((width + inset) as u32, height as u32)
                 };
-                let bars = self.stats_bars_form();
-                let head_in = |form| band + crate::stats_deck::deck_px(bars, form, scale, cell_h);
+                let bars = self.window_bars(wid);
+                // The whole reservation (the deck and the Network State band under it), as
+                // `chrome_head_px` counts the attach's head.
+                let head_in =
+                    |form| band + crate::stats_deck::reserved_deck_px(bars, form, scale, cell_h);
                 let carried = self.windows.get(&wid).and_then(|ws| ws.carried_inner_px);
                 let was = carried.and_then(|c| {
                     crate::stats_deck::carried_deck(c.height, cell_h, head_in, |head| {
@@ -1252,7 +1258,12 @@ impl App {
                 let moved = was.is_some_and(|was| was.keeps_frame(deck));
                 let chrome = self.chrome_rows(wid);
                 let grid_of = |px: PhysicalSize<u32>| {
-                    let cols = aterm_render::pad_split(px.width as usize, pad, cell_w).cells;
+                    let cols = aterm_render::pad_split(
+                        (px.width as usize).saturating_sub(inset),
+                        pad,
+                        cell_w,
+                    )
+                    .cells;
                     let rows = crate::asymmetric_pad_cells(
                         (px.height as usize).saturating_sub(head),
                         pad_top,
@@ -1324,12 +1335,14 @@ impl App {
                 .get(&wid)
                 .map_or(0.0, |ws| ws.last_windowed_band_pts),
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.head_pts = head_pts;
             ws.last_windowed_band_pts = band_memory_pts;
         }
         let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.scale = scale;
         }
         if let Some((px, reset)) = self.font_size_from_device.take() {
@@ -1349,7 +1362,8 @@ impl App {
         {
             let cell_h = self.backend.cell_geometry(self.font_px).1;
             let synthetic = self.synthetic_strip_head_px(scale, cell_h);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.head_pts = synthetic as f64 / if scale > 0.0 { scale } else { 1.0 };
             }
         }
@@ -1357,12 +1371,15 @@ impl App {
         let carried = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.carried_inner_px.take());
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, ws.metrics.head);
         }
         let head = self.attach_deck_head(wid, head_pts, scale);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }
         size = self.attach_frame_px(wid, rows, cols, carried);
@@ -1403,7 +1420,8 @@ impl App {
             }
         }
         #[cfg(target_os = "linux")]
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.initial_frame_settle = Some(crate::InitialFrameSettle {
                 rows: ws.rows,
                 cols: ws.cols,
@@ -1417,7 +1435,8 @@ impl App {
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
             let least = self.least_window_size(wid);
             crate::app_config::tell_least_inner_size(&window, least);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.least_held = Some(least);
             }
             if (self.font_size - self.default_font_size).abs() < 0.5 {
@@ -1441,6 +1460,7 @@ impl App {
         if let Some(placement) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.restore_placement.take())
             && early_reveal_size.is_none()
         {
@@ -1541,25 +1561,27 @@ impl App {
                         window_gpu.set_sdr_white_scale(self.apprt.screen_sdr_white_scale(&window));
                     }
                     self.winit_to_window.insert(window.id(), wid);
-                    let present_installed = if let Some(ws) = self.windows.get_mut(&wid) {
-                        ws.os_window = Some(window);
-                        ws.pending_reveal = defer_reveal
-                            .then(|| Instant::now() + std::time::Duration::from_millis(1500));
-                        ws.win_px = Some(raw_px);
-                        #[cfg(a11y_tree)]
-                        {
-                            ws.a11y = a11y_adapter;
-                        }
-                        ws.capture_acquire_armed = false;
-                        ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
-                        ws.present = Some(PresentTarget::Gpu {
-                            gpu_surface: surf,
-                            window_gpu,
-                        });
-                        true
-                    } else {
-                        false
-                    };
+                    let present_installed =
+                        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                            let ws = &mut **route_guard_ws;
+                            ws.os_window = Some(window);
+                            ws.pending_reveal = defer_reveal
+                                .then(|| Instant::now() + std::time::Duration::from_millis(1500));
+                            ws.win_px = Some(raw_px);
+                            #[cfg(a11y_tree)]
+                            {
+                                ws.a11y = a11y_adapter;
+                            }
+                            ws.capture_acquire_armed = false;
+                            ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
+                            ws.present = Some(PresentTarget::Gpu {
+                                gpu_surface: surf,
+                                window_gpu,
+                            });
+                            true
+                        } else {
+                            false
+                        };
                     if present_installed {
                         self.adopt_attached_window_focus(wid);
                         #[cfg(target_os = "linux")]
@@ -1644,7 +1666,8 @@ impl App {
         };
         let startup_after_surface_create = Instant::now();
         self.winit_to_window.insert(window.id(), wid);
-        let present_installed = if let Some(ws) = self.windows.get_mut(&wid) {
+        let present_installed = if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.os_window = Some(window);
             ws.pending_reveal =
                 defer_reveal.then(|| Instant::now() + std::time::Duration::from_millis(1500));
@@ -1695,12 +1718,14 @@ impl App {
         let Some(focused) = os_focus else {
             return;
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         // What the OS says of its key window is the look's input too (§14.11).
         ws.os_key = focused;
         if ws.focused != focused {
+            drop(route_guard_ws);
             self.on_focus(wid, focused);
         }
     }
@@ -1727,7 +1752,8 @@ impl App {
             return false;
         };
         if settle_now() > settle.deadline || settle.corrections == 0 {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.initial_frame_settle = None;
             }
             return false;
@@ -1752,7 +1778,7 @@ impl App {
                 );
             }
             if settle.corrected
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.initial_frame_settle = None;
             }
@@ -1771,9 +1797,10 @@ impl App {
             intended.height,
             settle.corrections.saturating_sub(1)
         );
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         if let Some(s) = ws.initial_frame_settle.as_mut() {
             s.corrections -= 1;
             s.corrected = true;
@@ -1782,6 +1809,7 @@ impl App {
         let granted = os_window
             .as_ref()
             .and_then(|w| w.request_inner_size(intended));
+        drop(route_guard_ws);
         self.settle_take_over(wid, size, granted, settle.deadline);
         if granted.is_some()
             && let Some(w) = os_window
@@ -1805,13 +1833,15 @@ impl App {
         granted: Option<PhysicalSize<u32>>,
         settle_deadline: Instant,
     ) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if let Some(applied) = granted {
             ws.pending_resize = None;
             ws.next_resize_settle = None;
             ws.win_px = Some(applied);
+            drop(route_guard_ws);
             self.sync_surface_to_window(wid);
             self.on_resize(wid, applied);
         } else {
@@ -1852,6 +1882,7 @@ impl App {
         let deferred_attribution = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.pending_close_attribution.take());
         let _deferred_close = deferred_attribution
             .map(|(reason, actor)| crate::session_store::CloseAttribution::enter(reason, actor));
@@ -2026,9 +2057,10 @@ impl App {
     /// Re-read the frame window `wid` must draw itself ([`crate::client_frame`]) from its OS window.
     #[cfg(target_os = "linux")]
     pub(crate) fn sync_client_frame(&mut self, wid: WindowId) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         let frame = ws
             .os_window
             .as_deref()
@@ -2044,6 +2076,7 @@ impl App {
             ws.caption_move = None;
             ws.strip_hover_caption = None;
         }
+        drop(route_guard_ws);
         self.sync_strip_header_row(wid)
     }
 
@@ -2096,7 +2129,8 @@ impl App {
             .map(|(w, _)| *w)
             .collect();
         for wid in flagged {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.caption_close = false;
             }
             let _closing = crate::session_store::CloseAttribution::enter(
@@ -2116,7 +2150,8 @@ impl App {
             .map(|(w, _)| *w)
             .collect();
         for w in to_close {
-            if let Some(ws) = self.windows.get_mut(&w) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&w) {
+                let ws = &mut **route_guard_ws;
                 ws.pending_close = false;
             }
             self.close_window(el, w);
@@ -2523,7 +2558,8 @@ impl App {
             self.resume_drained_accounts();
             // The attribution `present_close_banner` stashed was for a replay that
             // will not run; a later close must not inherit this gesture's name.
-            if let Some(ws) = self.windows.get_mut(&pending.wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&pending.wid) {
+                let ws = &mut **route_guard_ws;
                 ws.pending_close_attribution = None;
             }
             self.ask_next_queued_close();
@@ -2604,6 +2640,7 @@ impl App {
             | crate::close_confirm::CloseReplay::Pane { wid, .. } => self
                 .windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|ws| ws.pending_close_attribution.take()),
             crate::close_confirm::CloseReplay::Window(_)
             | crate::close_confirm::CloseReplay::Quit => None,
@@ -2938,7 +2975,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.replay == replay)
             && let Some(pending) = self.close_banner.take()
-            && let Some(ws) = self.windows.get_mut(&pending.wid)
+            && let Some(mut ws) = self.windows.get_mut(&pending.wid)
         {
             if let Some(w) = ws.os_window.as_ref() {
                 w.request_redraw();
@@ -3074,10 +3111,11 @@ impl App {
         let search_active = self.windows.get(&id).is_some_and(|ws| ws.search.is_some());
         let title_authority = window_title_authority(search_active);
         let title_changed = {
-            let Some(ws) = self.windows.get_mut(&id) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
                 self.window_title_scratch = scratch;
                 return;
             };
+            let ws = &mut **route_guard_ws;
             if ws.current_title != scratch
                 && !crate::toolbar::busy_spinner_phase_only_change(&ws.current_title, &scratch)
             {
@@ -3223,7 +3261,8 @@ impl App {
                         .unwrap_or_else(|p| p.into_inner())
                         .set_title(s.id, title);
                 }
-                if let Some(ws) = self.windows.get_mut(&id) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+                    let ws = &mut **route_guard_ws;
                     ws.store_title.0 = aid;
                     ws.store_title.1.clear();
                     ws.store_title.1.push_str(title);
@@ -3549,3 +3588,33 @@ mod tests;
 #[cfg(test)]
 #[path = "app_window_close_confirm_tests.rs"]
 mod close_confirm_tests;
+
+impl App {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "DK-2 enables the navigator inset; only tests set it until then"
+        )
+    )]
+    /// Reserve whole cells beside the frame without changing any tab's grid.
+    pub(crate) fn set_side_inset_cells(&mut self, wid: WindowId, cells: u16) {
+        {
+            let Some(mut ws) = self.windows.get_mut(&wid) else {
+                return;
+            };
+            if ws.side_inset_cells == cells {
+                return;
+            }
+            ws.side_inset_cells = cells;
+            ws.invalidate_raster_caches();
+            ws.request_redraw();
+        }
+        self.refresh_pointer_after_frame_placement(wid);
+        self.push_least_window_size(wid);
+    }
+}
+
+#[cfg(test)]
+#[path = "app_window_side_inset_tests.rs"]
+mod side_inset_tests;

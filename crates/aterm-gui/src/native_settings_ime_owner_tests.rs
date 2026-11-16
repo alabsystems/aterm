@@ -188,7 +188,8 @@ fn settings_ime_retirement_preserves_values_and_clears_only_the_original_project
         );
 
         // A separate, real input's marked text must not be swept up in the cleanup.
-        let Some(AppViewState::Settings(current)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(current)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         if field == showcase_page::SHOWCASE_FILTER {
@@ -199,6 +200,7 @@ fn settings_ime_retirement_preserves_values_and_clears_only_the_original_project
                 .filter
                 .set_preedit("independent".into(), None);
         }
+        drop(route_native_guard);
         app.dispatch_native_event(wid, AppEvent::FocusChanged(None))
             .unwrap();
         app.on_ime_preedit(wid, String::new(), None);

@@ -23,11 +23,13 @@ fn paging_view(
     let service = VersionedConfigService::new(source.to_string()).expect("valid fixture");
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("projects");
     state.navigate(route);
+    drop(route_native_guard);
     (runtime, instance, view)
 }
 
@@ -168,7 +170,8 @@ fn modifieds_row_whose_facts_the_strip_holds_is_shown_and_turned_past() {
             .limit();
         for top in 0..limit {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.scroll_page_to(top);
@@ -251,7 +254,8 @@ fn page_keys_turn(
 ) -> (usize, Vec<String>) {
     let (mut turned, mut faults) = (0usize, Vec::new());
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(0);
@@ -338,11 +342,13 @@ fn page_keys_walk(
     let mut faults = Vec::new();
     let mut showable = BTreeSet::new();
     for top in 0..=limit {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(top);
         state.page_reveal = None;
+        drop(route_native_guard);
         if let Some((screen, _)) = screen_now(runtime, instance, view, cx) {
             if screen.top != top {
                 faults.push(format!(
@@ -385,7 +391,8 @@ fn a_bar_coming_moves_no_row_and_the_screen_under_it_ends_on_a_peek() {
     };
     let screen = |runtime: &mut NativeRuntime, bar: bool| {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = None;
@@ -473,7 +480,9 @@ fn no_screen_ends_on_blank_and_page_keys_turn_over_what_it_showed_whole() {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = paging_view(source, route);
                 if bar {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.show_transient_status_for_test("Cursor blink turned off");
@@ -683,7 +692,9 @@ fn a_bar_over_a_rows_facts_never_moves_the_list() {
                 .limit();
             for top in 0..limit {
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.scroll_page_to(top);
@@ -713,7 +724,9 @@ fn a_bar_over_a_rows_facts_never_moves_the_list() {
                 found += 1;
                 let context = format!("{route:?} {width}x{height} screen {top} {key:?}");
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.last_focus = Some(key.clone());
@@ -723,7 +736,9 @@ fn a_bar_over_a_rows_facts_never_moves_the_list() {
                 let at = before.semantic(&key).map(|node| node.rect);
                 assert!(at.is_some(), "{context}: the control is live");
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.show_transient_status_for_test("Copied");
@@ -760,7 +775,8 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
         let cx = view_cx_at(width, height);
         let (mut runtime, instance, view) = paging_view("", route);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             if let Some(access) = access {
@@ -769,7 +785,8 @@ fn a_short_window_sheds_chrome_only_as_far_as_the_first_screen_needs() {
         }
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         if let Some(status) = status {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.config_watch_status = Some(status.to_string());
@@ -879,7 +896,8 @@ fn the_room_kept_for_a_status_bar_never_cuts_every_row() {
             let (mut runtime, instance, view) = paging_view("", route);
             let _ = compile_settings_view(&runtime, instance, view, &cx);
             if bar {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.show_transient_status_for_test("Saved");
@@ -1184,7 +1202,9 @@ fn a_keyboard_page_turn_lands_where_the_turn_says() {
                     continue;
                 };
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.last_focus = Some(first);
@@ -1208,14 +1228,19 @@ fn a_keyboard_page_turn_lands_where_the_turn_says() {
                             .scroll_shown()
                             .map(|(_, shown)| shown);
                         let (settled, meant) = {
-                            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                            let mut route_native_guard = runtime.view_state_mut(view);
+                            let Some(AppViewState::Settings(state)) =
+                                route_native_guard.as_deref_mut()
                             else {
                                 unreachable!();
                             };
                             let reveal = state.page_reveal.take();
+                            drop(route_native_guard);
                             let settled =
                                 list_paint(&compile_settings_view(&runtime, instance, view, &cx));
-                            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                            let mut route_native_guard = runtime.view_state_mut(view);
+                            let Some(AppViewState::Settings(state)) =
+                                route_native_guard.as_deref_mut()
                             else {
                                 unreachable!();
                             };
@@ -1279,7 +1304,9 @@ fn a_status_bar_never_changes_the_page_chrome() {
                 let _ = compile_settings_view(&runtime, instance, view, &cx);
                 let calm = messages_view_state(&runtime, view).page_chrome.get();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     match bar {
@@ -1356,7 +1383,9 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
                     continue;
                 };
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.last_focus = Some(first.clone());
@@ -1408,7 +1437,8 @@ fn the_lists_keys_never_change_a_control_they_carried_the_keyboard_to() {
         let (mut runtime, instance, view) = paging_view("", SettingsRoute::TextFonts);
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.common.last_focus = Some(weight.clone());
@@ -1896,7 +1926,9 @@ fn every_stop_of_a_short_window_is_whole_by_page_and_by_wheel() {
                         .map_or_else(|| format!("#{stop}"), |key| key.as_str().to_string())
                 };
                 let to_top = |runtime: &mut NativeRuntime| {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.scroll_page_to(0);
@@ -2014,7 +2046,8 @@ fn a_page_turn_takes_the_keyboard_onto_its_screen() {
                 return;
             };
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.common.last_focus = Some(first);
@@ -2346,7 +2379,8 @@ fn manuals_explanation_is_set_on_lines_of_its_own_height() {
             let cx = view_cx_at(width, height);
             let (mut runtime, instance, view) = paging_view("", SettingsRoute::Manual);
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.arm_config_file(
@@ -2406,7 +2440,8 @@ fn end_reaches_the_lists_end_before_a_render_has_measured_it() {
                 let _ = compile_settings_view(&runtime, instance, view, &cx);
                 match trigger {
                     "navigate" => {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        let mut route_native_guard = runtime.view_state_mut(view);
+                        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
                         else {
                             unreachable!();
                         };
@@ -3346,7 +3381,8 @@ fn a_glossed_choice_shows_its_value_where_the_gloss_does_not_fit() {
         let cx = view_cx_at(178.0, 152.0);
         let (mut runtime, instance, view) = paging_view("", SettingsRoute::TextFonts);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             assert!(state.replace_font_families(super::injected_font_families()));
@@ -3570,7 +3606,9 @@ fn the_wheel_and_the_page_keys_step_through_the_keyboards_message() {
                 };
                 // The keyboard on its title, the list on its head.
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.last_focus = Some(title.clone());
@@ -3696,7 +3734,9 @@ fn the_keyboards_control_shows_in_a_least_window() {
                     .dispatch(instance, view, AppEvent::FocusChanged(Some(key.clone())))
                     .unwrap();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.focus_visible = true;

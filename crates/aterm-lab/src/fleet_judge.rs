@@ -465,7 +465,7 @@ pub fn judge_text(
             .filter(|l| {
                 l.split(' ')
                     .next()
-                    .is_some_and(aterm_types::tab_id::is_tab_id)
+                    .is_some_and(aterm_types::control_verbs::is_minted_sid)
                     && l.contains(aterm_ctl::EXCERPTS_CUT)
             })
             .count();

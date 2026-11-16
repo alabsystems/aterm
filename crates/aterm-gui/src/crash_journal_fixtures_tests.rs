@@ -9,6 +9,7 @@ fn leaf(local: u64, cwd: Option<&str>, title: &str) -> restore::RestoredSplitTre
             pinned: false,
             sid: None,
             lineage: None,
+            opened_ms: None,
             log_ep: None,
             cwd: cwd.map(str::to_string),
             title: title.to_string(),

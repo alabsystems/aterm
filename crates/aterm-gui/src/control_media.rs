@@ -2103,6 +2103,9 @@ pub(crate) fn invoke_refusal(name: &str) -> Option<String> {
                 "View \u{25b8} Stats Lens, \u{2318}I"
             }
             crate::menu::MenuAction::ToggleStatsLens => "View \u{25b8} Stats Lens",
+            crate::menu::MenuAction::ShowSystemResourcesHere => {
+                "View \u{25b8} Show System Resources Here"
+            }
             crate::menu::MenuAction::RecordUnseenKeys => {
                 "View \u{25b8} Record Keys Not Echoed\u{2026}, then aterm's alert"
             }

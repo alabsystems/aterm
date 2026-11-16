@@ -44,6 +44,7 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
         0,
         10,
         10,
+        aterm_render::SideInsetPx(0),
         0..0,
         Some(tray),
         true,
@@ -70,7 +71,7 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
     let src: Vec<u32> = (0..fw * fh).map(|i| 0x0040_0000 | i as u32).collect();
     let (dw, dh) = (fw + 5, fh + 2);
     let (ox, oy) = (
-        aterm_render::band_offset(dw, fw),
+        aterm_render::band_offset(dw, fw, aterm_render::SideInsetPx(0)),
         aterm_render::band_offset_y(dh, fh),
     );
     let rgba: Vec<u8> = (0..fw).flat_map(|_| [0xC0, 0xFF, 0xEE, 0xFF]).collect();
@@ -94,6 +95,7 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
             &src,
             fw,
             fh,
+            aterm_render::SideInsetPx(0),
             false,
             BAND,
             edge_rows.clone(),
@@ -106,6 +108,7 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
             oy,
             fw,
             fh,
+            aterm_render::SideInsetPx(0),
             edge_rows.clone(),
             Some(tray()),
             invert,

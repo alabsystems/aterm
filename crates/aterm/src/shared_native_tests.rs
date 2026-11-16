@@ -312,6 +312,16 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
     let (temp, paths, config) = successor_fixture();
     let original = &paths[0];
     let expected = client::config(original).unwrap().unwrap();
+    assert!(
+        expected.signer.is_some(),
+        "the fixture holds a signed vault"
+    );
+    let expected_policy = client::read_verified_entry(original, &expected, ENTRY)
+        .unwrap()
+        .unwrap()
+        .value()
+        .as_slice()
+        .to_vec();
     let next = aterm_db::test_complete_writer_successor(
         temp.path(),
         original,
@@ -324,11 +334,40 @@ fn native_policy_and_member_follow_real_successors_and_recheck_generation() {
         aterm_db::application_paths_until(original, deadline()).unwrap(),
         next
     );
-    std::fs::remove_file(original.home.join(".secrets").join(ENTRY)).unwrap();
-    assert!(
-        policy_at(original, &expected, deadline())
+    // The policy is the successor's read, not the original Mac's own copy: its version names the
+    // successor's recipient. That copy is no file to delete now, and the store that holds it
+    // also holds the commons custody is resolved by.
+    let own = |paths: &Paths| {
+        let config = client::config(paths).unwrap().unwrap();
+        client::read_verified_entry(paths, &config, ENTRY)
             .unwrap()
-            .is_some()
+            .unwrap()
+            .snapshot()
+            .version()
+    };
+    for home in [&original.home, &next.home] {
+        assert_eq!(
+            std::fs::symlink_metadata(home.join(".secrets").join(ENTRY))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "no policy copy is materialized under the predecessor or successor home"
+        );
+    }
+    let (followed_policy, followed_snapshot) =
+        policy_at(original, &expected, deadline()).unwrap().unwrap();
+    assert_eq!(followed_policy.text().as_bytes(), expected_policy);
+    assert!(followed_snapshot.version().not_before(&own(&next)));
+    assert!(!followed_snapshot.version().not_before(&own(original)));
+    let selected_entry = followed_snapshot.read(&next).unwrap().unwrap();
+    assert_eq!(selected_entry.value().as_slice(), expected_policy);
+    let original_entry = client::read_verified_entry(original, &expected, ENTRY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original_entry.value().as_slice(), expected_policy);
+    assert!(
+        followed_snapshot.read(original).unwrap().is_none(),
+        "the successor's policy snapshot cannot bind the predecessor's still-readable entry"
     );
     assert_eq!(member(original, deadline()).unwrap(), "m2");
     let before = selection_scope(original, deadline()).unwrap();

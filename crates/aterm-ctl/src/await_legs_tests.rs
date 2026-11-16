@@ -10,9 +10,11 @@ fn parts(line: &str) -> Vec<String> {
 #[test]
 fn the_inbox_and_agent_waits_are_parsed_with_their_timeout_taken_out() {
     assert_eq!(
-        parse(&parts("@s-ab await inbox since=4 topic=lab timeout=900000")),
+        parse(&parts(
+            "@tabxxxxxxxx await inbox since=4 topic=lab timeout=900000"
+        )),
         Some(Wait {
-            parts: parts("@s-ab await inbox since=4 topic=lab"),
+            parts: parts("@tabxxxxxxxx await inbox since=4 topic=lab"),
             timeout: Some(Duration::from_secs(900)),
         })
     );
@@ -32,17 +34,17 @@ fn the_inbox_and_agent_waits_are_parsed_with_their_timeout_taken_out() {
     );
     assert_eq!(
         parse(&parts(
-            "@s-ab await agent idle,prompt since=7 timeout=900000"
+            "@tabxxxxxxxx await agent idle,prompt since=7 timeout=900000"
         )),
         Some(Wait {
-            parts: parts("@s-ab await agent idle,prompt since=7"),
+            parts: parts("@tabxxxxxxxx await agent idle,prompt since=7"),
             timeout: Some(Duration::from_secs(900)),
         })
     );
     assert_eq!(
-        parse(&parts("@s-ab await edit ticket=7 timeout=900000")),
+        parse(&parts("@tabxxxxxxxx await edit ticket=7 timeout=900000")),
         Some(Wait {
-            parts: parts("@s-ab await edit ticket=7"),
+            parts: parts("@tabxxxxxxxx await edit ticket=7"),
             timeout: Some(Duration::from_secs(900)),
         })
     );
@@ -55,7 +57,7 @@ fn the_inbox_and_agent_waits_are_parsed_with_their_timeout_taken_out() {
     );
     for refused in [
         "await idle 500",
-        "await task @s-a",
+        "await task @taxxxxxxxxx",
         "await gone ready",
         "inbox since=4",
         "agent idle",
@@ -111,7 +113,7 @@ fn run(wait: &Wait, until: Option<Instant>, script: Vec<Leg>) -> Run {
 
 #[test]
 fn a_wait_is_re_armed_with_the_same_since_until_a_leg_answers() {
-    let wait = parse(&parts("@s-ab await inbox since=4 topic=lab")).expect("re-armed");
+    let wait = parse(&parts("@tabxxxxxxxx await inbox since=4 topic=lab")).expect("re-armed");
     let until = Some(Instant::now() + Duration::from_secs(3600));
     let mut sent = Vec::new();
     let mut printed = Vec::new();
@@ -143,7 +145,7 @@ fn a_wait_is_re_armed_with_the_same_since_until_a_leg_answers() {
     for (request, asked) in &sent {
         assert_eq!(
             request,
-            "@s-ab await inbox since=4 topic=lab timeout=600000\n"
+            "@tabxxxxxxxx await inbox since=4 topic=lab timeout=600000\n"
         );
         assert_eq!(*asked, await_task::LEG_MAX);
     }

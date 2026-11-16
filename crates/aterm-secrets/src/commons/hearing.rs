@@ -57,6 +57,13 @@ pub const LIFTED: Version = Version(0, 146, 0);
 /// that qualifies. The workspace stood at 0.202.0 when the apply stopped writing files, so a
 /// 0.202.0 build may still write them, and 0.203.0 is the first whose every build writes none.
 pub const NO_SECRET_FILE: Option<Version> = Some(Version(0, 203, 0));
+/// The first release that reads a table checkpoint (`ATCKP1`, aterm
+/// docs/DESIGN-table-checkpoint-2026-11-15.md §5, tracker LT-B10B). An older build reads one as a
+/// command it cannot decode and, once the bodies below a checkpoint go cold (LT-B10C), could no
+/// longer rebuild the table's cells. The workspace stood at 0.202.0 when checkpoints were first
+/// read, so a 0.202.0 build may not read them, and 0.203.0 is the first whose every build does
+/// (the reasoning of [`NO_SECRET_FILE`]).
+pub const READS_CHECKPOINTS: Version = Version(0, 203, 0);
 /// Exact wire size of a signed [`report`].
 pub const REPORT_LEN: usize = 4 + 12 + 64;
 const REPORT_DOMAIN: &[u8] = b"aterm/commons/version-report/1\0";
@@ -217,6 +224,12 @@ pub const fn in_place(release: Option<Version>) -> Floor {
         unheard_passes: false,
     }
 }
+
+/// The gate a table checkpoint's signing waits on (tracker LT-B10B): every current member heard
+/// within [`RECENT`] reporting [`READS_CHECKPOINTS`] or later. A member unheard for [`RECENT`]
+/// holds it however long this device watched, for a Mac that comes back on an older build could
+/// not read the table from the checkpoint; only a member gone from the roster stops counting.
+pub const CHECKPOINTS: Floor = in_place(Some(READS_CHECKPOINTS));
 
 /// The gate one Mac passes once it writes no vault entry to a file ([`NO_SECRET_FILE`],
 /// [`Ledger::writes_no_secret_file`]).

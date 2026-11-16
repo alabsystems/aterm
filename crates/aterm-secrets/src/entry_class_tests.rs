@@ -200,3 +200,34 @@ fn a_folded_pair_names_both_and_only_names_written_as_files() {
     assert!(folded_pairs(["foo", "foo", "bar"]).is_empty());
     assert!(folded_pair_refusal("Foo", "foo").contains("unset `foo` first"));
 }
+
+/// What the vault text's size door holds: fleet configuration, by its fixed names, a pooled
+/// CLI's file, a native pool's allocation and any plain name with a configuration suffix; never
+/// a credential, a control record or release material, which a lab rotates at any size.
+#[test]
+fn vault_fill_door_names_are_fleet_configuration_and_never_a_credential() {
+    for name in FLEET_CONFIGURATION.into_iter().chain([
+        "github-repositories.json",
+        "ai-accounts-codex.toml",
+        "sheet.csv",
+        "Lab-Inventory.JSON",
+    ]) {
+        assert!(fleet_configuration(name), "{name}");
+    }
+    for name in [
+        "gh_access_token",
+        GH_HOSTS,
+        GIT_CREDENTIALS,
+        GIT_CONFIG,
+        RELEASE_GH_TOKEN,
+        NOTARY,
+        "~/.aterm/apple/devid-m22.key",
+        FLEET_CODE,
+        crate::SWARM_ROSTER_ENTRY,
+        crate::SWARM_LEASE_ENTRY,
+        TOKEN,
+        "~/notes.txt",
+    ] {
+        assert!(!fleet_configuration(name), "{name}");
+    }
+}

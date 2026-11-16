@@ -2024,6 +2024,7 @@ fn no_seat_edit_survives_mirror(parented: bool) {
             &admin,
             &admin.doc,
             Instant::now() + Duration::from_secs(60),
+            Author::Person,
         )
         .unwrap();
     }

@@ -60,6 +60,11 @@ pub(crate) enum Backend {
 pub(crate) struct PlatformSpecificEventLoopAttributes {
     /// Only ever `Some(Backend::Headless)` (`EventLoopBuilderExtHeadless::with_headless`).
     pub(crate) forced_backend: Option<Backend>,
+    /// Where no display server the environment names answers (none is named, or nothing
+    /// listens where each is named), build the headless loop instead of failing, and try X11
+    /// where Wayland's compositor does not answer
+    /// (`EventLoopBuilderExtHeadless::with_headless_fallback`).
+    pub(crate) headless_fallback: bool,
 }
 
 mod attributes;
@@ -514,6 +519,27 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
     }
 }
 
+/// A backend that gave no event loop ([`EventLoop::on_backend`]).
+#[derive(Debug)]
+struct Unbuilt {
+    error: EventLoopError,
+    /// It reached a display server (or needs none) before it failed, so the failure is the
+    /// backend's own, and the headless fallback does not stand in for it: only a display server
+    /// that never answered (none listens where the environment names it) is fallen back from.
+    reached: bool,
+}
+
+/// Whether the X11 connection reached the X server: `XOpenDisplay` answered, so a later failure
+/// (a missing extension, a conversion to XCB) is the backend's against a live server. Xlib that
+/// does not load reaches nothing.
+#[cfg(x11_platform)]
+fn x11_reached() -> bool {
+    !matches!(
+        X11_BACKEND.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+        Err(XNotSupported::XOpenDisplayFailed | XNotSupported::LibraryOpenError(_))
+    )
+}
+
 impl<T: 'static> EventLoop<T> {
     pub(crate) fn new(
         attributes: &PlatformSpecificEventLoopAttributes,
@@ -525,47 +551,111 @@ impl<T: 'static> EventLoop<T> {
             );
         }
 
-        let backend = match (
-            attributes.forced_backend,
-            env::var("WAYLAND_DISPLAY")
-                .ok()
-                .filter(|var| !var.is_empty())
-                .or_else(|| env::var("WAYLAND_SOCKET").ok())
-                .filter(|var| !var.is_empty())
-                .is_some(),
-            env::var("DISPLAY").map(|var| !var.is_empty()).unwrap_or(false),
-        ) {
-            (Some(backend), ..) => backend,
-            #[cfg(wayland_platform)]
-            (None, true, _) => Backend::Wayland,
-            #[cfg(x11_platform)]
-            (None, _, true) => Backend::X,
-            (_, wayland_display, x11_display) => {
-                let msg = if wayland_display && !cfg!(wayland_platform) {
-                    "DISPLAY is not set; note: enable the `aterm-window/wayland` feature to support \
-                     Wayland"
-                } else if x11_display && !cfg!(x11_platform) {
-                    "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; note: enable the \
-                     `aterm-window/x11` feature to support X11"
-                } else {
-                    "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set."
-                };
-                return Err(EventLoopError::Os(os_error!(OsError::Misc(msg))));
-            },
+        let wayland_display = env::var("WAYLAND_DISPLAY")
+            .ok()
+            .filter(|var| !var.is_empty())
+            .or_else(|| env::var("WAYLAND_SOCKET").ok())
+            .filter(|var| !var.is_empty())
+            .is_some();
+        let x11_display = env::var("DISPLAY").map(|var| !var.is_empty()).unwrap_or(false);
+        // The backends to try, in winit's order: the forced one, else each display server the
+        // environment names. Only the headless fallback goes past the first.
+        let mut named = Vec::new();
+        if let Some(backend) = attributes.forced_backend {
+            named.push(backend);
+        }
+        #[cfg(wayland_platform)]
+        if named.is_empty() && wayland_display {
+            named.push(Backend::Wayland);
+        }
+        #[cfg(x11_platform)]
+        if (named.is_empty() || attributes.headless_fallback)
+            && attributes.forced_backend.is_none()
+            && x11_display
+        {
+            named.push(Backend::X);
+        }
+        let unnamed = || {
+            let msg = if wayland_display && !cfg!(wayland_platform) {
+                "DISPLAY is not set; note: enable the `aterm-window/wayland` feature to support \
+                 Wayland"
+            } else if x11_display && !cfg!(x11_platform) {
+                "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set; note: enable the \
+                 `aterm-window/x11` feature to support X11"
+            } else {
+                "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set."
+            };
+            EventLoopError::Os(os_error!(OsError::Misc(msg)))
         };
+        Self::first_built(
+            named.into_iter().map(Self::on_backend),
+            attributes.headless_fallback,
+            unnamed,
+        )
+    }
 
+    /// The first event loop `tried` gives, trying each only once those before it failed. A
+    /// backend that reached a display server and still failed ends it with that failure; one that
+    /// reached none is passed over only under `fallback`, which ends where nothing was built in
+    /// the headless loop, keeping each reason ([`headless::EventLoop::fell_back`]). With nothing
+    /// to try, `unnamed` is the failure, or under `fallback` the reason.
+    fn first_built(
+        tried: impl IntoIterator<Item = Result<Self, Unbuilt>>,
+        fallback: bool,
+        unnamed: impl FnOnce() -> EventLoopError,
+    ) -> Result<Self, EventLoopError> {
+        let mut unanswered = Vec::new();
+        for outcome in tried {
+            match outcome {
+                Ok(built) => return Ok(built),
+                Err(Unbuilt { error, reached: false }) if fallback => {
+                    unanswered.push(error.to_string())
+                },
+                Err(Unbuilt { error, .. }) => return Err(error),
+            }
+        }
+        if unanswered.is_empty() {
+            let error = unnamed();
+            if !fallback {
+                return Err(error);
+            }
+            unanswered.push(error.to_string());
+        }
+        Ok(EventLoop::Headless(headless::EventLoop::new()?.fell_back(unanswered.join("; "))))
+    }
+
+    /// The event loop on `backend`, or the reason it gave none and whether it reached a display
+    /// server first ([`Unbuilt::reached`]).
+    fn on_backend(backend: Backend) -> Result<Self, Unbuilt> {
         match backend {
-            Backend::Headless => Ok(EventLoop::Headless(headless::EventLoop::new()?)),
+            Backend::Headless => headless::EventLoop::new()
+                .map(EventLoop::Headless)
+                .map_err(|error| Unbuilt { error, reached: true }),
             #[cfg(wayland_platform)]
-            Backend::Wayland => EventLoop::new_wayland_any_thread(),
+            Backend::Wayland => {
+                let connection = wayland::EventLoop::<T>::connect(None)
+                    .map_err(|error| Unbuilt { error, reached: false })?;
+                wayland::EventLoop::on_connection(connection)
+                    .map(|evlp| EventLoop::Wayland(Box::new(evlp)))
+                    .map_err(|error| Unbuilt { error, reached: true })
+            },
             #[cfg(x11_platform)]
-            Backend::X => EventLoop::new_x11_any_thread(),
+            Backend::X => EventLoop::new_x11_any_thread()
+                .map_err(|error| Unbuilt { error, reached: x11_reached() }),
         }
     }
 
-    #[cfg(wayland_platform)]
-    fn new_wayland_any_thread() -> Result<EventLoop<T>, EventLoopError> {
-        wayland::EventLoop::new().map(|evlp| EventLoop::Wayland(Box::new(evlp)))
+    /// Why this event loop runs without a display server though the platform's own backend was
+    /// asked for first ([`EventLoopBuilderExtHeadless::with_headless_fallback`]): each display
+    /// server tried, none of which answered. `None` on that backend or a forced headless one.
+    ///
+    /// [`EventLoopBuilderExtHeadless::with_headless_fallback`]: crate::platform::headless::EventLoopBuilderExtHeadless::with_headless_fallback
+    pub(crate) fn headless_fallback(&self) -> Option<&str> {
+        match self {
+            EventLoop::Headless(evlp) => evlp.fell_back_from(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
     }
 
     #[cfg(x11_platform)]
@@ -722,3 +812,7 @@ fn is_main_thread() -> bool {
 fn is_main_thread() -> bool {
     std::thread::current().name() == Some("main")
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

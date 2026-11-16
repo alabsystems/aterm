@@ -264,4 +264,36 @@ fn the_live_comparison_names_each_difference() {
             Difference::PageNotFetched("terminal.html"),
         ]
     );
+
+    // get-aterm.ps1: served by neither agrees; the live site serves the checkout's bytes or
+    // none, and a copy the checkout does not hold is stale.
+    let mut live = local.clone();
+    let v = lookup(&live);
+    assert_eq!(compare(&f, &Copies { get: &l }, &Copies { get: &v }), []);
+    live.insert("get-aterm.ps1", "param()\n".into());
+    let v = lookup(&live);
+    assert_eq!(
+        compare(&f, &Copies { get: &l }, &Copies { get: &v }),
+        [Difference::WindowsInstallerStale]
+    );
+    local.insert("get-aterm.ps1", "param([string]$Repo)\n".into());
+    let l = lookup(&local);
+    assert_eq!(
+        compare(&f, &Copies { get: &l }, &Copies { get: &v }),
+        [Difference::WindowsInstallerDiffers]
+    );
+    live.remove("get-aterm.ps1");
+    live.insert("install.sh", "#!/bin/sh\n".into());
+    let v = lookup(&live);
+    assert_eq!(
+        compare(&f, &Copies { get: &l }, &Copies { get: &v }),
+        [
+            Difference::InstallerDiffers,
+            Difference::WindowsInstallerNotFetched
+        ]
+    );
+    live.insert("install.sh", local["install.sh"].clone());
+    live.insert("get-aterm.ps1", local["get-aterm.ps1"].clone());
+    let v = lookup(&live);
+    assert_eq!(compare(&f, &Copies { get: &l }, &Copies { get: &v }), []);
 }

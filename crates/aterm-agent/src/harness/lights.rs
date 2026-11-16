@@ -123,21 +123,21 @@ pub struct Screen {
     pub mode: Option<Mode>,
     /// A pill is drawn under the composer, known or not: a row opening with a pill glyph (`footer::opens_with_pill_glyph`), a cut one included.
     pub pill: bool,
-    /// Claude is mid-turn (`aterm_phase::phase::busy_seen`, hard): the screen shows the turn, or the window title runs one it does not show ([`Screen::title_live`]).
+    /// Claude is mid-turn (`aterm_phase::phase::busy_seen`, hard): the screen shows the turn, or its run sign (its report, else its window title) runs one the screen does not show ([`Screen::title_live`]).
     pub busy: bool,
-    /// The window title runs a turn the screen does not show (`aterm_phase::phase::title_live`: a reply drawn under a status line, whose footer and spinner are gone), the one live turn no background pill excuses.
+    /// The run sign runs a turn the screen does not show (`aterm_phase::phase::title_live`: a reply drawn under a status line, whose footer and spinner are gone), the one live turn no background pill excuses.
     pub title_live: bool,
     /// The pill stands after vim INSERT's indicator (`footer::vim_insert`: `  -- INSERT -- ⏵⏵ auto mode on …`, MEASURED on 2.1.304): the pill names its mode as on any mode row, and the composer takes keys through vim.
     pub vim_insert: bool,
 }
 
-/// Read `rows` (one pane, top to bottom) with the window title Claude Code set over them (`None` where the caller holds none: then the screen alone says whether a turn runs).
+/// Read `rows` (one pane, top to bottom) with the window title Claude Code set over them and the program-status report standing with them (`report`, the body that says it, which says before the title: `aterm_phase::ScreenReader::runs`); `None` for each where the caller holds none: with neither, the screen alone says whether a turn runs.
 #[must_use]
-pub fn read_screen(rows: &[String], title: Option<&str>) -> Option<Screen> {
+pub fn read_screen(rows: &[String], title: Option<&str>, report: Option<&str>) -> Option<Screen> {
     use aterm_phase::ScreenReader as _;
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
     let Reading { mode, pill } = reading_under(rows, bottom);
-    let runs = aterm_phase::ClaudeReader.runs(title);
+    let runs = aterm_phase::ClaudeReader.runs(title, report);
     let busy = aterm_phase::phase::busy_seen(rows, runs).is_some_and(|b| !b.soft);
     let title_live = aterm_phase::phase::title_live(rows, runs);
     let vim_insert =

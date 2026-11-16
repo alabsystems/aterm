@@ -788,6 +788,7 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     // A press of its own, not a double click's second: the first press was stamped a minute ago.
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
         .expect("noted")
         .light_pressed = Some(a_minute_ago());

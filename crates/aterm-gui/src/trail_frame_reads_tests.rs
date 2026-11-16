@@ -25,10 +25,11 @@ fn typed(t0: Instant) -> (App, Instant) {
     let mut now = t0;
     for (i, col) in [4_u16, 5, 6].into_iter().enumerate() {
         let key_at = t0 + Duration::from_millis(100 * (i as u64 + 1));
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.fx.cursor_mut().glow.note_typed_cells(key_at, 1);
         ws.fx.cursor_mut().trail.note_typed(key_at);
         now = key_at + Duration::from_millis(16);
+        drop(ws);
         frame(&mut app, now, col);
     }
     (app, now)

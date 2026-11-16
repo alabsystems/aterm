@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Selected readiness observations use the real cell resolver and the real run dispatcher.
+//! Selected readiness observations, and what a checked cell keeps of its directory, use the real
+//! cell resolver and the real run dispatcher.
 
 use super::*;
 use crate::checks::Check;
@@ -309,4 +310,110 @@ fn preparation_admission_refusal_defers_cells_but_other_checks_still_run() {
         assert!(ctx.root.join("native-ran").exists());
         assert!(!output.contains("NO-TOOLCHAIN"), "{output}");
     }
+}
+
+/// A CHECKED CELL KEEPS WHAT ITS CALLS USED, IN ITS OWN DIRECTORY, AND A FAILED ONE NOTHING
+/// ([`run_prepared`], [`check_cell`], [`cargo_call`], [`close_passed`],
+/// `crate::disk::keep_used`): a browser cell named as forge's `wasm-cpu`, so that its directory
+/// is one the run keeps a record of (`crate::disk::dir_of`), and built of the fixture's member
+/// `app`, is checked by the real resolver and dispatcher with a stand-in stock cargo whose lint
+/// reports `app`'s metadata in the cell's directory and that its build finished: its row passes,
+/// and the run keeps one record, at the cell directory's top, naming that unit in its profile and
+/// `app` as the workspace's own though the lint built no test. NEGATIVE CONTROL: the same run
+/// whose lint also reports an error in `app` (cargo exiting 0, its build finished) fails its row
+/// (`TYPE-ERROR`) and keeps nothing. Without the close in `run_prepared`, or with the lint run
+/// through [`noted`] alone, the passing run keeps nothing; with the lint noted without the
+/// workspace's members, its record names none; with a close whatever the row, the control keeps
+/// one.
+#[cfg(unix)]
+#[test]
+fn a_checked_cell_keeps_what_its_calls_used_and_a_failed_one_keeps_nothing() {
+    const CELL: &str = "wasm-cpu";
+    const HASH: &str = "0123456789abcdef";
+    let checked = |error: bool| {
+        let (dir, mut ctx) = world();
+        let root = ctx.root.clone();
+        ctx.main_build_dir = Some(format!(
+            "build.build-dir='{}'",
+            root.join("cache").display()
+        ));
+        ctx.cached_lanes_dir = Some(root.join("lanes"));
+        let leaf = cell_dir(&ctx, CELL);
+        std::fs::create_dir_all(&leaf).expect("the cell's directory");
+        let unit = leaf.join(format!("{TARGET}/release/deps/libapp-{HASH}.rmeta"));
+        let app = format!("path+file://{}#1.0.0", root.join("app").display());
+        let mut wire = vec![aterm_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": app.as_str(),
+            "target": {"kind": ["lib"], "name": "app"},
+            "profile": {"test": false},
+            "filenames": [unit.display().to_string()],
+            "fresh": false,
+        })];
+        if error {
+            wire.push(aterm_json::json!({
+                "reason": "compiler-message",
+                "package_id": app.as_str(),
+                "message": {"level": "error", "rendered": "error[E0001]: a fixture's\n"},
+            }));
+        }
+        wire.push(aterm_json::json!({"reason": "build-finished", "success": true}));
+        let lines: Vec<String> = wire.iter().map(ToString::to_string).collect();
+        let aside = root.join("wire.clippy.aside");
+        std::fs::write(&aside, lines.join("\n") + "\n").expect("the wire");
+        std::fs::rename(&aside, root.join("wire.clippy")).expect("the wire in place");
+        let cargo = root.join("bin/cargo");
+        crate::standin_body(&cargo, &format!("/bin/cat \"{}/wire.$1\"", root.display()));
+        let prepared = PreparedRun {
+            inputs: Ok(Inputs {
+                policy: Vec::new(),
+                host: "fixture-host".into(),
+                cells: vec![Cell {
+                    name: CELL.into(),
+                    triple: TARGET.into(),
+                    package: "app".into(),
+                }],
+                stock: Ok(rustup::Stock {
+                    toolchain: rustup::Toolchain {
+                        name: "fixture-stock".into(),
+                        cargo,
+                        rustc: root.join("bin/rustc"),
+                        clippy: true,
+                    },
+                    targets: vec![TARGET.into()],
+                }),
+                members: None,
+                cached: Vec::new(),
+            }),
+        };
+        let mut report = Report::new("cells");
+        run_prepared(&ctx, &mut report, Some(prepared));
+        let kept = crate::disk::keep_used(&ctx);
+        (dir, ctx, leaf, report, kept)
+    };
+
+    let (_dir, ctx, leaf, report, kept) = checked(false);
+    let rows: Vec<Outcome> = report.outcomes().map(|(outcome, _)| outcome).collect();
+    assert_eq!(rows, vec![Outcome::Ok], "{}", report.render());
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].of, crate::disk::Dir::Side(leaf.clone()), "{kept:?}");
+    let record = std::fs::read(leaf.join(atpkg::build_cache::stale::USED)).expect("kept");
+    let record = atpkg::build_cache::stale::Kept::decode(&record).expect("a record");
+    let run = &record.runs[&crate::disk::run_key(&ctx)];
+    assert_eq!(run.members, BTreeSet::from(["app".to_owned()]));
+    assert_eq!(
+        run.profiles,
+        BTreeMap::from([(
+            format!("{TARGET}/release"),
+            BTreeSet::from([HASH.to_owned()])
+        )])
+    );
+
+    let (_failed, _, leaf, report, kept) = checked(true);
+    let text = report.render();
+    let rows: Vec<Outcome> = report.outcomes().map(|(outcome, _)| outcome).collect();
+    assert!(matches!(rows.as_slice(), [Outcome::Fail(_)]), "{text}");
+    assert!(text.contains("TYPE-ERROR"), "{text}");
+    assert!(kept.is_empty(), "{kept:?}");
+    assert!(!leaf.join(atpkg::build_cache::stale::USED).exists());
 }

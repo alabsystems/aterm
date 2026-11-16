@@ -56,8 +56,8 @@ pub const ENGINE_REGISTRY: &str = "external/registry";
 /// The installed release released-shim judges with: its store `targo` shim, the helper that
 /// shim names and its app's `Info.plist`.
 pub const RELEASE: &str = "release";
-/// The two newest fetched public release tags in the candidate's ancestry, which decide whether
-/// the installed release may judge.
+/// The two newest fetched public release tags in the candidate's ancestry at or before its
+/// workspace version, which decide whether the installed release may judge.
 pub const RELEASE_TAGS: &str = "release-tags";
 
 /// The fields every check reads.
@@ -925,8 +925,9 @@ fn release_files(ctx: &Ctx) -> Result<(Vec<PathBuf>, Vec<String>), String> {
     Ok((files, Vec::new()))
 }
 
-/// The two newest fetched public release tags in the candidate's ancestry, the ones
-/// released-shim picks its judging release from ([`crate::released_shim::public_releases`]).
+/// The two newest fetched public release tags in the candidate's ancestry at or before its
+/// workspace version, the ones released-shim picks its judging release from
+/// ([`crate::released_shim::public_releases`]).
 #[cfg(target_os = "macos")]
 fn release_tags(ctx: &Ctx) -> Result<String, String> {
     let manifest = std::fs::read_to_string(ctx.root.join("Cargo.toml"))

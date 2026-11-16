@@ -120,12 +120,12 @@ fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
             Page::row(
                 1,
                 "n-a",
-                "s-1",
+                "t0000003vsh",
                 "v=1 t=1 state=live",
-                "/f/f1/pub/n-a/s-1/presence",
+                "/f/f1/pub/n-a/t0000003vsh/presence",
             ),
-            Page::empty("/f/f1/pub/n-a/s-9/presence"),
-            Page::row(3, "n-b", "s-2", "v=1 t=2 attention=needs-you", ""),
+            Page::empty("/f/f1/pub/n-a/t0000003vss/presence"),
+            Page::row(3, "n-b", "t0000003vsj", "v=1 t=2 attention=needs-you", ""),
         ],
         &["--attention"],
     );
@@ -140,7 +140,11 @@ fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
 
 #[test]
 fn a_last_walk_that_never_ends_is_an_error_rather_than_a_short_roster() {
-    let (stdout, stderr, ok) = ls("bnd", vec![Page::empty("/f/f1/pub/n-a/s-1/presence")], &[]);
+    let (stdout, stderr, ok) = ls(
+        "bnd",
+        vec![Page::empty("/f/f1/pub/n-a/t0000003vsh/presence")],
+        &[],
+    );
     assert!(!ok, "an unfinished walk must not exit 0: {stdout:?}");
     assert!(stdout.is_empty(), "no partial roster: {stdout:?}\n{stderr}");
 }

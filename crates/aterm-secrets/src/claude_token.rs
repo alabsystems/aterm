@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Claude Code setup-tokens in the fleet vault (`docs/DESIGN-claude-setup-token-2026-11-05.md`
-//! §4.1–§4.3, slice S4): the typed calls that write, read, judge, verify and remove one account's
-//! token, the only code that reads or writes the class ([`crate::entry_class::claude_token`]).
+//! §4.1–§4.3, slice S4): the typed calls that write, read, judge, verify, settle and remove one
+//! account's token, the only code that reads or writes the class
+//! ([`crate::entry_class::claude_token`]).
 //!
 //! An account has two `[everyone]` entries, both `Consumed`: `aterm-claude-token-<key>`, the
 //! token, and `aterm-claude-token-<key>-meta`, a value-free JSON record ([`Meta`]). `<key>` is the
@@ -21,8 +22,8 @@
 //! presses `Authorize` only in the account's own session. A token made at a person's terminal, or
 //! one whose meta names no route (an earlier build's, or one an earlier build wrote again), is in
 //! use only on the Mac that minted it (its own seat signed the earliest `Put` of the value) until
-//! it is verified ([`Meta::verification`]: a comparison with the account's stored login, never an
-//! earlier build's stamp from a usage sample), then on every Mac. Verification is a label: it
+//! it is verified ([`Meta::verification`]: a comparison with the account's stored login on any Mac
+//! where that login works, never an earlier build's stamp from a usage sample), then on every Mac. Verification is a label: it
 //! widens a terminal token's use and never withdraws a token. A refusal of the token (Claude Code
 //! refused it on this Mac, [`note_refused`], kept beside this Mac's vault state), or a comparison
 //! that found its windows another account's (the harness's table there), is the observing Mac's
@@ -37,6 +38,7 @@ use crate::client::{
 };
 use crate::entry_class::{CLAUDE_TOKEN_META, CLAUDE_TOKEN_PREFIX};
 pub use crate::entry_class::{MintedBy, Mismatch};
+use crate::membership_log::entries::DraftPut;
 use crate::membership_log::entries::inner::{self, Form};
 use crate::membership_log::{Log, MemberId};
 use crate::text::Audience;
@@ -135,7 +137,8 @@ impl ExpiryFrom {
 /// What showed a token is the account its row names (§5.6): value-free.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verified {
-    /// The Mac that verified it.
+    /// The Mac that verified it: the seat that wrote the verification, whichever Mac minted the
+    /// token ([`verify`] reads it from the log).
     pub on: String,
     /// When (unix seconds).
     pub at: u64,
@@ -190,8 +193,9 @@ impl Meta {
     /// comparison with a reading of a session on the account's stored login. An earlier build's
     /// stamp from the row's usage sample is none, on every Mac, the minting one included: that
     /// sample can hold another account's readings, so the token serves only where its route
-    /// serves an unverified one ([`MintedBy::serves_unverified`]), and its minting Mac compares
-    /// it again, whose stamp by [`BY_WINDOWS`] replaces the earlier one ([`verify`]).
+    /// serves an unverified one ([`MintedBy::serves_unverified`]), and a Mac that holds the
+    /// account's stored login compares it again, whose stamp by [`BY_WINDOWS`] replaces the
+    /// earlier one ([`verify`]).
     #[must_use]
     pub fn verification(&self) -> Option<&Verified> {
         self.verified
@@ -491,6 +495,9 @@ pub struct TokenRead {
     /// The meta's value as the log holds it, beside [`TokenRead::token`]: what a verification
     /// stands on ([`verify`]), byte for byte, whatever build wrote it.
     meta_value: Option<SecretBytes>,
+    /// This Mac's seat's label in the log the read judged, where one is this Mac's: who a
+    /// verification names ([`verify`]).
+    seat: Option<String>,
     /// The standing.
     pub standing: Standing,
 }
@@ -564,6 +571,7 @@ fn write_pair(
         anchor: crate::client::Anchor::Drop,
         fleet_reads_anchors: false,
         read_as: read_as.cloned(),
+        settles: None,
     };
     member_write(
         paths,
@@ -612,6 +620,8 @@ fn read_until(paths: &Paths, key: &Key, deadline: Instant) -> Result<Lookup<Toke
         meta.as_ref(),
     )?;
     judged.standing.refused_at = refused_at(&refusals(paths), &judged.standing);
+    judged.seat =
+        own_actor(&snapshot.log, &snapshot.identity).map(|actor| seat_label(&snapshot.log, &actor));
     Ok(Lookup::Found(judged))
 }
 
@@ -692,10 +702,20 @@ const MAX_REFUSALS: usize = 1 << 16;
 /// The refusals file's schema.
 const REFUSALS_SCHEMA: i64 = 1;
 
-/// This Mac's refusals by account key: the refused token's `minted_at` and when the refusal was
-/// recorded. A file that is absent or does not read holds none: each session here meets a refused
-/// token's refusal again at its next request, which records it again ([`note_refused`]).
-fn refusals(paths: &Paths) -> BTreeMap<String, (u64, u64)> {
+/// One refusal this Mac recorded ([`note_refused`]): the refused token's `minted_at`, when the
+/// refusal was recorded, and the HTTP status Claude Code refused it with, where the record names
+/// one (a record an earlier build wrote names none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Refusal {
+    minted_at: u64,
+    at: u64,
+    status: Option<u16>,
+}
+
+/// This Mac's refusals by account key ([`Refusal`]). A file that is absent or does not read holds
+/// none: each session here meets a refused token's refusal again at its next request, which
+/// records it again ([`note_refused`]).
+fn refusals(paths: &Paths) -> BTreeMap<String, Refusal> {
     let Ok(Some(bytes)) = crate::fsx::read_private(&paths.dir.join(REFUSALS), MAX_REFUSALS) else {
         return BTreeMap::new();
     };
@@ -715,30 +735,55 @@ fn refusals(paths: &Paths) -> BTreeMap<String, (u64, u64)> {
         .flatten()
         .filter_map(|row| {
             let key = Key::parse(row.get("key")?.as_str()?)?;
-            Some((key.0, (secs(row, "minted_at")?, secs(row, "at")?)))
+            let status = row
+                .get("status")
+                .and_then(aterm_json::Value::as_i64)
+                .and_then(|n| u16::try_from(n).ok());
+            Some((
+                key.0,
+                Refusal {
+                    minted_at: secs(row, "minted_at")?,
+                    at: secs(row, "at")?,
+                    status,
+                },
+            ))
         })
         .collect()
 }
 
-/// When this Mac refused the token `standing` reads, by `refused`: only a refusal of that very
+/// This Mac's refusal of the token `standing` reads, by `refused`: only a refusal of that very
 /// token, the one its meta's `minted_at` names, counts, so a newer token is never one refused.
-fn refused_at(refused: &BTreeMap<String, (u64, u64)>, standing: &Standing) -> Option<u64> {
-    let (minted_at, at) = refused.get(standing.key.as_str())?;
-    (standing.meta.as_ref()?.minted_at == *minted_at).then_some(*at)
+fn refusal_of(refused: &BTreeMap<String, Refusal>, standing: &Standing) -> Option<Refusal> {
+    let refusal = refused.get(standing.key.as_str())?;
+    (standing.meta.as_ref()?.minted_at == refusal.minted_at).then_some(*refusal)
 }
 
-/// RECORDS THIS MAC'S REFUSAL OF A TOKEN (§5.6): Claude Code refused, on this Mac at `now`, the
-/// token whose standing is `standing`. The refusal is kept beside this Mac's vault state, value-free
-/// (the account's key, the token's `minted_at`, when), and never written to the vault: it is this
-/// Mac's observation, and each Mac's sessions meet the same refusal at their next request. Every
-/// later reading here judges that token `rejected` ([`State::Rejected`]: not in use), until a newer
-/// one replaces it; a refusal of the newer one replaces the older record. Returns whether this call
-/// recorded it first; a standing with no meta names no token and records nothing.
+/// When this Mac refused the token `standing` reads, by `refused` ([`refusal_of`]).
+fn refused_at(refused: &BTreeMap<String, Refusal>, standing: &Standing) -> Option<u64> {
+    refusal_of(refused, standing).map(|refusal| refusal.at)
+}
+
+/// The HTTP status Claude Code refused the token `standing` reads with on this Mac, as the refusal
+/// this Mac recorded of that very token names it ([`note_refused`]): `None` where this Mac
+/// recorded no refusal of it, or the record names no status (an earlier build's).
+#[must_use]
+pub fn refused_status(paths: &Paths, standing: &Standing) -> Option<u16> {
+    refusal_of(&refusals(paths), standing)?.status
+}
+
+/// RECORDS THIS MAC'S REFUSAL OF A TOKEN (§5.6): Claude Code refused, on this Mac at `now` and
+/// with the HTTP status `status`, the token whose standing is `standing`. The refusal is kept
+/// beside this Mac's vault state, value-free (the account's key, the token's `minted_at`, when,
+/// the status), and never written to the vault: it is this Mac's observation, and each Mac's
+/// sessions meet the same refusal at their next request. Every later reading here judges that
+/// token `rejected` ([`State::Rejected`]: not in use), until a newer one replaces it; a refusal of
+/// the newer one replaces the older record. Returns whether this call recorded it first; a
+/// standing with no meta names no token and records nothing.
 ///
 /// # Errors
 /// This Mac's vault state folder or the refusals file cannot be written, or another writer held
 /// the refusals file's lock past [`REFUSALS_WAIT`].
-pub fn note_refused(paths: &Paths, standing: &Standing, now: u64) -> Result<bool> {
+pub fn note_refused(paths: &Paths, standing: &Standing, status: u16, now: u64) -> Result<bool> {
     let Some(meta) = standing.meta.as_ref() else {
         return Ok(false);
     };
@@ -754,11 +799,26 @@ pub fn note_refused(paths: &Paths, standing: &Standing, now: u64) -> Result<bool
     if refused_at(&refused, standing).is_some() {
         return Ok(false);
     }
-    refused.insert(standing.key.0.clone(), (meta.minted_at, now));
+    refused.insert(
+        standing.key.0.clone(),
+        Refusal {
+            minted_at: meta.minted_at,
+            at: now,
+            status: Some(status),
+        },
+    );
     let rows: Vec<aterm_json::Value> = refused
         .iter()
-        .map(|(key, (minted_at, at))| {
-            aterm_json::json!({"key": key, "minted_at": minted_at, "at": at})
+        .map(|(key, refusal)| {
+            let mut row = aterm_json::json!({
+                "key": key,
+                "minted_at": refusal.minted_at,
+                "at": refusal.at,
+            });
+            if let (Some(status), Some(fields)) = (refusal.status, row.as_object_mut()) {
+                fields.insert("status".to_owned(), aterm_json::json!(status));
+            }
+            row
         })
         .collect();
     let text =
@@ -793,7 +853,11 @@ pub fn seat_here(paths: &Paths) -> Result<Option<String>> {
 }
 
 /// The standing of the account `key`'s entries `token` and `meta` (each as the log decodes it),
-/// as `identity` opens `log` (`opened`), and the token where it passes.
+/// as `identity` opens `log` (`opened`), and the token where it passes. A pair whose two names'
+/// winners come from different drafts, or whose registers hold concurrent writes, reads
+/// `mismatched (draft)` before any parse of its values: the winner's meta may be one this build
+/// does not read (a later schema's, a refutation's), and the pair is still one [`settle`] makes
+/// whole, which `mismatched (value)` would never send it to.
 fn judge(
     log: &Log,
     identity: &crate::age::Identity,
@@ -811,12 +875,12 @@ fn judge(
         [Some(Form::Unreadable(_)), _] | [_, Some(Form::Unreadable(_))] => Check::Unreadable,
         [Some(Form::Unsealed), _] | [_, Some(Form::Unsealed)] => Check::Mismatched(Mismatch::Value),
         [Some(Form::Opened(token)), Some(Form::Opened(_))] => {
-            if !value_grammar(token) || parsed.is_none() {
-                Check::Mismatched(Mismatch::Value)
-            } else if one_draft(log, opened, key) {
-                Check::Readable
-            } else {
+            if !one_draft(log, opened, key) {
                 Check::Mismatched(Mismatch::Draft)
+            } else if !value_grammar(token) || parsed.is_none() {
+                Check::Mismatched(Mismatch::Value)
+            } else {
+                Check::Readable
             }
         }
         [Some(Form::Opened(token)), None] if !value_grammar(token) => {
@@ -839,6 +903,7 @@ fn judge(
             return Ok(TokenRead {
                 token: None,
                 meta_value: None,
+                seat: None,
                 standing,
             });
         }
@@ -852,6 +917,7 @@ fn judge(
     Ok(TokenRead {
         token: Some(token),
         meta_value: Some(meta),
+        seat: None,
         standing,
     })
 }
@@ -926,20 +992,26 @@ fn exposure(log: &Log, lineage: &crate::membership_log::entries::Lineage) -> Vec
 
 /// Write the account `key`'s token again with its meta's `verified` set to `evidence`, both in
 /// one draft (§5.6): the same token, the meta with the verification (its route, `minted_by`,
-/// kept). Only the Mac that minted the token verifies it; any other is refused, and so is a token
-/// that does not read as one here. `minted_at` names the token the evidence was read on (its
-/// meta's `minted_at` in the standing the reading was judged against): where the vault's token is
-/// another (a replacement landed before this call read it), the write is refused, so a
-/// verification never stamps a token it did not compare. A verification is of the pair it read:
-/// each entry stands on the value it read ([`MemberEntry::read_as`]: the token, and the meta byte
-/// for byte as the log holds it), so the write is refused where the token or its meta changed
-/// before the write lands: at its draft, where the log holds another value or concurrent values (a
-/// replacement that committed after this read, this Mac's own or one a vault pass applied, another
-/// Mac's token beside it included), and as it lands what waits, where a write of this Mac's still
-/// to be signed leaves the name otherwise (a `--replace` that waits for the vault pass, whose
-/// token sessions here do not use yet, even one that keeps the token and changes only its meta). A
-/// verification that itself waits for the vault pass is dropped there as overtaken, both entries,
-/// where either changed by then. It never replaces a newer token or meta and settles no conflict.
+/// kept). Any seated Mac verifies it, the one that minted it or another: the harness compares the
+/// token's windows with a reading of the account's stored login wherever that login works, and
+/// the comparison is what verifies. The verification names this Mac's seat in the log
+/// ([`Verified::on`]), whatever `evidence` says. A token that does not read as one here is
+/// refused: a refutation among them, which a later build writes as a meta of a later schema this
+/// build does not parse (`mismatched (value)`), so no verification is ever written over one.
+/// `minted_at` names the token the evidence was read on (its meta's `minted_at` in the standing
+/// the reading was judged against): where the vault's token is another (a replacement landed
+/// before this call read it), the write is refused, so a verification never stamps a token it
+/// did not compare. A verification is of
+/// the pair it read: each entry stands on the value it read ([`MemberEntry::read_as`]: the token,
+/// and the meta byte for byte as the log holds it), so the write is refused where the token or
+/// its meta changed before the write lands: at its draft, where the log holds another value or
+/// concurrent values (a replacement that committed after this read, this Mac's own or one a vault
+/// pass applied, another Mac's token beside it included), and as it lands what waits, where a
+/// write of this Mac's still to be signed leaves the name otherwise (a `--replace` that waits for
+/// the vault pass, whose token sessions here do not use yet, even one that keeps the token and
+/// changes only its meta). A verification that itself waits for the vault pass is dropped there
+/// as overtaken, both entries, where either changed by then. It never replaces a newer token or
+/// meta and settles no conflict: two Macs' concurrent writes of the pair are [`settle`]'s.
 ///
 /// # Errors
 /// As [`write`].
@@ -947,7 +1019,7 @@ pub fn verify(
     paths: &Paths,
     key: &Key,
     minted_at: u64,
-    evidence: Verified,
+    mut evidence: Verified,
     on_busy: OnBusy,
 ) -> Result<MemberWritten> {
     let deadline = match on_busy {
@@ -980,14 +1052,316 @@ pub fn verify(
             key.as_str()
         )));
     }
-    if !read.standing.minted_here {
-        return Ok(MemberWritten::Refused(
-            "only the Mac that minted a token verifies it".to_owned(),
-        ));
-    }
+    let Some(seat) = read.seat.clone() else {
+        return Ok(MemberWritten::NotSeated);
+    };
+    evidence.on = seat;
     let mut meta = meta.clone();
     meta.verified = Some(evidence);
     write_pair(paths, key, token, &meta, Some((token, meta_value)), on_busy)
+}
+
+/// Whether the meta `bytes` carries a refutation: a non-null `refuted`, which a later build writes
+/// where a comparison found the token another account's, in a meta of a later schema this build
+/// does not parse. This build reads it only to keep it at a settle ([`merged_meta`]).
+fn refuted(bytes: &[u8]) -> bool {
+    aterm_json::from_slice::<aterm_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value.get("refuted").cloned())
+        .is_some_and(|refuted| !refuted.is_null())
+}
+
+/// What [`settle`] did of an account's pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// No concurrent writes split the pair: nothing to settle.
+    Nothing,
+    /// Another Mac's turn it is to settle it ([`settle`]), whose seat's label this is: display
+    /// only, since two Macs can share a label and the turn is a seat's.
+    Theirs(String),
+    /// Nothing written, and why (value-free): a removal among the siblings, a sibling this Mac
+    /// does not open, no meta of the token beside it, or a vault state that could not be read
+    /// just now.
+    Held(String),
+    /// This Mac settled it: what became of its draft.
+    Written(MemberWritten),
+}
+
+/// How long one seat's turn to settle a split pair lasts before the next seat's begins
+/// ([`settle_turn`]): long enough for the Mac whose turn it is to reach the pair at its own
+/// accounts upkeep, a vault held busy for a while included, and short enough that a Mac off the
+/// LAN, asleep or on a build with no settle leaves the pair split, and served by no Mac, for one
+/// turn and no longer.
+pub const SETTLE_TURN_SECS: u64 = 30 * 60;
+
+/// The seat whose turn it is at `now` (unix seconds) to settle a pair split since `split_at` (the
+/// latest of its siblings' drafts, by its writer's clock): `first` where one is named (the
+/// writer of the pair [`settle`] keeps, where the siblings carry different tokens), then each
+/// other of `writers` (the siblings' current writers), then each other of `members` (every
+/// current seat), each group in seat order, every turn [`SETTLE_TURN_SECS`] long, round and round
+/// from the split on. Every Mac that reads the same siblings reads the same order and the same
+/// turn (their clocks apart by less than a turn), so one seat settles at a time; a seat whose turn
+/// passes unsettled hands it on. Seats, never labels, take turns: two Macs can share a label, and
+/// one seat is one Mac. `None` where no seat is current.
+pub(crate) fn settle_turn(
+    first: Option<MemberId>,
+    writers: &BTreeSet<MemberId>,
+    members: &BTreeSet<MemberId>,
+    split_at: u64,
+    now: u64,
+) -> Option<MemberId> {
+    let order: Vec<MemberId> = first
+        .into_iter()
+        .chain(writers.iter().copied().filter(|seat| Some(*seat) != first))
+        .chain(
+            members
+                .iter()
+                .copied()
+                .filter(|seat| Some(*seat) != first && !writers.contains(seat)),
+        )
+        .collect();
+    let turns = u64::try_from(order.len()).ok().filter(|turns| *turns > 0)?;
+    let turn = now.saturating_sub(split_at) / SETTLE_TURN_SECS % turns;
+    order.get(usize::try_from(turn).ok()?).copied()
+}
+
+/// The meta of `metas` (each opened, beside its op) a settle keeps where the siblings carry one
+/// token: a refutation before a verification ([`Meta::verification`]) before neither, ties to the
+/// lowest op, so every Mac that reads the same siblings picks the same one. `metas` holds only the
+/// metas written beside the token ([`settle`]).
+fn merged_meta<'a>(
+    metas: &[(crate::membership_log::RecordId, &'a [u8])],
+) -> Option<(crate::membership_log::RecordId, &'a [u8])> {
+    let merit = |bytes: &[u8]| {
+        if refuted(bytes) {
+            2
+        } else if Meta::from_json(bytes).is_some_and(|meta| meta.verification().is_some()) {
+            1
+        } else {
+            0
+        }
+    };
+    metas
+        .iter()
+        .min_by(|(a_id, a), (b_id, b)| merit(*b).cmp(&merit(*a)).then(a_id.cmp(b_id)))
+        .copied()
+}
+
+/// The `minted_at` the meta `bytes` names, read from its JSON whatever its schema (a later
+/// build's refutation included): which token of two concurrent replacements is the later mint
+/// ([`settle`]). `None` where it names none.
+fn minted_at_of(bytes: &[u8]) -> Option<u64> {
+    aterm_json::from_slice::<aterm_json::Value>(bytes)
+        .ok()?
+        .get("minted_at")?
+        .as_u64()
+}
+
+/// Each of `values` (a register's ops, [`Log::everyone_values`]) opened, where every one is: a
+/// `Put` whose inner seal this Mac opens.
+fn opened_values(values: &[Option<SecretBytes>]) -> Option<Vec<&[u8]>> {
+    values
+        .iter()
+        .map(|value| match inner::of(value.as_ref()?.as_slice()) {
+            Form::Opened(bytes) => Some(bytes),
+            Form::Unreadable(_) | Form::Unsealed => None,
+        })
+        .collect()
+}
+
+/// SETTLES CONCURRENT WRITES OF THE ACCOUNT `key`'S PAIR (§5.6): two Macs that wrote the pair at
+/// once (a verification and a refutation, say) leave a name's register with siblings, which split
+/// the pair's draft (`mismatched (draft)`), so no Mac serves it. One Mac writes the pair again, in
+/// one draft standing on every sibling it read ([`MemberEntry::settles`]), never on a write it did
+/// not see:
+///
+/// - the token is one no Mac refuted where one stands (a refuted token is never served, so
+///   keeping it would leave the account no token any Mac uses), then the latest mint's: of the
+///   tokens the token's register holds, the one beside which a meta names the greatest
+///   `minted_at`, by the minting Mac's clock (a person's later replacement stands over an earlier
+///   one, so no Mac's row of the account moves back to a token the settle dropped), the
+///   register's winner where two name the same;
+/// - the meta is the one that weighs most ([`merged_meta`]: refuted, then verified, then
+///   neither), byte for byte as the log holds it, of the metas whose draft wrote that token
+///   beside them: a meta whose draft's token the register no longer holds is another token's (a
+///   verification whose put of the token it compared a concurrent replacement took out, as a
+///   re-put of a value held is), so it never lands beside this one. A meta that is a reseal's
+///   carry counts as the write it carries
+///   ([`stands_for`](crate::membership_log::entries::OpenedAudienceEntries::stands_for)): a
+///   reseal re-puts each register's winner in one draft of its own, and the two winners may come
+///   from two drafts. A token beside which no meta stands is not kept, and where no meta stands
+///   beside any token the register holds, nothing is written. Where a write a meta stands for
+///   holds a `Put` this Mac does not open (which may be the token beside it), the pair is not
+///   this Mac's to settle: it writes nothing, and a Mac that opens it settles it.
+///
+/// Whose turn it is to write is a seat's ([`settle_turn`], at `now`, unix seconds): first the
+/// writer of the kept pair where the tokens differ, then the siblings' current writers,
+/// then every other current seat, each in seat order for [`SETTLE_TURN_SECS`] from the split, so
+/// a Mac that never settles (off the LAN, asleep, on a build with no settle) holds the pair for
+/// one turn. A writer the log now removes takes no turn. This Mac writes where the turn is its
+/// own seat; any other reads [`Settled::Theirs`] and writes nothing. It never mints, never waits
+/// for a vault pass (busy past `by`, it writes nothing; the next reading settles), and nothing of
+/// a value leaves it.
+///
+/// # Errors
+/// This Mac's state or records cannot be read or written, or a record addressed to it does not
+/// open.
+pub fn settle(paths: &Paths, key: &Key, now: u64, by: Instant) -> Result<Settled> {
+    let held = |why: &str| Ok(Settled::Held(why.to_owned()));
+    let (entry, meta_entry) = (key.entry(), key.meta_entry());
+    let Some(snapshot) = read_claude_token_until(paths, &[&entry, &meta_entry], by)? else {
+        return held("this Mac's vault state could not be read just now");
+    };
+    let (log, identity) = (&snapshot.log, &snapshot.identity);
+    let Some(opened) = log.open_audience_entries(identity)? else {
+        return held("this Mac's vault state could not be read just now");
+    };
+    let ops = [
+        opened.everyone_ops(&entry),
+        opened.everyone_ops(&meta_entry),
+    ];
+    if ops.iter().all(|ops| ops.len() < 2) {
+        return Ok(Settled::Nothing);
+    }
+    let (tokens, metas) = (
+        log.everyone_values(&opened, &entry, &ops[0])?,
+        log.everyone_values(&opened, &meta_entry, &ops[1])?,
+    );
+    let (Some(tokens), Some(metas)) = (opened_values(&tokens), opened_values(&metas)) else {
+        return held("a write of the pair is a removal, or does not open here");
+    };
+    let draft_of = |id: &crate::membership_log::RecordId| {
+        let record = log.get(id)?;
+        let crate::membership_log::Body::Put { epoch, .. } = record.body() else {
+            return None;
+        };
+        Some((*record.actor(), record.authored_ms(), *epoch))
+    };
+    let Some(first) = tokens.first() else {
+        return held("the pair holds no token");
+    };
+    let membership = log.membership_ref();
+    let current = |seat: &MemberId| membership.removal(seat).is_none();
+    // The writers a current Mac is (a removed one settles nothing, so its turn never comes), and
+    // when the latest sibling was drafted.
+    let (mut writers, mut split_ms) = (BTreeSet::new(), 0);
+    for id in ops.iter().flatten() {
+        let Some((actor, authored_ms, _)) = draft_of(id) else {
+            return held("a write of the pair is a removal, or does not open here");
+        };
+        if current(&actor) {
+            writers.insert(actor);
+        }
+        split_ms = split_ms.max(authored_ms);
+    }
+    let one_token = tokens.iter().all(|token| aterm_digest::ct_eq(token, first));
+    // Each meta beside the token its draft wrote with it, by that token's first place among the
+    // token register's ops: the draft of the write the meta stands for (a reseal's carry stands
+    // for the write whose value it carries, never for its own draft, which pairs two registers'
+    // winners), where the register still holds the token that draft put. A meta whose draft's
+    // token the register no longer holds is another token's (a verification whose put of the
+    // token it compared a concurrent replacement took out), so it never lands beside this one.
+    // A write this Mac cannot open may be the token a meta stands beside: the pair is then not
+    // this Mac's to settle, and a Mac that opens it settles it.
+    let mut drafts = Vec::with_capacity(metas.len());
+    for id in &ops[1] {
+        let Some((actor, authored_ms, epoch)) = draft_of(&opened.stands_for(id)) else {
+            return held("a write of the pair is a removal, or does not open here");
+        };
+        drafts.push((actor, authored_ms, epoch));
+    }
+    let mut beside = Vec::with_capacity(metas.len());
+    let written = log.everyone_puts_of_drafts(&opened, &entry, &drafts)?;
+    for ((id, meta), put) in ops[1].iter().zip(metas.iter().copied()).zip(written) {
+        let put = match put {
+            DraftPut::Wrote(put) => put,
+            DraftPut::Nothing => continue,
+            DraftPut::Unopened => {
+                return held("a write a meta of the pair stands for does not open here");
+            }
+        };
+        let Form::Opened(with) = inner::of(put.as_slice()) else {
+            return held("a write of the pair is a removal, or does not open here");
+        };
+        if let Some(place) = tokens
+            .iter()
+            .position(|token| aterm_digest::ct_eq(token, with))
+        {
+            beside.push((place, *id, meta));
+        }
+    }
+    // The token kept is one no Mac refuted where one stands, then the latest mint's: the one
+    // whose meta names the greatest `minted_at`, the token register's winner where two name the
+    // same. A refuted token is never served, so a settle that kept it beside one that may still
+    // verify would leave the account with no token any Mac uses; a person's later replacement
+    // stands over an earlier one, and no Mac's row of the account moves back to a token the
+    // settle dropped.
+    let winner = opened
+        .winning_puts
+        .get(&(Audience::Everyone, entry.clone()))
+        .copied();
+    let refuted_token = |at: usize| {
+        beside
+            .iter()
+            .any(|(place, _, meta)| *place == at && refuted(meta))
+    };
+    let Some(&(place, ..)) = beside.iter().max_by_key(|(place, _, meta)| {
+        (
+            !refuted_token(*place),
+            minted_at_of(meta),
+            Some(ops[0][*place]) == winner,
+            std::cmp::Reverse(*place),
+        )
+    }) else {
+        return held("no meta written beside a token the pair holds");
+    };
+    let with_token: Vec<_> = beside
+        .iter()
+        .filter(|(at, ..)| *at == place)
+        .map(|(_, id, meta)| (*id, *meta))
+        .collect();
+    let Some((kept, meta)) = merged_meta(&with_token) else {
+        return held("no meta written beside a token the pair holds");
+    };
+    let first_turn = if one_token {
+        None
+    } else {
+        draft_of(&opened.stands_for(&kept))
+            .map(|(actor, ..)| actor)
+            .filter(current)
+    };
+    let token = tokens[place];
+    if !value_grammar(token) {
+        return held("the pair's token is not a setup-token");
+    }
+    let members: BTreeSet<MemberId> = membership
+        .members()
+        .keys()
+        .copied()
+        .filter(current)
+        .collect();
+    let Some(turn) = settle_turn(first_turn, &writers, &members, split_ms / 1_000, now) else {
+        return held("the pair has no current seat to settle it");
+    };
+    if own_actor(log, identity) != Some(turn) {
+        return Ok(Settled::Theirs(seat_label(log, &turn)));
+    }
+    let put =
+        |name: String, value: &[u8], settles: &[crate::membership_log::RecordId]| MemberEntry {
+            name,
+            value: SecretBytes::from(value),
+            if_absent: false,
+            anchor: crate::client::Anchor::Drop,
+            fleet_reads_anchors: false,
+            read_as: None,
+            settles: Some(settles.iter().copied().collect()),
+        };
+    let entries = [put(entry, token, &ops[0]), put(meta_entry, meta, &ops[1])];
+    Ok(Settled::Written(member_write(
+        paths,
+        &entries,
+        OnBusy::Refuse(by),
+    )?))
 }
 
 /// Remove the account `key`'s token and meta, both in one draft under a fresh `[everyone]` epoch

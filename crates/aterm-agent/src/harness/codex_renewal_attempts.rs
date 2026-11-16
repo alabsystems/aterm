@@ -765,7 +765,20 @@ pub fn with_receipt_writer<T>(
     let store = env
         .accounts_store_for(accounts::Cli::Codex)
         .ok_or("store-unavailable")?;
-    let Some(guard) = store.acquire_bounded().map_err(|_| "receipt-lock")? else {
+    with_receipt_writer_of(env, &store, use_writer)
+}
+
+/// [`with_receipt_writer`] under the lock of `store`, `env`'s Codex store, taken on that store's
+/// own ladder ([`accounts::Store::acquire_bounded`]): a store [`accounts::Store::bounded_by`] an
+/// empty ladder tries it once, and `Ok(None)` is then a lock another writer holds now.
+/// # Errors
+/// The lock failed, or the callback failed.
+pub(in crate::harness) fn with_receipt_writer_of<T>(
+    env: &Env,
+    store: &accounts::Store,
+    use_writer: impl FnOnce(&ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    let Some(guard) = store.acquire_bounded().map_err(|_| RECEIPT_LOCK)? else {
         return Ok(None);
     };
     use_writer(&ReceiptWriter::held(env, &guard)).map(Some)

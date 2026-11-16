@@ -805,7 +805,7 @@ impl Planner<'_> {
 
     /// A cell a guard refuses: its coordinate is kept for the owner, and a finding says no cell
     /// holds it.
-    fn refused(
+    pub(super) fn refused(
         &mut self,
         collection: &'static crate::typed::Collection,
         pk: &str,
@@ -1552,11 +1552,7 @@ impl Planner<'_> {
         if let Some(at) =
             nick_at.filter(|_| !read.conflicted("aliases") && !read.conflicted("nickname_aliases"))
         {
-            if nick_aliases.len() > 8 {
-                self.refused(&MACHINE, &pk, "nickname_aliases", at.clone());
-            }
-            nick_aliases.truncate(8);
-            self.want(&MACHINE, &pk, "nickname_aliases", json!(nick_aliases), &at);
+            self.texts(&MACHINE, &pk, "nickname_aliases", nick_aliases, &at);
         }
         if let Some((node, at)) = self.agreed(MACHINE.name, &pk, "node_id", read.get("node_id")) {
             let node = node.to_ascii_lowercase();
@@ -1576,9 +1572,7 @@ impl Planner<'_> {
             && names::host_given(&host, raw.trim())
         {
             if guard::text(&host, 64).is_ok() && !host.contains('@') {
-                if let Some(hosts) = self.hosts_cell(&pk, &host, &at) {
-                    self.want(&MACHINE, &pk, "hosts", hosts, &at);
-                }
+                self.want_host(&pk, &host, &at);
             } else {
                 self.refused(&MACHINE, &pk, "hostname", at);
             }

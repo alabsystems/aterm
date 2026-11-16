@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pinned `targo` command builder for performance lanes.
+//! Pinned `targo` command builder for performance lanes, and the executables its builds report.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -48,6 +48,7 @@ impl CargoDriver {
     }
 
     /// `<targo> [--unverified] <verb>`, ready for the caller's own arguments.
+    #[cfg(unix)]
     pub(crate) fn command(&self, verb: &str) -> Command {
         let mut cmd = self.base_command();
         cmd.args(Self::lead(verb, None));
@@ -159,6 +160,7 @@ pub(super) fn apply_workspace_layout(command: &mut Command) -> Result<(), String
 }
 
 /// The captured workspace target shared by artifact readers and native compiler commands.
+#[cfg(unix)]
 pub(crate) fn target_dir() -> Result<PathBuf, String> {
     workspace_layout()
         .plan
@@ -188,6 +190,84 @@ pub(crate) fn cargo_driver() -> Result<&'static CargoDriver, &'static str> {
         })
         .as_ref()
         .map_err(String::as_str)
+}
+
+/// Cargo's exact executable artifact, matched by both target name and target kind.
+pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result<PathBuf, String> {
+    built_executable_checked(messages, name, kind, |_| Ok(()))
+}
+
+/// A normal debug executable whose compiler profile enables the checkout's lab identity.
+/// Test harnesses and missing or disabled debug assertions cannot supply that fixture.
+#[cfg(any(unix, test))]
+pub(crate) fn built_debug_app(messages: &str, name: &str) -> Result<PathBuf, String> {
+    built_executable_checked(messages, name, "bin", |message| {
+        let profile = message.get("profile");
+        if profile
+            .and_then(|p| p.get("debug_assertions"))
+            .and_then(aterm_json::Value::as_bool)
+            != Some(true)
+            || profile
+                .and_then(|p| p.get("test"))
+                .and_then(aterm_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err(format!(
+                "`{name}` lab fixture requires a normal executable with debug assertions enabled"
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn built_executable_checked(
+    messages: &str,
+    name: &str,
+    kind: &str,
+    accept: impl Fn(&aterm_json::Value) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    let mut selected: Option<PathBuf> = None;
+    for line in messages.lines() {
+        let Ok(wire) = aterm_json::from_str::<crate::compiler_message::UnitMessage>(line) else {
+            continue;
+        };
+        let message = match wire {
+            crate::compiler_message::UnitMessage::Unit(value) => value,
+            crate::compiler_message::UnitMessage::Other => continue,
+            crate::compiler_message::UnitMessage::Ambiguous { .. } => {
+                return Err("compiler reported ambiguous message fields".into());
+            }
+        };
+        if message.get("reason").and_then(aterm_json::Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(path) = message
+            .get("executable")
+            .and_then(aterm_json::Value::as_str)
+        else {
+            continue;
+        };
+        let kinds = crate::compiler_message::artifact_target_kinds(&message)?;
+        let target = message.get("target");
+        let named = target
+            .and_then(|t| t.get("name"))
+            .and_then(aterm_json::Value::as_str)
+            == Some(name);
+        let bin = kinds.contains(&kind);
+        if named && bin {
+            accept(&message)?;
+            if selected
+                .as_ref()
+                .is_some_and(|prior| prior.as_os_str() != std::ffi::OsStr::new(path))
+            {
+                return Err(format!(
+                    "compiler reported conflicting executables for `{name}`"
+                ));
+            }
+            selected.get_or_insert_with(|| PathBuf::from(path));
+        }
+    }
+    selected.ok_or_else(|| format!("cargo reported no `{name}` binary"))
 }
 
 #[cfg(test)]

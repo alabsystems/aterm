@@ -28,7 +28,7 @@ fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &str) -> Str
     cmd_deliver(
         store,
         &format!(
-            "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} text={text}"
+            "{sid} off={off} from=tpeer000000@n-lab kind=note trust=agent topic={topic} text={text}"
         ),
     )
 }
@@ -199,14 +199,14 @@ fn a_broadcast_its_refilling_bridge_let_go_of_is_counted_lost() {
         assert_eq!(shout(20, "h-andrew"), "OK 1\n");
         let cap = u64::try_from(RING_CAP).unwrap();
         for i in 1..cap {
-            assert!(shout(100 + i, &format!("s-x@n-p{i}")).starts_with("OK "));
+            assert!(shout(100 + i, &format!("txxxxxxxxxx@n-p{i}")).starts_with("OK "));
         }
         assert_eq!(
             carried(&pctx),
             (cap, cap),
             "fewer than the bound came after it"
         );
-        assert!(shout(100 + cap, &format!("s-x@n-p{cap}")).starts_with("OK "));
+        assert!(shout(100 + cap, &format!("txxxxxxxxxx@n-p{cap}")).starts_with("OK "));
         assert!(
             pctx.fabric
                 .with_inbox_for_test(|i| i.rows.iter().any(|r| r.id == 1)),
@@ -236,16 +236,19 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             "OK\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one"),
+            deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "one"),
             "OK 1\n"
         );
         assert_eq!(
             deliver(&store, &sid, 11, "h-andrew", "task", "two"),
             "OK 2\n"
         );
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note gone", None), "OK 1\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=note waiting", None),
+            cmd_post(&ctx, "to=@tpeer000000 kind=note gone", None),
+            "OK 1\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note waiting", None),
             "OK 2\n"
         );
         assert_eq!(
@@ -259,7 +262,7 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
         let drain = cmd_outbox(&successor, "");
         assert!(
             drain.contains(&format!(
-                "post sid={new_sid} id=2 to=@s-peer kind=note len=7\nwaiting"
+                "post sid={new_sid} id=2 to=@tpeer000000 kind=note len=7\nwaiting"
             )),
             "the queued post is on the successor's drain: {drain}"
         );
@@ -269,7 +272,7 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
         );
         assert!(
             drain.contains(&format!(
-                "receipt sid={new_sid} rid=1 off=10 verdict=handled kind=ask from=s-peer@n-lab"
+                "receipt sid={new_sid} rid=1 off=10 verdict=handled kind=ask from=tpeer000000@n-lab"
             )),
             "the owed receipt is on the successor's drain: {drain}"
         );
@@ -279,7 +282,7 @@ fn a_seamless_update_carries_the_outbox_the_receipts_and_the_ids() {
             format!("OK {next_row}\n")
         );
         assert_eq!(
-            cmd_post(new_ctx, "to=@s-peer kind=note next", None),
+            cmd_post(new_ctx, "to=@tpeer000000 kind=note next", None),
             "OK 3\n"
         );
         assert_eq!(
@@ -307,13 +310,16 @@ fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
         let tell = |ident: String| cmd_link(&store, &format!("log {ident}"), Some(generation));
         assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
         for (off, text, row) in [(10, "a0", "OK 1\n"), (11, "a1", "OK 2\n")] {
-            assert_eq!(deliver(&store, &sid, off, "s-peer@n-lab", "ask", text), row);
+            assert_eq!(
+                deliver(&store, &sid, off, "tpeer000000@n-lab", "ask", text),
+                row
+            );
         }
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(tell(format!("{}.0", "bb".repeat(16))), "OK forgot=1\n");
         assert_eq!(cmd_inbox_seen(&ctx, "2 deferred"), "OK seen=2\n");
         assert_eq!(
-            deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "b0"),
+            deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "b0"),
             "OK 3\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "3 handled"), "OK seen=3\n");
@@ -328,14 +334,14 @@ fn a_receipt_for_a_row_of_an_earlier_log_is_listed_as_one_across_an_update() {
             [
                 format!(
                     "receipt sid={sid} rid=1 off=10 verdict=handled kind=ask \
-                     from=s-peer@n-lab log=earlier"
+                     from=tpeer000000@n-lab log=earlier"
                 ),
                 format!(
                     "receipt sid={sid} rid=2 off=11 verdict=deferred kind=ask \
-                     from=s-peer@n-lab log=earlier"
+                     from=tpeer000000@n-lab log=earlier"
                 ),
                 format!(
-                    "receipt sid={sid} rid=3 off=10 verdict=handled kind=ask from=s-peer@n-lab"
+                    "receipt sid={sid} rid=3 off=10 verdict=handled kind=ask from=tpeer000000@n-lab"
                 ),
             ]
         };
@@ -386,7 +392,7 @@ fn unknown_carried_receipts_stay_fenced_before_the_first_log_report() {
                 off: 7,
                 verdict: "handled".to_string(),
                 kind: "ask".to_string(),
-                from: "s-peer@n-lab".to_string(),
+                from: "tpeer000000@n-lab".to_string(),
             }],
             ..FabricCarry::default()
         };
@@ -407,11 +413,11 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
     with_link(|| {
         let store = new_store();
         let (sid, ctx) = registered(&store, 1);
-        deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
+        deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "one");
         deliver(&store, &sid, 11, "h-andrew", "task", "two");
         for (n, text) in [(1, "landed"), (2, "queued"), (3, "queued-too")] {
             assert_eq!(
-                cmd_post(&ctx, &format!("to=@s-peer kind=note {text}"), None),
+                cmd_post(&ctx, &format!("to=@tpeer000000 kind=note {text}"), None),
                 format!("OK {n}\n")
             );
         }
@@ -500,11 +506,18 @@ fn a_keeper_recovery_holds_resubscribes_and_counts_above_the_dead_window() {
             "an id the agent learned before the crash names no row"
         );
         assert_eq!(
-            deliver(&successor, &new_sid, 12, "s-peer@n-lab", "ask", "three"),
+            deliver(
+                &successor,
+                &new_sid,
+                12,
+                "tpeer000000@n-lab",
+                "ask",
+                "three"
+            ),
             format!("OK {}\n", lease + 1)
         );
         assert_eq!(
-            cmd_post(&new_ctx, "to=@s-peer kind=note next", None),
+            cmd_post(&new_ctx, "to=@tpeer000000 kind=note next", None),
             format!("OK {}\n", lease + 1)
         );
         assert_eq!(
@@ -890,11 +903,14 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
     with_link(|| {
         let store = new_store();
         let (sid, ctx) = registered(&store, 1);
-        deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
+        deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "one");
         let parked = ctx.fabric.carry_serial();
         let _ = cmd_inbox(&ctx, "");
         assert_eq!(ctx.fabric.carry_serial(), parked, "a read moves nothing");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note one", None),
+            "OK 1\n"
+        );
         let after_post = ctx.fabric.carry_serial();
         assert_ne!(after_post, parked, "a queued post moves it");
         assert_eq!(cmd_inbox_seen(&ctx, "1 deferred"), "OK seen=1\n");
@@ -916,7 +932,7 @@ fn the_commit_sees_the_outbox_move_and_a_post_waits_on_its_fence() {
         let before = ctx.fabric.fence_waits();
         let poster = {
             let ctx = ctx.clone();
-            std::thread::spawn(move || cmd_post(&ctx, "to=@s-peer kind=note two", None))
+            std::thread::spawn(move || cmd_post(&ctx, "to=@tpeer000000 kind=note two", None))
         };
         assert_parked_on_the_fence(
             &ctx.fabric,
@@ -975,7 +991,7 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
         assert_eq!(
             cmd_post(
                 &ctx,
-                "to=@s-peer kind=note",
+                "to=@tpeer000000 kind=note",
                 Some(coloured.clone().into_bytes())
             ),
             "OK 1\n"
@@ -1000,8 +1016,8 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
         );
         assert!(toml_cost(&coloured) > coloured.len() * 3 / 2);
 
-        deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "one");
-        deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
+        deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "one");
+        deliver(&store, &sid, 11, "tpeer000000@n-lab", "ask", "two");
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
         let mut none = 0;
@@ -1013,7 +1029,7 @@ fn the_mail_budget_charges_what_toml_writes_and_holds_the_receipts() {
             off: 10,
             verdict: "handled".to_string(),
             kind: "ask".to_string(),
-            from: "s-peer@n-lab".to_string(),
+            from: "tpeer000000@n-lab".to_string(),
         }
         .cost();
         let carry = ctx.fabric.handoff_carry(&mut one);
@@ -1033,9 +1049,15 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
     with_link(|| {
         let store = new_store();
         let (sid, ctx) = registered(&store, 1);
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note two", None), "OK 2\n");
-        deliver(&store, &sid, 10, "s-peer@n-lab", "task", "t");
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note one", None),
+            "OK 1\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note two", None),
+            "OK 2\n"
+        );
+        deliver(&store, &sid, 10, "tpeer000000@n-lab", "task", "t");
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         let mut roomy = CARRY_MAIL_BYTES;
         let mut carry = ctx.fabric.handoff_carry(&mut roomy);
@@ -1068,7 +1090,7 @@ fn a_shed_carry_keeps_its_counters_and_says_what_it_dropped() {
             ]
         );
         assert_eq!(
-            cmd_post(&fresh.ctx, "to=@s-peer kind=note three", None),
+            cmd_post(&fresh.ctx, "to=@tpeer000000 kind=note three", None),
             "OK 3\n"
         );
     });
@@ -1097,7 +1119,7 @@ fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
         let fenced = ctx.fabric.fence_hold(true);
         assert_eq!(fenced, parked);
         assert_eq!(
-            deliver(&store, &sid, 12, "s-peer@n-lab", "note", "three"),
+            deliver(&store, &sid, 12, "tpeer000000@n-lab", "note", "three"),
             "OK 3\n",
             "under the fence, inside the reserve: answered at once"
         );
@@ -1112,7 +1134,7 @@ fn mail_in_the_overlap_is_numbered_below_the_successor_and_vetoes_nothing() {
         );
         assert!(!ctx.fabric.past_handoff_ceiling(), "at the ceiling: fine");
         assert_eq!(
-            deliver(&store, &sid, 14, "s-peer@n-lab", "note", "five"),
+            deliver(&store, &sid, 14, "tpeer000000@n-lab", "note", "five"),
             format!("OK {}\n", carried.last_msg_id + 1)
         );
         assert!(
@@ -1206,7 +1228,7 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
     let row = {
         let store = store.clone();
         let sid = sid.clone();
-        std::thread::spawn(move || deliver(&store, &sid, 11, "s-peer@n-lab", "note", "two"))
+        std::thread::spawn(move || deliver(&store, &sid, 11, "tpeer000000@n-lab", "note", "two"))
     };
     let shout = {
         let store = store.clone();
@@ -1228,7 +1250,7 @@ fn a_fenced_delivery_waits_past_every_bound_and_is_never_refused() {
     assert_eq!(reply, format!("OK {}\n", carried.last_msg_id + 1));
     assert_eq!(shout.join().unwrap(), "OK 2\n");
     assert_eq!(
-        deliver(&store, &sid, 11, "s-peer@n-lab", "note", "two"),
+        deliver(&store, &sid, 11, "tpeer000000@n-lab", "note", "two"),
         reply,
         "a redelivery of the same offset answers the same id"
     );
@@ -1243,9 +1265,15 @@ fn the_fence_holds_a_retirement_back_only_for_a_successor_that_reads_the_carry()
     with_link(|| {
         let store = new_store();
         let (sid, ctx) = registered(&store, 1);
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note one", None), "OK 1\n");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note two", None), "OK 2\n");
-        deliver(&store, &sid, 10, "s-peer@n-lab", "ask", "q");
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note one", None),
+            "OK 1\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@tpeer000000 kind=note two", None),
+            "OK 2\n"
+        );
+        deliver(&store, &sid, 10, "tpeer000000@n-lab", "ask", "q");
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
 
         let _ = ctx.fabric.fence_hold(false);

@@ -648,11 +648,10 @@ impl ApprovalCtx {
         ctx
     }
 
-    /// The trust roots from `[harness] trust_roots` ([`roots_from_config`]), and the Read roots
+    /// The trust roots from `[harness] trust_roots` ([`trust_roots_of`]), and the Read roots
     /// rebuilt around them.
     pub fn set_trust_roots(&mut self, specs: &[String], uid: u32) {
-        let specs: Vec<String> = specs.iter().map(|s| own_claude_tmp(s, uid)).collect();
-        self.trust_roots = roots_from_config(&specs, self.home.as_deref());
+        self.trust_roots = trust_roots_of(specs, self.home.as_deref(), uid);
         self.read_roots = self.trust_roots.clone();
         for sys in ["/usr", "/etc", "/private/etc", "/opt/homebrew"] {
             self.read_roots.extend(ScratchRoot::dir(Path::new(sys)));
@@ -718,6 +717,50 @@ fn shell_models_hold(
         state.admits(line)?;
     }
     Ok(())
+}
+
+/// The folders `[harness] trust_roots` names for the user `uid` whose home is `home`
+/// ([`roots_from_config`], a `claude-*` scratch root read as that user's own).
+#[must_use]
+pub fn trust_roots_of(specs: &[String], home: Option<&Path>, uid: u32) -> Vec<ScratchRoot> {
+    let specs: Vec<String> = specs.iter().map(|s| own_claude_tmp(s, uid)).collect();
+    roots_from_config(&specs, home)
+}
+
+/// Whether the safe rules trust `folder` (its absolute components): it is the folder the
+/// session's starter trusted (`trusted_cwd`, a `spawn agent=<word>` worker's), or it lies under
+/// a trust root.
+fn safe_rules_trust(roots: &[ScratchRoot], trusted_cwd: Option<&Path>, folder: &[String]) -> bool {
+    let spawned = trusted_cwd
+        .and_then(|dir| abs_components(&dir.to_string_lossy()))
+        .is_some_and(|dir| dir == folder);
+    spawned || roots.iter().any(|r| r.holds(folder))
+}
+
+/// THE FOLDER JUDGMENT, which rule trusts the folder a Claude Code session starts in: the one
+/// judgment its folder-trust dialog's rules ([`RULE_TRUST_DIALOG`], [`RULE_TRUST_ANY`]) and the
+/// step that settles the folder before the launch (`crate::harness::launch_trust`) share, so the
+/// rule a ledger row names is the same whichever of them trusted the folder. `folder` is the
+/// session's own folder, absolute; `None` trusts nothing (`approve = "none"`, a folder the safe
+/// rules do not hold under `approve = "safe"`, a path that is not absolute).
+#[must_use]
+pub fn trust_folder_rule(
+    approve: Approve,
+    roots: &[ScratchRoot],
+    trusted_cwd: Option<&Path>,
+    folder: &Path,
+) -> Option<&'static str> {
+    let folder = abs_components(&folder.to_string_lossy())?;
+    let safe = || safe_rules_trust(roots, trusted_cwd, &folder);
+    match approve {
+        Approve::None => None,
+        Approve::Safe => safe().then_some(RULE_TRUST_DIALOG),
+        Approve::All => Some(if safe() {
+            RULE_TRUST_DIALOG
+        } else {
+            RULE_TRUST_ANY
+        }),
+    }
 }
 
 fn own_claude_tmp(spec: &str, uid: u32) -> String {
@@ -5265,12 +5308,7 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
             ctx.cwd.display()
         ));
     }
-    let spawned = ctx
-        .trusted_cwd
-        .as_deref()
-        .and_then(|dir| abs_components(&dir.to_string_lossy()))
-        .is_some_and(|dir| dir == comps);
-    if !spawned && !ctx.trust_roots.iter().any(|r| r.holds(&comps)) {
+    if !safe_rules_trust(&ctx.trust_roots, ctx.trusted_cwd.as_deref(), &comps) {
         return Decision::escalate(format!(
             "a folder-trust dialog for {path}, under no trust root"
         ));

@@ -294,9 +294,6 @@ pub(crate) fn claim(
     let Some(pool) = &ctx.pool else {
         return Ok(None);
     };
-    if ctx.background {
-        return Ok(None);
-    }
     let Some(book) = &ctx.memory else {
         return Ok(None);
     };
@@ -507,7 +504,7 @@ pub(crate) fn keep_meter_units(
     Ok(kept)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn keep_current_unit(
     unit: &crate::unitgraph::UnitName,
     peak: u64,

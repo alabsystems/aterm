@@ -729,6 +729,7 @@ pub fn check_pack(
         let hooks = atpkg::install::StageHooks {
             pre_swap: Some(&gate),
             sidecars: None,
+            records: &[],
             aliases: &[],
             npm_package: None,
         };
@@ -791,6 +792,32 @@ pub fn verify_pinned(
         pkg.version
     ));
     Ok(())
+}
+
+/// The signed manifest of `def`'s build `build`, verified under `quad`'s roster: from
+/// `pack_dir` when given, else fetched as [`verify_pinned`] fetches it.
+/// # Errors
+/// A pair that does not fetch, read or verify.
+pub(crate) fn pinned_manifest(
+    ctx: &Ctx,
+    quad: &VerifiedQuad,
+    def: &ProgramDef,
+    build: Build,
+    pack_dir: Option<&Path>,
+) -> Result<atpkg::PkgManifest> {
+    let tag = upload::tag(def.name, build);
+    let mf = pkgdoc::manifest_name(def.name, build);
+    let sig = pkgdoc::sig_name(def.name, build);
+    let scratch = Scratch::new("harness-pin")?;
+    let (dir, from) = match pack_dir {
+        Some(d) if d.join(&mf).is_file() => (d.to_path_buf(), ctx.shown(d)),
+        _ => fetch_pair(ctx, def.repo, &tag, &mf, &sig, scratch.path())?,
+    };
+    let read = |name: &str| {
+        crate::identity::read_regular_bytes(&dir.join(name), crate::identity::MAX_META_BYTES)
+            .map_err(|e| Error::refused(format!("{tag}: {name} does not read from {from} ({e})")))
+    };
+    quad.verify_pkg(&read(&mf)?, &read(&sig)?)
 }
 
 /// The manifest pair of `tag`, from the public owner's download host, else the staging
@@ -964,6 +991,7 @@ pub fn pack_package_with_signed_root(
         build: request.build,
         exposes: exposes.clone(),
         shim_env: Vec::new(),
+        harness: None,
     };
     let row_doc = Row {
         triple,

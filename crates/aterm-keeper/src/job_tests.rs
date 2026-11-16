@@ -89,6 +89,9 @@ fn the_installed_app_and_dev_builds_never_share_a_keeper() {
     );
 }
 
+/// The keeper and its app bundle are Unix's; its home is a Unix path, which Windows does not
+/// read as absolute.
+#[cfg(unix)]
 #[test]
 fn a_copy_installed_in_the_home_applications_is_the_installed_keeper() {
     let home = Path::new("/Users//x");

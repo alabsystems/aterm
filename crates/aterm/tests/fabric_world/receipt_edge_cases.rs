@@ -506,7 +506,7 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
         let src = "n-00000000000000aa";
         let lane = format!("/f/{FLEET}/in/{}/{b}/{src}/ask", w.node);
         let mut body = Body::new(aterm_link::now_ms());
-        body.from = Some("s-00000000000000beef00".to_string());
+        body.from = Some("t9000000001".to_string());
         body.text = "from-a-node-that-is-gone".to_string();
         let (off, _) = c
             .publish(astream_cap::producer_id_of(src), 1, &lane, &body.encode())

@@ -221,6 +221,18 @@ fn launchd_overrides_read_enabled_disabled_and_absent_apart() {
         launchd_enabled(PRINT_DISABLED_NO_SCREEN_SHARING, SCREEN_SHARING_LABEL),
         Read::Absent
     );
+    // A row of another block (`login item associations` names jobs too) is not its switch.
+    // MUTANT: reading every `=>` row of the text reads this one as disabled.
+    assert_eq!(
+        launchd_enabled(
+            &format!(
+                "{PRINT_DISABLED_NO_SCREEN_SHARING}\tlogin item associations = {{\n\t\t\
+                 \"{SCREEN_SHARING_LABEL}\" => disabled\n\t}}\n"
+            ),
+            SCREEN_SHARING_LABEL
+        ),
+        Read::Absent
+    );
     assert!(matches!(
         launchd_enabled("Bad request.\n", SSHD_LABEL),
         Read::Unusable(_)

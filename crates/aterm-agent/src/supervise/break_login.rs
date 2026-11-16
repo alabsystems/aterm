@@ -115,7 +115,7 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Muse
             | Program::Generic => return,
         }
-        let runs = reader.runs(screen.title.as_deref());
+        let runs = runs_of(reader, screen);
         let carried = self.transcript_wait_seq == Some(screen.seq);
         let at_break = (carried
             || (phase_of(reader, screen) == Phase::Busy

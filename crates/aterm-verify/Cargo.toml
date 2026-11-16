@@ -5,6 +5,7 @@
 name = "aterm-verify"
 version = "0.0.0"
 edition = "2024"
+default-run = "aterm-verify"
 # src/wasm_glue/templates.rs and src/wasm_glue/js.rs are derived from
 # wasm-bindgen-cli-support 0.2.108 (MIT OR Apache-2.0); see LICENSE-MIT. The
 # rest is aterm's own.
@@ -18,6 +19,15 @@ description = "Every aterm check as one CLI: targo --unverified verify [CHECK|SE
 name = "aterm-verify"
 path = "src/main.rs"
 test = false
+# The CLI has no harness cases; the real benchmarks are explicit targets below.
+bench = false
+
+# The private-image execution tests need a typed facts probe owned by this package.
+[[bin]]
+name = "aterm-verify-artifact-fixture"
+path = "tests/artifact_fixture.rs"
+test = false
+bench = false
 
 [lib]
 name = "aterm_verify"
@@ -45,10 +55,6 @@ harness = false
 [[test]]
 name = "bootstrap_custody"
 path = "tests/bootstrap_custody.rs"
-harness = false
-
-[[bench]]
-name = "journal_push_admission"
 harness = false
 
 [[bench]]
@@ -145,6 +151,11 @@ aterm-sysprobe = { workspace = true }
 # (docs/DESIGN-adaptive-build-2026-10-24.md, VERIFY-MEM). Workspace crate,
 # already in the graph through aterm-capacity.
 aterm-types = { workspace = true }
+# The trailers `land` writes on the merge it pushes and their one reader, shared with the
+# harness's land receipt. Std only.
+aterm-land-trailer = { workspace = true }
+# The generated-file seal `vendor-out` stamps its list of vendored files with. Std only.
+aterm-seal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # `verify land`'s verdict records are signed and verified by this Mac's fleet node key, as
@@ -180,9 +191,12 @@ aterm-spec = { workspace = true }
 [lints]
 workspace = true
 
-# Nothing in `aterm` depends on verify, so `verify cells` reaches its Linux
-# code only through this key: the linux-arm cell lints it with the clippy.toml
-# bans and type-checks its targets (the Linux-only tests among them) on
-# aarch64-unknown-linux-gnu, beside `aterm` (STOCK EXCEPTION, as every cell).
+# Nothing in `aterm` depends on verify, so `verify cells` reaches its Linux and
+# Windows code only through this key: the linux-arm cell lints it with the
+# clippy.toml bans and type-checks its targets (the Linux-only tests among them)
+# on aarch64-unknown-linux-gnu, and the win cell does the same on
+# x86_64-pc-windows-msvc (where `land`, `watch`, `provision` and the browser lane
+# do not build and are refused by name), each beside `aterm` (STOCK EXCEPTION, as
+# every cell).
 [package.metadata.aterm]
-cells = ["linux-arm"]
+cells = ["linux-arm", "win"]

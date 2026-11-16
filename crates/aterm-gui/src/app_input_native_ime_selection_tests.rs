@@ -20,11 +20,13 @@ fn native_ime_preedit_preserves_platform_byte_selection_through_the_input_route(
     .unwrap();
     app.on_ime_commit(wid, "aβz".to_string());
     let (_, view) = app.active_native_view(wid).unwrap();
-    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.search_input.set_selection(1, 3);
     let original = state.search_input.clone();
+    drop(route_native_guard);
 
     for (text, cursor, expected) in [
         ("e\u{301}日本", Some((3, 3)), 4..4),

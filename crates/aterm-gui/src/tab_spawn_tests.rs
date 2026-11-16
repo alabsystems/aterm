@@ -903,7 +903,7 @@ fn a_tab_lands_at_the_grid_its_window_took_while_it_was_in_flight() {
         t.resize(rows, cols);
     }
     let (later_rows, later_cols) = (rows + 7, cols + 11);
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = later_rows;
         ws.cols = later_cols;
     }
@@ -1628,7 +1628,7 @@ fn a_window_spawned_off_the_loop_lands_frontmost_and_gets_what_was_typed() {
             .is_some(),
         "another window's input is its own"
     );
-    if let Some(ws) = app.windows.get_mut(&from) {
+    if let Some(mut ws) = app.windows.get_mut(&from) {
         ws.rows += 7;
         ws.cols += 11;
     }
@@ -1915,7 +1915,7 @@ fn a_new_window_key_books_its_window_in_its_own_turn() {
     assert_eq!(app.next_window_id, next + 1, "the key minted its window");
     assert!(said_no_window(&app, "no event loop to host the new window"));
     if crate::app_input::HARDCODED_SUPER_CHORDS {
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.mods = ModifiersState::SUPER;
         }
         app.on_key(
@@ -2053,7 +2053,7 @@ fn a_click_held_on_the_tab_strip_is_dropped_not_replayed_onto_a_moved_chip() {
     };
     let clicks = |app: &mut App, strip: bool| {
         app.tab_strip_rows = u16::from(strip);
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.last_cursor_px = on_strip;
         }
         let id = book(app, wid, TabSpawnThen::Nothing);

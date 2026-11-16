@@ -80,9 +80,9 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "records",
-            "task_state task_rev log_seq log_ep log_base run turn step need need_since_ms rollout \
-         rollout_asks log_journal log_journal_why exec_watch exec_watch_why editing editor \
-         bells bells_sounded last_bell",
+            "task_state task_rev log_seq log_ep log_base run turn step need need_since_ms \
+         opened_ms rollout rollout_asks log_journal log_journal_why exec_watch exec_watch_why \
+         editing editor bells bells_sounded last_bell",
         ),
         row("gen", "gen seq hash"),
         para(
@@ -226,7 +226,10 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`program_state=` is the root OSC 7501 report of the program in front when \
                      it names that program (a codex's `app=codex`, a Grok Build's \
-                     `app=grok-build`), a claim beside an `agent=` it never moves, `-` otherwise, \
+                     `app=grok-build` or `app=grok`, a Claude Code's `app=claude-code`), a \
+                     claim beside an `agent=` it never moves, `-` otherwise (Claude Code's \
+                     screen reader also takes its report as its run sign, `text --json`'s \
+                     `\"program_report\"`), \
                      and `program_state_ms=` how long it has stood, counted through sleep as the \
                      survey's `agent_ms=` is; `agent_since_ms=` and `human_ms=` stop while the \
                      Mac sleeps, so across a sleep it is not comparable with them.",
@@ -353,8 +356,9 @@ pub(crate) const PAGE: Page = Page {
                 row(
                     "supervisor_contract=",
                     "the standing claim's contract, its effective scopes (every duty for a claim \
-                     that names none, `-` with no claim) and the claim's revision, which a scoped \
-                     harness's `if-supervisor-revision=` names (`help key`)",
+                     that names none, `-` with no claim or a contract 4 claim granted nothing) and \
+                     the claim's revision, which a scoped harness's `if-supervisor-revision=` names \
+                     (`help key`)",
                 ),
                 row(
                     "supervisor_act=",
@@ -460,12 +464,23 @@ pub(crate) const PAGE: Page = Page {
         },
         Section {
             name: "records",
-            about: "the task and log cursors, the rollout tap, the log journal, exec watch, bells",
+            about: "the task and log cursors, the first open, the rollout tap, the log journal, \
+                    exec watch, bells",
             rows: &[
                 para(
                     "`task_state= task_rev= log_seq= log_ep= log_base= run= turn= step= need= \
-                     need_since_ms= rollout_asks= editing= editor=<amacs|-> bells= \
-                     bells_sounded= last_bell=`",
+                     need_since_ms= opened_ms=<unix ms|-> rollout_asks= editing= \
+                     editor=<amacs|-> bells= bells_sounded= last_bell=`",
+                ),
+                row(
+                    "opened_ms=",
+                    "the Unix ms at which the session's lineage first opened: a session a cold \
+                     restore, a seamless update or a reopened tab brought back keeps its first \
+                     open's time. Where an older aterm saved no such time: a seamless update \
+                     keeps the open of the log it carried (usually the tab's first), or the \
+                     update's own time where that log did not carry, and a cold restore says \
+                     when it opened the session; `-` before its log opened. No field says its \
+                     age: now minus this",
                 ),
                 row(
                     "task_state=",

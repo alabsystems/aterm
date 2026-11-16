@@ -14,7 +14,7 @@ use aterm_window::keyboard::{
     Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
 };
 
-use super::{LEAVE, Lens, Opened};
+use super::{DiskSpan, LEAVE, Lens, Opened};
 use crate::input::{InputEvent, PasteFraming, Source};
 use crate::menu::{MenuAction, native_menu_checked};
 use crate::stats_deck::StatsBars;
@@ -69,6 +69,9 @@ fn rig(form: &str) -> Rig {
         .stats_bars = Some(form.into());
     app.windows.get_mut(&wid).expect("window").metrics.pad = 24;
     app.vitals.snapshot = Some(Arc::new(crate::stats_deck::tests::snapshot()));
+    let now = Instant::now();
+    app.vitals.sampled_at = Some(now);
+    app.vitals.landed_at = Some(now);
     let session = app.focused_session_id(wid).expect("the tab's terminal");
     let _ = drain(&mut wire);
     Rig {
@@ -124,7 +127,7 @@ impl Rig {
     fn deck(&mut self, form: DeckForm, width_pt: Option<f64>) {
         let (cw, cell) = self.app.win_cell_size(self.wid);
         let pad = self.app.win_pad(self.wid);
-        let ws = self.app.windows.get_mut(&self.wid).expect("window");
+        let mut ws = self.app.windows.get_mut(&self.wid).expect("window");
         ws.deck_form = form;
         if let Some(w) = width_pt {
             let px = (w * ws.scale).round() as usize;
@@ -361,12 +364,69 @@ fn a_press_pins_the_lens_and_a_press_outside_closes_it_and_goes_on() {
 }
 
 #[test]
-fn focus_loss_closes_the_lens() {
+fn focus_loss_retires_hover_lenses_and_their_pending_timers() {
     let mut r = rig("sill");
-    assert!(r.app.toggle_stats_lens());
-    assert!(r.lens().is_some());
+    let (on, _) = r.instrument(Instrument::Cpu);
+    r.move_to(on);
+    let pending = r.app.stats_lens_deadline().expect("a hover is pending");
     r.app.on_focus(r.wid, false);
     assert_eq!(r.lens(), None);
+    assert_eq!(r.app.stats_lens_deadline(), None);
+    r.app.service_stats_lens(pending);
+    r.app.on_focus(r.wid, true);
+    assert_eq!(r.lens(), None, "the old rest does not reopen on return");
+
+    r.rest_on(Instrument::Cpu);
+    assert!(r.lens().is_some_and(|lens| lens.how == Opened::Hover));
+    let away = r.cell(0, 0);
+    r.move_to(away);
+    assert!(
+        r.app.stats_lens_deadline().is_some(),
+        "hover leave is armed"
+    );
+    r.app.on_focus(r.wid, false);
+    assert_eq!(r.lens(), None);
+    assert_eq!(r.app.stats_lens_deadline(), None);
+    r.app.on_focus(r.wid, true);
+    assert_eq!(r.lens(), None);
+}
+
+#[test]
+fn explicit_lenses_keep_their_selection_and_disk_span_across_focus() {
+    for how in [Opened::Pinned, Opened::Keyboard] {
+        for focus in [Instrument::Disk, Instrument::NetworkState] {
+            let mut r = rig("sill");
+            r.app.open_stats_lens(r.wid, focus, Bar::Tab, how);
+            if focus == Instrument::Disk {
+                r.named(KeyCode::Tab, NamedKey::Tab);
+                assert_eq!(r.app.windows[&r.wid].stats_lens.disk_span, DiskSpan::Weeks);
+            }
+            r.app
+                .windows
+                .get_mut(&r.wid)
+                .unwrap()
+                .stats_lens
+                .network_target = crate::network_deck::Target::Secrets;
+            let selected = r.lens().expect("an explicitly opened lens");
+            let span = r.app.windows[&r.wid].stats_lens.disk_span;
+            r.app.on_focus(r.wid, false);
+            assert_eq!(r.lens(), Some(selected), "{how:?} {focus:?} survives blur");
+            assert_eq!(r.app.stats_lens_deadline(), None);
+            r.app.on_focus(r.wid, true);
+            r.app.splice_stats_lens(r.wid);
+            assert_eq!(
+                r.lens(),
+                Some(selected),
+                "{how:?} {focus:?} survives return"
+            );
+            assert_eq!(r.app.windows[&r.wid].stats_lens.disk_span, span);
+            assert_eq!(
+                r.app.windows[&r.wid].stats_lens.network_target,
+                crate::network_deck::Target::Secrets
+            );
+            assert!(r.app.windows[&r.wid].lens_card.is_some());
+        }
+    }
 }
 
 #[test]
@@ -583,6 +643,89 @@ fn the_disk_lens_asks_for_the_where_survey() {
     );
 }
 
+/// Tab in a Disk lens that takes keys (pinned, or opened by ⌘I) switches its used-space chart
+/// between the last 24 hours and the last 3 weeks, keeps the lens open, reaches no program and
+/// changes the frame the lens paints. Every printable key still closes it and goes on: `w` closes
+/// a keyboard and a pinned Disk lens and reaches the terminal. CONTROLS: Tab in the Memory lens,
+/// in a hover Disk lens, and ⌃Tab in a Disk lens that takes keys close the lens and leave the
+/// span as it was; dropping the Disk focus test, the hover test or the modifier test fails them,
+/// and taking a printable key for the span fails the `w` rows.
+#[test]
+fn the_disk_lens_takes_tab_for_its_span_and_passes_every_printable_key_on() {
+    let mut r = rig("sill");
+    let span = |r: &Rig| r.app.windows[&r.wid].stats_lens.disk_span;
+    let tab = |r: &mut Rig| r.named(KeyCode::Tab, NamedKey::Tab);
+    let w = |r: &mut Rig| r.key(KeyCode::KeyW, Key::Character(SmolStr::new("w")), Some("w"));
+    let to_disk = |r: &mut Rig| {
+        for _ in 0..Instrument::ALL.len() {
+            if r.lens().is_some_and(|l| l.focus == Instrument::Disk) {
+                break;
+            }
+            r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+        }
+        assert_eq!(r.lens().map(|l| l.focus), Some(Instrument::Disk));
+    };
+    assert!(r.app.toggle_stats_lens());
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
+    assert_eq!(r.lens().map(|l| l.focus), Some(Instrument::Memory));
+    tab(&mut r);
+    assert_eq!(r.lens(), None, "CONTROL: the Memory lens closes on Tab");
+    assert_eq!(r.sent(), "\t", "and Tab reaches the terminal");
+    assert_eq!(span(&r), DiskSpan::Day, "and the span stays");
+
+    assert!(r.app.toggle_stats_lens());
+    to_disk(&mut r);
+    w(&mut r);
+    assert_eq!(r.lens(), None, "w closes a keyboard Disk lens");
+    assert_eq!(r.sent(), "w", "and reaches the terminal");
+    assert_eq!(span(&r), DiskSpan::Day, "and leaves the span");
+
+    assert!(r.app.toggle_stats_lens());
+    to_disk(&mut r);
+    let before = r.app.stats_lens_fp(r.wid);
+    assert_ne!(before, 0, "PRECONDITION: the lens has a frame");
+    tab(&mut r);
+    assert_eq!(span(&r), DiskSpan::Weeks, "Tab shows the last 3 weeks");
+    assert_eq!(
+        r.lens().map(|l| l.focus),
+        Some(Instrument::Disk),
+        "and keeps the lens open"
+    );
+    assert_ne!(
+        r.app.stats_lens_fp(r.wid),
+        before,
+        "and the lens paints its new span"
+    );
+    tab(&mut r);
+    assert_eq!(span(&r), DiskSpan::Day, "and again the last 24 hours");
+    assert_eq!(r.sent(), "", "the span's key reaches no program");
+
+    r.app.windows.get_mut(&r.wid).expect("window").mods = ModifiersState::CONTROL;
+    tab(&mut r);
+    r.app.windows.get_mut(&r.wid).expect("window").mods = ModifiersState::empty();
+    assert_eq!(r.lens(), None, "CONTROL: ⌃Tab closes the lens");
+    assert_eq!(span(&r), DiskSpan::Day, "and leaves the span");
+    let _ = r.sent();
+
+    r.app
+        .open_stats_lens(r.wid, Instrument::Disk, Bar::Global, Opened::Pinned);
+    tab(&mut r);
+    assert_eq!(span(&r), DiskSpan::Weeks, "a pinned Disk lens takes Tab");
+    assert_eq!(r.sent(), "", "and Tab reaches no program");
+    w(&mut r);
+    assert_eq!(r.lens(), None, "w closes a pinned Disk lens");
+    assert_eq!(r.sent(), "w", "and reaches the terminal");
+
+    r.app
+        .open_stats_lens(r.wid, Instrument::Disk, Bar::Global, Opened::Hover);
+    assert!(r.lens().is_some_and(|l| l.how == Opened::Hover));
+    tab(&mut r);
+    assert_eq!(r.lens(), None, "CONTROL: a hover lens closes on Tab");
+    assert_eq!(r.sent(), "\t", "and Tab goes on to the program");
+    assert_eq!(span(&r), DiskSpan::Weeks, "and the span stays");
+}
+
 #[test]
 fn a_hover_lens_moves_after_a_rest_and_a_pinned_lens_stays() {
     let mut r = rig("sill");
@@ -705,9 +848,10 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
 fn a_rest_on_the_decks_header_opens_how_to_read() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
-    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    let mut ws = r.app.windows.get_mut(&r.wid).expect("window");
     let deck = crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
     ws.metrics.head = deck;
+    drop(ws);
     let (on, _) = r.hit(|h| h.kind == crate::stats_paint::HitKind::Header);
     r.move_to(on);
     let due = r.app.stats_lens_deadline().expect("the rest's deadline");
@@ -727,9 +871,10 @@ fn why_now_reads_the_front_tab_by_every_pane() {
     use aterm_vitals::explain::fixtures;
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
-    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    let mut ws = r.app.windows.get_mut(&r.wid).expect("window");
     ws.metrics.head =
         crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    drop(ws);
     let other = r.app.split_active_stub_tab(r.wid);
     assert!(
         other > r.session,
@@ -778,9 +923,10 @@ fn why_now_reads_the_front_tab_by_every_pane() {
 fn a_split_front_tab_reads_every_pane() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
-    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    let mut ws = r.app.windows.get_mut(&r.wid).expect("window");
     ws.metrics.head =
         crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    drop(ws);
     let other = r.app.split_active_stub_tab(r.wid);
     assert_eq!(
         r.app.deck_tab_panes(r.wid),
@@ -830,10 +976,11 @@ fn a_split_front_tab_reads_every_pane() {
 fn the_tree_reads_the_deck_and_its_lens() {
     let mut r = rig("deck");
     let (_, cell) = r.app.win_cell_size(r.wid);
-    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    let mut ws = r.app.windows.get_mut(&r.wid).expect("window");
     ws.metrics.head =
         crate::stats_deck::reserved_deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
 
+    drop(ws);
     let stats = r.app.stats_a11y(r.wid).expect("the deck is read");
     let group = &stats.group;
     assert_eq!(group.name, "Stats deck, newest first");
@@ -948,6 +1095,78 @@ fn no_lens_opens_or_stays_where_none_can_show() {
     assert_eq!(r.sent(), "\x1b[C", "the arrow reaches the terminal");
     assert!(!r.app.toggle_stats_lens(), "⌘I opens none");
     assert_eq!(r.lens(), None);
+}
+
+#[test]
+fn stale_resource_frames_keep_the_lens_open_and_repaint_once_per_freshness_change() {
+    let mut r = rig("sill");
+    r.app.splice_stats_deck(r.wid);
+    let fresh_pixels = r.app.windows[&r.wid]
+        .deck_card
+        .as_ref()
+        .unwrap()
+        .rgba
+        .clone();
+    assert!(r.app.toggle_stats_lens());
+    let reading = r.app.vitals.snapshot.clone().expect("held reading");
+    let lens = r.lens().expect("open lens");
+    let fresh = r.app.stats_lens_fp(r.wid);
+    let now = Instant::now();
+    r.app.vitals.sampled_at = now.checked_sub(Duration::from_secs(60));
+    r.app.vitals.landed_at = Some(now);
+    r.app.splice_stats_deck(r.wid);
+    let stale_pixels = r.app.windows[&r.wid]
+        .deck_card
+        .as_ref()
+        .unwrap()
+        .rgba
+        .clone();
+    assert_ne!(
+        fresh_pixels, stale_pixels,
+        "sill raster follows its stale key"
+    );
+    let stale = r.app.stats_lens_fp(r.wid);
+    assert_ne!(
+        fresh, stale,
+        "same reading changes its freshness presentation"
+    );
+    assert_eq!(
+        stale,
+        r.app.stats_lens_fp(r.wid),
+        "no animation while stale"
+    );
+    assert_eq!(r.lens(), Some(lens));
+    assert!(Arc::ptr_eq(
+        &reading,
+        r.app.vitals.snapshot.as_ref().unwrap()
+    ));
+    let (geometry, lens, frame) = r.app.lens_frame(r.wid).unwrap();
+    assert!(!frame.live.fresh);
+    let laid = super::lay_lens(
+        &geometry,
+        &r.app.lens_input(&frame, r.wid),
+        &lens,
+        &super::deck_metrics(),
+        false,
+    );
+    assert!(laid.explainer.starts_with("Updates delayed"));
+    assert!(
+        r.app
+            .stats_lens_sentence(r.wid)
+            .unwrap()
+            .starts_with("Updates delayed")
+    );
+    r.app.vitals.sampled_at = Some(Instant::now());
+    r.app.splice_stats_deck(r.wid);
+    assert_eq!(
+        fresh_pixels,
+        r.app.windows[&r.wid].deck_card.as_ref().unwrap().rgba
+    );
+    assert_eq!(
+        r.app.stats_lens_fp(r.wid),
+        fresh,
+        "freshness recovers without clearing selection"
+    );
 }
 
 /// A new reading draws the lens's body over the shell's kept raster, and a move of what the shell
@@ -1522,13 +1741,14 @@ fn a_stacked_lens_frame_acknowledges_its_keys() {
     let folded = compose_lens_input(&mut r).expect("the folded lens is composed visibly");
     assert_eq!(folded.input, Some(token));
     // The window's cards as a Metal window leaves them: a stack for the renderer, no fold.
-    let ws = r.app.windows.get_mut(&r.wid).unwrap();
+    let mut ws = r.app.windows.get_mut(&r.wid).unwrap();
     ws.deck_fold = None;
     ws.tray_stacked = true;
     assert!(
         ws.tray_stack().is_some(),
         "CONTROL: the deck and the lens are a tray stack"
     );
+    drop(ws);
     let paint = r
         .app
         .stats_lens_input_receipt(r.wid)

@@ -6,18 +6,20 @@
 //! latest reading of a session on the row's stored login, recorded by [`note_basis`] and by
 //! nothing else, so no token reading is ever its own basis; a reading with no current basis
 //! decides nothing: the stored login's next reading compares it at once while its week runs, and
-//! otherwise the next token reading is compared afresh; equal windows on the minting Mac write
-//! `verified` into the scratch vault for the token compared, and the token then serves a Mac that
-//! did not mint it; unequal windows leave it `unverified (windows differ)`, not in use on the Mac
-//! that compared, its readings apart from the row and a `--replace` offered; shared windows, and a
+//! otherwise the next token reading is compared afresh; equal windows write `verified` into the
+//! scratch vault for the token compared, naming the seat that wrote it, and the token then serves
+//! a Mac that did not mint it; unequal windows leave it `unverified (windows differ)`, not in use
+//! on the Mac that compared, its readings apart from the row, `token-differ` journaled and a
+//! `--replace` offered; shared windows, until a basis of a later week reopens them, and a
 //! row-less account, leave it `unverified (<why>)`, a terminal token's shared windows offering its
 //! replacement; a token awaiting its basis is held off while the row's stored login works here, and
 //! while a replacement waits in the vault's writes the token it replaces is judged by its own facts
 //! and nothing of it is written on the waiting token's row, nor any verification of it; a reading
 //! taken before its windows reset compares nothing of them; the shared check reads another
 //! account's windows only by the resets its sample names; a check file that does not read holds
-//! only the tokens this Mac compares; a token another Mac minted in aterm's window is compared here
-//! as one minted here is, and one it minted at a terminal is apart until verified; a row whose
+//! only the tokens this Mac compares; a token another Mac minted in aterm's window is compared and
+//! verified here as one minted here is, and one it minted at a terminal is apart until verified;
+//! a row whose
 //! write was overtaken follows the vault's token; first and last served are written under
 //! `tokens.lock`; and renewal is off for a row on its token.
 
@@ -66,9 +68,22 @@ fn served(reading: Windows, others: Vec<Windows>) -> Served {
     Served {
         label: "work".to_owned(),
         reading,
-        others,
+        others: labelled(&others),
         named: true,
     }
+}
+
+/// `windows`, each another account's current windows here, under a row of its own: the first
+/// `other-0`, the next `other-1`.
+fn labelled(windows: &[Windows]) -> Vec<Other> {
+    windows
+        .iter()
+        .enumerate()
+        .map(|(at, windows)| Other {
+            label: format!("other-{at}"),
+            windows: *windows,
+        })
+        .collect()
 }
 
 /// The row a mint of `token` for `work` leaves in this Mac's table: its label, its `minted_at`,
@@ -122,6 +137,7 @@ fn a_tokens_reading_is_never_its_basis_and_a_stored_logins_is() {
             basis: None,
             reading: Some(theirs),
             verdict: Some(Verdict::NoBasis),
+            shared_with: BTreeSet::new(),
         }
     );
     assert_eq!(
@@ -424,7 +440,8 @@ fn a_stored_login_reading_after_the_tokens_compares_the_kept_reading_at_once() {
                 Due::Nothing,
                 "{name}: nothing to compare the token's reading with yet"
             );
-            let based = note_basis(&store, &token, "work", &basis.0, others, basis.1).unwrap();
+            let based =
+                note_basis(&store, &token, "work", &basis.0, &labelled(others), basis.1).unwrap();
             (based, scratch.table().rows.remove(KEY).expect("the row"))
         };
 
@@ -586,7 +603,10 @@ fn equal_windows_on_the_minting_mac_write_verified_and_the_token_turns_active() 
     };
     assert_eq!(verify.minted_at, meta.minted_at);
     assert_eq!(verify.evidence.by, aterm_secrets::claude_token::BY_WINDOWS);
-    assert_eq!(verify.evidence.on, "m22");
+    assert!(
+        verify.evidence.on.is_empty(),
+        "the evidence names no Mac: the vault names the seat that writes it"
+    );
     assert_eq!(
         verify.evidence.seven_day_resets_at,
         stored.week_reset.and_then(|r| u64::try_from(r).ok())
@@ -614,6 +634,15 @@ fn equal_windows_on_the_minting_mac_write_verified_and_the_token_turns_active() 
         panic!("the vault holds the token");
     };
     assert!(verified.verified(), "the vault's meta says verified");
+    assert_eq!(
+        verified
+            .meta
+            .as_ref()
+            .and_then(Meta::verification)
+            .map(|v| v.on.as_str()),
+        Some("m22"),
+        "by the seat that wrote it"
+    );
     assert_eq!(verified.check, Check::Readable, "one draft");
     let table = scratch.table();
     let row = table.rows.get(KEY).expect("the row");
@@ -1004,7 +1033,7 @@ fn an_unreadable_check_file_holds_only_the_tokens_this_mac_compares() {
     assert_eq!(row.used_on.last_served_at, Some(NOW));
     let paths = Paths::locate_for_home(&scratch.path().join("home"));
     assert!(
-        note_rejected(&paths, &store, &elsewhere, NOW + 60).unwrap(),
+        note_rejected(&paths, &store, &elsewhere, 401, NOW + 60).unwrap(),
         "its refusal is recorded"
     );
     let refused = Lookup::Found(Standing {
@@ -1056,7 +1085,7 @@ fn an_unreadable_check_file_holds_only_the_tokens_this_mac_compares() {
         "its reading is not folded"
     );
     let paths = Paths::locate_for_home(&scratch.path().join("home"));
-    assert!(note_rejected(&paths, &store, &here, NOW + 60).is_err());
+    assert!(note_rejected(&paths, &store, &here, 401, NOW + 60).is_err());
     assert_eq!(bytes(&store, CHECK_FILE).as_deref(), Some(&later[..]));
     assert_eq!(bytes(&store, TABLE_FILE), table, "nothing is written");
     assert_eq!(
@@ -1315,9 +1344,9 @@ fn a_waiting_replacement_leaves_the_token_it_replaces_judged_by_its_own_facts() 
             "{case}: a second waiting write keeps the token the vault holds"
         );
         let paths = Paths::locate_for_home(&scratch.path().join("home"));
-        assert!(note_rejected(&paths, &store, &old, NOW + 120).unwrap());
+        assert!(note_rejected(&paths, &store, &old, 401, NOW + 120).unwrap());
         assert!(
-            !note_rejected(&paths, &store, &old, NOW + 130).unwrap(),
+            !note_rejected(&paths, &store, &old, 401, NOW + 130).unwrap(),
             "{case}: recorded once, of the vault's token"
         );
         let refused = Lookup::Found(Standing {
@@ -2097,14 +2126,17 @@ fn first_and_last_served_are_recorded_under_tokens_lock() {
     assert_eq!(notes().len(), 1, "one token-served note");
 }
 
-/// A TOKEN ANOTHER MAC MINTED IN ATERM'S WINDOW IS COMPARED HERE AS ONE MINTED HERE IS (§5.6), AND
-/// ONE IT MINTED AT A TERMINAL IS APART UNTIL VERIFIED: m7's window-minted token is in use here
-/// from its mint, so this Mac's stored-login reading is its basis and a token reading is compared
-/// with it. Equal windows leave no write here (the vault's `verified` is the minting Mac's to
-/// write) and the token stays in use, `unverified (made on m7; windows equal)`; different windows
-/// leave the reading apart and stop the token on this Mac alone, while m7's own state of it is
+/// A TOKEN ANOTHER MAC MINTED IN ATERM'S WINDOW IS COMPARED AND VERIFIED HERE AS ONE MINTED HERE IS
+/// (§5.6), AND ONE IT MINTED AT A TERMINAL IS APART UNTIL VERIFIED: m7's window-minted token is in
+/// use here from its mint, so this Mac's stored-login reading is its basis and a token reading is
+/// compared with it. Equal windows leave the write due here, as on the minting Mac (the evidence
+/// names no Mac: the vault names the seat that writes it), and the token stays in use meanwhile,
+/// `unverified (made on m7; windows equal)`; different windows leave the reading apart, journal
+/// `token-differ` once and stop the token on this Mac alone, while m7's own state of it is
 /// untouched. CONTROL: the same token made at m7's terminal, or by a meta that names no route,
-/// takes no basis here and its readings are apart, as a token not in use here.
+/// takes no basis here and its readings are apart, as a token not in use here. NEGATIVE CONTROL
+/// (2026-11-14, by hand, then restored): with `note_served`'s write gated on `minted_here` again,
+/// the equal windows leave nothing.
 #[test]
 fn a_window_minted_token_another_mac_minted_is_compared_here_and_a_terminal_one_is_apart() {
     let stored = stored_at(NOW);
@@ -2115,11 +2147,13 @@ fn a_window_minted_token_another_mac_minted_is_compared_here_and_a_terminal_one_
         stored_reading(&equal.store(), &window, stored, NOW),
         "this Mac's stored login gives the basis"
     );
-    assert_eq!(
-        note_served(&equal.store(), &window, &served(stored, vec![]), NOW + 30).unwrap(),
-        Due::Nothing,
-        "equal windows: nothing written here"
-    );
+    let Due::Verify(verify) =
+        note_served(&equal.store(), &window, &served(stored, vec![]), NOW + 30).unwrap()
+    else {
+        panic!("equal windows: the write is due here");
+    };
+    assert_eq!(verify.minted_at, window.meta.as_ref().unwrap().minted_at);
+    assert!(verify.evidence.on.is_empty());
     let row = equal.table().rows.remove(KEY).expect("the row");
     assert_eq!(row.verification.verdict, Some(Verdict::Equal));
     let state = TokenState::of(&found, Some(&row), NOW + 30);
@@ -2128,6 +2162,7 @@ fn a_window_minted_token_another_mac_minted_is_compared_here_and_a_terminal_one_
 
     let differ = Scratch::new("peer-differ");
     assert!(stored_reading(&differ.store(), &window, stored, NOW));
+    let _ = notes();
     assert_eq!(
         note_served(
             &differ.store(),
@@ -2147,6 +2182,16 @@ fn a_window_minted_token_another_mac_minted_is_compared_here_and_a_terminal_one_
         crate::harness::token_route::fact_of(&state),
         TokenFact::Differ
     );
+    let kinds: Vec<&str> = notes().iter().map(|n| n.kind).collect();
+    assert_eq!(kinds, ["token-served", "token-differ"], "journaled once");
+    note_served(
+        &differ.store(),
+        &window,
+        &served(others_at(NOW), vec![]),
+        NOW + 60,
+    )
+    .unwrap();
+    assert!(notes().is_empty(), "a final differ journals nothing again");
     assert!(
         TokenState::of(
             &Lookup::Found(Standing {
@@ -2262,15 +2307,19 @@ fn an_earlier_builds_sample_stamp_leaves_the_token_unverified_and_compared_again
     }
 }
 
-/// A ROW WITH NO LOGIN MADE HERE IS NOT ON ITS TOKEN HERE, WHATEVER ITS TOKEN: m7's window-minted
-/// token of `away` is in use on every Mac, but `away`'s login directory holds nothing here, so no
-/// launch starts on the row here ([`accounts::LoginHere::NotMade`]); it is not among the rows on
-/// their token, so neither the sign-in ladder's vault route holds its sign-in nor renewal leaves it
-/// out, and its sign-in makes its login. Once its login is made here, the same token puts it on
-/// its token. NEGATIVE CONTROL: without the enrolment check in `rows_on_token_of`, `away` is on
-/// its token while its login is not made, the row neither signed in nor run here.
+/// A ROW WITH NO LOGIN MADE HERE RUNS ON ITS FLEET TOKEN HERE WHERE THIS MAC'S CLAIMS COVER IT
+/// (FL-135): m7's window-minted token of `away` is in use on every Mac, and `away`'s login
+/// directory holds nothing here. On a Mac with `ai-pool.toml`, whose claims cover every account
+/// ([`super::super::claims::covers`]), the row is one of the rows on their token, which the upkeep
+/// keeps for rotation ([`accounts::LoginHere::OnToken`]); the sign-in ladder's vault route then
+/// holds its sign-in and renewal leaves it out, so nothing makes its login: the reading writes
+/// nothing in its directory and it stays not enrolled. NEGATIVE CONTROLS: on a Mac whose claims
+/// cover no such account (no pool file, no lab naming it the home), nothing would keep a second
+/// Mac off it, so it is not on its token and reads [`accounts::LoginHere::NotMade`]; and a token
+/// m7 minted at a person's terminal, not yet verified, serves only m7, so `away` is not on it
+/// either.
 #[test]
-fn a_row_with_no_login_made_here_is_not_on_its_token_here() {
+fn a_row_with_no_login_made_here_runs_on_its_fleet_token_here() {
     let scratch = Scratch::new("not-made");
     let dir = scratch.path().join("logins").join("away");
     let roster_file = scratch.path().join("away.toml");
@@ -2284,10 +2333,9 @@ fn a_row_with_no_login_made_here_is_not_on_its_token_here() {
     )
     .expect("the roster");
     let roster = Roster::load_for(Cli::Claude, &roster_file).expect("it loads");
-    let token = unverified_by(false, MintedBy::Window);
     let paths = Paths::for_home(&scratch.path().join("home"));
     let store = scratch.store();
-    let on_token = || {
+    let on_token = |token: &Standing| {
         journal::with_keyer(keyer, || {
             rows_on_token_of(
                 &paths,
@@ -2300,18 +2348,64 @@ fn a_row_with_no_login_made_here_is_not_on_its_token_here() {
         .expect("the listing was read")
     };
     let row = roster.row("away").expect("the row");
+    let now = i64::try_from(NOW).unwrap();
+    let here = |read: &BTreeMap<String, u64>| {
+        let state = accounts::State {
+            tokens_here: Some(accounts::TokensHere {
+                read_at: now,
+                ends: read
+                    .iter()
+                    .map(|(label, end)| (label.clone(), i64::try_from(*end).unwrap()))
+                    .collect(),
+            }),
+            ..accounts::State::default()
+        };
+        accounts::login_here(
+            row,
+            &state,
+            accounts::enrolled(&roster).contains("away"),
+            now,
+        )
+    };
     assert!(!accounts::enrolled(&roster).contains("away"));
+
+    let terminal = unverified_by(false, MintedBy::Terminal);
     assert!(
-        on_token().is_empty(),
-        "no login made here: not on its token"
+        on_token(&terminal).is_empty(),
+        "CONTROL: a terminal token m7 has not verified serves only m7"
     );
-    std::fs::create_dir_all(&dir).expect("the login directory");
-    std::fs::write(dir.join("settings.json"), "{}").expect("a login's file");
-    assert!(accounts::enrolled(&roster).contains(&row.label));
+    assert_eq!(here(&on_token(&terminal)), accounts::LoginHere::NotMade);
+
+    let window = unverified_by(false, MintedBy::Window);
+    assert!(
+        on_token(&window).is_empty(),
+        "CONTROL: no claims cover the account here"
+    );
+    crate::vault_entry::put(
+        &paths.home,
+        crate::harness::ai_pool::AI_POOL_FILE,
+        "version = 1\n",
+    );
+    assert_eq!(here(&on_token(&terminal)), accounts::LoginHere::NotMade);
+    let read = on_token(&window);
     assert_eq!(
-        on_token().get("away"),
-        token.meta.as_ref().map(|meta| meta.expires_at).as_ref(),
-        "CONTROL: made here, the row is on its token"
+        read.get("away"),
+        window.meta.as_ref().map(|meta| meta.expires_at).as_ref(),
+        "no login made here: its fleet token runs it"
+    );
+    assert_eq!(
+        here(&read),
+        if crate::harness::token_route::LAUNCHES_ON_TOKEN {
+            accounts::LoginHere::OnToken
+        } else {
+            accounts::LoginHere::NotMade
+        },
+        "rotation can pick it wherever a launch starts on a token"
+    );
+    assert!(!dir.exists(), "the reading makes no login directory");
+    assert!(
+        !accounts::enrolled(&roster).contains("away"),
+        "nor enrols the row"
     );
 }
 
@@ -2407,5 +2501,333 @@ fn renew_on_a_token_row_says_so_and_takes_no_sign_in_lock() {
         }),
         Some(BTreeMap::new()),
         "held while the stored login works here"
+    );
+}
+
+/// WINDOWS SHARED WITH ANOTHER ACCOUNT HERE WRITE NOTHING, AND ARE COMPARED AGAIN THE NEXT WEEK
+/// ONLY AGAINST THE ACCOUNTS THAT SHARED THEM (§5.6): m7's window-made token, whose reading shows
+/// the basis's windows while another account's current windows here (`other-0`'s) show them too,
+/// is `shared`, nothing is due, and the row keeps `other-0` as the account that shared them. Later
+/// that week a token reading compares nothing, though `other-0` is no longer read here, and a
+/// stored-login reading of the same week is recorded as the basis and compares nothing either. A
+/// basis of the next week reopens it: the kept reading and its verdict go, `other-0` stays. The
+/// next token reading, the next week's windows, verifies it only where this Mac reads `other-0`'s
+/// current windows apart from them: with `other-0` idle here that week (no current windows: a
+/// token minted in its browser session would read its windows still), it is `shared` again and
+/// nothing is due; with `other-0` still showing them, `shared`; with `other-0`'s windows apart,
+/// `equal`, and the write is due. NEGATIVE CONTROL (2026-11-14, by hand, then restored): with
+/// `Verification::compare`'s rule for the accounts that shared the windows cut, the idle case
+/// leaves the write due.
+#[test]
+fn windows_shared_with_another_account_are_compared_again_the_next_week() {
+    let next = NOW + 4 * 86_400;
+    let week = stored_at(next);
+    let stored = stored_at(NOW);
+    assert_ne!(
+        week.week_reset, stored.week_reset,
+        "PRECONDITION: a later week"
+    );
+    for (case, others_next) in [
+        ("idle", vec![]),
+        ("sharing", vec![week]),
+        ("apart", vec![others_at(next)]),
+    ] {
+        let scratch = Scratch::new(&format!("shared-week-{case}"));
+        let store = scratch.store();
+        let token = unverified_by(false, MintedBy::Window);
+        let verdict = || scratch.table().rows[KEY].verification.verdict;
+        assert!(stored_reading(&store, &token, stored, NOW));
+        assert_eq!(
+            note_served(&store, &token, &served(stored, vec![stored]), NOW + 30).unwrap(),
+            Due::Nothing,
+            "{case}: shared windows write nothing"
+        );
+        assert_eq!(verdict(), Some(Verdict::Shared));
+        assert_eq!(
+            scratch.table().rows[KEY].verification.shared_with,
+            BTreeSet::from(["other-0".to_owned()]),
+            "{case}: the account that shared them is kept"
+        );
+        assert_eq!(
+            note_served(&store, &token, &served(stored, vec![]), NOW + 60).unwrap(),
+            Due::Nothing,
+            "{case}: the same week compares nothing again"
+        );
+        assert_eq!(verdict(), Some(Verdict::Shared));
+        assert!(
+            stored_reading(&store, &token, stored, NOW + 90),
+            "{case}: a basis of the same week is recorded"
+        );
+        assert_eq!(
+            verdict(),
+            Some(Verdict::Shared),
+            "{case}: and compares nothing"
+        );
+
+        assert!(stored_reading(&store, &token, week, next));
+        let row = scratch.table().rows.remove(KEY).expect("the row");
+        assert_eq!(
+            (row.verification.verdict, row.verification.reading),
+            (None, None),
+            "{case}: a basis of a later week reopens it"
+        );
+        assert_eq!(
+            row.verification.shared_with,
+            BTreeSet::from(["other-0".to_owned()]),
+            "{case}: and keeps who shared the windows"
+        );
+        let due = note_served(&store, &token, &served(week, others_next), next + 30).unwrap();
+        if case == "apart" {
+            assert!(matches!(due, Due::Verify(_)), "{case}: {due:?}");
+            assert_eq!(verdict(), Some(Verdict::Equal));
+        } else {
+            assert_eq!(due, Due::Nothing, "{case}: nothing verified");
+            assert_eq!(verdict(), Some(Verdict::Shared), "{case}");
+        }
+    }
+}
+
+/// A `shared` VERDICT THAT NAMES NO ACCOUNT IS FINAL, AS THE BUILD THAT WROTE IT MADE IT (§5.6):
+/// an earlier build's check file holds `shared` with no accounts beside it (or an earlier build
+/// wrote back a later one's, dropping them). No later comparison could tell the token's account
+/// apart from accounts nobody named, so a basis of a later week records nothing and reopens
+/// nothing, and once the basis's week has ended the token is not held for a stored-login reading:
+/// it stays `unverified (windows shared)`. CONTROL: the same verdict naming `other-0` awaits a
+/// stored-login reading once its week has ended.
+#[test]
+fn a_shared_verdict_naming_no_account_is_final() {
+    let token = unverified_by(false, MintedBy::Window);
+    let found = Lookup::Found(token.clone());
+    let next = NOW + 4 * 86_400;
+    for named in [false, true] {
+        let scratch = Scratch::new(&format!("shared-unnamed-{named}"));
+        let store = scratch.store();
+        assert!(stored_reading(&store, &token, stored_at(NOW), NOW));
+        update_table(&store, |table| {
+            let check = &mut table.rows.get_mut(KEY).expect("the row").verification;
+            check.verdict = Some(Verdict::Shared);
+            check.reading = Some(stored_at(NOW));
+            if named {
+                check.shared_with.insert("other-0".to_owned());
+            }
+        })
+        .unwrap();
+        let why = match TokenState::of(&found, scratch.table().rows.get(KEY), next) {
+            TokenState::Unverified { why, .. } => why,
+            state => panic!("named: {named}: {state:?}"),
+        };
+        assert_eq!(
+            why,
+            if named {
+                Unverified::AwaitingBasis
+            } else {
+                Unverified::WindowsShared
+            },
+            "named: {named}"
+        );
+        assert_eq!(
+            stored_reading(&store, &token, stored_at(next), next),
+            named,
+            "named: {named}: a later week's basis reopens only a verdict that names its accounts"
+        );
+        let check = scratch
+            .table()
+            .rows
+            .remove(KEY)
+            .expect("the row")
+            .verification;
+        assert_eq!(
+            check.verdict,
+            (!named).then_some(Verdict::Shared),
+            "named: {named}"
+        );
+    }
+}
+
+/// WINDOWS FOUND SHARED HAND THE TOKEN BACK TO THE HOLD ONCE THEIR WEEK ENDS, AS THE TOKEN ROUTE
+/// JUDGES IT (§5.6, [`standing_judged`]): m7's window-made token, in use on every Mac, has no row
+/// here, so while this Mac's stored login of the account works the route holds it for a basis.
+/// The stored login's reading lifts the hold; the token's reading then shows the basis's windows
+/// and `other-0`'s, so it is `shared`, and through that week the route puts launches on the token
+/// (it serves, and nothing compares it). Once that basis's week has ended, the route holds the
+/// token again, so a launch runs on the stored login and its reading gives the later week's basis,
+/// which reopens the comparison and lifts the hold; the token's next reading, `other-0`'s windows
+/// apart from it, leaves the write due. NEGATIVE CONTROL (2026-11-14, by hand, then restored):
+/// with `Unverified::of` judging `shared` before an ended basis, the route puts every launch of
+/// that week on the token, no stored-login reading comes, and the token stays `shared`.
+#[test]
+fn windows_shared_in_a_week_that_ended_hold_the_token_for_a_stored_login_reading() {
+    let scratch = Scratch::new("shared-route");
+    let store = scratch.store();
+    let token = unverified_by(false, MintedBy::Window);
+    let found = Lookup::Found(token.clone());
+    let roster = Roster::load_for(Cli::Claude, &scratch.path().join("accounts.toml")).unwrap();
+    login_record(&scratch, EMAIL);
+    let stored = stored_at(NOW);
+    assert_eq!(
+        judged(&scratch, &found, &roster, NOW),
+        TokenFact::AwaitingBasis,
+        "held for its basis"
+    );
+    assert!(stored_reading(&store, &token, stored, NOW + 30));
+    assert_eq!(
+        judged(&scratch, &found, &roster, NOW + 60),
+        TokenFact::InUse
+    );
+    assert_eq!(
+        note_served(&store, &token, &served(stored, vec![stored]), NOW + 90).unwrap(),
+        Due::Nothing
+    );
+    assert_eq!(
+        scratch.table().rows[KEY].verification.verdict,
+        Some(Verdict::Shared)
+    );
+    assert_eq!(
+        judged(&scratch, &found, &roster, NOW + 120),
+        TokenFact::InUse,
+        "through its week the token serves"
+    );
+
+    let next = NOW + 4 * 86_400;
+    assert_eq!(
+        judged(&scratch, &found, &roster, next),
+        TokenFact::AwaitingBasis,
+        "its week ended: held for a stored-login reading"
+    );
+    let week = stored_at(next);
+    assert!(stored_reading(&store, &token, week, next + 30));
+    assert_eq!(
+        judged(&scratch, &found, &roster, next + 60),
+        TokenFact::InUse,
+        "the later week's basis lifts the hold"
+    );
+    assert!(matches!(
+        note_served(
+            &store,
+            &token,
+            &served(week, vec![others_at(next)]),
+            next + 90
+        )
+        .unwrap(),
+        Due::Verify(_)
+    ));
+}
+
+/// A PAIR THAT DOES NOT READ AS ONE TOKEN RECORDS NOTHING AND CREDITS NO READING (FL-134): two
+/// Macs' concurrent writes split the pair (`mismatched (draft)`) until a settle, and its meta is
+/// the meta register's winner, which may be of a token the settle drops (another Mac's later
+/// replacement, one the token register no longer holds). A stored-login reading then records no
+/// basis and moves no row to that meta's token, and a token reading leaves `Due::Apart`, a
+/// verified meta beside it or not: a verification beside two tokens may be of the token a
+/// replacement replaced, so it says nothing of whose this session's reading is. CONTROL: the same
+/// readings against the pair read as one token record the basis and credit the reading.
+/// NEGATIVE CONTROLS (2026-11-15, by hand, then restored): with `note_basis`'s check of the pair
+/// cut, "gives no basis" fails; with `note_served`'s cut, "a verification beside two tokens
+/// credits no reading" fails.
+#[test]
+fn a_split_pair_records_nothing_and_credits_no_reading() {
+    let scratch = Scratch::new("split-pair");
+    let store = scratch.store();
+    let token = unverified_by(true, MintedBy::Window);
+    minted_row(&store, &token);
+    let before = scratch.table();
+    let mut split = token.clone();
+    split.check = Check::Mismatched(Mismatch::Draft);
+    split.meta.as_mut().expect("a meta").minted_at += 600;
+    let stored = stored_at(NOW);
+    assert!(
+        !stored_reading(&store, &split, stored, NOW),
+        "a pair that does not read as one token gives no basis"
+    );
+    let mut stamped = split.clone();
+    stamped.meta.as_mut().expect("a meta").verified = Some(Verified {
+        on: "m7".to_owned(),
+        at: NOW - 3_600,
+        by: aterm_secrets::claude_token::BY_WINDOWS.to_owned(),
+        seven_day_resets_at: None,
+        five_hour_resets_at: None,
+    });
+    assert!(stamped.verified(), "CONTROL: the meta reads verified");
+    assert_eq!(
+        note_served(&store, &stamped, &served(stored, vec![]), NOW + 30).unwrap(),
+        Due::Apart,
+        "a verification beside two tokens credits no reading"
+    );
+    assert_eq!(
+        note_served(&store, &split, &served(stored, vec![]), NOW + 60).unwrap(),
+        Due::Apart,
+        "and its reading, of a token not verified, is no row's"
+    );
+    assert_eq!(scratch.table(), before, "no row made, moved or compared");
+    assert!(
+        stored_reading(&store, &token, stored, NOW + 90),
+        "CONTROL: the pair read as one token takes the basis"
+    );
+    assert_eq!(
+        note_served(&store, &token, &served(stored, vec![]), NOW + 120).unwrap(),
+        Due::Verify(verify_of(
+            token.meta.as_ref().expect("a meta"),
+            Some(stored),
+            NOW + 120
+        )),
+        "CONTROL: and its reading is compared"
+    );
+}
+
+/// A READING THAT RECORDS NOTHING REWRITES NEITHER TABLE FILE (FL-134): a row whose token this
+/// Mac found `equal` (its write still due) or `differ` is final, so the cheap look finds none
+/// ([`basis_wanted`]), yet the tap still looks at the vault once per reading heartbeat for the
+/// account's stored login, and its reading reaches [`note_basis`], which records nothing on a
+/// final row. Neither `tokens.json` nor the check file is written again then: each write replaces
+/// its file, so an unchanged inode is a file nothing rewrote. CONTROL: a reading that records a
+/// basis replaces both. NEGATIVE CONTROL (2026-11-15, by hand, then restored): with
+/// `update_parts` writing an unchanged table, "nothing rewritten" fails.
+#[test]
+fn a_reading_that_records_nothing_rewrites_no_table_file() {
+    use std::os::unix::fs::MetadataExt;
+    let scratch = Scratch::new("no-rewrite");
+    let store = scratch.store();
+    let token = unverified_by(true, MintedBy::Window);
+    minted_row(&store, &token);
+    let files = || {
+        [TABLE_FILE, CHECK_FILE].map(|file| {
+            std::fs::metadata(store.shared_dir().join(file))
+                .expect("a table file")
+                .ino()
+        })
+    };
+    for verdict in [Verdict::Equal, Verdict::Differ] {
+        update_table(&store, |table| {
+            table
+                .rows
+                .get_mut(KEY)
+                .expect("the row")
+                .verification
+                .verdict = Some(verdict);
+        })
+        .unwrap();
+        assert!(!basis_wanted(&store, &key()), "{verdict:?}: final");
+        let before = files();
+        assert!(
+            !stored_reading(&store, &token, stored_at(NOW), NOW),
+            "{verdict:?}: records nothing"
+        );
+        assert_eq!(files(), before, "{verdict:?}: nothing rewritten");
+    }
+    update_table(&store, |table| {
+        table
+            .rows
+            .get_mut(KEY)
+            .expect("the row")
+            .verification
+            .verdict = None;
+    })
+    .unwrap();
+    let before = files();
+    assert!(stored_reading(&store, &token, stored_at(NOW), NOW));
+    let after = files();
+    assert!(
+        before.iter().zip(&after).all(|(was, now)| was != now),
+        "CONTROL: a basis rewrites both"
     );
 }

@@ -70,10 +70,13 @@ thread_local! {
 #[inline]
 fn shallow_plug_on() -> bool {
     #[cfg(any(test, debug_assertions))]
-    if SHALLOW_EYE_PLUG.with(std::cell::Cell::get) {
-        return true;
+    {
+        SHALLOW_EYE_PLUG.with(std::cell::Cell::get)
     }
-    false
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
 }
 
 /// Primary catch-light radius as a fraction of the grown eye's smaller diameter, bounded in device pixels: the floor survives 4×4 coverage at ship size, the ceiling stops a headlamp.

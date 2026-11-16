@@ -85,7 +85,7 @@ impl Selection {
 /// pool, fleet and sheet are read from one version of the vault ([`vault_sources`]), and an
 /// entry this Mac cannot read holds its place: it never lets a lower source stand in for it.
 #[cfg_attr(
-    any(test, debug_assertions),
+    all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
         machine = "AccountSourceSelection",
         action = "Select",
@@ -93,7 +93,7 @@ impl Selection {
     )
 )]
 fn select_inner(
-    home: Option<&Path>,
+    sources: impl FnOnce() -> [Option<VaultSource>; 3],
     config: Option<&Path>,
     roster: Option<&Path>,
     scope: Scope,
@@ -106,7 +106,7 @@ fn select_inner(
     if !named && let Some(key) = &key {
         return Selection::Key(key.clone());
     }
-    let [pool, fleet, sheet] = vault_sources(home);
+    let [pool, fleet, sheet] = sources();
     if key.is_none()
         && let Some(pool) = pool.filter(VaultSource::occupies)
     {
@@ -174,7 +174,13 @@ pub(super) fn select_observed(
     scope: Scope,
     policy: &accounts::source_policy::Snapshot,
 ) -> Result<Selection, String> {
-    let selected = select_inner(home, config, roster, scope, policy.retired());
+    let selected = select_inner(
+        || vault_sources(home),
+        config,
+        roster,
+        scope,
+        policy.retired(),
+    );
     if let Selection::Key(source) = &selected
         && let Some(home) = home
     {
@@ -190,7 +196,7 @@ pub(super) fn select(
     roster: Option<&Path>,
     scope: Scope,
 ) -> Selection {
-    select_inner(home, config, roster, scope, false)
+    select_inner(|| vault_sources(home), config, roster, scope, false)
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ mod host_fit;
 mod open_next;
 mod qualify_model;
 mod sign_model;
+mod windows_pull;
 
 const OLD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TIP: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -388,7 +389,7 @@ struct World {
     /// Fresh cuts that adopted the signed copy, and fresh cuts that signed their own.
     adopted: usize,
     resigned: usize,
-    /// The repair workers the cut's reds open ([`Backend::repair`]).
+    /// Caller-owned repairs, or the pump's workers ([`Backend::repair`]).
     repairs: Repairs,
     /// Whether origin/main's tip holds the handoff fixtures of the release main declares
     /// ([`Backend::fixtures_at`]), which `--open-next` asks.
@@ -404,22 +405,30 @@ struct World {
     distribution: Vec<Finding>,
     /// Each ask of [`Backend::distribution`], by whether it was a dry run's.
     distribution_dry: Vec<bool>,
+    /// The release commit's pull-lane configuration ([`Backend::windows_pull_config`]).
+    windows_pull: crate::buildplan::windows_pull::Config,
+    /// Why writing the Windows build request fails; it is written otherwise.
+    windows_request_error: Option<String>,
+    /// Each request written: (version, build, commit, at).
+    windows_requests: Vec<(String, u64, String, u64)>,
+    /// What origin holds for the pull at each look ([`Backend::windows_look`]).
+    windows_found: Result<crate::buildplan::windows_pull::Found, String>,
+    /// The day each look judged an attestation on.
+    windows_look_days: Vec<String>,
+    /// Each `cut --sign`'s arguments, in order.
+    sign_args: Vec<Vec<String>>,
 }
 
-/// The world's repair spawner, inside an aterm session unless `outside`: every failure the cut
-/// hands it, and every worker it starts, numbered `s-repair<n>`.
+/// The world's repair handoff, caller-owned unless `pump`: every failure the cut hands it,
+/// and every pump worker it starts, numbered `s-repair<n>`.
 #[derive(Default)]
 struct Repairs {
-    outside: bool,
+    pump: bool,
     asked: Vec<aterm_release::repair::Failure>,
     spawned: Vec<(PathBuf, String)>,
 }
 
 impl aterm_release::repair::Spawner for Repairs {
-    fn in_session(&self) -> bool {
-        !self.outside
-    }
-
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
         self.spawned.push((cwd.to_path_buf(), task.to_string()));
         Ok(format!("s-repair{}", self.spawned.len()))
@@ -633,6 +642,12 @@ impl World {
             fleet_elsewhere: false,
             distribution: Vec::new(),
             distribution_dry: Vec::new(),
+            windows_pull: crate::buildplan::windows_pull::Config::OFF,
+            windows_request_error: None,
+            windows_requests: Vec::new(),
+            windows_found: Err("no look was expected".into()),
+            windows_look_days: Vec::new(),
+            sign_args: Vec::new(),
         }
     }
 
@@ -1155,6 +1170,7 @@ impl Branches for WorldBranches<'_> {
         let mut w = self.world();
         assert_eq!(args[..2], ["cut", "--sign"], "{args:?}");
         w.calls.push("cut --sign".into());
+        w.sign_args.push(args.to_vec());
         // A cutter a person's signal cut short, whose exit says only 1.
         if w.interrupt_at("cut --sign") {
             return ran(1);
@@ -1458,10 +1474,8 @@ impl crate::release::PendingSign for FakePreparingSign {
 }
 
 impl Backend for World {
-    fn main_lane(&mut self, base: &str) -> Option<String> {
-        Some(format!(
-            "main lane: base {base}: red, age_s=23 (advisory fixture)"
-        ))
+    fn follower(&mut self, base: &str) -> Option<String> {
+        Some(format!("follower: base {base}: failure (advisory fixture)"))
     }
     fn start_prefreeze(&mut self) {
         std::fs::write(
@@ -2331,7 +2345,12 @@ impl Backend for World {
         self.repairs.asked.push(failure.clone());
         let record = World::release_dir(self).join(aterm_release::repair::RECORD_FILE);
         let clone = self.dir.path().to_path_buf();
-        aterm_release::repair::open(&record, &clone, failure, &mut self.repairs).lines(&record)
+        let mode = if self.repairs.pump {
+            aterm_release::repair::RepairMode::Pump(&mut self.repairs)
+        } else {
+            aterm_release::repair::RepairMode::Caller
+        };
+        aterm_release::repair::open(&record, &clone, failure, mode).lines(&record)
     }
     fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String> {
         self.calls.push("slice-memory-forecast".into());
@@ -2348,6 +2367,33 @@ impl Backend for World {
             commit: format!("e{}", &c.commit[1..]),
             line: format!("{build} {}", c.version),
         })
+    }
+    fn windows_pull_config(&mut self, _commit: &str) -> crate::buildplan::windows_pull::Config {
+        self.windows_pull
+    }
+    fn windows_request(
+        &mut self,
+        version: &str,
+        build: u64,
+        commit: &str,
+        now: u64,
+    ) -> Result<String, String> {
+        self.calls.push("windows-request".into());
+        if let Some(why) = &self.windows_request_error {
+            return Err(why.clone());
+        }
+        self.windows_requests
+            .push((version.to_string(), build, commit.to_string(), now));
+        Ok(format!("{:040x}", self.windows_requests.len()))
+    }
+    fn windows_look(
+        &mut self,
+        _ask: &crate::buildplan::windows_pull::Ask,
+        day: &str,
+    ) -> Result<crate::buildplan::windows_pull::Found, String> {
+        self.calls.push("windows-look".into());
+        self.windows_look_days.push(day.to_string());
+        self.windows_found.clone()
     }
     fn preview_roll(&mut self, _c: &Candidate) -> Result<String, Refusal> {
         Ok(crate::changelog::roll_words(1, 0))
@@ -4143,7 +4189,7 @@ fn a_release_claims_its_disk_until_verify_ends_and_a_later_stage_claims_its_own(
     let mut w = World::new();
     w.claim_refusal = Some(Refusal::new(
         "the release's 30 GiB can never fit on /c",
-        "free space, then re-run",
+        "cut from a clone on a larger volume, then re-run",
     ));
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}");
@@ -4990,9 +5036,10 @@ const SHIM_REFUSED: &str = "released-shim: aterm 0.199.0 refuses candidate (exit
     it, then adopt the configuration";
 
 /// A judgment the installed app may not make: it is two releases behind the newest public tag.
-const SHIM_UNDECIDED: &str = "released-shim: installed aterm 0.197.0 is 2 releases behind the \
-    newest fetched public tag v0.199.0; only that release or the one before it judges \
-    bootstrap compatibility: update the installed app";
+const SHIM_UNDECIDED: &str = "released-shim: installed aterm 0.197.0 is 2 releases behind \
+    v0.199.0, the newest public tag the candidate holds at or before its workspace version \
+    0.199.0; only that release or the one before it judges bootstrap compatibility: update the \
+    installed app";
 
 /// THE CUT ASKS FIRST WHAT THE PUBLIC RELEASE SAYS OF R (R29). The released-shim judgment
 /// depends on which release is public, so a tree nobody changed can turn red; the 0.200.0 cut
@@ -5039,7 +5086,7 @@ fn a_public_release_that_refuses_rs_tree_refuses_at_step_one_with_nothing_qualif
             w.calls
         );
     }
-    assert_eq!(w.repairs.asked.len(), 1, "a red of R opens its worker");
+    assert_eq!(w.repairs.asked.len(), 1, "a red of R hands off its repair");
     assert_eq!(w.repairs.asked[0].gate, "verify released-shim");
     assert_eq!(w.repairs.asked[0].step, "1/10 checks");
 
@@ -5416,7 +5463,7 @@ fn measure_commit_gate_refusal_order() {
 }
 
 #[test]
-fn selection_states_the_bases_lane_red_without_refusing_or_reselecting() {
+fn selection_states_the_followers_red_on_its_base_without_refusing_or_reselecting() {
     let mut w = World::new();
     w.versions.insert(TIP.into(), "0.6.0".into());
     let tip = w.history.last().unwrap().clone();
@@ -5425,7 +5472,11 @@ fn selection_states_the_bases_lane_red_without_refusing_or_reselecting() {
         ..mac()
     });
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
-    assert!(w.out.iter().any(|line| line == &format!("main lane: base {tip}: red, age_s=23 (advisory fixture)")));
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line == &format!("follower: base {tip}: failure (advisory fixture)"))
+    );
     assert!(w.journal().is_none());
     assert_eq!(w.count("build"), 0);
     assert_eq!(w.count("bump"), 0);
@@ -7265,14 +7316,14 @@ fn a_line_that_fails_its_meaning_check_is_never_exported() {
     );
 }
 
-/// A real cut's red reaches its repair worker once, at the failure exit: one worker opens per
+/// A pump cut's red reaches its repair worker once, at the failure exit: one worker opens per
 /// failing input hash, told the step's log and the cut's inputs, its sid kept in the clone's
 /// repair record, and the cut still ends with its own refusal. NEGATIVE CONTROLS: a dry run's
-/// red, a COULD NOT RUN and an operational refusal open none; outside an aterm session the
-/// command is printed and nothing opens.
+/// red, a COULD NOT RUN and an operational refusal open none.
 #[test]
-fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
+fn a_red_pump_cut_opens_one_repair_worker_per_failing_input_hash() {
     let mut w = World::new();
+    w.repairs.pump = true;
     w.verify_code = 1;
     w.verify_passes = false;
     let (code, last) = w.run(bump());
@@ -7343,6 +7394,7 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
 
     // A gate's red at step 1 opens one too, naming the gate; its dry run opens none.
     let mut gated = World::new();
+    gated.repairs.pump = true;
     gated.blocks = vec![
         Refusal::new(
             "handoff fixtures — the handoff fixtures of v0.5.0 are not checked in",
@@ -7377,6 +7429,7 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
     // same inputs. NEGATIVE CONTROL: a source gate's red at step 1 on those inputs takes it.
     for source_red in [false, true] {
         let mut w = World::new();
+        w.repairs.pump = true;
         w.versions.insert(TIP.into(), "0.6.0".into());
         w.blocks = if source_red {
             vec![Refusal::new("changelog — no entry for 0.6.0", "add it").failing("changelog")]
@@ -7425,6 +7478,7 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
             .collect::<Vec<_>>()
     };
     let mut built = World::new();
+    built.repairs.pump = true;
     built.build_claims_late = true;
     let (code, last) = built.run(bump());
     assert!(
@@ -7433,6 +7487,7 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
     );
     assert_eq!(gates(&built), ["qualify's build branch"]);
     let mut input = World::new();
+    input.repairs.pump = true;
     input.versions.insert(TIP.into(), "0.6.0".into());
     input.input_finding = Some(InputFinding::Failed(
         "export-scan: planted forbidden content".into(),
@@ -7441,6 +7496,7 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
     assert_eq!(code, 1, "{last}");
     assert_eq!(gates(&input), ["verify release-input"]);
     let mut unread = World::new();
+    unread.repairs.pump = true;
     // Step 5's bundle half, not AppKit's run of that half at the front of step 4.
     unread.verify_half = Some(Half::Bundle);
     unread.verify_step = Some(Step::Bundle);
@@ -7459,10 +7515,12 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
 
     // A COULD NOT RUN and an operational refusal decide nothing of R's code.
     let mut unrun = World::new();
+    unrun.repairs.pump = true;
     unrun.verify_code = 3;
     unrun.verify_passes = false;
     assert_eq!(unrun.run(bump()).0, 3);
     let mut off_main = World::new();
+    off_main.repairs.pump = true;
     off_main.on_main = false;
     let (code, last) = off_main.run(bump());
     assert!(
@@ -7472,28 +7530,52 @@ fn a_red_cut_opens_one_repair_worker_per_failing_input_hash() {
     for world in [&unrun, &off_main] {
         assert!(world.repairs.asked.is_empty(), "{:?}", world.repairs.asked);
     }
+}
 
-    // Outside an aterm session the red prints the command, and nothing opens.
-    let mut outside = World::new();
-    outside.repairs.outside = true;
-    outside.verify_code = 1;
-    outside.verify_passes = false;
-    assert_eq!(outside.run(bump()).0, 1);
-    assert!(outside.repairs.spawned.is_empty());
-    assert!(
-        outside
+/// A caller's real failure exit returns the repair context without starting a worker or
+/// touching its worker record. A malformed old record cannot hide the original failure.
+#[test]
+fn a_red_caller_cut_returns_its_failure_context_without_opening_a_worker() {
+    for original in [None, Some("not a repair record\n")] {
+        let mut w = World::new();
+        let record = w.release_dir().join(aterm_release::repair::RECORD_FILE);
+        if let Some(text) = original {
+            std::fs::create_dir_all(record.parent().expect("release directory"))
+                .expect("directory");
+            std::fs::write(&record, text).expect("old record");
+        }
+        w.verify_code = 1;
+        w.verify_passes = false;
+        let (code, last) = w.run(bump());
+        assert!(
+            code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+            "{last}"
+        );
+        assert_eq!(w.out.last(), Some(&last));
+        assert_eq!(w.repairs.asked.len(), 1);
+        assert!(w.repairs.spawned.is_empty());
+        let failure = &w.repairs.asked[0];
+        let handed = w
             .out
             .iter()
-            .any(|line| line.starts_with("aterm ctl @self spawn agent=claude ")),
-        "{:#?}",
-        outside.out
-    );
-    assert!(
-        !outside
-            .release_dir()
-            .join(aterm_release::repair::RECORD_FILE)
-            .exists()
-    );
+            .position(|line| line.starts_with("repair: caller-owned repair "))
+            .expect("the caller's handoff is said before the final refusal");
+        let said = w.out[handed + 1..w.out.len() - 1].join("\n");
+        for field in [
+            failure.gate.as_str(),
+            failure.step.as_str(),
+            failure.version.as_str(),
+            failure.commit.as_str(),
+            failure.trustc.as_str(),
+            failure.log.to_str().expect("fixture log"),
+        ] {
+            assert!(said.contains(field), "missing failure field {field:?}");
+        }
+        match original {
+            Some(text) => assert_eq!(std::fs::read_to_string(&record).expect("old record"), text),
+            None => assert!(!record.exists()),
+        }
+    }
 }
 
 /// A line started by `--bump` whose `verify release` went red, then FIX landed on main and
@@ -12068,7 +12150,7 @@ fn a_fail_is_never_rerolled_into_a_pass() {
     w.verify_code = 0;
     w.claim_refusal = Some(Refusal::new(
         "the release's 30 GiB can never fit on /c",
-        "free space, then re-run",
+        "cut from a clone on a larger volume, then re-run",
     ));
     w.calls.clear();
     let (code, last) = w.run(mac());

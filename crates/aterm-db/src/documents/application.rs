@@ -376,9 +376,12 @@ fn observe_declared<T>(
 /// fenced original whose selection record holds no completion and that holds no completion
 /// mark ([`crate::generation::Preserving`]), a catalog or declared table
 /// whose directory binding was lost to a relocation is read from the prefix its claim witnesses
-/// ([`Directory::observe_held_table`]), each record authenticated as on any observation. That
-/// table read writes nothing, backfills no volume witness and repairs no binding. A table whose
-/// prefix has no witness still refuses, as does a displaced table of a home that is not fenced;
+/// ([`Directory::observe_held_table`]), each record authenticated as on any observation, and
+/// combined with the table's enrolled recovery replica as a bound table is (a replica that
+/// refuses refuses the read: the prefix alone would not be the whole table). That table read
+/// writes nothing, backfills no volume witness and repairs no binding. A table whose prefix has
+/// no witness, and a displaced table of a home that is not fenced, are read as every reader
+/// reads them: from their recovery replica alone where one answers, and otherwise refused;
 /// and every other reader here ([`observe_store_if_declared_within`] and those built on it,
 /// [`observe_store_in_session`], [`peek_catalog`], [`peek_declaration`]) refuses a displaced
 /// table as before.

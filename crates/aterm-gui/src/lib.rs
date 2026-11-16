@@ -159,6 +159,7 @@ mod native_usage_retention;
 mod native_workers;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
+mod option_routing;
 mod os_appearance;
 mod parked_awaits;
 #[cfg(all(test, unix))]
@@ -176,6 +177,10 @@ mod session_theme;
 #[cfg(all(test, unix))]
 mod settings_draft_carry_conformance;
 mod tables_store;
+mod title_authority;
+#[cfg(test)]
+#[path = "lib_title_authority_tests.rs"]
+mod title_authority_tests;
 #[cfg(all(test, unix))]
 mod typed_rekey_conformance;
 #[cfg(test)]
@@ -673,6 +678,7 @@ mod desktop_files;
 #[cfg(test)]
 mod disk_await_conformance;
 mod disk_board;
+mod disk_stores;
 mod disk_where;
 mod elevated_caption;
 pub(crate) use aterm_gui_consent::durable;
@@ -1005,6 +1011,7 @@ mod spawn_prep;
 mod split_regrid_hold;
 #[cfg(target_os = "linux")]
 mod startup_token;
+mod stats_band;
 mod stats_clock;
 mod stats_deck;
 mod stats_gauge;
@@ -1095,7 +1102,6 @@ mod window_show;
 use app_config::{
     Config, config_path, resolve_force_scale, resolve_tab_strip_rows, resolve_want_gpu,
 };
-use app_search::SearchState;
 use cli::{Cli, parse_cli};
 use input::{InputEvent, InputOutcome, Source};
 use platform::AppRt;
@@ -5630,7 +5636,7 @@ pub(crate) struct SessionCtx {
     pub byte_fanout: Arc<crate::cast::ByteFanout>,
     pub turns: Arc<std::sync::Mutex<crate::turn_ledger::TurnLedger>>,
     pub temporal: Arc<std::sync::Mutex<crate::temporal::TemporalRecorder>>,
-    pub meta: Arc<std::sync::Mutex<crate::session_timeline::SessionMeta>>,
+    pub meta: Arc<crate::session_timeline::MetaLock>,
     pub timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
     pub(crate) fabric: std::sync::Arc<crate::fabric::SessionFabric>,
     pub(crate) idem: pty_idem::PtyIdem,
@@ -7273,7 +7279,7 @@ struct WindowState {
     redraw_requests_for_test: std::cell::Cell<u32>,
     present: Option<PresentTarget>,
     scale: f64,
-    front_content: Option<front_content::FrontContent>,
+    routing: option_routing::Routing,
     active_terminal: Option<front_content::TerminalMirror>,
     window_focus: front_content::WindowFocus,
     tabs: TabIndex,
@@ -7287,13 +7293,26 @@ struct WindowState {
     head_pts: f64,
     last_windowed_band_pts: f64,
     deck_form: crate::stats_plan::DeckForm,
+    /// Whether this window carries the System Resources band (the stats deck and the Network
+    /// State band under it): what `[sys] stats_bars = "deck"` gives a window
+    /// ([`stats_deck::StatsBars::in_window`]). Set in the first window a process creates, clear
+    /// in every later one, and flipped by a person (`App::toggle_window_band`).
+    carries_band: bool,
+    /// A lib fixture's stand-in for the platform arms of `App::on_resize_inner`: this window's
+    /// head follows its form at each resize, as an attached window's does.
+    #[cfg(test)]
+    head_follows_form_for_test: bool,
     mods: ModifiersState,
     scripted_mods_saved: Option<ModifiersState>,
     last_mouse_cell: (u16, u16),
     last_mouse_window_cell: (u16, u16),
     last_cursor_px: (f64, f64),
     pointer_position_known: bool,
+    /// Pane hover was retired for this entry into the unpainted side inset.
+    inset_hover_cleared: bool,
     native_rest: Option<app_mouse::NativePointerRest>,
+    /// The control of a native page the pointer is held on and drags.
+    native_drag: Option<app_mouse::NativeDrag>,
     hover_grid_owned: bool,
     native_rehover: bool,
     hover_mapping: app_mouse::HoverMapping,
@@ -7386,6 +7405,8 @@ struct WindowState {
     verdict_hush: bool,
     /// The session whose shell prompt took the last plain Enter, on a line with something on it; `None` once that Enter's sound was sent, and after an Enter anywhere else.
     prompt_enter: Option<u64>,
+    /// Last sampled raw window pixels for the motion wake comparison; the effects handoff
+    /// separately translates them through the frame's placement.
     pet_pointer_sampled_px: Option<(f64, f64)>,
     delivery_seen: Option<(u64, u64)>,
     installed_config_assets: Option<std::sync::Arc<app_config::ConfigAssetCatalog>>,
@@ -7440,6 +7461,8 @@ struct WindowState {
     /// size ([`App::held_inner_px`]). `None` for a platform window, and for a headless one no
     /// size was given yet (its grid's frame stands for it).
     headless_px: Option<app_config::HeadlessSize>,
+    /// Whole cells beside the frame; kept at zero until the dock commits them.
+    side_inset_cells: u16,
     carried_inner_px: Option<PhysicalSize<u32>>,
     #[cfg(any(windows, target_os = "linux"))]
     restore_placement: Option<app_window::RestorePlacement>,
@@ -7531,13 +7554,11 @@ struct WindowState {
     strip_press: Option<(Instant, tab_model::TabId)>,
     strip_band_press: Option<Instant>,
     strip_drag: Option<app_mouse::StripDrag>,
-    tab_menu: Option<tab_menu::TabMenu>,
     tab_menu_rect: Option<tab_menu::MenuRect>,
     tab_menu_laid: Option<app_mouse::GlassGrid>,
     tab_menu_consumed_button: Option<aterm_types::mouse::MouseButton>,
     #[cfg(windows)]
     band_menu_release_pending: bool,
-    rename_edit: Option<app_rename::TabRenameEdit>,
     cached_strip_rows: Vec<Vec<RenderCell>>,
     occluded: bool,
     #[cfg(test)]
@@ -7561,7 +7582,7 @@ struct WindowState {
     #[cfg(any(test, debug_assertions))]
     tooltips_pushed: Vec<Option<String>>,
     option_as_alt: std::cell::Cell<bool>,
-    tab_title_epochs: std::collections::HashMap<u64, u64>,
+    tab_title_epochs: title_authority::TitleEpochs,
     tab_title_cache: std::collections::HashMap<u64, crate::app_tabs::CapturedTitle>,
     tab_chrome_titles: std::collections::HashMap<u64, String>,
     tab_chrome_titles_by_tab: std::collections::HashMap<tab_model::TabId, (Option<u64>, String)>,
@@ -7577,11 +7598,9 @@ struct WindowState {
     ime_recipient: Option<app_input::ImeComposition>,
     preedit_shown: bool,
     last_ime_rect: Option<(i32, i32, u32, u32)>,
-    search: Option<SearchState>,
     find_bar_hit: Option<FindBarHit>,
     #[cfg(test)]
     find_bar_match_work: usize,
-    overlay: Option<crate::overlay::Overlay>,
     #[cfg(a11y_tree)]
     a11y: Option<a11y_adapter::Adapter>,
     #[cfg(a11y_tree)]
@@ -7648,6 +7667,13 @@ fn os_window_hidden(window: &Window) -> bool {
 #[cfg(not(target_os = "macos"))]
 const fn os_window_hidden(_window: &Window) -> bool {
     false
+}
+
+impl std::ops::Deref for WindowState {
+    type Target = option_routing::ReadOnly;
+    fn deref(&self) -> &Self::Target {
+        self.routing.read()
+    }
 }
 
 impl WindowState {
@@ -8455,29 +8481,29 @@ impl WindowState {
         self.sync_holding_gauge.set(self.sync_hold_until.is_some());
     }
 
-    const fn palette(&self) -> Option<&crate::palette::PaletteState> {
-        match &self.overlay {
+    fn palette(&self) -> Option<&crate::palette::PaletteState> {
+        match self.overlay.as_ref() {
             Some(crate::overlay::Overlay::Palette(p)) => Some(p),
             _ => None,
         }
     }
 
-    const fn palette_mut(&mut self) -> Option<&mut crate::palette::PaletteState> {
-        match &mut self.overlay {
+    fn palette_mut(&mut self) -> Option<&mut crate::palette::PaletteState> {
+        match self.routing.overlay_mut() {
             Some(crate::overlay::Overlay::Palette(p)) => Some(p),
             _ => None,
         }
     }
 
-    const fn overview(&self) -> Option<&crate::overview::OverviewState> {
-        match &self.overlay {
+    fn overview(&self) -> Option<&crate::overview::OverviewState> {
+        match self.overlay.as_ref() {
             Some(crate::overlay::Overlay::Overview(m)) => Some(m),
             _ => None,
         }
     }
 
-    const fn overview_mut(&mut self) -> Option<&mut crate::overview::OverviewState> {
-        match &mut self.overlay {
+    fn overview_mut(&mut self) -> Option<&mut crate::overview::OverviewState> {
+        match self.routing.overlay_mut() {
             Some(crate::overlay::Overlay::Overview(m)) => Some(m),
             _ => None,
         }
@@ -8499,11 +8525,11 @@ impl WindowState {
             .map_or(0, crate::overlay::Overlay::fingerprint)
     }
 
-    const fn overlay(&self) -> Option<&crate::overlay::Overlay> {
+    fn overlay(&self) -> Option<&crate::overlay::Overlay> {
         self.overlay.as_ref()
     }
 
-    const fn overlay_open(&self) -> bool {
+    fn overlay_open(&self) -> bool {
         self.overlay.is_some()
     }
 
@@ -8602,7 +8628,7 @@ impl WindowState {
             redraw_requests_for_test: std::cell::Cell::new(0),
             present: None,
             scale: 1.0,
-            front_content,
+            routing: option_routing::Routing::new(front_content),
             active_terminal,
             window_focus: front_content.map_or(front_content::WindowFocus::Host, |front| {
                 front_content::WindowFocus::Content(front.view())
@@ -8622,13 +8648,18 @@ impl WindowState {
             head_pts: 0.0, // no chrome measured until attach_os_window queries AppKit
             last_windowed_band_pts: 0.0, // no good windowed sample yet either
             deck_form: crate::stats_plan::DeckForm::Folded,
+            carries_band: false,
+            #[cfg(test)]
+            head_follows_form_for_test: false,
             mods: ModifiersState::empty(),
             scripted_mods_saved: None,
             last_mouse_cell: (0, 0),
             last_mouse_window_cell: (0, 0),
             last_cursor_px: (0.0, 0.0),
             pointer_position_known: false,
+            inset_hover_cleared: false,
             native_rest: None,
+            native_drag: None,
             hover_grid_owned: false,
             native_rehover: false,
             hover_mapping: app_mouse::HoverMapping::default(),
@@ -8744,6 +8775,7 @@ impl WindowState {
             last_visible_views: Vec::new(),
             win_px: None,
             headless_px: None,
+            side_inset_cells: 0,
             carried_inner_px: None,
             #[cfg(any(windows, target_os = "linux"))]
             restore_placement: None,
@@ -8816,13 +8848,11 @@ impl WindowState {
             strip_press: None,
             strip_band_press: None,
             strip_drag: None,
-            tab_menu: None,
             tab_menu_rect: None,
             tab_menu_laid: None,
             tab_menu_consumed_button: None,
             #[cfg(windows)]
             band_menu_release_pending: false,
-            rename_edit: None,
             cached_strip_rows: Vec::new(),
             occluded: false,
             #[cfg(test)]
@@ -8847,7 +8877,7 @@ impl WindowState {
             #[cfg(any(test, debug_assertions))]
             tooltips_pushed: Vec::new(),
             option_as_alt: std::cell::Cell::new(false),
-            tab_title_epochs: std::collections::HashMap::new(),
+            tab_title_epochs: title_authority::TitleEpochs::default(),
             tab_title_cache: std::collections::HashMap::new(),
             tab_chrome_titles: std::collections::HashMap::new(),
             tab_chrome_titles_by_tab: std::collections::HashMap::new(),
@@ -8863,11 +8893,9 @@ impl WindowState {
             ime_recipient: None,
             preedit_shown: false,
             last_ime_rect: None,
-            search: None,
             find_bar_hit: None,
             #[cfg(test)]
             find_bar_match_work: 0,
-            overlay: None,
             #[cfg(a11y_tree)]
             a11y: None,
             #[cfg(a11y_tree)]
@@ -8955,9 +8983,11 @@ fn tabs_label_session(
     views: &tab_model::ViewStore,
     session: u64,
 ) -> bool {
-    views
-        .terminal_views(session)
-        .any(|view| tabs.contains_focused_view(view))
+    views.terminal_views(session).any(|view| {
+        #[cfg(test)]
+        crate::work_counts::title_membership_probe();
+        tabs.contains_focused_view(view)
+    })
 }
 
 /// Why the automatic intent's current retry deadline exists. A completion may shorten only the
@@ -10340,9 +10370,19 @@ const DRIFT_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct TitleDrift {
+    completed: std::collections::HashMap<u64, TitleCompletion>,
+    reconciled_views: Option<tab_model::ViewStoreRevision>,
+    reconciling: bool,
     seen: std::collections::HashMap<u64, u64>,
     last_flush: std::collections::HashMap<u64, Instant>,
     pending: std::collections::HashSet<u64>,
+}
+
+#[derive(Clone)]
+struct TitleCompletion {
+    epoch: u64,
+    authority: tab_model::TitleRevision,
+    views: tab_model::ViewStoreRevision,
 }
 
 impl TitleDrift {
@@ -10353,6 +10393,7 @@ impl TitleDrift {
     }
 
     fn forget(&mut self, session: u64) {
+        self.completed.remove(&session);
         self.seen.remove(&session);
         self.last_flush.remove(&session);
         self.pending.remove(&session);
@@ -10577,7 +10618,7 @@ struct App {
     engine_color_fanouts: u64,
     session_color_installs: u64,
     palette_tab_theme: Option<session_theme::TabThemeTrial>,
-    windows: BTreeMap<WindowId, Box<WindowState>>,
+    windows: option_routing::Windows,
     frontmost_window: Option<WindowId>,
     focus_reported: Option<u64>,
     focus_order: Vec<WindowId>,
@@ -11155,7 +11196,8 @@ impl App {
             if let Some(rim) = self.level_up.as_mut() {
                 rim.hold_still();
             }
-            for ws in self.windows.values_mut() {
+            for mut route_guard_ws in self.windows.values_mut() {
+                let ws = &mut **route_guard_ws;
                 ws.drain_serious_effects();
                 ws.last_present = None;
                 ws.settings_card = None;
@@ -11441,7 +11483,8 @@ impl App {
                  ambient modifier snapshot so no chord is fabricated from it"
             );
             metrics::note_handoff_input_incoherent();
-            for ws in self.windows.values_mut() {
+            for mut route_guard_ws in self.windows.values_mut() {
+                let ws = &mut **route_guard_ws;
                 ws.mods = ModifiersState::empty();
             }
         }
@@ -14455,16 +14498,18 @@ impl App {
         };
         crate::metrics::note_capture_episode(false);
         let mut take = None;
-        if let (Some(gpu), Some(ws)) = (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
+        if let (Some(gpu), Some(mut ws)) =
+            (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
             && let Some(
                 PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
             ) = &mut ws.present
         {
             take = gpu.video_finish(window_gpu);
         }
-        if let Some(ws) = self.windows.get_mut(&rec.window)
-            && matches!(ws.present, Some(PresentTarget::Virtual { .. }))
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&rec.window)
+            && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
+            let ws = &mut **route_guard_ws;
             ws.present = None;
         }
         if let Some(window) = self
@@ -14537,9 +14582,10 @@ impl App {
             return false;
         };
         crate::metrics::note_capture_episode(false);
-        if let Some(ws) = self.windows.get_mut(&rec.window)
-            && matches!(ws.present, Some(PresentTarget::Virtual { .. }))
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&rec.window)
+            && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
+            let ws = &mut **route_guard_ws;
             ws.present = None;
         }
         if let Some(window) = self
@@ -14570,7 +14616,7 @@ impl App {
             .take()
             .expect("recording was observed immediately above");
         if drain_tap
-            && let (Some(gpu), Some(ws)) =
+            && let (Some(gpu), Some(mut ws)) =
                 (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
             && let Some(
                 PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
@@ -14578,9 +14624,10 @@ impl App {
         {
             let _ = gpu.video_finish(window_gpu);
         }
-        if let Some(ws) = self.windows.get_mut(&rec.window)
-            && matches!(ws.present, Some(PresentTarget::Virtual { .. }))
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&rec.window)
+            && matches!(route_guard_ws.present, Some(PresentTarget::Virtual { .. }))
         {
+            let ws = &mut **route_guard_ws;
             ws.present = None;
         }
         fail_video_request(&rec.reply, rec.dir, reason);
@@ -14692,7 +14739,8 @@ impl App {
             .video_rec
             .take()
             .expect("recording was observed immediately above");
-        if let (Some(gpu), Some(ws)) = (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
+        if let (Some(gpu), Some(mut ws)) =
+            (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
             && let Some(PresentTarget::Gpu { window_gpu, .. }) = &mut ws.present
         {
             let _ = gpu.video_finish(window_gpu);
@@ -14713,9 +14761,10 @@ impl App {
     }
 
     fn refresh_frame_interval(&mut self, wid: WindowId, force_read: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some(w) = ws.os_window.as_ref() else {
             return;
         };
@@ -14771,9 +14820,10 @@ impl App {
     }
 
     fn refresh_edr_headroom(&mut self, wid: WindowId, now: Instant) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let surface_hdr = match &ws.present {
             Some(PresentTarget::Gpu { gpu_surface, .. }) => Some(gpu_surface.is_hdr()),
             _ => None,
@@ -14864,9 +14914,7 @@ impl App {
         if !terminal_only {
             return None;
         }
-        let ws = self.windows.get_mut(&wid)?;
-        let active = ws.tabs.active;
-        ws.layouts.get_mut(active)
+        self.windows.active_tree_mut(&wid)
     }
 
     /// Resolve the canonical front terminal capability for one window.
@@ -15085,13 +15133,22 @@ impl App {
             native_runtime,
             ..
         } = self;
-        let Some(ws) = windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.stats_lens.sync_tab_scope(ws.tab_set.active_id());
         let previous_front = ws.front_content;
         let focused = ws.tab_set.active().map(|tab| tab.focus);
-        ws.front_content = next_front;
+        if let Some(front_content::FrontContent::Native { view, .. }) = previous_front {
+            native_runtime.unbind_option_route(view, ws.routing.signal());
+        }
+        if let Some(front_content::FrontContent::Native { view, .. }) = next_front {
+            native_runtime.bind_option_route(view, ws.routing.signal().clone());
+        }
+        if previous_front != next_front {
+            ws.routing.set_front(next_front);
+        }
         ws.active_terminal = match next_front {
             Some(front_content::FrontContent::Terminal { session, .. }) => {
                 pool.get(session).map(|s| front_content::TerminalMirror {
@@ -15162,6 +15219,7 @@ impl App {
         } else {
             ws.predictor.reset();
         }
+        drop(route_guard_ws);
         // Find searches the front terminal, so it closes with it: a tab switch, a pane
         // focus move or the front's own close. A sync that leaves the front as it was (a
         // background tab or split sibling closing) keeps the open field, its query and
@@ -15352,12 +15410,13 @@ impl App {
             *active = next_active;
         }
 
-        let Some(ws) = self.windows.get_mut(&front) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&front) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let os_window = ws.os_window.clone();
-        if let Some(w) = os_window {
-            let title = match focused_session.and_then(|session| self.pool.get(session)) {
+        let title = os_window.as_ref().and_then(|_| {
+            match focused_session.and_then(|session| self.pool.get(session)) {
                 Some(live) => match live.term.try_lock() {
                     Ok(term) => Some(term.title().to_string()),
                     Err(std::sync::TryLockError::Poisoned(poisoned)) => {
@@ -15371,10 +15430,11 @@ impl App {
                         .map(|tab| tab.presentation.title.clone())
                         .unwrap_or_else(|| "aterm".to_string()),
                 ),
-            };
-            if let Some(title) = title {
-                self.apply_title(front, &w, &title);
             }
+        });
+        drop(route_guard_ws);
+        if let (Some(window), Some(title)) = (os_window, title) {
+            self.apply_title(front, &window, &title);
         }
         debug_assert!(
             self.structural_invariants_ok(),
@@ -15486,6 +15546,8 @@ impl App {
             leader_execd: |_| None,
             #[cfg(unix)]
             shell_children: |_| Vec::new(),
+            #[cfg(unix)]
+            meta_ring: crate::keeper_link::MetaRing::KEEPER,
             #[cfg(windows)]
             job_seam: None,
             card_probe: false,
@@ -15500,7 +15562,7 @@ impl App {
         let mut tab_ids = tab_model::IdAllocator::default();
         let tab0 = register_terminal_tab(&mut tab_ids, &mut view_store, &layout0)
             .expect("initial test tab identity space");
-        let ws0 = WindowState::new_terminal(
+        let mut ws0 = WindowState::new_terminal(
             term.clone(),
             master,
             app_sink,
@@ -15513,6 +15575,8 @@ impl App {
             vec![layout0],
             tab_model::TabSet::new(tab0),
         );
+        // The process's first window carries the System Resources band (`main_entry_with_network`).
+        ws0.carries_band = true;
         let mut pool = SessionPool::default();
         pool.insert(session0);
         let apprt = platform::headless_fixture_apprt(platform::platform_apprt());
@@ -15724,7 +15788,7 @@ impl App {
             keybindings: keybinding::Keybindings::default(),
             key_sequences: keybinding::KeySequences::default(),
             windows: {
-                let mut m = BTreeMap::new();
+                let mut m = option_routing::Windows::default();
                 m.insert(WindowId(0), Box::new(ws0));
                 m
             },
@@ -16127,6 +16191,7 @@ impl App {
                 let moved = self
                     .windows
                     .get_mut(&owner)
+                    .as_deref_mut()
                     .and_then(|window| window.tab_set.active_mut())
                     .is_some_and(|tab| tab.set_focus(view));
                 if moved {
@@ -16171,15 +16236,16 @@ impl App {
     }
 
     fn reset_pane_space_decorations(&mut self, wid: WindowId) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if active_terminal_projection(ws, &self.view_store).is_none() {
             return;
         }
         let WindowState {
             layouts, tabs, fx, ..
-        } = &mut **ws;
+        } = &mut *ws;
         let Some(tree) = layouts.get(tabs.active) else {
             return;
         };
@@ -16208,6 +16274,7 @@ impl App {
         } else {
             self.windows
                 .get_mut(&owner)
+                .as_deref_mut()
                 .and_then(|window| window.tab_set.active_mut())
                 .is_some_and(|tab| {
                     if tab.root.len() > 1 {
@@ -16372,6 +16439,7 @@ impl App {
             };
             self.windows
                 .get_mut(&owner)
+                .as_deref_mut()
                 .and_then(|window| window.tab_set.active_mut())
                 .is_some_and(|tab| tab.split_focused(axis, view))
         } else {
@@ -16430,7 +16498,8 @@ impl App {
         let mut ask_reading = false;
         let frame_interval = self.frame_interval;
         let view_store = &self.view_store;
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             #[cfg(test)]
             wake_census::note_admission_window();
             if !active_tab_displays_session(ws, view_store, session) {
@@ -16480,7 +16549,8 @@ impl App {
             .idle_rest_or_default()
             .filter(|_| !self.headless);
         let filmed = self.video_rec.as_ref().map(|rec| rec.window);
-        for (wid, ws) in &mut self.windows {
+        for (wid, mut route_guard_ws) in &mut self.windows {
+            let ws = &mut **route_guard_ws;
             let after = after.filter(|_| filmed != Some(*wid));
             ws.rest.settle(now, after);
         }
@@ -16508,9 +16578,10 @@ impl App {
     /// other frame, counts in `n_rest_wake_key`. The focus that wakes an unfocused window marks
     /// nothing: that window's deck was already still.
     pub(crate) fn stir_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if !ws.rest.stir(now) {
             return;
         }
@@ -16518,6 +16589,7 @@ impl App {
             ws.present_metrics.note_rest_wake();
         }
         if focusing || ws.focused {
+            drop(route_guard_ws);
             self.vitals_ask_now(now);
         }
     }
@@ -16680,7 +16752,8 @@ impl App {
         let chrome_changed = native_appearance::take_chrome_inputs_moved();
         let repair_frame = resample_wants_repair_frame(cause);
         if motion_changed || chrome_changed || repair_frame {
-            for ws in self.windows.values_mut() {
+            for mut route_guard_ws in self.windows.values_mut() {
+                let ws = &mut **route_guard_ws;
                 // The strip's row cache key does not move with the OS palette.
                 if chrome_changed {
                     ws.last_strip_fp = None;
@@ -16701,9 +16774,10 @@ impl App {
     /// covered one at most a frame every 5 s (`WindowState::park_hidden_frame`,
     /// `docs/ATERM_DESIGN.md` §7.4); visible again it draws its current state once.
     fn on_occlusion_changed(&mut self, wid: WindowId, occluded: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.note_occlusion(occluded);
         if occluded {
             ws.stats_lens.input.retire();
@@ -16714,6 +16788,7 @@ impl App {
         if !occluded {
             ws.last_visible_views.clear();
             ws.rearm_present(true);
+            drop(route_guard_ws);
             self.note_done_seen(wid);
         }
     }
@@ -16733,7 +16808,8 @@ impl App {
             }
             // A window raised while hidden draws its current state at once, and stays hidden
             // until its occlusion changes (§7.4, `WindowState::note_raised_while_hidden`).
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 let raised = ws.note_raised_while_hidden();
                 ws.rearm_present(raised);
             }
@@ -16758,7 +16834,8 @@ impl App {
             self.claude_glass_focus(wid, false);
         }
         // The OS's key window, which only this event and the attach-time adoption write (§14.11).
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.os_key = focused;
         }
         self.on_focus(wid, focused);
@@ -16796,13 +16873,14 @@ impl App {
             self.settle_selection_gesture(wid);
             self.scrollbar_release(wid);
             self.close_tab_menu(wid);
-            self.close_stats_lens(wid);
+            self.stats_lens_focus_lost(wid);
             if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
                 self.close_autopilot_menu();
             }
         }
         let reorders_pre_commit_queue = !focused && self.pre_commit_focus_loss_reorders_queue(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.focused = focused;
             ws.fx.cursor_mut().glow.note_focus(focused, focus_now);
             if let Some(rain) = ws.fx.rain_mut() {
@@ -16841,7 +16919,7 @@ impl App {
         }
         self.settle_scroll_motion_if_reduced(wid, Instant::now());
         if self.render_knobs.selection_inactive
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.invalidate_raster_caches();
             if let Some(w) = ws.os_window.as_ref() {
@@ -16852,7 +16930,8 @@ impl App {
         self.recompute_notify_suppress();
         self.recompute_focus_boost();
         self.note_update_handoff_tolerated_activity();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.rearm_present(false);
         }
         self.reconcile_licence(wid);
@@ -16861,11 +16940,13 @@ impl App {
         if focused && let Some(session) = self.focused_session_id(wid) {
             self.note_session_seen(wid, session);
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.blink_phase = true;
         }
         self.sync_blink_phase();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.next_blink = None;
         }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -16905,6 +16986,7 @@ impl App {
         let Some(saved) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.scripted_mods_saved.take())
         else {
             return;
@@ -16929,11 +17011,13 @@ impl App {
         )
     )]
     fn on_modifiers_changed(&mut self, wid: WindowId, mods: ModifiersState) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let previous = std::mem::replace(&mut ws.mods, mods);
         let pointer_inside = ws.pointer_position_known;
+        drop(route_guard_ws);
         // A mark on the glass shows the hand to a plain pointer too (`claude_card::GlassHit`,
         // `claude_lights::GlassAt::Mark`).
         if pointer_inside
@@ -16947,7 +17031,7 @@ impl App {
 
     fn set_drag_hover(&mut self, wid: WindowId, hovering: bool) {
         match self.windows.get_mut(&wid) {
-            Some(ws) if ws.drag_hover != hovering => ws.drag_hover = hovering,
+            Some(mut ws) if ws.drag_hover != hovering => ws.drag_hover = hovering,
             _ => return,
         }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -16986,6 +17070,7 @@ impl App {
         self.windows
             .values()
             .find(|ws| active_tab_displays_session(ws, &self.view_store, session))
+            .map(Box::as_ref)
             .or_else(|| self.frontmost_window.and_then(|wid| self.windows.get(&wid)))
             .and_then(|ws| ws.os_window.clone())
     }
@@ -17406,6 +17491,8 @@ impl App {
             .ok();
     }
 
+    // Native DroppedFile carries no point. A dock-aware drop needs that event contract
+    // to carry its actual coordinates; last_cursor_px may belong to an earlier pane motion.
     fn drop_file(&mut self, wid: WindowId, path: &std::path::Path) {
         // Other native apps take no ambient file authority.
         if let Some((instance, _)) = self.active_native_view(wid) {
@@ -18226,6 +18313,7 @@ impl App {
     }
 
     fn observe_title_drift(&mut self, session: u64, now: Instant) {
+        self.reconcile_title_delivery(now);
         let Some(live) = self.pool.get(session) else {
             return;
         };
@@ -18239,12 +18327,43 @@ impl App {
                 return;
             }
         };
+        #[cfg(test)]
+        let allow_completion = !title_authority::faulty(title_authority::Fault::Completion);
+        #[cfg(not(test))]
+        let allow_completion = true;
+        #[cfg(test)]
+        let omit_pending = title_authority::faulty(title_authority::Fault::Pending);
+        #[cfg(not(test))]
+        let omit_pending = false;
+        #[cfg(test)]
+        let omit_view = title_authority::faulty(title_authority::Fault::View);
+        #[cfg(not(test))]
+        let omit_view = false;
+        if allow_completion
+            && (omit_pending
+                || (!self.title_drift.pending.contains(&session)
+                    && !self.session_chrome_retry.contains(&session)))
+            && self
+                .title_drift
+                .completed
+                .get(&session)
+                .is_some_and(|done| {
+                    done.epoch == live_epoch
+                        && done.authority.is_current(self.windows.title_authority())
+                        && (omit_view || done.views.is_current(&self.view_store))
+                })
+        {
+            return;
+        }
         let stale = self.title_drift.seen.get(&session).copied() != Some(live_epoch)
             || self.windows.values().any(|ws| {
+                #[cfg(test)]
+                crate::work_counts::title_window_gate();
                 ws.tab_title_epochs.get(&session).copied() != Some(live_epoch)
                     && tabs_label_session(&ws.tab_set, &self.view_store, session)
             });
         if !stale {
+            self.complete_title_delivery(session, live_epoch);
             return;
         }
         let due_passed = self.title_drift.due_at(session).is_none_or(|d| now >= d);
@@ -18253,7 +18372,161 @@ impl App {
         }
     }
 
+    fn complete_title_delivery(&mut self, session: u64, epoch: u64) {
+        #[cfg(test)]
+        let mint_pending = title_authority::faulty(title_authority::Fault::MintPending);
+        #[cfg(not(test))]
+        let mint_pending = false;
+        if mint_pending
+            || (!self.title_drift.pending.contains(&session)
+                && !self.session_chrome_retry.contains(&session))
+        {
+            self.title_drift.completed.insert(
+                session,
+                TitleCompletion {
+                    epoch,
+                    authority: self.windows.title_authority().revision(),
+                    views: self.view_store.revision(),
+                },
+            );
+        }
+    }
+
+    fn refresh_title_delivery_windows(&mut self, windows: std::collections::BTreeSet<WindowId>) {
+        #[cfg(test)]
+        if !windows.is_empty() {
+            title_authority::before_publication(self);
+        }
+        for wid in windows {
+            let (titles, metadata) = self.refresh_window_tabs(wid);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
+            let needs_redraw = self.windows.get(&wid).is_some_and(|ws| {
+                ws.last_present
+                    .as_ref()
+                    .is_none_or(|key| key.tab_strip != fp)
+            });
+            if needs_redraw
+                && let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+            {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Reconcile owed topology at title-consumption boundaries, independently of PTY pacing.
+    /// No mutable window guard survives into resolution or native publication.
+    pub(crate) fn reconcile_title_delivery(&mut self, now: Instant) {
+        #[cfg(test)]
+        if title_authority::faulty(title_authority::Fault::Reconcile) {
+            return;
+        }
+        if self.title_drift.reconciling {
+            return;
+        }
+        #[cfg(test)]
+        let omit_view = title_authority::faulty(title_authority::Fault::View);
+        #[cfg(not(test))]
+        let omit_view = false;
+        let view_changed = !omit_view
+            && self
+                .title_drift
+                .reconciled_views
+                .as_ref()
+                .is_none_or(|old| !old.is_current(&self.view_store));
+        let mut dirty = self.windows.take_title_pending();
+        if view_changed {
+            dirty.extend(self.windows.keys().map(|wid| wid.0));
+        }
+        if dirty.is_empty() {
+            if view_changed {
+                self.title_drift.reconciled_views = Some(self.view_store.revision());
+            }
+            return;
+        }
+        let views = self.view_store.revision();
+        self.title_drift.reconciling = true;
+        let topology = self.windows.title_authority().topology_revision();
+        let mut sessions = std::collections::BTreeMap::<u64, Vec<WindowId>>::new();
+        let mut refreshes = std::collections::BTreeSet::new();
+        for id in dirty {
+            let wid = WindowId(id);
+            let Some(ws) = self.windows.get(&wid) else {
+                continue;
+            };
+            #[cfg(test)]
+            crate::work_counts::title_window_gate();
+            let labels: std::collections::HashSet<u64> = ws
+                .tab_set
+                .focused_views()
+                .filter_map(|view| {
+                    self.view_store
+                        .get(view)
+                        .copied()
+                        .and_then(tab_model::View::terminal_session)
+                })
+                .collect();
+            for &sid in &labels {
+                if !ws.tab_title_epochs.contains_key(&sid)
+                    || self.session_chrome_retry.contains(&sid)
+                {
+                    sessions.entry(sid).or_default().push(wid);
+                }
+            }
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.tab_title_epochs.retain(|sid, _| labels.contains(sid));
+            }
+            refreshes.insert(wid);
+        }
+        for (sid, windows) in sessions {
+            if !self.deliver_title_drift(sid, now, Some(&windows), &mut refreshes) {
+                self.title_drift.pending.insert(sid);
+                self.title_drift.last_flush.entry(sid).or_insert(now);
+                for wid in windows {
+                    self.windows.title_authority().owe(wid.0);
+                }
+            }
+        }
+        self.refresh_title_delivery_windows(refreshes);
+        if topology.is_current(self.windows.title_authority()) && views.is_current(&self.view_store)
+        {
+            self.title_drift.reconciled_views = Some(views);
+        } else {
+            self.title_drift.reconciled_views = None;
+        }
+        self.title_drift.reconciling = false;
+    }
+
     fn flush_title_drift(&mut self, session: u64, now: Instant) -> bool {
+        let topology = self.windows.title_authority().topology_revision();
+        let views = self.view_store.revision();
+        let mut refreshes = std::collections::BTreeSet::new();
+        let complete = self.deliver_title_drift(session, now, None, &mut refreshes);
+        self.refresh_title_delivery_windows(refreshes);
+        if complete
+            && topology.is_current(self.windows.title_authority())
+            && views.is_current(&self.view_store)
+            && let Some(epoch) = self.title_drift.seen.get(&session).copied()
+        {
+            self.complete_title_delivery(session, epoch);
+        }
+        if complete
+            && self
+                .teams
+                .get(&session)
+                .is_some_and(|team| team.workers > 0)
+        {
+            self.rebuild_teams();
+        }
+        complete
+    }
+
+    fn deliver_title_drift(
+        &mut self,
+        session: u64,
+        now: Instant,
+        targets: Option<&[WindowId]>,
+        refreshes: &mut std::collections::BTreeSet<WindowId>,
+    ) -> bool {
         let Some(s) = self.pool.get(session) else {
             self.title_drift.forget(session);
             self.session_chrome_retry.remove(&session);
@@ -18292,26 +18565,35 @@ impl App {
             task_line.as_deref(),
             live_cwd.as_deref(),
         );
-        self.title_drift.pending.remove(&session);
-        self.title_drift.seen.insert(session, live_epoch);
-        self.title_drift.last_flush.insert(session, now);
-        let pool = &self.pool;
-        self.title_drift.seen.retain(|sid, _| {
-            #[cfg(test)]
-            crate::work_counts::title_drift_cache_probed();
-            pool.get(*sid).is_some()
-        });
-        self.title_drift.last_flush.retain(|sid, _| {
-            #[cfg(test)]
-            crate::work_counts::title_drift_cache_probed();
-            pool.get(*sid).is_some()
-        });
-        self.title_drift.pending.retain(|sid| {
-            #[cfg(test)]
-            crate::work_counts::title_drift_cache_probed();
-            pool.get(*sid).is_some()
-        });
-        let cwd_changed = {
+        if targets.is_none() {
+            self.title_drift.pending.remove(&session);
+            self.title_drift.seen.insert(session, live_epoch);
+            self.title_drift.last_flush.insert(session, now);
+            let pool = &self.pool;
+            let completed = &mut self.title_drift.completed;
+            self.title_drift.seen.retain(|sid, _| {
+                #[cfg(test)]
+                crate::work_counts::title_drift_cache_probed();
+                let live = pool.get(*sid).is_some();
+                if !live {
+                    completed.remove(sid);
+                }
+                live
+            });
+            self.title_drift.last_flush.retain(|sid, _| {
+                #[cfg(test)]
+                crate::work_counts::title_drift_cache_probed();
+                pool.get(*sid).is_some()
+            });
+            self.title_drift.pending.retain(|sid| {
+                #[cfg(test)]
+                crate::work_counts::title_drift_cache_probed();
+                pool.get(*sid).is_some()
+            });
+        }
+        let cwd_changed = if targets.is_some() {
+            false
+        } else {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let cwd_moved = timeline.record_cwd_change(live_cwd.as_deref());
             let shown = crate::tab_label::informative(&live_title).to_string();
@@ -18322,14 +18604,36 @@ impl App {
         if cwd_changed {
             crate::harness_host::disk_cwd_reported(session, live_cwd.as_deref());
         }
-        let force_chrome_refresh = self.session_chrome_retry.remove(&session);
-        let label_windows: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|(_, ws)| tabs_label_session(&ws.tab_set, &self.view_store, session))
-            .map(|(wid, _)| *wid)
-            .collect();
+        let force_chrome_refresh = if targets.is_none() {
+            self.session_chrome_retry.remove(&session)
+        } else {
+            self.session_chrome_retry.contains(&session)
+        };
+        let label_windows: Vec<WindowId> = if let Some(targets) = targets {
+            targets.to_vec()
+        } else {
+            self.windows
+                .iter()
+                .filter(|(_, ws)| {
+                    #[cfg(test)]
+                    crate::work_counts::title_window_gate();
+                    tabs_label_session(&ws.tab_set, &self.view_store, session)
+                })
+                .map(|(wid, _)| *wid)
+                .collect()
+        };
         for wid in label_windows {
+            // Existing labels keep their ordinary epoch pacing. Topology owes only missing
+            // deliveries; a cache retry deliberately removes its evidence first.
+            if targets.is_some()
+                && !force_chrome_refresh
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.tab_title_epochs.contains_key(&session))
+            {
+                continue;
+            }
             let (drifted, needs_refresh) = self.windows.get(&wid).map_or((false, false), |ws| {
                 let cached_epoch = ws.tab_title_epochs.get(&session).copied();
                 let effective_title = resolved_title_rung.clone().unwrap_or_else(|| {
@@ -18372,26 +18676,36 @@ impl App {
             if !drifted {
                 continue;
             }
-            let labels: std::collections::HashSet<u64> = self
-                .windows
-                .get(&wid)
-                .into_iter()
-                .flat_map(|window| window.tab_set.tabs())
-                .filter_map(|tab| {
-                    #[cfg(test)]
-                    crate::work_counts::title_drift_tab_visited();
-                    self.view_store
-                        .get(tab.focus)
-                        .copied()
-                        .and_then(tab_model::View::terminal_session)
-                })
-                .collect();
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.tab_title_epochs.retain(|sid, _| {
-                    #[cfg(test)]
-                    crate::work_counts::title_drift_cache_probed();
-                    labels.contains(sid)
-                });
+            // The topology reconciler has already pruned each dirty owner once. Ordinary
+            // drift still performs its original per-window maintenance here.
+            #[cfg(test)]
+            let rescan = title_authority::faulty(title_authority::Fault::TopologyRescan);
+            #[cfg(not(test))]
+            let rescan = false;
+            let labels = (targets.is_none() || rescan).then(|| {
+                self.windows
+                    .get(&wid)
+                    .into_iter()
+                    .flat_map(|window| window.tab_set.tabs())
+                    .filter_map(|tab| {
+                        #[cfg(test)]
+                        crate::work_counts::title_drift_tab_visited();
+                        self.view_store
+                            .get(tab.focus)
+                            .copied()
+                            .and_then(tab_model::View::terminal_session)
+                    })
+                    .collect::<std::collections::HashSet<u64>>()
+            });
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                if let Some(labels) = labels {
+                    ws.tab_title_epochs.retain(|sid, _| {
+                        #[cfg(test)]
+                        crate::work_counts::title_drift_cache_probed();
+                        labels.contains(sid)
+                    });
+                }
                 ws.tab_title_epochs.insert(session, live_epoch);
                 crate::app_tabs::synchronize_captured_title_cache(
                     &mut ws.tab_title_cache,
@@ -18404,24 +18718,7 @@ impl App {
             if !needs_refresh {
                 continue;
             }
-            let (titles, metadata) = self.refresh_window_tabs(wid);
-            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata);
-            let needs_redraw = self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.last_present.as_ref().is_none_or(|k| k.tab_strip != fp));
-            if needs_redraw
-                && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
-            {
-                w.request_redraw();
-            }
-        }
-        if self
-            .teams
-            .get(&session)
-            .is_some_and(|team| team.workers > 0)
-        {
-            self.rebuild_teams();
+            refreshes.insert(wid);
         }
         true
     }
@@ -18481,7 +18778,8 @@ impl ApplicationHandler<Wake> for App {
         self.settle_rest(effect_now);
         #[cfg(a11y_tree)]
         self.serve_parked_tells(effect_now);
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.service_due_terminal_effect_tick(effect_now)
                 && let Some(window) = ws.os_window.as_ref()
             {
@@ -18501,7 +18799,8 @@ impl ApplicationHandler<Wake> for App {
         self.service_diskwalk(Instant::now());
         let present_now = Instant::now();
         let app_frame_interval = self.frame_interval;
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             let pace_floor = ws.content_pace_floor(app_frame_interval);
             let due = ws.service_presentation_clocks(pace_floor, present_now);
             if due && let Some(window) = ws.os_window.as_ref() {
@@ -18545,7 +18844,8 @@ impl ApplicationHandler<Wake> for App {
             let level_up_animating = self.level_up.is_some();
             let messages_repaint = self.settle_messages(now);
             self.presence_tick(now);
-            for (id, ws) in self.windows.iter_mut() {
+            for (id, mut route_guard_ws) in self.windows.iter_mut() {
+                let ws = &mut **route_guard_ws;
                 let mut dirty = ws.bell_flash.expire(now);
                 dirty |= ws.flip_due_blink(now);
                 dirty |= ws.covered_frame_due(now);
@@ -18667,6 +18967,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.reconcile_title_delivery(Instant::now());
         let mut root = crate::watchdog::enter_about_to_wait();
         self.poll_account_drain(el);
         if el.exiting() {
@@ -18825,7 +19126,8 @@ impl ApplicationHandler<Wake> for App {
         self.watch_update_checker();
         self.retire_overdue_native_update_check(park_now);
         let now = park_now;
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.pending_reveal.is_some_and(|d| now < d) {
                 continue;
             }
@@ -18937,7 +19239,8 @@ impl ApplicationHandler<Wake> for App {
             && matches!(glow.style, crate::cursor_glow::GlowStyle::RainbowKitty)
             && serious_policy.allows(crate::motion::SeriousEffect::CursorBody)
             && focused_motion.amplitude(crate::motion::MotionEffect::CursorGlow) > 0.0;
-        for (id, ws) in self.windows.iter_mut() {
+        for (id, mut route_guard_ws) in self.windows.iter_mut() {
+            let ws = &mut **route_guard_ws;
             // Serious mode drains cursor animation hints before any deadline decision.
             if !serious_policy.allows(crate::motion::SeriousEffect::CursorGlow) {
                 ws.drain_serious_effects();
@@ -19774,7 +20077,8 @@ impl ApplicationHandler<Wake> for App {
         }
         // Other idle-pass work can outlive an effect slot. Service that slot now and
         // plan its successor immediately before arming, rather than booking the past.
-        for (id, ws) in self.windows.iter_mut() {
+        for (id, mut route_guard_ws) in self.windows.iter_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.gpu_acquire_pending() || !ws.present_retry.present_attempt_allowed() {
                 continue;
             }
@@ -20070,7 +20374,8 @@ impl App {
                 let now = Instant::now();
                 let frame_interval = self.frame_interval;
                 let view_store = &self.view_store;
-                for ws in self.windows.values_mut() {
+                for mut route_guard_ws in self.windows.values_mut() {
+                    let ws = &mut **route_guard_ws;
                     if !active_tab_displays_session(ws, view_store, session)
                         || !ws.queued_key_delivery_releases_pending_frame(at, now, frame_interval)
                     {
@@ -20211,7 +20516,7 @@ impl App {
                         Ok(VideoMode::SwapchainTap) => {
                             match (
                                 self.backend.gpu_mut(),
-                                self.windows.get_mut(&wid).map(Box::as_mut),
+                                self.windows.get_mut(&wid).as_deref_mut().map(Box::as_mut),
                             ) {
                                 (
                                     Some(gpu),
@@ -20238,7 +20543,7 @@ impl App {
                                     .ok_or_else(|| "GPU backend required".to_string())
                                     .and_then(|gpu| gpu.virtual_begin(&mut window_gpu, w, h, opts));
                                 match (began, self.windows.get_mut(&wid)) {
-                                    (Ok(()), Some(ws)) => {
+                                    (Ok(()), Some(mut ws)) => {
                                         ws.present = Some(PresentTarget::Virtual { window_gpu });
                                         Ok(VideoMode::OffscreenPresentReal)
                                     }
@@ -20271,7 +20576,8 @@ impl App {
                                 cancel,
                                 reply,
                             });
-                            if let Some(ws) = self.windows.get_mut(&wid) {
+                            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                                let ws = &mut **route_guard_ws;
                                 ws.last_present = None;
                             }
                             if let Some(w) =
@@ -21786,7 +22092,11 @@ impl App {
         self.reconcile_licence(wid);
         #[cfg(a11y_tree)]
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
-            && let Some(adapter) = self.windows.get_mut(&wid).and_then(|ws| ws.a11y.as_mut())
+            && let Some(adapter) = self
+                .windows
+                .get_mut(&wid)
+                .as_deref_mut()
+                .and_then(|ws| ws.a11y.as_mut())
         {
             adapter.process_event(&w, &event);
         }
@@ -21817,7 +22127,8 @@ impl App {
                 self.redraw_window(wid);
             }
             WindowEvent::Moved(position) => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.note_normal_origin(position);
                 }
                 self.refresh_frame_interval(wid, false);
@@ -21891,7 +22202,8 @@ impl App {
                     return;
                 }
                 crate::metrics::note_resize_arrival();
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.win_px = Some(size);
                     ws.last_resized_event_at = Some(std::time::Instant::now());
                 }
@@ -21902,7 +22214,8 @@ impl App {
                     self.apprt.reflow_toolbar_tabs(handle);
                 }
                 self.apply_window_resized_grid(wid, size);
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     let _ = ws.present_retry.on_external_stimulus();
                     ws.present_retry.recovery_redraw_outstanding = true;
                 }
@@ -21916,7 +22229,8 @@ impl App {
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.rearm_present(false);
                     #[cfg(windows)]
                     if let Some(w) = ws.os_window.as_ref() {
@@ -21927,7 +22241,8 @@ impl App {
             }
             WindowEvent::Occluded(occluded) => self.on_occlusion_changed(wid, occluded),
             WindowEvent::ThemeChanged(theme) => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.rearm_present(false);
                 }
                 if self.os_appearance_source.reads_window_theme() {
@@ -25223,14 +25538,6 @@ fn failure_cause(detail: &str, fallback: &str) -> String {
     }
 }
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
-))]
-fn a_display_server_is_reachable() -> bool {
-    display_is_reachable_from(|var| std::env::var_os(var).map(|v| v.to_string_lossy().into_owned()))
-}
-
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinuxTrialStart {
@@ -25408,24 +25715,6 @@ fn a_display_server_answers() -> bool {
 #[cfg(all(test, unix))]
 #[path = "lib_display_answers_tests.rs"]
 mod display_answers_tests;
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
-))]
-fn display_is_reachable_from(read: impl Fn(&str) -> Option<String>) -> bool {
-    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
-        .iter()
-        .any(|var| read(var).is_some_and(|v| !v.is_empty()))
-}
-
-#[cfg(all(
-    test,
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
-))]
-#[path = "lib_headless_display_probe_tests.rs"]
-mod headless_display_probe_tests;
 
 impl App {
     /// `appnotice <lane> <text>`, taken and logged: aterm.log names the lane and the text's
@@ -26390,11 +26679,13 @@ const fn launch_image_replacement(
 }
 
 fn loop_before_session0(headless: bool) -> bool {
+    // A headless build that finds no display server builds the windowless loop instead
+    // (`with_headless_fallback`), so only a windowed build waits on a display's answer.
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "android", target_os = "ios"))
     ))]
-    let opens_a_display = !headless || a_display_server_is_reachable();
+    let opens_a_display = !headless;
     #[cfg(not(all(
         unix,
         not(any(target_os = "macos", target_os = "android", target_os = "ios"))
@@ -26452,9 +26743,13 @@ fn build_event_loop(headless: bool, successor: bool) -> BuiltLoop {
         unix,
         not(any(target_os = "macos", target_os = "android", target_os = "ios"))
     ))]
-    if headless && !a_display_server_is_reachable() {
+    if headless {
+        // The real backend where a display server the environment names answers, so a headless
+        // run on a desktop exercises it (and fails as a windowed one would where that backend
+        // cannot run there); the windowless one where none is named or nothing listens where
+        // each is named (a stale `DISPLAY` over SSH or in a detached multiplexer).
         use aterm_window::platform::headless::EventLoopBuilderExtHeadless as _;
-        builder.with_headless();
+        builder.with_headless_fallback();
     }
     #[cfg(target_os = "macos")]
     let windowed = if headless {
@@ -26468,6 +26763,18 @@ fn build_event_loop(headless: bool, successor: bool) -> BuiltLoop {
         Ok(el) => {
             crate::metrics::stamp_claim(crate::metrics::ClaimStamp::EventLoopBuilt);
             count_linux_window_start_once_open();
+            #[cfg(all(
+                unix,
+                not(any(target_os = "macos", target_os = "android", target_os = "ios"))
+            ))]
+            {
+                use aterm_window::platform::headless::EventLoopExtHeadless as _;
+                if let Some(why) = el.headless_fallback() {
+                    aterm_log::info!(
+                        "headless: no display server gave an event loop ({why}); it runs without one"
+                    );
+                }
+            }
             el
         }
         Err(e) => {
@@ -27484,6 +27791,8 @@ pub fn main_entry_with_network(
         leader_execd: crate::fg_sample::execd_start,
         #[cfg(unix)]
         shell_children: crate::spawn::shell_children,
+        #[cfg(unix)]
+        meta_ring: crate::keeper_link::MetaRing::KEEPER,
         #[cfg(windows)]
         job_seam: Some(crate::command_ran::JOB_SHIPPING),
         card_probe: crate::holder_image::card_probe_requested(),
@@ -28266,6 +28575,10 @@ pub fn main_entry_with_network(
         tab_model::TabSet::new(tab0),
     );
     ws0.scale = headless_scale;
+    // The first window a process creates carries the System Resources band, set before the
+    // window first attaches so the band is in its birth geometry; every later window is born
+    // without it (`WindowState::new_with_front`).
+    ws0.carries_band = true;
     ws0.take_carried_frame(
         seamless_window
             .as_ref()
@@ -28701,7 +29014,7 @@ pub fn main_entry_with_network(
         keybindings,
         key_sequences,
         windows: {
-            let mut m = BTreeMap::new();
+            let mut m = option_routing::Windows::default();
             m.insert(WindowId(0), Box::new(ws0));
             m
         },

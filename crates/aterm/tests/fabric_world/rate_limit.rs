@@ -85,7 +85,7 @@ fn a_flooding_producer_is_throttled_while_a_persons_post_lands() {
         "the world's broker is under aterm's default limit, as the command's is"
     );
     let (a, _b) = w.two_sessions();
-    let subject = format!("/f/{FLEET}/in/n-0000000000000f10/s-flood/a-flood/note");
+    let subject = format!("/f/{FLEET}/in/n-0000000000000f10/t004c2d8mhm/a-flood/note");
     let body = format!("v=1 t=1 text={}", "f".repeat(FLOOD_BODY)).into_bytes();
     let record = u64::try_from(subject.len() + body.len()).expect("a record's size");
     let limit = astream_broker::RateLimit::records(1_000, 1_000)

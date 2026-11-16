@@ -76,7 +76,7 @@ fn a_headless_runs_first_native_view_lays_out_in_its_painted_faces() {
     let redeemed = !app.deferred_font_seal && sealed(&app);
     let (_, view) = app.active_native_view(wid).expect("Settings in front");
     // The layout: every audit line but its raster identities, which name the faces' install.
-    let audit = |app: &super::App| {
+    let audit = |app: &mut super::App| {
         app.inspect_app(crate::app_control::InspectRequest::View {
             view,
             projection: aterm_types::app_inspection::InspectionProjection::Audit,
@@ -92,11 +92,11 @@ fn a_headless_runs_first_native_view_lays_out_in_its_painted_faces() {
         })
         .collect::<Vec<_>>()
     };
-    let before = audit(&app);
+    let before = audit(&mut app);
     app.ensure_pixel_backend();
     app.sync_chrome_fonts();
     assert_eq!(
-        audit(&app),
+        audit(&mut app),
         before,
         "the layout read before the first capture is the painted one"
     );

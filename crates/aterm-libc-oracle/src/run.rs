@@ -84,7 +84,7 @@ struct Run<'o> {
 
 fn started(error: io::Error) -> CouldNotRun {
     if error.kind() == io::ErrorKind::StorageFull {
-        return CouldNotRun::new(error.to_string(), "free disk space and rerun");
+        return CouldNotRun::new(error.to_string(), "rerun");
     }
     CouldNotRun::new(
         format!("targo could not start: {error}"),

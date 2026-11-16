@@ -158,6 +158,38 @@ fn only_the_removers_own_descriptors_are_ignored() {
     }
 }
 
+#[test]
+fn ignoring_own_descriptor_use_preserves_independent_uncertainty() {
+    let me = std::process::id();
+    let path = PathBuf::from("/cache/partial-probe");
+    let scan = PathScan {
+        users: vec![PathUse {
+            pid: me,
+            how: "fd",
+            path: path.join("guard"),
+        }],
+        unreadable: vec![(me, Some(PathBuf::from("/private/test-remover")))],
+        scanned: 1,
+    };
+    let processes = |_: &[PathBuf], _: &[u32]| Ok(scan.clone());
+    let filtered = |dirs: &[PathBuf], skip: &[u32]| observed(dirs, skip, &processes);
+    let fence = Fence::new(&filtered).with_reporting();
+    assert!(!fence.clear_all(&path, &[&path]));
+    assert_eq!(
+        fence.retained().as_slice(),
+        [RetainedCheck {
+            path: path.clone(),
+            reason: KeepReason::ProcessUnreadable(me),
+        }]
+    );
+
+    let mut complete = scan.clone();
+    complete.unreadable.clear();
+    let processes = |_: &[PathBuf], _: &[u32]| Ok(complete.clone());
+    let filtered = |dirs: &[PathBuf], skip: &[u32]| observed(dirs, skip, &processes);
+    assert!(Fence::new(&filtered).clear_all(&path, &[&path]));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_relative_cache_keeps_its_absolute_original_after_staging_through_a_symlink() {

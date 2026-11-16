@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::harness::codex_rollout::{is_rollout_of, is_thread_id, thread_created_ms};
+use crate::harness::upgrade_drive::NotRead;
 
 fn v(s: &str) -> Version {
     Version::parse(s).expect("a version")
@@ -88,6 +89,70 @@ fn package_metadata_refuses_nonfiles_and_oversized_text() {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         refused();
     }
+}
+
+/// LS-15: A PACKAGE NOT READ IS NOT OPENAI'S CODEX. Whether a running Codex is codex-alab rests
+/// on reads of its package: a manifest caught mid-write (not JSON, written within its write
+/// window) is not read ([`NotRead`]), never the answer that the package is not ALab's, which
+/// routes the snapshot to no lane. CONTROLS: a package read with no marker is the answer
+/// `Ok(false)`, one with its marker `Ok(true)`, and an image that names no file now is the answer
+/// `Ok(false)`; so is a lasting state every later read finds again (LS-72): a half manifest that
+/// has stood past its write window, or one whose open is refused (`EACCES`). [`alab_bytes`] is
+/// true only for the read ALab package.
+#[test]
+fn a_package_not_read_is_unread_and_one_read_without_a_marker_is_an_answer() {
+    let d = crate::supervise::ScratchDir::new("codex", "alab-unread");
+    let root = d.join("pkg");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe is never run");
+    let manifest = root.join(PACKAGE_JSON);
+    std::fs::write(&manifest, PACKAGE_0_157_1).expect("manifest");
+    assert_eq!(
+        alab_package(&exe),
+        Ok(false),
+        "read, and no marker: OpenAI's"
+    );
+    std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
+    assert_eq!(alab_package(&exe), Ok(true));
+    assert!(alab_bytes(&exe));
+    let half = &PACKAGE_0_157_1[..PACKAGE_0_157_1.len() / 2];
+    std::fs::write(&manifest, half).expect("a manifest caught mid-write");
+    assert_eq!(alab_package(&exe), Err(NotRead), "{half}");
+    assert!(
+        !alab_bytes(&exe),
+        "no ALab bytes are claimed from a read that failed"
+    );
+    // LS-72: the same half manifest left standing past its write window is that root's lasting
+    // content, which names no entry: read, and no package names the image.
+    std::fs::File::options()
+        .write(true)
+        .open(&manifest)
+        .expect("manifest")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3_600))
+        .expect("an hour back");
+    assert_eq!(alab_package(&exe), Ok(false), "a half manifest that stood");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(&manifest, PACKAGE_0_157_1).expect("manifest");
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // SAFETY: `geteuid` reads this process's effective uid.
+        let root_user = unsafe { libc::geteuid() } == 0;
+        let got = alab_package(&exe);
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod back");
+        // Root reads a file of mode 0 as any other. For anyone else the open's `EACCES` is a
+        // lasting state that every later open finds again (LS-72): the root holds no manifest
+        // this reader may read, so none names the image, an answer, never a read not made.
+        let want = if root_user { Ok(true) } else { Ok(false) };
+        assert_eq!(got, want, "a manifest whose open failed (EACCES)");
+    }
+    assert_eq!(
+        alab_package(&root.join("bin/gone")),
+        Ok(false),
+        "an image that names no file now: no package names it"
+    );
 }
 
 #[test]

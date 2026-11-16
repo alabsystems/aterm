@@ -628,6 +628,7 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
         7,
         8,
         0,
+        0,
     );
     if cfg!(target_os = "linux") {
         assert_eq!(uniform.content_off, [-2.0, 0.0]);
@@ -649,6 +650,7 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
         1,
         1,
         0,
+        0,
     );
     if cfg!(target_os = "linux") {
         assert_eq!(
@@ -667,7 +669,7 @@ fn visible_source_scissor_preserves_signed_odd_crop_intersections() {
 
 #[test]
 fn crown_scissor_clips_both_scroll_directions_to_independent_destination_bounds() {
-    let mut uniform = present_blit_uniform(false, None, None, 40, 60, 40, 60, 0);
+    let mut uniform = present_blit_uniform(false, None, None, 40, 60, 40, 60, 0, 0);
     let up = BandShift {
         src_y: 13,
         dst_y: 10,
@@ -2728,5 +2730,56 @@ fn the_screen_upgrade_moves_the_layer_before_it_promotes_the_metadata() {
         layer(&surf),
         TexelFormat::Rgba16Float.metal(),
         "one direction only"
+    );
+}
+
+#[test]
+fn the_blit_places_the_frame_after_the_side_inset() {
+    let mut gpu = crate::renderer::gpu_renderer_for_test(None, 18.0, Theme::default());
+    gpu.set_hdr_glow(true);
+    let mut input = Terminal::new(6, 12).cell_frame(6, 12);
+    input.cursor_glow_add.push(GlowQuad {
+        x: 8,
+        y: 24,
+        w: 8,
+        h: 16,
+        color: 0xffffff,
+        alpha: 0,
+        color2: 0xffffff,
+        alpha2: 0,
+        row: 2,
+    });
+    let (fw, fh) = gpu.frame_size(6, 12);
+    let (fw, fh) = (fw as u32, fh as u32);
+    let mut win = WindowGpu::new();
+    win.edr_max = 2.0;
+    win.set_side_inset_px(40);
+    let p = gpu.present_uniforms(
+        &mut win,
+        &input,
+        false,
+        None,
+        None,
+        (fw, fh),
+        (fw + 46, fh + 6),
+        true,
+        false,
+        false,
+    );
+    assert_eq!(p.want.content_off[0], 43.0);
+    assert_eq!(
+        p.want.content_off[0],
+        aterm_render::band_offset_after(
+            (fw + 46) as usize,
+            fw as usize,
+            aterm_render::SideInsetPx(40)
+        ) as f32
+    );
+    assert_eq!(p.crown.expect("glow crown").content_off, p.want.content_off);
+    assert!(
+        visible_source_scissor(&p.want, fw + 46, fh + 6)
+            .expect("visible")
+            .0
+            >= 40
     );
 }

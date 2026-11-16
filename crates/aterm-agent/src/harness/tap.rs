@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aterm_json::{Map, Value};
-use aterm_types::control_verbs::is_minted_sid;
+use aterm_types::control_request::Sid;
 
 use super::accounts;
 use super::netwatch::{self, Source};
@@ -268,7 +268,7 @@ pub fn rl_dir_in(state: &Path) -> PathBuf {
 /// The file of process `pid` in tab `sid`.
 #[must_use]
 pub fn file_name(sid: &str, pid: u32) -> Option<String> {
-    (is_minted_sid(sid) && pid > 0).then(|| format!("{sid}-{pid}.json"))
+    (Sid::parse(sid).is_some() && pid > 0).then(|| format!("{sid}-{pid}.json"))
 }
 
 /// One window's figure as Claude Code hands it.
@@ -458,7 +458,7 @@ impl Reading {
     /// The vendor's status-line payload `text` as a reading for the tab and process `vars` name.
     #[must_use]
     pub fn of_stdin(text: &str, vars: &TapVars, now: i64) -> Option<Reading> {
-        let sid = vars.sid.clone().filter(|s| is_minted_sid(s))?;
+        let sid = vars.sid.clone().filter(|s| Sid::parse(s).is_some())?;
         let pid = vars
             .pid
             .as_deref()
@@ -624,7 +624,7 @@ impl Reading {
             sid: doc
                 .get("sid")?
                 .as_str()
-                .filter(|s| is_minted_sid(s))?
+                .filter(|s| Sid::parse(s).is_some())?
                 .to_owned(),
             pid: u32::try_from(doc.get("pid")?.as_u64()?)
                 .ok()
@@ -1095,7 +1095,7 @@ pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
             .strip_prefix('.')
             .and_then(|rest| rest.split_once(".json.tmp"))
             .and_then(|(stem, _)| stem.rsplit_once('-'))
-            .is_some_and(|(sid, _)| is_minted_sid(sid));
+            .is_some_and(|(sid, _)| Sid::parse(sid).is_some());
         if temp_of_tab {
             if file_mtime(&path).is_some_and(|at| now.saturating_sub(at) > SILENT_S) {
                 let _ = std::fs::remove_file(&path);
@@ -1108,7 +1108,7 @@ pub fn sweep(dir: &Path, now: i64, alive: &dyn Fn(u32) -> bool) {
         else {
             continue;
         };
-        let Some(pid) = crate::parse_uint::<u32>(pid).filter(|_| is_minted_sid(sid)) else {
+        let Some(pid) = crate::parse_uint::<u32>(pid).filter(|_| Sid::parse(sid).is_some()) else {
             continue;
         };
         let Some(at) = file_mtime(&path) else {
@@ -1344,7 +1344,7 @@ pub struct LaunchFacts<'a> {
 #[must_use]
 pub fn launch_value(f: &LaunchFacts<'_>) -> Option<String> {
     let armed = f.armed?;
-    if f.no_harness || !f.sid.is_some_and(is_minted_sid) || carried_by(f.argv) {
+    if f.no_harness || !f.sid.is_some_and(|sid| Sid::parse(sid).is_some()) || carried_by(f.argv) {
         return None;
     }
     if f.home.is_none_or(|home| !home.is_absolute()) || f.home != f.account_home {
@@ -1376,13 +1376,32 @@ pub fn launch_value(f: &LaunchFacts<'_>) -> Option<String> {
 /// such word (`claude hello`) is not tapped at launch; one of more words is.
 #[must_use]
 pub fn launch_admits(argv: &[String]) -> bool {
+    line_admits(argv) && no_subcommand(argv)
+}
+
+/// Whether the first operand of `argv`, where it has one, is no word a subcommand's name could
+/// be ([`launch_admits`]).
+fn no_subcommand(argv: &[String]) -> bool {
     let subcommand_like = |word: &str| {
         !word.is_empty()
             && word
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
-    line_admits(argv) && super::upgrade::first_operand(argv).is_none_or(|w| !subcommand_like(w))
+    super::upgrade::first_operand(argv).is_none_or(|w| !subcommand_like(w))
+}
+
+/// Whether a launch's argv (`argv[0]` first) is an interactive Claude Code, the one kind that
+/// draws a folder-trust dialog: [`launch_admits`] without its refusal of a `--settings` of the
+/// line's own, which bars the tap's value and nothing else. A line that does not parse or cannot
+/// resume (`-p`, `--print`), a subcommand, and a `--bare` line (whose dialog was not measured)
+/// are not.
+#[must_use]
+pub fn launch_interactive(argv: &[String]) -> bool {
+    let Ok(flags) = super::upgrade::carried_names(argv) else {
+        return false;
+    };
+    !flags.contains(&"--bare") && no_subcommand(argv)
 }
 
 /// `argv` (`argv[0]` first) with the tap's own `--settings` value set aside: each `--settings`

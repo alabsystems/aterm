@@ -33,7 +33,7 @@ use super::accounts_tokens::{
     self as tokens, InVault, Offered, SessionLogin, TokenNote, TokenRow, TokenState, TokenVault,
     date,
 };
-use super::token_steps::{self, Since, Stopped};
+use super::token_steps::{self, Since, Stopped, Tried};
 use aterm_json::{Map, Value};
 use aterm_secrets::claude_token::{Key, Lookup, Standing};
 use std::collections::BTreeMap;
@@ -159,6 +159,26 @@ impl AccountToken {
             .or_else(|| self.row.as_ref()?.signer.clone())
     }
 
+    /// The token's verification: when, and the Mac that compared it and wrote the stamp, as the
+    /// vault's meta carries it ([`aterm_secrets::claude_token::Meta::verification`]), whichever
+    /// Mac that was. This Mac's row holds only its own write ([`TokenRow::verified`]), so a token
+    /// another Mac verified, or one whose two verifications were settled on the other Mac's, is
+    /// read from the vault. `None` while the vault's meta carries none (this Mac's own write
+    /// still on its way included) or the pair does not read as one token. Where the vault was
+    /// not read, when this Mac's row says, naming no Mac.
+    #[must_use]
+    pub fn verified(&self) -> Option<(u64, Option<String>)> {
+        match &self.standing {
+            Some(standing) => standing
+                .meta
+                .as_ref()?
+                .verification()
+                .filter(|_| standing.check == aterm_secrets::claude_token::Check::Readable)
+                .map(|verified| (verified.at, Some(verified.on.clone()))),
+            None => self.row.as_ref()?.verified.map(|at| (at, None)),
+        }
+    }
+
     /// When this Mac recorded Claude Code's refusal of its token, where it did.
     #[must_use]
     pub fn rejected_at(&self) -> Option<u64> {
@@ -261,8 +281,9 @@ impl AccountToken {
         if let Some(vault) = self.vault_words() {
             parts.push(vault);
         }
-        if let Some(at) = self.row.as_ref().and_then(|row| row.verified) {
-            parts.push(format!("verified {}", date(at)));
+        if let Some((at, on)) = self.verified() {
+            let on = on.map_or_else(String::new, |on| format!(" on {on}"));
+            parts.push(format!("verified {}{on}", date(at)));
         }
         if let Some(at) = self.rejected_at() {
             parts.push(format!("rejected here {}", date(at)));
@@ -317,9 +338,14 @@ impl AccountToken {
         o.insert("vault".into(), Value::from(self.vault_words()));
         o.insert("not_yet_in_vault".into(), Value::from(self.not_yet()));
         let row = self.row.as_ref();
+        let verified = self.verified();
         o.insert(
             "verified".into(),
-            Value::from(row.and_then(|row| row.verified)),
+            Value::from(verified.as_ref().map(|(at, _)| *at)),
+        );
+        o.insert(
+            "verified_on".into(),
+            Value::from(verified.and_then(|(_, on)| on)),
         );
         o.insert("rejected_at".into(), Value::from(self.rejected_at()));
         let used = row.map(|row| &row.used_on);
@@ -931,9 +957,9 @@ pub enum Report {
         peers: PeersShown,
         /// This aterm's Claude Code sessions, where its survey was read.
         sessions: Option<Vec<SessionRoute>>,
-        /// Each account's token step a check stopped and still holds, by its key
-        /// ([`super::token_steps`]): shown here, on demand, and posted nowhere.
-        steps: BTreeMap<String, Stopped>,
+        /// What holds each account's token step, by its key ([`held_steps`]): shown here, on
+        /// demand, and posted nowhere.
+        steps: Held,
     },
 }
 
@@ -955,17 +981,23 @@ impl Report {
                 }
                 for account in accounts {
                     text.push_str(&account.text(peers));
-                    if let Some(step) = steps.get(&account.key) {
-                        let person = account.label.as_ref().map(|label| {
-                            Step::Token {
-                                label: label.clone(),
-                                replace: false,
-                            }
-                            .to_string()
-                        });
+                    let person = account.label.as_ref().map(|label| {
+                        Step::Token {
+                            label: label.clone(),
+                            replace: false,
+                        }
+                        .to_string()
+                    });
+                    if let Some(step) = steps.stopped.get(&account.key) {
                         text.push_str(&format!(
                             "\n    token step: {}",
                             step.words(person.as_deref())
+                        ));
+                    }
+                    if let Some(ran) = steps.tried.get(&account.key) {
+                        text.push_str(&format!(
+                            "\n    token upkeep: {}",
+                            ran.words(person.as_deref())
                         ));
                     }
                     text.push('\n');
@@ -1021,7 +1053,14 @@ impl Report {
                                 if let Some(o) = account.as_object_mut() {
                                     o.insert(
                                         "step".into(),
-                                        steps.get(&a.key).map_or(Value::Null, Stopped::json),
+                                        steps
+                                            .stopped
+                                            .get(&a.key)
+                                            .map_or(Value::Null, Stopped::json),
+                                    );
+                                    o.insert(
+                                        "tried".into(),
+                                        steps.tried.get(&a.key).map_or(Value::Null, Tried::json),
                                     );
                                 }
                                 account
@@ -1074,55 +1113,108 @@ impl Report {
     }
 }
 
-/// Each of `accounts`' token steps a check stopped that its record still holds
-/// ([`Stopped::holds`]), by account key, judged by the Claude Code build a capture would run now
-/// (`cli`, asked only where a record is there), this aterm's build, the account's window store
-/// and the mailbox configurations under `home` ([`token_steps::route_at`]), and the token the
-/// vault holds: what the report shows on demand. None where the steps file does not read.
+/// What holds each of the accounts' token steps on this Mac, by account key ([`held_steps`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// Each step a check stopped whose record still holds it ([`Stopped::holds`]).
+    pub stopped: BTreeMap<String, Stopped>,
+    /// Each run this Mac's upkeep made of a gap of the token the vault holds now, which made no
+    /// token, whose record still holds that gap ([`Tried::holds`]): the upkeep runs it no
+    /// more, whatever lets a stop through (a mailbox the window reads now does not).
+    pub tried: BTreeMap<String, Tried>,
+}
+
+impl Held {
+    /// Whether no record holds any account's step.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.stopped.is_empty() && self.tried.is_empty()
+    }
+}
+
+/// What holds each of `accounts`' token steps ([`Held`]), each record judged by the Claude Code
+/// build a capture would run now (`cli`, asked only where a record is there), this aterm's build,
+/// the account's window store and the mailbox configuration files under `home`
+/// ([`token_steps::route_at`]) and the token the vault holds: a stop whose record still holds
+/// it, a code page's only while aterm's window reads no mailbox of the account, the environment
+/// read through `var` ([`token_steps::mailbox_read`]); and this Mac's upkeep's record of a run
+/// for a gap of the token the vault holds now (by its `minted_at`) while that record holds it,
+/// whatever mailbox the window reads. What the report shows on demand; nothing of a file that
+/// does not read.
 pub fn held_steps(
     store: &Store,
     accounts: &[AccountToken],
-    home: Option<&Path>,
+    (home, var): token_steps::EnvRead<'_>,
     cli: impl FnOnce() -> Option<String>,
-) -> BTreeMap<String, Stopped> {
-    let Ok(mut steps) = token_steps::read(store) else {
-        return BTreeMap::new();
-    };
-    steps.retain(|key, _| accounts.iter().any(|account| account.key == *key));
-    if steps.is_empty() {
-        return steps;
+) -> Held {
+    let shown = |key: &String| accounts.iter().any(|account| account.key == *key);
+    let mut steps = token_steps::read(store).unwrap_or_default();
+    steps.retain(|key, _| shown(key));
+    let mut tried = token_steps::read_tried(store).unwrap_or_default();
+    tried.retain(|key, _| shown(key));
+    let mut held = Held::default();
+    if steps.is_empty() && tried.is_empty() {
+        return held;
     }
     let cli = cli();
     let aterm = aterm_stamp::build_id();
-    accounts
-        .iter()
-        .filter_map(|account| {
-            let step = steps.remove(&account.key)?;
-            step.holds(&Since {
-                cli: cli.as_deref(),
-                aterm: Some(&aterm),
-                route_at: token_steps::route_at(store, home, &account.email),
-                token_at: account.minted_at(),
-            })
-            .then(|| (account.key.clone(), step))
-        })
-        .collect()
+    for account in accounts {
+        let since = Since {
+            cli: cli.as_deref(),
+            aterm: Some(&aterm),
+            route_at: token_steps::route_at(store, home, &account.email),
+            token_at: account.minted_at(),
+            mailbox_read: None,
+        };
+        if let Some(step) = steps.remove(&account.key) {
+            let since = Since {
+                mailbox_read: step.waits_on_a_mailbox().then(|| {
+                    token_steps::mailbox_read(
+                        store,
+                        (home, var),
+                        account.label.as_deref(),
+                        &account.email,
+                    )
+                }),
+                ..since
+            };
+            if step.holds(&since) {
+                held.stopped.insert(account.key.clone(), step);
+            }
+        }
+        // The upkeep's gap is of the token the vault holds, by its own meta alone.
+        let token_at = account.meta().map(|meta| meta.minted_at);
+        if let Some(ran) = tried.remove(&account.key)
+            && ran.minted_at == token_at
+            && ran.holds(&Since { token_at, ..since })
+        {
+            held.tried.insert(account.key.clone(), ran);
+        }
+    }
+    held
 }
 
 /// Each of `accounts`' token steps a check stopped that its record still holds on this Mac
-/// ([`held_steps`] for the store under `harness` and the mailbox configurations under `home`),
-/// judged by the Claude Code build aterm manages here, as a capture would run it, read from its
-/// twin and never run: what the Account card's details show on demand.
+/// ([`held_steps`]' stops, for the store under `harness`, the mailbox configurations under
+/// `home` and this process's environment), judged by the Claude Code build aterm manages here,
+/// as a capture would run it, read from its twin and never run: what the Account card's details
+/// show on demand.
 #[must_use]
 pub fn steps_here(
     harness: &Path,
     home: Option<&Path>,
     accounts: &[AccountToken],
 ) -> BTreeMap<String, Stopped> {
-    held_steps(&Store::at(harness), accounts, home, || {
-        let twin = super::upgrade_drive::managed_agent_twin("claude")?;
-        super::upgrade_drive::twin_version(&twin)
-    })
+    held_steps(
+        &Store::at(harness),
+        accounts,
+        (home, &|name| std::env::var_os(name)),
+        || {
+            let twin = super::upgrade_drive::managed_agent_twin("claude")?;
+            super::upgrade_drive::twin_version(&twin)
+        },
+    )
+    .stopped
 }
 
 /// The account key `session`'s login record names, and that account among `accounts`.

@@ -499,6 +499,7 @@ impl crate::App {
                 && let Some(owed) = self
                     .windows
                     .get_mut(&window)
+                    .as_deref_mut()
                     .and_then(|ws| ws.restore_regrid_owed.as_mut())
             {
                 owed.since = now;

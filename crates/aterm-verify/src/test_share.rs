@@ -44,7 +44,8 @@
 //! cover, so the stacks its binaries boot rise and fall with the binaries it runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aterm_capacity::{Rank, Reading, Record};
@@ -73,7 +74,9 @@ pub(crate) struct Others {
 }
 
 /// Who asks: this run's dispatch, placed among the ledger's claims as one claim made when the
-/// dispatch began would be.
+/// dispatch began would be: by the stamp of its place in the memory queue once it has entered
+/// its first binary's request ([`Live::placed`]), so its cores and its memory are ordered by
+/// one stamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Asker {
     /// This process.
@@ -82,7 +85,8 @@ pub(crate) struct Asker {
     pub(crate) ancestors: Vec<u32>,
     /// The rank its binaries claim at.
     pub(crate) rank: Rank,
-    /// When the dispatch began, unix ms: a waiter that arrived later is behind it.
+    /// The dispatch's stamp, unix ms: a waiter that arrived later is behind it. When the
+    /// dispatch began, then its place in the ledger's queue ([`Live::placed`]).
     pub(crate) since_ms: u64,
 }
 
@@ -262,16 +266,37 @@ pub(crate) struct Live {
     look: Box<dyn Fn() -> Option<Look> + Send + Sync>,
     slots: Option<Slots>,
     state: Mutex<State>,
+    /// The dispatch's stamp ([`Asker::since_ms`]), which a look on the ledger reads.
+    since: Arc<AtomicU64>,
 }
 
 impl Live {
-    /// A dispatch that asked `asked` cores and whose recording pass was granted `granted`,
-    /// looking through `look`, its subprocess pool `slots` held to the share from now on.
+    /// TEST: [`Self::since`] with a stamp of its own, set at now.
+    #[cfg(test)]
     pub(crate) fn new(
         asked: u32,
         granted: u32,
         look: Box<dyn Fn() -> Option<Look> + Send + Sync>,
         slots: Option<Slots>,
+    ) -> Live {
+        Live::since(
+            asked,
+            granted,
+            look,
+            slots,
+            Arc::new(AtomicU64::new(unix_ms())),
+        )
+    }
+
+    /// A dispatch that asked `asked` cores and whose recording pass was granted `granted`,
+    /// looking through `look`, its subprocess pool `slots` held to the share from now on, its
+    /// look reading the dispatch's stamp from `since`.
+    fn since(
+        asked: u32,
+        granted: u32,
+        look: Box<dyn Fn() -> Option<Look> + Send + Sync>,
+        slots: Option<Slots>,
+        since: Arc<AtomicU64>,
     ) -> Live {
         let live = Live {
             asked: asked.max(1),
@@ -283,6 +308,7 @@ impl Live {
                 read: None,
                 range: None,
             }),
+            since,
         };
         if let Some(slots) = &live.slots {
             slots.follow(live.granted);
@@ -298,7 +324,9 @@ impl Live {
         slots: Option<Slots>,
     ) -> Live {
         let asker = Asker::live(&aterm_capacity::Live, rank);
-        Live::new(
+        let since = Arc::new(AtomicU64::new(asker.since_ms));
+        let placed = Arc::clone(&since);
+        Live::since(
             asked,
             granted,
             Box::new(move || {
@@ -308,13 +336,27 @@ impl Live {
                     return None;
                 }
                 let records = ledger.list().ok()?;
+                let asker = Asker {
+                    since_ms: placed.load(Ordering::Relaxed),
+                    ..asker.clone()
+                };
                 Some(Look {
                     machine: aterm_capacity::Live.read(None),
                     others: Others::of(&records, &asker, unix_ms()),
                 })
             }),
             slots,
+            since,
         )
+    }
+
+    /// The dispatch's place in the ledger's memory queue is `ms` (unix ms; `None`: it has none
+    /// yet, or none stands): the stamp its share places it by from the next look, so a waiter
+    /// is ahead of the dispatch's cores exactly where it is ahead of its memory.
+    pub(crate) fn placed(&self, ms: Option<u64>) {
+        if let Some(ms) = ms {
+            self.since.store(ms, Ordering::Relaxed);
+        }
     }
 
     /// The share now, the run's binaries using `rate` cores at their last reads: read again

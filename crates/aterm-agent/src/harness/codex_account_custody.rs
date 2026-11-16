@@ -4,7 +4,9 @@
 //! Shared file and source custody checks. Holding these locks is not selection,
 //! process, or restart authority; each caller must retain its own admission proof.
 
-use super::{accounts, accounts_sync, cli::Env, codex_app_login, codex_renewal::Identity};
+use super::{
+    accounts, accounts_sync, cli::Env, codex_app_login, codex_renewal, codex_renewal::Identity,
+};
 use std::path::Path;
 
 pub(super) struct Custody {
@@ -72,8 +74,8 @@ pub(super) fn lock(
         .iter()
         .map(|path| {
             codex_app_login::AuthLock::try_take(path)
-                .map_err(|_| "auth-lock")?
-                .ok_or("auth-busy")
+                .map_err(|_| codex_renewal::AUTH_LOCK)?
+                .ok_or(codex_renewal::AUTH_BUSY)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let old_home = old_auth.parent().ok_or("auth-path")?;

@@ -23,6 +23,7 @@ fn claim(pid: u32, asks: u64, need: Need, held: bool) -> Record {
         accounting: crate::Accounting::Holder,
         pid,
         start_ms: asks,
+        laid_at: None,
         seq: 0,
         checkout: "/w".to_owned(),
         need,

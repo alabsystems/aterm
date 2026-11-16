@@ -170,7 +170,7 @@ impl HostVitals {
             mem_used_bytes: memory.map(aterm_sysprobe::MemoryDetail::used),
             mem_wired_bytes: memory.map(|m| m.wired),
             mem_compressed_bytes: memory.and_then(|m| m.compressed),
-            swap_used_bytes: memory.map(|m| m.swap_used),
+            swap_used_bytes: memory.and_then(|m| m.swap_used),
             mem_pressure: memory
                 .and_then(|m| m.pressure)
                 .map(|p| p.as_str().to_owned()),

@@ -136,6 +136,7 @@ fn parse_reads_release_build() {
             commit: commit.to_string(),
             out: PathBuf::from("carry"),
             repo: Some(PathBuf::from("r")),
+            sign: None,
         }))
     );
     let full = [
@@ -164,4 +165,169 @@ fn parse_reads_release_build() {
     let mut extra = full.to_vec();
     extra.push("--sign");
     assert!(parse(&args(&extra)).is_err());
+}
+
+#[test]
+fn parse_reads_the_pull_lane_verbs() {
+    let commit = "1a37de31a3401234567890abcdef1234567890ab";
+    let build = [
+        "release-build",
+        "--version",
+        "0.200.0",
+        "--build-number",
+        "1794421328",
+        "--commit",
+        commit,
+        "--out",
+        "carry",
+    ];
+    let mut signed = build.to_vec();
+    signed.extend(["--sign-with", "k.pk8", "--builder", "m6"]);
+    let Ok(Verb::ReleaseBuild(opts)) = parse(&args(&signed)) else {
+        panic!("{signed:?} was not read");
+    };
+    assert_eq!(
+        opts.sign,
+        Some(release::Sign {
+            key: PathBuf::from("k.pk8"),
+            builder: Some("m6".to_string()),
+        })
+    );
+    let mut keyed = build.to_vec();
+    keyed.extend(["--sign-with", "k.pk8"]);
+    let Ok(Verb::ReleaseBuild(opts)) = parse(&args(&keyed)) else {
+        panic!("{keyed:?} was not read");
+    };
+    assert_eq!(opts.sign.and_then(|s| s.builder), None);
+    assert_eq!(
+        parse(&args(&[
+            "release-key",
+            "init",
+            "--key",
+            "k",
+            "--builder",
+            "m6"
+        ])),
+        Ok(Verb::ReleaseKey {
+            init: true,
+            key: Some(PathBuf::from("k")),
+            builder: Some("m6".to_string()),
+        })
+    );
+    assert_eq!(
+        parse(&args(&["release-key", "show"])),
+        Ok(Verb::ReleaseKey {
+            init: false,
+            key: None,
+            builder: None,
+        })
+    );
+    assert_eq!(
+        parse(&args(&[
+            "release-serve",
+            "--once",
+            "--repo",
+            "r",
+            "--key",
+            "k",
+            "--builder",
+            "m6",
+            "--log"
+        ])),
+        Ok(Verb::ReleaseServe {
+            opts: serve::Options {
+                once: true,
+                repo: Some(PathBuf::from("r")),
+                key: Some(PathBuf::from("k")),
+                builder: Some("m6".to_string()),
+            },
+            log: true,
+        })
+    );
+    assert_eq!(
+        parse(&args(&["release-serve"])),
+        Ok(Verb::ReleaseServe {
+            opts: serve::Options {
+                once: false,
+                repo: None,
+                key: None,
+                builder: None,
+            },
+            log: false,
+        })
+    );
+    // Negative controls.
+    let mut builder_alone = build.to_vec();
+    builder_alone.extend(["--builder", "m6"]);
+    let mut bad_builder = build.to_vec();
+    bad_builder.extend(["--sign-with", "k", "--builder", "M6 HP"]);
+    for bad in [
+        builder_alone,
+        bad_builder,
+        vec!["release-key"],
+        vec!["release-key", "make"],
+        vec!["release-key", "init", "--key"],
+        vec!["release-key", "show", "--builder", "-x"],
+        vec!["release-serve", "--daily"],
+        vec!["release-serve", "--builder", "A"],
+    ] {
+        assert!(parse(&args(&bad)).is_err(), "{bad:?} was taken");
+    }
+}
+
+#[test]
+fn release_key_prints_the_pin_and_never_the_private_key() {
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let path = scratch.path().join("ed25519.pk8");
+    let mut lines = Vec::new();
+    // `show` with no key made says how to make one.
+    let code = release_key(false, &path, "m6", 1_794_424_462, &mut |l| {
+        lines.push(l.to_string());
+    });
+    assert_eq!(code, NOT_RUN, "{lines:?}");
+    assert!(lines.concat().contains("release-key init"), "{lines:?}");
+    lines.clear();
+    let code = release_key(true, &path, "m6", 1_794_424_462, &mut |l| {
+        lines.push(l.to_string());
+    });
+    assert_eq!(code, PASS, "{lines:?}");
+    let key = std::fs::read(&path).expect("key");
+    let public = attest::public_key(&key).expect("public");
+    let said = lines.join("\n");
+    assert!(said.contains("release-key: made"), "{said}");
+    assert!(
+        said.contains(&format!("public_key = \"{public}\"")),
+        "{said}"
+    );
+    assert!(said.contains("id = \"m6\""), "{said}");
+    // Pinned for 90 days, not a year: a copied key attests no longer than that.
+    assert!(said.contains("not_after = \"2027-02-09\""), "{said}");
+    // The pin it prints reads as a pins file that admits this key.
+    let pin: String = lines
+        .iter()
+        .skip_while(|l| *l != "[[builder]]")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let pinned = attest::Builders::parse(&pin).expect("the printed pin reads");
+    assert!(pinned.admits("m6", &public, "2026-11-15").is_ok());
+    // No run of 16 bytes of the key file is printed but the public key's own.
+    let document = aterm_codec::hex::encode_lower(&key);
+    for at in (0..=document.len() - 32).step_by(2) {
+        let run = &document[at..at + 32];
+        if !public.contains(run) {
+            assert!(
+                !said.contains(run),
+                "{run} of the key file was printed: {said}"
+            );
+        }
+    }
+    // A second init keeps the key it made.
+    lines.clear();
+    assert_eq!(
+        release_key(true, &path, "m6", 1_794_424_462, &mut |l| lines
+            .push(l.to_string())),
+        PASS
+    );
+    assert!(lines.concat().contains("is kept"), "{lines:?}");
+    assert_eq!(std::fs::read(&path).expect("key"), key);
 }

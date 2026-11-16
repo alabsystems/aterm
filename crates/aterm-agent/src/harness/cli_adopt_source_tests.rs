@@ -39,6 +39,7 @@ fn fleet_text(label: &str, email: &str, opt_in: Option<&str>, shared: bool) -> S
     )
 }
 
+#[cfg(unix)]
 fn source_case(case: i64) -> (i64, i64, i64, i64) {
     let tmp = tmp_dir("adopt-source-policy");
     let env = env_at(&tmp);
@@ -242,6 +243,7 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
     )
 }
 
+#[cfg(unix)]
 pub(crate) fn adopt_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -265,6 +267,7 @@ pub(crate) fn adopt_transition(
 }
 
 #[test]
+#[cfg(unix)]
 fn default_adoption_conforms_to_source_authority() {
     let model = aterm_models_harness::account_adopt_source_model();
     assert_eq!(model.mutant_dials(), (1..=18).collect::<Vec<_>>());

@@ -501,6 +501,8 @@ fn retained_diagnostic(report: &str) -> bool {
                 | "new-core-work-completed"
                 | "shared-client-application-boundary"
                 | "withdraw-frontend"
+                | "resource-native-copy-and-external-change"
+                | "resource-replay-without-clipboard-redelivery"
         );
     }
     let Some((stage, kind)) = report
@@ -606,7 +608,19 @@ pub fn cmd(args: &[String]) -> Res {
     })?;
     let keep = instance::take_flag(&mut args, "--keep");
     let retained = instance::take_flag(&mut args, "--retained-service");
+    let distinct = instance::take_flag(&mut args, "--distinct-intents");
+    let resources = instance::take_flag(&mut args, "--app-resources");
     let replacement = instance::take_value(&mut args, "--replacement-package")?;
+    if resources && (!retained || distinct || replacement.is_some()) {
+        return Err(Fail::usage(
+            "App resources require retained qualification without distinct or replacement options",
+        ));
+    }
+    if distinct && (!retained || replacement.is_some()) {
+        return Err(Fail::usage(
+            "distinct intents require retained qualification without replacement",
+        ));
+    }
     if replacement.is_some() && !retained {
         return Err(Fail::usage(
             "replacement package requires the retained qualification",
@@ -642,6 +656,10 @@ pub fn cmd(args: &[String]) -> Res {
     fixture.publish().map_err(Fail::die)?;
     let task = if let Some(replacement) = &replacement {
         fixture.retained_upgrade_task(&executable, replacement)
+    } else if resources {
+        fixture.retained_resources_task(&executable)
+    } else if distinct {
+        fixture.retained_distinct_task(&executable)
     } else if retained {
         fixture.retained_task(&executable)
     } else {
@@ -779,6 +797,9 @@ pub fn cmd(args: &[String]) -> Res {
         if header["retained"].as_bool().unwrap_or(false) != retained {
             return Err(Fail::die("source proof qualification kind changed"));
         }
+        if header["resources"].as_bool().unwrap_or(false) != resources {
+            return Err(Fail::die("source resource qualification kind changed"));
+        }
         let mut output = File::from(
             received
                 .fds
@@ -802,6 +823,8 @@ pub fn cmd(args: &[String]) -> Res {
                 .write_all(b"RUN retained\n")
                 .map_err(|_| Fail::die("retained SDK start barrier failed"))?;
             let until = Instant::now() + Duration::from_secs(120);
+            let mut resource_copy = false;
+            let mut resource_replay = false;
             loop {
                 let fd = output.as_raw_fd();
                 let bytes = match line(&mut output, fd, SDK_REPLY_LIMIT) {
@@ -817,6 +840,10 @@ pub fn cmd(args: &[String]) -> Res {
                 let report = std::str::from_utf8(&bytes)
                     .map_err(|_| Fail::die("invalid retained SDK output"))?
                     .trim_end_matches('\r');
+                resource_copy |= report
+                    == "Retained qualification: phase=resource-native-copy-and-external-change";
+                resource_replay |= report
+                    == "Retained qualification: phase=resource-replay-without-clipboard-redelivery";
                 // Export only these fixed phase labels, never arbitrary SDK,
                 // configuration, credential or terminal output.
                 if retained_diagnostic(report) {
@@ -825,6 +852,11 @@ pub fn cmd(args: &[String]) -> Res {
                 if report
                     == "PASS retained SDK startup, physical attachment and actual configuration response"
                 {
+                    if resources && !(resource_copy && resource_replay) {
+                        return Err(Fail::die(
+                            "retained App resource qualification phases missing",
+                        ));
+                    }
                     break;
                 }
                 if Instant::now() >= until {

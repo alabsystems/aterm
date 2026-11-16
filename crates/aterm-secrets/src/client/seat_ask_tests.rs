@@ -808,6 +808,6 @@ fn a_persons_allow_seats_a_seatless_recipient_off_the_lan() {
         source,
         "its configuration is kept"
     );
-    assert_eq!(crate::client::stored(&s, "shared").unwrap(), b"everyone-v1");
+    assert_eq!(crate::client::stored(s, "shared").unwrap(), b"everyone-v1");
     world.macs.server.stop();
 }

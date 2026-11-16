@@ -1185,7 +1185,7 @@ pub(crate) fn run_driven(
     )
 }
 
-/// `await task …` under `--host any`, resolving each `@s-<hex>` target to the peer hosting it.
+/// `await task …` under `--host any`, resolving each `@t…` tab ID to the peer hosting it.
 pub(crate) fn run_driven_any(
     parts: &[String],
     total: Option<Option<Duration>>,
@@ -1218,7 +1218,7 @@ fn driven_wait_any(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "await task over the fleet names each worker by its sid (@s-…, as `aterm ctl \
+                "await task over the fleet names each worker by its sid (@tqn5r6e0148, as `aterm ctl \
                  survey --host <h>` shows it); {named}"
             ),
         ));
@@ -1307,7 +1307,7 @@ fn driven_wait(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "await task over the fleet names each worker by its sid (@s-…, as `aterm ctl \
+                "await task over the fleet names each worker by its sid (@tqn5r6e0148, as `aterm ctl \
                  survey --host <h>` shows it); {named}"
             ),
         ));

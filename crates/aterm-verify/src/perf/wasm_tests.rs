@@ -47,7 +47,17 @@ fn wasm_builds_guard_automatic_finals_and_read_the_captured_target() {
             std::fs::create_dir(artifacts.join("target")).unwrap();
             std::os::unix::fs::symlink(&outside, artifacts.join("target/.ubd")).unwrap();
         }
-        let mut env = crate::EnvSnapshot::default();
+        // A HOME of its own: with none, the front cannot tell which folders atpkg manages and
+        // refuses every build (atpkg's `homeless`), as a native child here would meet it.
+        let home = temp.join("home");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let mut env = crate::EnvSnapshot {
+            home,
+            ..crate::EnvSnapshot::default()
+        };
         if shape == "explicit-link" {
             env.cargo_layout
                 .push(("CARGO_TARGET_DIR", logical.clone().into_os_string()));
@@ -227,7 +237,7 @@ fn each_gated_keys_samples_print_in_lane_order() {
     assert!(sample_lines(&json("{}")).is_empty());
 }
 
-/// Compare already built modules under the same real browser driver and fresh timing admission.
+/// Compare already built modules and their glue under the same browser driver and timing admission.
 #[cfg(unix)]
 #[test]
 #[ignore = "manual paired browser measurement; requires ATERM_WASM_BASE_SITE, ATERM_WASM_AFTER_SITE and ATERM_WASM_PAIR_REPORT"]
@@ -241,12 +251,20 @@ fn paired_prebuilt_browser_costs() {
         "use a fresh report path to retain each cohort"
     );
     assert_ne!(base.canonicalize().unwrap(), after.canonicalize().unwrap());
-    let assets = ["cpu/aterm_wasm_bg.wasm", "gpu/aterm_gpu_web_bg.wasm"];
+    let assets = [
+        "cpu/aterm_wasm_bg.wasm",
+        "gpu/aterm_gpu_web_bg.wasm",
+        "cpu/aterm_wasm.js",
+        "gpu/aterm_gpu_web.js",
+    ];
     let before: Vec<_> = [&base, &after]
         .into_iter()
         .map(|site| assets.map(|name| std::fs::read(site.join(name)).unwrap()))
         .collect();
-    assert!(before[0] != before[1], "both WASM modules are identical");
+    assert!(
+        before[0] != before[1],
+        "all shipping JS and WASM assets are identical"
+    );
     let browser = wasm_page::browser().expect("provision the pinned browser with verify provision");
     let scratch = aterm_tempfile::tempdir().unwrap();
     let root = workspace_root();
@@ -282,7 +300,7 @@ fn paired_prebuilt_browser_costs() {
             for key in WASM_LANE.keys {
                 assert!(
                     ran.value
-                        .get(*key)
+                        .get(key)
                         .and_then(Value::as_f64)
                         .is_some_and(|v| v.is_finite() && v > 0.0),
                     "{key}"
@@ -291,7 +309,7 @@ fn paired_prebuilt_browser_costs() {
                     ran.value
                         .get("samples")
                         .unwrap()
-                        .get(*key)
+                        .get(key)
                         .unwrap()
                         .as_array()
                         .unwrap()

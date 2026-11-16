@@ -209,6 +209,87 @@ fn text_json_carries_the_title_read_with_its_rows() {
     );
 }
 
+/// `"program_report"` is the OSC 7501 report standing, as the body that says it, read in the rows' own hold and
+/// sent last; NEGATIVE CONTROLS: no report, a `clear`, a child record's report and a report of a program the engine
+/// does not take send none, and none moves another key.
+#[test]
+fn text_json_carries_the_program_report_standing_with_its_rows() {
+    let reply = |seed: &str| cmd_text_json_opt(&term_with(4, seed.as_bytes()), TextArgs::default());
+    let report = |reply: &str| {
+        let body = reply.strip_prefix("OK 1\n").expect("an OK 1 reply");
+        let v: aterm_json::Value = aterm_json::from_str(body.trim()).expect("valid JSON");
+        v.get("program_report")
+            .and_then(aterm_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let bare = "\x1b]0;Claude Code\x07\u{23fa} streaming\r\n";
+    let none = reply(bare);
+    assert_eq!(report(&none), None, "{none}");
+    assert!(!none.contains("program_report"), "{none}");
+    let working = reply(&format!(
+        "\x1b]7501;state=working:app=claude-code\x07{bare}"
+    ));
+    assert_eq!(
+        report(&working).as_deref(),
+        Some("state=working:app=claude-code"),
+        "{working}"
+    );
+    assert!(
+        working.ends_with(",\"program_report\":\"state=working:app=claude-code\"}\n"),
+        "sent last: {working}"
+    );
+    assert_eq!(
+        working.replace(",\"program_report\":\"state=working:app=claude-code\"", ""),
+        none,
+        "the report is the only key it adds"
+    );
+    let blocked = reply(&format!(
+        "\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZQ==\x07{bare}"
+    ));
+    assert_eq!(
+        report(&blocked).as_deref(),
+        Some("state=blocked:app=claude-code:kind=permission"),
+        "as the engine carries it: {blocked}"
+    );
+    for seed in [
+        "\x1b]7501;state=working:app=claude-code\x07\x1b]7501;state=clear\x07",
+        "\x1b]7501;state=working:app=claude-code:id=sub-1\x07",
+        "\x1b]7501;state=working:app=muse\x07",
+    ] {
+        let r = reply(&format!("{seed}{bare}"));
+        assert_eq!(report(&r), None, "{seed:?}: {r}");
+        assert_eq!(r, none, "{seed:?}");
+    }
+    // A report whose writer's group has left the front (a Claude Code killed mid-turn) is no run
+    // sign: none is sent, and the next program's own report is.
+    let left = term_with(4, b"");
+    {
+        let mut t = left.lock().unwrap();
+        t.program_front_is(100);
+        t.process(b"\x1b]7501;state=working:app=claude-code\x07");
+        t.program_front_is(100);
+        t.process(bare.as_bytes());
+    }
+    let seen = cmd_text_json_opt(&left, TextArgs::default());
+    assert_eq!(
+        report(&seen).as_deref(),
+        Some("state=working:app=claude-code"),
+        "{seen}"
+    );
+    left.lock().unwrap().program_front_is(200);
+    let gone = cmd_text_json_opt(&left, TextArgs::default());
+    assert_eq!(report(&gone), None, "its writer left the front: {gone}");
+    left.lock()
+        .unwrap()
+        .process(b"\x1b]7501;state=idle:app=claude-code\x07");
+    let next = cmd_text_json_opt(&left, TextArgs::default());
+    assert_eq!(
+        report(&next).as_deref(),
+        Some("state=idle:app=claude-code"),
+        "{next}"
+    );
+}
+
 #[test]
 fn text_json_carries_the_generation_of_the_rows_it_sends() {
     const ALT_A: &[u8] = b"\x1b[?1049h\x1b[H Bash command\r\n   ls -la /tmp/work\r\n";

@@ -191,3 +191,36 @@ fn a_sleeping_child_stalls_and_an_exited_one_ended() {
     );
     assert_eq!(got, Err(Unanswered::Ended));
 }
+
+/// A child whose exit has begun is not yet gone: XNU reads it exited from the moment its exit
+/// begins, while its parent can reap it only once the exit finishes, so a wait for what its end
+/// does (here its reaping) still waits. Each child is read the moment its input closes, and over
+/// enough of them some are read mid-exit. CONTROL: with an exiting child read as gone, the one
+/// more probe found nothing to reap and the wait ended `Ended` within these children (measured:
+/// `native_act::source_exec`'s source-gone test failed so, one run in three).
+#[cfg(unix)]
+#[test]
+fn a_child_mid_exit_is_waited_for_until_its_end_is_done() {
+    for n in 0..300u64 {
+        let mut child = aterm_uds::spawnfd::command("/bin/cat")
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stdin.take());
+        // The wait's first reading of the child, a few microseconds later each time: from
+        // before cat has woken to its read's end, to after its exit has finished.
+        let read_at = Instant::now() + Duration::from_micros(n * 7);
+        while Instant::now() < read_at {
+            std::hint::spin_loop();
+        }
+        let got = within_while_working(
+            child.id(),
+            MUST_HAPPEN,
+            WORKING_GUARD,
+            Duration::from_millis(1),
+            || child.try_wait().unwrap().map(|_| ()),
+        );
+        assert_eq!(got, Ok(()), "child {n}");
+    }
+}

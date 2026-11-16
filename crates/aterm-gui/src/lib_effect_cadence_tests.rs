@@ -152,7 +152,7 @@ fn a_sixty_hertz_panel_presents_effects_at_panel_rate_off_apple_silicon() {
 fn a_parked_acquire_drops_the_window_to_the_halving_until_the_lane_idles() {
     let hz60 = Duration::from_nanos(1_000_000_000_000 / 60_000);
     let mut app = super::App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&super::WindowId(0))
         .expect("the headless fixture owns window 0");
@@ -190,11 +190,13 @@ fn a_parked_acquire_drops_the_window_to_the_halving_until_the_lane_idles() {
     ws.note_acquire_wait(super::EFFECT_LANE_ACQUIRE_PARK_NS);
     assert_eq!(ws.effect_present_interval(), halved);
     let sid = app.next_session_id;
+    drop(ws);
     let wid_b = app.insert_logical_window(super::stub_session(sid), 24, 80);
-    let other = app.windows.get_mut(&wid_b).expect("the second window");
+    let mut other = app.windows.get_mut(&wid_b).expect("the second window");
     other.frame_interval = Some(hz60);
     assert!(!other.effect_lane_parked);
     assert_eq!(other.effect_present_interval(), platform);
+    drop(other);
     assert_eq!(
         app.windows[&super::WindowId(0)].effect_present_interval(),
         halved,
@@ -219,7 +221,7 @@ fn the_decoration_latch_is_sized_for_the_lane_a_park_stretches_it_to() {
     );
     assert!(halved * super::DECO_ANIM_LEVEL_FRAMES >= halved * 3);
     let mut app = super::App::headless_for_test();
-    let ws = app
+    let mut ws = app
         .windows
         .get_mut(&super::WindowId(0))
         .expect("the headless fixture owns window 0");

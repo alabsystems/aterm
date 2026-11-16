@@ -359,9 +359,48 @@ fn a_replacement_companion_is_confirmed_only_once_the_keeper_has_read_it() {
     drop(server);
 }
 
-/// An idle wait no hang detector outlasts: a link idling this long wakes only for an op
-/// queued or a frame from its keeper.
+/// A retry pace no hang detector outlasts: a link that lost its keeper tries it again only on
+/// an op queued (a connected link waits for an op or a keeper frame alone at any pace).
 const IDLE_FOR_GOOD: Duration = Duration::from_secs(3_600);
+
+/// A connected link's worker waits with no deadline, however short its retry pace: nothing but
+/// an op or the keeper's frame wakes it. Once its keeper is gone it waits for its next try, the
+/// pace at least.
+#[test]
+fn a_connected_link_waits_with_no_deadline_and_a_lost_one_for_its_next_try() {
+    let scratch = crate::test_scratch_dir("nodeadline");
+    let sock = scratch.path().join("k.sock");
+    let mut server = serve(&sock);
+    let retry = Duration::from_millis(1);
+    let (link, _) = linked(&mut server, &sock, retry, "/dev/zero");
+    // The control op: a turn after the REGISTER's, so a connected wait was chosen before it.
+    assert!(link.send_and_wait(LinkOp::Pending { pid: 1 }, aterm_spec::wait::MUST_HAPPEN));
+    let connected = link.waits_until("a connected turn", |waits| {
+        waits.iter().any(|(connected, _)| *connected)
+    });
+    assert!(
+        connected
+            .iter()
+            .filter(|(connected, _)| *connected)
+            .all(|(_, wait)| wait.is_none()),
+        "a connected worker's wait has no deadline, whatever its pace: {connected:?}"
+    );
+    drop(server);
+    let lost = link.waits_until("a turn that has lost its keeper", |waits| {
+        waits
+            .iter()
+            .skip(connected.len())
+            .any(|(connected, _)| !*connected)
+    });
+    assert!(
+        lost.iter()
+            .skip(connected.len())
+            .filter(|(connected, _)| !*connected)
+            .all(|(_, wait)| wait.is_some_and(|wait| wait >= retry)),
+        "a lost worker holding a master waits for its next try, the pace at least: {lost:?}"
+    );
+    link.shutdown();
+}
 
 #[test]
 fn an_interrupted_doorbell_write_is_retried_before_the_worker_is_left_waiting() {
@@ -440,7 +479,7 @@ fn a_receipt_is_confirmed_as_the_keeper_answers_with_no_op_behind_it() {
     let sock = scratch.path().join("k.sock");
     let mut server = serve(&sock);
     let (rdev, register) = register_op("/dev/null", 1);
-    let link = KeeperLink::start_idling(
+    let link = KeeperLink::start_retrying(
         sock.clone(),
         Identity::same_uid(),
         "t".into(),
@@ -490,8 +529,8 @@ fn a_receipt_is_confirmed_as_the_keeper_answers_with_no_op_behind_it() {
 }
 
 /// A keeper that welcomes a link and then closes it is tried again on the link's next op or
-/// its idle wait, never on the wake its close caused: a worker that dialled there would dial
-/// a keeper dropping every link it welcomes as fast as it could, with no pause between.
+/// its retry, never on the wake its close caused: a worker that dialled there would dial a
+/// keeper dropping every link it welcomes as fast as it could, with no pause between.
 #[test]
 fn a_keeper_that_closes_the_link_is_not_dialled_again_on_its_close() {
     use crate::wire::Kind;
@@ -548,7 +587,7 @@ fn a_keeper_that_closes_the_link_is_not_dialled_again_on_its_close() {
         })
     };
     let (_, register) = register_op("/dev/null", 1);
-    let link = KeeperLink::start_idling(
+    let link = KeeperLink::start_retrying(
         sock,
         Identity::same_uid(),
         "t".into(),
@@ -562,9 +601,23 @@ fn a_keeper_that_closes_the_link_is_not_dialled_again_on_its_close() {
     closed
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("the keeper read the REGISTER and closed the link");
-    // Neither an op nor the link's idle wait comes here, so a dial in this pause is one the
-    // close's own wake made. Its length is only how sure the test is to see one.
-    std::thread::sleep(LINK_POLL);
+    // The worker's turns: its first wait (nothing held), the one after it wrote the REGISTER
+    // (connected), and the one after the close's own wake. A dial that wake made comes before
+    // that last turn's wait is noted, so before `asked`; the wait is for the retry (an hour), so
+    // no wake of the worker's own comes before the op below.
+    let waits = link.waits_until("the turn after the close's wake", |waits| {
+        waits
+            .iter()
+            .skip_while(|(connected, _)| !connected)
+            .nth(1)
+            .is_some()
+    });
+    let after_close = waits.iter().skip_while(|(connected, _)| !connected).nth(1);
+    assert_eq!(
+        after_close,
+        Some(&(false, Some(IDLE_FOR_GOOD))),
+        "the close's wake dialled nobody and left the worker waiting for its retry: {waits:?}"
+    );
     asked.store(true, Ordering::SeqCst);
     assert!(
         link.send_and_wait(LinkOp::Pending { pid: 1 }, aterm_spec::wait::MUST_HAPPEN),
@@ -574,8 +627,8 @@ fn a_keeper_that_closes_the_link_is_not_dialled_again_on_its_close() {
     assert_eq!(first, [Kind::Hello, Kind::Register]);
     assert!(
         !unasked,
-        "the link dialled the keeper again on its close, with no op queued and its idle wait \
-         not over"
+        "the link dialled the keeper again on its close, with no op queued and its retry not \
+         due"
     );
     assert_eq!(second, [Kind::Hello, Kind::Register, Kind::Pending]);
     link.shutdown();
@@ -788,16 +841,16 @@ fn a_keeper_that_answers_no_sync_is_sent_none() {
 
 /// A link already speaking to `server`'s keeper (its REGISTER of the device at `own` held
 /// there), and that master's rdev.
-fn linked(server: &mut Server, sock: &Path, idle: Duration, own: &str) -> (KeeperLink, u64) {
+fn linked(server: &mut Server, sock: &Path, retry: Duration, own: &str) -> (KeeperLink, u64) {
     let (own, register) = register_op(own, 9);
-    let link = KeeperLink::start_idling(
+    let link = KeeperLink::start_retrying(
         sock.to_path_buf(),
         Identity::same_uid(),
         "t".into(),
         None,
         None,
         true,
-        idle,
+        retry,
     )
     .expect("link");
     assert!(link.enqueue(register));
@@ -1020,7 +1073,7 @@ fn a_boot_connection_s_retirement_is_seen_through_by_its_link() {
     let observer = std::sync::Arc::new(ReadObserver::default());
     boot.retire(rdev, std::sync::Arc::clone(&observer))
         .expect("written");
-    let link = KeeperLink::start_idling(
+    let link = KeeperLink::start_retrying(
         sock.clone(),
         Identity::same_uid(),
         "t".into(),
@@ -1035,6 +1088,52 @@ fn a_boot_connection_s_retirement_is_seen_through_by_its_link() {
         observer.confirmed()
     });
     assert!(!server.holds(rdev), "the keeper closed its copy");
+    link.shutdown();
+    older.shutdown();
+}
+
+/// A boot connection that read the answer behind its retirement before its link started (its
+/// own `drain`) hands the link a retirement already answered: the link confirms it as it
+/// starts, though nothing wakes it (a connected worker waits for an op or a keeper frame alone).
+#[test]
+fn a_boot_retirement_already_answered_is_confirmed_as_its_link_starts() {
+    let scratch = crate::test_scratch_dir("bootans");
+    let sock = scratch.path().join("k.sock");
+    let mut server = serve(&sock);
+    let (older, _) = linked(&mut server, &sock, IDLE_FOR_GOOD, "/dev/zero");
+    let (rdev, register) = register_op("/dev/null", 1);
+    assert!(older.enqueue(register));
+    step_until(&mut server, "the keeper holds the old master", |s| {
+        s.holds(rdev)
+    });
+    let boot = booted(&mut server, &sock);
+    let observer = std::sync::Arc::new(ReadObserver::default());
+    boot.retire(rdev, std::sync::Arc::clone(&observer))
+        .expect("written");
+    step_until(
+        &mut server,
+        "the boot connection reads the keeper's answer",
+        |_| {
+            assert!(boot.drain(), "the boot connection is open");
+            boot.synced() == boot.syncs.get()
+        },
+    );
+    assert!(!observer.confirmed(), "premise: only a link confirms it");
+    let link = KeeperLink::start_retrying(
+        sock.clone(),
+        Identity::same_uid(),
+        "t".into(),
+        None,
+        Some(boot),
+        true,
+        IDLE_FOR_GOOD,
+    )
+    .expect("link");
+    step_until(
+        &mut server,
+        "the link confirms the answered retirement",
+        |_| observer.confirmed(),
+    );
     link.shutdown();
     older.shutdown();
 }

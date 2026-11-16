@@ -4,6 +4,7 @@
 use super::*;
 
 #[test]
+#[cfg(unix)]
 fn a_configured_key_excludes_default_pool_beside_named_roster() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
     for key in [false, true] {
@@ -60,6 +61,7 @@ fn a_configured_key_excludes_default_pool_beside_named_roster() {
 }
 
 #[test]
+#[cfg(unix)]
 fn empty_pool_checks_the_captured_source_before_publishing() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
     for changed in [false, true] {
@@ -183,6 +185,7 @@ fn automatic_configured_fetch_rechecks_admission_before_publication() {
 }
 
 #[test]
+#[cfg(unix)]
 fn captured_legacy_source_refuses_a_new_registry_decision() {
     use crate::harness::alab_roster::{Lab, SourceSnapshot, TestSourceOverride, test_machine};
     let bound = SourceSnapshot::Present(Arc::new(Lab {
@@ -258,6 +261,7 @@ fn equivalent_registry_refresh_does_not_cancel_automatic_sync() {
 }
 
 #[test]
+#[cfg(unix)]
 fn automatic_source_capture_cannot_outlive_a_changed_configuration() {
     for changed in [false, true] {
         let bed = Bed::new("source-capture-configuration");
@@ -275,15 +279,25 @@ fn automatic_source_capture_cannot_outlive_a_changed_configuration() {
             store.wake_path(),
             store.machine_file(),
             bed.config.join(FLEET_ROSTER_FILE),
-            bed.secrets().join(FLEET_ROSTER_FILE),
         ];
+        // The files, and the fleet roster entry the capture read, as this Mac's store holds it.
         let retained = || {
-            paths
+            let mut held = paths
                 .iter()
                 .map(|path| fs::read(path).ok())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            held.push(
+                crate::vault_entry::read_text(&bed.home, FLEET_ROSTER_FILE, 1 << 20)
+                    .text()
+                    .map(|text| text.as_bytes().to_vec()),
+            );
+            held
         };
         let before = retained();
+        assert!(
+            before.last().is_some_and(Option::is_some),
+            "PRECONDITION: the store holds the fleet roster entry"
+        );
         let result = sync_accounts_for_init_with(
             &bed.home,
             &bed.state,
@@ -320,6 +334,7 @@ fn automatic_source_capture_cannot_outlive_a_changed_configuration() {
 }
 
 #[test]
+#[cfg(unix)]
 fn pending_registry_does_not_promote_an_automatic_file_into_an_explicit_source() {
     let bed = Bed::new("pending-source");
     let roster = bed.roster(Cli::Claude);
@@ -360,8 +375,8 @@ fn pending_registry_does_not_promote_an_automatic_file_into_an_explicit_source()
         assert!(!roster.exists(), "a pending source created account rows");
         assert!(!bed.config.join(FLEET_ROSTER_FILE).exists());
         assert_eq!(
-            crate::vault_entry::read_text(&bed.home, FLEET_ROSTER_FILE, 1 << 20).text(),
-            Some(fleet)
+            crate::vault_entry::read_text(&bed.home, FLEET_ROSTER_FILE, SOURCE_TEXT_MAX_BYTES),
+            crate::vault_entry::Read::Present(fleet.to_owned())
         );
     });
 }

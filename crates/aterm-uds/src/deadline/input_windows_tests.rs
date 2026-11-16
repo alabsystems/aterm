@@ -90,7 +90,7 @@ fn direct_exit_retires_the_witnessed_descendant_holding_all_three_pipes() {
 }
 
 #[test]
-fn a_witnessed_nonreading_child_is_retired_when_the_deadline_crosses() {
+fn owned_input_timeout_witnessed_nonreader_is_retired_after_its_snapshot() {
     let dir = aterm_tempfile::tempdir().expect("owned proof directory");
     let proof = dir.path().join("child");
     let path = proof.clone();
@@ -120,6 +120,15 @@ fn a_witnessed_nonreading_child_is_retired_when_the_deadline_crosses() {
     drop(clock);
     let (pid, birth) = witness(&proof).expect("child ran before its deadline crossed");
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let observed = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<OwnedInputTimeout>()
+        .unwrap();
+    assert!(observed.spawned && !observed.natural_exit_observed);
+    assert_eq!(observed.stdin, super::super::OwnedInputState::Pending);
+    assert!(observed.stdin_bytes_sent < 256 * 1024);
+    assert!(!observed.stdout_eof && !observed.stderr_eof);
     assert_ne!(crate::process::read_birth(pid), Some(birth));
 }
 
@@ -135,7 +144,7 @@ fn cmd(script: &str) -> Command {
 /// std's `File::read`, which returns `Ok(0)` for both, the closed writer is taken for an
 /// empty pipe, so the stream never ends and the closed-writer assertion fails.
 #[test]
-fn the_parent_pipe_does_not_wait_for_input_or_capacity() {
+fn owned_input_timeout_output_completion_distinguishes_an_empty_pipe_from_eof() {
     let (reader, mut client) = pipe(false).expect("read pipe");
     let mut reader = Some(reader);
     let mut bytes = Vec::new();
@@ -182,16 +191,40 @@ fn the_parent_pipe_does_not_wait_for_input_or_capacity() {
 }
 
 #[test]
-fn an_expired_exchange_does_not_spawn_the_missing_program() {
+fn owned_input_timeout_expired_exchange_does_not_spawn_the_missing_program() {
     let mut command = crate::spawnfd::command("aterm-deliberately-missing-helper.exe");
+    command.arg("owned-timeout-inert-argument");
     let error = output_with_input_until(
         &mut command,
-        Secret::new(b"inert input"),
+        Secret::new(b"private-owned-input-payload"),
         Instant::now(),
         1024,
     )
     .expect_err("deadline before spawn");
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let observed = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<OwnedInputTimeout>()
+        .unwrap();
+    assert!(!observed.spawned && !observed.natural_exit_observed);
+    assert_eq!(observed.stdin, super::super::OwnedInputState::NotStarted);
+    assert!(!observed.stdout_eof && !observed.stderr_eof);
+    assert_eq!(
+        (
+            observed.stdin_bytes_sent,
+            observed.stdout_bytes_observed,
+            observed.stderr_bytes_observed
+        ),
+        (0, 0, 0)
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("aterm-deliberately-missing-helper.exe")
+    );
+    assert!(!error.to_string().contains("owned-timeout-inert-argument"));
+    assert!(!error.to_string().contains("private-owned-input-payload"));
 }
 
 #[test]

@@ -36,11 +36,20 @@ fn fixture_flushes_keep_their_order_and_errors_without_hardware_drains() {
 /// The exact first-exec line B1's frozen release-tool proof expects.
 pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
 
+/// The context of the commit statuses the follower (`verify watch`) posts on main's tips: the
+/// one verdict of main it keeps, which the release reads.
+pub const FOLLOWER_CONTEXT: &str = "aterm/follower";
+
 #[cfg(all(test, unix, debug_assertions))]
 mod benchmark_fixture_tests;
 
 mod admission_rows;
 pub mod appkit_content;
+pub mod artifact;
+/// The browser lane (`verify browser`): it starts and drives its browsers through unix-only
+/// descriptors and lane children (`std::os::fd`, `aterm_uds::spawnfd::LaneCommand`), so it builds
+/// on unix only, and the stage is COULD NOT RUN elsewhere.
+#[cfg(unix)]
 pub mod browser;
 pub mod cells;
 mod census_fix;
@@ -52,7 +61,6 @@ pub mod compile_width;
 mod compiler_message;
 mod compiler_observation;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
-#[cfg(unix)]
 pub mod disk;
 pub mod engine;
 pub mod event_log;
@@ -111,6 +119,7 @@ pub mod unitgraph;
 pub mod vendor_out;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
+/// The journal `refs/aterm/judged`, where `verify land` files its verdict and run records.
 #[cfg(unix)]
 pub mod judged;
 /// `verify land`: merge main, judge the cone since it, push, compose or re-judge (design B10).
@@ -134,7 +143,6 @@ pub mod land_seal;
 /// The verdict and run records a clone has still to append to the journal.
 #[cfg(unix)]
 pub mod land_spool;
-#[cfg(unix)]
 mod remote;
 pub mod remote_cli;
 pub mod remote_host;
@@ -859,7 +867,7 @@ fn writable_dir(_dir: &Path) -> Option<bool> {
     None
 }
 
-/// The release bundle `measure` judges (`--app <APP>`).
+/// The bundle `measure` judges under a checked assertion contract (`--app <APP>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasureArtifact {
     /// The bundle, canonical.
@@ -869,6 +877,40 @@ pub struct MeasureArtifact {
     /// The commit it was built from (`ATermGitCommit`: 12 hex digits, `-dirty` when that tree had
     /// changes), when its `Info.plist` names one.
     pub commit: Option<String>,
+    /// The requested assertion contract, proved by the executable rather than its path or plist.
+    pub profile: artifact::Profile,
+    executable: Option<Arc<artifact::Executable>>,
+}
+
+/// A proved private image for one owning measurement callback. Its paths never name the
+/// supplied bundle, which may change after admission.
+pub(crate) struct AdmittedArtifact<'a> {
+    source: &'a MeasureArtifact,
+    app: &'a Path,
+}
+
+impl AdmittedArtifact<'_> {
+    pub(crate) fn bin(&self, name: &str) -> PathBuf {
+        self.app.join("Contents/MacOS").join(name)
+    }
+
+    /// The admitted assertion contract used to select and judge measurement rows.
+    pub(crate) const fn profile(&self) -> artifact::Profile {
+        self.source.profile
+    }
+
+    pub(crate) fn built_from(&self, head: &str) -> bool {
+        self.source.built_from(head)
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{}; executing private image at {}; retained because no receipt proves every later \
+             descendant retired",
+            self.source.describe(),
+            self.app.display()
+        )
+    }
 }
 
 /// Maximum byte size for a single regular file read by `aterm-verify` (128 MiB).
@@ -1003,20 +1045,32 @@ impl MeasureArtifact {
     /// # Errors
     /// What `app` is instead, in words.
     pub fn at(app: &Path) -> Result<Self, String> {
+        Self::for_profile(app, artifact::Profile::Release)
+    }
+
+    /// Admit a bundle under an explicit assertion contract, without executing it.
+    /// # Errors
+    /// The bundle is missing, its executable is unreadable or lacks valid immutable facts,
+    /// or those facts contradict the requested profile or executable architecture.
+    pub fn for_profile(app: &Path, profile: artifact::Profile) -> Result<Self, String> {
         let app = std::fs::canonicalize(app)
-            .map_err(|e| format!("{} is not a release bundle: {e}", app.display()))?;
+            .map_err(|e| format!("{} is not a bundle: {e}", app.display()))?;
         if !is_executable_file(&app.join("Contents/MacOS/aterm")) {
             return Err(format!(
-                "{} is not a release bundle: it holds no executable Contents/MacOS/aterm",
+                "{} is not a bundle: it holds no executable Contents/MacOS/aterm",
                 app.display()
             ));
         }
         let plist = read_regular_text(app.join("Contents/Info.plist")).unwrap_or_default();
         let read = |key| plist_string(&plist, key).map(str::to_string);
+        let executable = artifact::Executable::open(&app.join("Contents/MacOS/aterm"), profile)
+            .map_err(|why| format!("{}: {why}", app.display()))?;
         Ok(Self {
             version: read("CFBundleShortVersionString"),
             commit: read("ATermGitCommit"),
             app,
+            profile,
+            executable: Some(Arc::new(executable)),
         })
     }
 
@@ -1028,6 +1082,8 @@ impl MeasureArtifact {
             app: app.into(),
             version: None,
             commit: None,
+            profile: artifact::Profile::Release,
+            executable: None,
         }
     }
 
@@ -1035,6 +1091,48 @@ impl MeasureArtifact {
     #[must_use]
     pub fn bin(&self, name: &str) -> PathBuf {
         self.app.join("Contents/MacOS").join(name)
+    }
+
+    /// Check profile, trusted VM observation and exact executable custody before a measurement
+    /// can spawn a process. A test's platform probe is inert unless explicitly injected.
+    pub(crate) fn admit(&self, ctx: &Ctx) -> Result<(), String> {
+        let executable = self
+            .executable
+            .as_ref()
+            .ok_or("bundle has no admitted immutable compile facts")?;
+        if self.profile != executable.profile() {
+            return Err("bundle assertion contract changed after admission".into());
+        }
+        if self.profile == artifact::Profile::Debug && (ctx.release || ctx.checkers_in_tests) {
+            return Err("debug bundle validation cannot qualify a release".into());
+        }
+        if self.profile == artifact::Profile::Release && (ctx.virtual_machine)() != Some(true) {
+            return Err("release bundle measurement uses a fresh HOME and requires a virtual machine; use an explicitly admitted debug bundle for native validation".into());
+        }
+        executable.validate(&self.bin("aterm"))?;
+        for alias in ["aterm-gui", "aterm-ctl"] {
+            executable.matches_alias(&self.bin(alias))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_admission<T>(
+        &self,
+        ctx: &Ctx,
+        start: impl FnOnce(&AdmittedArtifact<'_>) -> T,
+    ) -> Result<T, String> {
+        self.admit(ctx)?;
+        let executable = self
+            .executable
+            .as_ref()
+            .ok_or("bundle has no admitted immutable compile facts")?;
+        let mut snapshot = artifact::Snapshot::prepare(&self.app, executable)?;
+        snapshot.prove(ctx)?;
+        let admitted = AdmittedArtifact {
+            source: self,
+            app: snapshot.app(),
+        };
+        Ok(start(&admitted))
     }
 
     /// Whether `head` (a full commit id) built it: its commit, less `-dirty`, begins `head`.
@@ -1057,7 +1155,11 @@ impl MeasureArtifact {
         if let Some(c) = &self.commit {
             name.push_str(&format!(" ({c})"));
         }
-        format!("{name} at {}", self.app.display())
+        let facts = self.executable.as_ref().map_or_else(
+            || "unadmitted compile facts".into(),
+            |executable| executable.describe(),
+        );
+        format!("{name} at {} [{facts}]", self.app.display())
     }
 }
 
@@ -1126,6 +1228,9 @@ pub struct Ctx {
     pub no_windows: bool,
     /// Fresh console-lock reading for native-window stages. Inert in constructed test contexts.
     pub screen_locked: fn() -> bool,
+    /// Trusted platform observation for native release/scratch-world admission. Tests read no
+    /// live platform fact unless they explicitly inject one.
+    pub(crate) virtual_machine: fn() -> Option<bool>,
     /// A focused GUI pacing measurement, never release qualification.
     pub cursor_pacing: bool,
     /// Run only the test compilation stage, never a release qualification.
@@ -1154,8 +1259,6 @@ pub struct Ctx {
     /// then run and report their live load without claiming measurement qualification. `None` is the caller's explicit
     /// untimed/outer-owned contract; it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
-    /// A repeatable watch sample whose stage admissions rank behind overlapping Ordinary work.
-    pub background: bool,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
     /// Where the run keeps what each stage's memory peaked at, and the machine it claims on
@@ -1382,6 +1485,16 @@ impl Ctx {
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
             screen_locked: || false,
+            virtual_machine: {
+                #[cfg(test)]
+                {
+                    || None
+                }
+                #[cfg(not(test))]
+                {
+                    aterm_sysprobe::hv_vmm_present
+                }
+            },
             cursor_pacing: false,
             compile_only: false,
             checkers_in_tests: false,
@@ -1391,7 +1504,6 @@ impl Ctx {
             test_seed: None,
             test_recorder: std::env::current_exe().ok(),
             quiet: None,
-            background: false,
             runs: None,
             memory: None,
             test_history: None,
@@ -1838,6 +1950,9 @@ impl Ctx {
             && let Some(a) = &self.measure_artifact
         {
             cmd.push_str(&format!(" --app {}", a.app.display()));
+            if a.profile == artifact::Profile::Debug {
+                cmd.push_str(" --app-profile debug");
+            }
         }
         if check == Check::Cells {
             for cell in &self.cells {
@@ -1975,19 +2090,6 @@ fn admit_in(
         },
         &stopping,
     )
-}
-
-/// A whole-tree Background candidate's disk is Background too. It may finish its current stage;
-/// Ordinary work retains priority for overlapping resources, and a Release may end it immediately.
-const fn run_admit_mode(
-    background: bool,
-    requested: aterm_capacity::Admit,
-) -> aterm_capacity::Admit {
-    if background {
-        aterm_capacity::Admit::Preemptible
-    } else {
-        requested
-    }
 }
 
 thread_local! {
@@ -2411,7 +2513,11 @@ pub fn time_line(begun: Duration, ran: Duration, machine: &str) -> String {
 /// runs, not a named skip before it starts anything ([`plan::named_skip`]: a windowed stage under
 /// `--no-windows`, a measuring one with no `--app`).
 fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
+    #[cfg(unix)]
     let desk = id == plan::StageId::BrowserLane && browser::takes_the_desk(ctx);
+    // Off unix the browser lane opens no session (it is COULD NOT RUN), so none takes the desk.
+    #[cfg(not(unix))]
+    let desk = false;
     (id.timed() || desk) && !plan::named_skip(ctx, id)
 }
 
@@ -2757,9 +2863,7 @@ impl EarlyClaims {
                 // is that measured peak, or the machine's memory alone where none is kept
                 // (`compile_width::lint_claim`).
                 let early = stage.clone();
-                before_stage_claim(ctx)
-                    .and_then(|()| claim_memory(ctx, &early, admit))
-                    .map(|claim| (stage.id, claim))
+                claim_memory(ctx, &early, admit).map(|claim| (stage.id, claim))
             })
             .transpose()?;
         Ok(EarlyClaims {
@@ -2779,16 +2883,6 @@ impl EarlyClaims {
             None
         }
     }
-}
-
-/// The CPU width a repeatable tree stage asks for. A caller's smaller explicit build ceiling is
-/// retained; otherwise the host's parallelism is the upper bound. Capacity may grant less.
-fn background_cores(ctx: &Ctx) -> Option<u32> {
-    ctx.background.then(|| {
-        ctx.build_jobs_ceiling()
-            .unwrap_or_else(|| ctx.parallelism())
-            .max(1)
-    })
 }
 
 /// How `claim`, admitted as `mode` says, came to be admitted, for its stage's time line: by
@@ -2860,21 +2954,8 @@ fn claim_memory(
     let Some(book) = ctx.memory.as_ref() else {
         return Ok(None);
     };
-    let cores = background_cores(ctx).unwrap_or(0);
     if spec.mem == 0 {
-        if cores == 0 || memory::dispatched(spec.id) {
-            return Ok(None);
-        }
-        return claim_bytes(
-            ctx,
-            &spec.title,
-            0,
-            "its CPU share",
-            book.budget(),
-            cores,
-            admit,
-        )
-        .map(|claim| Some(claim.sized_by(admission_rows::Basis::word("none"))));
+        return Ok(None);
     }
     let (need, keyed_jobs) = book.need_keyed(
         spec,
@@ -2887,16 +2968,8 @@ fn claim_memory(
         None => aterm_capacity::size(spec.mem),
     };
     let basis = admission_rows::basis(spec, &need, keyed_jobs);
-    claim_bytes(
-        ctx,
-        &spec.title,
-        spec.mem,
-        &why,
-        book.budget(),
-        cores,
-        admit,
-    )
-    .map(|claim| Some(claim.sized_by(basis)))
+    claim_bytes(ctx, &spec.title, spec.mem, &why, book.budget(), 0, admit)
+        .map(|claim| Some(claim.sized_by(basis)))
 }
 
 /// Claim `bytes` for a test run's binaries (`what` says which: the most its plan's hold at once,
@@ -2935,11 +3008,7 @@ fn claim_bytes(
     if let Some(why) = ended(ctx) {
         return Err(why);
     }
-    let mode = if ctx.background {
-        aterm_capacity::Admit::Preemptible
-    } else {
-        ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait)
-    };
+    let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
     let ask = |alone: bool| {
         let need = aterm_capacity::Need::new(format!("verify {title}"))
             .mem(bytes)
@@ -3006,15 +3075,6 @@ fn claim_bytes(
     }
 }
 
-fn before_stage_claim(ctx: &Ctx) -> Result<(), String> {
-    #[cfg(unix)]
-    if ctx.background && watch::running_should_stop(&ctx.root)? {
-        exec::group::stop_run();
-        return Err("a Release stopped the background sample".into());
-    }
-    Ok(())
-}
-
 /// One stage, run by its callback once its memory is claimed ([`claim_memory`]), on the run's
 /// quiet machine when it is timed ([`quietly`]), with the machine read as it starts and as it
 /// ends and its memory metered ([`memory::Meter`]): the report, when it started (after any
@@ -3055,7 +3115,6 @@ fn staged(
         }
     });
     let run = || {
-        before_stage_claim(ctx)?;
         let claim = match early.take(spec.id) {
             Some(claim) => claim,
             None => claim_memory(ctx, spec, seams.admit_memory)?,
@@ -3358,8 +3417,7 @@ fn run_seamed(
         // A failed admission defers resolution to the ordinary cells stage; it cannot invent
         // a missing-tool result or prevent the other checks from running.
         observed = false;
-        if before_stage_claim(ctx).is_ok()
-            && let Ok(claim) = claim_memory(ctx, spec, seams.admit_memory)
+        if let Ok(claim) = claim_memory(ctx, spec, seams.admit_memory)
             && ended(ctx).is_none()
         {
             let _reservation =
@@ -3396,16 +3454,16 @@ fn run_seamed(
         }
     }
     let preparation = Mutex::new(preparation);
-    let owners: Vec<Option<Check>> = stages
+    let owners: Vec<Vec<Check>> = stages
         .iter()
-        .map(|s| checks::owner(s.id, &ctx.checks))
+        .map(|s| checks::owners(s.id, &ctx.checks, ctx.checkers_in_tests))
         .collect();
     let progress: Vec<Mutex<Progress>> = ctx
         .checks
         .iter()
         .map(|c| {
             Mutex::new(Progress {
-                left: owners.iter().filter(|o| **o == Some(*c)).count(),
+                left: owners.iter().filter(|o| o.contains(c)).count(),
                 started: None,
                 ended: None,
                 reports: vec![None; stages.len()],
@@ -3430,7 +3488,10 @@ fn run_seamed(
                 .iter()
                 .position(|s| std::ptr::eq(s, spec))
                 .unwrap_or_default();
-            let owner = owners[i].and_then(|c| ctx.checks.iter().position(|k| *k == c));
+            let owner_indices: Vec<usize> = owners[i]
+                .iter()
+                .filter_map(|c| ctx.checks.iter().position(|k| k == c))
+                .collect();
             let held = held_note(&stages, i, held, budget);
             let (report, begun_at, machine, cpu) =
                 staged(ctx, &quiet, spec, held, seams, &early, || {
@@ -3457,22 +3518,28 @@ fn run_seamed(
             // The ordered log and aggregate check result can wait for other stages;
             // the completed stage's decisions must already be visible to the caller.
             let event = ctx.record_event(&report::stage_event(
-                i, owners[i], &report, waiting, execution, cpu,
+                i,
+                owners[i].first().copied(),
+                &report,
+                waiting,
+                execution,
+                cpu,
             ));
             if let Ok(mut o) = out.lock() {
                 let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
             }
-            if let Some(k) = owner
-                && let Ok(mut p) = progress[k].lock()
-            {
-                p.started = Some(p.started.map_or(begun_at, |s| s.min(begun_at)));
+            for k in &owner_indices {
+                if let Ok(mut p) = progress[*k].lock() {
+                    p.started = Some(p.started.map_or(begun_at, |s| s.min(begun_at)));
+                }
             }
             if let Ok(mut c) = clocks.lock() {
                 c[i] = Some((waiting, execution, machine));
             }
-            if let Some(k) = owner
-                && let Ok(mut p) = progress[k].lock()
-            {
+            for k in owner_indices {
+                let Ok(mut p) = progress[k].lock() else {
+                    continue;
+                };
                 p.reports[i] = Some(report.clone());
                 p.ended = Some(Instant::now());
                 p.left = p.left.saturating_sub(1);
@@ -3516,8 +3583,8 @@ fn run_seamed(
                 }
             }
             // After its own event and line, so a reader meets the red before what it stopped.
-            if let Some(check) = owners[i] {
-                red_now(ctx, check, &report);
+            for check in &owners[i] {
+                red_now(ctx, *check, &report);
             }
             report
         },
@@ -3931,12 +3998,7 @@ fn with_parsed(ctx: Ctx, parsed: &cli::Args) -> Ctx {
         .with_test_threads(parsed.test_threads)
         .with_test_cores(parsed.test_cores)
         .with_carry_context(parsed.carry_context.clone())
-        .with_quiet(Some(if parsed.background {
-            aterm_capacity::Admit::Preemptible
-        } else {
-            parsed.admit
-        }));
-    ctx.background = parsed.background;
+        .with_quiet(Some(parsed.admit));
     ctx.test_seed = parsed.test_seed;
     ctx
 }
@@ -3958,6 +4020,20 @@ fn plan_land(
     ctx.land = Some(land_seal::Run::new(plan, machine));
 }
 
+/// The verbs [`run_cli`] dispatches to a module that builds on unix only: `land` (its
+/// interrupts, judgment child and handoff are unix process machinery), `watch` (its judging
+/// process group and the `judged` journal it writes are unix's), `provision` (it provisions
+/// macOS and Linux hosts) and the browser lane's (`browser-site`, `browser-drive`: it drives its
+/// browsers through unix descriptors and lane children). Off unix each is COULD NOT RUN by name.
+#[cfg(not(unix))]
+const UNIX_ONLY_VERBS: [&str; 5] = [
+    "land",
+    "watch",
+    "provision",
+    "browser-site",
+    "browser-drive",
+];
+
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
@@ -3975,10 +4051,21 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if args.first().is_some_and(|a| a == "land") {
         return land::run(&args[1..], cwd);
     }
+    // The verbs whose modules build on unix only ([`UNIX_ONLY_VERBS`]) are refused by name off
+    // unix, never parsed as an unknown check.
+    #[cfg(not(unix))]
+    if let Some(verb) = args
+        .first()
+        .filter(|a| UNIX_ONLY_VERBS.contains(&a.as_str()))
+    {
+        eprintln!("verify {verb}: COULD NOT RUN — it runs on macOS and Linux hosts only");
+        return exit::COULD_NOT_RUN;
+    }
     // `perf`, `soak`, `glue`, `vendor-out`, `provision` and the browser lane's verbs
     // (`browser-site`, `browser-drive`) parse their own arguments, and none
     // needs targo to start: a host without Trust drives the browser lane, and
-    // `provision` names what provides targo where a row needs it.
+    // `provision` names what provides targo where a row needs it (both on unix, where alone
+    // they build).
     if args.first().is_some_and(|a| a == "perf") {
         return perf::run(&args[1..]);
     }
@@ -3994,11 +4081,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "provision") {
         return provision::main(&args[1..], cwd);
-    }
-    #[cfg(not(unix))]
-    if args.first().is_some_and(|a| a == "provision") {
-        eprintln!("verify provision: COULD NOT RUN — it provisions macOS and Linux hosts only");
-        return exit::COULD_NOT_RUN;
     }
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "browser-site") {
@@ -4036,7 +4118,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let measure_artifact = match parsed
         .app
         .as_deref()
-        .map(|app| MeasureArtifact::at(&cwd.join(app)))
+        .map(|app| MeasureArtifact::for_profile(&cwd.join(app), parsed.app_profile))
         .transpose()
     {
         Ok(a) => a,
@@ -4237,11 +4319,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
     // A heavy run takes the judgment turn before it claims its disk, so a run that waits for the
     // turn holds nothing another run could use (`docs/DESIGN-landing-economy.md` §2.3).
-    let turn = match turn::take(
-        &mut ctx,
-        parsed.queued_since,
-        run_admit_mode(parsed.background, parsed.admit),
-    ) {
+    let turn = match turn::take(&mut ctx, parsed.queued_since, parsed.admit) {
         Ok(turn) => turn,
         Err(why) => {
             if let Some(record) = &ctx.runs {
@@ -4255,7 +4333,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     #[cfg(unix)]
-    let disk = match disk::admit(&ctx, run_admit_mode(parsed.background, parsed.admit)) {
+    let disk = match disk::admit(&ctx, parsed.admit) {
         Ok(held) => held,
         Err(why) => {
             if let Some(record) = &ctx.runs {
@@ -4333,11 +4411,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     }
     end_run(&ctx, &scratch);
-    if parsed.background && stopping() && code != exit::FAILED {
-        75
-    } else {
-        code
-    }
+    code
 }
 
 /// Admit paired diagnostics before stages begin, binding only captured context facts.
@@ -4400,7 +4474,8 @@ fn open_run_log(ctx: &mut Ctx, chosen: Option<&Path>, cwd: &Path) -> Option<run_
 /// first proven red ended the run ([`stopping`]), which stopped short of its work and so wrote
 /// less than a run of its scope writes (`atpkg::admit_disk::Admitted::abandon`). The line says
 /// which records took it ([`kept_line`]). A run the work it is part of covered
-/// ([`disk::Disk::Covered`]) walked and keeps nothing, and its line says whose claim covered it.
+/// ([`disk::Disk::Covered`]) walked nothing and keeps no record of what it wrote, and its line
+/// says whose claim covered it.
 /// Then, whatever the run's disk, it says on stderr how it was held and how many walks of its
 /// directories it made ([`disk::event`]).
 #[cfg(unix)]
@@ -4627,3 +4702,7 @@ mod memory_claim_tests;
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "checker_sharing_tests.rs"]
+mod checker_sharing_tests;

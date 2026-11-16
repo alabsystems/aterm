@@ -205,6 +205,22 @@ impl RunError {
             | CompleteOutputError::StdoutIncomplete) => Self::AfterStart(error.to_string()),
         }
     }
+
+    fn from_progress_collector(error: aterm_uds::deadline::ProgressError) -> Self {
+        match error {
+            aterm_uds::deadline::ProgressError::Run(error) => Self::from_collector(error),
+            aterm_uds::deadline::ProgressError::Stalled { .. } => Self::TimedOut,
+        }
+    }
+
+    fn from_complete_progress_collector(error: aterm_uds::deadline::CompleteProgressError) -> Self {
+        match error {
+            aterm_uds::deadline::CompleteProgressError::Complete(error) => {
+                Self::from_complete_collector(error)
+            }
+            aterm_uds::deadline::CompleteProgressError::Stalled { .. } => Self::TimedOut,
+        }
+    }
 }
 
 /// Every external program a pack runs.
@@ -359,10 +375,12 @@ impl Tools for HostTools {
                 )
                 .map_err(RunError::from_collector)?
             }
-            (Some(limit), None) => {
-                aterm_uds::deadline::output_until(&mut cmd, host_deadline(limit))
-                    .map_err(RunError::from_collector)?
-            }
+            (Some(limit), None) => aterm_uds::deadline::output_while_process_progressing(
+                &mut cmd,
+                limit,
+                format!("package tool {}", run.program.display()),
+            )
+            .map_err(RunError::from_progress_collector)?,
             (None, _) => {
                 // Match Command::output's stdio and collection, keeping the owned-child
                 // boundary visible: a capture or wait failure cannot mean no dispatch.
@@ -396,14 +414,18 @@ impl Tools for HostTools {
                     limit,
                     &mut || clock.over(),
                 )
+                .map_err(RunError::from_complete_collector)
             }
-            None => aterm_uds::deadline::output_until_complete_stdout_with_limit(
-                &mut cmd,
-                host_deadline(within),
-                limit,
-            ),
-        }
-        .map_err(RunError::from_complete_collector)?;
+            None => {
+                aterm_uds::deadline::output_while_process_progressing_complete_stdout_with_limit(
+                    &mut cmd,
+                    within,
+                    format!("package metadata {}", run.program.display()),
+                    limit,
+                )
+                .map_err(RunError::from_complete_progress_collector)
+            }
+        }?;
         Ok(Ran {
             code: out.status.code(),
             stdout: out.stdout,

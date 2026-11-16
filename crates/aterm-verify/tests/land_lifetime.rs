@@ -634,7 +634,7 @@ mod handoff {
             composes: 0,
             cone: "2".repeat(40),
             branch: None,
-            stated: aterm_types::land_trailer::Stated::default(),
+            stated: aterm_land_trailer::Stated::default(),
             run: Some(aterm_verify::land::handoff::Carried {
                 id: "a".repeat(32),
                 started: 1,

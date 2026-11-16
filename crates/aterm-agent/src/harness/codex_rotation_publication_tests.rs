@@ -32,6 +32,7 @@ fn publication_fixture(prior: bool, commit: bool) -> (World, Env, Receipt) {
             thread: "00000000-0000-0000-0000-000000000001".into(),
             wall: "00000000-0000-0000-0000-000000000002".into(),
             identity: proposal.source_identity.clone(),
+            limit: None,
         },
         sid: "s-one".into(),
         old_pid: 10,
@@ -360,4 +361,92 @@ fn exec_publication_public_entry_preserves_retry_and_refuses_terminal_inputs() {
     );
     assert_eq!(receipt, published);
     assert_eq!(renewal::read_receipt(&env, &receipt.id), Some(published));
+}
+
+/// ONLY AN EXEC HANDOFF'S PREPARED WRITER TRIES EACH LOCK ONCE: an exec handoff's `arm` and
+/// `reserve` ask `with_prepared_writer_now` while they hold their session's own locks, which the
+/// window's thread takes too, and their session asks again shortly. With the machine's sign-in
+/// turn taken it answers `signin-busy`, and with `accounts.lock` taken `Ok(None)`, at its first
+/// try: on a store whose ladder goes on trying for two minutes, each answer still comes back
+/// inside the one-minute hang detector. `with_prepared_writer`, which a TUI session's quota
+/// handoff publishes and commits through and its lost-login move publishes through, waits on the
+/// store's ladder as it always did: on that same ladder, while another holds the turn or the lock
+/// it answers nothing, and once that one lets go the TUI's publication of its receipt goes
+/// through. CONTROL: with neither taken the exec handoff's writer judges the selection and runs
+/// its callback.
+#[test]
+fn only_an_exec_handoffs_prepared_writer_tries_each_lock_once() {
+    /// A pause of 20 ms, for two minutes: a ladder that outlasts the hang detector.
+    const LADDER: &[Duration] = &[Duration::from_millis(20); 6000];
+    /// What the TUI's publication answered, and the receipt then stored under its id.
+    type Published = (Result<Option<Receipt>, &'static str>, Option<Receipt>);
+    let (world, env, receipt) = publication_fixture(false, false);
+    let exec = || {
+        let (env, receipt) = (env.clone(), receipt.clone());
+        let (sent, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let judged = accounts::with_store_ladder(LADDER, || {
+                codex_rotation::with_prepared_writer_now(&env, &receipt, |_, _| Ok(()))
+            });
+            let _ = sent.send(judged);
+        });
+        answer
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the exec handoff's writer waited for a lock it found taken")
+    };
+    // The TUI quota control's `publish`: a new receipt of the selection under its own index.
+    let tui = |id: &str| -> std::sync::mpsc::Receiver<Published> {
+        let mut receipt = receipt.clone();
+        receipt.id = id.repeat(32);
+        let index = renewal::IndexKey::moved(&receipt.intent, receipt.old_pid, 1, id).unwrap();
+        let env = env.clone();
+        let (sent, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let published = accounts::with_store_ladder(LADDER, || {
+                codex_rotation::with_prepared_writer(&env, &receipt, |_, writer| {
+                    let prior = writer.read_indexed(&index)?;
+                    if prior.as_ref().is_some_and(|old| !old.may_replace()) {
+                        return Err("existing-receipt");
+                    }
+                    writer.publish_indexed(&index, prior.as_ref(), &receipt)?;
+                    Ok(receipt.clone())
+                })
+            });
+            let _ = sent.send((published, renewal::read_receipt(&env, &receipt.id)));
+        });
+        answer
+    };
+    let held = |answer: &std::sync::mpsc::Receiver<Published>, why: &str| {
+        assert!(
+            matches!(
+                answer.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "{why}: the TUI's writer answered while it was held"
+        );
+    };
+    let published = |answer: std::sync::mpsc::Receiver<Published>, why: &str| {
+        let (published, stored) = answer
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the TUI's writer took it once it was let go");
+        let published = published.expect(why).expect(why);
+        assert_eq!(stored.as_ref(), Some(&published), "{why}");
+    };
+    let store = world.seat().store(Cli::Codex);
+
+    let signin = store.signin_within().unwrap().unwrap();
+    assert_eq!(exec(), Err("signin-busy"));
+    let waiting = tui("b");
+    held(&waiting, "sign-in turn");
+    drop(signin);
+    published(waiting, "sign-in turn");
+
+    let lock = store.acquire_bounded().unwrap().unwrap();
+    assert_eq!(exec(), Ok(None));
+    let waiting = tui("c");
+    held(&waiting, "accounts.lock");
+    drop(lock);
+    published(waiting, "accounts.lock");
+
+    assert_eq!(exec(), Ok(Some(())), "CONTROL");
 }

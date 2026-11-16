@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn a_delayed_key_after_paste_releases_its_echo_at_the_half_refresh_floor() {
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+    let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
     let t0 = Instant::now();
     let full = Duration::from_millis(16);
     ws.input_hot = true;

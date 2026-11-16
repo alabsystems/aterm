@@ -295,8 +295,10 @@ fn the_undo_points_take_the_panel_back() {
         assert_eq!(ws.input_scratch.ink.len(), ink, "never doubled");
         assert_eq!(ws.input_scratch.glow_halo.len(), halos);
     }
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+    let ws = &mut **field_guard_ws;
     crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+    drop(field_guard_ws);
     assert_eq!(painted_ink(&app, wid), 0, "the ink taken back");
     let ws = &app.windows[&wid];
     let ours = light(&app, wid);
@@ -823,7 +825,7 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -914,7 +916,7 @@ fn a_second_stuck_row_breathes_a_new_course() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1206,7 +1208,7 @@ fn the_bar_crests_while_an_agent_runs_and_only_its_fill_moves() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1325,7 +1327,7 @@ fn wakes(
 fn crest_and_breath(t0: Instant) -> (App, WindowId, Instant) {
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1379,7 +1381,7 @@ fn a_present_in_the_slack_draws_the_breaths_step() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1439,7 +1441,7 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1486,7 +1488,7 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     host.shutdown_and_join();
     let (mut app, wid, _) = glass(t0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
@@ -1511,7 +1513,7 @@ fn reduced_motion_and_serious_mode_ask_no_step() {
     ] {
         let (mut app, wid, session) = glass(t0);
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.window_on_screen_for_test = true;
             ws.focused = true;
         }

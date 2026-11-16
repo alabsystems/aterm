@@ -198,10 +198,11 @@ fn scan(
         splits += usize::from(t.sync_frame_unfinished());
         let rows = screen(&t);
         let zone = reader.busy_zone_start(&rows).min(rows.len());
-        // The program's title read with the rows, as the harness reads them: under a status
-        // line Claude Code draws its reply with no busy row, and its title's run glyph is the
-        // turn's one sign.
-        let runs = reader.runs(Some(t.title()));
+        // The program's run signs read with the rows, as the harness reads them: under a status
+        // line Claude Code draws its reply with no busy row, and its program-status report (where
+        // its query was answered) or else its title's run glyph is the turn's one sign.
+        let report = t.program_state().run_sign();
+        let runs = reader.runs(Some(t.title()), report.as_deref());
         let reading = reader.read_titled(&rows, None, runs);
         states.push(State {
             at: e.at,

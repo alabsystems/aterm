@@ -763,7 +763,7 @@ fn a_footprint_no_memory_holds_turns_the_lane_off_for_good() {
     let reads = |s: &mut Sample, footprint: u64| {
         s.mem = Some(MemSample {
             total: 16 * GIB,
-            swap_total: 4 * GIB,
+            swap_total: Some(4 * GIB),
             ..MemSample::default()
         });
         s.coalitions.as_mut().expect("a split tick").rows[0].footprint = Some(footprint);

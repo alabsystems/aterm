@@ -230,7 +230,7 @@ fn wide_glyphs_take_two_cells_and_find_counts_columns() {
 fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
     let clean = clean_frame();
     for col in 0..3 {
-        let cell = J::Obj(measure_cell(&clean, Some(&clean), &GRID, 1, col, 1));
+        let cell = J::Obj(measure_cell(&clean, Some(&clean), &GRID, (1, col, 1), None));
         assert_eq!(cell.get("method").and_then(J::as_str), Some("mask"));
         assert_eq!(field(&cell, "contrast"), field(&cell, "clean_contrast"));
         assert_eq!(field(&cell, "contrast"), round_to(contrast(INK, PAGE), 2));
@@ -240,7 +240,7 @@ fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
         assert_eq!(cell.get("local_under").and_then(J::as_i64), Some(0));
         assert_eq!(cell.get("local_px").and_then(J::as_i64), Some(12));
     }
-    let blank = J::Obj(measure_cell(&clean, Some(&clean), &GRID, 0, 5, 1));
+    let blank = J::Obj(measure_cell(&clean, Some(&clean), &GRID, (0, 5, 1), None));
     assert_eq!(blank.get("blank"), Some(&J::Bool(true)));
     let diff = diff_vs_clean(&clean, &clean, None);
     assert_eq!(diff.get("px").and_then(J::as_i64), Some(0));
@@ -252,8 +252,8 @@ fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
 #[test]
 fn a_ribbon_under_a_glyph_counts_against_it_and_nothing_else() {
     let (clean, frame) = (clean_frame(), trail_frame());
-    let a = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 0, 1));
-    let c = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 2, 1));
+    let a = J::Obj(measure_cell(&frame, Some(&clean), &GRID, (1, 0, 1), None));
+    let c = J::Obj(measure_cell(&frame, Some(&clean), &GRID, (1, 2, 1), None));
     assert_eq!(field(&a, "contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&a, "local_contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&c, "clean_contrast"), field(&a, "clean_contrast"));
@@ -291,14 +291,14 @@ fn a_glyph_on_a_bed_of_its_own_colour_is_unreadable() {
             }
         }
     }
-    let cell = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 1, 1));
+    let cell = J::Obj(measure_cell(&frame, Some(&clean), &GRID, (1, 1, 1), None));
     assert_eq!(
         cell.get("ground").and_then(J::as_str),
         Some(hex(RIBBON).as_str())
     );
     assert_eq!(field(&cell, "contrast"), round_to(contrast(INK, RIBBON), 2));
     assert!(field(&cell, "contrast") < 1.5);
-    let coarse = J::Obj(measure_cell(&clean, None, &GRID, 1, 1, 1));
+    let coarse = J::Obj(measure_cell(&clean, None, &GRID, (1, 1, 1), None));
     assert_eq!(coarse.get("method").and_then(J::as_str), Some("extreme"));
     assert_eq!(
         coarse.get("ground").and_then(J::as_str),
@@ -324,7 +324,7 @@ fn a_body_over_part_of_a_glyph_is_judged_by_the_ground_next_to_its_ink() {
                 }
             }
         }
-        J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 1, 1))
+        J::Obj(measure_cell(&frame, Some(&clean), &GRID, (1, 1, 1), None))
     };
     // On the glyph's top row and above it.
     let over = lay(b.y0..b.y0 + 3);
@@ -386,7 +386,7 @@ fn a_light_away_from_the_strokes_leaves_the_letter_its_reading() {
         },
         RIBBON,
     );
-    let cell = J::Obj(measure_cell(&frame, Some(&clean), &grid, 0, 0, 1));
+    let cell = J::Obj(measure_cell(&frame, Some(&clean), &grid, (0, 0, 1), None));
     let local = field(&cell, "local_contrast");
     assert_eq!(local, round_to(contrast(INK, PAGE), 2));
     assert_eq!(
@@ -836,8 +836,18 @@ fn a_thin_caret_s_span_is_its_own_ink_and_not_the_light_beside_it() {
         "the bar reads against the light laid beside it"
     );
 
-    let by_strength =
-        thin_caret_reading(&f, None, &GRID, (row, col), PAPER, CaretShape::Bar, false);
+    let by_strength = thin_caret_reading(
+        &f,
+        None,
+        &GRID,
+        (row, col),
+        PAPER,
+        CaretShape::Bar,
+        Spans {
+            own_ink: false,
+            ..Spans::OWN
+        },
+    );
     assert_eq!(
         span(&by_strength),
         Some(vec![cell.x0, cell.x0 + 5]),
@@ -941,6 +951,395 @@ fn a_thin_caret_s_span_is_where_its_clean_twin_draws_it() {
         no_caret.get("span_from").and_then(J::as_str),
         Some("frame"),
         "a twin that draws no caret there leaves the span to the frame"
+    );
+}
+
+/// A THIN CARET'S LINE READS AGAINST THE LIGHT BESIDE IT (CT-51 B.1): a band's light laid in the
+/// column just left of a bar lies in the neighbour's cell, where the cell's median never sees it, and
+/// the bar is read against it pixel by pixel, as a letter's stroke is read against its ring. A
+/// green bar on a dark page beside a column of the band's olive reads that pair's ratio. Negative
+/// control: the same column four pixels off the bar, outside every ring of its line, leaves the bar
+/// its reading against the page.
+#[test]
+fn a_thin_caret_s_line_reads_against_the_light_beside_it() {
+    const BAR: Rgb = [0x50, 0xfa, 0x7b];
+    const BAND: Rgb = [0x8e, 0x84, 0x63];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let mut twin = Image::from_pixels(W, H, vec![PAGE; W * H]);
+    paint(
+        &mut twin,
+        PxBox {
+            x1: cell.x0 + 2,
+            ..cell
+        },
+        BAR,
+    );
+    let read = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
+    let beside = |dx: i64| {
+        let mut f = twin.clone();
+        paint(
+            &mut f,
+            PxBox {
+                x0: cell.x0 - dx,
+                x1: cell.x0 - dx + 1,
+                ..cell
+            },
+            BAND,
+        );
+        measure_caret(&f, Some(&twin), &GRID, (row, col), PAGE, CaretShape::Bar)
+    };
+    let hugged = beside(1);
+    assert_eq!(
+        read(&hugged, "ring_contrast"),
+        round_to(contrast(BAR, BAND), 2)
+    );
+    assert_eq!(
+        read(&hugged, "contrast"),
+        round_to(contrast(BAR, BAND), 2),
+        "the bar reads against the band beside it: {}",
+        hugged.py()
+    );
+    assert!(read(&hugged, "contrast") < LEGIBLE);
+    let off = beside(4);
+    assert!(
+        read(&off, "contrast") >= 13.0,
+        "negative control: a band off the line's ring leaves the bar its reading, {}",
+        off.py()
+    );
+    // With no twin the line has no ring to read: its reading is the cell's alone.
+    let mut f = twin.clone();
+    paint(
+        &mut f,
+        PxBox {
+            x0: cell.x0 - 1,
+            x1: cell.x0,
+            ..cell
+        },
+        BAND,
+    );
+    let unread = measure_caret(&f, None, &GRID, (row, col), PAGE, CaretShape::Bar);
+    assert!(unread.get("ring_contrast").is_none());
+}
+
+/// A THIN CARET'S RING READS ITS SOLID INK (CT-51 B.1): where a letter's descender greys part of
+/// the row above an underline in the clean twin, that row's median blends with the line's ink and
+/// joins the span, but its pixels are the page's and the descender's; the ring reads only the
+/// pixels the twin draws in the caret's solid ink, and the line reads as itself (coloured-prompt's
+/// `j` over Dracula's green underline). Negative control: read on every pixel of the span by its
+/// pixel rows, the page pixels of that row read against the page beside them, about 1:1 (read
+/// across, by columns, each column's line pixels outvote its one page pixel).
+#[test]
+fn a_thin_caret_s_ring_reads_only_its_solid_ink() {
+    const LINE: Rgb = [0x50, 0xfa, 0x7b];
+    const FAINT: Rgb = [0x1e, 0x20, 0x24];
+    const STEM: Rgb = [0x84, 0x89, 0x92];
+    let (row, col) = (1, 3);
+    let cell = GRID.cell_box(row, col, 1);
+    let mut twin = Image::from_pixels(W, H, vec![PAGE; W * H]);
+    paint(
+        &mut twin,
+        PxBox {
+            y0: cell.y1 - 3,
+            ..cell
+        },
+        LINE,
+    );
+    // The descender's row: two page pixels, three faint edges and its stem.
+    let edge = cell.y1 - 4;
+    for (dx, c) in [FAINT, FAINT, FAINT, STEM].into_iter().enumerate() {
+        let x = cell.x0 + 2 + i64::try_from(dx).unwrap();
+        paint(
+            &mut twin,
+            PxBox {
+                x0: x,
+                x1: x + 1,
+                y0: edge,
+                y1: edge + 1,
+            },
+            c,
+        );
+    }
+    assert!(contrast(FAINT, PAGE) >= CARET_DIFF && blends(FAINT, PAGE, LINE));
+    let read = |spans: Spans| {
+        thin_caret_reading(
+            &twin,
+            Some(&twin),
+            &GRID,
+            (row, col),
+            PAGE,
+            CaretShape::Underline,
+            spans,
+        )
+    };
+    let own = read(Spans::OWN);
+    let span = own
+        .get("span")
+        .and_then(J::as_arr)
+        .map(|s| s.iter().filter_map(J::as_i64).collect::<Vec<_>>());
+    assert_eq!(
+        span,
+        Some(vec![edge, cell.y1]),
+        "the descender's row joins the span by its median: {}",
+        own.py()
+    );
+    let ring = |c: &J| c.get("ring_contrast").and_then(J::as_f64).unwrap();
+    assert_eq!(
+        ring(&own),
+        round_to(contrast(LINE, PAGE), 2),
+        "the line reads against the page beside it: {}",
+        own.py()
+    );
+    let every = read(Spans {
+        solid_ring: false,
+        across: false,
+        ..Spans::OWN
+    });
+    assert!(
+        ring(&every) < 1.5,
+        "negative control: the row's page pixels read against the page, {}",
+        every.py()
+    );
+}
+
+/// A THIN CARET'S LINE IS READ ACROSS ITS LENGTH (CT-51 B.1): an underline whose right six of
+/// fourteen columns have a pink light hugging them above reads that pair's ratio, for each of those
+/// columns is a slice of the line a reader sees break; a bar's slices are its pixel rows. Negative
+/// control: read by pixel rows, as a letter's strokes are, each row of the line keeps its lower
+/// median, the page's, with six of its pixels at about 1.3:1.
+#[test]
+fn a_thin_caret_s_line_is_read_across_its_length() {
+    const LINE: Rgb = [0x50, 0xfa, 0x7b];
+    const PINK: Rgb = [0xff, 0xb0, 0xd0];
+    // A cell as wide as a film's, fourteen px.
+    const WIDE: Grid = Grid {
+        ox: 2,
+        oy: 1,
+        cw: 14,
+        ch: 10,
+        rows: 3,
+        cols: 3,
+        source: "args",
+    };
+    let (w, h) = (48, 32);
+    let (row, col) = (1, 1);
+    let cell = WIDE.cell_box(row, col, 1);
+    let mut twin = Image::from_pixels(w, h, vec![PAGE; w * h]);
+    let line = PxBox {
+        y0: cell.y1 - 3,
+        ..cell
+    };
+    paint(&mut twin, line, LINE);
+    let mut frame = twin.clone();
+    // The light hugging the line's right six columns, above it and below, on into the next cell.
+    for y in [line.y0 - 1, line.y1] {
+        paint(
+            &mut frame,
+            PxBox {
+                x0: cell.x1 - 6,
+                x1: cell.x1 + 2,
+                y0: y,
+                y1: y + 1,
+            },
+            PINK,
+        );
+    }
+    let read = |spans: Spans| {
+        thin_caret_reading(
+            &frame,
+            Some(&twin),
+            &WIDE,
+            (row, col),
+            PAGE,
+            CaretShape::Underline,
+            spans,
+        )
+    };
+    let ring = |c: &J, k: &str| c.get(k).and_then(J::as_f64).unwrap();
+    let across = read(Spans::OWN);
+    assert_eq!(
+        ring(&across, "contrast"),
+        round_to(contrast(LINE, PINK), 2),
+        "the columns under the light read against it: {}",
+        across.py()
+    );
+    let rows = read(Spans {
+        across: false,
+        ..Spans::OWN
+    });
+    assert!(
+        ring(&rows, "ring_min") < LEGIBLE,
+        "the light lowers pixels of the line read by rows too: {}",
+        rows.py()
+    );
+    assert!(
+        ring(&rows, "contrast") >= LEGIBLE,
+        "negative control: by pixel rows each row keeps its lower median, {}",
+        rows.py()
+    );
+}
+
+/// A THIN CARET'S TWIN SPAN IS ITS OWN INK (CT-51 B.2): where a letter's grey stem stands flush
+/// against GitHub Light's blue bar in the clean twin, the twin's span keeps only the lines that are
+/// the bar's ink or its edge, as the frame's span does, and the bar reads as itself. Negative
+/// control: by strength alone the span takes the stem in and reads a blend of the two no pixel has.
+#[test]
+fn a_thin_caret_s_twin_span_leaves_out_a_stem_beside_it() {
+    const PAPER: Rgb = [0xff, 0xff, 0xff];
+    const BAR: Rgb = [0x09, 0x69, 0xda];
+    const STEM: Rgb = [0x8f, 0x93, 0x9d];
+    let grid = Grid {
+        ox: 0,
+        oy: 0,
+        cw: 10,
+        ch: 12,
+        rows: 1,
+        cols: 3,
+        source: "args",
+    };
+    let (w, h) = (30, 12);
+    let (row, col) = (0, 1);
+    let cell = grid.cell_box(row, col, 1);
+    let columns = |x0: i64, x1: i64| PxBox {
+        x0: cell.x0 + x0,
+        x1: cell.x0 + x1,
+        ..cell
+    };
+    let mut twin = Image::from_pixels(w, h, vec![PAPER; w * h]);
+    paint(&mut twin, columns(0, 2), BAR);
+    paint(&mut twin, columns(2, 4), STEM);
+    assert!(contrast(STEM, PAPER) >= CARET_DIFF && !blends(STEM, PAPER, BAR));
+    let span = |c: &J| {
+        c.get("span")
+            .and_then(J::as_arr)
+            .map(|s| s.iter().filter_map(J::as_i64).collect::<Vec<_>>())
+    };
+    let own = thin_caret_reading(
+        &twin,
+        Some(&twin),
+        &grid,
+        (row, col),
+        PAPER,
+        CaretShape::Bar,
+        Spans::OWN,
+    );
+    assert_eq!(span(&own), Some(vec![cell.x0, cell.x0 + 2]));
+    assert_eq!(
+        own.get("colour").and_then(J::as_str),
+        Some(hex(BAR).as_str())
+    );
+    assert!(
+        own.get("contrast").and_then(J::as_f64).unwrap() >= 5.1,
+        "{}",
+        own.py()
+    );
+    let by_strength = thin_caret_reading(
+        &twin,
+        Some(&twin),
+        &grid,
+        (row, col),
+        PAPER,
+        CaretShape::Bar,
+        Spans {
+            own_ink: false,
+            ..Spans::OWN
+        },
+    );
+    assert_eq!(
+        span(&by_strength),
+        Some(vec![cell.x0, cell.x0 + 4]),
+        "negative control: by strength alone the stem joins the span"
+    );
+    assert!(
+        by_strength.get("contrast").and_then(J::as_f64).unwrap() < LEGIBLE,
+        "negative control: {}",
+        by_strength.py()
+    );
+}
+
+/// A LETTER UNDER A BAR IS JUDGED BY ITS OWN STROKES (CT-51 B.3): where the clean twin draws a bar
+/// over a lettered cell, the bar's pixels are left out of the letter before its extreme and its
+/// solid ink are chosen. On GitHub Light the bar (5.19:1) outreads fish's grey suggestion (3.25:1),
+/// so the bar was the cell's solid ink and the letter was never judged: a pink light laid round the
+/// letter, clear of the bar, took it under 97% of its own reading unseen. Read through the report
+/// with a bar's cursor reply, the letter is judged and lowered. Negative control: with the line
+/// kept in the glyph (no skip, as before), the bar is judged in its place and nothing is lowered.
+#[test]
+fn a_letter_under_a_bar_is_judged_by_its_own_strokes() {
+    const PAPER: Rgb = [0xff, 0xff, 0xff];
+    const BAR: Rgb = [0x09, 0x69, 0xda];
+    const GREY: Rgb = [0x8a, 0x8f, 0x99];
+    const PINK: Rgb = [0xf8, 0xe1, 0xf0];
+    let grid = Grid {
+        ox: 0,
+        oy: 0,
+        cw: 10,
+        ch: 12,
+        rows: 1,
+        cols: 3,
+        source: "args",
+    };
+    let (w, h) = (30, 12);
+    let cell = grid.cell_box(0, 1, 1);
+    let mut clean = Image::from_pixels(w, h, vec![PAPER; w * h]);
+    paint(
+        &mut clean,
+        PxBox {
+            x1: cell.x0 + 2,
+            ..cell
+        },
+        BAR,
+    );
+    let letter = PxBox {
+        x0: cell.x0 + 5,
+        y0: 2,
+        x1: cell.x0 + 7,
+        y1: 10,
+    };
+    paint(&mut clean, letter, GREY);
+    let mut frame = clean.clone();
+    paint(
+        &mut frame,
+        PxBox {
+            x0: cell.x0 + 4,
+            ..cell
+        },
+        PINK,
+    );
+    paint(&mut frame, letter, GREY);
+    assert!(contrast(GREY, PAPER) < LEGIBLE && contrast(BAR, PAPER) >= LEGIBLE);
+
+    let dir = scratch("bar-letter");
+    let png = dir.join("x-light.t0.png");
+    std::fs::write(&png, encode_rgb(&frame)).unwrap();
+    std::fs::write(dir.join("x-light.t0.clean.png"), encode_rgb(&clean)).unwrap();
+    std::fs::write(dir.join("x-light.t0.text.txt"), " x \n").unwrap();
+    std::fs::write(dir.join("x-light.t0.cursor.txt"), "OK 0 1 1 steady_bar\n").unwrap();
+    std::fs::write(
+        dir.join("x-light.dims.txt"),
+        "OK 1 3 30 12 cell_w=10 cell_h=12 pad=0 pad_top=0 head=0 tab_rows=0 offset_x=0 offset_y=0 \
+         band_left=0 band_top=0 crop_left=0 crop_top=0 layer_gravity=none\n",
+    )
+    .unwrap();
+    let png_s = png.to_string_lossy().into_owned();
+    let r = report(&parse_args(&args(&[&png_s, "--lowered-min", "4.5"])).unwrap()).unwrap();
+    let cells = r.get("cells").and_then(J::as_arr).unwrap();
+    let x = cells
+        .iter()
+        .find(|c| c.get("char").and_then(J::as_str) == Some("x"))
+        .expect("the letter under the bar is measured");
+    assert!(
+        lowered_under(x, LEGIBLE),
+        "the letter is judged by its own strokes, and lowered: {}",
+        x.py()
+    );
+    assert!(field(x, "clean_local_contrast") < 3.3, "{}", x.py());
+
+    let kept = J::Obj(measure_cell(&frame, Some(&clean), &grid, (0, 1, 1), None));
+    assert!(
+        !lowered_under(&kept, LEGIBLE),
+        "negative control: with the line kept the bar is judged in the letter's place: {}",
+        kept.py()
     );
 }
 

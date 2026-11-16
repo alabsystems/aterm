@@ -1,0 +1,17 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-land-trailer"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The trailers `verify land` writes on a landing merge, and their one reader"
+
+# No dependencies: std only. Its writer (aterm-verify's `land`) and its readers (the harness's
+# land receipt, agh) share it, and a change to it reaches those crates alone.
+[dependencies]
+
+[lints]
+workspace = true

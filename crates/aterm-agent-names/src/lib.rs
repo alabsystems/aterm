@@ -45,7 +45,11 @@ pub fn agent_of(program: &str) -> Option<Agent> {
         Some(Agent::Claude)
     } else if is("codex") || is("codex-old") {
         Some(Agent::Codex)
-    } else if is("agy") {
+    } else if is("agy") || is("agy-alab") {
+        // Its harness leads the session's foreground group and runs the vendor's CLI as its child
+        // on the same terminal, so the screen is the vendor's
+        // (`docs/DESIGN-harness-repos-2026-10-24.md` §8.1 item 5); the harness leads no word, so
+        // its registry row's agent is read from its id here.
         Some(Agent::Agy)
     } else if is("muse") || is("muse-alab") || is_muse_build(word) {
         // muse-alab, the Muse Code harness, leads the session's foreground group and runs the

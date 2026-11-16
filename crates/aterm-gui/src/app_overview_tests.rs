@@ -1025,7 +1025,7 @@ fn a_harness_need_says_needs_you_on_the_overview() {
 fn a_retina_pointer_lands_on_an_overview_row_past_a_device_pixel_cap() {
     let (mut app, wid, _) = app_with_three();
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.cols = 400;
         ws.scale = 2.0;
         ws.input_scratch.cells = vec![Vec::new(); 50];

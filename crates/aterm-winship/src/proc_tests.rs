@@ -116,3 +116,34 @@ fn job_ends_the_child_and_what_it_started() {
     assert!(rest.is_ok(), "{rest:?}");
     reader.join().expect("the reader ends");
 }
+
+#[cfg(windows)]
+#[test]
+fn run_to_file_keeps_both_streams_and_the_exit_code() {
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let rows = scratch.path().join("rows.txt");
+    std::fs::write(&rows, "an earlier run's rows\n").expect("write");
+    let code = run_to_file(
+        &system32("cmd.exe"),
+        &["/d", "/c", "echo PASS one& echo FAIL two 1>&2& exit 1"],
+        &rows,
+        Duration::from_secs(60),
+    )
+    .expect("cmd runs");
+    assert_eq!(code, Some(1));
+    let text = std::fs::read_to_string(&rows).expect("rows");
+    assert!(text.contains("PASS one"), "{text}");
+    assert!(text.contains("FAIL two"), "{text}");
+    // The file is made anew: nothing of an earlier run is read as this one's.
+    assert!(!text.contains("earlier"), "{text}");
+    // Negative control: a program that is not there is an error, not an exit code.
+    assert!(
+        run_to_file(
+            &scratch.path().join("absent.exe"),
+            &["smoke"],
+            &rows,
+            Duration::from_secs(60)
+        )
+        .is_err()
+    );
+}

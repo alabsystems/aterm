@@ -6,25 +6,12 @@
 use std::time::Instant;
 
 use aterm_core::terminal::program_state::{
-    ProgramApp, ProgramState, ProgramStateReport, ProgramStateWord,
+    OtherReport, ProgramApp, ProgramState, ProgramStateReport,
 };
-
-/// One edge of a codex's turn that no shown move claims ([`ProgramStateGate::observe_fed`]), with
-/// the wall clock of the parse batch it arrived in (epoch ms; `None` where that batch read none).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FedEdge {
-    /// A turn began.
-    Began(Option<u64>),
-    /// A turn ended at this rest (`idle`, `done` or `error`).
-    Ended(ProgramStateWord, Option<u64>),
-}
 
 /// One session's gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramStateGate {
-    /// A sweep has read the engine; the first reading is a baseline ([`Self::observe_fed`] feeds
-    /// none of the edges it finds).
-    read: bool,
     /// The engine sequence the last sweep saw.
     seen_seq: u64,
     /// Reports at or below this sequence were already seen before the latest
@@ -53,9 +40,19 @@ pub(crate) struct ProgramStateGate {
     /// The engine's count of turns begun (`ProgramStateReport::turns`) at the
     /// last sweep's reading, honoured or not.
     turns: u64,
-    /// How many times the report shown moved ([`Self::observe`] returning true): what the tab
-    /// hover's cached activity line keys on (`App::session_status_revision`).
+    /// How many times the report shown or another program's moved ([`Self::observe`] or
+    /// [`Self::observe_other`] returning true): what the tab hover's cached activity line keys on
+    /// (`App::session_status_revision`).
     moves: u64,
+    /// Another program's reports at or below this sequence were written before the sweep that
+    /// saw the latest foreground move: none of them shows. Unlike the known report's floor
+    /// (`floor_seq`), it drops a report no sweep saw too, since the job that left may have
+    /// written it: a word that is only shown waits for the program's next report rather than
+    /// stand for one that left.
+    other_floor: u64,
+    /// Another program's report shown (`ProgramApp::Other`), and since when: only the words read
+    /// it ([`Self::said`]), never [`Self::shown`], a turn count or an edge.
+    other: Option<(ProgramState, Instant)>,
 }
 
 impl ProgramStateGate {
@@ -67,7 +64,6 @@ impl ProgramStateGate {
         group_moved: bool,
         now: Instant,
     ) -> bool {
-        self.read = true;
         self.turns = report.turns;
         if group_moved {
             // Discard reports already seen under the previous group. An
@@ -108,52 +104,32 @@ impl ProgramStateGate {
         true
     }
 
-    /// Fold one sweep's reading as [`Self::observe`] does, and answer with it the edges of a
-    /// codex's turns the engine kept (`ProgramStateReport::turn_edges`) that no shown move claims,
-    /// oldest first: each beginning and end past the last reading, an end only for a turn begun
-    /// after the latest foreground move (one begun at or before it, or one kept with no beginning
-    /// once a move was seen, is the run's that left), and not the beginning this reading's own
-    /// move shows, which its program mark claims. None is fed
-    /// on the first reading (a baseline), on a foreground move's reading (unseen output then is
-    /// not attributable to its writer), with no codex in front (`codex_front`), or from a report
-    /// whose sequence went back.
-    pub(crate) fn observe_fed(
+    /// Fold one sweep's reading of another program's report (`ProgramStateReport::other`),
+    /// honoured as `honoured` says ([`honoured_for`] of its app), above a floor that a foreground
+    /// move raises to the report standing as that move is seen (`other_floor`): whether the one
+    /// shown moved. It is shown only in the words ([`Self::said`]); nothing that decides reads it.
+    pub(crate) fn observe_other(
         &mut self,
-        report: ProgramStateReport,
+        other: OtherReport,
         honoured: bool,
-        codex_front: bool,
         group_moved: bool,
         now: Instant,
-    ) -> (bool, Vec<FedEdge>) {
-        let mut edges = Vec::new();
-        // An edge's sequence is at most its report's, so a report whose sequence went back (another
-        // engine) has none past the last reading.
-        if self.read && !group_moved && codex_front {
-            for turn in report.turn_edges().filter(|t| t.app == ProgramApp::Codex) {
-                if let Some(began) = turn.began.filter(|b| b.seq > self.seen_seq) {
-                    edges.push(FedEdge::Began(began.wall_ms));
-                }
-                let after_move = turn
-                    .began
-                    .map_or(self.floor_seq == 0, |b| b.seq > self.floor_seq);
-                if let Some((word, ended)) = turn.ended.filter(|(_, e)| e.seq > self.seen_seq)
-                    && after_move
-                {
-                    edges.push(FedEdge::Ended(word, ended.wall_ms));
-                }
-            }
+    ) -> bool {
+        if group_moved {
+            self.other_floor = other.seq;
         }
-        let starts = self.turn_starts;
-        let moved = self.observe(report, honoured, group_moved, now);
-        // The beginning this move shows is its mark's. Only the running turn's beginning comes
-        // last: an end's sequence is above its beginning's.
-        if self.turn_starts > starts && matches!(edges.last(), Some(FedEdge::Began(_))) {
-            edges.pop();
+        let next = other
+            .state
+            .filter(|_| honoured && other.seq > self.other_floor);
+        if self.other.map(|(state, _)| state) == next {
+            return false;
         }
-        (moved, edges)
+        self.other = next.map(|state| (state, now));
+        self.moves += 1;
+        true
     }
 
-    /// How many times the report shown has moved.
+    /// How many times the report shown, or another program's, has moved.
     pub(crate) const fn moves(&self) -> u64 {
         self.moves
     }
@@ -196,6 +172,20 @@ impl ProgramStateGate {
         self.shown
     }
 
+    /// Another program's report shown ([`Self::observe_other`]), and since when.
+    pub(crate) const fn other(&self) -> Option<(ProgramState, Instant)> {
+        self.other
+    }
+
+    /// The report the words say ([`row_word`]): the one shown, else another program's. Nothing
+    /// that decides reads it.
+    pub(crate) const fn said(&self) -> Option<(ProgramState, Instant)> {
+        match self.shown {
+            Some(shown) => Some(shown),
+            None => self.other,
+        }
+    }
+
     /// The engine's count of turns begun as the last sweep read it, whatever the gate shows.
     pub(crate) const fn turns(&self) -> u64 {
         self.turns
@@ -224,11 +214,17 @@ fn starts_a_turn(before: Option<ProgramState>, after: Option<ProgramState>) -> b
 }
 
 /// Whether a report naming `app` is honoured under the program in front, its published name
-/// (`program=`): a `codex` report under a codex (or a script runtime one runs under, as an npm
-/// install does), a `grok-build` report under a Grok Build, and a `claude-code` report under
-/// Claude Code. A report is the claim of the program it names, so one never stands for
-/// another program in front.
-pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>) -> bool {
+/// (`program=`), where `job` says a job, not the session's root process, leads the terminal
+/// (`Evidence::foreground_job`): a `codex` report under a codex (or a script runtime one runs
+/// under, as an npm install does), a `grok-build` report under a Grok Build, a `claude-code`
+/// report under Claude Code, and another program's report ([`ProgramApp::Other`]) under a
+/// program that is none of those three, each of which reports under its own word, and leads as
+/// a job or as a root that is no shell (`aterm -e kimi`): a shell in front writes none, so a
+/// report under it is one a program that left wrote. A report is the claim of the program it
+/// names, so one never stands for another program in front. Another program's report stands
+/// apart, in the engine (`ProgramStateReport::other`) and here
+/// ([`ProgramStateGate::observe_other`]), where only the words read it: it decides nothing.
+pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>, job: bool) -> bool {
     use aterm_phase::Program;
     let (Some(name), Some(app)) = (program, app) else {
         return false;
@@ -238,6 +234,11 @@ pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>) -> bo
         | (Some(Program::Codex), ProgramApp::Codex)
         | (Some(Program::Grok), ProgramApp::GrokBuild) => true,
         (None, ProgramApp::Codex) => aterm_phase::may_host_agent(name),
+        (
+            Some(Program::Kimi | Program::Generic | Program::Agy | Program::Muse) | None,
+            ProgramApp::Other(_),
+        ) => job || !crate::quit_safety::is_shell_name(name),
+        (Some(Program::Claude | Program::Codex | Program::Grok), ProgramApp::Other(_)) => false,
         (
             Some(
                 Program::Claude
@@ -278,10 +279,11 @@ pub(crate) fn column(shown: Option<crate::session_timeline::ShownProgram>) -> St
 }
 
 /// The hover's word for a shown report (`presence::state_line`), when the screen's reader names no
-/// phase: the program the report names, then its state.
-pub(crate) const fn row_word(state: ProgramState) -> &'static str {
+/// phase: the program the report names, then its state; another program by the word it named
+/// itself with.
+pub(crate) fn row_word(state: ProgramState) -> std::borrow::Cow<'static, str> {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
-    match (state.app, state.state) {
+    std::borrow::Cow::Borrowed(match (state.app, state.state) {
         (ProgramApp::ClaudeCode, W::Idle) => "claude idle",
         (ProgramApp::ClaudeCode, W::Working) => "claude working",
         (ProgramApp::ClaudeCode, W::Blocked) => "claude blocked",
@@ -297,7 +299,10 @@ pub(crate) const fn row_word(state: ProgramState) -> &'static str {
         (ProgramApp::GrokBuild, W::Blocked) => "grok blocked",
         (ProgramApp::GrokBuild, W::Done) => "grok done",
         (ProgramApp::GrokBuild, W::Error) => "grok error",
-    }
+        (ProgramApp::Other(word), state) => {
+            return format!("{} {}", word.as_str(), state.as_str()).into();
+        }
+    })
 }
 
 /// The survey's agent word for a shown report, when the screen's reader names no phase

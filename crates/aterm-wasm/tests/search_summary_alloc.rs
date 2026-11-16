@@ -8,14 +8,20 @@ use std::cell::Cell;
 
 thread_local! {
     static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+    static REQUEST_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 struct Counting;
 
-fn requested() {
+fn requested(size: usize) {
     let _ = COUNT.try_with(|count| {
         if let Some(n) = count.get() {
             count.set(Some(n.wrapping_add(1)));
+        }
+    });
+    let _ = REQUEST_BYTES.try_with(|bytes| {
+        if let Some(n) = bytes.get() {
+            bytes.set(Some(n.wrapping_add(size)));
         }
     });
 }
@@ -24,19 +30,19 @@ fn requested() {
 // The constant, drop-free thread-local counter neither allocates nor unwinds.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        requested();
+        requested(layout.size());
         // SAFETY: the caller supplies the allocator's required valid layout.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        requested();
+        requested(layout.size());
         // SAFETY: the caller supplies the allocator's required valid layout.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        requested();
+        requested(size);
         // SAFETY: the caller supplies a live System allocation and valid new size.
         unsafe { System.realloc(ptr, layout, size) }
     }
@@ -324,4 +330,158 @@ fn smart_link_lookup_allocation_cost() {
     assert_eq!(hit.url(), "https://example.test/path");
     eprintln!("warmed smart link lookup: {requests} allocation requests");
     assert!(requests <= 2, "link lookup allocated {requests} times");
+}
+
+#[test]
+fn message_log_reply_allocation_cost() {
+    let font = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+    let mut t = aterm_wasm::AtermTerminal::new(4, 80, font, 14.0, 0, 0, 0, 0).unwrap();
+    for i in 0..32 {
+        let response = t.notice(&format!("post perf synthetic log line {i} 漢🙂"));
+        assert!(response.starts_with("OK "), "{response}");
+    }
+    let expected = t.messages_log_since(0.0);
+    assert!(expected.lines().count() > 32, "at least32encodedrecords");
+    COUNT.with(|count| count.set(Some(0)));
+    let output = t.messages_log_since(0.0);
+    let requests = COUNT.with(|count| count.replace(None).unwrap());
+    assert_eq!(output, expected);
+    eprintln!(
+        "message log reply: {requests} allocation requests, {} output bytes",
+        output.len()
+    );
+    assert!(requests <= 16, "log reply allocated {requests} times");
+}
+
+fn selector_terminal() -> aterm_wasm::AtermTerminal {
+    let font = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+    aterm_wasm::AtermTerminal::new(4, 80, font, 14.0, 0, 0, 0, 0).unwrap()
+}
+
+#[test]
+fn theme_selector_explicit_install_cost() {
+    let mut t = selector_terminal();
+    let expected = t.set_theme_by_name("Nord").unwrap();
+    COUNT.with(|count| count.set(Some(0)));
+    let output = t.set_theme_by_name("  Nord  ").unwrap();
+    let requests = COUNT.with(|count| count.replace(None).unwrap());
+    assert_eq!(output, expected);
+    assert_eq!(
+        output,
+        r#"{"selector":"Nord","appearance":"dark","id":"Nord","side":"dark","reported":"dark","source":"builtin"}"#
+    );
+    eprintln!(
+        "theme selector explicit: {requests} allocation requests, {} output bytes",
+        output.len()
+    );
+    assert!(
+        requests <= 6,
+        "theme selector explicit allocated {requests} times"
+    );
+}
+
+#[test]
+fn theme_selector_appearance_refresh_cost() {
+    let mut t = selector_terminal();
+    t.set_theme_by_name("dark:Gruvbox Dark,light:Gruvbox Light")
+        .unwrap();
+    t.set_color_scheme(false);
+    let expected = t.theme_state();
+    t.set_color_scheme(true);
+    COUNT.with(|count| count.set(Some(0)));
+    t.set_color_scheme(false);
+    let requests = COUNT.with(|count| count.replace(None).unwrap());
+    let output = t.theme_state();
+    assert_eq!(output, expected);
+    assert_eq!(
+        output,
+        r#"{"selector":"dark:Gruvbox Dark,light:Gruvbox Light","appearance":"light","id":"Gruvbox Light","side":"light","reported":"light","source":"builtin"}"#
+    );
+    eprintln!(
+        "theme selector appearance: {requests} allocation requests, {} output bytes",
+        output.len()
+    );
+    assert!(
+        requests <= 5,
+        "theme selector appearance allocated {requests} times"
+    );
+}
+
+#[test]
+fn theme_selector_active_registration_refresh_cost() {
+    const CONF: &str = "name = Custom\nbackground = #101820\nforeground = #e0e0e0\n";
+    let mut t = selector_terminal();
+    let expected_reply = t.register_theme(CONF).unwrap();
+    t.set_theme_by_name("Custom").unwrap();
+    let expected_state = t.theme_state();
+    COUNT.with(|count| count.set(Some(0)));
+    let output = t.register_theme(CONF).unwrap();
+    let requests = COUNT.with(|count| count.replace(None).unwrap());
+    assert_eq!(output, expected_reply);
+    assert_eq!(t.theme_state(), expected_state);
+    assert_eq!(
+        output,
+        r#"{"id":"Custom","appearance":"dark","appearance_source":"measured","warnings":[]}"#
+    );
+    eprintln!(
+        "theme selector registration: {requests} allocation requests, {} output bytes",
+        output.len()
+    );
+    assert!(
+        requests <= 29,
+        "theme selector registration allocated {requests} times"
+    );
+}
+
+#[test]
+fn theme_catalog_reservation_avoids_repeated_growth() {
+    let font = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+    for (registered, max_requests, max_bytes, capacity) in [
+        (0, 2, 5864, 4096),
+        (1, 3, 14056, 8192),
+        (128, 5, 63208, 32768),
+    ] {
+        let mut t = aterm_wasm::AtermTerminal::new(4, 80, font, 14.0, 0, 0, 0, 0).unwrap();
+        for i in 0..registered {
+            t.register_theme(&format!(
+                "name = Custom{i}\nbackground = #101820\nforeground = #e0e0e0\n"
+            ))
+            .unwrap();
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        REQUEST_BYTES.with(|bytes| bytes.set(Some(0)));
+        let catalog = t.theme_catalog();
+        let requests = COUNT.with(|count| count.replace(None).unwrap());
+        let bytes = REQUEST_BYTES.with(|bytes| bytes.replace(None).unwrap());
+        eprintln!("CATALOG_PROFILE registered={registered} requests={requests} requested_bytes={bytes} output_bytes={} capacity={}", catalog.len(), catalog.capacity());
+        if std::env::var_os("ATERM_CATALOG_PROFILE").is_some() {
+            println!("CATALOG {registered} {catalog}");
+        }
+        assert!(
+            requests <= max_requests,
+            "{registered} registered: {requests} allocation requests"
+        );
+        assert!(
+            bytes <= max_bytes,
+            "{registered} registered: {bytes} requested bytes"
+        );
+        assert_eq!(
+            catalog.capacity(),
+            capacity,
+            "{registered} registered: retained capacity"
+        );
+    }
+}
+
+#[test]
+fn tier_capability_json_only_allocates_its_output() {
+    COUNT.with(|count| count.set(Some(0)));
+    REQUEST_BYTES.with(|bytes| bytes.set(Some(0)));
+    let json = aterm_wasm::AtermTerminal::tier_capabilities_json();
+    let requests = COUNT.with(|count| count.replace(None).unwrap());
+    let bytes = REQUEST_BYTES.with(|bytes| bytes.replace(None).unwrap());
+    eprintln!("TIER_PROFILE requests={requests} requested_bytes={bytes} output_bytes={} capacity={} json={json}", json.len(), json.capacity());
+    assert_eq!(requests, 1);
+    assert_eq!(bytes, json.len());
+    assert_eq!(json.capacity(), json.len());
 }

@@ -3730,9 +3730,10 @@ impl App {
         {
             self.ask_default_read(session);
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.claude_lights.observe_read(session, read);
         ws.claude_lights.note_click(session, click, jobs);
     }
@@ -3773,7 +3774,8 @@ impl App {
             .mode()
             .filter(|mode| *mode != Autopilot::Off)
             .map(|_| self.continuation_words(session));
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_lights
                 .sessions
                 .entry(session)
@@ -3791,7 +3793,8 @@ impl App {
     /// Fold in `session`'s Team chip for the footer this frame draws.
     pub(crate) fn note_claude_team(&mut self, wid: WindowId, session: u64) {
         let face = self.team_face(session);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let s = ws.claude_lights.sessions.entry(session).or_default();
             if s.team != face {
                 s.team = face;
@@ -3833,7 +3836,8 @@ impl App {
         chips_at: ChipAt,
         room: (usize, bool),
     ) -> Option<Block> {
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         let waits = crate::claude_panel::pointed_wait(ws.claude_card.panels(), session);
         let lights = &mut ws.claude_lights;
         let mine = |at: Option<(u64, Target)>| at.filter(|(id, _)| *id == session).map(|(_, t)| t);
@@ -3988,7 +3992,7 @@ impl App {
     pub(crate) fn claude_chip_words_due(&mut self, now: Instant) -> Vec<WindowId> {
         self.windows
             .iter_mut()
-            .filter_map(|(wid, ws)| {
+            .filter_map(|(wid, mut ws)| {
                 let counting = ws.claude_lights.sessions.values().any(|s| {
                     s.continuation
                         .as_deref()
@@ -4026,7 +4030,8 @@ impl App {
 
     /// Hand a painted block back to window `wid` ([`Self::claude_lights_block`]).
     pub(crate) fn recycle_claude_lights_block(&mut self, wid: WindowId, block: Block) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_lights.give_back(block);
         }
     }
@@ -4046,14 +4051,16 @@ impl App {
         term_row: usize,
         room: usize,
     ) {
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && !ws
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if !ws
                 .claude_lights
                 .footers
                 .iter()
                 .any(|(s, _, _)| *s == session)
-        {
-            ws.claude_lights.footers.push((session, term_row, room));
+            {
+                ws.claude_lights.footers.push((session, term_row, room));
+            }
         }
     }
 
@@ -4067,7 +4074,8 @@ impl App {
         col: usize,
         block: &Block,
     ) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let chips = block
                 .cols
                 .iter()
@@ -4126,7 +4134,8 @@ impl App {
     /// The pointer left the window.
     pub(crate) fn clear_claude_light_hover(&mut self, wid: WindowId) {
         let mut had_fact = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let prev_hover = ws.claude_lights.hover.take();
             had_fact = prev_hover.is_some_and(|(_, t)| t.fact().is_some());
             ws.claude_lights.glass_hit_hover = None;
@@ -4163,9 +4172,10 @@ impl App {
                         && self.chrome_overlay_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
                 }));
         let focused = self.focused_session_id(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let regridded = std::mem::replace(&mut ws.claude_lights.drawn_at, grid) != grid;
         let chrome = WindowLights::chrome_rows_digest(&ws.chrome_rows, &ws.chrome_spans);
         let chrome_changed =
@@ -4183,13 +4193,14 @@ impl App {
         let prev = lights.laid.replace(laid);
         let places_changed = prev.is_none_or(|(places, _)| places != laid.0);
         let moved = prev.is_some_and(|(places, hover)| hover == was && places != laid.0);
-        if (regridded || moved || chrome_changed || uncovered)
+        let track = ((regridded || moved || chrome_changed || uncovered)
             && ws.pointer_position_known
-            && !ws.selecting
-        {
-            let (x, y) = ws.last_cursor_px;
+            && !ws.selecting)
+            .then_some(ws.last_cursor_px);
+        drop(route_guard_ws);
+        if let Some((x, y)) = track {
             let _ = self.track_claude_light_hover(wid, x, y);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
                 let lights = &mut ws.claude_lights;
                 lights.cursor_owed |= lights.glass_hover() != was;
             }
@@ -4201,7 +4212,8 @@ impl App {
 
     /// Record that a paste or close confirmation band covered the top rows in `wid`.
     pub(crate) fn note_band_covered(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_lights.band_covered = true;
         }
     }
@@ -4231,7 +4243,8 @@ impl App {
             0..1
         };
         let mut had_fact = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let stale = {
                 let ws_ref = &*ws;
                 ws_ref.claude_lights.selection_stale(
@@ -4270,9 +4283,10 @@ impl App {
         plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
         self.evict_stale_glass_selection(wid, plan);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if WindowLights::chrome_rows_digest(&ws.chrome_rows, &ws.chrome_spans)
             != ws.claude_lights.chrome_rows_laid
         {
@@ -4281,6 +4295,7 @@ impl App {
         let Some((x, y)) = ws.claude_lights.glass_hover_px else {
             return;
         };
+        drop(route_guard_ws);
         let (at, column, glass_hit) = if self.chrome_overlay_at(wid, x, y) {
             self.note_band_covered(wid);
             (None, None, None)
@@ -4300,9 +4315,10 @@ impl App {
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let lights = &mut ws.claude_lights;
         let mut gone = false;
         let mut cursor_gone = false;
@@ -4342,6 +4358,7 @@ impl App {
         if gone {
             redraw(ws);
             if fact_gone {
+                drop(route_guard_ws);
                 self.note_fact_readings(wid);
             }
         }
@@ -4381,7 +4398,8 @@ impl App {
         wid: WindowId,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) {
-        let owed = self.windows.get_mut(&wid).is_some_and(|ws| {
+        let owed = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+            let ws = &mut **ws;
             std::mem::take(&mut ws.claude_lights.cursor_owed) && ws.pointer_position_known
         });
         if owed {
@@ -4393,7 +4411,8 @@ impl App {
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn hover_claude_chip(&mut self, wid: WindowId, at: Option<(u64, Chip)>) {
         let mut had_fact = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             had_fact = ws
                 .claude_lights
                 .hover
@@ -4410,7 +4429,8 @@ impl App {
     /// The pointer on `at`.
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn hover_claude_fact(&mut self, wid: WindowId, at: Option<(u64, Fact)>) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_lights.hover = at.map(|(session, fact)| (session, Target::Fact(fact)));
             ws.claude_lights.quota_column = None;
             ws.claude_lights.glass_hover_px = None;
@@ -4421,11 +4441,12 @@ impl App {
     /// A mouse press anywhere lets a keyboard selection go.
     pub(crate) fn clear_claude_light_selection(&mut self, wid: WindowId) {
         let mut had_fact = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && let Some((_, target)) = ws.claude_lights.selected.take()
-        {
-            had_fact = target.fact().is_some();
-            redraw(ws);
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some((_, target)) = ws.claude_lights.selected.take() {
+                had_fact = target.fact().is_some();
+                redraw(ws);
+            }
         }
         if had_fact {
             self.note_fact_readings(wid);
@@ -4447,9 +4468,10 @@ impl App {
             .filter(|(_, t)| *t == Target::Fact(Fact::Account))
             .and_then(|_| self.quota_column_at(wid, x, y));
         let glass_hit = self.glass_hit_hover_at(wid, x, y);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return OverChips::No;
         };
+        let ws = &mut **route_guard_ws;
         if ws.selecting {
             return OverChips::No;
         }
@@ -4472,6 +4494,7 @@ impl App {
             ws.claude_lights.part_hover = part;
             redraw(ws);
             if had_fact || over.is_some_and(|(_, t)| t.fact().is_some()) {
+                drop(route_guard_ws);
                 self.note_fact_readings(wid);
             }
         }
@@ -4579,9 +4602,10 @@ impl App {
                 (session, fact, (whole, short))
             })
             .collect();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let lights = &mut ws.claude_lights;
         lights.fact_readings.retain(|r| {
             built
@@ -4640,9 +4664,10 @@ impl App {
 
     /// A fact menu's row did `notice` for `session` in window `wid` (a copy, a new tab).
     pub(crate) fn note_fact_notice(&mut self, wid: WindowId, session: u64, notice: FactNotice) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.claude_lights
             .sessions
             .entry(session)
@@ -4675,9 +4700,10 @@ impl App {
         words: String,
         shown: Duration,
     ) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         ws.claude_lights
             .sessions
             .entry(session)
@@ -4699,7 +4725,7 @@ impl App {
         if self
             .windows
             .get_mut(&wid)
-            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, at))
+            .is_some_and(|mut ws| ws.claude_lights.switch_just_pressed(session, at))
         {
             return;
         }
@@ -4708,7 +4734,7 @@ impl App {
         let now = Instant::now();
         let (_, view, _) = self.session_autopilot(session);
         let turning = |app: &mut Self, on: bool| {
-            if let Some(ws) = app.windows.get_mut(&wid) {
+            if let Some(mut ws) = app.windows.get_mut(&wid) {
                 ws.claude_lights
                     .sessions
                     .entry(session)
@@ -4739,7 +4765,8 @@ impl App {
             }
             _ => false,
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             if flipped {
                 ws.claude_lights
                     .sessions
@@ -4865,7 +4892,8 @@ impl App {
     pub(crate) fn show_upgrade_refusal(&mut self, session: u64, words: &str) {
         let until = Instant::now() + REFUSAL_SHOWN;
         let mut shown = false;
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws
                 .claude_lights
                 .border_toggles
@@ -5023,7 +5051,7 @@ impl App {
             && self
                 .windows
                 .get_mut(&wid)
-                .is_some_and(|ws| !ws.claude_card.link_press_repeats(session, at))
+                .is_some_and(|mut ws| !ws.claude_card.link_press_repeats(session, at))
         {
             crate::app_mouse::open_url_external(url);
         }
@@ -5071,9 +5099,10 @@ impl App {
     ) {
         match chip {
             Chip::Light(light) => {
-                let Some(ws) = self.windows.get_mut(&wid) else {
+                let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                     return;
                 };
+                let ws = &mut **route_guard_ws;
                 if ws.claude_lights.light_just_pressed(session, at) {
                     return;
                 }
@@ -5082,6 +5111,7 @@ impl App {
                     .entry(session)
                     .or_default()
                     .light_pressed = Some(at);
+                drop(route_guard_ws);
                 self.click_permission(wid, session, light);
             }
             Chip::Autopilot => self.press_autopilot_chip(wid, session, at),
@@ -5094,7 +5124,7 @@ impl App {
         if self
             .windows
             .get_mut(&wid)
-            .is_some_and(|ws| ws.claude_lights.switch_just_pressed(session, at))
+            .is_some_and(|mut ws| ws.claude_lights.switch_just_pressed(session, at))
         {
             return;
         }
@@ -5137,9 +5167,10 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| self.effect_policy(effect, ws.focused).animate(effect));
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let lights = ws.claude_lights.sessions.entry(session).or_default();
         // The mode's name comes up beside the glyph, from the click where the word is written
         // already, else from the frame that reads it back ([`WindowLights::note_autopilot_at`]).
@@ -5200,7 +5231,8 @@ impl App {
             wake_after(session, REFUSAL_SHOWN);
         };
         let Some(pill) = self.permission_pill(session) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 refuse(ws, Refusal::NotShown);
             }
             return;
@@ -5210,7 +5242,8 @@ impl App {
             // Before the resolver's first read of this agent nothing says what the restart
             // would change: ask for the read and let the next click decide on it.
             self.ask_default_read(session);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 refuse(ws, Refusal::SettingsUnread);
             }
             return;
@@ -5224,7 +5257,8 @@ impl App {
             .and_then(|snap| snap.session)
             .or_else(|| self.footer_conversation(session))
         else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 refuse(ws, Refusal::Unread);
             }
             return;
@@ -5261,7 +5295,8 @@ impl App {
         session: u64,
         told: &crate::permission_box::Told,
     ) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let s = ws.claude_lights.sessions.entry(session).or_default();
             s.refused = None;
         }
@@ -5307,7 +5342,8 @@ impl App {
             click.to.word()
         );
         self.permission_clicks.clicks.stand(click, from_yolo);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let s = ws.claude_lights.sessions.entry(session).or_default();
             s.refused = None;
         }
@@ -5325,7 +5361,8 @@ impl App {
             );
         }
         self.refresh_permission_box(session);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_lights
                 .sessions
                 .entry(session)
@@ -5337,7 +5374,8 @@ impl App {
 
     /// Redraw every window that draws `session`'s lights.
     fn redraw_click(&mut self, session: u64) {
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.claude_lights.sessions.contains_key(&session) {
                 redraw(ws);
             }
@@ -5388,7 +5426,8 @@ impl App {
     )]
     fn say_click_refusal(&mut self, session: u64, why: Refusal) {
         let until = Instant::now() + REFUSAL_SHOWN;
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if let Some(s) = ws.claude_lights.sessions.get_mut(&session) {
                 s.refused = Some((Light::Mode, why, until));
             }
@@ -5415,17 +5454,24 @@ impl App {
     }
 
     /// `session`'s screen read straight from its engine (behind the reader's panic fence), with
-    /// the window title Claude Code set over it: under a status line its `◐`/`◑` is the only sign
-    /// that a reply still being drawn is a turn running.
+    /// the window title Claude Code set over it and its program-status report standing: under a
+    /// status line its title's `◐`/`◑`, or where its answered query leaves the title no glyph its
+    /// `working` report, is the only sign that a reply still being drawn is a turn running.
     fn claude_screen_now(&self, session: u64) -> Option<Screen> {
-        let (rows, title) = self.claude_rows_now(session)?;
-        fenced_screen_now(session, &rows, || lights::read_screen(&rows, Some(&title)))
+        let (rows, title, report) = self.claude_rows_now(session)?;
+        fenced_screen_now(session, &rows, || {
+            lights::read_screen(&rows, Some(&title), report.as_deref())
+        })
     }
 
     /// `session`'s live screen copied out of its engine, its rows as text, and the program's
-    /// window title read in the same hold.
+    /// window title and program-status report standing (the body that says it), read in the same
+    /// hold.
     /// `None` while Claude's DEC 2026 frame is unfinished: the event loop never waits for its close.
-    fn claude_rows_now(&self, session: u64) -> Option<(Vec<String>, std::sync::Arc<str>)> {
+    fn claude_rows_now(
+        &self,
+        session: u64,
+    ) -> Option<(Vec<String>, std::sync::Arc<str>, Option<String>)> {
         let entry = self.pool.get(session)?;
         let t = crate::term_lock(&entry.term);
         if t.grid().display_offset() > 0 || crate::frame_unfinished_now(&t) {
@@ -5436,6 +5482,7 @@ impl App {
                 .map(|r| row_text(&t, r))
                 .collect(),
             t.title_arc(),
+            t.program_state().run_sign(),
         ))
     }
 
@@ -5443,7 +5490,8 @@ impl App {
     pub(crate) fn drain_claude_lights(&mut self) {
         let now = Instant::now();
         self.advance_slash_presses(now);
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.claude_lights.expire(now) {
                 redraw(ws);
             }
@@ -5506,9 +5554,10 @@ impl App {
             0..1
         };
         let now = Instant::now();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         let room = ws
             .claude_lights
             .footers
@@ -5586,14 +5635,17 @@ impl App {
                 ws.claude_lights.select(Some((session, next)));
                 redraw(ws);
                 if had_fact || next.fact().is_some() {
+                    drop(route_guard_ws);
                     self.note_fact_readings(wid);
                 }
             } else if had_fact {
+                drop(route_guard_ws);
                 self.note_fact_readings(wid);
             }
             return true;
         }
         let Some(target) = selected else {
+            drop(route_guard_ws);
             if stale_had_fact {
                 self.note_fact_readings(wid);
             }
@@ -5630,6 +5682,7 @@ impl App {
                 let escape = matches!(&ev.logical_key, Key::Named(NamedKey::Escape));
                 ws.claude_lights.select(None);
                 redraw(ws);
+                drop(route_guard_ws);
                 return match face {
                     Some(face) if clicks => {
                         self.press_switch_as_clicked(wid, session, face, Instant::now());
@@ -5662,6 +5715,7 @@ impl App {
                 let escape = matches!(&ev.logical_key, Key::Named(NamedKey::Escape));
                 ws.claude_lights.select(None);
                 redraw(ws);
+                drop(route_guard_ws);
                 self.note_fact_readings(wid);
                 return match hit {
                     Some(hit) if clicks => {
@@ -5682,6 +5736,7 @@ impl App {
             Key::Named(NamedKey::Enter | NamedKey::Space) if plain => {
                 ws.claude_lights.select(None);
                 redraw(ws);
+                drop(route_guard_ws);
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);

@@ -17,19 +17,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::host::{Absent, Lookup};
 
-/// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
-/// compiles its cells for, on the stock pin: every forge cell's triple (this machine's
-/// own among them, which a minimal install already carries). wasm32's is also the one the web
-/// modules' lanes build for, and the Macs' and Linux gnu ones the libc oracle's cross cells.
-pub const CELL_TARGETS: [&str; 7] = [
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
-    "wasm32-unknown-unknown",
-];
+use crate::rustup::CELL_TARGETS;
 
 /// The std targets `--linux` adds to the stock pin: the Linux lane's guest agent
 /// (`crates/aterm-vz-agent`) is a static musl binary cross-built for this one

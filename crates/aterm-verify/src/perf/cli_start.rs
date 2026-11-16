@@ -1180,8 +1180,7 @@ mod live {
             let messages = build(&args, &env)?;
             bins.iter()
                 .map(|(name, bin)| {
-                    let program =
-                        super::super::bench_build::built_executable(&messages, bin, "bin")?;
+                    let program = super::super::driver::built_executable(&messages, bin, "bin")?;
                     Ok(Arm {
                         name: (*name).to_string(),
                         loads: loads(&program)?,
@@ -1425,8 +1424,8 @@ mod live {
             }
             let messages = String::from_utf8_lossy(&out.stdout);
             Ok((
-                bench_build::built_debug_app(&messages, "aterm-lab")?,
-                bench_build::built_debug_app(&messages, "aterm")?,
+                super::super::driver::built_debug_app(&messages, "aterm-lab")?,
+                super::super::driver::built_debug_app(&messages, "aterm")?,
             ))
         }
 

@@ -163,15 +163,16 @@ impl App {
             return false;
         };
         let cursor = seed.len();
-        if let Some(ws) = self.windows.get_mut(&window) {
-            ws.rename_edit = Some(TabRenameEdit {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&window) {
+            let ws = &mut **route_guard_ws;
+            ws.routing.set_rename(Some(TabRenameEdit {
                 session,
                 tab,
                 surface,
                 field,
                 text: seed,
                 cursor,
-            });
+            }));
         } else {
             return false;
         }
@@ -205,7 +206,8 @@ impl App {
         let had_edit = self
             .windows
             .get_mut(&window)
-            .and_then(|ws| ws.rename_edit.take())
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.take_rename())
             .is_some();
         if let Some(handle) = self._toolbars.get(&window) {
             self.apprt.end_tab_rename(handle);
@@ -256,16 +258,18 @@ impl App {
 
     /// Apply one field edit to `window`'s in-grid rename field and repaint.
     pub(crate) fn rename_field_edit(&mut self, window: WindowId, edit: SearchEdit) -> bool {
-        let Some(ws) = self.windows.get_mut(&window) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&window) else {
             return false;
         };
-        let Some(state) = ws
-            .rename_edit
-            .as_mut()
+        let ws = &mut **route_guard_ws;
+        let Some(mut rename_scope) = ws
+            .routing
+            .rename_mut()
             .filter(|state| state.surface == RenameSurface::InGrid)
         else {
             return false;
         };
+        let state = &mut *rename_scope;
         apply_field_edit(&mut state.text, &mut state.cursor, edit);
         let canonical =
             crate::session_timeline::sanitize_presentation_line(&state.text, state.field.cap());
@@ -276,6 +280,8 @@ impl App {
                 state.cursor -= 1;
             }
         }
+        drop(rename_scope);
+        drop(route_guard_ws);
         self.request_rename_repaint(window);
         true
     }

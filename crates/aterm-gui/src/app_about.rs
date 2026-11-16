@@ -42,9 +42,10 @@ impl App {
                 Err(_) => return false,
             },
         };
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if !window.tab_set.switch_to(tab)
             || !window
                 .tab_set
@@ -55,6 +56,7 @@ impl App {
         }
         crate::app_tabs::cancel_pending_close(window);
         window.last_present = None;
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.sync_active_session();
         self.note_restore_focus_intent(wid);

@@ -24,12 +24,15 @@ pub use field::{
     BoundedText, BoundedToken, Cap, Charset, FIELDS, FieldError, Fields, Key, MAX_FIELDS, Tier, Val,
 };
 pub use fold::{
-    BusFacts, BusTotals, Claim, Clause, ClauseRow, ClosedNode, Fold, Hints, MAIL_LINK_WINDOW_MS,
-    MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, Need, OpenNode, Phase, SessionState,
-    SnapError, Tone, Totals, Words, amend_refines_out, clause_of, clause_of_proven, clear_lifts,
-    confidence_law, lifts_failure, mail_in_window, mail_link_of, mark_may_raise, mark_need_node,
-    may_observe, need_precedence, need_raised, need_takes_amend, need_words, observed_need_words,
-    shown_label, shown_proven_label, shown_verdicts, starts_epoch, turn_out_rebucket,
+    BusFacts, BusTotals, Claim, Clause, ClauseRow, ClosedNode, DESC_AGENTS, DESC_CARRY_BYTES,
+    DESC_CLAIMS, DESC_CLAIMS_MAX, DESC_HEAP_BYTES, DESC_SLOTS, DESC_TEXT_BYTES, DESC_TURN_RING,
+    DESC_UNKNOWN_SLOTS, DescClaim, DescIdent, DescRow, DescSlot, DescSubject, Described, Fold,
+    Hints, KNOWN_SLOTS, MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting,
+    Need, OpenNode, Phase, Rank, SessionState, Shown, SnapError, Tone, Totals, Words,
+    amend_refines_out, clause_of, clause_of_proven, clear_lifts, confidence_law, lifts_failure,
+    mail_in_window, mail_link_of, mark_may_raise, mark_need_node, may_observe, need_precedence,
+    need_raised, need_takes_amend, need_words, observed_need_words, rank_of, shown, shown_label,
+    shown_proven_label, shown_verdicts, starts_epoch, turn_out_rebucket,
 };
 pub use limit::{MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed};
 pub use line::{
@@ -55,11 +58,11 @@ pub use rec::{Rec, Stamp};
 #[cfg(any(test, debug_assertions))]
 pub use turn::ClaimView;
 pub use turn::{
-    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, BoundInput, Chose, Claimed,
-    ClaimedBox, ClaimedReport, LastClose, SETTLE_MS, STEP_ACT_MS, STEP_INPUT_LEAD_MS, ScreenStep,
-    SettleCause, TX_TOOLS_MAX, TrackerView, TurnTracker, TxEvent, TxMark, TxPos, TxState, TxView,
-    Verdict, WallJudge, attributes, dismisses, rebase, settle_due, settle_out, tx_close_at,
-    within_lead,
+    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, BoundInput, Chose, ClaimEdge,
+    ClaimedBox, ClaimedReport, EdgeOutcome, LastClose, SETTLE_MS, STEP_ACT_MS, STEP_INPUT_LEAD_MS,
+    ScreenStep, SettleCause, TX_TOOLS_MAX, TrackerView, TurnTracker, TxEvent, TxMark, TxPos,
+    TxState, TxView, Verdict, WallJudge, attributes, dismisses, rebase, settle_due, settle_out,
+    tx_close_at, within_lead,
 };
 pub use vocab::{
     Actor, Conf, FLEET_ACTOR_PREFIX, FLEET_NODE_HEAD, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS,

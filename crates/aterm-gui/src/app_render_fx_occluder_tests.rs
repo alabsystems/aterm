@@ -319,11 +319,11 @@ fn top_mark(app: &App, wid: WindowId, id: u64, (row, col): (usize, usize)) -> Fx
     use aterm_effects::cli_marks::{self, CliMark};
     let (cw, ch) = app.win_cell_size(wid);
     let side = |v: usize| u16::try_from(v).expect("a cell is small");
-    let fit = cli_marks::fit(CliMark::Claude, side(cw), side(ch)).expect("the mark fits the cell");
+    let fit = cli_marks::fit(CliMark::CLAUDE, side(cw), side(ch)).expect("the mark fits the cell");
     let px = |v: usize| i32::try_from(v).expect("a test frame is small");
     cli_marks::layer(
         id,
-        cli_marks::content(CliMark::Claude, fit, 0x0000_0000),
+        cli_marks::content(CliMark::CLAUDE, fit, 0x0000_0000),
         (px(col * cw), px(row * ch)),
         PxRect::EVERYWHERE,
     )

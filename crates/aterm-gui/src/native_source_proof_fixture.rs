@@ -887,6 +887,9 @@ fn spawn_foreground(
         .to_str()
         .ok_or("foreground SDK path unavailable")?;
     let mut arguments = vec!["alab-native-retained-proof".to_owned()];
+    if launch.resources_frontend() {
+        arguments.push("--app-resources".into());
+    }
     if let Some(replacement) = launch.replacement_candidate() {
         arguments.push("--replacement-image".into());
         arguments.push(

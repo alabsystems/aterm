@@ -19,7 +19,7 @@ fn the_production_planner_pulls_forge_only_for_a_dev_touch_of_a_fork() {
     let fork = parsed(&["-p", "aterm-window"]);
     assert!(fork.contains(&Check::Forge), "default dev plan: {fork:?}");
     assert!(
-        checks::stages_of(&fork).contains(&plan::StageId::Forge),
+        checks::stages_of(&fork, false).contains(&plan::StageId::Forge),
         "`verify -p aterm-window` must carry the Forge stage that runs OB-7: {fork:?}"
     );
     let unrelated = parsed(&["-p", "aterm-types"]);
@@ -114,24 +114,6 @@ fn the_production_planner_pulls_appkit_for_resolved_macos_dev_inputs() {
             "an explicit or release-shaped selection stays exact: {checks:?}"
         );
     }
-}
-
-#[test]
-fn background_runs_admit_their_disk_as_background() {
-    assert_eq!(
-        run_admit_mode(true, aterm_capacity::Admit::Wait),
-        aterm_capacity::Admit::Preemptible
-    );
-    assert_eq!(
-        run_admit_mode(false, aterm_capacity::Admit::Wait),
-        aterm_capacity::Admit::Wait,
-        "negative control: an ordinary verifier keeps its requested mode"
-    );
-    assert_eq!(
-        run_admit_mode(false, aterm_capacity::Admit::Now),
-        aterm_capacity::Admit::Now,
-        "negative control: --admit now remains an ordinary override"
-    );
 }
 
 #[cfg(unix)]
@@ -1449,7 +1431,7 @@ fn a_measured_bundle_names_the_commit_that_built_it() {
     let app = tmp.join("aterm.app");
     std::fs::create_dir_all(app.join("Contents/MacOS")).expect("mkdir");
     let bin = app.join("Contents/MacOS/aterm");
-    std::fs::write(&bin, "#!/bin/sh\n").expect("write");
+    std::fs::write(&bin, crate::artifact::tests::executable(false)).expect("write");
     std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .expect("chmod");
     let unnamed = MeasureArtifact::at(&app).expect("a bundle");
@@ -1516,6 +1498,32 @@ fn the_cli_refuses_usage_and_a_place_it_cannot_run_from() {
     assert_eq!(run_cli(&args(&["list"]), &tmp), exit::PASS);
     assert_eq!(run_cli(&args(&["--help"]), &tmp), exit::PASS);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Off unix, where `land`, `watch`, `provision` and the browser lane's verbs do not build, each
+/// is refused by name (COULD NOT RUN, 3), not parsed as an unknown check (a usage error, 2).
+/// NEGATIVE CONTROL: a verb no build has is that usage error, so the refusal is the name's.
+#[cfg(not(unix))]
+#[test]
+fn a_unix_only_verb_off_unix_is_could_not_run_not_an_unknown_check() {
+    for verb in [
+        "land",
+        "watch",
+        "provision",
+        "browser-site",
+        "browser-drive",
+    ] {
+        assert_eq!(
+            run_cli(&[verb.to_string()], Path::new(".")),
+            exit::COULD_NOT_RUN,
+            "{verb}"
+        );
+    }
+    assert_eq!(
+        run_cli(&["no-such-verb".to_string()], Path::new(".")),
+        exit::USAGE,
+        "control"
+    );
 }
 
 /// A release's header names the half it runs, or the checks `--checks` listed, so its log
@@ -2180,6 +2188,7 @@ fn built_from_rejects_short_or_non_hex_commits() {
         app: PathBuf::from("/tmp/aterm.app"),
         version: Some("0.137.0".into()),
         commit: Some(commit.into()),
+        ..MeasureArtifact::unnamed("/tmp/aterm.app")
     };
     let head = "22cb722a2ec9abcdef0123456789abcdef012345";
     assert!(!art("22cb72").built_from(head), "6 hex chars is too short");

@@ -32,6 +32,9 @@ pub struct Retirement {
 pub(super) struct LogRetirement {
     pub(super) retirement: Retirement,
     pub(super) records: Vec<crate::membership_log::Record>,
+    /// Every age recipient the retirement takes out: those it names and their writer
+    /// successors' (`super::remove::with_successors`).
+    pub(super) gone: std::collections::BTreeSet<Recipient>,
 }
 
 /// Successful vault removal and its prior Commons retirement, when enrolled.
@@ -303,9 +306,10 @@ pub(super) fn non_admin_target(admin: &Admin, recipient: Recipient) -> crate::Re
 }
 
 impl Admin {
-    /// Permanently retire every retained binding of these recipients, preserving
-    /// other current members and roles in a fresh epoch. Exact retries append
-    /// nothing. This performs no network I/O; the returned result is durable.
+    /// Permanently retire every retained binding of these recipients, and in a
+    /// membership log of their writer successors' too, preserving other current
+    /// members and roles in a fresh epoch. Exact retries append nothing. This
+    /// performs no network I/O; the returned result is durable.
     pub fn retire_commons_members(
         &self,
         bootstrap: &Bootstrap,
@@ -534,6 +538,16 @@ impl Admin {
                 "this device cannot retire its own Commons membership",
             ));
         }
+        // The Macs named, with their writer successors: a successor is the same Mac's writer
+        // under an age identity of its own, on the same disk, so the removal takes it out too
+        // and wraps the epochs it mints to none of them.
+        let gone = super::remove::with_successors(log, targets);
+        if gone.contains(&access.local().binding().recipient()) {
+            return Err(Error::new(
+                "this device's seat is a writer successor of a Mac this retirement names, and a \
+                 removal takes a Mac's successors out with it: a device does not retire itself",
+            ));
+        }
         let mut known = std::collections::BTreeSet::new();
         let mut actors = std::collections::BTreeSet::new();
         for rec in log.records() {
@@ -542,7 +556,7 @@ impl Admin {
                     for f in founders {
                         known.insert(f.recipient);
                         if let Some(b) = &f.binding
-                            && targets.contains(&b.recipient())
+                            && gone.contains(&b.recipient())
                         {
                             actors.insert(b.actor());
                         }
@@ -554,7 +568,7 @@ impl Admin {
                     let b = entrant.request.binding();
                     if log.has_historical_seat(b) || membership.removed().contains_key(&b.actor()) {
                         known.insert(b.recipient());
-                        if targets.contains(&b.recipient()) {
+                        if gone.contains(&b.recipient()) {
                             actors.insert(b.actor());
                         }
                     }
@@ -574,10 +588,10 @@ impl Admin {
         let active_targets: Vec<crate::membership_log::MemberId> = membership
             .members()
             .iter()
-            .filter(|(_, m)| targets.contains(&m.binding.recipient()))
+            .filter(|(_, m)| gone.contains(&m.binding.recipient()))
             .map(|(actor, _)| *actor)
             .collect();
-        let target_still_wrapped = targets.iter().any(|r| {
+        let target_still_wrapped = gone.iter().any(|r| {
             log.wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Commons, r)
                 || log.wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Everyone, r)
         });
@@ -586,10 +600,11 @@ impl Admin {
                 retirement: Retirement {
                     head,
                     bindings: actors.len(),
-                    recipients: targets.len(),
+                    recipients: gone.len(),
                     changed: false,
                 },
                 records: Vec::new(),
+                gone,
             }));
         }
         let mut store = load_records(bootstrap.paths())?;
@@ -597,7 +612,7 @@ impl Admin {
             bootstrap.paths(),
             &store,
             &active_targets,
-            targets,
+            &gone,
             Some(lock),
         )?;
         store.ingest_records(records.clone())?;
@@ -614,8 +629,8 @@ impl Admin {
             .membership()
             .members()
             .values()
-            .any(|m| targets.contains(&m.binding.recipient()))
-            || targets.iter().any(|r| {
+            .any(|m| gone.contains(&m.binding.recipient()))
+            || gone.iter().any(|r| {
                 updated_log
                     .wraps_maximal_audience_to(&crate::membership_log::EpochAudience::Commons, r)
                     || updated_log.wraps_maximal_audience_to(
@@ -632,10 +647,11 @@ impl Admin {
             retirement: Retirement {
                 head: new_head,
                 bindings: actors.len(),
-                recipients: targets.len(),
+                recipients: gone.len(),
                 changed: true,
             },
             records,
+            gone,
         }))
     }
 }
@@ -1355,6 +1371,12 @@ fn strip_labels_from_pool_toml(
     Ok((rendered, exposed_accounts))
 }
 
+/// The admin's revoke cascade of §7.6 (`DESIGN-alab-swarm`) over `doc`, for the Mac `host` whose
+/// age recipient is `recipient`: where the vault keeps a swarm roster, the Mac's rows go and its
+/// labels and node keys go to the roster's deny-lists unless another Mac still holds them; its
+/// `ai-pool.toml` slots are freed; and the fleet code, where there is one, rotates. The Mac's
+/// writer successors in this Mac's log (`super::remove::with_successors`) go with it, as the
+/// removal takes them out: none of them is another Mac that still holds a label.
 fn apply_swarm_revoke_cascade(
     paths: &Paths,
     admin: &Admin,
@@ -1362,7 +1384,17 @@ fn apply_swarm_revoke_cascade(
     host: &str,
     recipient: &Recipient,
 ) -> crate::Result<CascadeSummary> {
-    let recipient_str = recipient.to_bech32();
+    let local_log = log_entries::trusted_local_log(paths, &admin.config)
+        .ok()
+        .flatten();
+    let named = std::collections::BTreeSet::from([*recipient]);
+    let gone = local_log.as_ref().map_or_else(
+        || named.clone(),
+        |log| super::remove::with_successors(log, &named),
+    );
+    let gone_strs: std::collections::BTreeSet<String> =
+        gone.iter().map(Recipient::to_bech32).collect();
+    let named_str = recipient.to_bech32();
     let has_roster_entry = doc
         .entry(&Audience::Everyone, crate::swarm_roster::ROSTER_ENTRY)
         .is_some();
@@ -1391,13 +1423,13 @@ fn apply_swarm_revoke_cascade(
         .map(|r| {
             r.members
                 .iter()
-                .filter(|m| m.recipient != recipient_str && m.vault_name != host)
+                .filter(|m| !gone_strs.contains(&m.recipient) && m.vault_name != host)
                 .map(|m| m.recipient.clone())
                 .collect()
         })
         .unwrap_or_default();
     for machine in doc.machines() {
-        if machine.recipient != recipient_str
+        if !gone_strs.contains(&machine.recipient)
             && machine.name != host
             && !rostered_recipients.contains(&machine.recipient)
             && let Some((_, canon)) = crate::swarm_roster::leading_m_label(&machine.name)
@@ -1406,15 +1438,18 @@ fn apply_swarm_revoke_cascade(
         }
     }
     let mut log_surviving_nodes = std::collections::BTreeSet::new();
-    if let Ok(Some(log)) = log_entries::trusted_local_log(paths, &admin.config) {
+    if let Some(log) = &local_log {
         let membership = log.membership();
         let mut target_actors = std::collections::BTreeSet::new();
         for (actor, member) in membership.members() {
             let rec = member.binding.recipient();
-            if rec == *recipient {
+            if gone.contains(&rec) {
                 target_actors.insert(*actor);
                 if crate::membership_log::is_label(&member.label) {
-                    if crate::swarm_roster::leading_m_label(&display_label).is_none() {
+                    // The Mac is named by its own seat's label, never a successor's.
+                    if rec == *recipient
+                        && crate::swarm_roster::leading_m_label(&display_label).is_none()
+                    {
                         display_label = member.label.clone();
                     }
                     revoked_labels.insert(member.label.clone());
@@ -1472,11 +1507,13 @@ fn apply_swarm_revoke_cascade(
             }
         }
         for founder in membership.unproved() {
-            if founder.recipient == *recipient {
+            if gone.contains(&founder.recipient) {
                 if let Some((_, canon)) = crate::swarm_roster::leading_m_label(&founder.label)
                     .filter(|(_, c)| c == &founder.label)
                 {
-                    if crate::swarm_roster::leading_m_label(&display_label).is_none() {
+                    if founder.recipient == *recipient
+                        && crate::swarm_roster::leading_m_label(&display_label).is_none()
+                    {
                         display_label = canon.clone();
                     }
                     revoked_labels.insert(canon);
@@ -1524,8 +1561,11 @@ fn apply_swarm_revoke_cascade(
         let mut kept = Vec::with_capacity(roster.members.len());
         let mut surviving_nodes = log_surviving_nodes;
         for member in std::mem::take(&mut roster.members) {
-            if member.recipient == recipient_str || member.vault_name == host {
-                display_label = member.label.clone();
+            let own_row = member.recipient == named_str || member.vault_name == host;
+            if own_row || gone_strs.contains(&member.recipient) {
+                if own_row {
+                    display_label = member.label.clone();
+                }
                 revoked_labels.insert(member.label);
                 for alias in member.aliases {
                     revoked_labels.insert(alias);
@@ -1600,8 +1640,16 @@ fn apply_swarm_revoke_cascade(
         let (updated, exposed) = strip_labels_from_pool_toml(text, &revoked_labels)?;
         warm_accounts = exposed;
         if let Some(rendered) = updated {
-            doc.set_entry(&Audience::Everyone, AI_POOL_ENTRY, rendered.as_bytes())
-                .map_err(|e| Error::new(e.to_string()))?;
+            // The removal's own rewrite, without the removed Mac's labels: no size door holds
+            // a removal back (`Document::hold_entry_with`).
+            doc.hold_entry_with(
+                &Audience::Everyone,
+                AI_POOL_ENTRY,
+                rendered.as_bytes(),
+                false,
+                None,
+            )
+            .map_err(|e| Error::new(e.to_string()))?;
         }
     }
 
@@ -2221,8 +2269,15 @@ pub(super) fn repair_half_done_revokes_with_log(
             .map_err(|_| Error::new(format!("{AI_POOL_ENTRY} is not UTF-8")))?;
         let (updated, _) = strip_labels_from_pool_toml(text, &denied_labels)?;
         if let Some(rendered) = updated {
-            doc.set_entry(&Audience::Everyone, AI_POOL_ENTRY, rendered.as_bytes())
-                .map_err(|e| Error::new(e.to_string()))?;
+            // A removal's rewrite, as above: no size door holds it back.
+            doc.hold_entry_with(
+                &Audience::Everyone,
+                AI_POOL_ENTRY,
+                rendered.as_bytes(),
+                false,
+                None,
+            )
+            .map_err(|e| Error::new(e.to_string()))?;
             pool_changed = true;
         }
     }

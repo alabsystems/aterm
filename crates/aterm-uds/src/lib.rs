@@ -460,6 +460,8 @@ pub mod keychain;
 #[cfg(unix)]
 pub mod lan;
 pub mod latest;
+/// launchd's job switches (`launchctl print-disabled`), read without changing them.
+pub mod launchd;
 /// Unix-only: the descriptor a throwaway `--headless` instance watches so it ends with the process that started it — both ends.
 #[cfg(unix)]
 pub mod lifeline;

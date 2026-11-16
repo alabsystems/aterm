@@ -17,8 +17,8 @@ use std::{
 mod listener;
 mod multicast;
 mod native;
-pub use listener::Listener;
 pub(crate) use listener::Witness as ListenerWitness;
+pub use listener::{Listener, RecheckedListener};
 pub use multicast::{Heard, Multicast};
 
 /// Loopback is an explicit local/test transport, never inferred as a LAN.
@@ -440,6 +440,22 @@ thread_local! {
     static FIXED_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The routing sockets [`native::RouteChanges::open`] opened on this thread, counted.
+    static ROUTE_CHANGES_OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The route-change sockets listener binds opened on this thread (tests): which bind a caller
+/// made, [`Listener::bind`] opening one for a LAN listener and [`RecheckedListener::bind`] none.
+/// A LAN bind on the loopback shows it without reaching the LAN: its attachment check refuses it
+/// after the socket a heard bind subscribes with first.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn route_changes_opened() -> usize {
+    ROUTE_CHANGES_OPENED.get()
+}
+
 /// How long a kept read of the attachments may stand even while the generation does: a bound on
 /// what a message the kernel dropped from a full routing socket, which says nothing, could leave
 /// unseen.
@@ -459,7 +475,9 @@ fn forget_attachments() {
 /// ([`ATTACHMENTS_REREAD`] after it was made, so the recheck then reads again), or one
 /// [`crate::slots::ACCEPT_POLL`] from now where none is kept (no generation, so every recheck
 /// reads). `None` on Linux: rtnetlink reports a lost message as an error on the listener's own
-/// socket, which withdraws it ([`Listener::drain_changes`]).
+/// socket, which withdraws it ([`Listener::drain_changes`]), and with no generation there every
+/// read of the attachments asks the OS, so a listener with no such socket
+/// ([`RecheckedListener`]) judges by what the OS says at each recheck.
 fn unheard_look(local: SocketAddr) -> Option<Instant> {
     if !cfg!(target_os = "macos") {
         return None;

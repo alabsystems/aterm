@@ -33,7 +33,7 @@ fn cheer_app(behind: bool) -> (App, String, crate::harness_host::HostHandle) {
     app.recompute_sparkle();
     assert!(app.trail_is_kitty_pet(), "fixture: the pet is the trail");
     {
-        let ws = app.windows.get_mut(&WID).expect("window");
+        let mut ws = app.windows.get_mut(&WID).expect("window");
         ws.present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
         });

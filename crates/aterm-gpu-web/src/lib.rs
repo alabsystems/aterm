@@ -762,6 +762,9 @@ impl AtermGpuTerminal {
 
     /// Per-cell minimum contrast ratio (xterm's `minimumContrastRatio`, 1..=21; `<= 1.0` is off, the default).
     pub fn set_minimum_contrast(&mut self, ratio: f32) {
+        if ratio.is_finite() && self.cpu.minimum_contrast().to_bits() == ratio.to_bits() {
+            return;
+        }
         self.note_host_visual_change();
         self.cpu.set_minimum_contrast(ratio);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -772,6 +775,9 @@ impl AtermGpuTerminal {
 
     /// Default-background opacity (0..=1, like Ghostty's `background-opacity`; `1.0` is opaque and the default).
     pub fn set_background_opacity(&mut self, opacity: f32) {
+        if opacity.is_finite() && self.cpu.background_opacity().to_bits() == opacity.to_bits() {
+            return;
+        }
         self.note_host_visual_change();
         self.cpu.set_background_opacity(opacity);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -784,6 +790,10 @@ impl AtermGpuTerminal {
     pub fn set_chrome(&mut self, pad: u16, head: u16) -> Result<(), String> {
         let (cw, ch) = self.cpu.cell_size();
         self.checked_surface_geometry(cw, ch, usize::from(pad), usize::from(head))?;
+        if self.cpu.pad() == usize::from(pad) && self.cpu.head() == usize::from(head) {
+            self.size_swapchain();
+            return Ok(());
+        }
         self.note_host_visual_change();
         self.cpu.set_pad(pad as usize);
         self.cpu.set_head(head as usize);
@@ -813,6 +823,9 @@ impl AtermGpuTerminal {
 
     /// Cursor-fill opacity (0..=1, like Ghostty's `cursor-opacity`; `1.0` is the default opaque fill with block cut-out).
     pub fn set_cursor_opacity(&mut self, opacity: f32) {
+        if opacity.is_finite() && self.cpu.cursor_opacity().to_bits() == opacity.to_bits() {
+            return;
+        }
         self.note_host_visual_change();
         self.cpu.set_cursor_opacity(opacity);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -823,6 +836,9 @@ impl AtermGpuTerminal {
 
     /// Mark the pane unfocused (`true`) or focused (`false`).
     pub fn set_selection_inactive(&mut self, inactive: bool) {
+        if self.cpu.selection_inactive() == inactive {
+            return;
+        }
         self.note_host_visual_change();
         self.cpu.set_selection_inactive(inactive);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -833,6 +849,9 @@ impl AtermGpuTerminal {
 
     /// Set the inactive (unfocused) selection bg (0x00RRGGBB), or `undefined` to derive it from the active selection bg blended toward the theme bg.
     pub fn set_selection_inactive_bg(&mut self, bg: Option<u32>) {
+        if self.cpu.selection_inactive_bg() == bg {
+            return;
+        }
         self.note_host_visual_change();
         self.cpu.set_selection_inactive_bg(bg);
         if let Some(gpu) = self.gpu.as_mut() {
@@ -845,6 +864,9 @@ impl AtermGpuTerminal {
     pub fn set_px(&mut self, px: f32) -> Result<(), String> {
         let (cw, ch, _) = self.cpu.cell_geometry(px);
         self.checked_surface_geometry(cw, ch, self.cpu.pad(), self.cpu.head())?;
+        if self.cpu.px() == px {
+            return Ok(());
+        }
         self.note_host_visual_change();
         self.cpu.set_px(px);
         if let Some(gpu) = self.gpu.as_mut() {

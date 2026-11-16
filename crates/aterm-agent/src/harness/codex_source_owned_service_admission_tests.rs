@@ -41,8 +41,17 @@ fn frontend_requires_independent_control_namespace_and_actual_app_scope() {
         .unwrap();
     assert!(!controller.credential_construction_started().unwrap());
     let admitted = registry.service_frontend(&controller, &scope).unwrap();
+    let identity = admitted.identity();
     admitted.current().unwrap();
     assert!(admitted.same_requester(&registry.service_frontend(&controller, &scope).unwrap()));
+    assert!(
+        identity.same(
+            &registry
+                .service_frontend(&controller, &scope)
+                .unwrap()
+                .identity()
+        )
+    );
     let other_namespace = Registry::for_app(&lifetime);
     assert!(matches!(
         other_namespace.service_frontend(&controller, &scope),
@@ -85,6 +94,14 @@ fn frontend_requires_independent_control_namespace_and_actual_app_scope() {
         .frontend_controller(&peer, &foreign, &other_member, &other_operation)
         .unwrap();
     assert!(!admitted.same_requester(&registry.service_frontend(&other, &scope).unwrap()));
+    assert!(
+        !identity.same(
+            &registry
+                .service_frontend(&other, &scope)
+                .unwrap()
+                .identity()
+        )
+    );
     scope.cancellation().cancel();
     assert!(
         !admitted.retired(),
@@ -92,6 +109,12 @@ fn frontend_requires_independent_control_namespace_and_actual_app_scope() {
     );
     assert_eq!(admitted.current(), Err(Error::Stale));
     assert!(connection.is_live());
+    drop(admitted);
+    drop(scope);
+    assert!(
+        lifetime.pause().unwrap().try_wait().is_ok(),
+        "comparison identity must not keep the original request operation alive"
+    );
 }
 
 #[test]

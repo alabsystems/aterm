@@ -22,6 +22,15 @@ fn settings_frame_preserves_raw_values_and_refuses_truncation_or_trailing_bytes(
 }
 
 #[test]
+fn settings_frame_preserves_non_utf8_and_empty_arguments() {
+    let frame = b"ALABSET1\0\0\0\x1c\0\0\0\x02\0\0\0\x0c/workspace/\xff\0\0\0\0\0\0\0\0";
+    let settings = Settings::read(&mut frame.as_slice()).unwrap();
+    assert_eq!(settings.arguments[0].as_bytes(), b"/workspace/\xff");
+    assert!(settings.arguments[1].is_empty());
+    assert!(settings.environment.is_empty());
+}
+
+#[test]
 fn settings_frame_refuses_invalid_counts_duplicate_keys_and_nul_values() {
     fn frame(body: &[u8]) -> Vec<u8> {
         let mut frame = b"ALABSET1".to_vec();

@@ -37,12 +37,18 @@ THE LAB:
                          --details includes saved transport coordinates
   aterm fleet [--json]   read authenticated fleet facts (three seconds per peer)
                          and match their complete node keys to signed seats.
-                         Show current build, free disk, sessions and account
-                         usage where served; unanswered and unknown seats
-                         stay distinct. JSON includes observation times and
-                         build provenance; an unread seat's book build is
-                         historical. Membership still comes from this Mac's
-                         signed log and book
+                         Show current build, the home volume's size, free
+                         space and build output, the fullest of aterm's own
+                         stores that refuse writes at a bound with its share
+                         (STORE), sessions and account usage
+                         where served; unanswered and unknown seats stay
+                         distinct, and a figure a Mac does not say is `-`
+                         (JSON null), never 0. A build output's age is told
+                         on that Mac's own clock. JSON includes observation
+                         times (this Mac's, and the answer's own) and build
+                         provenance; an unread seat's book build is
+                         historical. Membership still comes from this
+                         Mac's signed log and book
   aterm fleet remove <node|label|name|code> [--stolen]
                          take that Mac out of the lab as this Mac, printing the
                          log name and node id it acted on (as `aterm members
@@ -8784,8 +8790,8 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
             };
             // A peer's sid is printed only when it is one, as `survey` prints it.
             if field("held_from").is_some_and(|node| node.eq_ignore_ascii_case(&own))
-                && let Some(sid) =
-                    field("sid").filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))
+                && let Some(sid) = field("sid")
+                    .filter(|sid| aterm_types::control_request::Sid::parse(sid).is_some())
                 && !held.iter().any(|(_, seen)| seen == sid)
             {
                 held.push((name(), sid.to_owned()));
@@ -10386,11 +10392,20 @@ fn write_fleet(
 /// `aterm fleet access [read|write|full] [--json]`: print or state this machine's fleet access
 /// ([`crate::fleet_access`]). A running window is told of a level stated ([`announcing`]).
 fn access(places: &Places, args: &[String]) -> Result<String, Failure> {
-    let session = std::env::var("ATERM_SESSION_ID").ok();
+    access_with_env(places, args, &|name| std::env::var(name).ok())
+}
+
+/// [`access`] with the calling shell's environment supplied by the caller.
+fn access_with_env(
+    places: &Places,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, Failure> {
+    let session = atpkg::build_start::session_of(env);
     access_from(places, args, session.as_deref()).map(|(report, _)| report)
 }
 
-/// [`access`] asked from `session` (`$ATERM_SESSION_ID`), with whether the level in force
+/// [`access`] asked from `session` (`$ATERM_PARENT_SESSION_ID`), with whether the level in force
 /// changed; it posts nothing. A level named is written even where it is the one in force: it is
 /// this machine's statement now, and a raise the menu-bar lock had pending is not written over
 /// it. A raise is refused inside a worker another fleet Mac started here

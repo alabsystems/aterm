@@ -9,10 +9,8 @@ const R: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const HOP: &str = "1111111111111111111111111111111111111111";
 const OTHER: &str = "2222222222222222222222222222222222222222";
 
-/// A spawner inside a session or outside one: it records each spawn's folder and task, and
-/// answers them in turn.
+/// A pump's spawner: it records each spawn's folder and task, and answers them in turn.
 struct Spawns {
-    in_session: bool,
     answers: Vec<Result<String, String>>,
     spawned: Vec<(PathBuf, String)>,
 }
@@ -20,7 +18,6 @@ struct Spawns {
 impl Spawns {
     fn answering(answers: Vec<Result<String, String>>) -> Self {
         Self {
-            in_session: true,
             answers,
             spawned: Vec::new(),
         }
@@ -29,20 +26,9 @@ impl Spawns {
     fn opening(sid: &str) -> Self {
         Self::answering(vec![Ok(sid.into())])
     }
-
-    fn outside() -> Self {
-        Self {
-            in_session: false,
-            ..Self::answering(Vec::new())
-        }
-    }
 }
 
 impl Spawner for Spawns {
-    fn in_session(&self) -> bool {
-        self.in_session
-    }
-
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
         self.spawned.push((cwd.to_path_buf(), task.to_string()));
         if self.answers.is_empty() {
@@ -74,18 +60,18 @@ fn failure(commit: &str) -> Failure {
 }
 
 #[test]
-fn failed_cut_spawns_one_repair_worker() {
+fn pump_cuts_spawn_one_repair_worker_per_input_hash() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     let record = scratch.path().join("aterm-release").join(RECORD_FILE);
     let clone = scratch.path().join("clone");
     let red = failure(R);
     let hash = input_hash(&red);
 
-    // A failing cut in a session spawns exactly one worker, in the release clone, told the
+    // A pump's failing cut spawns exactly one worker, in the release clone, told the
     // failing log and the cut's inputs.
     let mut first = Spawns::opening("s-0123456789abcdef0123");
     assert_eq!(
-        open(&record, &clone, &red, &mut first),
+        open(&record, &clone, &red, RepairMode::Pump(&mut first)),
         Opened::Spawned {
             hash: hash.clone(),
             sid: "s-0123456789abcdef0123".into()
@@ -142,7 +128,7 @@ fn failed_cut_spawns_one_repair_worker() {
         ..red.clone()
     };
     assert_eq!(
-        open(&record, &clone, &failed_again, &mut again),
+        open(&record, &clone, &failed_again, RepairMode::Pump(&mut again)),
         Opened::Already {
             hash: hash.clone(),
             sid: "s-0123456789abcdef0123".into()
@@ -155,7 +141,7 @@ fn failed_cut_spawns_one_repair_worker() {
     let hop = failure(HOP);
     let mut next = Spawns::opening("s-1111111111111111aaaa");
     assert_eq!(
-        open(&record, &clone, &hop, &mut next),
+        open(&record, &clone, &hop, RepairMode::Pump(&mut next)),
         Opened::Spawned {
             hash: input_hash(&hop),
             sid: "s-1111111111111111aaaa".into()
@@ -163,41 +149,45 @@ fn failed_cut_spawns_one_repair_worker() {
     );
     assert_eq!(next.spawned.len(), 1);
     assert_eq!(Record::load(&record).expect("record").workers.len(), 2);
+}
 
-    // Outside an aterm session it prints the command instead: nothing spawns and nothing is
-    // recorded, so a run inside one still opens the worker.
-    let other = failure(OTHER);
-    let mut outside = Spawns::outside();
-    let opened = open(&record, &clone, &other, &mut outside);
-    let Opened::Command { command, .. } = &opened else {
-        panic!("outside a session the command is given: {opened:?}");
-    };
-    assert!(outside.spawned.is_empty(), "{:?}", outside.spawned);
-    assert!(
-        command.starts_with(&format!(
-            "aterm ctl @self spawn agent=claude {} - <<'ATERM_REPAIR_TASK'\n",
-            shell_word(&format!("cwd={}", clone.display()))
-        )),
-        "{command}"
-    );
-    assert!(
-        command.ends_with(&format!(
-            "{}ATERM_REPAIR_TASK",
-            task(&clone, &other, &input_hash(&other))
-        )),
-        "the here-document is the task: {command}"
-    );
-    let said = opened.lines(&record);
-    assert!(
-        said[0].starts_with("repair: not in an aterm session"),
-        "{said:?}"
-    );
-    assert_eq!(
-        said[1..].join("\n"),
-        *command,
-        "the command is printed whole"
-    );
-    assert_eq!(Record::load(&record).expect("record").workers.len(), 2);
+#[test]
+fn caller_cuts_return_repair_context_without_starting_or_recording_a_worker() {
+    for in_session in [false, true] {
+        assert!(spawner(in_session, false).is_none());
+        for original in [None, Some("not a worker record\n")] {
+            let scratch = aterm_tempfile::tempdir().expect("scratch");
+            let record = scratch.path().join(RECORD_FILE);
+            if let Some(text) = original {
+                std::fs::write(&record, text).expect("the caller's unreadable record");
+            }
+            let red = failure(OTHER);
+            let opened = open(&record, scratch.path(), &red, RepairMode::Caller);
+            let Opened::Caller { hash, briefing } = &opened else {
+                panic!("the caller gets the failure context: {opened:?}");
+            };
+            assert_eq!(*hash, input_hash(&red));
+            for expected in [
+                red.gate.as_str(),
+                red.step.as_str(),
+                red.version.as_str(),
+                red.commit.as_str(),
+                red.trustc.as_str(),
+                red.log.to_str().expect("fixture log"),
+                red.detail[0].as_str(),
+            ] {
+                assert!(briefing.contains(expected), "missing {expected:?}");
+            }
+            assert!(!briefing.contains("`FIX <") && !briefing.contains("`NO-FIX <"));
+            assert!(!briefing.contains("aterm ctl @self spawn"));
+            let said = opened.lines(&record);
+            assert_eq!(said[1..].join("\n"), briefing.trim_end_matches('\n'));
+            match original {
+                Some(text) => assert_eq!(std::fs::read_to_string(&record).unwrap(), text),
+                None => assert!(!record.exists(), "no worker record was created"),
+            }
+        }
+    }
 }
 
 #[test]
@@ -206,7 +196,12 @@ fn a_spawn_that_fails_is_said_and_kept_nowhere() {
     let record = scratch.path().join(RECORD_FILE);
     let red = failure(R);
     let mut refused = Spawns::answering(vec![Err("ERR spawn agent=claude: no such window".into())]);
-    let opened = open(&record, scratch.path(), &red, &mut refused);
+    let opened = open(
+        &record,
+        scratch.path(),
+        &red,
+        RepairMode::Pump(&mut refused),
+    );
     assert_eq!(
         opened,
         Opened::Failed {
@@ -219,7 +214,12 @@ fn a_spawn_that_fails_is_said_and_kept_nowhere() {
 
     let mut working = Spawns::opening("s-2222222222222222bbbb");
     assert!(matches!(
-        open(&record, scratch.path(), &red, &mut working),
+        open(
+            &record,
+            scratch.path(),
+            &red,
+            RepairMode::Pump(&mut working)
+        ),
         Opened::Spawned { .. }
     ));
     assert_eq!(working.spawned.len(), 1, "the next failing cut asks again");
@@ -231,7 +231,12 @@ fn an_unreadable_record_starts_no_worker() {
     let record = scratch.path().join(RECORD_FILE);
     std::fs::write(&record, "[[worker]\nnot a record").expect("write");
     let mut spawns = Spawns::opening("s-3333333333333333cccc");
-    let opened = open(&record, scratch.path(), &failure(R), &mut spawns);
+    let opened = open(
+        &record,
+        scratch.path(),
+        &failure(R),
+        RepairMode::Pump(&mut spawns),
+    );
     assert!(
         matches!(&opened, Opened::Failed { why, .. } if why.contains("is not a repair record")),
         "{opened:?}"
@@ -283,31 +288,21 @@ fn the_input_hash_is_the_cuts_inputs_alone() {
 }
 
 #[test]
-fn the_task_fits_one_spawn_and_the_command_reads_it_back() {
+fn the_task_fits_one_spawn_and_sanitizes_its_payload() {
     let clone = Path::new("/c/a clone's/path");
     let huge = Failure {
         why: format!("{}\n{}", "x".repeat(200_000), "line\n".repeat(5_000)),
-        detail: vec![format!("nul\0here\r{TASK_END}"); 2_000],
-        remedy: format!("{TASK_END}\n").repeat(50),
+        detail: vec!["nul\0here\rdetail".to_owned(); 2_000],
+        remedy: "remedy\n".repeat(50),
         ..failure(R)
     };
     let told = task(clone, &huge, &input_hash(&huge));
     assert!(told.len() <= MAX_TASK_BYTES, "{} bytes", told.len());
     assert!(!told.contains('\0') && !told.contains('\r'));
     assert!(told.ends_with('\n'));
-    assert!(
-        told.lines().all(|line| line != TASK_END),
-        "no line ends the here-document early"
-    );
     assert!(told.contains("more line(s), in the log"));
-    let command = command(clone, &told);
-    assert!(
-        command.starts_with(
-            "aterm ctl @self spawn agent=claude 'cwd=/c/a clone'\\''s/path' - \
-             <<'ATERM_REPAIR_TASK'\n"
-        ),
-        "{command}"
-    );
+    assert!(told.contains(clone.to_str().unwrap()));
+    assert_eq!(spawn_args(clone)[3], format!("cwd={}", clone.display()));
     assert_eq!(
         sid_of("OK s-0123456789abcdef0123\n"),
         Some("s-0123456789abcdef0123".into())
@@ -327,24 +322,18 @@ fn multibyte_excerpts_leave_the_inputs_and_what_to_do_whole() {
         why: format!("{}\n", "─".repeat(300)).repeat(400),
         detail: vec!["𝄞".repeat(300); 2_000],
         remedy: format!("{}\n", "—".repeat(600)).repeat(50),
-        log: PathBuf::from(format!(
-            "/c/clone/.git/aterm-release/logs/run\n{TASK_END}\r\0/04-qualify.log"
-        )),
-        step: format!("4/10 qualify\n{TASK_END}"),
+        log: PathBuf::from("/c/clone/.git/aterm-release/logs/run\nsecond-line\r\0/04-qualify.log"),
+        step: "4/10 qualify\nsecond-line".into(),
         ..failure(R)
     };
     let hash = input_hash(&huge);
     let told = task(clone, &huge, &hash);
     assert!(told.len() <= MAX_TASK_BYTES, "{} bytes", told.len());
     assert!(!told.contains('\0') && !told.contains('\r'));
-    assert!(
-        told.lines().all(|line| line != TASK_END),
-        "no line ends the here-document early:\n{told}"
-    );
     for word in [
-        "What failed: verify release: test, at step 4/10 qualify ATERM_REPAIR_TASK of",
+        "What failed: verify release: test, at step 4/10 qualify second-line of",
         "The step's log, which ends with that detail: /c/clone/.git/aterm-release/logs/run \
-         ATERM_REPAIR_TASK  /04-qualify.log",
+         second-line  /04-qualify.log",
         "- version: 0.6.0",
         R,
         huge.trustc.as_str(),
@@ -381,7 +370,7 @@ fn a_started_worker_the_record_cannot_keep_is_said_unrecorded() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("read-only");
     let red = failure(R);
     let mut spawns = Spawns::opening("s-4444444444444444dddd");
-    let opened = open(&record, scratch.path(), &red, &mut spawns);
+    let opened = open(&record, scratch.path(), &red, RepairMode::Pump(&mut spawns));
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("writable");
     let Opened::Unrecorded { hash, sid, why } = &opened else {
         panic!("a save that fails after the spawn is Unrecorded: {opened:?}");
@@ -419,7 +408,7 @@ fn the_record_keeps_the_newest_sixty_four_workers() {
     full.save(&record).expect("save");
     let mut spawns = Spawns::opening("s-5555555555555555eeee");
     assert!(matches!(
-        open(&record, scratch.path(), &red, &mut spawns),
+        open(&record, scratch.path(), &red, RepairMode::Pump(&mut spawns)),
         Opened::Spawned { .. }
     ));
     let kept = Record::load(&record).expect("record");
@@ -610,12 +599,12 @@ fn a_red_opening_has_one_worker_at_every_tip() {
 
     let mut first = Spawns::opening("s-0123456789abcdef0123");
     assert!(matches!(
-        open(&record, &clone, &opening(R), &mut first),
+        open(&record, &clone, &opening(R), RepairMode::Pump(&mut first)),
         Opened::Spawned { .. }
     ));
     let mut again = Spawns::opening("s-ffffffffffffffffffff");
     assert_eq!(
-        open(&record, &clone, &opening(HOP), &mut again),
+        open(&record, &clone, &opening(HOP), RepairMode::Pump(&mut again)),
         Opened::Already {
             hash: opening_hash("0.5.0"),
             sid: "s-0123456789abcdef0123".into()
@@ -626,7 +615,7 @@ fn a_red_opening_has_one_worker_at_every_tip() {
     // The line of the version it opened then goes red at that same commit: a cut's failure.
     let mut cut = Spawns::opening("s-11111111111111111111");
     assert!(matches!(
-        open(&record, &clone, &failure(R), &mut cut),
+        open(&record, &clone, &failure(R), RepairMode::Pump(&mut cut)),
         Opened::Spawned { .. }
     ));
     let kept = Record::load(&record).unwrap();
@@ -636,13 +625,12 @@ fn a_red_opening_has_one_worker_at_every_tip() {
     );
 }
 
-/// A PUMP'S CUT OPENS ITS WORKER WITHOUT A SESSION. Outside a session a person's cut prints the
-/// command; the pump's reaches the newest local aterm with no `@self`, in a tab it does not
-/// raise.
+/// A pump's cut opens its worker inside or outside a session. Outside one it reaches the
+/// newest local aterm with no `@self`, in a tab it does not raise.
 /// NEGATIVE CONTROL: with `@self` the spawn outside a session names no session and fails, so
 /// an unattended red would open no worker.
 #[test]
-fn a_cut_outside_a_session_spawns_through_the_local_aterm_only_for_the_pump() {
+fn pump_cuts_dispatch_repairs_inside_and_outside_sessions() {
     for (in_session, pump, expected) in [
         (false, false, false),
         (true, false, false),
@@ -655,7 +643,13 @@ fn a_cut_outside_a_session_spawns_through_the_local_aterm_only_for_the_pump() {
             "{in_session} {pump}"
         );
     }
-    assert!(spawner(false, true).in_session(), "the pump's cut spawns");
+    for in_session in [false, true] {
+        assert!(spawner(in_session, true).is_some(), "the pump's cut spawns");
+        assert!(
+            spawner(in_session, false).is_none(),
+            "the caller handles its repair"
+        );
+    }
     let words = unattended_args(Path::new("/c/clone"));
     assert_eq!(
         words,

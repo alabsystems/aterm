@@ -748,7 +748,22 @@ impl Grid {
         if self.storage.scrollback.is_some() {
             let before = self.scrollback_lines();
             let ring_cap = self.storage.max_scrollback;
+            // A rows grow can leave the ring short. Seat the newest history before
+            // reducing the store's share, or it evicts rows the ring could retain.
             let store_limit = limit.map(|l| l.saturating_sub(ring_cap));
+            if let Some(share) = store_limit
+                && self.storage.scrollback.as_ref().is_some_and(|store| {
+                    store
+                        .line_count()
+                        .saturating_add(self.storage.lazy_buffer.len())
+                        > share
+                })
+            {
+                let retained_ring = limit.map_or(ring_cap, |limit| limit.min(ring_cap));
+                self.pull_history_into_ring(
+                    retained_ring.saturating_sub(self.storage.ring_buffer_scrollback()),
+                );
+            }
             // The new share first, then the staged rows into the store under it: drained under
             // the old share, a raise evicted the oldest lines it was meant to keep. A lowered
             // share ends the same either way (the drain's pushes evict the oldest).

@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use aterm_census::seal;
+use aterm_seal as seal;
 
 use super::{CRATES, Drift, MANIFEST, VENDOR, drift, run, vendored, verdict, write};
 use crate::exit;

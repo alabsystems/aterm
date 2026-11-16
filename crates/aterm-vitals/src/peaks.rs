@@ -121,6 +121,13 @@ pub struct Peaks {
     /// bucket's close as Network's are. A file written before it restores and learns it from
     /// zero.
     pub proc_starts: DailyMax,
+    /// Compute watts, CPU + GPU + Neural Engine ([`crate::heat::Watts::compute`]): what the Heat
+    /// row's watt tiles and strip draw against (A4 §4), fed at each bucket's close. A file
+    /// written before it restores and learns it from zero, as each row added since the first.
+    pub compute_w: DailyMax,
+    /// Work per joule, instructions per joule of CPU energy ([`crate::heat::Judged::ipj`]): what
+    /// the Heat row's work tile draws against (A4 §4).
+    pub work_per_joule: DailyMax,
     /// Each device's, most recently read first, at most
     /// [`crate::units::DISK_DEVICES_KEPT`] ([`Self::disk`]).
     pub disks: Vec<DiskPeaks>,
@@ -128,7 +135,15 @@ pub struct Peaks {
 
 impl Peaks {
     /// The fixed rows' names, first in [`Self::to_pairs`].
-    pub const NAMES: [&'static str; 5] = ["net_rx", "net_tx", "tokens", "mem_churn", "proc_starts"];
+    pub const NAMES: [&'static str; 7] = [
+        "net_rx",
+        "net_tx",
+        "tokens",
+        "mem_churn",
+        "proc_starts",
+        "compute_w",
+        "work_per_joule",
+    ];
 
     /// Each peak as `(name, read_s, days)`: the [`Self::NAMES`] rows, then each device's write
     /// and read rows, most recently read first.
@@ -140,6 +155,8 @@ impl Peaks {
             &self.tokens,
             &self.mem_churn,
             &self.proc_starts,
+            &self.compute_w,
+            &self.work_per_joule,
         ];
         let mut rows: Vec<PeakRow> = Self::NAMES
             .iter()
@@ -177,6 +194,8 @@ impl Peaks {
                 "tokens" => &mut p.tokens,
                 "mem_churn" => &mut p.mem_churn,
                 "proc_starts" => &mut p.proc_starts,
+                "compute_w" => &mut p.compute_w,
+                "work_per_joule" => &mut p.work_per_joule,
                 _ => {
                     let (id, write) = match (device(DISK_WRITE), device(DISK_READ)) {
                         (Some(id), _) => (id, true),

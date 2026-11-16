@@ -130,10 +130,10 @@ impl pool::UsageReader for FakeReader<'_> {
         let _gate = fake.gate.lock().unwrap_or_else(|p| p.into_inner());
         fake.reads.lock().unwrap().push(path.to_owned());
         if path != fake.source {
-            return IdentifiedRead::Usage(usage_of("target", now));
+            return IdentifiedRead::Usage(Box::new(usage_of("target", now)));
         }
         if fake.works.load(Ordering::Acquire) {
-            return IdentifiedRead::Usage(usage_of("source", now));
+            return IdentifiedRead::Usage(Box::new(usage_of("source", now)));
         }
         let home = path.parent().unwrap();
         match codex_app_login::refusal_standing(home, None, now) {
@@ -375,6 +375,7 @@ impl World {
             crate::harness_claim::Scoped {
                 proven: proof.clone(),
                 claim,
+                child: None,
             },
             crate::metrics::now_us(),
             aterm_slog::Actor::Ctl,

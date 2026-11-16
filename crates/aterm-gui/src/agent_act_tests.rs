@@ -29,6 +29,8 @@ thread_local! {
     static VERDICTS: Cell<usize> = const { Cell::new(0) };
     /// How many times the team was read: a `codesign` run each, live.
     static TEAM_READS: Cell<usize> = const { Cell::new(0) };
+    /// How many times [`FLICKERING`]'s layout was read.
+    static LAYOUT_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(unix)]
@@ -54,6 +56,51 @@ const FAKE: Kernel = Kernel {
     },
     script: |_| PROC.with_borrow(|p| p.script.clone()),
     version: |_| PROC.with_borrow(|p| p.version),
+    birth: |_| PROC.with_borrow(|p| p.start_us.map(aterm_uds::process::Birth)),
+    layout: agent_image::in_vendor_layout,
+};
+
+#[cfg(unix)]
+thread_local! {
+    /// The processes [`KEYED`] reports, by pid: a harness-led tab's leader and its child.
+    static PROCS: RefCell<BTreeMap<i32, Proc>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// A fake kernel that reports each pid's own process ([`PROCS`]), for a tab whose leader and
+/// agent are two processes.
+#[cfg(unix)]
+const KEYED: Kernel = Kernel {
+    exe: |pid| {
+        let pid = i32::try_from(pid).ok()?;
+        PROCS.with_borrow(|p| p.get(&pid).and_then(|p| p.exe.clone()))
+    },
+    file: |_, exe| FileId::of(exe),
+    start_us: |pid| PROCS.with_borrow(|p| p.get(&pid).and_then(|p| p.start_us)),
+    team: |pid| {
+        let pid = i32::try_from(pid).ok()?;
+        PROCS.with_borrow(|p| p.get(&pid).and_then(|p| p.team.clone()))
+    },
+    script: |pid| PROCS.with_borrow(|p| p.get(&pid).and_then(|p| p.script.clone())),
+    version: |pid| PROCS.with_borrow(|p| p.get(&pid).and_then(|p| p.version)),
+    birth: |pid| {
+        PROCS.with_borrow(|p| {
+            p.get(&pid)
+                .and_then(|p| p.start_us)
+                .map(aterm_uds::process::Birth)
+        })
+    },
+    layout: agent_image::in_vendor_layout,
+};
+
+/// [`FAKE`] whose vendor layout confirms the image on its first read and on no later one: a read
+/// a loaded host made once and then did not.
+#[cfg(unix)]
+const FLICKERING: Kernel = Kernel {
+    layout: |agent, image, places| {
+        LAYOUT_READS.set(LAYOUT_READS.get() + 1);
+        LAYOUT_READS.get() == 1 && agent_image::in_vendor_layout(agent, image, places)
+    },
+    ..FAKE
 };
 
 /// A scratch machine: Claude Code's versions directory, an install in it, a copy of `sleep` and
@@ -223,6 +270,41 @@ fn the_verdict_is_kept_per_process_and_read_again_after_an_exec() {
     );
     assert_eq!(VERDICTS.get(), 4, "another agent named is read again");
     assert_eq!(cached(&s, GROUP + 1), None, "another group has no verdict");
+}
+
+/// ONE LAYOUT READ DECIDES BOTH THE TEAM'S READ AND THE PROOF (LS-72): an install its layout
+/// confirmed is On by that read, its team not read, though a later read of the same layout would
+/// not confirm it. NEGATIVE CONTROL (by hand, run): with the proof read by `proof_among` (a
+/// second layout read) after the first skipped the team's read, the install is Observe with no
+/// proof, kept for the process, and the layout is read twice.
+#[cfg(unix)]
+#[test]
+fn the_layout_read_that_skips_the_team_is_the_proof() {
+    let w = World::new();
+    let places = w.places();
+    set(w.running(&w.install, 30));
+    LAYOUT_READS.set(0);
+    TEAM_READS.set(0);
+    let s = sid("flicker");
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FLICKERING, &places),
+        Verdict {
+            act: Act::On,
+            proof: Some(Proof::Layout),
+        }
+    );
+    assert_eq!(LAYOUT_READS.get(), 1, "the layout is read once");
+    assert_eq!(TEAM_READS.get(), 0, "the layout confirmed it: no team read");
+    let other = sid("flicker-sleep");
+    set(w.running(&w.sleep, 31));
+    LAYOUT_READS.set(0);
+    assert_eq!(
+        read_with(&other, Program::Claude, GROUP, &FLICKERING, &places).act,
+        Act::Observe,
+        "CONTROL: a copy of sleep its one layout read does not confirm is observed"
+    );
+    assert_eq!(LAYOUT_READS.get(), 1);
+    assert_eq!(TEAM_READS.get(), 1, "CONTROL: no layout: the team is read");
 }
 
 /// A read whose key moved under it (the process exec'd or was replaced while its image was read)
@@ -969,6 +1051,7 @@ fn a_harness_led_claude_tab_is_observed() {
                 start: "fixture-birth".to_string(),
             },
             claim,
+            child: None,
         },
         crate::metrics::now_us(),
         aterm_slog::Actor::Ctl,
@@ -1007,4 +1090,142 @@ fn a_harness_led_claude_tab_is_observed() {
     );
     assert_eq!(status_word(&s, Some(Program::Claude), GROUP), "on");
     assert_eq!(withheld_with(&h.ctx, None, &FAKE, &places), None);
+}
+
+/// HX-06: THE ENGINE TYPES IN A HARNESS-LED TAB ONLY WHEN THE CLAIM'S CHILD PASSES THE IMAGE
+/// PROOF (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2). claude-code-alab's store build
+/// leads the tab under its proven contract 4 claim. With no kept child the engine reads the
+/// leader, which no layout, team or stand-in confirms as Claude Code: observed, its writes
+/// withheld. With a kept child that runs Claude Code's own install the engine reads the child:
+/// confirmed (`on`), and its writes pass the gate. NEGATIVE CONTROLS: a kept child running
+/// another image is observed; a kept child whose birth moved (another process under its pid)
+/// is not the agent, and the engine reads the leader again: observed.
+#[cfg(unix)]
+#[test]
+fn the_engine_types_in_a_harness_led_tab_only_when_the_claims_child_passes_the_image_proof() {
+    use aterm_agent::harness::contract;
+    const CHILD: i32 = 4243;
+    const BIRTH: u64 = 1_763_000_000_123_456;
+    let w = World::new();
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let root = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+    let layout = atpkg::store::Layout {
+        prefix: root.join("pkg"),
+    };
+    let build_dir = layout.build_dir("claude-code-alab", 1234);
+    std::fs::create_dir_all(build_dir.join("bin")).expect("build dir");
+    let harness = build_dir.join("bin").join("claude-alab");
+    std::fs::copy("/bin/sleep", &harness).expect("a build");
+    atpkg::store::mark_build_ready(&build_dir).expect("ready");
+    let places = w.places();
+    let h = crate::session_store::test_handle(74);
+    let store = crate::session_store::new_store();
+    store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register(h.clone());
+    let s = h.ctx.self_id.as_str().to_string();
+    {
+        let mut timeline = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        timeline.note_foreground_group(GROUP);
+        timeline.set_program(GROUP, Some("claude-alab".to_string()));
+    }
+    let holder = format!("claude-code-alab@{GROUP}");
+    let claim_with = |child: Option<crate::harness_claim::KeptChild>| {
+        let words = [
+            "contract=4",
+            "scope=relaunch,upgrade",
+            "version=0.3.0",
+            "child=4243:1763000000123456",
+        ];
+        let contract::Words::Scoped(claim) = contract::read(&holder, &words) else {
+            panic!("the registry admits claude-code-alab's contract 4 claim");
+        };
+        assert_eq!(claim.contract, contract::UNIVERSAL);
+        crate::session_timeline::claim_supervisor_scoped(
+            &h.ctx,
+            &holder,
+            Some(75),
+            crate::harness_claim::Scoped {
+                proven: crate::self_claim::Proven {
+                    pid: u32::try_from(GROUP).expect("a pid"),
+                    start: "fixture-birth".to_string(),
+                },
+                claim,
+                child,
+            },
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the proven scoped claim");
+    };
+    let kept = crate::harness_claim::KeptChild {
+        pid: u32::try_from(CHILD).expect("a pid"),
+        claimed_us: BIRTH,
+        birth: aterm_uds::process::Birth(BIRTH),
+    };
+    let procs = |child: Option<Proc>| {
+        PROCS.with_borrow_mut(|p| {
+            p.clear();
+            p.insert(GROUP, w.running(&harness, 50));
+            if let Some(child) = child {
+                p.insert(CHILD, child);
+            }
+        });
+    };
+    let refusal = format!("{}\n", agent_image::OBSERVE_REFUSAL);
+
+    claim_with(None);
+    procs(Some(w.running(&w.install, BIRTH)));
+    assert_eq!(
+        crate::harness_claim::agent_pid_with(&h.ctx, GROUP, &KEYED.birth),
+        GROUP,
+        "no kept child: the agent is the leader"
+    );
+    assert_eq!(hosted_with(&store, &s, &KEYED, &places), Act::Observe);
+    assert_eq!(
+        withheld_with(&h.ctx, None, &KEYED, &places).as_deref(),
+        Some(refusal.as_str())
+    );
+
+    claim_with(Some(kept));
+    assert_eq!(
+        crate::harness_claim::agent_pid_with(&h.ctx, GROUP, &KEYED.birth),
+        CHILD
+    );
+    assert_eq!(
+        hosted_with(&store, &s, &KEYED, &places),
+        Act::On,
+        "the kept child runs Claude Code's own install"
+    );
+    assert_eq!(withheld_with(&h.ctx, None, &KEYED, &places), None);
+    assert_eq!(status_word(&s, Some(Program::Claude), GROUP), "on");
+
+    procs(Some(w.running(&w.sleep, BIRTH)));
+    assert_eq!(
+        hosted_with(&store, &s, &KEYED, &places),
+        Act::Observe,
+        "NEGATIVE CONTROL: a kept child running another image"
+    );
+
+    procs(Some(w.running(&w.install, BIRTH + 1)));
+    assert_eq!(
+        crate::harness_claim::agent_pid_with(&h.ctx, GROUP, &KEYED.birth),
+        GROUP,
+        "another process under the child's pid is not the agent"
+    );
+    assert_eq!(
+        hosted_with(&store, &s, &KEYED, &places),
+        Act::Observe,
+        "NEGATIVE CONTROL: the leader is read again"
+    );
+    assert_eq!(
+        withheld_with(&h.ctx, None, &KEYED, &places).as_deref(),
+        Some(refusal.as_str())
+    );
+    PROCS.with_borrow_mut(BTreeMap::clear);
 }

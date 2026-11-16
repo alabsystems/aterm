@@ -453,7 +453,7 @@ fn a_model_move_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
 }
 
 /// A dry run's options over the scratch folder `root`, for tab `s-1`.
-fn opts_in(root: &Path) -> Opts {
+pub(super) fn opts_in(root: &Path) -> Opts {
     Opts {
         home: root.join("home"),
         state: root.join("state"),
@@ -487,8 +487,8 @@ impl Kernel for Unread {
     fn parent(&self, _: u32) -> Option<u32> {
         None
     }
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        None
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(None)
     }
     fn process_start(&self, _: u32) -> Option<String> {
         None

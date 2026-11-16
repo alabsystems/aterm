@@ -1981,6 +1981,7 @@ fn stand_in_claims(_: &aterm_capacity::Ledger) -> Option<Vec<aterm_capacity::Rec
         timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/ws".to_owned(),
         need: aterm_capacity::Need::new("a build").mem(8 << 30),

@@ -134,25 +134,33 @@ fn run(
         let _ = writeln!(log, "  recorded the goldens and {}", fixture.display());
     }
 
-    let planted = site.join("planted");
-    std::fs::create_dir_all(&planted)
-        .map_err(|e| failed(format!("could not create {}: {e}", planted.display())))?;
-    for entry in std::fs::read_dir(&out).map_err(|e| failed(format!("{}: {e}", out.display())))? {
-        let entry = entry.map_err(|e| failed(e.to_string()))?;
-        let mut contents = crate::read_regular(entry.path()).map_err(|e| failed(e.to_string()))?;
-        if entry.file_name().to_string_lossy().ends_with(".js") {
-            let text = String::from_utf8_lossy(&contents);
-            if !text.contains("return ret$ >>> 0;") {
-                return Err(failed(
-                    "the negative control found no u32 return to plant in".to_string(),
-                ));
+    for (name, original, mutation) in [
+        ("planted", "return ret$ >>> 0;", "return ret$;"),
+        (
+            "planted-utf8",
+            "arg.slice(first.read)",
+            "arg.slice(first.written)",
+        ),
+    ] {
+        let planted = site.join(name);
+        std::fs::create_dir_all(&planted)
+            .map_err(|e| failed(format!("could not create {}: {e}", planted.display())))?;
+        for entry in std::fs::read_dir(&out).map_err(|e| failed(e.to_string()))? {
+            let entry = entry.map_err(|e| failed(e.to_string()))?;
+            let mut contents =
+                crate::read_regular(entry.path()).map_err(|e| failed(e.to_string()))?;
+            if entry.file_name().to_string_lossy().ends_with(".js") {
+                let text = String::from_utf8_lossy(&contents);
+                if !text.contains(original) {
+                    return Err(failed(format!(
+                        "the {name} negative control found no mutation site"
+                    )));
+                }
+                contents = text.replace(original, mutation).into_bytes();
             }
-            contents = text
-                .replace("return ret$ >>> 0;", "return ret$;")
-                .into_bytes();
+            crate::write_fresh(planted.join(entry.file_name()), contents)
+                .map_err(|e| failed(e.to_string()))?;
         }
-        crate::write_fresh(planted.join(entry.file_name()), contents)
-            .map_err(|e| failed(e.to_string()))?;
     }
 
     let mut page = start_page(browser, root, &site, work)?;
@@ -173,6 +181,16 @@ fn run(
     let _ = writeln!(
         log,
         "  negative control: a u32 return read as signed fails the driver"
+    );
+    let (ok, console) = drive(&mut page, "../planted-utf8/aterm_wasm_abi_toy.js")?;
+    if ok || !console.contains("UTF-16 round trip") {
+        return Err(failed(format!(
+            "NEGATIVE CONTROL: the UTF-16 oracle did not reject a byte count used as a UTF-16 offset:\n{console}"
+        )));
+    }
+    let _ = writeln!(
+        log,
+        "  negative control: a byte count used as a UTF-16 offset fails the driver"
     );
     Ok(())
 }

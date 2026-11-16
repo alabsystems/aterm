@@ -12,6 +12,12 @@
 //! - **falls back** wherever the judgment does not say [`Decision::Token`]: it execs the program
 //!   exactly as typed, with no descriptor, and journals `token-fallback` with the reason word
 //!   where the account has a token entry (a launch on an account with none says nothing);
+//! - **starts nothing** where that fallback would start a session on a stored login this Mac must
+//!   not run ([`Decided::unstored`]): the row's login was never made here, so the session would
+//!   come up signed out on an empty directory and its sign-in wall would ask this Mac to sign in
+//!   another Mac's account (FL-135), or another Mac's warm set holds the row
+//!   ([`accounts::Row::held_by`], which refuses every route here). It says why on stderr and
+//!   exits [`NOT_STARTED`];
 //! - **serves** otherwise: it unsets every [`accounts::CREDENTIAL_KEYS`] variable (today's
 //!   judgment left only empty ones) and any inherited marker, sets
 //!   [`token_route::MARKER_ENV`] to the entry and [`token_route::MINTED_ENV`] to the served
@@ -137,8 +143,14 @@ impl Ctx {
     }
 }
 
-/// How long a labelled line waits for a vault writer: a relaunch typed it on purpose.
+/// How long a labelled line waits for a vault writer: a relaunch typed it on purpose. An
+/// unlabelled run on a row with no stored login to fall back on waits as long
+/// ([`Decided::unstored`]): a busy vault would otherwise start nothing.
 pub const LABELLED_WAIT: Duration = Duration::from_secs(2);
+
+/// The wrapper's exit where it starts nothing ([`Decided::unstored`]): `EX_TEMPFAIL`, since a
+/// later run may find the token serving.
+pub const NOT_STARTED: u8 = 75;
 
 /// [`Ask`] over a [`Ctx`]: today's judgment of the launch, the claims snapshot, the vault.
 struct Asked<'a> {
@@ -148,6 +160,8 @@ struct Asked<'a> {
     env: &'a [(&'a str, &'a str)],
     /// The entry today's judgment resolved, for the fallback's journal.
     entry: Cell<Option<TokenEntry>>,
+    /// The row today's judgment resolved the launch to, where a row names its account.
+    label: RefCell<Option<String>>,
     /// Whether the token step found an entry (anything but `absent`).
     found: Cell<bool>,
     /// The read the token step made, to serve from.
@@ -181,6 +195,7 @@ impl Ask for Asked<'_> {
             &|| token_route::outside_why(self.env, &settings, profile),
         )?;
         self.entry.set(found.1);
+        self.label.borrow_mut().clone_from(&found.0.label);
         Ok(found)
     }
 
@@ -210,7 +225,7 @@ impl Ask for Asked<'_> {
         let (Some(vault), Some(store)) = (&self.ctx.vault, &self.ctx.store) else {
             return TokenFact::Absent;
         };
-        let wait = if self.run.named.is_some() {
+        let wait = if self.run.named.is_some() || self.unstored().is_some() {
             LABELLED_WAIT
         } else {
             Duration::ZERO
@@ -236,26 +251,52 @@ impl Ask for Asked<'_> {
     }
 }
 
-/// What the wrapper decided for `run` in `ctx`: the judgment, for [`Decision::Token`] the read
-/// to serve from, and the build in atpkg's store `run.program` resolved to, the one file it
-/// serves. A fallback where the account has a token entry is journaled (`token-fallback`). Off
-/// macOS the judgment ends at `platform`, so it never decides `Token`.
-#[must_use]
-fn decide(run: &Run, ctx: &Ctx) -> (Decision, Option<Read>, Option<PathBuf>) {
-    let (decision, read, build, noted) = decide_with(run, ctx);
-    if let Some((entry, why)) = noted {
-        note_fallback(entry, why, ctx.now);
+impl Asked<'_> {
+    /// Why the launch must not start on its row's stored login here, where it must not: the row
+    /// today's judgment resolved ([`Self::label`]) has no login made on this Mac
+    /// ([`accounts::login_made_here`]), or another Mac's warm set holds it
+    /// ([`accounts::Row::held_by`]). `None` where no row names the account.
+    fn unstored(&self) -> Option<String> {
+        let label = self.label.borrow().clone()?;
+        let row = self.ctx.roster.as_ref()?.row(&label)?;
+        if let Some(holder) = &row.held_by {
+            return Some(format!("{label} is held by {holder}"));
+        }
+        (!accounts::login_made_here(row))
+            .then(|| format!("{label} has no login on this Mac to start on"))
     }
-    (decision, read, build)
 }
 
-/// [`decide`]'s judgment, its read, the resolved build, and the fallback it journals.
-type Decided = (
-    Decision,
-    Option<Read>,
-    Option<PathBuf>,
-    Option<(TokenEntry, &'static str)>,
-);
+/// What the wrapper decided for `run` in `ctx` ([`Decided`]). A fallback where the account has
+/// a token entry is journaled (`token-fallback`), unless the wrapper starts nothing. Off macOS the
+/// judgment ends at `platform`, so it never decides `Token`.
+#[must_use]
+fn decide(run: &Run, ctx: &Ctx) -> Decided {
+    let decided = decide_with(run, ctx);
+    if let Some((entry, why)) = decided.noted {
+        note_fallback(entry, why, ctx.now);
+    }
+    decided
+}
+
+/// What the wrapper decided for a run.
+struct Decided {
+    /// The one judgment.
+    decision: Decision,
+    /// For [`Decision::Token`], the read to serve from.
+    read: Option<Read>,
+    /// The build in atpkg's store the run's program resolved to, the one file it serves.
+    build: Option<PathBuf>,
+    /// The fallback it journals.
+    noted: Option<(TokenEntry, &'static str)>,
+    /// Why the run must not start on its row's stored login here (`Asked::unstored`), where the
+    /// judgment put it there ([`Decision::Stored`]: today's judgment had it on that login, and the
+    /// token does not serve it) or where a token decision found nothing to serve: then the
+    /// wrapper starts nothing ([`NOT_STARTED`]). A run the judgment leaves as typed
+    /// ([`Decision::AsTyped`]) is none: it is off the row's stored login, or no session-starting
+    /// shape.
+    unstored: Option<String>,
+}
 
 /// [`decide`]'s judgment, and the fallback it would journal.
 fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
@@ -294,12 +335,28 @@ fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
         argv: &argv,
         env: &env,
         entry: Cell::new(None),
+        label: RefCell::new(None),
         found: Cell::new(false),
         read: RefCell::new(None),
     };
     let decision = token_route::judge(&facts, &asked);
+    let unstored = match &decision {
+        Decision::Stored(why) => {
+            // The program step comes before the account's: resolve it for the row's login.
+            if *why == Fallback::Program {
+                let _ = asked.account();
+            }
+            asked
+                .unstored()
+                .map(|unstored| format!("{unstored} ({})", why.why()))
+        }
+        Decision::Token { .. } => asked.unstored(),
+        Decision::AsTyped(_) => None,
+    };
     let noted = match &decision {
-        Decision::Stored(why @ (Fallback::Claimed(_) | Fallback::Held(_))) => {
+        // A held row's fallback always starts nothing ([`Asked::unstored`]), so it is never noted.
+        _ if unstored.is_some() && matches!(decision, Decision::Stored(_)) => None,
+        Decision::Stored(why @ Fallback::Claimed(_)) => {
             asked.entry.get().map(|entry| (entry, why.word()))
         }
         Decision::Stored(why) if asked.found.get() => {
@@ -307,7 +364,13 @@ fn decide_with(run: &Run, ctx: &Ctx) -> Decided {
         }
         _ => None,
     };
-    (decision, asked.read.into_inner(), build, noted)
+    Decided {
+        decision,
+        read: asked.read.into_inner(),
+        build,
+        noted,
+        unstored,
+    }
 }
 
 /// Journal that a launch on `entry`'s account fell back (`token-fallback`), with the reason.
@@ -322,8 +385,8 @@ fn note_fallback(entry: TokenEntry, why: &'static str, now: i64) {
 }
 
 /// `aterm harness accounts token-run …` (the words after `accounts token-run`): the module's
-/// summary says what it does. It returns only where the program could not be started (127), or
-/// on a platform with no exec, the program's own exit.
+/// summary says what it does. It returns only where it starts nothing ([`NOT_STARTED`]), where
+/// the program could not be started (127), or on a platform with no exec, the program's own exit.
 pub fn main_entry(args: &[OsString]) -> ExitCode {
     let run = match parse(args) {
         Ok(run) => run,
@@ -334,17 +397,27 @@ pub fn main_entry(args: &[OsString]) -> ExitCode {
     };
     let decided = decide(&run, &Ctx::from_process());
     #[cfg(unix)]
+    let served = match (&decided.decision, &decided.read, &decided.build) {
+        (Decision::Token { entry, .. }, Some(read), Some(build)) => read
+            .token()
+            .zip(read.standing.meta.as_ref())
+            .map(|(token, meta)| (build, token, (*entry, meta.minted_at))),
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let served: Option<()> = None;
+    if let Some(why) = refusal(&decided, served.is_some()) {
+        eprintln!(
+            "aterm: refusing to run {}: {why}",
+            Path::new(&run.program).display()
+        );
+        return ExitCode::from(NOT_STARTED);
+    }
+    #[cfg(unix)]
     {
-        let error = match decided {
-            (Decision::Token { entry, .. }, Some(read), Some(build)) => {
-                match (read.token(), read.standing.meta.as_ref()) {
-                    (Some(token), Some(meta)) => {
-                        serve(build.as_os_str(), &run.args, token, (entry, meta.minted_at))
-                    }
-                    _ => as_typed(&run.program, &run.args),
-                }
-            }
-            _ => as_typed(&run.program, &run.args),
+        let error = match served {
+            Some((build, token, minted)) => serve(build.as_os_str(), &run.args, token, minted),
+            None => as_typed(&run.program, &run.args),
         };
         eprintln!("aterm: {}: {error}", Path::new(&run.program).display());
         ExitCode::from(127)
@@ -352,7 +425,7 @@ pub fn main_entry(args: &[OsString]) -> ExitCode {
     #[cfg(not(unix))]
     {
         // Off Unix the judgment ends at `platform`: the program runs as typed.
-        debug_assert!(!matches!(decided.0, Decision::Token { .. }));
+        debug_assert!(!matches!(decided.decision, Decision::Token { .. }));
         match aterm_uds::spawnfd::transparent(&run.program)
             .args(&run.args)
             .status()
@@ -366,6 +439,21 @@ pub fn main_entry(args: &[OsString]) -> ExitCode {
             }
         }
     }
+}
+
+/// Why [`main_entry`] starts nothing for `decided`, where it does: the run would otherwise start
+/// on its row's stored login, which this Mac must not run ([`Decided::unstored`]), whether the
+/// judgment fell back to it or decided [`Decision::Token`] and the token could not be served
+/// (`served` false). `None` where it serves the token or the judgment leaves nothing in the way.
+fn refusal(decided: &Decided, served: bool) -> Option<String> {
+    if served {
+        return None;
+    }
+    let why = decided.unstored.as_deref()?;
+    Some(match decided.decision {
+        Decision::Token { .. } => format!("{why} (its token could not be read)"),
+        _ => why.to_owned(),
+    })
 }
 
 /// Exec `program` exactly as typed: this process's environment, descriptors and stdio.

@@ -37,10 +37,10 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
     });
     let other_mark = format!("{:016x}", u64::from_str_radix(&mark, 16).unwrap() ^ 1);
 
-    let ghost = "s-fffffffffffffffffffe";
-    let sibling = "s-cafecafecafecafecafe";
-    let legacy = "s-abababababababababab";
-    let same_inc_copy = "s-babababababababababa";
+    let ghost = "t9000000014";
+    let sibling = "t9000000009";
+    let legacy = "t9000000006";
+    let same_inc_copy = "t9000000008";
     let mut god = w.god();
     for (n, (sid, inc, mark)) in [
         (ghost, 1u64, Some(mark.as_str())),
@@ -79,7 +79,7 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
         (kv(&body, "state") == Some("exited")).then_some(())
     });
 
-    let second = "s-ffffffffffffffffffff";
+    let second = "t9000000015";
     god.publish(
         7_104,
         1,
@@ -165,7 +165,7 @@ fn a_later_bridge_of_the_state_dir_retires_an_earlier_ones_ghost() {
         "{:016x}",
         u64::from_str_radix(&mark, 16).expect("the mark is sixteen hex digits") ^ 1
     );
-    let (copy, ghost) = ("s-fffffffffffffffffffc", "s-fffffffffffffffffffd");
+    let (copy, ghost) = ("t9000000012", "t9000000013");
     let mut god = w.god();
     for (n, (sid, by)) in [(ghost, &mark), (copy, &copied)].iter().enumerate() {
         god.publish(

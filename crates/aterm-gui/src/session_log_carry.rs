@@ -306,6 +306,12 @@ impl SessionLog {
             self.journal_start = Some(stats.head);
         }
         self.read_host(&host, at);
+        // The carried log is already open, so no open stamps the lineage's first one: the
+        // predecessor's log open stands for it until the handoff's leaf names the lineage's own
+        // (`SessionLog::seed_opened`).
+        if self.lineage_opened.is_none() {
+            self.lineage_opened = self.opened_wall;
+        }
         self.reconcile(at);
         self.resync();
         Ok(stats)

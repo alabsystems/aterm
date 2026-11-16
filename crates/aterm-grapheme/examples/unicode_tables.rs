@@ -13,7 +13,7 @@ const GC: [&str; 30] = [
     "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn",
 ];
 
-/// The generator each output's seal line names (`aterm_census::seal`).
+/// The generator each output's seal line names (`aterm_seal`).
 const GENERATOR: &str = "aterm-grapheme's `unicode_tables` example";
 const LICENCE_HEADER: &str =
     "// Copyright 2026 Andrew Yates\n// SPDX-License-Identifier: Apache-2.0\n";
@@ -28,7 +28,7 @@ const USAGE: &str = "usage: targo --unverified run -p aterm-grapheme --example u
 fn header() -> String {
     format!(
         "{LICENCE_HEADER}{}\n{HEADER}",
-        aterm_census::seal::line("//", GENERATOR)
+        aterm_seal::line("//", GENERATOR)
     )
 }
 
@@ -282,6 +282,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         _ => return Err(USAGE.into()),
     };
-    std::fs::write(Path::new(destination), aterm_census::seal::stamp(&out)?)?;
+    std::fs::write(Path::new(destination), aterm_seal::stamp(&out)?)?;
     Ok(())
 }

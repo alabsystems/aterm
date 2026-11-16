@@ -297,6 +297,310 @@ fn a_later_merge_replays_the_branchs_own_merge() {
     }
 }
 
+/// A STACKED BRANCH'S MERGE BASES KEEP MAIN'S LATER CLOSURE: the child merged the old main
+/// before its lower branch landed, so both lower tips are bases of the final merge. Main then
+/// closed B beside the child's E; Git's union brings B back, and the landing must drop it.
+/// CONTROLS: the child deliberately changes B, or main opens it again, and B stays open.
+#[test]
+fn a_stacked_branchs_multiple_merge_bases_preserve_closures_and_deliberate_reopenings() {
+    for reopened in ["neither", "child", "main"] {
+        let world = issues_world();
+        commit(&world.work, "a/x.txt", "a2\n");
+        let alpha = commit(&world.work, INDEX, &issues(&[A, D, B, C]));
+        git(&world.work, &["branch", "stacked"]);
+        let old_main = rival_moves(&world, "notes.txt", "main moved before alpha landed\n");
+        git(&world.work, &["fetch", "-q", "origin"]);
+
+        git(&world.work, &["checkout", "-q", "stacked"]);
+        commit(&world.work, INDEX, &issues(&[A, D, E, B, C]));
+        git(&world.work, &["merge", "-q", "--no-edit", &old_main]);
+        assert_eq!(
+            issues_at(&world, "HEAD"),
+            issues(&[A, D, E, B, C]).trim_end(),
+            "B was still open when the child merged main"
+        );
+
+        git(&world.work, &["checkout", "-q", "feature"]);
+        let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
+        assert_eq!(code, exit::PASS, "{reopened}: {said:#?}");
+        let lower_landing = origin_main(&world);
+        assert_eq!(
+            git(&world.work, &["rev-parse", &format!("{lower_landing}^@")])
+                .lines()
+                .collect::<Vec<_>>(),
+            [alpha.as_str(), old_main.as_str()]
+        );
+        assert_eq!(
+            issues_at(&world, &lower_landing),
+            issues(&[A, D, B, C]).trim_end(),
+            "the lower branch landed while B was open"
+        );
+        let closed = rival_moves(&world, INDEX, &issues(&[A, D, C]));
+
+        git(&world.work, &["checkout", "-q", "stacked"]);
+        let changed = measured(B, "Deliberately reopened by the child.");
+        if reopened == "child" {
+            commit(&world.work, INDEX, &issues(&[A, D, E, &changed, C]));
+        }
+        let main = if reopened == "main" {
+            rival_moves(&world, INDEX, &issues(&[A, D, B, C]))
+        } else {
+            closed
+        };
+        let child = git(&world.work, &["rev-parse", "HEAD"]);
+        git(&world.work, &["fetch", "-q", "origin"]);
+        let bases: std::collections::BTreeSet<String> =
+            git(&world.work, &["merge-base", "--all", &child, &main])
+                .lines()
+                .map(str::to_owned)
+                .collect();
+        assert_eq!(
+            bases,
+            std::collections::BTreeSet::from([alpha, old_main]),
+            "{reopened}: both incomparable lower tips are merge bases"
+        );
+        assert!(
+            gits_merge(&world, &main, &child).contains(B_HEADING),
+            "{reopened}: Git's own merge holds B"
+        );
+
+        let expected = match reopened {
+            "child" => issues(&[A, D, E, &changed, C]),
+            "main" => issues(&[A, D, E, B, C]),
+            _ => issues(&[A, D, E, C]),
+        };
+        let judged = std::cell::Cell::new(0);
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| {
+            let now = std::fs::read_to_string(world.work.join(INDEX)).expect("the file judged");
+            assert_eq!(now, expected, "{reopened}: the complete judged issues");
+            judged.set(judged.get() + 1);
+            green()
+        });
+        assert_eq!(
+            (code, bases.len(), judged.get()),
+            (exit::PASS, 1, 1),
+            "{reopened}: {said:#?}"
+        );
+        assert_eq!(bases, [main], "the judgment is based on current main");
+        let pushed = issues_at(&world, &origin_main(&world));
+        assert_eq!(pushed, expected.trim_end(), "{reopened}");
+        assert_eq!(
+            pushed.matches(B_HEADING).count(),
+            usize::from(reopened != "neither"),
+            "{reopened}: a deliberate reopening is kept exactly once"
+        );
+    }
+}
+
+/// THREE BEST BASES KEEP EVERY SIDE'S ENTRIES: the child and main merge the same three lower
+/// tips through different binary merges. Main later closes B, which the child's E brings back
+/// in Git's union. The landing drops B and keeps D, E and the third side's F in full.
+#[test]
+fn three_merge_bases_keep_closed_issues_closed_and_each_sides_entries() {
+    let world = issues_world();
+    git(&world.work, &["checkout", "-q", "-b", "third"]);
+    let third = commit(&world.work, INDEX, &issues(&[A, B, C, F]));
+    git(&world.work, &["checkout", "-q", "feature"]);
+    commit(&world.work, "a/x.txt", "a2\n");
+    let alpha = commit(&world.work, INDEX, &issues(&[A, D, B, C]));
+    git(&world.work, &["branch", "stacked"]);
+    let old_main = rival_moves(&world, "notes.txt", "main moved before alpha landed\n");
+    git(&world.work, &["fetch", "-q", "origin"]);
+
+    git(&world.work, &["checkout", "-q", "stacked"]);
+    commit(&world.work, INDEX, &issues(&[A, D, E, B, C]));
+    git(&world.work, &["merge", "-q", "--no-edit", &old_main]);
+    git(&world.work, &["merge", "-q", "--no-edit", &third]);
+    let child = git(&world.work, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        issues_at(&world, &child),
+        issues(&[A, D, E, B, C, F]).trim_end()
+    );
+
+    git(&world.work, &["checkout", "-q", "feature"]);
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    git(&world.work, &["merge", "-q", "--no-edit", &third]);
+    git(&world.work, &["push", "-q", "origin", "HEAD:main"]);
+    assert_eq!(
+        issues_at(&world, &origin_main(&world)),
+        issues(&[A, D, B, C, F]).trim_end(),
+        "all three lower sides reach main before B closes"
+    );
+    let main = rival_moves(&world, INDEX, &issues(&[A, D, C, F]));
+
+    git(&world.work, &["checkout", "-q", "stacked"]);
+    git(&world.work, &["fetch", "-q", "origin"]);
+    let bases: std::collections::BTreeSet<String> =
+        git(&world.work, &["merge-base", "--all", &child, &main])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(
+        bases,
+        std::collections::BTreeSet::from([alpha, old_main, third])
+    );
+    assert!(gits_merge(&world, &main, &child).contains(B_HEADING));
+
+    let expected = issues(&[A, D, E, C, F]);
+    let judged = std::cell::Cell::new(0);
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| {
+        assert_eq!(
+            std::fs::read_to_string(world.work.join(INDEX)).expect("the file judged"),
+            expected
+        );
+        judged.set(judged.get() + 1);
+        green()
+    });
+    assert_eq!((code, judged.get()), (exit::PASS, 1), "{said:#?}");
+    assert_eq!(bases, [main]);
+    assert_eq!(issues_at(&world, &origin_main(&world)), expected.trim_end());
+}
+
+/// Commit an explicit issue-file resolution over two parents, without moving a ref.
+fn issue_merge_commit(world: &World, tree: &str, first: &str, second: &str) -> String {
+    git(
+        &world.work,
+        &[
+            "commit-tree",
+            tree,
+            "-p",
+            first,
+            "-p",
+            second,
+            "-m",
+            "explicit issue-file resolution",
+        ],
+    )
+}
+
+/// UNRELATED BEST BASES USE THE EMPTY ANCESTOR: two independent histories with the same files
+/// are joined in opposite parent order. The child's bridge closes B while main's bridge adds
+/// D beside it; Git's outer union resurrects B, and the replay must drop it while keeping D.
+#[test]
+fn unrelated_merge_bases_keep_a_bridge_closure_and_the_other_bridges_entries() {
+    let world = issues_world();
+    let one = git(&world.work, &["rev-parse", "HEAD"]);
+    let tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
+    let other = git(
+        &world.work,
+        &["commit-tree", &tree, "-m", "an independent history"],
+    );
+    let bases = Git {
+        root: &world.work,
+        make: &git_cmd,
+    }
+    .complete(&["merge-base", "--all", &one, &other], LOCAL)
+    .expect("the relation between the independent histories");
+    assert_eq!(bases.status.code(), Some(1));
+    assert!(bases.stdout.is_empty(), "the histories share no base");
+    write(&world.work, INDEX, &issues(&[A, C]));
+    git(&world.work, &["add", "--", INDEX]);
+    let child_tree = git(&world.work, &["write-tree"]);
+    let child = issue_merge_commit(&world, &child_tree, &one, &other);
+    write(&world.work, INDEX, &issues(&[A, D, B, C]));
+    git(&world.work, &["add", "--", INDEX]);
+    let main_tree = git(&world.work, &["write-tree"]);
+    let main = issue_merge_commit(&world, &main_tree, &other, &one);
+    let bases: std::collections::BTreeSet<String> =
+        git(&world.work, &["merge-base", "--all", &child, &main])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(bases, std::collections::BTreeSet::from([one, other]));
+    let outer = git(
+        &world.work,
+        &["merge-tree", "--write-tree", "--no-messages", &child, &main],
+    );
+    let outer = outer.lines().next().expect("the outer merge tree");
+    assert!(issues_at(&world, outer).contains(B_HEADING));
+    let (fixed, _) = issues::fixed(
+        &Git {
+            root: &world.work,
+            make: &git_cmd,
+        },
+        &main,
+        &child,
+        Some(outer),
+    )
+    .expect("the unrelated internal bases can be merged")
+    .expect("the outer union's resurrection is repaired");
+    assert_eq!(fixed, issues(&[A, D, C]));
+}
+
+/// A NONREGULAR HISTORICAL BASE IS NOT AN EMPTY ISSUES FILE: both sides explicitly resolved it
+/// to a regular readable file, but their virtual base is unsupported. The replay keeps the
+/// original resolved merge and changes no source bytes, index tree or ref.
+#[test]
+fn a_nonregular_historical_base_keeps_the_original_merge_without_mutating_the_checkout() {
+    let world = issues_world();
+    let base = git(&world.work, &["rev-parse", "HEAD"]);
+    let left = commit(&world.work, "a/x.txt", "a2\n");
+    let blob = git(&world.work, &["rev-parse", &format!("HEAD:{INDEX}")]);
+    git(
+        &world.work,
+        &["update-index", "--cacheinfo", "120000", &blob, INDEX],
+    );
+    let historical_tree = git(&world.work, &["write-tree"]);
+    let right = git(
+        &world.work,
+        &[
+            "commit-tree",
+            &historical_tree,
+            "-p",
+            &base,
+            "-m",
+            "a historical nonregular issues entry",
+        ],
+    );
+    assert!(git(&world.work, &["ls-tree", &right, "--", INDEX]).starts_with("120000 blob "));
+    git(
+        &world.work,
+        &["update-index", "--cacheinfo", "100644", &blob, INDEX],
+    );
+    write(&world.work, INDEX, &issues(&[A, C]));
+    git(&world.work, &["add", "--", INDEX]);
+    let head_tree = git(&world.work, &["write-tree"]);
+    let head = issue_merge_commit(&world, &head_tree, &left, &right);
+    write(&world.work, INDEX, &issues(&[A, D, B, C]));
+    git(&world.work, &["add", "--", INDEX]);
+    let main_tree = git(&world.work, &["write-tree"]);
+    let main = issue_merge_commit(&world, &main_tree, &right, &left);
+    let outer = issue_merge_commit(&world, &main_tree, &head, &main);
+    for at in [&head, &main, &outer] {
+        assert!(git(&world.work, &["ls-tree", at, "--", INDEX]).starts_with("100644 blob "));
+    }
+    let bases: std::collections::BTreeSet<String> =
+        git(&world.work, &["merge-base", "--all", &head, &main])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    assert_eq!(bases, std::collections::BTreeSet::from([left, right]));
+    let resolved = issues(&[A, D, B, C]);
+    assert_eq!(issues_at(&world, &outer), resolved.trim_end());
+    let snapshot = || {
+        (
+            std::fs::read(world.work.join(INDEX)).expect("the source bytes"),
+            git(&world.work, &["write-tree"]),
+            git(&world.work, &["show-ref"]),
+        )
+    };
+    let before = snapshot();
+    let repaired = issues::fixed(
+        &Git {
+            root: &world.work,
+            make: &git_cmd,
+        },
+        &main,
+        &outer,
+        None,
+    )
+    .expect("unsupported history keeps the original fallback without an error");
+    assert_eq!(repaired, None);
+    assert_eq!(snapshot(), before);
+    assert_eq!(issues_at(&world, &outer), resolved.trim_end());
+}
+
 /// AN ENTRY BOTH SIDES CHANGED KEEPS EACH SIDE'S LINES: where the branch measured B while main
 /// closed it and opened F in its place, Git's merge lost B's heading and filed the branch's line
 /// under F's; where both measured A while main closed B, it filed main's line under the B it

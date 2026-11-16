@@ -663,9 +663,12 @@ fn listing(git: &dyn Git, checkout: &Path) -> Result<Vec<(PathBuf, Listed)>, Str
     Ok(out)
 }
 
-/// `path` resolved where it can be, as written where it cannot.
+/// `path` resolved where it can be, as written where it cannot. A resolved path is spelled as git
+/// spells it ([`git_path`]: no Windows verbatim drive prefix), so it compares with a path that
+/// could not be resolved and reads as the person's own spelling in a verdict.
 fn resolved(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path)
+        .map_or_else(|_| path.to_path_buf(), |real| git_path(&real).to_path_buf())
 }
 
 /// The entry `git worktree list --porcelain` in `checkout` gives `wt`.

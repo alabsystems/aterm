@@ -115,8 +115,8 @@ fn find(app: &mut App, wid: WindowId, query: &str) {
     app.windows
         .get_mut(&wid)
         .expect("window")
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .expect("find mode is open")
         .set_query(query.to_string());
     app.search_recompute();
@@ -557,7 +557,7 @@ fn a_hover_resolved_over_another_session_is_never_painted() {
     let wid = WindowId(0);
     feed(&app, wid, PHISH);
     let front = app.front_terminal(wid).expect("front terminal").session;
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.link_hover = Some(crate::link_target::LinkHover {
             cell: (0, LINK_COL),
             window_row: 0,
@@ -1206,7 +1206,7 @@ fn a_pointer_over_a_sibling_pane_discloses_nothing() {
         .process(b"\x1b]8;;https://evil.example/steal\x1b\\google.com\x1b]8;;\x1b\\ for details");
     let (ro, co, _, _) = app.focused_pane_rect(wid);
     assert!(co > 0, "precondition: the focused pane starts mid-window");
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.mods = if cfg!(target_os = "macos") {
             aterm_window::keyboard::ModifiersState::SUPER
         } else {

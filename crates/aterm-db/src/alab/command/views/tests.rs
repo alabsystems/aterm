@@ -1266,7 +1266,7 @@ fn heard(uuid: &str, account: &str, tab: &str, t_ms: u64, ended: bool) -> Heard 
     Heard {
         uuid: uuid.to_owned(),
         account: account.to_owned(),
-        tab: tab.to_owned(),
+        tab: Some(tab.to_owned()),
         t_ms,
         ended,
     }
@@ -1317,6 +1317,48 @@ fn seen_on_lapses_without_a_sighting_and_counts_heard_tabs() {
     assert_eq!(rows[1]["status"], json!("pending"));
     let alone = seen_on(&lapsed, &[], &named, NOW);
     assert!(alone[UNICORN].macs.is_empty(), "{alone:?}");
+}
+
+/// A row that says `signed-out` is no sighting in the registry view either: an account only
+/// such a row names shows no Mac and no `last_seen`, and a Mac whose row says so runs the
+/// account no more, though the tab it was seen in still dates when it was last seen.
+/// NEGATIVE CONTROL: with `seen_on` keeping an account no Mac sighted, at time 0, unicorn's
+/// `last_seen` reads `` left: String("20833 d") right: Null ``.
+#[test]
+fn a_signed_out_row_is_no_sighting_and_runs_nothing_in_the_registry_view() {
+    let out = crate::typed::owned::OwnedRead {
+        rows: [
+            obs_row(
+                &format!("{UNICORN}.{M65}"),
+                UNICORN,
+                "signed-out",
+                0,
+                NOW - 60_000,
+            ),
+            obs_row(
+                &format!("{BRONTO}.{M65}"),
+                BRONTO,
+                "signed-out",
+                0,
+                NOW - 60_000,
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let events = [heard(M65, BRONTO, "aaaaaaaa", NOW - 120_000, false)];
+    let mut rows = vec![
+        json!({"ac": UNICORN, "status": "pending"}),
+        json!({"ac": BRONTO, "status": "pending"}),
+    ];
+    shown_seen(&mut rows, &seen_on(&out, &events, &named, NOW), NOW);
+    assert_eq!(rows[0]["seen_on"], Value::Null);
+    assert_eq!(rows[0]["last_seen"], Value::Null);
+    assert_eq!(rows[0]["status"], json!("pending"));
+    assert_eq!(rows[1]["seen_on"], Value::Null, "the row ended the tab");
+    assert_eq!(rows[1]["last_seen"], json!("2 min"));
+    assert_eq!(rows[1]["status"], json!("pending"));
 }
 
 /// Replacing or clearing a secret cell removes the entries its candidates named, whatever entry
@@ -1682,4 +1724,68 @@ fn the_registry_view_keeps_the_observed_columns_and_the_unbound_seats() {
     ] {
         assert!(read(noun, list).is_err(), "{noun:?} {list:?}");
     }
+}
+
+/// `set <machine> nickname_aliases <members>` writes registry.4's text set member by member
+/// (LT-15B): each member the text names that the set lacks is added, each it holds that the text
+/// leaves out is removed, and one another writer added since stands unless the text drops it.
+/// NEGATIVE CONTROL (run 2026-11-15): with `set` reading every set as holding nothing (`before`
+/// empty), the second write adds both members again and removes none: `` left: Number(…(2))
+/// right: Number(…(1)) ``.
+#[test]
+fn a_text_set_is_set_member_by_member() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let machine = keys::machine_pk("m70");
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry
+        .write(vec![vec![
+            put(&registry::MACHINE, &machine, "label", json!("m70")),
+            put(&registry::MACHINE, &machine, "status", json!("active")),
+            put(&registry::MACHINE, &machine, "row", json!("live")),
+        ]])
+        .unwrap();
+    let set = |members: &str| {
+        view(
+            paths,
+            Noun::Computers,
+            &["set", "m70", "nickname_aliases", members],
+            &mut no_grid,
+            b"",
+            &store,
+        )
+        .unwrap()
+    };
+    let members = || {
+        let view = crate::alab::Registry::at(paths.clone()).view().unwrap();
+        let machines = view.project(&registry::MACHINE);
+        let column = view
+            .collection(&registry::MACHINE)
+            .column("nickname_aliases")
+            .unwrap();
+        let mut held: Vec<String> = cell::members(
+            column,
+            machines.rows[&machine].fields.get("nickname_aliases"),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        held.sort_unstable();
+        held
+    };
+    assert_eq!(set("fb, Red Balloon")["written"], json!(2));
+    assert_eq!(members(), ["Red Balloon", "fb"]);
+    // Another writer's member, added since.
+    registry
+        .write(vec![vec![crate::typed::grid::tests::elem(
+            &registry::MACHINE,
+            &machine,
+            "nickname_aliases",
+            "studio",
+        )]])
+        .unwrap();
+    assert_eq!(set("fb, studio")["written"], json!(1));
+    assert_eq!(members(), ["fb", "studio"]);
+    assert_eq!(set("studio, fb")["written"], json!(0));
 }

@@ -3,9 +3,19 @@
 // Author: Andrew Yates
 
 //! Environment variable deny lists for PTY child processes.
+//!
+//! Two lists decide what a child loses: [`ENV_DENY_VARS`], exact names aterm itself sets, and the
+//! strip list of prefixes ([`EnvStrip`]). The strip list is aterm.toml's `shell_env_strip`
+//! (default [`DEFAULT_ENV_STRIP`]) plus each verified harness record's `env_strip`
+//! (`docs/HARNESS-CONTRACT.md` §2), which can add entries and remove none. The process that
+//! spawns shells installs the list it composed ([`install_env_strip`]); a process that installs
+//! none strips the default.
 
-/// Environment variable prefixes stripped before spawning a PTY child.
-pub const ENV_DENY_PREFIXES: &[&str] = &[
+use std::sync::{Arc, RwLock};
+
+/// The default of aterm.toml's `shell_env_strip`: prefixes of environment variables stripped
+/// before spawning a PTY child.
+pub const DEFAULT_ENV_STRIP: &[&str] = &[
     "CLAUDE",
     "ANTHROPIC_",
     "COPILOT_",
@@ -143,7 +153,153 @@ pub fn agent_marker(var: &dyn Fn(&str) -> Option<String>) -> Option<&'static str
         .find(|k| var(k).is_some_and(|v| !v.is_empty()))
 }
 
-/// Returns `true` if `key` matches a deny-listed AI or provisioning environment variable.
+/// Names an `env_strip` entry may not strip ([`admit_env_strip_entry`]): an entry is refused when
+/// it or one of these is a prefix of the other, so `LC_ALL` is as protected as `LC_`, `TERM_` and
+/// `TERM_PROGRAM` are refused because `TERM` is their prefix (`TERM_PROGRAM` names aterm to its
+/// children), `ATERM_SESSION` because it would strip `ATERM_SESSION_ID`, and `__A` or
+/// `__ATERM_REROUTE` because they would strip aterm's own `__ATERM_` variables
+/// (`__ATERM_REROUTE_PASSTHROUGH`, the reroute stubs' passthrough marker).
+pub const PROTECTED_ENV_NAMES: &[&str] = &[
+    "ATERM_", "__ATERM_", "PATH", "HOME", "SHELL", "TERM", "LANG", "LC_", "SSH_", "TMPDIR", "USER",
+    "LOGNAME", "XDG_", "DYLD_", "GIT_", "TMP",
+];
+
+/// The refusal [`admit_env_strip_entry`] gives an entry that would strip a protected name.
+const PROTECTED_REFUSAL: &str = "an env_strip entry may not strip ATERM_, __ATERM_, PATH, HOME, \
+     SHELL, TERM, LANG, LC_, SSH_, TMPDIR, USER, LOGNAME, XDG_, DYLD_, GIT_ or TMP (neither may \
+     be a prefix of the other)";
+
+/// The longest strip-list entry.
+const ENV_STRIP_ENTRY_MAX: usize = 64;
+
+/// Whether `entry` may join a strip list: it matches `[A-Z_][A-Z0-9_]{2,}` (at most 64 bytes),
+/// and neither it nor any [`PROTECTED_ENV_NAMES`] name is a prefix of the other.
+///
+/// # Errors
+/// The rule the entry breaks, in words a refusal line prints.
+pub fn admit_env_strip_entry(entry: &str) -> Result<(), &'static str> {
+    let bytes = entry.as_bytes();
+    let first_ok = bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_uppercase() || *b == b'_');
+    if bytes.len() < 3
+        || bytes.len() > ENV_STRIP_ENTRY_MAX
+        || !first_ok
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return Err("an env_strip entry matches [A-Z_][A-Z0-9_]{2,}");
+    }
+    if PROTECTED_ENV_NAMES
+        .iter()
+        .any(|p| p.starts_with(entry) || entry.starts_with(p))
+    {
+        return Err(PROTECTED_REFUSAL);
+    }
+    Ok(())
+}
+
+/// One entry a strip list refused, and why ([`EnvStrip::compose`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvStripRefusal {
+    /// Who asked for it: `aterm.toml` or a harness id.
+    pub origin: String,
+    /// The entry as written.
+    pub entry: String,
+    /// The rule it broke ([`admit_env_strip_entry`]).
+    pub reason: &'static str,
+}
+
+/// The prefixes a spawned child loses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvStrip {
+    prefixes: Vec<String>,
+}
+
+impl Default for EnvStrip {
+    /// [`DEFAULT_ENV_STRIP`].
+    fn default() -> Self {
+        Self {
+            prefixes: DEFAULT_ENV_STRIP.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+}
+
+impl EnvStrip {
+    /// The list a person's `shell_env_strip` (`None`: unset, so [`DEFAULT_ENV_STRIP`]) and the
+    /// harness records' `(id, entry)` pairs make. A record's entry only adds: nothing a record
+    /// says removes a prefix. Every entry passes [`admit_env_strip_entry`] or is refused, and a
+    /// repeated one is kept once.
+    #[must_use]
+    pub fn compose<'a>(
+        person: Option<&'a [String]>,
+        records: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> (Self, Vec<EnvStripRefusal>) {
+        let mut strip = Self {
+            prefixes: Vec::new(),
+        };
+        let mut refused = Vec::new();
+        let base: Vec<(&str, &str)> = match person {
+            Some(list) => list.iter().map(|e| ("aterm.toml", e.as_str())).collect(),
+            None => DEFAULT_ENV_STRIP.iter().map(|e| ("aterm", *e)).collect(),
+        };
+        for (origin, entry) in base.into_iter().chain(records) {
+            match admit_env_strip_entry(entry) {
+                Ok(()) => {
+                    if !strip.prefixes.iter().any(|p| p == entry) {
+                        strip.prefixes.push(entry.to_string());
+                    }
+                }
+                Err(reason) => refused.push(EnvStripRefusal {
+                    origin: origin.to_string(),
+                    entry: entry.to_string(),
+                    reason,
+                }),
+            }
+        }
+        (strip, refused)
+    }
+
+    /// The prefixes, in the order they were composed.
+    #[must_use]
+    pub fn prefixes(&self) -> &[String] {
+        &self.prefixes
+    }
+
+    /// Whether `key` starts with one of the prefixes.
+    #[must_use]
+    pub fn strips(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|p| key.starts_with(p.as_str()))
+    }
+}
+
+/// The strip list this process installed, or `None` before any install.
+static INSTALLED: RwLock<Option<Arc<EnvStrip>>> = RwLock::new(None);
+
+/// Make `strip` the list every later spawn in this process strips ([`is_ai_env_var`]).
+pub fn install_env_strip(strip: EnvStrip) {
+    let mut slot = INSTALLED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(Arc::new(strip));
+}
+
+/// The installed strip list, or the default one ([`EnvStrip::default`]) before any install.
+#[must_use]
+pub fn effective_env_strip() -> Arc<EnvStrip> {
+    static DEFAULT: std::sync::OnceLock<Arc<EnvStrip>> = std::sync::OnceLock::new();
+    let slot = INSTALLED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.as_ref() {
+        Some(strip) => Arc::clone(strip),
+        None => Arc::clone(DEFAULT.get_or_init(|| Arc::new(EnvStrip::default()))),
+    }
+}
+
+/// Returns `true` if `key` matches a deny-listed AI or provisioning environment variable: an
+/// exact [`ENV_DENY_VARS`] name, or a prefix of the installed strip list ([`install_env_strip`]).
 #[must_use]
 #[inline]
 pub fn is_ai_env_var(key: &str) -> bool {
@@ -154,15 +310,7 @@ pub fn is_ai_env_var(key: &str) -> bool {
             break;
         }
     }
-    if denied {
-        return true;
-    }
-    for prefix in ENV_DENY_PREFIXES {
-        if key.starts_with(prefix) {
-            return true;
-        }
-    }
-    false
+    denied || effective_env_strip().strips(key)
 }
 
 /// Classifies an OS environment variable name against [`is_ai_env_var`].

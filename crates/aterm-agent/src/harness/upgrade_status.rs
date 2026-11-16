@@ -1856,7 +1856,10 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
         (_, "not-idle:waiting")
         | (
             "box" | "draft" | "login" | "attended" | "held" | "terminal" | NOT_FOREGROUND | CLAIMED
-            | AUTOPILOT_OFF | AGENT_OFF,
+            | AUTOPILOT_OFF | AGENT_OFF
+            // Another user's agent, whose arguments aterm never reads (LS-72): only the person can
+            // start it as their own.
+            | crate::harness::relaunch::ARGV_WITHHELD,
             _,
         ) => WaitClass::Person,
         (
@@ -1889,7 +1892,14 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
             | "no-process"
             | "argv-unreadable"
             | "exe-unreadable"
-            | "home-unreadable",
+            | "home-unreadable"
+            // A process fact the relaunch snapshot read did not read (LS-72): its terminal's
+            // owner, the shell holding the tab, the vendor layout naming its lane, or the
+            // session record registering it. Each is a tab not read yet, never the person's.
+            | crate::harness::upgrade_drive::TERMINAL_UNREAD
+            | crate::harness::relaunch::SHELL_UNREAD
+            | crate::harness::relaunch::LAYOUT_UNREAD
+            | crate::harness::relaunch::RECORDS_UNREAD,
             _,
         ) => WaitClass::TabUnread,
         // The relaunch's own admission after its agent ended (`relaunch::WAIT_ACCOUNT`), retried

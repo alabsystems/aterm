@@ -2,12 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! A BUILD'S CLAIM KEPT BY A HOLDER WHILE THE BUILD RUNS IN ITS FRONT'S PID (BUILD-ADMIT, the shim
-//! hop). The front ([`super::front_exec`]) claims, spawns `<aterm> __build_hold <pid> <serial>
-//! <claim> <key> <book>` detached ([`aterm_uds::spawnfd::detached_with_two_fds`]: its own session,
-//! stdio on `/dev/null`, a copy of the claim's descriptor at 3 and the arming pipe's write end at
-//! 4), waits for the arming byte, hands its own copy off and execs the build. That call's first
-//! act ([`entry`]) forks once, while it has one thread, and the parent exits, so the holder is
-//! launchd's: no job's signal, no `TaskStop` of the caller's tree and no wait of the build's
+//! hop). The front ([`super::front_exec_bounded`]) claims, spawns `<aterm> __build_hold <pid>
+//! <serial> <claim> <key> <book>` detached ([`aterm_uds::spawnfd::detached_with_two_fds`]: its own
+//! session, stdio on `/dev/null`, a copy of the claim's descriptor at 3 and the arming pipe's write
+//! end at 4), waits for the arming byte, hands its own copy off and execs the build. That call's
+//! first act ([`entry`]) forks once, while it has one thread, and the parent exits, so the holder
+//! is launchd's: no job's signal, no `TaskStop` of the caller's tree and no wait of the build's
 //! reaches it.
 //!
 //! The holder ([`hold`]) writes its pid, adopts the claim (`Claim::adopt`'s three proofs),

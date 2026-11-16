@@ -34,6 +34,8 @@ fn accepted() -> Reading {
     Reading::Usage(Usage {
         sample: Default::default(),
         walls: Vec::new(),
+        refusal: None,
+        limits: Default::default(),
     })
 }
 

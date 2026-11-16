@@ -46,7 +46,7 @@ fn the_drift_request_shapes_are_recognized() {
     assert!(is_cast_drift(&strings(&["cast", "drift"])));
     assert!(!is_cast_drift(&strings(&["cast", "frames"])));
     assert!(!is_cast_drift(&strings(&["cast"])));
-    assert!(is_drift_request("cast", "@s-a cast drift rows=2\n"));
+    assert!(is_drift_request("cast", "@taxxxxxxxxx cast drift rows=2\n"));
     assert!(is_drift_request("cast", "cast drift"));
     assert!(!is_drift_request("cast", "cast frames"));
     assert_eq!(
@@ -194,13 +194,13 @@ fn an_older_server_gets_the_report_computed_client_side() {
 fn the_offline_entry_refuses_what_it_cannot_do() {
     let parts = strings(&["cast", "drift", "--file", "/nonexistent.cast"]);
     offline_entry(&parts, &LocalVerbs::NONE).expect_err("no analyzer");
-    let with_sel = strings(&["@s-a", "cast", "drift", "--file", "x"]);
+    let with_sel = strings(&["@taxxxxxxxxx", "cast", "drift", "--file", "x"]);
     let local = LocalVerbs {
         cast_drift: Some(echo),
         ..LocalVerbs::NONE
     };
     assert!(offline_entry(&with_sel, &local).is_err());
-    let live_form = strings(&["@s-a", "cast", "drift", "rows=2"]);
+    let live_form = strings(&["@taxxxxxxxxx", "cast", "drift", "rows=2"]);
     assert!(offline_entry(&live_form, &local).unwrap().is_none());
     let missing = offline_entry(&parts, &local).expect_err("unreadable file");
     assert!(

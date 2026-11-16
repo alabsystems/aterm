@@ -1261,10 +1261,12 @@ fn find_availability_tracks_content_and_query_without_changing_documents() {
         .unwrap();
     assert_find_availability(&app, wid, true, false);
     let (_, view) = app.active_native_view(wid).unwrap();
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("editor view");
     };
     state.buffer = None;
+    drop(route_native_guard);
     assert_find_availability(&app, wid, false, false);
     app.frontmost_window = None;
     assert_find_availability(&app, wid, false, false);
@@ -2048,7 +2050,7 @@ fn the_palette_scrim_is_a_layer_and_the_theme_picker_has_none() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.cols = 200;
         ws.input_scratch.cells = vec![Vec::new(); 50];
     }
@@ -2067,7 +2069,7 @@ fn the_palette_scrim_is_a_layer_and_the_theme_picker_has_none() {
         card.dx
     );
 
-    app.windows.get_mut(&wid).unwrap().overlay = None;
+    app.windows.get_mut(&wid).unwrap().routing.set_overlay(None);
     app.open_theme_palette();
     assert!(
         app.windows[&wid]
@@ -2089,7 +2091,7 @@ fn a_retina_window_paints_and_hit_tests_the_card_at_its_width_in_points() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.cols = 400;
         ws.input_scratch.cells = vec![Vec::new(); 50];
     }
@@ -2633,7 +2635,11 @@ fn palette_theme_preview_ends_when_the_highlight_or_the_palette_goes() {
     highlight(&mut app, "Gruvbox Light");
     app.sync_palette_theme_preview();
     assert_ne!(app.theme, before);
-    app.windows.get_mut(&WindowId(0)).unwrap().overlay = None;
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .routing
+        .set_overlay(None);
     app.sync_palette_theme_preview();
     assert!(
         app.theme_preview.is_none(),

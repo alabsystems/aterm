@@ -63,6 +63,9 @@ mod gl;
 #[cfg(all(test, target_os = "macos", not(gl_arm)))]
 #[path = "gl/shaders.rs"]
 mod gl_shaders;
+#[cfg(all(test, not(gl_arm)))]
+#[path = "gl/source.rs"]
+mod gl_source;
 #[cfg(target_os = "macos")]
 mod metal;
 /// The quiet-commit probe's entry point and types (`benches/quiet_commit.rs`).

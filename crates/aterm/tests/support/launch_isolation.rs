@@ -195,7 +195,7 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
 }
 
 #[path = "aterm_under_test.rs"]
-mod aterm_under_test;
+pub(crate) mod aterm_under_test;
 pub use aterm_under_test::aterm_executable;
 
 pub fn apply(cmd: &mut Command, root: &Path) {

@@ -51,7 +51,11 @@ fn receipt_checks_local_config_and_retirement_after_planning() {
 #[test]
 fn policy_and_source_precedence_are_rechecked_after_capture() {
     let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-    for retire in [false, true] {
+    for retire in [
+        #[cfg(unix)]
+        false,
+        true,
+    ] {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let home = scratch.path();
         let config = home.join("aterm.toml");
@@ -74,7 +78,9 @@ fn policy_and_source_precedence_are_rechecked_after_capture() {
         if retire {
             let held = store.acquire().unwrap();
             store.retire_source_held(&held, 1).unwrap();
-        } else {
+        }
+        #[cfg(unix)]
+        if !retire {
             crate::vault_entry::seed(
                 home,
                 &[(crate::harness::ai_pool::AI_POOL_FILE, b"account=[]\n")],

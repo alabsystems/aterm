@@ -132,6 +132,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
         M::Messages => spec("app.settings.messages", S::App, A::ConfigMutate, C::Any),
         M::SystemState => spec("app.system_state.open", S::App, A::ConfigMutate, C::Any),
+        M::Tables => spec("app.tables.open", S::App, A::ConfigMutate, C::Any),
         M::Mail => spec("app.mail.open", S::App, A::ConfigMutate, C::Any),
         M::HarnessSettings => spec("app.settings.harness", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
@@ -177,6 +178,9 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::ConfigMutate,
             C::Any,
         ),
+        M::ShowSystemResourcesHere => {
+            spec("sys.resources_band.toggle", S::Window, A::LocalUi, C::Any)
+        }
         M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
         M::NetworkState => spec("sys.network_state.open", S::Window, A::LocalUi, C::Any),
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),

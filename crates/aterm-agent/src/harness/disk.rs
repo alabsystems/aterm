@@ -81,7 +81,8 @@ pub mod worktree;
 #[path = "disk_cadence.rs"]
 pub mod cadence;
 
-/// The rebuildable budget's sizing and its shared record (`aterm ctl sys disk`'s `budget`).
+/// The rebuildable budget's sizing and its shared record (`aterm ctl sys disk`'s `budget`), and
+/// the pass that holds the volume to its cap.
 #[path = "disk_budget.rs"]
 pub mod budget;
 
@@ -241,7 +242,7 @@ pub struct Config {
     pub apply: bool,
     /// Below this many free GiB the host's tick applies [`auto_plan`]; `0` is off ([`DEFAULT_AUTO_FREE_GIB`]).
     pub auto_free_gib: u64,
-    /// Once the volume is low, may a build directory whose owner is gone go whole ([`DEFAULT_DEAD_BUILD_DIRS`], tier 1)?
+    /// Once the volume is low, or over its rebuildable budget ([`budget`]), may a build directory whose owner is gone go whole ([`DEFAULT_DEAD_BUILD_DIRS`], tier 1)?
     pub dead_build_dirs: bool,
     /// `disk.room_gib`: the room PINNED, read as written (`None`: the watch's measured room, [`room`]).
     pub room_gib: Option<u64>,
@@ -249,7 +250,7 @@ pub struct Config {
     pub idle_build_dirs: bool,
     /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]).
     pub idle_build_days: i64,
-    /// `disk.cap_used_gib`: the cap the rebuildable budget is counted against ([`Self::budget`]). No line, level or removal reads it, and a pass's discovery cycle is scoped on [`Self::removal_view`], which leaves it out.
+    /// `disk.cap_used_gib`: the cap the rebuildable budget is counted against ([`Self::budget`]). No line or level reads it; over it the budget's pass takes only what no live session's builds use ([`budget`]), and the pressure pass's discovery cycle is scoped on [`Self::removal_view`], which leaves it out.
     pub cap_used_gib: Cap,
 }
 
@@ -617,6 +618,8 @@ pub struct Survey {
     pub demand: Option<u64>,
     /// The projection standing on the volume ([`fill::Fill`]): pressure now (§8.2).
     pub projected: Option<fill::Projection>,
+    /// The free bytes a budget pass stops at ([`budget::Over::free_target`]), where one runs.
+    pub budget: Option<u64>,
 }
 
 impl Survey {
@@ -646,6 +649,7 @@ impl Survey {
             mounts: None,
             demand: None,
             projected: None,
+            budget: None,
         }
     }
 }
@@ -947,6 +951,9 @@ pub struct Report {
     pub demand: Option<u64>,
     /// The projection the pass ran under ([`Survey::projected`]).
     pub projected: Option<fill::Projection>,
+    /// What a budget pass may take ([`budget::ask`]), where one runs: [`pass_plan`] then plans
+    /// its rows alone.
+    pub budget: Option<budget::Ask>,
 }
 
 /// One build directory — or an x.py checkout's whole `build/` — holding bytes no row of the report would free.
@@ -1465,6 +1472,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         room: survey.room,
         demand: survey.demand,
         projected: survey.projected,
+        budget: None,
     }
 }
 
@@ -1541,9 +1549,15 @@ fn whole_verdict(
         return None;
     };
     let projected = survey.projected.as_ref();
-    let low =
+    let pressed =
         config.below_warn(survey.free_bytes) || survey.demand.is_some() || projected.is_some();
-    if !config.dead_build_dirs || config.auto_free_gib == 0 || !low {
+    // Over the budget alone, the line the row names is the free space the budget pass stops at.
+    let budget_line = survey
+        .budget
+        .filter(|_| !pressed)
+        .map(|free_target| free_target.div_ceil(GIB));
+    if !config.dead_build_dirs || config.auto_free_gib == 0 || !(pressed || survey.budget.is_some())
+    {
         return None;
     }
     let below = config.below_auto_floor(survey.free_bytes);
@@ -1612,12 +1626,12 @@ fn whole_verdict(
             last_used: newest,
             age_s,
             quiet_s,
-            floor_gib: if short {
+            floor_gib: budget_line.unwrap_or(if short {
                 config.auto_free_gib
             } else {
                 config.warn_free_gib
-            },
-            until_gib: config.warn_free_gib,
+            }),
+            until_gib: budget_line.unwrap_or(config.warn_free_gib),
             device,
             projected: projected.filter(|_| !below).copied(),
         })
@@ -1888,9 +1902,11 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
         if !config.below_warn(survey.free_bytes)
             && survey.demand.is_none()
             && survey.projected.is_none()
+            && survey.budget.is_none()
         {
             return format!(
-                "{what}; it goes whole once free space is below the {} GiB warning",
+                "{what}; it goes whole once free space is below the {} GiB warning, or the \
+                 volume is over its rebuildable budget",
                 config.warn_free_gib
             );
         }
@@ -3092,6 +3108,81 @@ pub fn worktree_row(now: i64, action: SweepAction, row: &WorktreeRow<'_>) -> Str
         .unwrap_or_else(|_| format!("{{\"kind\":\"{WORKTREE_ROW_KIND}\"}}"))
 }
 
+/// The `kind` of the row that says a pass cannot hold the volume to its cap
+/// ([`cannot_meet_row`]).
+pub const CANNOT_MEET_ROW_KIND: &str = "cannot-meet";
+
+/// What one `cannot-meet` row of the disk ledger says ([`cannot_meet_row`]).
+#[derive(Debug, Clone, Copy)]
+pub struct CannotMeetRow<'a> {
+    /// Which pass could not meet it (`budget`).
+    pub by: &'a str,
+    /// The volume, by its spelled key.
+    pub volume: &'a str,
+    /// The budget the pass ran against: its cap, kept and rebuildable bytes.
+    pub budget: &'a Budget,
+    /// Whether the figures, or what the pass's search reached, were a floor.
+    pub partial: bool,
+    /// Free bytes measured after the pass.
+    pub free: u64,
+    /// The free bytes the pass stopped at.
+    pub free_target: u64,
+    /// The build directories live sessions kept from it.
+    pub held: usize,
+}
+
+/// One `cannot-meet` row of the disk ledger: a pass took every row it may and the volume is
+/// still over its cap. A record, not a request: no alert reads it.
+#[must_use]
+pub fn cannot_meet_row(now: i64, row: &CannotMeetRow<'_>) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert(
+        "kind".to_owned(),
+        Value::from(CANNOT_MEET_ROW_KIND.to_owned()),
+    );
+    o.insert(
+        "by".to_owned(),
+        Value::from(truncate_bytes(row.by, ROW_TEXT_CAP).to_owned()),
+    );
+    o.insert(
+        "volume".to_owned(),
+        Value::from(truncate_bytes(row.volume, ROW_TEXT_CAP).to_owned()),
+    );
+    o.insert("cap_bytes".to_owned(), Value::from(row.budget.cap));
+    o.insert("kept_bytes".to_owned(), Value::from(row.budget.kept));
+    o.insert(
+        "rebuildable_bytes".to_owned(),
+        Value::from(row.budget.rebuildable),
+    );
+    o.insert("partial".to_owned(), Value::from(row.partial));
+    o.insert("free_bytes".to_owned(), Value::from(row.free));
+    o.insert("target_free_bytes".to_owned(), Value::from(row.free_target));
+    o.insert(
+        "held".to_owned(),
+        Value::from(u64::try_from(row.held).unwrap_or(u64::MAX)),
+    );
+    let text = format!(
+        "{} free of the {} the cap leaves, with {}{} kept that aterm cannot rebuild and nothing \
+         more a pass may take ({} build director{} kept for live sessions); no further row \
+         until the cap or the volume changes or a pass meets the target; a pass is planned \
+         again when the rebuildable bytes grow or the live sessions change",
+        human_bytes(row.free),
+        human_bytes(row.free_target),
+        if row.partial { "at most " } else { "" },
+        human_bytes(row.budget.kept),
+        row.held,
+        if row.held == 1 { "y" } else { "ies" },
+    );
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(&text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{CANNOT_MEET_ROW_KIND}\"}}"))
+}
+
 /// One `poke` row of the disk ledger.
 #[must_use]
 pub fn poke_row(now: i64, cause: &poke::Cause, free: Option<u64>, level: Level) -> String {
@@ -3239,6 +3330,9 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
     if c.auto_free_gib == 0 {
         return None;
     }
+    if let Some(ask) = &rep.budget {
+        return Some(budget_plan(rep, ask));
+    }
     let low = c.below_warn(Some(free));
     let short = c.pressed(Some(free), rep.projected.as_ref());
     let demand = rep
@@ -3278,6 +3372,28 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
             })
             .collect(),
     )
+}
+
+/// THE BUDGET PASS'S PLAN ([`pass_plan`] of a report with [`Report::budget`]): the removable
+/// tier 1, 2 and 3 rows of the build directories `ask` makes eligible, in the report's order
+/// (cheapest first), each stopping at `ask`'s free target, tier 1's too: the measure before
+/// each row is where the pass stands down. Tier 4 is never the budget's.
+fn budget_plan(rep: &Report, ask: &budget::Ask) -> Vec<Planned> {
+    rep.rows
+        .iter()
+        .filter(|r| r.class == Class::CargoTargets && r.removable)
+        .filter(|r| {
+            matches!(
+                r.tier(),
+                Some(Tier::EndedOwners | Tier::IdleIncremental | Tier::IdleWhole)
+            )
+        })
+        .filter(|r| row_dir(r).is_some_and(|dir| ask.eligible.contains(dir)))
+        .map(|r| Planned {
+            row: r.clone(),
+            target: Some(ask.free_target),
+        })
+        .collect()
 }
 
 /// The rows [`pass_plan`] would take, without their targets: what the automatic grant reaches.
@@ -3373,10 +3489,16 @@ fn remove_rows(
     done: &mut Applied,
 ) {
     let tier_of = |p: &Planned| p.row.tier().map(Tier::number);
-    let mut runs: BTreeMap<Option<u8>, TierRun> = BTreeMap::new();
+    // Each tier counts what it released against the shortfall its first measure read. A budget
+    // pass's rows all stop at one free target, so its tiers count as one run: a free figure that
+    // lags its removals stops the pass once the shortfall is released, not once a tier.
+    let one_run = rep.budget.is_some();
+    let run_of = |p: &Planned| (!one_run).then(|| tier_of(p));
+    let mut runs: BTreeMap<Option<Option<u8>>, TierRun> = BTreeMap::new();
     for (i, planned) in rows.iter().enumerate() {
         let tier = tier_of(planned);
-        let run = runs.entry(tier).or_default();
+        let key = run_of(planned);
+        let run = runs.entry(key).or_default();
         if run.stopped {
             continue;
         }
@@ -3393,7 +3515,7 @@ fn remove_rows(
             if let Some(by) = by {
                 let left = rows[i..]
                     .iter()
-                    .filter(|p| tier_of(p) == tier && p.target.is_some())
+                    .filter(|p| run_of(p) == key && p.target.is_some())
                     .count();
                 let stop = Stop {
                     by,
@@ -3430,7 +3552,7 @@ fn remove_rows(
             Ok(removed) => {
                 done.freed_bytes = done.freed_bytes.saturating_add(removed.bytes);
                 if planned.target.is_some() {
-                    let run = runs.entry(tier).or_default();
+                    let run = runs.entry(key).or_default();
                     run.released = run.released.saturating_add(removed.bytes);
                 }
                 record(&Step::Removed(&row, &removed));
@@ -3705,6 +3827,9 @@ pub struct Roots {
     pub session_cwd_unknown: Option<String>,
     /// The folders whose links clause 5 reads (`~/.local/bin`, `~/.cargo/bin`, `$ATPKG_BIN`, `~/.rustup/toolchains`).
     pub link_dirs: Vec<PathBuf>,
+    /// The free bytes a budget pass stops at ([`Survey::budget`]): a build directory whose
+    /// owner is gone is then probed for a build's locks as under pressure, for tier 1.
+    pub budget: Option<u64>,
 }
 
 /// Measure one machine into a [`Survey`]: the one function here that touches a filesystem.
@@ -3743,6 +3868,7 @@ pub fn scan_with(
     s.mounts = roots.mounts.clone();
     s.demand = roots.demand;
     s.projected = roots.projected;
+    s.budget = roots.budget;
     if let Some(v) = &roots.volume {
         s.root = v.clone();
         s.volume_device = target::dev_of(v);
@@ -3784,8 +3910,11 @@ pub fn scan_with(
         if s.targets.iter().any(|seen| seen.path == canonical) {
             continue;
         }
-        if let Some(mut td) = scan_target(&canonical, now, config.target_stale_days, pressure) {
-            td.owned = owners.of(&origin);
+        let owned = owners.of(&origin);
+        let probe =
+            pressure || (roots.budget.is_some() && matches!(owned, discover::Owned::Gone { .. }));
+        if let Some(mut td) = scan_target(&canonical, now, config.target_stale_days, probe) {
+            td.owned = owned;
             td.origin = origin;
             let (total, foreign) = target::total_bytes_owned(&td.path);
             td.total = Some(total);

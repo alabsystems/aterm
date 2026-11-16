@@ -572,7 +572,7 @@ fn the_docked_bar_keeps_its_buttons_inside_its_box() {
     for variant in ["reset", "draft"] {
         let mut lab = Lab::new("font_px = 14.0\n");
         {
-            let state = lab.state_mut();
+            let mut state = lab.state_mut();
             state.navigate(SettingsRoute::Terminal);
             if variant == "reset" {
                 state.feedback = Some("Reset all settings?".to_string());
@@ -2316,7 +2316,8 @@ fn the_theme_cards_rows_keep_the_row_rule_at_every_size() {
                     let service = VersionedConfigService::new(source.to_string()).expect("fixture");
                     let (mut runtime, instance, view) = setup();
                     {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        let mut route_native_guard = runtime.view_state_mut(view);
+                        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
                         else {
                             unreachable!();
                         };
@@ -4725,7 +4726,9 @@ fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
                     .expect("fixture");
                 let (mut runtime, instance, view) = setup();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("state");
@@ -4888,7 +4891,9 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
             for &width in if classed { &edges } else { &widths } {
                 let (mut runtime, instance, view) = setup();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.navigate(route);

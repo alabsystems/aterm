@@ -16,9 +16,14 @@
 //! **Up is read from rows, never from a probe.** One tail of this Mac's own `metrics.log` takes
 //! every presence row as it lands, from a relay or from this Mac's own publisher, and the
 //! [`Board`] judges it. A seat is **up** while its row *advanced* within the last 90 seconds
-//! ([`UP_FOR`]) of this Mac's clock (the links' clock, injected in a test). Nothing dials,
-//! asks or times out to find a Mac down: a Mac that stops pushing reads silent once 90 seconds
-//! pass, with the time this Mac last saw it up.
+//! ([`UP_FOR`]) of this Mac's awake clock (the links' clock: the system's monotonic clock, which
+//! does not run while this Mac sleeps; injected in a test). Nothing dials, asks or times out to
+//! find a Mac down: a Mac that stops pushing reads silent once 90 seconds pass, with the time this
+//! Mac last saw it up. Because that clock stood still in sleep, a seat that advanced just before
+//! this Mac slept would read up for the rest of its 90 seconds after a wake, however long the
+//! sleep: so a wake, and a change of this Mac's network path, clears every seat's advance
+//! ([`Board::forget_advances`], from `crate::overlay::Waker::woke`), and each seat reads silent
+//! until a fresh row of it arrives.
 //!
 //! A row *advances* a seat when it is above the row held for that seat, it arrived after this
 //! Mac's tail started, and its origin timestamp is within 10 minutes ([`FRESH`]) of this Mac's
@@ -141,6 +146,23 @@ thread_local! {
 #[cfg(any(test, debug_assertions))]
 fn stale_rows_up() -> bool {
     STALE_ROWS_UP.with(std::cell::Cell::get) || aterm_types::negative_control::on("stale-rows-up")
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the wake rule (`keep-advances-on-wake`): a wake or a network
+    /// change handed to the mesh on a thread that sets it leaves every seat's advance standing
+    /// ([`Board::forget_advances`] forgets nothing), so a seat that advanced just before this Mac
+    /// slept reads up after the wake with no fresh row. A lab instance turns it on for its whole
+    /// process with `keep-advances-on-wake` in `ATERM_TEST_NEGATIVE_CONTROL`.
+    pub static KEEP_ADVANCES_ON_WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`KEEP_ADVANCES_ON_WAKE`] is on: set on this thread, or named for this process.
+#[cfg(any(test, debug_assertions))]
+fn keep_advances_on_wake() -> bool {
+    KEEP_ADVANCES_ON_WAKE.with(std::cell::Cell::get)
+        || aterm_types::negative_control::on("keep-advances-on-wake")
 }
 
 // ---------------------------------------------------------------------------
@@ -880,6 +902,19 @@ impl Board {
         }
     }
 
+    /// Forget when every seat last advanced: after a wake or a network change no seat reads up
+    /// until a fresh row of it advances it again. Each seat's held row and its last seen time
+    /// stay.
+    pub fn forget_advances(&mut self) {
+        #[cfg(any(test, debug_assertions))]
+        if keep_advances_on_wake() {
+            return;
+        }
+        for mark in self.marks.values_mut() {
+            mark.advanced = None;
+        }
+    }
+
     /// Whether `principal` is up at `now`.
     #[must_use]
     pub fn is_up(&self, principal: &str, now: Duration) -> bool {
@@ -1565,6 +1600,11 @@ impl Shared {
             needs,
             activity,
         }
+    }
+
+    /// [`Board::forget_advances`] on this presence's board.
+    pub(crate) fn forget_advances(&self) {
+        self.board.lock_or_recover().forget_advances();
     }
 
     /// [`Mesh::holders`].

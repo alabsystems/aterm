@@ -463,8 +463,8 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
             compressed: Some((4.0 * GIB) as u64),
             cached: (cache * GIB) as u64,
             free: ((128.0 - used - cache).max(0.0) * GIB) as u64,
-            swap_used: (swap * GIB) as u64,
-            swap_total: (swap * GIB) as u64,
+            swap_used: Some((swap * GIB) as u64),
+            swap_total: Some((swap * GIB) as u64),
             pressure,
             commit: None,
             ..MemSample::default()
@@ -515,6 +515,7 @@ pub(crate) fn owner_scene(o: Owner) -> Snapshot {
     net.basis = CapBasis::Peak;
     s.resources[4] = net;
     f.link = Some(LinkSample {
+        byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
         name: "en7".into(),
         kind: LinkKind::Ethernet,
         up: true,
@@ -544,6 +545,7 @@ pub(crate) fn owner_input(snap: &Snapshot) -> DeckInput<'_> {
         network: None,
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
+        disk_span: crate::stats_lens::DiskSpan::Day,
         lab: None,
         fleet: None,
         snap: Some(snap),

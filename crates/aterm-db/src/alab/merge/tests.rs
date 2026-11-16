@@ -12,7 +12,8 @@ use crate::{
             self, Input, KnownMac, Mode, Sheet,
             tests::{Stand, store, vault},
         },
-        registry::SOURCE,
+        // The lab's registry is in a generation that holds hosts and aliases as one list.
+        registry::{LIST_MACHINE as MACHINE, SOURCE},
     },
     machines::Label,
     typed::{
@@ -132,6 +133,11 @@ fn a_sheet_number_does_not_bypass_another_rows_node_binding() {
 /// A hold's `why` and what writes its cause into a book, given the two keys its case names.
 type Shape = (&'static str, fn(&mut Book, &str, &str));
 
+/// An import planned against registry.3, the generation these fixtures write (`LIST_MACHINE`).
+fn plan_import(input: &Input<'_>, cells: &Cells) -> crate::Result<import::Plan> {
+    import::plan_cells_at(input, &crate::alab::registry::REGISTRY_3, cells)
+}
+
 fn roster_of(labels: &[&str]) -> Roster {
     labels
         .iter()
@@ -150,7 +156,7 @@ fn run(cells: &Cells, bound: &[&str], roster: &[&str]) -> Plan {
 
 fn run_facts(cells: &Cells, facts: Vec<(Option<String>, Option<String>)>, roster: &[&str]) -> Plan {
     plan(
-        &cell::project(&MACHINE, cells),
+        (&MACHINE, &cell::project(&MACHINE, cells)),
         &cell::project(&PREFERENCE, cells),
         &Facts::new(facts),
         &roster_of(roster),
@@ -265,10 +271,10 @@ fn live_shape(book: &mut Book) -> (Vec<Sheet>, [KnownMac; 1], String, String) {
         fleet_node: None,
         hosts: Vec::new(),
     }];
-    let born = import::plan_cells(&import_input(&[], &macs), &book.cells()).unwrap();
+    let born = plan_import(&import_input(&[], &macs), &book.cells()).unwrap();
     let cells = apply_rows(book, &born.rows);
     let vault_alone = [vault(&[",ann@example.invalid,m104,m36,1,,,,,,,,"])];
-    let placed = import::plan_cells(&import_input(&vault_alone, &macs), &cells).unwrap();
+    let placed = plan_import(&import_input(&vault_alone, &macs), &cells).unwrap();
     apply_rows(book, &placed.rows);
     let sheets = sheets_of_the_live_mac(&computers);
     let source = sheets[0].source.clone();
@@ -321,7 +327,7 @@ fn assert_settled(cells: &Cells, sheets: &[Sheet], macs: &[KnownMac], keep: &str
     assert!(on_keep.live());
     assert!(!preferences.rows[&keys::preference_pk(gone, &account).unwrap()].live());
 
-    let again = import::plan_cells(&import_input(sheets, macs), cells).unwrap();
+    let again = plan_import(&import_input(sheets, macs), cells).unwrap();
     let kinds: Vec<&str> = again.findings.iter().map(|f| f.kind.word()).collect();
     assert!(!kinds.contains(&"label-ambiguous"), "{:?}", again.findings);
     assert!(!kinds.contains(&"differs"), "{:?}", again.findings);
@@ -393,7 +399,7 @@ fn the_live_shape_settles_after_the_merge() {
 fn an_import_before_the_merge_births_nothing_and_settles() {
     let mut book = Book::new();
     let (sheets, macs, keep, gone) = live_shape(&mut book);
-    let before = import::plan_cells(&import_input(&sheets, &macs), &book.cells()).unwrap();
+    let before = plan_import(&import_input(&sheets, &macs), &book.cells()).unwrap();
     assert_eq!(before.counts.get(MACHINE.name).map(|c| c.new_rows), Some(0));
     let ambiguous = |plan: &import::Plan| {
         plan.findings
@@ -412,7 +418,7 @@ fn an_import_before_the_merge_births_nothing_and_settles() {
         assert_eq!(ended.pk, duplicate_preference, "{ended:?}");
     }
     let cells = apply_rows(&mut book, &before.rows);
-    let repeat = import::plan_cells(&import_input(&sheets, &macs), &cells).unwrap();
+    let repeat = plan_import(&import_input(&sheets, &macs), &cells).unwrap();
     assert!(repeat.rows.is_empty(), "{:?}", repeat.planned);
     assert_eq!(repeat.counts.get(MACHINE.name).map(|c| c.new_rows), Some(0));
     assert!(ambiguous(&repeat));
@@ -1218,7 +1224,7 @@ fn what_it_cannot_decide_is_held() {
 
 fn plan_with(cells: &Cells, roster: &Roster) -> Plan {
     plan(
-        &cell::project(&MACHINE, cells),
+        (&MACHINE, &cell::project(&MACHINE, cells)),
         &cell::project(&PREFERENCE, cells),
         &Facts::default(),
         roster,
@@ -2030,7 +2036,7 @@ fn a_merged_row_waits_as_the_merge_left_it() {
     let plan = run(&book.cells(), &[], &[]);
     assert_eq!(plan.waiting.len(), 1, "{plan:?}");
     let cells = apply(&mut book, &plan);
-    let import = import::plan_cells(&import_input(&sheets, &[]), &cells).unwrap();
+    let import = plan_import(&import_input(&sheets, &[]), &cells).unwrap();
     assert!(
         import
             .planned
@@ -2112,7 +2118,7 @@ fn a_row_the_roster_gives_another_mac_does_not_wait() {
     let stated = |node: &str| BTreeMap::from([("fleet_node", node.to_owned())]);
     let run_on = |cells: &Cells, roster: &Roster| {
         plan(
-            &cell::project(&MACHINE, cells),
+            (&MACHINE, &cell::project(&MACHINE, cells)),
             &cell::project(&PREFERENCE, cells),
             &Facts::default(),
             roster,
@@ -2197,7 +2203,7 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
     assert_eq!(plan.waiting.len(), 1, "{plan:?}");
     apply(&mut book, &plan);
     book.write(3, &[], vec![put(&MACHINE, &pk, "node", json!(PRINCIPAL))]);
-    let joined = import::plan_cells(&import_input(&[], &macs), &book.cells()).unwrap();
+    let joined = plan_import(&import_input(&[], &macs), &book.cells()).unwrap();
     assert!(
         joined
             .findings
@@ -2208,7 +2214,7 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
     );
     let cells = apply_rows(&mut book, &joined.rows);
     assert_eq!(row(&cells, &pk).get("status"), Some(&json!("active")));
-    let again = import::plan_cells(&import_input(&[], &macs), &cells).unwrap();
+    let again = plan_import(&import_input(&[], &macs), &cells).unwrap();
     assert!(again.rows.is_empty(), "{:?}", again.planned);
     assert!(run(&cells, &[&pk], &[]).rows.is_empty());
 
@@ -2222,7 +2228,7 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
             put(&MACHINE, &pk, "node", json!(PRINCIPAL)),
         ],
     );
-    let owner = import::plan_cells(&import_input(&[], &macs), &book.cells()).unwrap();
+    let owner = plan_import(&import_input(&[], &macs), &book.cells()).unwrap();
     let cells = apply_rows(&mut book, &owner.rows);
     assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
 
@@ -2239,7 +2245,7 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
             vec![put(&MACHINE, &pk, "node", json!(PRINCIPAL))],
         ),
     );
-    let parked = import::plan_cells(&import_input(&[], &macs), &book.cells()).unwrap();
+    let parked = plan_import(&import_input(&[], &macs), &book.cells()).unwrap();
     let cells = apply_rows(&mut book, &parked.rows);
     assert_eq!(row(&cells, &pk).get("status"), Some(&json!("parked")));
 
@@ -2255,7 +2261,7 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
         &KEY,
     )
     .unwrap();
-    let replica = import::plan_cells(&import_input(&sheets, &[]), &book.cells()).unwrap();
+    let replica = plan_import(&import_input(&sheets, &[]), &book.cells()).unwrap();
     let cells = apply_rows(&mut book, &replica.rows);
     assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
 
@@ -2267,17 +2273,103 @@ fn a_mac_joining_a_row_merge_set_waiting_makes_it_active() {
         births: crate::alab::import::Births::None,
         ..import_input(&[], &macs)
     };
-    let adopted = import::plan_cells(&adopt, &book.cells()).unwrap();
+    let adopted = plan_import(&adopt, &book.cells()).unwrap();
     let cells = apply_rows(&mut book, &adopted.rows);
     assert_eq!(row(&cells, &pk).get("status"), Some(&json!("planned")));
     // Nor over the roster's own `planned`, on the row it birthed under the Mac's key: `adopt` and
     // `merge` then plan nothing over each other.
     let mut book = Book::new();
-    let born = import::plan_cells(&import_input(&[], &macs), &book.cells()).unwrap();
+    let born = plan_import(&import_input(&[], &macs), &book.cells()).unwrap();
     apply_rows(&mut book, &born.rows);
     let keyed = keys::machine_pk(&format!("n-{PRINCIPAL}"));
-    let adopted = import::plan_cells(&adopt, &book.cells()).unwrap();
+    let adopted = plan_import(&adopt, &book.cells()).unwrap();
     let cells = apply_rows(&mut book, &adopted.rows);
     assert_eq!(row(&cells, &keyed).get("status"), Some(&json!("planned")));
     assert!(run(&cells, &[], &[]).rows.is_empty());
+}
+
+/// On registry.4, whose `hosts` is a text set (LT-15B), the row that stays takes each host its
+/// duplicate holds that it answers in no spelling, as that member with its own provenance, and a
+/// re-run writes nothing; a member two writers dispute (one added, one removed) holds the group,
+/// as any disputed cell does.
+/// NEGATIVE CONTROL (run 2026-11-15): with `carry_hosts` taking its list path whatever the
+/// generation holds, `b.lan` arrives with no source: `` left: None right:
+/// Some("sr-0123456789abcdef") ``.
+#[test]
+fn a_duplicates_host_members_move_with_their_provenance_on_registry_4() {
+    use crate::alab::registry::MACHINE as MACHINE_4;
+    let (keep, gone) = (keys::machine_pk("m36"), keys::machine_pk("m104"));
+    let at = |pk: &str, col: &str, x: Value| put(&MACHINE_4, pk, col, x);
+    let imported = |pk: &str, host: &str| {
+        cell::member_change(&MACHINE_4, pk, "hosts", host, true, |x| {
+            CellValue::imported(MACHINE_4.version, x, "sr-0123456789abcdef")
+        })
+        .unwrap()
+    };
+    let book = || {
+        let mut book = Book::new();
+        book.write(
+            2,
+            &[],
+            vec![
+                at(&keep, "label", json!("m36")),
+                at(&keep, "row", json!("live")),
+                at(&keep, "fleet_node", json!(NODE)),
+                at(&keep, "status", json!("active")),
+                elem(&MACHINE_4, &keep, "aliases", "m104"),
+                elem(&MACHINE_4, &keep, "hosts", "a.lan"),
+                at(&gone, "label", json!("m104")),
+                at(&gone, "row", json!("live")),
+                at(&gone, "status", json!("active")),
+                imported(&gone, "b.lan"),
+                imported(&gone, "a.lan.local"),
+            ],
+        );
+        book
+    };
+    let run_4 = |cells: &Cells| {
+        plan(
+            (&MACHINE_4, &cell::project(&MACHINE_4, cells)),
+            &cell::project(&PREFERENCE, cells),
+            &Facts::new(Vec::new()),
+            &roster_of(&["m104"]),
+        )
+        .unwrap()
+    };
+    let mut merging = book();
+    let merged = run_4(&merging.cells());
+    assert_eq!(merged.merges.len(), 1, "{merged:?}");
+    let merge = &merged.merges[0];
+    assert_eq!(merge.keep, keep);
+    assert!(merge.carried.contains(&(gone.clone(), "hosts".to_owned())));
+    let cells = apply(&mut merging, &merged);
+    let kept = &cell::project(&MACHINE_4, &cells).rows[&keep];
+    let mut hosts = cell::texts(kept.fields.get("hosts"));
+    hosts.sort_unstable();
+    assert_eq!(hosts, ["a.lan", "b.lan"]);
+    let Some(Field::Set(members)) = kept.fields.get("hosts") else {
+        panic!("hosts is a set");
+    };
+    let Some(Field::Value(b)) = members.get(&keys::text_elem("b.lan")) else {
+        panic!("b.lan is one value");
+    };
+    assert_eq!(b.value.s.as_deref(), Some("sr-0123456789abcdef"));
+    assert!(run_4(&cells).rows.is_empty());
+
+    let mut disputed = book();
+    let seen = disputed.all();
+    disputed.write(2, &seen, vec![elem(&MACHINE_4, &gone, "hosts", "c.lan")]);
+    disputed.write(
+        3,
+        &seen,
+        vec![
+            cell::member_change(&MACHINE_4, &gone, "hosts", "c.lan", false, |x| {
+                CellValue::owner(MACHINE_4.version, x)
+            })
+            .unwrap(),
+        ],
+    );
+    let held = run_4(&disputed.cells());
+    assert!(held.merges.is_empty(), "{held:?}");
+    assert_eq!(held.held[0].why, "conflicted");
 }

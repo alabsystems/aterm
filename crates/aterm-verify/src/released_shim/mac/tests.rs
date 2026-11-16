@@ -3,11 +3,168 @@
 
 use super::*;
 
-/// The installed release's pair in an account's home: `released-shim`'s rig.
-fn installed_rig(env: &EnvSnapshot) -> Result<Rig, String> {
-    let store = Store::read(env)?;
-    let label = store.release()?;
-    Rig::new(env, &store, Pair::Installed, label, Placement::SharedCache)
+/// What the store gave, or the calling test's end: COULD NOT RUN where this machine has no pair
+/// to judge with ([`Unready::Absent`]: a scratch HOME's prefix, an uninstalled app), a failure
+/// where the pair it has is wrong ([`Unready::Defect`]).
+fn ready<T>(got: Result<T, Unready>) -> T {
+    match got {
+        Ok(value) => value,
+        Err(Unready::Absent(why)) => aterm_uds::host::could_not_run(why),
+        Err(Unready::Defect(why)) => panic!("the installed pair: {why}"),
+    }
+}
+
+/// This machine's package store, or the calling test's end ([`ready`]).
+fn store(env: &EnvSnapshot) -> Store {
+    ready(Store::read(env))
+}
+
+/// This machine's package store and its installed release's `--version` line, or the calling
+/// test's end ([`ready`]).
+fn installed_release(env: &EnvSnapshot) -> (Store, String) {
+    let store = store(env);
+    let line = ready(store.release());
+    (store, line)
+}
+
+/// The installed release's pair in an account's home: `released-shim`'s rig, its tree pinned to
+/// this checkout's compiler. A rig the pair cannot be made into (a shim with no store path to
+/// relocate) fails the test.
+fn installed_rig(env: &EnvSnapshot) -> Rig {
+    let (store, label) = installed_release(env);
+    let rig = Rig::new(env, &store, Pair::Installed, label, Placement::SharedCache)
+        .unwrap_or_else(|why| panic!("a rig of the installed pair: {why}"));
+    pin_fixture_toolchain(&rig.tree);
+    rig
+}
+
+/// Miniature build fixtures use this checkout's compiler, like its real bootstrap inputs.
+fn pin_fixture_toolchain(tree: &Path) {
+    fs::copy(
+        aterm_tempfile::manifest_dir().join("../../trust.lock"),
+        tree.join("trust.lock"),
+    )
+    .unwrap();
+}
+
+/// A package prefix `shim` (when given) is the `bin/targo` of, with an empty Trust store.
+fn prefix_with(shim: Option<&str>) -> aterm_tempfile::TempDir {
+    let prefix = aterm_tempfile::tempdir().unwrap();
+    fs::create_dir_all(prefix.path().join("store/trust")).unwrap();
+    if let Some(text) = shim {
+        fs::create_dir_all(prefix.path().join("bin")).unwrap();
+        fs::write(prefix.path().join("bin/targo"), text).unwrap();
+    }
+    prefix
+}
+
+/// A caller whose configured package prefix is `prefix`.
+fn env_at(prefix: &Path) -> EnvSnapshot {
+    EnvSnapshot {
+        test_package_prefix: Some(prefix.to_path_buf()),
+        ..EnvSnapshot::default()
+    }
+}
+
+/// Where an installed `aterm.app` keeps its helper and `aterm`.
+const APP: &str = "aterm.app/Contents/MacOS";
+
+/// A helper `atpkg` (a file) in the folder `at` names, in a new temporary folder, beside an
+/// `aterm` whose `--version` says `said`; the helper.
+fn helper_saying(at: &str, said: &str) -> (aterm_tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let bin = dir.path().join(at);
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("atpkg"), "").unwrap();
+    let aterm = bin.join("aterm");
+    fs::write(&aterm, format!("#!/bin/sh\necho '{said}'\n")).unwrap();
+    fs::set_permissions(&aterm, fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin.join("atpkg"))
+}
+
+/// The line by which a shim names its helper (`shim_helper`).
+fn helper_line(helper: &Path) -> String {
+    format!("# atpkg cache helper \"{}\"\n", helper.display())
+}
+
+/// A package prefix with no `bin/targo` (a scratch HOME's) holds no pair: absent, naming the
+/// missing shim and where it comes from.
+#[test]
+fn a_prefix_with_no_targo_shim_is_absent() {
+    let prefix = prefix_with(None);
+    match Store::read(&env_at(prefix.path())) {
+        Err(Unready::Absent(why)) => assert!(
+            why.contains(&prefix.path().join("bin/targo").display().to_string())
+                && why.contains("aterm pkg install trust"),
+            "{why}"
+        ),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("a prefix with no shim gave a store"),
+    }
+}
+
+/// A shim whose `aterm.app` is gone (the release was uninstalled) leads to no installed public
+/// release: absent, naming the helper and the app.
+#[test]
+fn a_shim_whose_installed_app_is_gone_is_absent() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let app = dir.path().join("aterm.app");
+    let helper = app.join("Contents/MacOS/atpkg");
+    let prefix = prefix_with(Some(&helper_line(&helper)));
+    let store = Store::read(&env_at(prefix.path())).unwrap();
+    match store.release() {
+        Err(Unready::Absent(why)) => assert!(
+            why.contains(&helper.display().to_string()) && why.contains(&app.display().to_string()),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A pair that is there and wrong is a defect, never an absence: a shim that cannot be read or
+/// names no helper, a helper outside an `aterm.app` (loose, or in a dev bundle), an installed
+/// app without the helper, and a development app. The loose and dev-bundle helpers sit beside an
+/// `aterm` that says a public version, so only their place refuses them. A public pair whose
+/// shim has no store path to relocate gives no rig.
+#[test]
+fn an_installed_pair_that_is_there_and_wrong_is_a_defect() {
+    let (_public, public) = helper_saying(APP, "aterm 0.199.0");
+    let (_dev, dev) = helper_saying(APP, "aterm 0.199.0+g0123456789a");
+    let (_bare, bare) = helper_saying(APP, "aterm 0.199.0");
+    fs::remove_file(&bare).unwrap();
+    let (_loose, loose) = helper_saying("target/debug", "aterm 0.199.0");
+    let (_bundle, bundle) = helper_saying("aterm (dev).app/Contents/MacOS", "aterm 0.199.0");
+    for (what, shim) in [
+        ("no helper", "#!/bin/sh\nexec targo \"$@\"\n".to_owned()),
+        ("a loose helper", helper_line(&loose)),
+        ("a dev bundle's helper", helper_line(&bundle)),
+        ("an installed app without the helper", helper_line(&bare)),
+        ("a development app", helper_line(&dev)),
+    ] {
+        let prefix = prefix_with(Some(&shim));
+        let got = Store::read(&env_at(prefix.path())).unwrap().release();
+        assert!(matches!(got, Err(Unready::Defect(_))), "{what}: {got:?}");
+    }
+    let unreadable = prefix_with(None);
+    fs::create_dir_all(unreadable.path().join("bin/targo")).unwrap();
+    let got = Store::read(&env_at(unreadable.path()));
+    assert!(
+        matches!(got, Err(Unready::Defect(_))),
+        "a shim that cannot be read: {:?}",
+        got.err()
+    );
+    let prefix = prefix_with(Some(&helper_line(&public)));
+    let env = env_at(prefix.path());
+    let store = Store::read(&env).unwrap();
+    let label = store.release().unwrap();
+    assert_eq!(label, "aterm 0.199.0");
+    let rig = Rig::new(&env, &store, Pair::Installed, label, Placement::SharedCache);
+    assert!(
+        rig.as_ref().is_err_and(|why| why.contains("relocatable")),
+        "no relocatable store path: {:?}",
+        rig.err()
+    );
 }
 
 #[test]
@@ -46,7 +203,7 @@ fn the_rigs_first_build_is_in_a_home_with_a_caches_folder() {
     let mut env = EnvSnapshot::capture();
     let absent = aterm_tempfile::tempdir().unwrap();
     env.rustup_home = Some(absent.path().join("rustup-not-installed").into_os_string());
-    let rig = installed_rig(&env).expect("installed released shim and helper");
+    let rig = installed_rig(&env);
     let context = crate::Ctx::new(
         rig.tree.clone(),
         crate::Scope::workspace(),
@@ -81,7 +238,7 @@ fn the_rigs_first_build_is_in_a_home_with_a_caches_folder() {
 #[test]
 fn installed_release_rejects_config_target_and_accepts_jobs() {
     let env = EnvSnapshot::capture();
-    let rig = installed_rig(&env).expect("installed released shim and helper");
+    let rig = installed_rig(&env);
     let context = crate::Ctx::new(
         rig.tree.clone(),
         crate::Scope::workspace(),
@@ -144,6 +301,7 @@ fn installed_release_rejects_config_target_and_accepts_jobs() {
             "add",
             "Cargo.toml",
             "Cargo.lock",
+            "trust.lock",
             ".cargo/config.toml",
             "src/lib.rs",
         ],
@@ -247,7 +405,7 @@ fn installed_release_rejects_config_target_and_accepts_jobs() {
 #[test]
 fn sandbox_only_allows_scratch_and_resource_bookkeeping_writes() {
     let env = EnvSnapshot::capture();
-    let rig = installed_rig(&env).unwrap();
+    let rig = installed_rig(&env);
     let outside = aterm_tempfile::tempdir().unwrap();
     for (path, accepted) in [
         (outside.path().join("protected"), false),
@@ -270,17 +428,32 @@ fn sandbox_only_allows_scratch_and_resource_bookkeeping_writes() {
     }
 }
 
-fn tags(versions: &[&str]) -> Vec<String> {
-    versions.iter().map(|v| (*v).to_owned()).collect()
+/// The public tags [`public_tags`] reads: `held` the candidate holds, `beside` fetched outside its
+/// ancestry, oldest first.
+fn tags(held: &[&str], beside: &[&str]) -> Vec<PublicTag> {
+    let mut all: Vec<_> = held
+        .iter()
+        .map(|version| (version, true))
+        .chain(beside.iter().map(|version| (version, false)))
+        .map(|(version, held)| PublicTag {
+            version: (*version).to_owned(),
+            held,
+        })
+        .collect();
+    all.sort_by_key(|tag| release_version(&tag.version));
+    all
 }
 
-/// The installed app judges when it is the newest fetched public tag or the one before it, and
-/// the row says which: after a release is published, a Mac that fetched the tag and has not yet
-/// updated can still land a bootstrap-input change.
+/// The installed app judges when it is the newest public tag the candidate holds at or before
+/// its workspace version or the one before it, and the row says which: after a release is
+/// published, a Mac that fetched the tag and has not yet updated can still land a
+/// bootstrap-input change. A tag past the workspace version is not yet the candidate's release,
+/// and the row names the newer tag as the newest at or before that version, never as the newest
+/// the candidate holds.
 #[test]
 fn the_newest_release_and_the_one_before_it_judge() {
-    let fetched = tags(&["0.197.0", "0.198.0", "0.199.0"]);
-    let newest = judging_release("aterm 0.199.0", &fetched).unwrap();
+    let fetched = tags(&["0.197.0", "0.198.0", "0.199.0"], &[]);
+    let newest = judging_release("aterm 0.199.0", "0.199.0", &fetched).unwrap();
     assert_eq!(
         newest,
         Judging {
@@ -289,7 +462,7 @@ fn the_newest_release_and_the_one_before_it_judge() {
         }
     );
     assert_eq!(newest.who(), "aterm 0.199.0");
-    let previous = judging_release("aterm 0.198.0", &fetched).unwrap();
+    let previous = judging_release("aterm 0.198.0", "0.199.0", &fetched).unwrap();
     assert_eq!(
         previous,
         Judging {
@@ -302,47 +475,252 @@ fn the_newest_release_and_the_one_before_it_judge() {
         who.starts_with("aterm 0.198.0 (") && who.contains("v0.199.0"),
         "{who}"
     );
-    // One fetched tag has no release before it.
+    let past = tags(&["0.197.0", "0.198.0", "0.199.0", "0.200.0"], &[]);
+    let beside_past = judging_release("aterm 0.198.0", "0.199.0", &past).unwrap();
+    assert_eq!(beside_past, previous);
+    let who_past = beside_past.who();
+    assert!(
+        who_past.contains(
+            "v0.199.0, the newest public tag the candidate holds at or before its workspace \
+             version;"
+        ),
+        "{who_past}"
+    );
+    // One held tag has no release before it.
     assert_eq!(
-        judging_release("aterm 0.199.0", &tags(&["0.199.0"])).unwrap(),
+        judging_release("aterm 0.199.0", "0.199.0", &tags(&["0.199.0"], &[])).unwrap(),
+        newest
+    );
+    assert_eq!(
+        judging_release(
+            "aterm 0.199.0",
+            "0.199.0",
+            &tags(&["0.198.0", "0.199.0", "0.200.0"], &["0.201.0"])
+        )
+        .unwrap(),
         newest
     );
 }
 
-/// Controls: a release two behind, a development build, and an app no fetched tag names decide
-/// nothing, each with its remedy.
+/// Controls: a release two or more behind the candidate's newest tag and a development build
+/// decide nothing, each with its remedy; so does a release older than two of the candidate's
+/// tags whose own tag this clone never fetched, which no fetch would make judge.
 #[test]
-fn an_older_release_a_development_build_and_an_unfetched_one_do_not_judge() {
-    let fetched = tags(&["0.196.0", "0.197.0", "0.198.0", "0.199.0"]);
-    let two_behind = judging_release("aterm 0.197.0", &fetched).unwrap_err();
+fn an_older_release_and_a_development_build_do_not_judge() {
+    let fetched = tags(&["0.196.0", "0.197.0", "0.198.0", "0.199.0"], &[]);
+    let two_behind = judging_release("aterm 0.197.0", "0.199.0", &fetched).unwrap_err();
     assert!(
         two_behind.contains("2 releases behind")
             && two_behind.contains("v0.199.0")
             && two_behind.contains("update the installed app"),
         "{two_behind}"
     );
-    let three_behind = judging_release("aterm 0.196.0", &fetched).unwrap_err();
+    // The candidate holds v0.200.0 too, past its workspace version: the refusal names v0.199.0
+    // as the newest at or before that version, not as the newest it holds.
+    let past = tags(
+        &["0.196.0", "0.197.0", "0.198.0", "0.199.0", "0.200.0"],
+        &[],
+    );
+    let two_behind_past = judging_release("aterm 0.197.0", "0.199.0", &past).unwrap_err();
+    assert!(
+        two_behind_past.contains(
+            "2 releases behind v0.199.0, the newest public tag the candidate holds at or before \
+             its workspace version 0.199.0;"
+        ),
+        "{two_behind_past}"
+    );
+    let three_behind = judging_release("aterm 0.196.0", "0.199.0", &fetched).unwrap_err();
     assert!(three_behind.contains("3 releases behind"), "{three_behind}");
+    // A release whose tag sits off the candidate's ancestry is still a release the installed
+    // app is behind: v0.197.0 here counts though the candidate does not hold it.
+    let off_line = tags(&["0.196.0", "0.198.0", "0.199.0"], &["0.197.0"]);
+    let behind_off_line = judging_release("aterm 0.196.0", "0.199.0", &off_line).unwrap_err();
+    assert!(
+        behind_off_line.contains("3 releases behind v0.199.0"),
+        "{behind_off_line}"
+    );
+    let ancient = judging_release("aterm 0.150.0", "0.199.0", &fetched).unwrap_err();
+    assert!(
+        ancient.contains("4 releases behind") && !ancient.contains("git fetch"),
+        "{ancient}"
+    );
     for development in [
         "aterm 0.199.0+g1a2b3c4d",
         "aterm 0.200.0+g1a2b3c4d",
+        "aterm 0.199.1",
         "aterm",
         "",
     ] {
-        let why = judging_release(development, &fetched).unwrap_err();
+        let why = judging_release(development, "0.199.0", &fetched).unwrap_err();
         assert!(why.contains("development or unreadable"), "{why}");
     }
-    // The app is ahead of what this checkout has fetched: the tags are stale, not the app.
-    let unfetched = judging_release("aterm 0.200.0", &fetched).unwrap_err();
+    let unversioned = judging_release("aterm 0.199.0", "0.199.0-dev", &fetched).unwrap_err();
     assert!(
-        unfetched.contains("git fetch origin --tags") && unfetched.contains("v0.199.0"),
+        unversioned.contains("is not MAJOR.MINOR.0"),
+        "{unversioned}"
+    );
+}
+
+/// An installed release the candidate's tags do not place is told where its own tag stands,
+/// and only the act that clears that: a tag this clone never fetched is fetched; a tag fetched
+/// beside the candidate's ancestry (the app updated itself to a release published after the
+/// branch forked) is brought in by merging main where main holds it, which no fetch does, or
+/// else the newest release the candidate holds is installed; a tag the candidate holds past its
+/// workspace version means that version went back, and that refusal names no other tag as the
+/// newest the candidate holds. With one or no held tag the same holds of the release before it.
+/// NEGATIVE CONTROL: each cause's remedy is absent from the others' refusals, and a candidate
+/// that holds no release at or before its version is offered none to install.
+#[test]
+fn an_app_the_candidates_tags_do_not_place_is_told_where_its_tag_stands() {
+    let held = ["0.198.0", "0.199.0"];
+    let fetch = "git fetch origin --tags";
+    let merge = "merge origin/main into the candidate";
+    let version = "take origin/main's workspace version";
+    let unfetched = judging_release("aterm 0.200.0", "0.200.0", &tags(&held, &[])).unwrap_err();
+    assert!(
+        unfetched.contains("tag v0.200.0 is not fetched")
+            && unfetched.contains(
+                "the newest public tag the candidate holds at or before its workspace version \
+                 0.200.0 is v0.199.0"
+            )
+            && unfetched.contains(fetch)
+            && !unfetched.contains(merge)
+            && !unfetched.contains(version),
         "{unfetched}"
     );
-    // With one fetched tag, the release before it is not known to be the one before it.
-    let lone = judging_release("aterm 0.198.0", &tags(&["0.199.0"])).unwrap_err();
-    assert!(lone.contains("git fetch origin --tags"), "{lone}");
-    let none = judging_release("aterm 0.199.0", &[]).unwrap_err();
-    assert!(none.contains("no fetched public"), "{none}");
+    let beside =
+        judging_release("aterm 0.200.0", "0.199.0", &tags(&held, &["0.200.0"])).unwrap_err();
+    assert!(
+        beside.contains("tag v0.200.0 is fetched but not in the candidate's ancestry")
+            && beside.contains(merge)
+            && beside.contains("where origin/main holds v0.200.0")
+            && beside.contains("or else install aterm 0.199.0")
+            && !beside.contains(fetch)
+            && !beside.contains(version),
+        "{beside}"
+    );
+    let ahead = judging_release(
+        "aterm 0.200.0",
+        "0.199.0",
+        &tags(&["0.198.0", "0.199.0", "0.200.0"], &[]),
+    )
+    .unwrap_err();
+    assert!(
+        ahead.contains("the candidate's workspace version 0.199.0 is behind it")
+            && !ahead.contains("v0.199.0")
+            && ahead.contains(version)
+            && !ahead.contains(fetch)
+            && !ahead.contains(merge),
+        "{ahead}"
+    );
+    let lone = judging_release("aterm 0.198.0", "0.199.0", &tags(&["0.199.0"], &[])).unwrap_err();
+    assert!(lone.contains(fetch) && !lone.contains(merge), "{lone}");
+    let lone_beside = judging_release(
+        "aterm 0.198.0",
+        "0.199.0",
+        &tags(&["0.199.0"], &["0.198.0"]),
+    )
+    .unwrap_err();
+    assert!(
+        lone_beside.contains(merge)
+            && lone_beside.contains("or else install aterm 0.199.0")
+            && !lone_beside.contains(fetch),
+        "{lone_beside}"
+    );
+    let none_beside =
+        judging_release("aterm 0.199.0", "0.199.0", &tags(&[], &["0.199.0"])).unwrap_err();
+    assert!(
+        none_beside.contains(merge) && !none_beside.contains("install aterm"),
+        "{none_beside}"
+    );
+    let none = judging_release("aterm 0.199.0", "0.199.0", &[]).unwrap_err();
+    assert!(
+        none.contains(
+            "the candidate holds no public tag at or before its workspace version 0.199.0"
+        ) && none.contains(fetch),
+        "{none}"
+    );
+}
+
+/// Every public tag this clone fetched is read, in version order and not name order, annotated
+/// or lightweight, each with whether the candidate holds it; a tag that is no `vMAJOR.MINOR.0`
+/// is no release. The releases a judgment and the land seal's `release-tags` are read by are the
+/// held ones at or before the workspace version.
+/// NEGATIVE CONTROL: a tag on a commit beside HEAD's ancestry is read, and not held, so an app
+/// updated to it is told to merge main and not to fetch the tag it already has.
+#[test]
+fn every_fetched_public_tag_says_whether_the_candidate_holds_it() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let mut cmd = crate::git_provider::command();
+        cmd.current_dir(dir.path())
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+            ])
+            .args(args);
+        for name in crate::changed::GIT_REDIRECTS {
+            cmd.env_remove(name);
+        }
+        let out =
+            aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "0.99.0"]);
+    git(&["tag", "-a", "-m", "v0.99.0", "v0.99.0"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "0.100.0"]);
+    for tag in ["v0.100.0", "v0.100.1", "v0.100", "vnext"] {
+        git(&["tag", tag]);
+    }
+    git(&["checkout", "-q", "-b", "side"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "0.101.0"]);
+    git(&["tag", "-a", "-m", "v0.101.0", "v0.101.0"]);
+    git(&["checkout", "-q", "-"]);
+    let env = EnvSnapshot::capture();
+    let tags = public_tags(dir.path(), &env, "HEAD").unwrap();
+    assert_eq!(
+        tags,
+        [
+            PublicTag {
+                version: "0.99.0".into(),
+                held: true,
+            },
+            PublicTag {
+                version: "0.100.0".into(),
+                held: true,
+            },
+            PublicTag {
+                version: "0.101.0".into(),
+                held: false,
+            },
+        ]
+    );
+    assert_eq!(
+        public_releases(dir.path(), &env, "HEAD", "0.99.0").unwrap(),
+        ["0.99.0"]
+    );
+    assert_eq!(
+        public_releases(dir.path(), &env, "HEAD", "0.101.0").unwrap(),
+        ["0.99.0", "0.100.0"]
+    );
+    let beside = judging_release("aterm 0.101.0", "0.100.0", &tags).unwrap_err();
+    assert!(
+        beside.contains("fetched but not in the candidate's ancestry")
+            && beside.contains("merge origin/main")
+            && !beside.contains("git fetch"),
+        "{beside}"
+    );
 }
 
 /// Through the production stage, with the installed pair: a checkout whose newest public tag is
@@ -350,8 +728,7 @@ fn an_older_release_a_development_build_and_an_unfetched_one_do_not_judge() {
 /// Before this rule it was COULD NOT RUN, as a checkout two releases past still is.
 #[test]
 fn the_stage_judges_with_the_release_before_the_newest_tag_and_not_an_older_one() {
-    let store = Store::read(&EnvSnapshot::capture()).expect("this machine's package store");
-    let installed = store.release().expect("installed public release");
+    let (_, installed) = installed_release(&EnvSnapshot::capture());
     let version = public_version(&installed).unwrap();
     let mut parts = version.split('.').map(|part| part.parse::<u64>().unwrap());
     let (major, minor) = (parts.next().unwrap(), parts.next().unwrap());
@@ -382,6 +759,7 @@ fn the_stage_judges_with_the_release_before_the_newest_tag_and_not_an_older_one(
         );
     };
     let release = |workspace: &str| {
+        pin_fixture_toolchain(dir.path());
         fs::write(
             dir.path().join("Cargo.toml"),
             format!(
@@ -390,7 +768,14 @@ fn the_stage_judges_with_the_release_before_the_newest_tag_and_not_an_older_one(
             ),
         )
         .unwrap();
-        git(&["add", "--", "Cargo.toml", "Cargo.lock", "src/lib.rs"]);
+        git(&[
+            "add",
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            "trust.lock",
+            "src/lib.rs",
+        ]);
         git(&["commit", "-qm", workspace]);
         git(&["tag", &format!("v{workspace}")]);
     };
@@ -565,7 +950,7 @@ impl exec::Host for BuildClock {
 fn sandboxed_bootstrap_excludes_admission_wait_and_still_detects_a_hang() {
     for work in [None, Some(false), Some(true)] {
         let env = EnvSnapshot::capture();
-        let rig = installed_rig(&env).unwrap();
+        let rig = installed_rig(&env);
         if work.is_some() {
             fs::write(rig.home.join("hold-work"), "hold").unwrap();
         }
@@ -634,8 +1019,7 @@ fn sandboxed_bootstrap_excludes_admission_wait_and_still_detects_a_hang() {
 fn a_cut_asks_the_stages_own_judgment_and_reads_its_row() {
     use super::super::{Verdict, WHOLE_TREE, judge};
     let env = EnvSnapshot::capture();
-    let store = Store::read(&env).expect("this machine's package store");
-    let installed = store.release().expect("installed public release");
+    let (_, installed) = installed_release(&env);
     let version = public_version(&installed).unwrap().to_owned();
     let dir = aterm_tempfile::tempdir().unwrap();
     let state = aterm_tempfile::tempdir().unwrap();
@@ -682,7 +1066,15 @@ fn a_cut_asks_the_stages_own_judgment_and_reads_its_row() {
     )
     .unwrap();
     git(&["init", "-q"]);
-    git(&["add", "--", "Cargo.toml", "Cargo.lock", "src/lib.rs"]);
+    pin_fixture_toolchain(dir.path());
+    git(&[
+        "add",
+        "--",
+        "Cargo.toml",
+        "Cargo.lock",
+        "trust.lock",
+        "src/lib.rs",
+    ]);
     git(&["commit", "-qm", "candidate"]);
     git(&["tag", &format!("v{version}")]);
     let whole = [WHOLE_TREE.to_owned()];
@@ -734,6 +1126,7 @@ fn a_cut_asks_the_stages_own_judgment_and_reads_its_row() {
 /// A tracked one-package checkout named as the rig's build names it.
 fn tracked_package() -> aterm_tempfile::TempDir {
     let dir = aterm_tempfile::tempdir().unwrap();
+    pin_fixture_toolchain(dir.path());
     fs::create_dir_all(dir.path().join("src")).unwrap();
     for (path, text) in [
         (
@@ -750,7 +1143,14 @@ fn tracked_package() -> aterm_tempfile::TempDir {
     }
     for args in [
         &["init", "--quiet"][..],
-        &["add", "--", "Cargo.toml", "Cargo.lock", "src/lib.rs"],
+        &[
+            "add",
+            "--",
+            "Cargo.toml",
+            "Cargo.lock",
+            "trust.lock",
+            "src/lib.rs",
+        ],
     ] {
         let mut cmd = crate::git_provider::command();
         cmd.current_dir(dir.path()).args(args);
@@ -769,16 +1169,28 @@ fn tracked_package() -> aterm_tempfile::TempDir {
 }
 
 /// A stand-in for the helper's front (`<helper> __build_admit --shim <tool> <placed> <program>
-/// <words>`): it becomes the program, as a front that admits the build does, except where
-/// `refused` (a `case` pattern over the call's words) matches, which it refuses as aterm
-/// 0.199.0's helper refused the no-cache fallback.
+/// <words>`): it runs the fixture's pinned compiler, except where `refused` (a `case` pattern
+/// over the call's words) matches. This stand-in controls admission, as aterm 0.199.0's helper
+/// refused the no-cache fallback; it does not implement the real helper's lock resolution.
 fn helper(dir: &Path, refused: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
+    let env = EnvSnapshot::capture();
+    // The stand-in runs the store's pinned compiler; a machine with no store ends the test here,
+    // COULD NOT RUN, before any rig reads it.
+    let store = store(&env);
+    let pin = atpkg::trust_lock::find(&aterm_tempfile::manifest_dir())
+        .unwrap()
+        .lock
+        .unwrap();
+    let program = store
+        .prefix
+        .join(format!("store/trust/{}/bin/targo", pin.build));
+    let program = crate::findings::shell_word(program.to_str().unwrap());
     let path = dir.join("helper");
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\nprogram=$5\nshift 5\ncase \"$*\" in\n  {refused})\n    \
+            "#!/bin/sh\nprogram={program}\nshift 5\ncase \"$*\" in\n  {refused})\n    \
              printf '%s\\n' 'atpkg: build cache ownership refused: the selected quiet build \
              target could not be resolved safely; no build started' >&2\n    exit 75 ;;\nesac\n\
              exec \"$program\" \"$@\"\n"
@@ -835,7 +1247,7 @@ fn a_candidate_pair_that_admits_every_placement_is_green_under_each() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let helper = helper(dir.path(), "'no call is refused'");
     let env = EnvSnapshot::capture();
-    let store = Store::read(&env).expect("this machine's package store");
+    let store = store(&env);
     let rig = Rig::new(
         &env,
         &store,

@@ -98,9 +98,10 @@ impl HeaderCache {
 impl App {
     /// Refreshes each split leaf's header and returns their fingerprint (0 for none).
     pub(crate) fn refresh_pane_headers(&mut self, wid: WindowId, plan: &VisibleLeafPlan) -> u64 {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
+        let ws = &mut **route_guard_ws;
         if plan.leaves.iter().all(|leaf| leaf.header.is_none()) {
             ws.pane_headers.entries.clear();
             return 0;
@@ -112,6 +113,7 @@ impl App {
                 .iter()
                 .any(|leaf| leaf.header.is_some() && leaf.view == entry.view)
         });
+        drop(route_guard_ws);
         let palette = self.chrome_palette(crate::app_render::ChromeSurface::Header);
         let theme = palette.theme;
         let colors = header_colors(palette);
@@ -229,14 +231,16 @@ impl App {
         } else {
             fingerprint.finish()
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.pane_headers = cache;
         }
         fp
     }
 
     pub(crate) fn paint_pane_headers(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.pane_headers.paint(&mut ws.input_scratch);
         }
     }

@@ -39,6 +39,8 @@ use aterm_uds::{CtlListener, CtlStream};
 
 #[path = "node_serve/health.rs"]
 mod health;
+#[path = "node_serve/mesh_wakes.rs"]
+mod mesh_wakes;
 #[path = "node_serve/route_refresh.rs"]
 mod route_refresh;
 #[cfg(target_os = "linux")]
@@ -1664,11 +1666,15 @@ fn row_stamp(window_at: Option<u64>, sent_at: Option<u64>) -> Option<String> {
 
 /// `instance`, an `instance` line that says no look at the machine, with `machine`'s: its header
 /// tokens (`MachineFacts::header_tokens`) before its `access=` token, so the line ends as the
-/// window wrote it, or at its end where it has no `access=`. Two of the window's own tokens are
-/// made to agree with the look, both on this machine's one clock:
-/// - `home_free_mb=` says the free space the look read, where it read one, so the volume's size
-///   and its `disk_lim=` verdict travel beside the free space they were judged against (an
-///   older window's figure comes from its own 60 s cache);
+/// window wrote it, or at its end where it has no `access=`. Three of the window's own tokens are
+/// made to agree with the look, the first two on this machine's one volume read, the last on its
+/// one clock:
+/// - `home_free_mb=` says the free space the look read, where it read one, so its `disk_lim=`
+///   verdict travels beside the free space it was judged against (an older window's figure
+///   comes from its own 60 s cache);
+/// - `home_total_mb=` says the size of the volume the look read, where it read one, once: in
+///   the window's own token where its line has one, else right after `home_free_mb=` (a window
+///   older than the key), else before the look's tokens, so every header says it at most once;
 /// - `at_ms=` is raised to the look's `m_at_ms=` where the look is later. The node job takes its
 ///   look after the window stamped its answer, and the answer is complete only with the look,
 ///   so it was answered then; a reader's age of the look (`at_ms` less `m_at_ms`) is then 0, never
@@ -1676,12 +1682,31 @@ fn row_stamp(window_at: Option<u64>, sent_at: Option<u64>) -> Option<String> {
 ///   ([`row_stamp`]).
 fn with_look(instance: &str, machine: &aterm_agent::survey_facts::MachineFacts) -> String {
     let look = &machine.look;
+    let total = look.disk_total_mb.filter(|total| *total > 0);
+    let says = |key: &str| {
+        instance
+            .split(' ')
+            .any(|token| token.split_once('=').is_some_and(|(k, _)| k == key))
+    };
+    // Where a window older than `home_total_mb=` says none, the look's size goes in once.
+    let unsaid = total.filter(|_| !says("home_total_mb"));
+    let after_free = unsaid.filter(|_| says("home_free_mb"));
     let edited: Vec<String> = instance
         .split(' ')
         .map(|token| match token.split_once('=') {
-            Some(("home_free_mb", _)) => look
-                .disk_free_mb
-                .map_or_else(|| token.to_owned(), |free| format!("home_free_mb={free}")),
+            Some(("home_free_mb", _)) => {
+                let free = look
+                    .disk_free_mb
+                    .map_or_else(|| token.to_owned(), |free| format!("home_free_mb={free}"));
+                match after_free {
+                    Some(total) => format!("{free} home_total_mb={total}"),
+                    None => free,
+                }
+            }
+            Some(("home_total_mb", _)) => total.map_or_else(
+                || token.to_owned(),
+                |total| format!("home_total_mb={total}"),
+            ),
             Some(("at_ms", at)) => match (at.parse::<u64>().ok(), look.at_unix_ms) {
                 (Some(at), Some(looked)) if looked > at => format!("at_ms={looked}"),
                 _ => token.to_owned(),
@@ -1690,7 +1715,11 @@ fn with_look(instance: &str, machine: &aterm_agent::survey_facts::MachineFacts) 
         })
         .collect();
     let line = edited.join(" ");
-    let tokens = machine.header_tokens();
+    let sized = match (unsaid, after_free) {
+        (Some(total), None) => format!(" home_total_mb={total}"),
+        _ => String::new(),
+    };
+    let tokens = format!("{sized}{}", machine.header_tokens());
     let at = line.find(" access=").unwrap_or(line.len());
     let mut out = String::with_capacity(line.len() + tokens.len());
     out.push_str(&line[..at]);
@@ -4274,18 +4303,22 @@ fn watch_pass_switches(
 }
 
 /// One generation's neighbour links: the table, its re-proof timer, and the mesh overlay over it,
-/// torn down in order however the generation ends. The overlay and its relays are told to stop,
-/// then the links close, which ends every relay still reading one; only then are they joined.
+/// torn down in order however the generation ends. What hears this Mac's wakes and network path
+/// changes for the overlay goes first; the overlay and its relays are told to stop, then the links
+/// close, which ends every relay still reading one; only then are they joined.
 struct GenerationLinks {
     table: Arc<Neighbours>,
     timer: Option<std::thread::JoinHandle<()>>,
     attached: Option<aterm_mesh::Attached>,
+    /// This Mac's wakes and network path changes, handed to the overlay (LT-B1).
+    wakes: Option<mesh_wakes::MeshWakes>,
     /// The mail pushes over the links (§11 C3), told to stop first, joined after the links close.
     mail: Option<Arc<aterm_mesh::mail::MailLinks>>,
 }
 
 impl Drop for GenerationLinks {
     fn drop(&mut self) {
+        drop(self.wakes.take());
         if let Some(mail) = &self.mail {
             mail.stop_soon();
         }
@@ -5450,10 +5483,16 @@ fn serve_one_node_generation(
                             mesh_hints(cfg.state_dir.clone()),
                         )
                     });
+                    // A wake or a network path change re-proves every link, kicks the relays
+                    // and resets presence (LT-B1).
+                    let wakes = attached
+                        .as_ref()
+                        .map(|attached| mesh_wakes::hear(&attached.waker()));
                     Some(GenerationLinks {
                         table,
                         timer: Some(timer),
                         attached,
+                        wakes,
                         mail,
                     })
                 }
@@ -6134,6 +6173,7 @@ fn push_node_facts_heartbeat(
             now_s,
         );
         facts.update = Some(crate::survey::updater_fact());
+        facts.store_worst = crate::disk_stores::worst_now();
         facts
     });
     let at_ms = aterm_time::unix_millis().unwrap_or(0);
@@ -6350,6 +6390,7 @@ fn spawn_windowless_survey(
                         // An answer: it takes the machine's look.
                         facts.take_latest_look();
                         facts.update = Some(crate::survey::updater_fact());
+                        facts.store_worst = crate::disk_stores::worst_now();
                         let here = crate::survey::Here {
                             host: aterm_uds::process::lan_host_name(),
                             instances: 0,

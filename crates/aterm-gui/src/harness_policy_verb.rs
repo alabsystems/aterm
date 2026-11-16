@@ -135,8 +135,8 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 10] {
 }
 
 /// The reply line, newline-terminated: `OK effective=<on|off>` alone for an edge token, the whole
-/// policy for the owner, opening with the harness contracts this aterm serves (`contract=2,3`:
-/// codex-alab's self-claim and a rostered harness's scoped claim,
+/// policy for the owner, opening with the harness contracts this aterm serves (`contract=2,3,4`:
+/// codex-alab's self-claim, a rostered harness's scoped claim and any registry row's claim,
 /// [`aterm_agent::harness::contract::SERVED`]; none under the negative control's seam,
 /// [`crate::harness_claim::served`]).
 #[must_use]
@@ -177,6 +177,16 @@ pub(crate) fn reply_serving(
             " codex_rotation=1 codex_rotation_five_hour={}",
             aterm_agent::harness::accounts::RESET_SOON_S
         ));
+        // This host leaves a wall its fresh read shows refusing ordinary use, whatever the
+        // windows show: a spend control, a workspace's credits or usage limit, or a credit-only
+        // plan out of credits (`codex_rotation::walled_window`). A codex-alab keeps an exec run
+        // waiting at a workspace's refusal only for a host that says so.
+        line.push_str(" codex_rotation_refusal=1");
+        // This host takes `limit=<id>` on a usage-limit `prepare`: it judges that limit's own
+        // entry in the session's fresh read (a model's own limit, not the codex bucket) and moves
+        // the session only to a row that lists the same limit with room. A codex-alab sends the
+        // limit its wall names only to a host that says so; an older one refuses a fifth key.
+        line.push_str(" codex_rotation_limits=1");
     }
     if facts.codex_login_rotation {
         // A codex-alab whose login was lost asks `codex-login-rotation prepare` only where this
@@ -210,12 +220,15 @@ pub(crate) fn reply_serving(
 }
 
 /// The agent a session's policy answers for: the one with a `[harness.<agent>]` table
-/// ([`crate::harness_host::agent_of`]), else the agent a rostered harness runs (Grok Build under
+/// ([`crate::harness_host::agent_of`]), else the agent a registered harness runs (Grok Build under
 /// grok-alab, contract v3 §8.1 item 7: its `agent-off` follows the row's program, which no table
 /// switches off), else Codex, the agent that asks for itself.
 #[cfg(test)]
 fn policy_agent(publication: &crate::session_timeline::AgentPublication) -> Program {
-    policy_agent_in(aterm_agent::harness::contract::ROSTER, publication)
+    policy_agent_in(
+        aterm_agent::harness::registry::current().rows(),
+        publication,
+    )
 }
 
 fn policy_agent_in(

@@ -54,8 +54,6 @@ pub struct Args {
     /// `--fail-fast`: every first proven red ends the run, as it ends other release runs. Without it,
     /// ordinary source/type preflight failures stop the run, while test failures keep the sweep.
     pub fail_fast: bool,
-    /// Repeatable tree sample: overlapping resources queue behind Ordinary work; Release can end it.
-    pub background: bool,
     /// `list`: print the table of checks and run nothing.
     pub list: bool,
     pub help: bool,
@@ -85,6 +83,8 @@ pub struct Args {
     /// for one.
     pub by_hand: bool,
     pub app: Option<PathBuf>,
+    /// Expected actual debug-assertion contract of the handed artifact, never a profile override.
+    pub app_profile: crate::artifact::Profile,
     /// `--fix`: `fmt` or `census` rewrites what it finds.
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks, in the order given; empty is
@@ -99,11 +99,12 @@ pub struct Args {
     /// release's red row prints; with
     /// `test --all --compile-only`, what it compiles.
     pub as_release: bool,
-    /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
-    /// for room for its memory, and its timed stages for a quiet machine (the default), or starts
-    /// at once, saying what it lacks. AppKit correctness drivers run under the load found and
-    /// report it; measurement stages still require qualified timing admission. Neither lifts the
-    /// run's own memory budget ([`crate::sched::memory_holders`]).
+    /// `--admit now|wait`: whether the run reclaims room once for the disk it will write, then
+    /// starts if it fits or ends at once, each stage waits for room for its memory, and its timed
+    /// stages for a quiet machine (the default), or it starts at once, saying what it lacks.
+    /// AppKit correctness drivers run under the load found and report it; measurement stages
+    /// still require qualified timing admission. Neither lifts the run's own memory budget
+    /// ([`crate::sched::memory_holders`]).
     pub admit: aterm_capacity::Admit,
     /// `--test-threads`: the most libtest threads any test binary runs on.
     pub test_threads: Option<NonZeroU32>,
@@ -227,6 +228,10 @@ where
             READERS => a.readers = Some(PathBuf::from(value(READERS)?)),
             BY_HAND => a.by_hand = true,
             "--app" => a.app = Some(PathBuf::from(value("--app")?)),
+            "--app-profile" => {
+                a.app_profile = crate::artifact::Profile::parse(&value("--app-profile")?)
+                    .ok_or_else(|| Usage::new("--app-profile requires debug or release"))?;
+            }
             "--fix" => a.fix = true,
             "--cell" => a.cells.push(value("--cell")?),
             "--no-windows" => a.no_windows = true,
@@ -234,7 +239,6 @@ where
             "--compile-only" => a.compile_only = true,
             "--as-release" => a.as_release = true,
             "--fail-fast" => a.fail_fast = true,
-            "--background" => a.background = true,
             "--tree" => tree = true,
             "--bundle" => bundle = true,
             "--checks" => listed.push(value("--checks")?),
@@ -393,9 +397,6 @@ where
             "--compile-only requires test, checkers or measure; it cannot qualify a release".into(),
         );
     }
-    if a.background && !(a.release && tree && !bundle) {
-        return usage("--background requires release --tree".into());
-    }
     if a.as_release && (!a.all || a.checks.is_empty() || a.checks.iter().any(|c| *c != Check::Test))
     {
         return usage("--as-release goes with `test` and `--all`".into());
@@ -406,6 +407,11 @@ where
         return usage(
             "--cursor-pacing requires only measure and --app; it cannot qualify a release".into(),
         );
+    }
+    if a.app_profile == crate::artifact::Profile::Debug
+        && (a.release || a.as_release || a.app.is_none() || a.checks != [Check::Measure])
+    {
+        return usage("--app-profile debug requires only measure and --app; debug validation cannot qualify a release".into());
     }
     if a.release {
         if !a.packages.is_empty() || a.base.is_some() || !a.cells.is_empty() {
@@ -572,10 +578,13 @@ Run aterm's checks in place, alone or in any combination.
   verify census --fix             move test modules a release build reads out of line
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
-  verify watch                    idle-capacity main samples; journaled verdicts, no gate
+  verify watch                    the follower: judges main tips, posts commit statuses
   verify land                     merge main, judge the cone since it, push; compose a
                                   moved main, or judge the merge over what the two
                                   share (`verify land --help`)
+  verify land --tab               optional program-worker tab: the person's explicit
+                                  request, or persistence native command tools
+                                  cannot provide; state why before spawning
   verify release --bundle [--app <APP>]
                                   its bundle CLI half: appkit needs no app;
                                   measure needs one after the build and tree
@@ -639,7 +648,10 @@ Options:
                           are judged too;
                           --by-hand: the merge was resolved or edited by hand,
                           so no crate is judged alone for a path the file names
-      --app <APP>         the release bundle `measure` judges
+      --app <APP>         the bundle `measure` judges
+      --app-profile <P>   expected compiled assertions: release (default) or debug;
+                          debug requires ordinary measure, names shipping size as not run,
+                          and cannot qualify a release
       --fix               with fmt alone: rewrite the files it finds unformatted;
                           with census alone: move the test modules it finds out of line
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
@@ -659,10 +671,11 @@ Options:
                           not run, its machine's fault, never ends it)
                           ordinary source/type preflight failures stop the run;
                           release --tree otherwise completes its full sweep
-      --admit <wait|now>  wait for room for the disk the run will write, for
-                          each stage's memory before it starts (held until
-                          it ends, beside other runs' claims), and for a
-                          quiet machine before the first timed stage,
+      --admit <wait|now>  reclaim room once for the disk the run will write,
+                          then start it if it fits or end it at once; wait
+                          for each stage's memory before it starts (held
+                          until it ends, beside other runs' claims), and
+                          for a quiet machine before the first timed stage,
                           held through the last (default wait, saying why
                           once a minute; next in line, it holds back claimed
                           work after {reserve} and starts whatever the load

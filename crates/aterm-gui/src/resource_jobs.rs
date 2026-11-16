@@ -41,6 +41,7 @@ struct State {
     native_pending: std::collections::BTreeMap<(u32, u64, u64), PendingNative>,
     #[cfg(unix)]
     native_delivered: std::collections::BTreeMap<(u32, u64, u64), PendingNative>,
+    // Rollback guards and native_receipt diagnostics belong to the adopted observer epoch.
     #[cfg(unix)]
     native_receipts: HashMap<String, (u64, u64)>,
     #[cfg(unix)]
@@ -129,23 +130,35 @@ pub(crate) fn native_model_pending(pending: bool) {
     {
         let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
         native_model_pending_into(&mut state, pending);
-        let finished = !native_demand(
-            &state,
+        finish_native_if_idle(
+            &mut state,
             NATIVE_SUBMITTING.load(std::sync::atomic::Ordering::Acquire),
             NATIVE_REVISION.load(std::sync::atomic::Ordering::Acquire),
+            aterm_resource_host::finish_resource_observer,
         );
-        if finished {
-            state.native_tracking = false;
-            state.native_tracking_cut = None;
-            if aterm_resource_host::finish_resource_observer() {
-                state.native_host = None;
-                state.native_seq = 0;
-                state.native_lost_origins = 0;
-            }
-        }
     }
     #[cfg(not(unix))]
     let _ = pending;
+}
+
+#[cfg(unix)]
+fn finish_native_if_idle(
+    state: &mut State,
+    submitting: usize,
+    revision: u64,
+    finish: impl FnOnce() -> bool,
+) {
+    if native_demand(state, submitting, revision) {
+        return;
+    }
+    state.native_tracking = false;
+    state.native_tracking_cut = None;
+    if finish() {
+        state.native_host = None;
+        state.native_seq = 0;
+        state.native_lost_origins = 0;
+        state.native_receipts = HashMap::new();
+    }
 }
 
 #[cfg(unix)]

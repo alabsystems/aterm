@@ -165,6 +165,109 @@ pub fn disk_reclaim_pass_model() -> Model {
     }
 }
 
+/// THE BUDGET PASS (DC-04b): over the rebuildable budget, at any level, a pass takes only the
+/// rows no live session's recent builds used, says `cannot-meet` once an episode, and strands no
+/// row a hold released. `over`, the volume read over its cap; `pass`, a budget pass running;
+/// `eligible`, the rows it may still take; `live`, a live session's row standing; `aged`, a row
+/// held by what lapses on its own (its runs' record, its idle window, a build's lock), standing;
+/// `memo`, the `cannot-meet` already said for this cap and volume (kept in a file, so a restart
+/// keeps it); `replan`, a pass the memo plans again: on an input it did not see (a session ended,
+/// more rebuildable bytes sized) or a day after the episode's last pass (`day`), kept until a
+/// pass ends against it; `rows`, the `cannot-meet` rows written this episode; `took_live`, a
+/// live session's row taken. A pass that stands down leaves `replan` as it was, as the memo is
+/// rewritten only by a pass that ends unable to meet its target. `Met` (a measured reading back
+/// under the cap) and `CapMoves` (another cap or volume read) end the episode. The mutants:
+/// `TakeLive` takes a live session's row; `CannotMeetAgain` writes the row again where the memo
+/// stands; `RestartForgets` loses the memo, as one kept in memory would be lost at a restart;
+/// `DayPassesBlind` lets the day pass with no pass planned, as a memo blind to the clock does.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn disk_budget_pass_model() -> Model {
+    aterm_spec::ty_model! {
+        DiskBudgetPass {
+            const Buggy = 0;
+            var over = 0;
+            var pass = 0;
+            var eligible = 2;
+            var live = 1;
+            var aged = 1;
+            var memo = 0;
+            var replan = 0;
+            var day = 0;
+            var rows = 0;
+            var took_live = 0;
+
+            action ReadOver when (pass == 0 && over == 0) { over = 1; }
+            action Admit when (pass == 0 && over == 1 && (memo == 0 || replan == 1)) { pass = 1; }
+            action Take when (pass == 1 && eligible > 0) { eligible = eligible - 1; }
+            action Met when (pass == 1) {
+                pass = 0;
+                over = 0;
+                memo = 0;
+                rows = 0;
+                replan = 0;
+                day = 0;
+            }
+            action StandDown when (pass == 1) { pass = 0; }
+            action CannotMeet when (pass == 1 && eligible == 0 && memo == 0) {
+                rows = rows + 1;
+                memo = 1;
+                pass = 0;
+                replan = 0;
+                day = 0;
+            }
+            action Exhausted when (pass == 1 && eligible == 0 && memo == 1) {
+                pass = 0;
+                replan = 0;
+                day = 0;
+            }
+            action SessionEnds when (pass == 0 && live == 1 && 2 > eligible) {
+                live = 0;
+                eligible = eligible + 1;
+                replan = 1;
+            }
+            action Ages when (pass == 0 && aged == 1 && 2 > eligible) {
+                aged = 0;
+                eligible = eligible + 1;
+            }
+            action Replans when (pass == 0 && memo == 1 && replan == 0) { replan = 1; }
+            action DayPasses when (pass == 0 && memo == 1 && day == 0) {
+                day = 1;
+                replan = 1;
+            }
+            action CapMoves when (pass == 0) {
+                memo = 0;
+                rows = 0;
+                replan = 0;
+                day = 0;
+            }
+
+            action TakeLive when (Buggy == 1 && pass == 1 && live == 1) { took_live = 1; }
+            action CannotMeetAgain when (
+                Buggy == 2 && pass == 1 && eligible == 0 && memo == 1 && 2 > rows
+            ) {
+                rows = rows + 1;
+                pass = 0;
+                replan = 0;
+                day = 0;
+            }
+            action RestartForgets when (Buggy == 3 && pass == 0 && memo == 1 && 2 > rows) {
+                memo = 0;
+            }
+            action DayPassesBlind when (Buggy == 4 && pass == 0 && memo == 1 && day == 0) {
+                day = 1;
+            }
+
+            invariant BudgetTakesNoLive: took_live == 0;
+            invariant CannotMeetOnce: rows <= 1;
+            invariant NothingStranded: memo == 0 || pass == 1 || eligible == 0 || day == 0
+                || replan == 1;
+            bound RowsBox: rows <= 2;
+            bound EligibleBox: eligible <= 2;
+        }
+    }
+}
+
 /// THE WAIT (`await sys`, design §3.3).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

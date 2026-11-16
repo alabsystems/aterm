@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 #[path = "title_drift_sizing_capture.rs"]
 mod capture;
 
-const HELP: &str = "usage: lab title-drift-memory [title-drift build/work/case options] --out NEW_ABSOLUTE_DIR --calibration-memory-mib N --bound-growth-mib N --bound-reason TEXT\n\nRuns the exact frozen title fixture under ordinary functional memory admission.\nBoth budgets must be explicit and positive. The functional budget must cover the\nwhole owned process envelope plus the ordinary separate spare. Growth is additional\nper-component headroom beyond the observed peak plus a fifth; explain its concrete\njustification (including sampling gaps and later controller evidence parsing).\nDefault cases: 1,30,200,split; default repetitions: 3 ABBA.\nProduces identity-bound raw sizing sweeps and a frozen memory-record.json only after\nevery requested fixture and exact cleanup succeeds. Never qualifies timing or emits\naccepted.csv. This opens native windows; respect the ordinary window/resource lane.\n";
+const HELP: &str = "usage: lab title-drift-memory [title-drift build/work/case options] --out NEW_ABSOLUTE_DIR --calibration-memory-mib N --bound-growth-mib N --bound-reason TEXT\n\nRuns the exact frozen title fixture under ordinary functional memory admission.\nBoth budgets must be explicit and positive. The functional budget must cover the\nwhole owned process envelope plus the ordinary separate spare. Growth is additional\nper-component headroom beyond the observed peak plus a fifth; explain its concrete\njustification (including sampling gaps and later controller evidence parsing).\nDefault cases: 1,30,200,split; default repetitions: 3 ABBA. Explicit real OS-window cases: windows1,windows2,windows8; the first window holds output/typing tabs and every additional window holds 30 idle tabs. Old tab-count memory evidence cannot authorize them.\nProduces identity-bound raw sizing sweeps and a frozen memory-record.json only after\nevery requested fixture and exact cleanup succeeds. Never qualifies timing or emits\naccepted.csv. This opens native windows; respect the ordinary window/resource lane.\n";
 
 fn positive_mib(args: &mut Vec<String>, name: &str) -> Result<u64, Fail> {
     let text = take_value(args, name)?
@@ -95,7 +95,7 @@ fn run(o: &Options, budget: u64, growth: u64, reason: &str) -> Result<(), String
             let (report, generation) = result?;
             experiment.validate()?;
             let source = json!({"footprint_semantics":FOOTPRINT_SEMANTICS,"kind":"functional_memory_sizing","timing_qualified":false,
-                "experiment_sha256":experiment.key,"case":case.label(),"ordinal":ordinal,"arm":arm.to_string(),
+                "experiment_sha256":experiment.key,"case":case.label(),"topology":case.receipt(),"ordinal":ordinal,"arm":arm.to_string(),
                 "binary_sha256":build.digest,"source_sha":build.source,"build_record_sha256":build.record_digest,
                 "functional_budget_bytes":budget,"ordinary_spare_bytes":crate::admission::FUNCTIONAL_MARGIN,
                 "fixture_complete":true,"cleanup_complete":true,"generation":generation,
@@ -124,7 +124,7 @@ fn run(o: &Options, budget: u64, growth: u64, reason: &str) -> Result<(), String
                 .get_mut(name)
                 .ok_or("complete sizing lacks component")?;
             values.sort_by_key(|v| v.get("monotonic_ns").and_then(Value::as_u64));
-            let evidence = json!({"footprint_semantics":FOOTPRINT_SEMANTICS,"experiment_sha256":experiment.key,"component":name,"observations":values,"captures":sources});
+            let evidence = json!({"footprint_semantics":FOOTPRINT_SEMANTICS,"experiment_sha256":experiment.key,"topology":case.receipt(),"component":name,"observations":values,"captures":sources});
             let text = evidence.to_string();
             let peak = crate::timing_comparison::measured_peak(&text, experiment, name)?;
             let bound = bound(peak, growth)?;
@@ -134,7 +134,7 @@ fn run(o: &Options, budget: u64, growth: u64, reason: &str) -> Result<(), String
                 "bound_derivation":format!("Observed current-reading sum floored by one member's kernel lifetime peak: {peak}; plus ceil(peak/5), plus explicit {growth} bytes growth per component. Counters are non-atomic and this is an observed lower bound, not a guaranteed unseen all-time aggregate peak. setup_cleanup_overlap deliberately duplicates the whole owned envelope. Justification: {reason}"),
                 "evidence_path":path.display().to_string(),"evidence_sha256":crate::measure::sha256(&text)}));
         }
-        comparisons.push(json!({"experiment_sha256":experiment.key,"components":components}));
+        comparisons.push(json!({"experiment_sha256":experiment.key,"topology":case.receipt(),"components":components}));
     }
     let _preparation = crate::admission::functional("title-drift memory record validation", budget)
         .map_err(|f| {

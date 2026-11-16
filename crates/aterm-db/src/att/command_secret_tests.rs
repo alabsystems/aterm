@@ -58,12 +58,14 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         },
     )]);
     let view = View {
+        table: None,
         causal: astream_wire::sync::Index::new(0),
         ops: vec![],
         quota: Default::default(),
         cells,
         owned: Default::default(),
         complete: true,
+        awaiting: crate::typed::Awaiting::NONE,
         refused: vec![],
     };
     const OLD: Collection = Collection {

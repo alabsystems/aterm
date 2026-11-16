@@ -43,10 +43,11 @@ fn page_beside_terminal() -> Split {
     // A real window with inert headless platform ports.
     app.headless = false;
     let window = WindowId(0);
-    let state = app.windows.get_mut(&window).unwrap();
+    let mut state = app.windows.get_mut(&window).unwrap();
     state.os_window_for_test = true;
     state.rows = 30;
     state.cols = 200;
+    drop(state);
     app.set_system_state_handlers_for_test(
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
     );
@@ -618,7 +619,7 @@ mod presses {
         app.config.scrollbar = Some(true);
         let wid = WindowId(0);
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.os_window_for_test = true;
             ws.rows = 30;
             ws.cols = 200;
@@ -758,7 +759,7 @@ mod presses {
         split.app.paste_banner = None;
 
         {
-            let ws = split.app.windows.get_mut(&wid).unwrap();
+            let mut ws = split.app.windows.get_mut(&wid).unwrap();
             ws.pane_overlay.hover = Some(split.terminal);
             ws.stats_lens.open = Some(crate::stats_lens::Lens {
                 focus: crate::stats_paint::Instrument::Cpu,
@@ -855,7 +856,7 @@ mod presses {
             "pressing the control arms state.common().pressed"
         );
         {
-            let ws = split.app.windows.get_mut(&wid).unwrap();
+            let mut ws = split.app.windows.get_mut(&wid).unwrap();
             ws.stats_lens.open = Some(crate::stats_lens::Lens {
                 focus: crate::stats_paint::Instrument::Cpu,
                 bar: crate::stats_paint::Bar::Global,
@@ -943,7 +944,7 @@ mod presses {
             "moving onto uncovered native control sets common().hovered"
         );
         {
-            let ws = split.app.windows.get_mut(&wid).unwrap();
+            let mut ws = split.app.windows.get_mut(&wid).unwrap();
             ws.stats_lens.open = Some(crate::stats_lens::Lens {
                 focus: crate::stats_paint::Instrument::Cpu,
                 bar: crate::stats_paint::Bar::Global,

@@ -732,7 +732,8 @@ pub(super) struct WindowRound {
 /// Two rounds of the window's keeper as its worker runs them ([`keeper_round`] with
 /// [`window_notifications`]), over a system off the console, which reads no hardware, with no
 /// follow-up asked for: the first finds a new sample, `between` runs, and the second is told.
-/// Its wait is the one [`next_wait`] chooses with every hint source armed.
+/// Its wait is the one [`next_wait`] chooses with every hint source armed and no notice to
+/// confirm.
 #[cfg(test)]
 pub(super) fn window_round_off_the_console(between: impl FnOnce()) -> WindowRound {
     let sys = aterm_machines::port::Fake::root();
@@ -764,7 +765,7 @@ pub(super) fn window_round_off_the_console(between: impl FnOnce()) -> WindowRoun
     WindowRound {
         caps_stand: facts.caps_stand,
         dispatch: facts.dispatch,
-        wait: next_wait(&facts, armed, PACE),
+        wait: next_wait(&facts, false, armed, PACE),
     }
 }
 
@@ -798,6 +799,13 @@ const PACE: Duration = Duration::from_secs(2);
 /// How long a settled keeper waits with no hint before it reads again: the longest pause its
 /// own retries already keep. It bounds how long a change that nothing announces stays unseen.
 const BACKSTOP: Duration = Duration::from_millis(aterm_secrets::converge::LONGEST_RETRY_MS);
+
+/// How many rounds confirm a keyboard or console notice after the round it starts, each no
+/// later than [`PACE`] after the one before. The notice can come before hidd's census or
+/// `/dev/console`'s owner shows the change, by an amount nothing bounds, so one look after it can
+/// be too early: five rounds at the pace look for about ten seconds. A change later still waits
+/// for the next hint or the [`BACKSTOP`].
+const CONFIRMING: u8 = 5;
 
 /// Which hint sources of a keeper's worker are armed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -845,8 +853,8 @@ struct RoundFacts {
 
 /// How long the worker waits after a round before the next, a hint apart. Each of these keeps
 /// the timer, `pace`:
-/// - a keyboard or console notice ended the wait before: the notice can come before the census
-///   or the console's owner shows the change, so one more round confirms it;
+/// - `confirming`: fewer than [`CONFIRMING`] rounds have followed the last keyboard or console
+///   notice's, so the next still confirms it;
 /// - the round moved something: the next reads what that left;
 /// - a pending scope, an unfinished attachment, a kept console return, a running follow-up
 ///   attempt, a Caps Lock live reading the readings do not hold, or readings the window's loop
@@ -855,10 +863,9 @@ struct RoundFacts {
 ///
 /// Otherwise the round is settled: the worker waits for a hint, for the follow-up's or the
 /// reader's own next time, or for [`BACKSTOP`], and never less than `pace`.
-fn next_wait(facts: &RoundFacts, coverage: Coverage, pace: Duration) -> Duration {
+fn next_wait(facts: &RoundFacts, confirming: bool, coverage: Coverage, pace: Duration) -> Duration {
     use super::withheld_preferences::Owed;
-    let confirm = watch::Causes::DEVICE.union(watch::Causes::CONSOLE);
-    if facts.causes.intersects(confirm)
+    if confirming
         || facts.moved
         || facts.pending_scope
         || facts.attempted
@@ -1060,11 +1067,12 @@ impl Waits for watch::Watch {
 /// ended. Each round is handed what the wait before it heard.
 ///
 /// A round that owes another, or whose hint sources did not all arm (`records` says whether the
-/// records watch did), keeps the two-second timer. A settled round does not: the next round
-/// comes at a hint or at [`BACKSTOP`]. The backstop is for the changes nothing announces: a
-/// mapping another program resets on a keyboard that stays attached, a keyboard whose driver
-/// family posts no lifecycle notice, a console owner that changed long after its notice, a
-/// record rewritten in place.
+/// records watch did), keeps the two-second timer, and a keyboard or console notice keeps it
+/// until [`CONFIRMING`] rounds have followed the one it started. A settled round does not: the
+/// next round comes at a hint or at [`BACKSTOP`]. The backstop is for the changes nothing
+/// announces: a mapping another program resets on a keyboard that stays attached, a keyboard
+/// whose driver family posts no lifecycle notice, a console owner that changed long after its
+/// notice, a record rewritten in place.
 fn keeper_loop(
     mut round: impl FnMut(watch::Causes) -> RoundFacts,
     chose: impl Fn(&RoundFacts, Coverage, Duration),
@@ -1074,16 +1082,26 @@ fn keeper_loop(
     pace: Duration,
 ) {
     let at_once = watch::Causes::DEVICE.union(watch::Causes::WAKE);
+    let notice = watch::Causes::DEVICE.union(watch::Causes::CONSOLE);
     let mut heard = watch::Causes::default();
+    // How many rounds, after the one running, are still owed to confirm the last keyboard or
+    // console notice.
+    let mut to_confirm = 0;
     while !stop.load(Ordering::Acquire) {
-        let facts = round(std::mem::take(&mut heard));
+        let causes = std::mem::take(&mut heard);
+        to_confirm = if causes.intersects(notice) {
+            CONFIRMING
+        } else {
+            to_confirm.saturating_sub(1)
+        };
+        let facts = round(causes);
         let watch::Armed { devices, console } = waits.armed();
         let coverage = Coverage {
             devices,
             console,
             records,
         };
-        let wait = next_wait(&facts, coverage, pace);
+        let wait = next_wait(&facts, to_confirm > 0, coverage, pace);
         chose(&facts, coverage, wait);
         let ended = waits.now();
         let paced = ended + pace;

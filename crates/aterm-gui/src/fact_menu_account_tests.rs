@@ -2274,6 +2274,7 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
     token.made_at = u64::try_from(OCT_2).ok();
     token.verified_at = u64::try_from(OCT_12).ok();
     token.made_on = Some("m20".into());
+    token.verified_on = Some("m12".into());
     token.vault_words = Some("in the vault, shared with 2 Macs".into());
     token.peers = vec!["m15".into(), "m22".into()];
     token.peers_read_at = u64::try_from(TODAY_13_05).ok();
@@ -2299,6 +2300,7 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
         "Token made: Fri 2 Oct 12:00 (2026-10-02T12:00:00Z)",
         "Token ends: Mon 1 Feb 12:00 (2027-02-01T12:00:00Z)",
         "Token made on: m20",
+        "Token verified on: m12",
         "Vault: in the vault, shared with 2 Macs",
         "Token step: stopped 11 Nov: the consent page carried a human check",
         "Other Macs on the token: m15, m22, read 13:05 (2026-11-11T13:05:00Z)",

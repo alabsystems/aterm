@@ -115,6 +115,23 @@ impl OwnedLaunchEnvironment {
     }
 
     pub(super) fn admit(self, starter: &worker::Starter) -> Result<AdmittedEnvironment, Error> {
+        let arguments = starter.args.as_ref().map_err(|_| Error::Unsupported)?;
+        let arguments = arguments.iter().map(OsString::from).collect();
+        self.admit_arguments(starter, arguments)
+    }
+
+    pub(super) fn admit_arguments(
+        self,
+        starter: &worker::Starter,
+        arguments: Vec<OsString>,
+    ) -> Result<AdmittedEnvironment, Error> {
+        if arguments
+            .iter()
+            .any(|argument| argument.as_bytes().contains(&0))
+        {
+            return Err(Error::Denied);
+        }
+        let starter_arguments = starter.args.clone().map_err(|_| Error::Unsupported)?;
         self.current()?;
         self.check(starter)?;
         let mut selected = self.effective(starter)?;
@@ -122,6 +139,8 @@ impl OwnedLaunchEnvironment {
         Ok(AdmittedEnvironment {
             source: self,
             selected,
+            arguments,
+            starter_arguments,
         })
     }
 
@@ -145,6 +164,8 @@ impl OwnedLaunchEnvironment {
 pub(super) struct AdmittedEnvironment {
     source: OwnedLaunchEnvironment,
     selected: BTreeMap<OsString, OsString>,
+    arguments: Vec<OsString>,
+    starter_arguments: Vec<String>,
 }
 
 /// The only executable command produced by complete environment installation.
@@ -186,11 +207,10 @@ impl AdmittedEnvironment {
         input: aterm_uds::spawnfd::Stdio,
         required_tether: bool,
     ) -> Result<InstalledCommand, Error> {
-        let args = starter.args.as_ref().map_err(|_| Error::Unsupported)?;
         let mut command = aterm_uds::spawnfd::command(&starter.exe);
         self.install(&mut command, starter)?;
         command
-            .args(args)
+            .args(&self.arguments)
             .current_dir(cwd)
             .stdin(input)
             .stdout(aterm_uds::spawnfd::Stdio::piped())
@@ -203,6 +223,9 @@ impl AdmittedEnvironment {
         Ok(InstalledCommand { command })
     }
     pub(super) fn check(&self, starter: &worker::Starter) -> Result<(), Error> {
+        if starter.args.as_ref().map_err(|_| Error::Unsupported)? != &self.starter_arguments {
+            return Err(Error::Denied);
+        }
         self.source.current()?;
         self.source.check(starter)?;
         let mut selected = self.source.effective(starter)?;

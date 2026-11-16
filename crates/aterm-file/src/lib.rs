@@ -30,6 +30,7 @@ pub mod frontier;
 pub mod layout;
 pub mod name;
 pub mod outbox;
+pub mod retain;
 pub mod snapshot;
 pub mod status;
 

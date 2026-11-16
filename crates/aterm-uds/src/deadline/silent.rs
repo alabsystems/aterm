@@ -312,7 +312,7 @@ impl Drop for KeptUntilRan {
 /// How long [`cat_echoes`] waits for the echo: the one-minute hang detector, never a budget.
 pub const ECHO_HANG: Duration = Duration::from_secs(60);
 
-/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from the copy with piped stdout, writes the line `line` (lines before it are skipped) within `hang` ([`ECHO_HANG`] for a copy of a small Apple binary, [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary), so its exec's assessment is done and it runs from its file. A child macOS's program check still holds at `hang` ends the test COULD NOT RUN ([`held_words`]).
+/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from the copy with piped stdout, writes the line `line` (lines before it are skipped), so its exec's assessment is done and it runs from its file. `hang` is a window without native process progress ([`ECHO_HANG`] for a copy of a small Apple binary, [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary). A child macOS's program check still holds when that window ends makes the test COULD NOT RUN ([`held_words`]).
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
@@ -397,7 +397,16 @@ fn prints_judged(
             }
         }
     });
-    match seen.recv_timeout(hang) {
+    let mut probe = super::ProcessProgressProbe::default();
+    let mut window = super::ProgressWindow::new(hang, super::deadline_now());
+    let received = loop {
+        let left = window.observe(super::deadline_now(), 0, || probe.read(child.id()));
+        match seen.recv_timeout(left) {
+            Err(RecvTimeoutError::Timeout) if !left.is_zero() => continue,
+            result => break result,
+        }
+    };
+    match received {
         Ok(()) => {}
         // How it ended says why: its own exit status, or a signal no test of its own sent.
         Err(RecvTimeoutError::Disconnected) => match super::exit_within(child, ECHO_HANG) {
@@ -597,7 +606,7 @@ fn refused(child: &mut crate::spawnfd::Child, line: &str, why: &str) -> ! {
     );
 }
 
-/// [`prints`] for a copy of `cat`: `child`, spawned with piped stdin and stdout, echoes a line written to it within [`ECHO_HANG`].
+/// [`prints`] for a copy of `cat`: `child`, spawned with piped stdin and stdout, echoes a line written to it with [`ECHO_HANG`] as its process inactivity window.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]

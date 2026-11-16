@@ -173,19 +173,23 @@ fn no_process_has_a_group_or_a_terminal() {
     let me = std::process::id();
     assert_eq!(ids(me), None, "Windows has no process group");
     assert_eq!(
-        super::live_terminal_read(me),
-        super::TerminalRead::Read(None),
+        super::live_terminal(me),
+        Ok(None),
         "the observed current process has no controlling terminal"
     );
-    assert_eq!(super::opener(me, parent_of(me).unwrap_or(0)), None);
+    assert_eq!(
+        super::opener(me, parent_of(me).unwrap_or(0)),
+        Ok(None),
+        "read, and no opener: never unread"
+    );
 }
 
 #[test]
 fn unobserved_process_terminal_remains_unread() {
     for pid in [0, u32::MAX] {
         assert_eq!(
-            super::live_terminal_read(pid),
-            super::TerminalRead::Unread,
+            super::live_terminal(pid),
+            Err(super::NotRead),
             "an unobservable process must not be classified as an observed terminal owner"
         );
     }

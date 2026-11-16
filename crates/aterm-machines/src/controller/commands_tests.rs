@@ -2914,10 +2914,6 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
             Ran::ok("/Library/Developer/CommandLineTools\n"),
         )
         .on(
-            "/bin/launchctl enable system/systems.alab.aterm-lan",
-            Ran::ok(""),
-        )
-        .on(
             "/bin/launchctl kickstart system/systems.alab.aterm-lan",
             Ran::ok(""),
         );
@@ -2973,10 +2969,6 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
         let interrupted = broker_case();
         interrupted
             .on(BROKER_PRINT, Ran::exit(113, "Could not find service"))
-            .on(
-                "/bin/launchctl enable system/systems.alab.aterm-lan",
-                Ran::ok(""),
-            )
             .on(
                 BROKER_BOOTSTRAP,
                 Ran::exit(5, "bootstrap still unavailable"),
@@ -3050,10 +3042,6 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
             Ran::ok(""),
         )
         .on(
-            "/bin/launchctl enable system/systems.alab.aterm-lan",
-            Ran::ok(""),
-        )
-        .on(
             BROKER_BOOTSTRAP,
             Ran::exit(5, "the other owner's job must not be restarted"),
         );
@@ -3103,10 +3091,6 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
             .on(
                 BROKER_PRINT,
                 Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
-            )
-            .on(
-                "/bin/launchctl enable system/systems.alab.aterm-lan",
-                Ran::ok(""),
             )
             .on(BROKER_BOOTSTRAP, Ran::ok(""))
             .on(

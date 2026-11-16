@@ -443,6 +443,12 @@ pub(in crate::harness) fn adopt(
     } else if raw.row(&row.label).is_some() {
         return Err("approved account label is already used by another local identity".into());
     }
+    // An adoption is nobody at this Mac: a row a bot protection stopped here, or one of its pool
+    // and realm, loads no page for the root's request, on any clock, and asks the root for
+    // nothing (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+    if super::super::accounts_sync::person_hold(store, &raw, &row, &logins).is_some() {
+        return Ok(false);
+    }
     if !signin.names(cli, &row.label) {
         return Err("the sign-in started here names another account".into());
     }
@@ -734,6 +740,22 @@ pub(in crate::harness) fn adopt(
                 }
                 shared_provider::Execution::Completed => {}
                 shared_provider::Execution::Unknown(why) => execution_error = Some(why),
+                shared_provider::Execution::BotCheck(why) => {
+                    // The account's check goes on record and no recovery is requested: the
+                    // root's next preparation would load the same page into the same check. The
+                    // retained attempt stays as it is, and only a person at this Mac goes on
+                    // ([`super::super::accounts_sync::person_hold`]).
+                    let at = host.now().max(env.now);
+                    store.transact_logins(at, &mut None, |_, current| {
+                        accounts::note_check_stop(current, &row, at);
+                        Ok(Vec::new())
+                    })?;
+                    return Err(format!(
+                        "{why}; a bot protection stopped this Mac's sign-in, which only a person \
+                         here goes on from, so no new attempt is asked for"
+                    )
+                    .into());
+                }
                 shared_provider::Execution::NotStarted(why) => {
                     if publication.is_saved() {
                         return Err(RenewalFailure::deferred());

@@ -4,6 +4,46 @@
 use super::*;
 
 #[test]
+fn distinct_intents_select_an_exact_single_image_census() {
+    let mut args = [
+        "--aterm",
+        "/host",
+        "--package",
+        "/sdk",
+        "--record",
+        "/evidence",
+        "--kind",
+        "retained-distinct",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let ask = parse(&args).unwrap();
+    assert!(ask.retained && ask.distinct);
+    args.extend(["--replacement-package".into(), "/after".into()]);
+    assert!(parse(&args).is_err());
+}
+
+#[test]
+fn app_resources_select_an_explicit_same_image_qualification() {
+    let mut args = [
+        "--aterm",
+        "/host",
+        "--package",
+        "/sdk",
+        "--record",
+        "/evidence",
+        "--kind",
+        "retained-resources",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let ask = parse(&args).unwrap();
+    assert!(ask.retained && ask.resources && !ask.distinct);
+    args.extend(["--replacement-package".into(), "/after".into()]);
+    assert!(parse(&args).is_err());
+}
+
+#[test]
 fn replacement_package_requires_explicit_retained_qualification() {
     let mut args = [
         "--aterm",

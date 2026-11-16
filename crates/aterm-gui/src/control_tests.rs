@@ -2436,7 +2436,6 @@ fn removed_verbs_are_unadvertised_stable_tombstones() {
             said.starts_with(&format!("ERR verb {operator} was removed")),
             "{said}"
         );
-        assert!(said.contains("spawn agent=claude"), "{operator}: {said}");
     }
     for dial in ["dial", "dial-list", "dial-token"] {
         let said = retired_verb_error(dial).unwrap_or_else(|| panic!("{dial} has a tombstone"));
@@ -6438,12 +6437,18 @@ fn escalated_op_fences_argument_dependent_seams() {
         "HoldSession",
         "LiftHold",
         "ToggleStatsLens",
+        "ShowSystemResourcesHere",
         "RecordUnseenKeys",
         "RenameMachine",
     ] {
         let refusal = super::control_media::invoke_refusal(name).expect("refused");
         assert!(refusal.starts_with("ERR denied"), "{name}: {refusal}");
     }
+    let band = super::control_media::invoke_refusal("ShowSystemResourcesHere").expect("refused");
+    assert!(
+        band.contains("(View \u{25b8} Show System Resources Here)"),
+        "the row's own place, not the Agents menu's: {band}"
+    );
     let lens = super::control_media::invoke_refusal("ToggleStatsLens").expect("refused");
     assert_eq!(
         lens.contains("\u{2318}I"),
@@ -8356,7 +8361,7 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
 
     let both = watch(
         "mail",
-        &[("h-andrew", "task", ""), ("s-peer", "note", "")],
+        &[("h-andrew", "task", ""), ("tpeer000000", "note", "")],
         2,
     );
     assert!(
@@ -8364,7 +8369,7 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
         "{both:?}"
     );
     assert!(
-        both.contains("MAIL 0 id=2 off=501 from=s-peer kind=note\n"),
+        both.contains("MAIL 0 id=2 off=501 from=tpeer000000 kind=note\n"),
         "{both:?}"
     );
     assert_eq!(both.matches("MAIL 0 ").count(), 2, "{both:?}");
@@ -8376,7 +8381,7 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
 
     let filtered = watch(
         "mail:kinds=task",
-        &[("h-andrew", "task", ""), ("s-peer", "note", "")],
+        &[("h-andrew", "task", ""), ("tpeer000000", "note", "")],
         1,
     );
     assert!(filtered.contains("MAIL 0 id=1 "), "{filtered:?}");
@@ -8388,8 +8393,8 @@ fn subscribe_mail_pushes_one_metadata_line_per_row_and_never_a_body() {
         "mail:topic=build.failed",
         &[
             ("h-andrew", "task", ""),
-            ("s-peer", "note", "topic=build.failed "),
-            ("s-peer", "note", "topic=other.thing "),
+            ("tpeer000000", "note", "topic=build.failed "),
+            ("tpeer000000", "note", "topic=other.thing "),
         ],
         1,
     );
@@ -15951,7 +15956,7 @@ fn fabric_attach_body() {
         assert_eq!(verb, "fabric");
         dispatch_fabric_verb(rest, selector.as_ref(), scope, &store)
     };
-    let post = || crate::fabric::cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 on?", None);
+    let post = || crate::fabric::cmd_post(&ctx, "to=@tpeer000000 kind=ask --wait=0 on?", None);
     let unattached = format!(
         "build={} bridge_lane=- bridge_build=- lane_faults=0",
         aterm_stamp::build_id()
@@ -15988,7 +15993,7 @@ fn fabric_attach_body() {
             "{line} from the bridge connection"
         );
         assert_eq!(
-            run(Scope::Owner, &format!("@s-other {line}")),
+            run(Scope::Owner, &format!("@t0000000002 {line}")),
             "ERR denied\n",
             "{line} with a selector"
         );
@@ -16597,6 +16602,10 @@ fn help_names_the_harness_lane_and_exactly_the_exempt_lanes() {
 /// logged; with its `a.lane.is_some()` dropped, the observed disk lanes on another connection
 /// pass; with `agent_act::withheld_with`'s unadmitted agent read as confirmed, the Codex and
 /// Grok rows pass.
+/// It keeps the kernel's read of the session (`agent_act::keep_live_for_test`), which stands only
+/// where the kernel reads a leader's start (`holder_image::start_us_of`): not elsewhere (Windows),
+/// where every gate read is made afresh (ATERM-KI-1115-12549).
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[test]
 fn every_harness_write_lane_passes_the_one_observe_gate() {
     use aterm_agent::harness::agent_image::{self, Act, Lane};
@@ -17508,31 +17517,32 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
     let local_sid = local.ctx.self_id.as_str().to_string();
     store.write().unwrap().register(local);
     let refused = worker_frame_refusal(
-        &control_request::head("@s-0ffcafe spawn agent=claude len=4"),
+        &control_request::head("@s-00000000000000ffcafe spawn agent=claude len=4"),
         &store,
     );
     assert!(
-        refused.as_deref().is_some_and(|r| r
-            .starts_with("ERR spawn agent=claude: @s-0ffcafe is not a session of this instance")),
+        refused.as_deref().is_some_and(|r| r.starts_with(
+            "ERR spawn agent=claude: @s-00000000000000ffcafe is not a session of this instance"
+        )),
         "{refused:?}"
     );
     let muse = worker_frame_refusal(
-        &control_request::head("@s-0ffcafe spawn agent=muse len=4"),
+        &control_request::head("@s-00000000000000ffcafe spawn agent=muse len=4"),
         &store,
     );
     assert!(
-        muse.as_deref()
-            .is_some_and(|r| r
-                .starts_with("ERR spawn agent=muse: @s-0ffcafe is not a session of this instance")),
+        muse.as_deref().is_some_and(|r| r.starts_with(
+            "ERR spawn agent=muse: @s-00000000000000ffcafe is not a session of this instance"
+        )),
         "{muse:?}"
     );
     assert!(!request_waits(
-        "@s-0ffcafe spawn agent=claude len=4",
+        "@s-00000000000000ffcafe spawn agent=claude len=4",
         Scope::Owner,
         &store
     ));
     assert!(
-        request_waits("@s-0ffcafe spawn cwd=/w", Scope::Owner, &store),
+        request_waits("@s-00000000000000ffcafe spawn cwd=/w", Scope::Owner, &store),
         "a plain spawn is relayed as before"
     );
     for here in [
@@ -17540,8 +17550,8 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
         "@. spawn agent=claude len=4".to_string(),
         "@0 spawn agent=claude len=4".to_string(),
         format!("@{local_sid} spawn agent=claude len=4"),
-        "@s-0ffcafe spawn cwd=/w".to_string(),
-        "@s-0ffcafe text".to_string(),
+        "@s-00000000000000ffcafe spawn cwd=/w".to_string(),
+        "@s-00000000000000ffcafe text".to_string(),
     ] {
         assert_eq!(
             worker_frame_refusal(&control_request::head(&here), &store),
@@ -18977,12 +18987,23 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     let store = session_store::new_store();
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
+    let opened = h
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .opened_ms()
+        .expect("the registered session's log opened");
     let row = || {
         let body = control_session::cmd_sessions_store(&store, None);
         let line = body.lines().nth(1).expect("one row");
         let (head, owner) = line.split_once(" path_evidence=").expect("owner columns");
         assert!(
-            owner.ends_with(" copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
+            owner.ends_with(&format!(
+                " copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0 \
+                 opened_ms={opened}"
+            )),
             "{line}"
         );
         head.strip_suffix(
@@ -18996,7 +19017,7 @@ fn the_supervisor_key_is_owner_only_shown_in_the_roster_and_released_with_its_co
     assert!(row().ends_with(" supervisor=-"), "{}", row());
 
     let sup = |scope: Scope, conn: Option<u64>, rest: &str| {
-        control_session::cmd_meta_supervisor(&h.ctx, scope, conn, &|_| None, rest)
+        control_session::cmd_meta_supervisor(&h.ctx, scope, conn, &|_, _| None, &|_, _| None, rest)
     };
     assert_eq!(sup(Scope::Owner, Some(1), "set title x"), None);
     assert_eq!(
@@ -19083,7 +19104,8 @@ fn an_aterm_serving_no_contract_three_refuses_a_claim_naming_one() {
             &h.ctx,
             Scope::Owner,
             Some(conn),
-            &|_| None,
+            &|_, _| None,
+            &|_, _| None,
             rest,
             serves,
         )
@@ -19129,6 +19151,153 @@ fn release_connection_claims_of(h: &crate::session_store::SessionHandle, conn: u
     let store = session_store::new_store();
     store.write().unwrap().register(h.clone());
     release_connection_claims(&store, None, conn);
+}
+
+/// A SEED ID WITH NO ROW IS REFUSED, NEVER STORED FOREIGN (`docs/HARNESS-CONTRACT.md` §2): in a
+/// session whose catalog holds claude-code-alab alone, grok-alab (a seed id whose row is gone, as
+/// when its live build's record fails) claiming under contract 3 or with no `contract=` is
+/// answered `ERR unproven`, nothing is claimed and no proof is asked for; a holder no row or seed
+/// names is still an ordinary foreign claim. NEGATIVE CONTROL: before HX-05's review fix
+/// grok-alab's claim here was stored as a foreign claim, which takes every duty from aterm's
+/// engine with nothing proven.
+#[cfg(unix)]
+#[test]
+fn a_seed_id_with_no_row_is_refused_and_never_stored_as_a_foreign_claim() {
+    let mut h = crate::session_store::test_handle_on(7531, -1);
+    let claude = aterm_agent::harness::contract::row_named("claude-code-alab").expect("seed");
+    let catalog = crate::native_session_policy::FixturePolicy::new(
+        std::slice::from_ref(claude),
+        vec![crate::native_session_policy::FixtureImages {
+            row: claude.id,
+            images: vec![aterm_agent::harness::native_act::Image {
+                path: b"/fixture".to_vec(),
+                device: 1,
+                inode: 1,
+            }],
+        }],
+        aterm_agent::supervise::SupervisorConfig::default(),
+        &[],
+    )
+    .expect("a bounded catalog");
+    assert!(
+        Arc::get_mut(&mut h.ctx)
+            .expect("one owner")
+            .install_fixture_policy(catalog)
+            .is_ok(),
+        "the fixture catalog"
+    );
+    let asked = Mutex::new(Vec::new());
+    let sup = |conn: u64, rest: &str| {
+        control_session::cmd_meta_supervisor(
+            &h.ctx,
+            Scope::Owner,
+            Some(conn),
+            &|holder: &str, contract| {
+                asked.lock().unwrap().push((holder.to_string(), contract));
+                None
+            },
+            &|_, _| None,
+            rest,
+        )
+        .expect("a supervisor line")
+        .0
+    };
+    let holder = || {
+        h.ctx
+            .meta
+            .lock()
+            .unwrap()
+            .live_claim(crate::metrics::now_us())
+            .map(|c| c.holder.clone())
+    };
+    for line in [
+        "set supervisor grok-alab@4242 contract=3 scope=relaunch,upgrade",
+        "set supervisor grok-alab@4242",
+        "set supervisor grok-alab@4242 contract=4 scope=relaunch version=0.3.0",
+    ] {
+        let reply = sup(7, line);
+        assert_eq!(
+            reply, "ERR unproven: no registry row proves this holder\n",
+            "{line}"
+        );
+        assert_eq!(holder(), None, "{line}: nothing is claimed");
+    }
+    assert!(asked.lock().unwrap().is_empty(), "no proof is asked for");
+    assert_eq!(
+        sup(
+            7,
+            "set supervisor other-alab@4242 contract=3 scope=relaunch"
+        ),
+        "OK\n",
+        "a holder no row or seed names is foreign"
+    );
+    assert_eq!(holder().as_deref(), Some("other-alab@4242"));
+}
+
+/// A CLAIM BEING MADE IS PROVEN UNDER ITS OWN CONTRACT'S IMAGE RULE, a standing one under the
+/// contract it stands on: `meta set supervisor` asks the claim-time proof for contract 3 or 4 as
+/// the claim names it, and nothing for a claim without `contract=`; the re-proof of a standing
+/// claim reads the contract the holder's live scoped claim names, and none for another holder or
+/// a claim that is not scoped. NEGATIVE CONTROL: before HX-05's review fix one proof judged every
+/// claimant by its registry row's rule, so a seed id's contract 3 claim from a build older than
+/// its first record, which contract 3's rule admits, was unproven.
+#[test]
+fn a_claim_is_proven_under_the_contract_it_names_or_stands_on() {
+    use aterm_agent::harness::contract::{SCOPED, Scope as Duty, UNIVERSAL};
+    let h = registered_session(0, -1, b"");
+    let asked = Mutex::new(Vec::new());
+    let sup = |rest: &str| {
+        control_session::cmd_meta_supervisor(
+            &h.ctx,
+            Scope::Owner,
+            Some(9),
+            &|holder: &str, contract| {
+                asked.lock().unwrap().push((holder.to_string(), contract));
+                None
+            },
+            &|_, _| None,
+            rest,
+        )
+        .expect("a supervisor line")
+        .0
+    };
+    let me = "claude-code-alab@4242";
+    assert!(sup(&format!("set supervisor {me} contract=3 scope=relaunch")).starts_with("ERR"));
+    assert!(
+        sup(&format!(
+            "set supervisor {me} contract=4 scope=relaunch version=0.3.0"
+        ))
+        .starts_with("ERR")
+    );
+    assert_eq!(sup("set supervisor watcher@4242"), "OK\n");
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        [
+            (me.to_string(), Some(SCOPED)),
+            (me.to_string(), Some(UNIVERSAL)),
+            ("watcher@4242".to_string(), None),
+        ]
+    );
+    assert_eq!(held_contract(&h.ctx, "watcher@4242"), None, "not scoped");
+    release_connection_claims_of(&h, 9);
+    let standing = "grok-alab@4242";
+    for contract in [SCOPED, UNIVERSAL] {
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[Duty::Relaunch]);
+        scoped.claim.contract = contract;
+        crate::session_timeline::claim_supervisor_scoped(
+            &h.ctx,
+            standing,
+            Some(10),
+            scoped,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the standing claim");
+        assert_eq!(held_contract(&h.ctx, standing), Some(contract));
+        assert_eq!(held_contract(&h.ctx, "kimi-alab@4242"), None);
+        release_connection_claims_of(&h, 10);
+        assert_eq!(held_contract(&h.ctx, standing), None);
+    }
 }
 
 /// Build an [`ActiveHandle`] over a `pipe_session` handle.
@@ -21578,7 +21747,7 @@ fn fleet_binary_input_records_authenticated_actor_not_request_text() {
                         host: "m72 / remote=desk".to_owned(),
                     },
                     aterm_types::control_verbs::Requester::of(
-                        Some("s-0123456789abcdef0123"),
+                        Some("tqn5r6e0148"),
                         Some("claude"),
                         None,
                         None,
@@ -21611,7 +21780,7 @@ fn fleet_binary_input_records_authenticated_actor_not_request_text() {
             assert_eq!(
                 rows[0].by,
                 if remote {
-                    Actor::fleet_drive("authenticated-node", Some("s-0123456789abcdef0123"))
+                    Actor::fleet_drive("authenticated-node", Some("tqn5r6e0148"))
                 } else {
                     Actor::Ctl
                 }
@@ -22792,9 +22961,9 @@ fn the_autopilot_words_meta_lines_wait_on_the_journal() {
 /// worker's do. CONTROL: every other verb on it; a sid nothing hosts or kept.
 #[test]
 fn a_drive_reads_a_reaped_workers_result_and_waits_on_its_end() {
-    const W: &str = "s-00000000000000aa";
-    const GONE: &str = "s-00000000000000dd";
-    const NEVER: &str = "s-00000000000000ee";
+    const W: &str = "t00000000aa";
+    const GONE: &str = "t00000000dd";
+    const NEVER: &str = "t00000000ee";
     let hosts = |sid: &SessionId| sid.as_str() == W;
     let kept = |sid: &SessionId| sid.as_str() == GONE;
     let no = |_: &SessionId| false;
@@ -22841,8 +23010,8 @@ fn a_drive_reads_a_reaped_workers_result_and_waits_on_its_end() {
 
 #[test]
 fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
-    const W: &str = "s-00000000000000aa";
-    const MINE: &str = "s-00000000000000bb";
+    const W: &str = "t00000000aa";
+    const MINE: &str = "t00000000bb";
     // An absolute folder: Windows' names a drive.
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
@@ -22857,9 +23026,9 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
     // A board is read whole, as Owner; its accept and its formatting are its own Mac's client's.
     assert_eq!(wrote("board"), None);
     for refused in [
-        "board accept @s-00000000000000aa passed",
+        "board accept @t00000000aa passed",
         "board --json",
-        "@s-00000000000000aa board",
+        "@t00000000aa board",
     ] {
         assert!(gate(refused).is_err(), "{refused}");
     }
@@ -22875,7 +23044,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             "vault approve --all",
             "vault edit",
             "vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef command=sh",
-            "@s-00000000000000aa vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef",
+            "@t00000000aa vault approve abcd-efgh-ijkl-mnop 0123456789abcdef0123456789abcdef",
         ] {
             assert!(gate(refused).is_err(), "{refused}");
         }
@@ -22893,7 +23062,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "accounts-renew start=x",
         "accounts-renew run=0123456789abcdef0123456789abcdef",
         "accounts-renew start=0123456789abcdef0123456789abcdef command=sh",
-        "@s-00000000000000aa accounts-renew start=0123456789abcdef0123456789abcdef",
+        "@t00000000aa accounts-renew start=0123456789abcdef0123456789abcdef",
     ] {
         assert!(gate(refused).is_err(), "{refused}");
     }
@@ -22939,7 +23108,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         (format!("hold {W} off"), "hold"),
         (format!("@{W} close"), "close"),
         (
-            format!("spawn agent=claude cwd={CWD} from=s-0000000000000c03 len=5"),
+            format!("spawn agent=claude cwd={CWD} from=t0000000c03 len=5"),
             "spawn",
         ),
     ] {
@@ -22993,7 +23162,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         format!("@{W} meta set role x"),
         "@. status".to_owned(),
         "@1 status".to_owned(),
-        "@s-00000000000000cc status".to_owned(),
+        "@t00000000cc status".to_owned(),
         format!("@{W},@{MINE} status"),
         "status".to_owned(),
         "turn hi".to_owned(),
@@ -23022,7 +23191,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         format!("@{W} spawn agent=claude len=5"),
         format!("hold {W} on origin=local"),
         format!("hold {W} on origin=remote"),
-        "hold s-00000000000000cc on".to_owned(),
+        "hold t00000000cc on".to_owned(),
         format!("hold {W}"),
         "await inbox".to_owned(),
         format!("@{W} await task"),
@@ -23039,7 +23208,7 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         format!("hold @{W} on"),
         format!("@{W} hold on"),
         format!("@{W} hold {W} on"),
-        "@s-00000000000000cc hold on".to_owned(),
+        "@t00000000cc hold on".to_owned(),
         format!("@1 hold {W} off"),
     ] {
         assert!(
@@ -23048,18 +23217,18 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         );
     }
     for line in [
-        "await task @s-00000000000000cc".to_owned(),
-        format!("await task @{W}:3,@s-00000000000000cc all timeout=20000"),
+        "await task @t00000000cc".to_owned(),
+        format!("await task @{W}:3,@t00000000cc all timeout=20000"),
     ] {
         assert_eq!(
             gate(&line),
             Ok(DriveLine::Answer(
-                "ERR no such session @s-00000000000000cc\n".to_owned()
+                "ERR no such session @t00000000cc\n".to_owned()
             )),
             "{line}: a worker it hosts no more, as on one Mac"
         );
     }
-    for line in ["@s-00000000000000cc status", "hold s-00000000000000cc off"] {
+    for line in ["@t00000000cc status", "hold t00000000cc off"] {
         assert!(
             gate(line).is_err(),
             "{line}: an unknown session was admitted"
@@ -23070,6 +23239,34 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         refused.ends_with("; not `agent=grok`"),
         "a word no worker row names is the spawn's grammar refusal: {refused}"
     );
+    // A legacy tab the driven Mac still hosts is named by its exact ID. NEGATIVE CONTROL: a
+    // loose `s-` word names no session, whatever the store would say of it.
+    const LEGACY: &str = "s-0123456789abcdef0123";
+    let legacy = |sid: &SessionId| sid.as_str() == LEGACY;
+    assert!(
+        matches!(
+            drive_gate(
+                &format!("@{LEGACY} status"),
+                &legacy,
+                &|_| false,
+                &|_| false,
+                &|_| false
+            ),
+            Ok(DriveLine::Act { .. })
+        ),
+        "a hosted legacy tab"
+    );
+    for line in [
+        "@s-00000000000000aa status",
+        "hold s-00000000000000aa on",
+        "await task @s-00000000000000aa",
+        "@s-0123456789ABCDEF0123 status",
+    ] {
+        assert!(
+            drive_gate(line, &|_| true, &|_| true, &|_| true, &|_| true).is_err(),
+            "{line}: a loose form was admitted"
+        );
+    }
 }
 
 /// EVERY DRIVE REFUSAL NAMES WHAT IT REFUSES: a remote lead's worker spawn with an option the
@@ -23082,9 +23279,9 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
 /// refusal too, named in both, never admitted to reach the handler's bare usage line.
 #[test]
 fn every_drive_refusal_names_the_word_it_refuses() {
-    const W: &str = "s-00000000000000aa";
-    const MINE: &str = "s-00000000000000bb";
-    const GONE: &str = "s-00000000000000cc";
+    const W: &str = "t00000000aa";
+    const MINE: &str = "t00000000bb";
+    const GONE: &str = "t00000000cc";
     // An absolute folder: Windows' names a drive.
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let hosts = |sid: &SessionId| [W, MINE].contains(&sid.as_str());
@@ -23345,13 +23542,13 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
         );
         assert!(refused.is_err_and(|why| why.starts_with("ERR denied: ")));
         let gone = drive_admission(
-            Request::parse("await task @s-00000000000000c0".to_owned()),
+            Request::parse("await task @t00000000c0".to_owned()),
             drive,
             &store,
         );
         assert_eq!(
             gone.err().as_deref(),
-            Some("ERR no such session @s-00000000000000c0\n")
+            Some("ERR no such session @t00000000c0\n")
         );
         let typing = format!("@{} send hi", sid.as_str());
         let (_, scope, write) = drive_admission(Request::parse(typing), drive, &store).unwrap();
@@ -23366,7 +23563,7 @@ fn only_a_drive_scope_on_a_drivers_thread_passes_the_drive_gate() {
 
 #[test]
 fn a_drives_record_names_what_moved() {
-    let sid = SessionId::new("s-0000000000d71e00");
+    let sid = SessionId::new("t0000d71e00");
     let hold = |on, held| DriveAct {
         shell: false,
         kind: DriveKind::Hold,
@@ -23458,7 +23655,7 @@ fn a_drives_record_names_what_moved() {
         node: "07".repeat(16),
         host: "mac-07".to_owned(),
     };
-    let worker = SessionId::new("s-0000000000d71e01");
+    let worker = SessionId::new("t0000d71e01");
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
     let spawn = DriveAct {
         shell: false,
@@ -23499,7 +23696,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
         host: "mac-0a".to_owned(),
     };
     let _driving = crate::fabric::DrivingAs::enter(driver.clone());
-    let worker = SessionId::new("s-0000000000f00d01");
+    let worker = SessionId::new("t0000f00d01");
     let forget = || {
         DRIVE_SPAWNED
             .lock()
@@ -23518,7 +23715,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     assert_eq!(drive_owned(&worker, &driver.node), Some(false));
     assert!(drive_may_close(&store, &worker, &driver.node));
     assert_eq!(drive_owned(&worker, "foreign"), None, "another node's");
-    let other = SessionId::new("s-0000000000f00d02");
+    let other = SessionId::new("t0000f00d02");
     assert_eq!(drive_owned(&other, &driver.node), None, "another session");
     let close = DriveAct {
         shell: false,
@@ -23531,7 +23728,7 @@ fn a_driven_worker_stays_its_nodes_to_close_after_this_process_forgets_it() {
     note_drive_act(&close, "OK closed\n", &store);
     assert_eq!(drive_owned(&worker, &driver.node), None, "closed");
 
-    let shell = SessionId::new("s-0000000000f00d03");
+    let shell = SessionId::new("t0000f00d03");
     let opened = DriveAct {
         shell: true,
         kind: DriveKind::Spawn,
@@ -23560,7 +23757,7 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
     let (handle, _output) = pipe_session(8231);
     let stalled = handle.sid.clone();
     store.write().unwrap().register(handle);
-    let gone = SessionId::new("s-0000000000f00d11");
+    let gone = SessionId::new("t0000f00d11");
     std::fs::create_dir_all(&workers).expect("the folder");
     let old =
         std::time::SystemTime::now() - DRIVE_WORKER_FILE_AGE - std::time::Duration::from_secs(3600);
@@ -23578,7 +23775,7 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
         host: "mac-0b".to_owned(),
     };
     let _driving = crate::fabric::DrivingAs::enter(driver);
-    let fresh = SessionId::new("s-0000000000f00d12");
+    let fresh = SessionId::new("t0000f00d12");
     let spawn = DriveAct {
         shell: false,
         kind: DriveKind::Spawn,
@@ -23605,10 +23802,10 @@ fn a_still_hosted_workers_old_file_outlives_the_prune() {
 fn a_drives_close_named_after_its_verb_is_told_the_form() {
     let no = |_: &SessionId| false;
     let refusal =
-        drive_gate("close s-00000000000000aa", &no, &no, &no, &|_| false).expect_err("no selector");
-    assert!(refusal.contains("@s-… close"), "{refusal}");
+        drive_gate("close t00000000aa", &no, &no, &no, &|_| false).expect_err("no selector");
+    assert!(refusal.contains("@<sid> close"), "{refusal}");
     let other = drive_gate("frobnicate", &no, &no, &no, &|_| false).expect_err("another verb");
-    assert!(!other.contains("@s-… close"), "{other}");
+    assert!(!other.contains("@<sid> close"), "{other}");
 }
 
 /// A DRIVE'S FIRST LINE IS ITS REQUESTER, read a byte at a time so the request behind it is left
@@ -23619,17 +23816,23 @@ fn a_drives_close_named_after_its_verb_is_told_the_form() {
 #[test]
 fn fleet_drive_without_requester_line_is_refused() {
     use aterm_types::control_verbs::Requester;
-    let asked = Requester::of(Some("s-0123456789abcdef0123"), Some("claude"), None, None);
-    let (mut near, mut far) = CtlStream::pair().expect("a pair");
-    far.write_all(format!("{}survey\n", asked.line()).as_bytes())
-        .expect("the lines");
-    assert_eq!(read_requester(&mut near), Ok(asked.clone()));
-    let mut rest = [0u8; 7];
-    near.read_exact(&mut rest).expect("the request behind it");
-    assert_eq!(&rest, b"survey\n");
+    let asked = Requester::of(Some("tqn5r6e0148"), Some("claude"), None, None);
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let requester = Requester::of(Some(sid), Some("claude"), None, None);
+        let (mut near, mut far) = CtlStream::pair().expect("a pair");
+        far.write_all(format!("{}survey\n", requester.line()).as_bytes())
+            .expect("the lines");
+        let read = read_requester(&mut near).expect("the requester");
+        assert_eq!(read.sid(), Some(sid), "the whole session ID is retained");
+        assert_eq!(read, requester);
+        let mut rest = [0u8; 7];
+        near.read_exact(&mut rest).expect("the request behind it");
+        assert_eq!(&rest, b"survey\n");
+    }
     for sent in [
         "survey\n".to_owned(),
         "@s-0123456789abcdef0123 turn hello\n".to_owned(),
+        "requester sid=s-0123456789abcdef012 program=- model=- account=-\n".to_owned(),
         "requester sid=- program=- model=-\n".to_owned(),
         format!(
             "requester sid=- program=- model=- account={}\n",
@@ -23671,9 +23874,9 @@ fn a_drives_typing_is_credited_to_its_host_over_the_fleet() {
 }
 
 /// A turn and an input mark a fleet drive types are the drive's (the requests design (2026-11-09)
-/// §5): the turn ledger and the session log's `input` mark both say `by=fleet:<node>:-`, the node
-/// as the drive's tab marks spell its host and `-` for the session the drive does not name, never
-/// `ctl`, the owner token its admitted line is served under. NEGATIVE CONTROL: the same turn off a
+/// §5): the turn ledger and the session log's `input` mark both name the fleet node and the
+/// requester's canonical tab ID, never `ctl`, the owner token its admitted line is served under.
+/// NEGATIVE CONTROL: the same turn off a
 /// drive is `ctl`.
 #[test]
 fn a_fleet_drives_turn_is_recorded_by_fleet_not_ctl() {
@@ -23699,19 +23902,14 @@ fn a_fleet_drives_turn_is_recorded_by_fleet_not_ctl() {
             .map(str::to_owned)
             .unwrap_or_default()
     };
-    let word = "fleet:87be5228:s-0123456789abcdef0123";
+    let word = "fleet:87be5228:t0123456789";
     {
         let _driving = crate::fabric::DrivingAs::requested(
             crate::fabric::Driver {
                 node: "87be5228".repeat(4),
                 host: "192.168.1.172 (node 87be5228)".to_owned(),
             },
-            aterm_types::control_verbs::Requester::of(
-                Some("s-0123456789abcdef0123"),
-                None,
-                None,
-                None,
-            ),
+            aterm_types::control_verbs::Requester::of(Some("t0123456789"), None, None, None),
         );
         assert_eq!(
             control_session::turn_by(Scope::Owner, None),
@@ -23927,7 +24125,7 @@ fn a_drive_spawn_takes_one_req_of_request_id_shape() {
 
 #[test]
 fn owned_shell_history_and_waits_are_bounded_and_not_granted_to_workers() {
-    let sid = SessionId::new("s-a8227f");
+    let sid = SessionId::new("t0000a8227f");
     let hosts = |s: &SessionId| s == &sid;
     for rest in [
         "blocks",
@@ -24290,7 +24488,7 @@ fn board_answers_this_macs_board_and_takes_no_words() {
             .is_some_and(|header| header.starts_with("board host=")),
         "{reply}"
     );
-    for words in ["--json", "accept @s-00000000000000aa passed"] {
+    for words in ["--json", "accept @t00000000aa passed"] {
         assert!(
             board_reply(words).starts_with("ERR usage: board"),
             "{words}"
@@ -24464,8 +24662,8 @@ fn a_typed_turn_whose_head_types_no_key_writes_its_rest_only_where_the_pace_fits
 #[test]
 fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
     use DriveKind as K;
-    const W: &str = "s-00000000000000aa";
-    const GONE: &str = "s-00000000000000dd";
+    const W: &str = "t00000000aa";
+    const GONE: &str = "t00000000dd";
     const NONCE: &str = "0123456789abcdef0123456789abcdef";
     // An absolute folder: Windows' names a drive.
     const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
@@ -24579,12 +24777,12 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
         ("spawn agent=nobody identity=x", K::Spawn),
         ("spawn cwd=~/../elsewhere", K::Spawn),
         ("hold", K::Hold),
-        ("hold s-00000000000000ee sideways", K::Hold),
-        ("@s-00000000000000ee turn hi", K::Turn),
-        ("@s-00000000000000ee close now", K::Close),
+        ("hold t00000000ee sideways", K::Hold),
+        ("@t00000000ee turn hi", K::Turn),
+        ("@t00000000ee close now", K::Close),
         ("@7 send hi", K::Send),
         ("@. post -- hi", K::Post),
-        ("@s-00000000000000ee inbox seen", K::MailSeen),
+        ("@t00000000ee inbox seen", K::MailSeen),
     ] {
         assert_eq!(kind(line), Ok(want), "{line}");
         assert!(gate(line).is_err(), "{line}: the gate refuses it");
@@ -24601,19 +24799,19 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
         "update status\napply",
         "update holds retry",
         "update unread=ok check",
-        "@s-00000000000000aa update status",
+        "@t00000000aa update status",
         "settings set columns 80",
-        "close s-00000000000000aa",
-        "board accept @s-00000000000000aa passed",
+        "close t00000000aa",
+        "board accept @t00000000aa passed",
         "await idle 5",
         "accounts-renew start=x",
-        "@s-00000000000000aa hold on",
-        "@s-00000000000000aa spawn agent=claude len=5",
-        "@s-00000000000000aa meta set supervisor other",
-        "@s-00000000000000aa board",
+        "@t00000000aa hold on",
+        "@t00000000aa spawn agent=claude len=5",
+        "@t00000000aa meta set supervisor other",
+        "@t00000000aa board",
         "request",
         "request review r-20261111-1200-87be5228-01",
-        "@s-00000000000000aa request claim path=/tmp",
+        "@t00000000aa request claim path=/tmp",
     ] {
         let refused = kind(line).expect_err(line);
         assert_eq!(gate(line), Err(refused), "{line}");
@@ -24765,7 +24963,7 @@ fn the_lock_caps_a_granted_driver_before_the_gate_looks_at_anything() {
 #[test]
 fn a_driven_line_the_lock_decides_has_one_row_in_the_fleet_activity_record() {
     use aterm_types::fleet_activity::{Outcome, Plain, Way};
-    const ASKER: &str = "s-0123456789abcdef0123";
+    const ASKER: &str = "t0123456789";
     let store = crate::session_store::new_store();
     let (target, _rx) = pipe_session(93);
     let sid = target.sid.clone();
@@ -25104,7 +25302,7 @@ fn a_drive_request_show_and_requests_are_reads_and_review_is_refused() {
         );
     }
     // NEGATIVE: a `request` aimed at a session is no drive's.
-    assert!(kind(&format!("@s-00000000000000aa request show {ID}")).is_err());
+    assert!(kind(&format!("@t00000000aa request show {ID}")).is_err());
 }
 
 /// A PIN OF A SESSION NOT HERE SAYS THERE IS NO SUCH SESSION: an id no tab here holds resolves to
@@ -25133,8 +25331,11 @@ fn a_pin_of_a_session_not_here_says_no_such_session() {
 
 #[test]
 fn a_fleet_spawn_carries_codex_effort_without_downgrading_other_engines() {
+    // An absolute folder: Windows' names a drive.
+    const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
     let homes = |_sid: &SessionId| false;
-    let line = "spawn agent=codex model=gpt-6.1-sol effort=ultra cwd=/tmp len=1";
+    let line = format!("spawn agent=codex model=gpt-6.1-sol effort=ultra cwd={CWD} len=1");
+    let line = line.as_str();
     assert_eq!(
         drive_spawn(line, line.strip_prefix("spawn ").unwrap(), &homes, None).unwrap(),
         format!("{line} raise=false")
@@ -25168,24 +25369,24 @@ fn agent_settings_refuse_unproven_targets_without_touching_the_terminal() {
 
 #[test]
 fn fleet_configuration_is_narrow_and_requires_a_hosted_session() {
-    let hosts = |sid: &SessionId| sid.as_str() == "s-00000000000000aa";
+    let hosts = |sid: &SessionId| sid.as_str() == "t00000000aa";
     let yes = |_: &SessionId| true;
     let no = |_: &SessionId| false;
     let gate = |line| drive_gate(line, &hosts, &yes, &no, &no);
     for line in [
-        "@s-00000000000000aa meta set autopilot cruise",
-        "@s-00000000000000aa meta set autopilot off",
-        "@s-00000000000000aa agent set effort=ultra",
+        "@t00000000aa meta set autopilot cruise",
+        "@t00000000aa meta set autopilot off",
+        "@t00000000aa agent set effort=ultra",
     ] {
         assert!(gate(line).is_ok(), "{line}");
     }
     for line in [
         "@self meta set autopilot cruise",
-        "@s-00000000000000bb meta set autopilot cruise",
-        "@s-00000000000000aa meta set supervisor mine",
-        "@s-00000000000000aa meta set autopilot cruise supervisor=mine",
-        "@s-00000000000000aa agent set model=a model=b",
-        "@s-00000000000000aa agent set effort=unknown",
+        "@t00000000bb meta set autopilot cruise",
+        "@t00000000aa meta set supervisor mine",
+        "@t00000000aa meta set autopilot cruise supervisor=mine",
+        "@t00000000aa agent set model=a model=b",
+        "@t00000000aa agent set effort=unknown",
     ] {
         assert!(gate(line).is_err(), "{line}");
     }

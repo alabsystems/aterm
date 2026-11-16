@@ -57,9 +57,6 @@ mod cursor;
 
 pub mod index;
 
-/// The trailers `verify land` writes on a landing merge, and their one reader (design B10).
-pub mod land_trailer;
-
 #[macro_use]
 mod bitflags;
 
@@ -115,6 +112,7 @@ mod env_sanitize;
 pub mod input;
 pub mod keyboard;
 mod kitty_keyboard;
+pub mod mark;
 pub mod mouse;
 pub mod native_window;
 pub mod pipeline_timestamps;

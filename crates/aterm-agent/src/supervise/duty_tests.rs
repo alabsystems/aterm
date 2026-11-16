@@ -290,7 +290,10 @@ fn status_authority_rejects_unknown_duplicate_and_noncanonical_fields() {
         format!("{good} supervisor_revision=42"),
         good.replace("revision=41", "revision=041"),
         good.replace("scope=upgrade", "scope=upgrade,upgrade"),
-        good.replace("contract=3", "contract=4"),
+        good.replace("contract=3", "contract=5"),
+        good.replace("supervisor=grok-alab@42", "supervisor=watcher@9")
+            .replace("contract=3", "contract=-")
+            .replace("scope=upgrade", "scope=-"),
         format!("{good}\nOK another=reply"),
     ] {
         assert_eq!(
@@ -306,6 +309,87 @@ fn status_authority_rejects_unknown_duplicate_and_noncanonical_fields() {
         ),
         BuiltinAuthority::complement(42, [])
     );
+    // Contract 4: its scope words, `state` and `accounts` among them, and an empty grant, which
+    // leaves every duty to the built-in rather than to nobody.
+    assert_eq!(
+        BuiltinAuthority::from_status(
+            &good
+                .replace("contract=3", "contract=4")
+                .replace("scope=upgrade", "scope=upgrade,state,accounts"),
+            "host@7"
+        ),
+        BuiltinAuthority::complement(41, [Scope::Upgrade, Scope::State, Scope::Accounts])
+    );
+    for contract in ["3", "4"] {
+        let empty = BuiltinAuthority::from_status(
+            &good
+                .replace("contract=3", &format!("contract={contract}"))
+                .replace("scope=upgrade", "scope=-"),
+            "host@7",
+        );
+        assert_eq!(
+            empty,
+            BuiltinAuthority::Ceded { revision: 41 },
+            "{contract}: a claim that stands and owns nothing, not the empty complement of none"
+        );
+        assert_ne!(empty, BuiltinAuthority::complement(41, []));
+        assert!(Scope::ALL.into_iter().all(|duty| empty.keeps(duty)));
+        assert_eq!(empty.revision(), Some(41));
+        assert!(!empty.foreign());
+    }
+}
+
+/// HX-06: A CLAIM GRANTED NOTHING IS NOT MISTAKEN FOR NO CLAIM. While a proven scoped claim with
+/// an empty grant stands ([`BuiltinAuthority::Ceded`]), the hosted engine keeps and types every
+/// duty under that claim's revision and never claims the session itself: no `meta set
+/// supervisor` goes out, which the server would answer `ERR busy` and the engine journal as
+/// another supervisor's. When the claim goes (the empty complement of no claim), the engine
+/// claims again. NEGATIVE CONTROL: the same empty grant read as the empty complement (before
+/// HX-06's fix) claimed again before every hosted operation.
+#[test]
+fn a_claim_granted_nothing_is_not_mistaken_for_no_claim() {
+    let authority = Arc::new(Mutex::new(BuiltinAuthority::complement(0, [])));
+    let mut adapter = Adapter {
+        authority: Arc::clone(&authority),
+        typed: Vec::new(),
+        legacy: Vec::new(),
+    };
+    let mut session = Session::new(&mut adapter, Some("@s-duty".to_string()));
+    session.set_builtin_duties(true);
+    session.claim_at_naming();
+    assert!(matches!(session.claim, Claim::Held { .. }));
+    *authority.lock().unwrap() = BuiltinAuthority::Ceded { revision: 1 };
+    for _ in 0..3 {
+        session.refresh_builtin_authority();
+        session.renew_claim_if_due();
+        assert!(matches!(session.claim, Claim::Complement));
+    }
+    session.with_duty(Scope::Approvals, |session| {
+        assert!(session.call(&["key", "1"]).unwrap().ok());
+    });
+    assert!(!session.remedies_withheld(), "the built-in keeps relaunch");
+    *authority.lock().unwrap() = BuiltinAuthority::complement(2, []);
+    session.refresh_builtin_authority();
+    session.renew_claim_if_due();
+    assert!(
+        matches!(session.claim, Claim::Held { .. }),
+        "no claim: it claims"
+    );
+    drop(session);
+    assert_eq!(adapter.typed.len(), 1);
+    assert_eq!(
+        (adapter.typed[0].0, adapter.typed[0].1),
+        (Scope::Approvals, 1)
+    );
+    assert_eq!(
+        adapter
+            .legacy
+            .iter()
+            .map(|args| args[2].as_str())
+            .collect::<Vec<_>>(),
+        ["set", "set"],
+        "naming, then only the claim's departure"
+    );
 }
 
 #[test]
@@ -317,6 +401,7 @@ fn complement_and_recorded_authority_preserve_all_duties_and_revision() {
         BuiltinAuthority::Exclusive,
         BuiltinAuthority::complement(41, [Scope::Upgrade]),
         BuiltinAuthority::complement(42, []),
+        BuiltinAuthority::Ceded { revision: 44 },
     ] {
         assert_eq!(
             BuiltinAuthority::from_tape(&authority.to_tape()).unwrap(),
@@ -334,7 +419,12 @@ fn complement_and_recorded_authority_preserve_all_duties_and_revision() {
         assert!(authority.keeps(duty));
     }
     assert!(BuiltinAuthority::from_tape(&[4, 0]).is_err());
-    assert!(BuiltinAuthority::from_tape(&[4, 0, 0, 0, 0, 0, 0, 0, 0, 64]).is_err());
+    let every = BuiltinAuthority::complement(43, Scope::ALL);
+    assert_eq!(
+        BuiltinAuthority::from_tape(&every.to_tape()).unwrap(),
+        every
+    );
+    assert!(Scope::ALL.into_iter().all(|duty| !every.keeps(duty)));
     assert!(BuiltinAuthority::from_tape(&[2, 0]).is_err());
 }
 
@@ -352,4 +442,20 @@ fn semantic_duty_restores_after_nested_error_and_unwind() {
     assert_eq!(duty.revision(), Some(41));
     drop(outer);
     assert_eq!(duty.get(), None);
+}
+
+/// THE GOAL RESTORE IS TURN-END'S WHOEVER TYPES IT (HX-05's review, finding 7): no rule of the
+/// engine's own names it, so the engine files it under `turn-end` at a point with no wall drawn
+/// (the restore waits while one is) and no prose question (it takes only a continuation's place),
+/// and the act a scoped claim reports it under names that same duty.
+#[test]
+fn the_goal_restore_is_filed_under_turn_end_whoever_types_it() {
+    use crate::supervise::policy::goal_restore::{RULE_GOAL_RESTORE, restore};
+    let typed = restore("ship the release");
+    assert_eq!(known_action_scope(&typed), None);
+    assert_eq!(action_scope(&typed, false, false), Scope::TurnEnd);
+    assert_eq!(
+        crate::harness::acts::act_scope(RULE_GOAL_RESTORE),
+        Some(Scope::TurnEnd)
+    );
 }

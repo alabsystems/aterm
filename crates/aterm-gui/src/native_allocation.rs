@@ -387,11 +387,14 @@ impl AllocationApp {
                 || "Physical memory: unavailable".into(),
                 |memory| {
                     let gib = 1024.0 * 1024.0 * 1024.0;
+                    let swap = memory.sample.swap_used.map_or_else(
+                        || "unavailable".to_owned(),
+                        |used| format!("{:.1} GiB", used as f64 / gib),
+                    );
                     format!(
-                        "Physical memory: {:.1} GiB · free {:.1} GiB · swap used {:.1} GiB",
+                        "Physical memory: {:.1} GiB · free {:.1} GiB · swap used {swap}",
                         memory.sample.total as f64 / gib,
                         memory.sample.free as f64 / gib,
-                        memory.sample.swap_used as f64 / gib
                     )
                 },
             ),

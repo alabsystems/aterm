@@ -159,7 +159,11 @@ fn cached_image_child() {
         ])
         .env(CHILD_STORE, &s.root)
         .env("ATERM_HOST_EXECUTABLE_TEST_DESCENDANT", "1");
-    let result = aterm_uds::deadline::output_within(&mut descendant, Duration::from_secs(60));
+    let result = aterm_uds::deadline::output_while_process_progressing(
+        &mut descendant,
+        Duration::from_secs(60),
+        "cached image descendant",
+    );
     if !result.as_ref().is_ok_and(|out| {
         out.stdout
             .windows(b"cached-image-running".len())
@@ -193,7 +197,11 @@ fn cached_process_publication_ancestry_and_rebound_listener() {
         ])
         .env(CHILD_STORE, &s.root)
         .stdout(aterm_uds::spawnfd::Stdio::piped());
-    let result = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60));
+    let result = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        Duration::from_secs(60),
+        "cached image publication actor",
+    );
     let ran = result.as_ref().is_ok_and(|out| {
         out.stdout
             .windows(b"cached-image-running".len())

@@ -157,6 +157,7 @@ impl Fixture {
                         routes: ROUTES.into(),
                         since: NOW,
                         tried_at: NOW,
+                        stop: None,
                     }),
                     ..Binding::default()
                 },
@@ -651,6 +652,7 @@ fn the_same_failed_routes_on_a_replacement_workflow_start_their_own_history() {
                     routes: ROUTES.into(),
                     since: NOW,
                     tried_at: NOW,
+                    stop: None,
                 })
             );
             assert!(workflow_event_matches(raw, &fresh.logins, &events[0]));

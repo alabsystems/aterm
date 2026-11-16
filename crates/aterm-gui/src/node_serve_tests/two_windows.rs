@@ -318,6 +318,9 @@ fn gate_answer(pid: u32, line: &str, holds: &Holds) -> Option<String> {
     Some(out)
 }
 
+/// A legacy tab's ID, as a shell opened before the `t` form still holds it.
+const LEGACY: &str = "s-4c56f539e92639ba37ae";
+
 /// A launcher whose own app runs the window at `app` (`None`: no window here runs it).
 struct Apps {
     app: Option<u32>,
@@ -411,37 +414,54 @@ fn drive_sending(relay_dir: &Path, app: Option<u32>, access: FleetAccess, sent: 
 
 /// A DRIVE NAMING A SESSION REACHES THE WINDOW THAT HOSTS IT: with the installed app's window
 /// older and a second window newer, `@<sid> status` for a worker in the older one reaches it and
-/// the newer never serves it. Each window answers its own sessions, whichever is newer.
+/// the newer never serves it. Each window answers its own sessions, whichever is newer, a
+/// legacy tab's by the `s-` ID its shell still holds.
 /// NEGATIVE CONTROL: windows that take each drive whatever it names, as every window did before
-/// drives were routed by their sessions, hand `@s-0d` to the newest window, which hosts it not.
+/// drives were routed by their sessions, hand `@t000000000d` to the newest window, which hosts
+/// it not.
 #[test]
 fn a_drive_naming_a_session_reaches_the_window_that_hosts_it() {
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("dr1-sid");
     {
-        let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
-        let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
-        let answer = drive(relay.path(), None, "@s-0d status");
-        assert_eq!(answer, format!("OK 1\nwindow={older} status s-0d\n"));
-        assert_eq!(old.served(), ["@s-0d status"]);
+        let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
+        let new = TestWindow::open(
+            relay.path(),
+            newer,
+            Holds::live(&["t00000000ae", LEGACY]),
+            false,
+        );
+        let answer = drive(relay.path(), None, "@t000000000d status");
+        assert_eq!(answer, format!("OK 1\nwindow={older} status t000000000d\n"));
+        assert_eq!(old.served(), ["@t000000000d status"]);
         assert!(new.served().is_empty(), "{:?}", new.served());
-        let answer = drive(relay.path(), Some(older), "@s-ae status");
-        assert_eq!(answer, format!("OK 1\nwindow={newer} status s-ae\n"));
-        assert_eq!(new.served(), ["@s-ae status"]);
-        assert_eq!(old.served(), ["@s-0d status"]);
-        let answer = drive(relay.path(), None, "hold s-0d on");
-        assert_eq!(old.served(), ["@s-0d status", "hold s-0d on"], "{answer}");
+        let answer = drive(relay.path(), Some(older), "@t00000000ae status");
+        assert_eq!(answer, format!("OK 1\nwindow={newer} status t00000000ae\n"));
+        assert_eq!(new.served(), ["@t00000000ae status"]);
+        assert_eq!(old.served(), ["@t000000000d status"]);
+        let answer = drive(relay.path(), None, "hold t000000000d on");
+        assert_eq!(
+            old.served(),
+            ["@t000000000d status", "hold t000000000d on"],
+            "{answer}"
+        );
+        // A legacy tab is named by its own ID, and reaches the window that hosts it.
+        let legacy = format!("@{LEGACY} status");
+        let answer = drive(relay.path(), Some(older), &legacy);
+        assert_eq!(answer, format!("OK 1\nwindow={newer} status {LEGACY}\n"));
+        assert_eq!(new.served(), ["@t00000000ae status", legacy.as_str()]);
+        assert_eq!(old.served().len(), 2, "{:?}", old.served());
     }
     // NEGATIVE CONTROL: the newest-first rule reaches the wrong window.
-    let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), true);
-    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), true);
-    let answer = drive(relay.path(), None, "@s-0d status");
+    let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), true);
+    let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000ae"]), true);
+    let answer = drive(relay.path(), None, "@t000000000d status");
     assert!(
         answer.starts_with("ERR denied: a drive names a session"),
         "{answer}"
     );
-    assert_eq!(new.served(), ["@s-0d status"]);
+    assert_eq!(new.served(), ["@t000000000d status"]);
     assert!(old.served().is_empty());
 }
 
@@ -458,7 +478,7 @@ fn a_node_drive_hands_its_window_the_requester_and_refuses_a_drive_without_one()
     let stand_in = StandIn::start();
     let (older, _) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("dr1-req");
-    let window = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
+    let window = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
     let asked = Requester::of(
         Some("s-0123456789abcdef0123"),
         Some("claude"),
@@ -469,11 +489,11 @@ fn a_node_drive_hands_its_window_the_requester_and_refuses_a_drive_without_one()
         relay.path(),
         Some(older),
         FleetAccess::Full,
-        &format!("{}@s-0d status\n", asked.line()),
+        &format!("{}@t000000000d status\n", asked.line()),
     );
-    assert_eq!(answer, format!("OK 1\nwindow={older} status s-0d\n"));
+    assert_eq!(answer, format!("OK 1\nwindow={older} status t000000000d\n"));
     assert_eq!(window.requesters(), [asked]);
-    assert_eq!(window.served(), ["@s-0d status"]);
+    assert_eq!(window.served(), ["@t000000000d status"]);
     for sent in [
         "spawn cwd=/tmp\n".to_owned(),
         "requester sid=worker program=- model=- account=-\nspawn cwd=/tmp\n".to_owned(),
@@ -491,7 +511,7 @@ fn a_node_drive_hands_its_window_the_requester_and_refuses_a_drive_without_one()
         answer.starts_with(aterm_types::control_verbs::DRIVE_LOCKED),
         "CONTROL: {answer}"
     );
-    assert_eq!(window.served(), ["@s-0d status"]);
+    assert_eq!(window.served(), ["@t000000000d status"]);
     assert_eq!(window.requesters().len(), 1);
 }
 
@@ -527,32 +547,32 @@ fn a_retired_workers_result_answers_from_the_window_that_keeps_its_row() {
     let old = TestWindow::open(
         relay.path(),
         older,
-        Holds::default().with_retired(&["s-dead"]),
+        Holds::default().with_retired(&["t000000dead"]),
         false,
     );
-    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-be"]), false);
-    let answer = drive(relay.path(), Some(newer), "@s-dead result");
+    let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000be"]), false);
+    let answer = drive(relay.path(), Some(newer), "@t000000dead result");
     assert_eq!(
         answer,
-        format!("OK 1\nwindow={older} retired result s-dead\n")
+        format!("OK 1\nwindow={older} retired result t000000dead\n")
     );
     let answer = drive(
         relay.path(),
         Some(newer),
-        "await task @s-dead:1 any timeout=60000",
+        "await task @t000000dead:1 any timeout=60000",
     );
     assert_eq!(
         answer,
-        format!("OK 1\n@s-dead rev=2 state=working window={older} task_news=1\n")
+        format!("OK 1\n@t000000dead rev=2 state=working window={older} task_news=1\n")
     );
-    let answer = drive(relay.path(), Some(newer), "@s-dead status");
+    let answer = drive(relay.path(), Some(newer), "@t000000dead status");
     assert!(answer.contains("answers only @<sid> result"), "{answer}");
     assert_eq!(
         old.served(),
         [
-            "@s-dead result",
-            "await task @s-dead:1 any timeout=60000",
-            "@s-dead status"
+            "@t000000dead result",
+            "await task @t000000dead:1 any timeout=60000",
+            "@t000000dead status"
         ]
     );
     assert!(new.served().is_empty(), "{:?}", new.served());
@@ -562,26 +582,45 @@ fn a_retired_workers_result_answers_from_the_window_that_keeps_its_row() {
 /// declines it, and the installed app's window, handed it naming no session, refuses it in its own
 /// words; a wait naming one session no window hosts beside one a single window hosts reaches that
 /// window, which says which is gone.
+/// NEGATIVE CONTROL: a loose `s-` word, as an earlier build took for a session's ID, names no
+/// session: the line goes, naming none, to the installed app's window, though another window
+/// holds a session of that name.
 #[test]
 fn a_drive_naming_a_session_no_window_hosts_hears_the_gate() {
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("dr1-nowhere");
-    let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
-    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
-    let answer = drive(relay.path(), Some(older), "@s-bad status");
+    let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
+    let new = TestWindow::open(
+        relay.path(),
+        newer,
+        Holds::live(&["t00000000ae", "s-5e55"]),
+        false,
+    );
+    let answer = drive(relay.path(), Some(older), "@t0000000bad status");
     assert!(
         answer.starts_with("ERR denied: a drive names a session"),
         "{answer}"
     );
-    assert_eq!(old.served(), ["@s-bad status"]);
+    assert_eq!(old.served(), ["@t0000000bad status"]);
     let answer = drive(
         relay.path(),
         Some(older),
-        "await task @s-bad,@s-ae any timeout=9",
+        "await task @t0000000bad,@t00000000ae any timeout=9",
     );
-    assert_eq!(answer, "ERR no such session @s-bad\n");
-    assert_eq!(new.served(), ["await task @s-bad,@s-ae any timeout=9"]);
+    assert_eq!(answer, "ERR no such session @t0000000bad\n");
+    assert_eq!(
+        new.served(),
+        ["await task @t0000000bad,@t00000000ae any timeout=9"]
+    );
+    // NEGATIVE CONTROL: the loose form is routed as a line that names no session.
+    let answer = drive(relay.path(), Some(older), "@s-5e55 status");
+    assert!(
+        answer.starts_with("ERR denied: a drive names a session"),
+        "{answer}"
+    );
+    assert_eq!(old.served(), ["@t0000000bad status", "@s-5e55 status"]);
+    assert_eq!(new.served().len(), 1, "{:?}", new.served());
 }
 
 /// AN AWAIT ACROSS TWO WINDOWS IS SPLIT AND ANSWERED AS ONE: each window waits on its own
@@ -599,23 +638,26 @@ fn an_await_across_two_windows_is_split_and_answered_as_one() {
         let old = TestWindow::open(
             relay.path(),
             older,
-            Holds::live(&["s-a"]).with_news(&["s-a"]),
+            Holds::live(&["t000000000a"]).with_news(&["t000000000a"]),
             false,
         );
-        let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-b"]), false);
+        let new = TestWindow::open(relay.path(), newer, Holds::live(&["t000000000b"]), false);
         let answer = drive(
             relay.path(),
             Some(older),
-            "await task @s-b:2,@s-a:1 any timeout=60000",
+            "await task @t000000000b:2,@t000000000a:1 any timeout=60000",
         );
         assert_eq!(
             answer,
             format!(
-                "OK 2\n@s-b rev=2 state=working window={newer} task_news=0\n@s-a rev=2 \
-                 state=working window={older} task_news=1\n"
+                "OK 2\n@t000000000b rev=2 state=working window={newer} task_news=0\n\
+                 @t000000000a rev=2 state=working window={older} task_news=1\n"
             )
         );
-        assert_eq!(old.served(), ["await task @s-a:1 any timeout=60000"]);
+        assert_eq!(
+            old.served(),
+            ["await task @t000000000a:1 any timeout=60000"]
+        );
         // The share's first ask and its look again come on two connections, recorded by two
         // threads: the first may be recorded after the answer went out.
         let mut newer_served = aterm_spec::wait::until_within(
@@ -630,36 +672,40 @@ fn an_await_across_two_windows_is_split_and_answered_as_one() {
         assert_eq!(
             newer_served,
             [
-                "await task @s-b:2 any timeout=0",
-                "await task @s-b:2 any timeout=60000",
+                "await task @t000000000b:2 any timeout=0",
+                "await task @t000000000b:2 any timeout=60000",
             ]
         );
         let answer = drive(
             relay.path(),
             Some(older),
-            "await task @s-a,@s-dead,@s-b any",
+            "await task @t000000000a,@t000000dead,@t000000000b any",
         );
-        assert_eq!(answer, "ERR no such session @s-dead\n");
+        assert_eq!(answer, "ERR no such session @t000000dead\n");
     }
     {
         let _old = TestWindow::open(
             relay.path(),
             older,
-            Holds::live(&["s-a"]).with_news(&["s-a"]),
+            Holds::live(&["t000000000a"]).with_news(&["t000000000a"]),
             false,
         );
         let _new = TestWindow::open(
             relay.path(),
             newer,
-            Holds::live(&["s-b"]).with_news(&["s-b"]),
+            Holds::live(&["t000000000b"]).with_news(&["t000000000b"]),
             false,
         );
-        let answer = drive(relay.path(), None, "await task @s-a,@s-b all timeout=60000");
+        let answer = drive(
+            relay.path(),
+            None,
+            "await task @t000000000a,@t000000000b all timeout=60000",
+        );
         assert_eq!(
             answer,
             format!(
-                "OK 2\n@s-a rev=2 state=working window={older} task_news=1\n@s-b rev=2 \
-                 state=working window={newer} task_news=1\n"
+                "OK 2\n@t000000000a rev=2 state=working window={older} task_news=1\n\
+                 @t000000000b rev=2 state=working window={newer} task_news=1\n"
             )
         );
     }
@@ -667,50 +713,83 @@ fn an_await_across_two_windows_is_split_and_answered_as_one() {
     let _old = TestWindow::open(
         relay.path(),
         older,
-        Holds::live(&["s-a"]).with_news(&["s-a"]),
+        Holds::live(&["t000000000a"]).with_news(&["t000000000a"]),
         true,
     );
-    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["s-b"]), true);
+    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["t000000000b"]), true);
     let answer = drive(
         relay.path(),
         None,
-        "await task @s-b:2,@s-a:1 any timeout=60000",
+        "await task @t000000000b:2,@t000000000a:1 any timeout=60000",
     );
-    assert_eq!(answer, "ERR no such session @s-a\n");
+    assert_eq!(answer, "ERR no such session @t000000000a\n");
 }
 
 /// The sessions a drive's line names, which node serve routes by, are its selector's, a hold's,
 /// and each wait target's, once each and in order; a spawn's `from=` and a line that names
-/// none carry none, and an id a relay line cannot carry is left to the gate.
+/// none carry none, and an id a relay line cannot carry is left to the gate. A legacy tab is
+/// named by its exact `s-` ID.
+/// NEGATIVE CONTROL: the loose `s-` forms an earlier build took (any hex, a name, upper case,
+/// another length) name no session and ride no relay line.
 #[test]
 fn a_drive_lines_sessions_are_its_selectors_holds_and_wait_targets() {
+    const A: &str = "t000000000a";
+    const B: &str = "t000000000b";
     let named = |line: &str| -> Vec<String> {
         crate::control::drive_line_sessions(line)
             .into_iter()
             .map(|sid| sid.as_str().to_owned())
             .collect()
     };
-    assert_eq!(named("@s-a status\n"), ["s-a"]);
+    assert_eq!(named(&format!("@{A} status\n")), [A]);
     // A selector names a session only in the id's own spelling, as the window's gate reads it.
     assert!(named("@s-old status").is_empty());
-    assert_eq!(named("@s-a post key=k kind=note -- hi"), ["s-a"]);
-    assert_eq!(named("hold s-b on reason=x"), ["s-b"]);
+    assert_eq!(named(&format!("@{A} post key=k kind=note -- hi")), [A]);
+    assert_eq!(named(&format!("hold {B} on reason=x")), [B]);
     assert_eq!(
-        named("await task @s-a:3,@s-b,@s-a:4:1 any facts=1 timeout=5"),
-        ["s-a", "s-b"]
+        named(&format!(
+            "await task @{A}:3,@{B},@{A}:4:1 any facts=1 timeout=5"
+        )),
+        [A, B]
     );
-    assert!(named("spawn agent=claude from=s-c len=4").is_empty());
+    assert!(named("spawn agent=claude from=t000000000c len=4").is_empty());
     assert!(named("survey").is_empty());
     assert!(named("board").is_empty());
     assert!(named("@1 status").is_empty());
-    assert!(relay_names("s-4c56f539e92639ba37ae"));
-    assert!(!relay_names("s-a,b"));
+    // A legacy tab's ID names it, as its shell still does.
+    assert_eq!(named(&format!("@{LEGACY} status")), [LEGACY]);
+    assert_eq!(named(&format!("hold {LEGACY} on")), [LEGACY]);
+    assert_eq!(
+        named(&format!("await task @{LEGACY}:3,@{A} any timeout=5")),
+        [LEGACY, A]
+    );
+    assert!(relay_names(LEGACY));
+    // NEGATIVE CONTROL: no loose `s-` form names a session.
+    for loose in [
+        "s-a",
+        "s-b1",
+        "s-5e55",
+        "s-4C56F539E92639BA37AE",
+        "s-4c56f539e92639ba37a",
+        "s-4c56f539e92639ba37ae0",
+    ] {
+        assert!(named(&format!("@{loose} status")).is_empty(), "{loose}");
+        assert!(named(&format!("hold {loose} on")).is_empty(), "{loose}");
+        assert_eq!(
+            named(&format!("await task @{loose},@{A} any timeout=5")),
+            [A],
+            "{loose}"
+        );
+        assert!(!relay_names(loose), "{loose}");
+    }
+    assert!(!relay_names("t000000000a,b"));
     assert!(!relay_names("s-"));
     assert!(!relay_names("x-a"));
 }
 
-/// A drive names a `t` tab as it names an `s-` one, by its selector, a hold or a wait target,
-/// and a relay line carries either; a malformed `t` ID names nothing and rides no relay line.
+/// A drive names a tab by its ID as it names a legacy tab by its `s-` one, by its selector, a
+/// hold or a wait target, and a relay line carries either; a malformed `t` ID names nothing and
+/// rides no relay line.
 #[test]
 fn a_drive_line_names_a_t_tab_and_a_relay_carries_either_form() {
     let named = |line: &str| -> Vec<String> {
@@ -722,10 +801,17 @@ fn a_drive_line_names_a_t_tab_and_a_relay_carries_either_form() {
     assert_eq!(named("@tqn5r6e0148 status"), ["tqn5r6e0148"]);
     assert_eq!(named("hold t0000000001 on reason=x"), ["t0000000001"]);
     assert_eq!(
-        named("await task @tqn5r6e0148:3,@s-a,@tqn5r6e0148:4 any timeout=5"),
-        ["tqn5r6e0148", "s-a"]
+        named("await task @tqn5r6e0148:3,@s-1a2b3c4d5e6f70819203,@tqn5r6e0148:4 any timeout=5"),
+        ["tqn5r6e0148", "s-1a2b3c4d5e6f70819203"]
     );
-    for malformed in ["T0000000000", "t000000000", "tqn5r6e014u", "tQN5R6E0148"] {
+    for malformed in [
+        "T0000000000",
+        "t000000000",
+        "tqn5r6e014u",
+        "tQN5R6E0148",
+        "s-a",
+        "s-0000000000000000000A",
+    ] {
         assert!(
             named(&format!("@{malformed} status")).is_empty(),
             "{malformed}"
@@ -816,8 +902,8 @@ fn a_survey_lists_the_sessions_of_every_window() {
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("dr1-survey");
-    let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
-    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
+    let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
+    let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000ae"]), false);
     let answers = survey(relay.path(), Some(older), &["survey", "version"]);
     let merged = &answers[0];
     let lines: Vec<&str> = merged.lines().collect();
@@ -830,8 +916,8 @@ fn a_survey_lists_the_sessions_of_every_window() {
     // The merge ends the line with it; the node job's own look follows, these windows
     // sending none (`the_node_job_adds_its_look_under_a_window_that_sends_none_…`).
     assert!(lines[1].contains(" instances_read=2 os="), "{merged}");
-    assert!(lines[2].contains(" sid=s-0d "), "{merged}");
-    assert!(lines[3].contains(" sid=s-ae "), "{merged}");
+    assert!(lines[2].contains(" sid=t000000000d "), "{merged}");
+    assert!(lines[3].contains(" sid=t00000000ae "), "{merged}");
     assert_eq!(lines[4], format!("account pool=claude id=a{older}"));
     assert_eq!(answers[1], format!("OK version window={older}\n"));
     assert_eq!(old.served(), ["survey", "version"]);
@@ -1095,7 +1181,7 @@ fn the_node_job_adds_its_look_under_a_window_that_sends_none_and_not_over_one_th
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("look-old");
-    let _old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
+    let _old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
     let one = &survey(relay.path(), Some(older), &["survey"])[0];
     assert!(
         one.starts_with(&format!("OK 3\ninstance pid={older} ")),
@@ -1116,7 +1202,7 @@ fn the_node_job_adds_its_look_under_a_window_that_sends_none_and_not_over_one_th
         head("cores").is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n > 0)),
         "{one}"
     );
-    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
+    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000ae"]), false);
     let two = &survey(relay.path(), Some(older), &["survey"])[0];
     assert!(
         two.starts_with(&format!("OK 4\ninstance pid={older} ")),
@@ -1132,13 +1218,108 @@ fn the_node_job_adds_its_look_under_a_window_that_sends_none_and_not_over_one_th
     );
 
     let relay = crate::test_scratch::short_dir("look-new");
-    let holds = Holds::live(&["s-0d"]).with_look();
+    let holds = Holds::live(&["t000000000d"]).with_look();
     let _looking = TestWindow::open(relay.path(), older, holds.clone(), false);
     assert_eq!(
         survey(relay.path(), Some(older), &["survey"])[0],
         window_survey(older, &holds),
         "a window that sends its look is relayed as it came"
     );
+}
+
+/// THE NODE JOB SAYS THE VOLUME'S SIZE ONCE, UNDER AN OLDER WINDOW AND A NEWER ONE: a window
+/// older than `home_total_mb=` sends a header with no size and no look, and the node job's look
+/// adds its volume's size once, right after the free space it also makes the look's; a newer
+/// window that sends no look but its own size has that one token made the look's, never a
+/// second; a look that read no volume leaves the window's size as it came; a line with no free
+/// space either says the look's size before the look's tokens. The strict parser reads the size
+/// into the facts and the look alike.
+/// NEGATIVE CONTROL: without the insertion after `home_free_mb=`, the older window's header says
+/// no size; without the `home_total_mb` arm, the newer one says the window's 950000; with the
+/// size left among the look's tokens too, a header says it twice.
+#[test]
+fn the_node_job_says_the_volumes_size_once_under_an_older_window_and_a_newer_one() {
+    use aterm_agent::survey_facts::{MachineFacts, SwarmSurveyFacts};
+    use aterm_capacity::machine_look::MachineLook;
+
+    let own = || MachineFacts {
+        look: MachineLook {
+            at_unix_ms: Some(1_793_160_000_123),
+            cores: Some(8),
+            disk_total_mb: Some(953_000),
+            disk_free_mb: Some(850),
+            ..MachineLook::UNREAD
+        },
+        up_since_ms: None,
+        os: Some("macos"),
+        target: None,
+    };
+    let volumeless = || MachineFacts {
+        look: MachineLook {
+            disk_total_mb: None,
+            disk_free_mb: None,
+            ..own().look
+        },
+        ..own()
+    };
+    // A window's answer with no look, its header saying `tail` after its free space.
+    let answer = |tail: &str| {
+        format!(
+            "OK 2\ninstance pid=7 host=m111 version=0.198.0 sessions=0 level=facts cut=0 \
+             at_ms=1 node=n instances=1 label=m7 window=1 window_last=5 ssh_host_key=- \
+             home_free_mb=900{tail} accounts=1 accounts_unread=- moves_7d=- move_tries_7d=- \
+             last_move=- roster_unread=0 access=full\naccount pool=claude id=a7 \
+             condition=usable enrolled=1 pct5=- pct7=- week_reset=- walled_until=- \
+             last_used=-\n"
+        )
+    };
+    let head_of = |answer: &str| answer.lines().nth(1).expect("the instance line").to_owned();
+    let sizes = |head: &str| head.matches(" home_total_mb=").count();
+
+    // A window older than the key: the look's size, once, right after the free space.
+    let older = answer("");
+    let with = merge_window_surveys(std::slice::from_ref(&older), usize::MAX, Some(&own));
+    let head = head_of(&with);
+    assert_eq!(sizes(&head), 1, "{head}");
+    assert!(
+        head.contains(" home_free_mb=850 home_total_mb=953000 accounts=1 "),
+        "{head}"
+    );
+    let parsed = SwarmSurveyFacts::from_survey_reply(&with).expect("the strict parser reads it");
+    assert_eq!(parsed.home_total_mb, Some(953_000));
+    assert_eq!(
+        parsed.machine.map(|m| m.look.disk_total_mb),
+        Some(Some(953_000))
+    );
+
+    // A newer window that sends its own size and no look: its one token made the look's.
+    let newer =
+        answer(" home_total_mb=950000 home_build_mb=- home_build_at_ms=- home_build_partial=-");
+    let with = merge_window_surveys(std::slice::from_ref(&newer), usize::MAX, Some(&own));
+    let head = head_of(&with);
+    assert_eq!(sizes(&head), 1, "{head}");
+    assert!(
+        head.contains(" home_free_mb=850 home_total_mb=953000 home_build_mb=- "),
+        "{head}"
+    );
+    let parsed = SwarmSurveyFacts::from_survey_reply(&with).expect("the strict parser reads it");
+    assert_eq!(parsed.home_total_mb, Some(953_000));
+
+    // A look that read no volume leaves the window's size as it came.
+    let with = merge_window_surveys(std::slice::from_ref(&newer), usize::MAX, Some(&volumeless));
+    let head = head_of(&with);
+    assert_eq!(sizes(&head), 1, "{head}");
+    assert!(
+        head.contains(" home_free_mb=900 home_total_mb=950000 "),
+        "{head}"
+    );
+
+    // A line with no free space either: the size goes before the look's own tokens.
+    let bare = "OK 1\ninstance pid=7 at_ms=1 access=full\n".to_owned();
+    let with = merge_window_surveys(std::slice::from_ref(&bare), usize::MAX, Some(&own));
+    let head = head_of(&with);
+    assert_eq!(sizes(&head), 1, "{head}");
+    assert!(head.contains(" home_total_mb=953000 os=macos "), "{head}");
 }
 
 /// The value an `instance` line says under a key.
@@ -1160,8 +1341,8 @@ fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("dr1-asked");
     let state = aterm_tempfile::tempdir().expect("a state folder");
-    let old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
-    let new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
+    let old = TestWindow::open(relay.path(), older, Holds::live(&["t000000000d"]), false);
+    let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000ae"]), false);
     let asker = "s-0123456789abcdef0123";
     let reader = crate::fleet_activity::Reader {
         node: "05".repeat(16),
@@ -1186,7 +1367,9 @@ fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
     );
     let kept = without_live_readings(&answers[0]);
     assert!(
-        kept.contains(" sid=s-0d ") && kept.contains(" sid=s-ae ") && kept.contains(" sessions="),
+        kept.contains(" sid=t000000000d ")
+            && kept.contains(" sid=t00000000ae ")
+            && kept.contains(" sessions="),
         "the comparison keeps the survey: {kept}"
     );
     let heard = ["survey", "survey", "survey facts", "survey"];
@@ -1294,12 +1477,12 @@ fn a_merged_survey_cuts_the_least_kept_rows_to_its_bound() {
 #[test]
 fn a_merged_survey_counts_the_cut_rows_it_sends() {
     let first = "OK 4\ninstance pid=7 host=m111 sessions=2 level=content cut=1 at_ms=1 node=n \
-                 instances=2\nsession sid=s-a program_kind=agent agent=busy said=done\nsession \
-                 sid=s-b program_kind=shell agent=- attention=- needs=-\naccount pool=claude \
+                 instances=2\nsession sid=t000000000a program_kind=agent agent=busy said=done\nsession \
+                 sid=t000000000b program_kind=shell agent=- attention=- needs=-\naccount pool=claude \
                  id=a7\n"
         .to_owned();
     let second = "OK 2\ninstance pid=9 host=m111 sessions=1 level=content cut=0 at_ms=1 node=n \
-                  instances=2\nsession sid=s-c program_kind=agent agent=idle said=ok\n"
+                  instances=2\nsession sid=t000000000c program_kind=agent agent=idle said=ok\n"
         .to_owned();
     let whole = merge_window_surveys(&[first.clone(), second.clone()], usize::MAX, None);
     assert!(
@@ -1308,10 +1491,10 @@ fn a_merged_survey_counts_the_cut_rows_it_sends() {
     );
     let row = whole
         .lines()
-        .find(|line| line.contains(" sid=s-b "))
+        .find(|line| line.contains(" sid=t000000000b "))
         .map_or(0, |line| line.len() + 1);
     let fitted = merge_window_surveys(&[first, second], whole.len() - row, None);
-    assert!(!fitted.contains(" sid=s-b "), "{fitted}");
+    assert!(!fitted.contains(" sid=t000000000b "), "{fitted}");
     assert!(
         fitted.starts_with("OK 4\ninstance pid=7 host=m111 sessions=3 level=content cut=0 "),
         "{fitted}"
@@ -1330,12 +1513,12 @@ fn a_merged_survey_keeps_the_first_windows_updater_beside_its_version() {
     let first = "OK 2\ninstance pid=7 host=m221 version=0.178.0 sessions=1 level=facts cut=0 \
                  at_ms=1793130000000 node=n instances=2 update=held update_at=1793129400 \
                  update_to=0.199.0 update_until=1793130060 update_why=crash-loop \
-                 update_tries=2 update_checks=on access=read\nsession sid=s-a program_kind=shell\n"
+                 update_tries=2 update_checks=on access=read\nsession sid=t000000000a program_kind=shell\n"
         .to_owned();
     let second = "OK 2\ninstance pid=9 host=m221 version=0.198.0 sessions=1 level=facts cut=0 \
                   at_ms=1793130120000 node=n instances=2 update=retrying update_at=1793129400 \
                   update_to=0.199.0 update_why=crash-loop update_checks=on access=read\n\
-                  session sid=s-b program_kind=shell\n"
+                  session sid=t000000000b program_kind=shell\n"
         .to_owned();
     let merged = merge_window_surveys(&[first, second], usize::MAX, None);
     let lines: Vec<String> = merged.lines().skip(1).map(str::to_owned).collect();
@@ -1355,7 +1538,8 @@ fn a_merged_survey_keeps_the_first_windows_updater_beside_its_version() {
 
 /// THE NODE COUNTS EVERY WINDOW'S AGENTS (Fleet Field §11, §14): a survey of each window here,
 /// merged, counts the agents of both windows by their words, listing the one whose sid is a
-/// minted one; with no window here the count is a reading of no agents.
+/// canonical metric session ID (a legacy tab's `s-` ID is counted and not listed); with no window
+/// here the count is a reading of no agents.
 /// NEGATIVE CONTROL: a window that takes no survey hand-over is no reading: nothing is counted,
 /// so nothing is published and the last count ages out.
 #[test]
@@ -1363,11 +1547,11 @@ fn the_node_counts_the_agents_of_every_window() {
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
     let relay = crate::test_scratch::short_dir("activity-two");
-    let minted = "s-00000000000000000001";
+    let minted = "t0000000001";
     let _old = TestWindow::open(
         relay.path(),
         older,
-        Holds::live(&["s-busy1", minted]),
+        Holds::live(&["s-busy1", minted, LEGACY]),
         false,
     );
     let _new = TestWindow::open(relay.path(), newer, Holds::live(&["s-busy2"]), false);
@@ -1382,7 +1566,7 @@ fn the_node_counts_the_agents_of_every_window() {
             row.walled,
             row.unknown
         ),
-        (1_793_160_000, 2, 1, 0, 0, 0)
+        (1_793_160_000, 2, 2, 0, 0, 0)
     );
     assert_eq!(
         row.sessions

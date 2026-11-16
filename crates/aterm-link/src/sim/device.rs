@@ -673,6 +673,31 @@ impl Device {
         );
     }
 
+    /// Every file under `dir` as it stands, bytes and mode, on the media: a unit test moves a
+    /// live state dir onto this device ([`crate::state::StateDir::write_through`]) once its
+    /// earlier writes were made on the filesystem, and a power cut takes back only what was
+    /// written through the device since.
+    pub(crate) fn seed_as_it_stands(&self, dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for entry in std::fs::read_dir(dir).expect("read a state dir").flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).expect("a state file's metadata");
+            if meta.is_dir() {
+                self.seed_as_it_stands(&path);
+            } else if meta.is_file() {
+                let bytes = std::fs::read(&path).expect("read a state file");
+                lock(&self.journal).files.insert(
+                    path,
+                    File {
+                        durable: Version::Bytes(bytes, meta.permissions().mode() & 0o7777),
+                        pending: Vec::new(),
+                        floor: 0,
+                    },
+                );
+            }
+        }
+    }
+
     /// A replace of `path` by `bytes` was made: where it is the mirror's pin,
     /// the highest total any pin was written with ([`Device::pin_total`]).
     fn note_pin(&self, path: &Path, bytes: &[u8]) {

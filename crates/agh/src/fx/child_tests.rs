@@ -207,7 +207,12 @@ fn a_child_killed_at_its_bound_may_have_acted() {
 
 #[test]
 fn explicit_git_stop_before_dispatch_starts_nothing() {
-    let missing = ChildSpec::new(Path::new("/missing/agh-stop-must-not-spawn"));
+    // An absolute path as this platform spells one, so the stop, not `check`, refuses it.
+    let missing = ChildSpec::new(Path::new(if cfg!(windows) {
+        r"C:\missing\agh-stop-must-not-spawn"
+    } else {
+        "/missing/agh-stop-must-not-spawn"
+    }));
     let error = super::run_unless(&missing, &mut || true)
         .expect_err("stop precedes dispatch")
         .into_data();
@@ -495,18 +500,14 @@ fn git_child_observation_refuses_other_modes_and_replacement() {
 #[cfg(unix)]
 #[test]
 fn source_inventory_spools_more_than_tail_capacity_with_bounded_records() {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::BufRead as _;
     let root = aterm_tempfile::Builder::new()
         .prefix("agh-inventory-")
         .tempdir()
         .unwrap();
     let input = root.path().join("input");
     let row = format!("{}\n", "1".repeat(40));
-    let mut file = std::fs::File::create(&input).unwrap();
-    for _ in 0..66_023 {
-        file.write_all(row.as_bytes()).unwrap();
-    }
-    drop(file);
+    std::fs::write(&input, row.repeat(66_023)).unwrap();
     let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
     for progress in [false, true] {
         let destination = root.path().join(if progress { "progress" } else { "wall" });

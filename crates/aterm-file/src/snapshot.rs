@@ -92,6 +92,13 @@ pub struct Row {
 }
 
 impl Row {
+    /// The bytes this row takes in a snapshot file, its line's end included: what a byte budget
+    /// on a snapshot's rows counts ([`crate::retain`]).
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        row_line(self).len() + 1
+    }
+
     /// The cell under `column` as the face shows it; the key under [`PK`].
     #[must_use]
     pub fn cell(&self, column: &str) -> &str {

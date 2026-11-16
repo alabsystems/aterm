@@ -60,20 +60,39 @@ impl TerminalHandler<'_> {
             633 => self.handle_osc_633(params),
             777 => self.handle_osc_777(params),
             1337 => self.handle_osc_1337(params),
-            7501 => self.handle_osc_7501(params),
+            7501 => self.handle_osc_7501(cap, params),
             30001 => self.handle_osc_30001(),
             30101 => self.handle_osc_30101(),
             _ => {}
         }
     }
 
-    /// OSC 7501 (`state=<word>:app=<claude-code|codex|grok-build>[:kind=<k>]`, `state=clear`), the root record
-    /// only ([`super::program_state`]), at the batch's injected wall clock.
+    /// OSC 7501: a program's query `?`, answered `OSC 7501 ; ?` with the query's terminator, in
+    /// dispatch order, so before the reply to the DA1 a program sends after it as its sentinel
+    /// (Claude Code takes the protocol as unspoken once that reply comes first, and takes any
+    /// reply whose body begins `?` as spoken); or a report (`state=<word>:app=<app>[:kind=<k>]`,
+    /// `state=clear`), the root record only ([`super::program_state`]), at the batch's injected
+    /// wall clock.
     #[inline]
-    fn handle_osc_7501(&mut self, params: &[&[u8]]) {
+    fn handle_osc_7501(
+        &mut self,
+        cap: &super::response_capability::ResponseCapability,
+        params: &[&[u8]],
+    ) {
         let [_, body] = params else {
             return;
         };
+        if *body == b"?" {
+            let st: &[u8] = if self.transient.last_osc_bel_terminated {
+                b"\x07"
+            } else {
+                b"\x1b\\"
+            };
+            let mut response = b"\x1b]7501;?".to_vec();
+            response.extend_from_slice(st);
+            self.send_response(cap, &response);
+            return;
+        }
         if let Ok(body) = std::str::from_utf8(body) {
             self.program_state
                 .accept_at(body, self.transient.process_wall_ms);

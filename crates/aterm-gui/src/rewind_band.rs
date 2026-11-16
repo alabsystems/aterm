@@ -270,9 +270,10 @@ impl App {
             let track = (band_rows(pane.rows) == 2).then(|| track_row(view, pane.cols, &inks));
             rows.push((*pane, band_row(view, pane.cols, &inks, &text), track));
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let t = (2.0 * ws.scale).round().max(2.0) as u32;
         let strip = ws
             .input_scratch

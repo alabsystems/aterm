@@ -181,7 +181,7 @@ pub fn front_sid(ls: &str) -> Option<String> {
         .filter(|l| l.split_whitespace().any(|w| w == "active=1"))
         .find_map(|l| {
             l.split_whitespace()
-                .find(|w| aterm_types::tab_id::is_tab_id(w))
+                .find(|w| aterm_types::control_verbs::is_minted_sid(w))
         })
         .map(str::to_string)
 }

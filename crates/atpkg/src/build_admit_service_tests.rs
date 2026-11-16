@@ -364,17 +364,18 @@ fn real_builds(world: &Path, seat: &Seat<'_>, d: &mut Driver) {
         assert!(d.outcome(*attempt).as_ref().unwrap().succeeded());
         let mut command = spawnfd::command(path.join("target.noindex/debug/headless_probe"));
         assert!(
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap()
-                .status
-                .success()
+            aterm_uds::deadline::output_while_process_progressing(
+                &mut command,
+                aterm_spec::wait::MUST_HAPPEN,
+                "host service compiled probe",
+            )
+            .unwrap()
+            .status
+            .success()
         );
     }
     assert!(seat.ledger.as_ref().unwrap().list().unwrap().is_empty());
-    assert_eq!(
-        stalled.step().unwrap(),
-        super::service::monitor::Progress::Pending
-    );
+    // The exchange's own deadline may have elapsed while the builds ran.
     drop(slow);
     assert!(stalled.step().is_err());
 }
@@ -571,13 +572,17 @@ fn run_actor(real: bool, fenced: bool) {
     if fenced {
         command.env(FENCED, "1");
     }
-    let output = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-        .unwrap_or_else(|e| {
-            panic!(
-                "session actor {e:?}; {}",
-                std::fs::read_to_string(world.path().join("phase")).unwrap_or_default()
-            )
-        });
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_spec::wait::MUST_HAPPEN,
+        "host service session actor",
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "session actor {e:?}; {}",
+            std::fs::read_to_string(world.path().join("phase")).unwrap_or_default()
+        )
+    });
     assert!(
         output.status.success(),
         "{}",

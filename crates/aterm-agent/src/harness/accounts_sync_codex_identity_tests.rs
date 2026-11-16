@@ -22,6 +22,7 @@ struct World {
 }
 
 impl World {
+    /// Local login and roster fixtures without an automatic account source.
     fn new(tag: &str) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix(tag)
@@ -38,9 +39,6 @@ impl World {
             "cli_auth_credentials_store='file'\n",
         )
         .unwrap();
-        crate::vault_entry::seed(&home, &[(&cli_fleet_file(Cli::Codex), format!(
-            "[[account]]\nlabel='a'\nemail='{A}'\nmachines=['m16']\n\n[[account]]\nlabel='b'\nemail='{B}'\nmachines=['m16']\n"
-        ).as_bytes())]);
         let roster = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
         let world = Self {
             _scratch: scratch,
@@ -65,6 +63,16 @@ impl World {
             ],
         });
         world.login(A);
+        world
+    }
+
+    #[cfg(unix)]
+    /// The local fixture with a real vault source for the two accounts.
+    fn with_source(tag: &str) -> Self {
+        let world = Self::new(tag);
+        crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), format!(
+            "[[account]]\nlabel='a'\nemail='{A}'\nmachines=['m16']\n\n[[account]]\nlabel='b'\nemail='{B}'\nmachines=['m16']\n"
+        ).as_bytes())]);
         world
     }
 
@@ -186,8 +194,9 @@ fn an_explicit_codex_signin_without_current_file_context_preserves_account_custo
 }
 
 #[test]
+#[cfg(unix)]
 fn a_replaced_default_login_keeps_old_auth_history_without_reusing_its_verdict() {
-    let world = World::new("codex-default-auth-context-");
+    let world = World::with_source("codex-default-auth-context-");
     let store = world.store();
     let old_b = store.login_dir("b").unwrap();
     write_login(&old_b, B);
@@ -366,9 +375,10 @@ fn sign_in_status_results_remain_bound_to_the_credentials_seen_before_the_status
 }
 
 #[test]
+#[cfg(unix)]
 fn codex_sync_reassigns_the_default_without_moving_account_history_or_sessions() {
     for (independent, alias) in [(false, false), (true, false), (false, true)] {
-        let world = World::new("codex-default-reassignment-");
+        let world = World::with_source("codex-default-reassignment-");
         if alias {
             let mut rows = world.rows();
             rows.rows[1].email = Some("b-alias@example.com".into());
@@ -618,9 +628,20 @@ fn codex_reassignment_needs_unambiguous_native_identity_and_current_local_policy
 #[test]
 fn codex_reassignment_rechecks_policy_auth_and_record_custody_before_publication() {
     for case in [
-        "auth", "backend", "config", "source", "roster", "binding", "occupied",
+        "auth",
+        "backend",
+        "config",
+        #[cfg(unix)]
+        "source",
+        "roster",
+        "binding",
+        "occupied",
     ] {
-        let world = World::new("codex-default-race-");
+        let world = match case {
+            #[cfg(unix)]
+            "source" => World::with_source("codex-default-race-"),
+            _ => World::new("codex-default-race-"),
+        };
         world.login(B);
         let before = world.records();
         let result = world.reassign(|| match case {
@@ -633,6 +654,7 @@ fn codex_reassignment_rechecks_policy_auth_and_record_custody_before_publication
             "config" => {
                 crate::test_config::write(&world.config, "[fleet]\nmachine='m22'\n").unwrap()
             }
+            #[cfg(unix)]
             "source" => {
                 crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"\n")])
             }
@@ -810,8 +832,9 @@ fn codex_reassignment_declines_a_configured_roster_link_that_changes_target() {
 /// row is and where it was. CONTROL: below, a directory it left with another account's login in it,
 /// or its own account's in one it never left, stays where it is.
 #[test]
+#[cfg(unix)]
 fn a_default_login_moved_back_takes_the_rows_own_directory_back() {
-    let world = World::new("codex-default-back-");
+    let world = World::with_source("codex-default-back-");
     let store = world.store();
     let (dir_a, dir_b) = (store.login_dir("a").unwrap(), store.login_dir("b").unwrap());
     write_login(&dir_b, B);
@@ -875,7 +898,7 @@ fn a_default_login_moved_back_takes_the_rows_own_directory_back() {
         ),
         ("its own account's in one it never left", B, false),
     ] {
-        let world = World::new("codex-default-back-refused-");
+        let world = World::with_source("codex-default-back-refused-");
         let store = world.store();
         let dir_b = store.login_dir("b").unwrap();
         write_login(&dir_b, B);
@@ -932,7 +955,6 @@ fn sync_words(world: &World) -> (ExitCode, String, String) {
 #[test]
 fn a_sync_with_no_source_still_follows_the_default_login() {
     let world = World::new("codex-default-no-source-");
-    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     assert_eq!(world.sync(), Ok(CliSync::NoSource), "CONTROL");
     let (code, _, err) = sync_words(&world);
     assert_eq!(code, ExitCode::FAILURE, "CONTROL");

@@ -15,6 +15,7 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             pinned: false,
             sid: None,
             lineage: None,
+            opened_ms: None,
             log_ep: None,
             cwd: Some("/tmp".to_string()),
             title: title.to_string(),
@@ -157,10 +158,11 @@ fn open_tab(app: &mut App, wid: WindowId) -> u64 {
     let tree = crate::pane::PaneTree::new(id);
     let tab = crate::register_terminal_tab(&mut app.tab_ids, &mut app.view_store, &tree)
         .expect("tab identity");
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.layouts.push(tree);
     ws.tabs.add();
     ws.tab_set.push(tab).expect("fresh tab id");
+    drop(ws);
     app.resync_active_or_window(wid);
     id
 }
@@ -211,7 +213,7 @@ fn the_restore_s_close_regrids_every_tab_to_its_window_once() {
     )]));
     let grid = (27, 80);
     {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         (ws.rows, ws.cols) = grid;
     }
     drain(&mut app);

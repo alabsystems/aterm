@@ -464,6 +464,218 @@ fn trust_cargo_custody_reads_each_twin_with_a_toolchain_and_no_lane() {
     }
 }
 
+/// TRUST'S CARGO-COMPATIBLE NAME READS A `-C` AS TARGO DOES: it is Targo's own program, on
+/// Targo's `trust` channel, which allows the gate, its `+toolchain` read past as an upstream
+/// cargo's, so a gated `cargo +trust -Zunstable-options -C <package> build` from a folder
+/// with no package builds that package into its target, which the front records, owned by
+/// it. NEGATIVE CONTROL: the same call with no gate, which Targo refuses for want of it, is
+/// refused with nothing recorded, as is an upstream cargo's on a released channel
+/// (`+stable`), which allows no nightly feature.
+#[test]
+fn trust_cargo_reads_a_gated_directory_as_targo_does() {
+    use super::super::Tool;
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let produce = |tool: Tool, args: &[&str]| {
+        let world = World::new();
+        let notes = world.home.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let owner = world.owner.display().to_string();
+        let args: Vec<String> = args
+            .iter()
+            .map(|word| {
+                if *word == "{owner}" {
+                    owner.clone()
+                } else {
+                    (*word).to_owned()
+                }
+            })
+            .collect();
+        let env = |name: &str| {
+            (name == "CARGO_TARGET_DIR").then(|| world.target.clone().into_os_string())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&notes),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let verdict = observe_for_producer(&args, tool, &world.home, &machine, true).ok();
+        let owners: Vec<PathBuf> = roots(&world.home)
+            .into_iter()
+            .flat_map(|root| root.owners)
+            .collect();
+        (verdict, owners, world)
+    };
+    let gated = ["+trust", "-Zunstable-options", "-C", "{owner}", "build"];
+    let (verdict, owners, world) = produce(Tool::CargoCompat, &gated);
+    assert_eq!(verdict, Some(true));
+    assert_eq!(owners, std::slice::from_ref(&world.owner));
+    let (verdict, owners, _world) =
+        produce(Tool::CargoCompat, &["+trust", "-C", "{owner}", "build"]);
+    assert_eq!((verdict, owners.len()), (None, 0), "ungated");
+    let (verdict, owners, _world) = produce(
+        Tool::Cargo,
+        &["+stable", "-Zunstable-options", "-C", "{owner}", "build"],
+    );
+    assert_eq!((verdict, owners.len()), (None, 0), "upstream");
+}
+
+/// A RELATIVE `CARGO_HOME` UNDER A `-C` BY THE CARGO NAME IS REFUSED: Targo run directly joins
+/// it to the `-C` directory, while a rustup proxy (which `cargo +trust` or a pinned `cargo`
+/// goes through) exports it joined to the launcher's folder first, so the launcher's `.ch`
+/// config, which names a target outside every recorded folder, may be the one the build
+/// reads. Each tool by the cargo name, gated, is refused with nothing recorded, and so is a
+/// user alias the `-C` directory's home reads as `clean` or as a query where the launcher's
+/// reads it as a build: the alias is the home's, so the call is read in both.
+/// NEGATIVE CONTROL: the same call with that home absolute records `out`, owned; a builtin
+/// `clean`, or an alias both homes read as one, is not refused and records nothing; with no
+/// `-C`, or by Targo's name, which reads the `-C` directory's home, it is not refused, and
+/// Targo's records nothing of the launcher's.
+#[test]
+fn a_relative_cargo_home_under_a_directory_by_the_cargo_name_is_refused() {
+    use super::super::Tool;
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let produce = |tool: Tool, args: &[&str], absolute: bool| {
+        let world = World::new();
+        let notes = world.home.join("notes");
+        std::fs::create_dir_all(notes.join(".ch")).unwrap();
+        let out = world.home.join("out");
+        std::fs::write(
+            notes.join(".ch/config.toml"),
+            format!(
+                "[build]\ntarget-dir = \"{}\"\n\
+                 [alias]\nx = \"build\"\ny = \"build\"\nz = \"clean\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        // The `-C` directory's home, which reads `x` as `clean` and `y` as a query.
+        std::fs::create_dir_all(world.owner.join(".ch")).unwrap();
+        std::fs::write(
+            world.owner.join(".ch/config.toml"),
+            "[alias]\nx = \"clean\"\ny = \"build --help\"\nz = \"clean\"\n",
+        )
+        .unwrap();
+        let owner = world.owner.display().to_string();
+        let args: Vec<String> = args
+            .iter()
+            .map(|word| {
+                if *word == "{owner}" {
+                    owner.clone()
+                } else {
+                    (*word).to_owned()
+                }
+            })
+            .collect();
+        let home = if absolute {
+            notes.join(".ch").into_os_string()
+        } else {
+            ".ch".into()
+        };
+        let env = |name: &str| (name == "CARGO_HOME").then(|| home.clone());
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&notes),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let verdict = observe_for_producer(&args, tool, &world.home, &machine, true);
+        let recorded: Vec<PathBuf> = roots(&world.home)
+            .into_iter()
+            .map(|root| root.root)
+            .collect();
+        (verdict, recorded, world, out)
+    };
+    for (tool, args) in [
+        (
+            Tool::CargoCompat,
+            &["+trust", "-Zunstable-options", "-C", "{owner}", "build"][..],
+        ),
+        (
+            Tool::CargoCompat,
+            &["-Zunstable-options", "-C", "{owner}", "build"][..],
+        ),
+        (
+            Tool::Cargo,
+            &["+nightly", "-Zunstable-options", "-C", "{owner}", "build"][..],
+        ),
+        // A custom name rustup may link to a nightly cargo, whose channel is untold.
+        (
+            Tool::Cargo,
+            &["+1dev", "-Zunstable-options", "-C", "{owner}", "build"][..],
+        ),
+        (
+            Tool::Cargo,
+            &["+beta-x", "-Zunstable-options", "-C", "{owner}", "build"][..],
+        ),
+        // An alias the `-C` directory's home reads as `clean`, and one it reads as a query,
+        // which the launcher's reads as a build into `out`.
+        (
+            Tool::CargoCompat,
+            &["+trust", "-Zunstable-options", "-C", "{owner}", "x"][..],
+        ),
+        (
+            Tool::CargoCompat,
+            &["+trust", "-Zunstable-options", "-C", "{owner}", "y"][..],
+        ),
+    ] {
+        let (verdict, recorded, _world, out) = produce(tool, args, false);
+        assert!(verdict.is_err(), "{tool:?} {args:?}: {verdict:?}");
+        assert!(recorded.is_empty(), "{tool:?} {args:?}: {recorded:?}");
+        assert!(!out.exists());
+    }
+    // An absolute home is the same from either folder: the launcher's config names `out`,
+    // which this reader then reads and owes custody by.
+    let gated = ["+trust", "-Zunstable-options", "-C", "{owner}", "build"];
+    let (verdict, _, world, out) = produce(Tool::CargoCompat, &gated, true);
+    assert!(
+        verdict.as_ref().is_ok_and(|owned| *owned)
+            && roots(&world.home).iter().any(|root| root.root == out),
+        "{verdict:?}"
+    );
+    // A call that builds nothing in either home, a builtin `clean` or an alias both read
+    // as one, is not refused, and records nothing.
+    for verb in ["clean", "z"] {
+        let args = ["+trust", "-Zunstable-options", "-C", "{owner}", verb];
+        let (verdict, recorded, _world, _) = produce(Tool::CargoCompat, &args, false);
+        assert!(matches!(verdict, Ok(false)), "{verb}: {verdict:?}");
+        assert!(recorded.is_empty(), "{verb}: {recorded:?}");
+    }
+    // With no `-C`, the launcher's folder is the one both read the home against: the call,
+    // from a folder that holds no package, is not refused.
+    let (verdict, _, _world, _) = produce(Tool::CargoCompat, &["+trust", "build"], false);
+    assert!(verdict.is_ok(), "{verdict:?}");
+    // Targo's name reads the `-C` directory's home, which holds no config: no target is
+    // named, nothing is refused and the launcher's `out` is never read.
+    let (verdict, recorded, _world, _) = produce(
+        Tool::Targo,
+        &[
+            "-Zunstable-options",
+            "-C",
+            "{owner}",
+            "--unverified",
+            "build",
+        ],
+        false,
+    );
+    assert!(verdict.is_ok(), "{verdict:?}");
+    assert!(recorded.is_empty(), "{recorded:?}");
+}
+
 /// Explicit target custody follows the physical directory Cargo changes into. A linked
 /// directory's `..` is its target's parent, not the launcher's lexical parent.
 #[test]
@@ -523,6 +735,12 @@ fn directory_changed_producers_own_the_effective_package_target() {
     }
 }
 
+/// A `-C` call whose custody the front cannot grant is refused: a directory Targo cannot
+/// change into and a config it cannot read there with nothing recorded, and a foreign target
+/// that already stands with its contents kept and never adopted, its quiet intermediates
+/// recorded in it as the same call typed from the package records them (`existing-here`,
+/// `package_registers_its_fresh_target_without_adopting_existing_output`); a query and a
+/// package outside HOME owe nothing.
 #[test]
 fn directory_changed_producers_refuse_unknown_custody_and_leave_queries_alone() {
     use super::super::Tool;
@@ -530,6 +748,7 @@ fn directory_changed_producers_refuse_unknown_custody_and_leave_queries_alone() 
         "missing",
         "file",
         "existing",
+        "existing-here",
         "unknown-config",
         "query",
         "outside",
@@ -548,23 +767,29 @@ fn directory_changed_producers_refuse_unknown_custody_and_leave_queries_alone() 
             std::fs::create_dir(&directory).unwrap();
             std::fs::write(directory.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         }
+        let existing = case.starts_with("existing");
         let target = directory.join("fresh.noindex");
-        if case == "existing" {
+        if existing {
             std::fs::create_dir(&target).unwrap();
             std::fs::write(target.join("keep"), b"foreign output").unwrap();
         }
-        let args: Vec<String> = [
-            "-Zunstable-options",
-            "-C",
-            directory.to_str().unwrap(),
-            "--unverified",
-            if case == "query" { "help" } else { "build" },
-            "--target-dir",
-            "fresh.noindex",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+        let moved = ["-Zunstable-options", "-C", directory.to_str().unwrap()];
+        let args: Vec<String> = moved[..if case == "existing-here" { 0 } else { 3 }]
+            .iter()
+            .copied()
+            .chain([
+                "--unverified",
+                if case == "query" { "help" } else { "build" },
+                "--target-dir",
+                "fresh.noindex",
+            ])
+            .map(str::to_owned)
+            .collect();
+        let launcher = if case == "existing-here" {
+            world.owner.clone()
+        } else {
+            launcher
+        };
         let read = |path: &Path| {
             if case == "unknown-config" && path == world.owner.join(".cargo/config.toml") {
                 return Err(());
@@ -590,18 +815,33 @@ fn directory_changed_producers_refuse_unknown_custody_and_leave_queries_alone() 
         } else {
             assert!(result.is_err(), "{case}: {result:?}");
         }
-        assert!(roots(&world.home).is_empty(), "{case}");
-        if case == "existing" {
+        let recorded: Vec<PathBuf> = roots(&world.home)
+            .into_iter()
+            .map(|root| root.root)
+            .collect();
+        if existing {
             assert_eq!(
                 std::fs::read(target.join("keep")).unwrap(),
                 b"foreign output"
             );
+            assert!(!target.join(MARKER).exists(), "{case}");
+            assert_eq!(
+                recorded,
+                [super::super::target_build_path(&target)],
+                "{case}"
+            );
         } else {
+            assert!(recorded.is_empty(), "{case}");
             assert!(!target.exists(), "{case}");
         }
     }
 }
 
+/// A CLI config file the front reads as Targo does keeps the typed target's custody, from
+/// the launcher's folder and through a `-C`: one that names no directory, one whose target
+/// directory the typed `--target-dir` outranks, and an empty `include`. NEGATIVE CONTROL: a
+/// build directory, an `include` naming a file that is absent and not optional, text Targo
+/// cannot parse, and a file the reader cannot read are refused with nothing recorded.
 #[test]
 fn cli_configs_preserve_selected_explicit_custody() {
     use super::super::Tool;
@@ -618,6 +858,11 @@ fn cli_configs_preserve_selected_explicit_custody() {
                 (r#"build."build\u002ddir" = false"#, false),
                 ("build.target-dir = false", false),
                 ("include = []\n", true),
+                // A build directory the config names is read with its definition base (the
+                // working directory for an inline value, the folder above a file's): both
+                // outputs are the call's, each recorded.
+                ("[build]\nbuild-dir = 'other'\n", true),
+                ("include = ['absent.toml']\n", false),
                 ("include = ['nested/neutral.toml']\n", true),
                 ("include = ['nested/unsafe.toml']\n", false),
                 ("include = ['nested/cycle.toml']\n", false),
@@ -684,17 +929,37 @@ fn cli_configs_preserve_selected_explicit_custody() {
                 let result = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true);
                 let recorded = roots(&world.home);
                 if expect_owned {
-                    assert!(result.unwrap(), "moved={moved}");
-                    assert_eq!(recorded.len(), 1);
-                    assert_eq!(recorded[0].root, world.owner.join("fresh.noindex"));
+                    assert!(result.unwrap(), "{text} moved={moved}");
+                    let intermediates = text.contains("build-dir = 'other'").then(|| {
+                        if file_form {
+                            world.home.join("other")
+                        } else {
+                            world.owner.join("other")
+                        }
+                    });
+                    assert_eq!(recorded.len(), 1 + usize::from(intermediates.is_some()));
                     assert!(
-                        !world.owner.join("other").exists(),
-                        "overridden config is unused"
+                        recorded
+                            .iter()
+                            .any(|entry| entry.root == world.owner.join("fresh.noindex"))
                     );
-                    assert_eq!(
-                        super::read(&recorded[0].receipt_path).unwrap().owners,
-                        [std::fs::canonicalize(&world.owner).unwrap()]
-                    );
+                    match &intermediates {
+                        Some(built) => assert!(
+                            built.is_dir()
+                                && recorded.iter().any(|entry| built.starts_with(&entry.root)),
+                            "{text} file={file_form} moved={moved}"
+                        ),
+                        None => assert!(
+                            !world.owner.join("other").exists(),
+                            "overridden config is unused"
+                        ),
+                    }
+                    for entry in &recorded {
+                        assert_eq!(
+                            super::read(&entry.receipt_path).unwrap().owners,
+                            [std::fs::canonicalize(&world.owner).unwrap()]
+                        );
+                    }
                 } else {
                     assert!(result.is_err(), "{text} moved={moved}: {result:?}");
                     assert!(recorded.is_empty());
@@ -827,6 +1092,18 @@ fn cli_include_targets_bind_the_winning_file_to_actual_custody() {
                     }
                     _ => "include=['layers/neutral.toml']",
                 };
+                // Inline, Targo takes one dotted key per value (`toml_dotted_keys`): the parent's
+                // two keys fail the call, so they are two values, the later one's target over
+                // the include's.
+                let inline: Vec<String> = match mode {
+                    "parent" => vec![
+                        "--config".into(),
+                        "include=['layers/target.toml']".into(),
+                        "--config".into(),
+                        "build.target-dir='parent.noindex'".into(),
+                    ],
+                    _ => vec!["--config".into(), text.into()],
+                };
                 std::fs::write(world.owner.join("settings.toml"), text).unwrap();
                 let read = |path: &Path| match std::fs::read_to_string(path) {
                     Ok(text) => Ok(Some(text)),
@@ -850,15 +1127,21 @@ fn cli_include_targets_bind_the_winning_file_to_actual_custody() {
                         world.owner.display().to_string(),
                     ]);
                 }
-                args.extend([
-                    "build".into(),
-                    "--config".into(),
-                    if file_form {
-                        "settings.toml".into()
-                    } else {
-                        text.into()
-                    },
-                ]);
+                args.push("build".into());
+                if !file_form && mode == "parent" {
+                    let two_keys = [args.clone(), vec!["--config".into(), text.into()]].concat();
+                    assert!(
+                        observe_for_producer(&two_keys, Tool::Targo, &world.home, &machine, true)
+                            .is_err(),
+                        "two keys moved={moved}"
+                    );
+                    assert!(roots(&world.home).is_empty(), "two keys moved={moved}");
+                }
+                if file_form {
+                    args.extend(["--config".into(), "settings.toml".into()]);
+                } else {
+                    args.extend(inline);
+                }
                 if mode == "neutral" {
                     args.extend(["--target-dir".into(), "direct.noindex".into()]);
                 }
@@ -2467,9 +2750,17 @@ fn equivalent_inherited_placement_preserves_owners_through_nested_and_rust_calls
     );
 }
 
+/// The workspace's own `target`, which a local fallback writes, keeps what a cargo home's
+/// cache keeps at its top only by chance (an xtask's `target/cache` downloads, a tool's
+/// `target/db` file, a link named `index`): no cargo home's cache is a workspace root's
+/// `target`, so its leaf is owned and the build runs, as it did before the quiet branch read
+/// a cache by its contents.
 #[test]
 fn quiet_local_fallback_owns_only_its_child_in_an_existing_unmanaged_target() {
-    for trust in [false, true] {
+    for (trust, beside) in [false, true]
+        .into_iter()
+        .flat_map(|trust| ["none", "cache-folder", "db-file", "index-link"].map(|b| (trust, b)))
+    {
         let world = World::new();
         let target = world.owner.join("target");
         std::fs::DirBuilder::new()
@@ -2477,6 +2768,16 @@ fn quiet_local_fallback_owns_only_its_child_in_an_existing_unmanaged_target() {
             .create(&target)
             .unwrap();
         std::fs::write(target.join("keep"), b"unmanaged final output").unwrap();
+        match beside {
+            "none" => {}
+            "cache-folder" => {
+                std::fs::create_dir(target.join("cache")).unwrap();
+                std::fs::write(target.join("cache/tool.tar"), b"x").unwrap();
+            }
+            "db-file" => std::fs::write(target.join("db"), b"x").unwrap(),
+            "index-link" => std::os::unix::fs::symlink("keep", target.join("index")).unwrap(),
+            _ => unreachable!(),
+        }
         let args = vec![
             if trust { "trust" } else { "--unverified" }.into(),
             "check".into(),
@@ -2496,18 +2797,19 @@ fn quiet_local_fallback_owns_only_its_child_in_an_existing_unmanaged_target() {
             writable: &|_| Some(false),
         };
         for _ in 0..2 {
+            let observed = observe_for_producer(
+                &args,
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+                true,
+            );
             assert!(
-                !observe_for_producer(
-                    &args,
-                    super::super::Tool::Targo,
-                    &world.home,
-                    &machine,
-                    true
-                )
-                .unwrap()
+                matches!(observed, Ok(false)),
+                "{trust} {beside}: {observed:?}"
             );
             let records = roots(&world.home);
-            assert_eq!(records.len(), 1);
+            assert_eq!(records.len(), 1, "{trust} {beside}");
             assert_eq!(records[0].root, super::super::target_build_path(&target));
             assert_eq!(
                 records[0].owners.as_slice(),
@@ -3632,9 +3934,22 @@ fn workspace_owners_follow_complete_search_and_package_home_boundaries() {
     }
 }
 
+/// A workspace's owner keeps Targo's logical spellings of the manifest and the package home: the
+/// root walk stops after the home as spelled, and the owner is the root found, canonical. A
+/// manifest that is a link is read through, its package the folder the link stands in, which
+/// owns it. NEGATIVE CONTROL: a root that does not list the member fails Targo's member check
+/// (`error_if_manifest_not_in_members`), and a linked manifest whose file lies outside HOME
+/// grants no permission to read it: each is refused, nothing recorded.
 #[test]
 fn workspace_owners_keep_logical_manifest_and_home_spellings() {
-    for case in ["home-alias", "both-alias", "manifest-alias", "file-link"] {
+    for case in [
+        "home-alias",
+        "both-alias",
+        "manifest-alias",
+        "file-link",
+        "unlisted",
+        "file-link-outside",
+    ] {
         let world = World::new();
         let member = world.owner.join("n/member");
         std::fs::create_dir_all(&member).unwrap();
@@ -3643,10 +3958,17 @@ fn workspace_owners_keep_logical_manifest_and_home_spellings() {
             "[package]\nname='member'\nversion='0.0.0'\n",
         )
         .unwrap();
+        if case != "unlisted" {
+            std::fs::write(
+                world.owner.join("Cargo.toml"),
+                "[workspace]\nmembers = ['n/member']\n",
+            )
+            .unwrap();
+        }
         let alias = world.home.join("alias");
         std::os::unix::fs::symlink(&world.owner, &alias).unwrap();
         let (manifest, package_home, expected) = match case {
-            "home-alias" => (
+            "home-alias" | "unlisted" => (
                 member.join("Cargo.toml"),
                 alias.join("n"),
                 world.owner.clone(),
@@ -3665,6 +3987,16 @@ fn workspace_owners_keep_logical_manifest_and_home_spellings() {
                 let logical = world.home.join("linked-member");
                 std::fs::create_dir(&logical).unwrap();
                 std::os::unix::fs::symlink(member.join("Cargo.toml"), logical.join("Cargo.toml"))
+                    .unwrap();
+                (logical.join("Cargo.toml"), world.home.clone(), logical)
+            }
+            "file-link-outside" => {
+                let outside = world.home.parent().unwrap().join("outside");
+                std::fs::create_dir(&outside).unwrap();
+                std::fs::copy(member.join("Cargo.toml"), outside.join("Cargo.toml")).unwrap();
+                let logical = world.home.join("linked-member");
+                std::fs::create_dir(&logical).unwrap();
+                std::os::unix::fs::symlink(outside.join("Cargo.toml"), logical.join("Cargo.toml"))
                     .unwrap();
                 (logical.join("Cargo.toml"), world.home.clone(), logical)
             }
@@ -3700,11 +4032,10 @@ fn workspace_owners_keep_logical_manifest_and_home_spellings() {
             &machine,
             true,
         );
-        if case == "file-link" {
-            // Targo resolves this logical package, but custody requires a regular manifest.
-            assert!(verdict.is_err());
-            assert!(!world.target.exists());
-            assert!(roots(&world.home).is_empty());
+        if matches!(case, "unlisted" | "file-link-outside") {
+            assert!(verdict.is_err(), "{case}");
+            assert!(!world.target.exists(), "{case}");
+            assert!(roots(&world.home).is_empty(), "{case}");
             continue;
         }
         assert!(verdict.unwrap(), "{case}");
@@ -3724,6 +4055,8 @@ fn workspace_owners_keep_unknown_ancestors_and_external_roots_unmanaged() {
         "missing-pointer",
         "unreadable",
         "external-root",
+        "external-root-listed",
+        "external-pointer",
         "redirected",
     ] {
         let world = World::new();
@@ -3759,6 +4092,32 @@ fn workspace_owners_keep_unknown_ancestors_and_external_roots_unmanaged() {
                 )
                 .unwrap();
                 std::fs::write(world.home.join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            // A root that lists the member, at HOME or outside it, is one Targo builds and no
+            // owner may be: the package is managed, so the target it names is refused.
+            "external-root-listed" => {
+                std::fs::write(
+                    &parent_manifest,
+                    "[package]\nname='parent'\nversion='0.0.0'\n",
+                )
+                .unwrap();
+                std::fs::write(
+                    world.home.join("Cargo.toml"),
+                    "[workspace]\nmembers=['source/n/member']\n",
+                )
+                .unwrap();
+            }
+            "external-pointer" => {
+                std::fs::write(
+                    member.join("Cargo.toml"),
+                    format!("{package}workspace='../../../..'\n"),
+                )
+                .unwrap();
+                std::fs::write(
+                    world.home.parent().unwrap().join("Cargo.toml"),
+                    "[workspace]\nmembers=['home/source/n/member']\n",
+                )
+                .unwrap();
             }
             "redirected" => {
                 let directory = world.home.parent().unwrap().join("elsewhere");
@@ -3809,6 +4168,12 @@ fn workspace_owners_keep_unknown_ancestors_and_external_roots_unmanaged() {
     }
 }
 
+/// A workspace's `exclude` and a `target/package` folder bound its root: an excluded member and
+/// a packaged source are their own roots, while an explicit `members` prefix wins over the
+/// exclusion, and an ancestor's pointer names the root, each a root that lists the member.
+/// NEGATIVE CONTROL: the same explicit prefix and pointer with a root that lists no such member
+/// fail Targo's member check (`error_if_manifest_not_in_members`, or the load of a `members`
+/// entry that is no package): each is refused, nothing recorded.
 #[test]
 fn workspace_owners_respect_exclusion_and_packaged_source_boundaries() {
     for case in [
@@ -3816,6 +4181,8 @@ fn workspace_owners_respect_exclusion_and_packaged_source_boundaries() {
         "explicit-member",
         "packaged",
         "ancestor-pointer",
+        "explicit-member-unlisted",
+        "ancestor-pointer-unlisted",
     ] {
         let world = World::new();
         let member = world.owner.join(if case == "packaged" {
@@ -3829,14 +4196,18 @@ fn workspace_owners_respect_exclusion_and_packaged_source_boundaries() {
             "[package]\nname='member'\nversion='0.0.0'\n",
         )
         .unwrap();
-        let definition = if case == "explicit-member" {
-            "[workspace]\nmembers=['n']\nexclude=['n']\n"
-        } else {
-            "[workspace]\nexclude=['n']\n"
+        let definition = match case {
+            "explicit-member" => "[workspace]\nmembers=['n/member']\nexclude=['n']\n",
+            "explicit-member-unlisted" => "[workspace]\nmembers=['n']\nexclude=['n']\n",
+            _ => "[workspace]\nexclude=['n']\n",
         };
         std::fs::write(world.owner.join("Cargo.toml"), definition).unwrap();
-        if case == "ancestor-pointer" {
-            std::fs::write(world.owner.join("Cargo.toml"), "[workspace]\n").unwrap();
+        if let Some(listed) = match case {
+            "ancestor-pointer" => Some("[workspace]\nmembers=['n/member']\n"),
+            "ancestor-pointer-unlisted" => Some("[workspace]\n"),
+            _ => None,
+        } {
+            std::fs::write(world.owner.join("Cargo.toml"), listed).unwrap();
             std::fs::write(
                 member.parent().unwrap().join("Cargo.toml"),
                 "[package]\nname='parent'\nversion='0.0.0'\nworkspace='..'\n",
@@ -3864,17 +4235,20 @@ fn workspace_owners_respect_exclusion_and_packaged_source_boundaries() {
             "--target-dir".into(),
             world.target.display().to_string(),
         ];
-        assert!(
-            observe_for_producer(
-                &args,
-                super::super::Tool::Targo,
-                &world.home,
-                &machine,
-                true
-            )
-            .unwrap(),
-            "{case}"
+        let verdict = observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
         );
+        if case.ends_with("-unlisted") {
+            assert!(verdict.is_err(), "{case}");
+            assert!(!world.target.exists(), "{case}");
+            assert!(roots(&world.home).is_empty(), "{case}");
+            continue;
+        }
+        assert!(verdict.unwrap(), "{case}");
         let expected = if matches!(case, "explicit-member" | "ancestor-pointer") {
             &world.owner
         } else {
@@ -4484,8 +4858,8 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         [std::fs::canonicalize(&world.owner).unwrap()]
     );
 
-    // Targo reads the alias in the directory a `-C` names, and the call is judged there: a
-    // named target is owned by that package, never by the launcher.
+    // Targo reads the alias in the directory a `-C` names, and the call is judged there: its
+    // alias hands the `-m` to the program, so the target is that directory's package's.
     let world = World::new();
     let launcher = world.another_owner();
     std::fs::create_dir(world.owner.join(".cargo")).unwrap();
@@ -4505,8 +4879,12 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
     ]);
     moved.push(outside(&world));
     assert_eq!(produce(&world, &launcher, &moved), (Some(true), 1));
+    assert_eq!(owners(&world), std::slice::from_ref(&world.owner));
+    // A `-C` that names the package builds it into its target, from a folder with none.
+    let world = World::new();
     let notes = world.home.join("notes");
     std::fs::create_dir(&notes).unwrap();
+    let owner_dir = world.owner.display().to_string();
     let moved = words(&[
         "-Zunstable-options",
         "-C",
@@ -4515,8 +4893,12 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         "build",
     ]);
     assert_eq!(produce(&world, &notes, &moved), (Some(true), 1));
-    // The directory is the kernel's: a link's `..` is its target's parent, and one Targo
-    // cannot change into owes custody.
+    assert_eq!(owners(&world), std::slice::from_ref(&world.owner));
+    // The directory is the kernel's: one with no package owes nothing, one Targo cannot
+    // change into owes custody, and a link's `..` is its target's parent, the package here.
+    let world = World::new();
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
     std::fs::create_dir(world.home.join("empty")).unwrap();
     let moved = words(&[
         "-Zunstable-options",
@@ -4525,7 +4907,10 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         "--unverified",
         "build",
     ]);
-    assert_eq!(produce(&world, &notes, &moved), (Some(false), 1));
+    assert_eq!(produce(&world, &notes, &moved), (Some(false), 0));
+    let moved = words(&["-Zunstable-options", "-C", "../ws", "--unverified", "build"]);
+    assert_eq!(produce(&world, &notes, &moved), (None, 0));
+    assert!(!world.target.exists());
     std::fs::create_dir(world.owner.join("sub")).unwrap();
     std::os::unix::fs::symlink(world.owner.join("sub"), notes.join("linked")).unwrap();
     let moved = words(&[
@@ -4536,18 +4921,20 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         "build",
     ]);
     assert_eq!(produce(&world, &notes, &moved), (Some(true), 1));
-    let moved = words(&["-Zunstable-options", "-C", "../ws", "--unverified", "build"]);
-    assert_eq!(produce(&world, &notes, &moved), (None, 1));
-    assert!(world.target.exists());
+    assert_eq!(owners(&world), std::slice::from_ref(&world.owner));
     // A relative package home is the `-C` directory's, as Targo resolves it there: its
-    // alias hands the `-m` to the program, so the call owes the package's custody.
+    // alias hands the `-m` to the program, so the target is the package's. With none there,
+    // `b` builds the manifest outside HOME, which owes no custody.
+    let world = World::new();
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
     std::fs::create_dir_all(world.owner.join("hh")).unwrap();
     std::fs::write(
         world.owner.join("hh/config.toml"),
         "[alias]\nb = \"run -q --\"\n",
     )
     .unwrap();
-    std::fs::remove_file(world.owner.join(".cargo/config.toml")).unwrap();
+    let owner_dir = world.owner.display().to_string();
     let mut moved = words(&[
         "-Zunstable-options",
         "-C",
@@ -4557,12 +4944,13 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         "-m",
     ]);
     moved.push(outside(&world));
+    assert_eq!(produce(&world, &notes, &moved), (Some(false), 0));
+    assert!(!world.target.exists());
     assert_eq!(
         produce_with(&world, &notes, &[("CARGO_HOME", "hh")], &moved),
         (Some(true), 1)
     );
-    assert_eq!(produce(&world, &notes, &moved), (Some(false), 1));
-    assert!(world.target.exists());
+    assert_eq!(owners(&world), std::slice::from_ref(&world.owner));
 
     // An optional value takes no word that starts with `-`, so the `--target-dir` after
     // `package -p` is Targo's; a trailing verb's program words are the program's, a
@@ -4834,6 +5222,528 @@ fn the_front_judges_the_line_targo_runs() {
     }
 }
 
+/// A `-C` BEFORE THE VERB IS WHERE TARGO BUILDS: it changes into that directory, as the
+/// kernel resolves it from the launcher's (a link's `..` is its target's parent), before it
+/// reads a config, an alias, a relative path or a relative package home, so the front reads
+/// the same call there without its `-C` and owns the target it names, recorded for that
+/// directory's package. An alias's own `-C` Targo ignores, and the front with it. Only
+/// behind its gate (`-Zunstable-options` among the `-Z` values clap keeps, on a channel that
+/// allows it). NEGATIVE CONTROL: each row fails read from the launcher (its config, alias,
+/// `--config` file, package home or manifest, a link's `..` read lexically); a `-C` Targo
+/// refuses for want of its gate, a second one, which clap refuses, one the front cannot
+/// resolve, an alias's that clap refuses and the lint's grant nothing, and the target each
+/// names owes custody, so the call is refused, from the package itself too; a `--config` file
+/// or a build directory only the `-C` directory has leaves its target ungranted.
+#[test]
+fn a_directory_before_the_verb_is_where_targo_builds() {
+    use super::super::Tool;
+    let words =
+        |line: &str| -> Vec<String> { line.split_whitespace().map(str::to_owned).collect() };
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    // `line` from `cwd` with `more` set, by `tool`: the producer's verdict, and the roots
+    // recorded.
+    let produce_by = |tool: Tool, world: &World, cwd: &Path, more: &[(&str, &str)], line: &str| {
+        let env = |name: &str| {
+            more.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.into())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let verdict = observe_for_producer(&words(line), tool, &world.home, &machine, true).ok();
+        (verdict, roots(&world.home).len())
+    };
+    let produce = |world: &World, cwd: &Path, more: &[(&str, &str)], line: &str| {
+        produce_by(Tool::Targo, world, cwd, more, line)
+    };
+    let config = |dir: &Path, text: &str| {
+        std::fs::create_dir_all(dir.join(".cargo")).unwrap();
+        std::fs::write(dir.join(".cargo/config.toml"), text).unwrap();
+    };
+    let root = |world: &World| {
+        roots(&world.home)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>()
+    };
+    let owners = |world: &World| -> Vec<PathBuf> {
+        roots(&world.home)
+            .into_iter()
+            .flat_map(|root| root.owners)
+            .map(|owner| std::fs::canonicalize(&owner).unwrap_or(owner))
+            .collect()
+    };
+    // A world whose launcher is `notes`, beside the package `source` (the owner).
+    let launched = || {
+        let world = World::new();
+        let notes = world.home.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        (world, notes)
+    };
+    let measured = "-Zunstable-options -C ../source --unverified build --target-dir fresh";
+
+    // The measured call, and its clustered spelling.
+    for line in [
+        measured,
+        "-Zunstable-options -qC../source --unverified build --target-dir fresh",
+    ] {
+        let (world, notes) = launched();
+        assert_eq!(
+            produce(&world, &notes, &[], line),
+            (Some(true), 1),
+            "{line}"
+        );
+        assert_eq!(root(&world), [world.owner.join("fresh")], "{line}");
+        assert_eq!(owners(&world), std::slice::from_ref(&world.owner), "{line}");
+        assert!(!notes.join("fresh").exists(), "{line}");
+    }
+    // A relative `CARGO_TARGET_DIR` is the `-C` directory's.
+    let (world, notes) = launched();
+    let call = "-Zunstable-options -C ../source --unverified build";
+    assert_eq!(
+        produce(&world, &notes, &[("CARGO_TARGET_DIR", "envout")], call),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.owner.join("envout")]);
+    // A configured target is the `-C` directory's config's, never the launcher's.
+    let (world, notes) = launched();
+    config(&world.owner, "[build]\ntarget-dir = \"cfgout\"\n");
+    config(&notes, "[build]\ntarget-dir = \"wrong\"\n");
+    assert_eq!(produce(&world, &notes, &[], call), (Some(true), 1));
+    assert_eq!(root(&world), [world.owner.join("cfgout")]);
+    assert!(!notes.join("wrong").exists());
+    // A link's `..` is its target's parent.
+    let (world, notes) = launched();
+    std::fs::create_dir(world.owner.join("sub")).unwrap();
+    std::os::unix::fs::symlink(world.owner.join("sub"), notes.join("linked")).unwrap();
+    let linked = "-Zunstable-options -C linked/.. --unverified build --target-dir fresh";
+    assert_eq!(produce(&world, &notes, &[], linked), (Some(true), 1));
+    assert_eq!(root(&world), [world.owner.join("fresh")]);
+    assert!(!notes.join("fresh").exists());
+    // A relative package home is the `-C` directory's: its config names the target, a
+    // config the launcher's home of that name would not.
+    let (world, notes) = launched();
+    std::fs::create_dir_all(world.owner.join("hh")).unwrap();
+    std::fs::write(
+        world.owner.join("hh/config.toml"),
+        "[build]\ntarget-dir = \"homeout\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(notes.join("hh")).unwrap();
+    std::fs::write(
+        notes.join("hh/config.toml"),
+        "[build]\ntarget-dir = \"wrong\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        produce(&world, &notes, &[("CARGO_HOME", "hh")], call),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.owner.join("homeout")]);
+    assert!(!notes.join("wrong").exists());
+    // An alias's own `-C` Targo ignores: the target is the launcher's.
+    let world = World::new();
+    let another = world.another_owner();
+    config(
+        &world.owner,
+        "[alias]\nob = \"-C ../another-source build\"\n",
+    );
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            &[],
+            "--unverified ob --target-dir fresh"
+        ),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.owner.join("fresh")]);
+    assert!(!another.join("fresh").exists());
+    // The alias is the `-C` directory's, never the launcher's of the same name.
+    let (world, notes) = launched();
+    config(&notes, "[alias]\nob = \"build --target-dir wrong\"\n");
+    config(&world.owner, "[alias]\nob = \"build --target-dir right\"\n");
+    assert_eq!(
+        produce(
+            &world,
+            &notes,
+            &[],
+            "-Zunstable-options -C ../source --unverified ob"
+        ),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.owner.join("right")]);
+    assert!(!notes.join("wrong").exists() && !world.owner.join("wrong").exists());
+    // A relative manifest is the `-C` directory's, from a launcher with none.
+    let (world, notes) = launched();
+    let manifest = "-Zunstable-options -C ../source --unverified build --manifest-path \
+                    Cargo.toml --target-dir fresh";
+    assert_eq!(produce(&world, &notes, &[], manifest), (Some(true), 1));
+    assert_eq!(owners(&world), std::slice::from_ref(&world.owner));
+    // A build directory only the launcher's config names is no config Targo reads there.
+    let (world, notes) = launched();
+    config(&notes, "[build]\nbuild-dir = \"hidden\"\n");
+    assert_eq!(produce(&world, &notes, &[], measured), (Some(true), 1));
+    assert_eq!(root(&world), [world.owner.join("fresh")]);
+    // An upstream cargo's `+toolchain` leads the words, the `-C` after it: a nightly cargo
+    // honours it, and a stable one under `RUSTC_BOOTSTRAP=1`, whose channel is `dev`. One
+    // whose channel this reader cannot tell (`+trust` by the cargo name, a custom name
+    // rustup may link to a nightly cargo, or no toolchain) checks the gate before it changes
+    // directory or reads anything (`cli.rs`'s `main`), so it refuses the call or builds
+    // from the `-C` directory, and is read there.
+    let bootstrap = [("RUSTC_BOOTSTRAP", "1")];
+    for (toolchain, more) in [
+        ("+nightly", &[][..]),
+        ("+stable", &bootstrap),
+        ("+trust", &[]),
+        ("+1dev", &[]),
+        ("+stable-mine", &[]),
+        ("", &[]),
+    ] {
+        let (world, notes) = launched();
+        let upstream =
+            format!("{toolchain} -Zunstable-options -C ../source build --target-dir fresh");
+        assert_eq!(
+            produce_by(Tool::Cargo, &world, &notes, more, &upstream),
+            (Some(true), 1),
+            "{upstream}"
+        );
+        assert_eq!(root(&world), [world.owner.join("fresh")], "{upstream}");
+    }
+    // A builtin verb's own `-Z` values are the ones clap keeps.
+    let (world, notes) = launched();
+    let late = "-C ../source --unverified build -Zunstable-options --target-dir fresh";
+    assert_eq!(produce(&world, &notes, &[], late), (Some(true), 1));
+    assert_eq!(root(&world), [world.owner.join("fresh")]);
+
+    // NEGATIVE CONTROL: Targo refuses a `-C` and builds nothing where the `-Z` values clap
+    // keeps lack `unstable-options` (none typed; a builtin verb's own replacing those before
+    // it; one after an alias's name, which the gate does not parse) or the channel allows no
+    // nightly feature (a stable cargo's, a beta one's or a release number's).
+    // The front grants nothing for it, and the target the call names in the `-C` directory
+    // owes custody, so the call is refused, as it fails closed wherever the `-C` is unread.
+    let gated = [
+        (
+            Tool::Targo,
+            "-C ../source --unverified build --target-dir fresh",
+        ),
+        (
+            Tool::Targo,
+            "-Zunstable-options -C ../source --unverified build -Zno-index-update \
+             --target-dir fresh",
+        ),
+        (
+            Tool::Targo,
+            "-C ../source --unverified b -Zunstable-options --target-dir fresh",
+        ),
+        (
+            Tool::Cargo,
+            "+stable -Zunstable-options -C ../source build --target-dir fresh",
+        ),
+        (
+            Tool::Cargo,
+            "+beta -Zunstable-options -C ../source build --target-dir fresh",
+        ),
+        (
+            Tool::Cargo,
+            "+1.91.0 -Zunstable-options -C ../source build --target-dir fresh",
+        ),
+        (
+            Tool::Cargo,
+            "+stable-2026-10-01 -Zunstable-options -C ../source build --target-dir fresh",
+        ),
+        (Tool::Cargo, "-C ../source build --target-dir fresh"),
+        (Tool::Cargo, "+trust -C ../source build --target-dir fresh"),
+    ];
+    for (tool, line) in gated {
+        let (world, notes) = launched();
+        assert_eq!(
+            produce_by(tool, &world, &notes, &[], line),
+            (None, 0),
+            "{line}"
+        );
+        assert!(!world.owner.join("fresh").exists(), "{line}");
+        assert!(!notes.join("fresh").exists(), "{line}");
+    }
+    // A second `-C`, the same directory too, which clap refuses, grants nothing.
+    let (world, notes) = launched();
+    let twice =
+        "-Zunstable-options -C ../source -C ../source --unverified build --target-dir fresh";
+    assert_eq!(produce(&world, &notes, &[], twice), (None, 0));
+    assert!(!world.owner.join("fresh").exists());
+    // Launched from the package itself, a `-C` the front cannot resolve, or one Targo
+    // refuses for want of its gate, grants nothing: never the launcher's own target.
+    for line in [
+        "-Zunstable-options -C . -C . --unverified build --target-dir fresh",
+        "-Zunstable-options -C missing --unverified build --target-dir fresh",
+        "-Zunstable-options -C= --unverified build --target-dir fresh",
+        "-C . --unverified build --target-dir fresh",
+    ] {
+        let world = World::new();
+        assert_eq!(
+            produce(&world, &world.owner, &[], line),
+            (None, 0),
+            "{line}"
+        );
+        assert!(!world.owner.join("fresh").exists(), "{line}");
+    }
+    // An alias whose words hold a `-C` clap refuses when it parses them again (a second
+    // one, one with no value) builds nothing, and a call through it is as wary as one whose
+    // alias is unknown: the target it may name owes custody, so the call is refused.
+    for alias in ["-C ../a -C ../b build", "-C= build", "-C -q build"] {
+        let world = World::new();
+        config(&world.owner, &format!("[alias]\nob = \"{alias}\"\n"));
+        let line = "--unverified ob --target-dir fresh";
+        assert_eq!(
+            produce(&world, &world.owner, &[], line),
+            (None, 0),
+            "{alias}"
+        );
+        assert!(!world.owner.join("fresh").exists(), "{alias}");
+    }
+    // The lint's words are its own: a `-C` among them grants nothing, behind its gate too,
+    // and the target it names owes custody, so the call is refused.
+    let (world, notes) = launched();
+    let lint = "-Zunstable-options -C ../source --target-dir fresh";
+    assert_eq!(
+        produce_by(Tool::Tippy, &world, &notes, &[], lint),
+        (None, 0)
+    );
+    assert!(!world.owner.join("fresh").exists());
+    // A build directory only the `-C` directory's config names is that directory's config's,
+    // against its definition base: the call's target and it are each owned for its package.
+    let (world, notes) = launched();
+    config(&world.owner, "[build]\nbuild-dir = \"hidden\"\n");
+    assert_eq!(produce(&world, &notes, &[], measured), (Some(true), 2));
+    let mut owned = root(&world);
+    owned.sort();
+    assert_eq!(
+        owned,
+        [world.owner.join("fresh"), world.owner.join("hidden")]
+    );
+    assert!(!notes.join("hidden").exists());
+    // A `--config` value that names a file only in the `-C` directory is that file's config,
+    // whose build directory is read against its definition base, the folder above the file's:
+    // the call's target and it are each owned (read as the inline value, the build directory
+    // was unrecorded).
+    let (world, notes) = launched();
+    std::fs::write(
+        world.owner.join("build.jobs=1"),
+        "[build]\nbuild-dir = \"hidden\"\n",
+    )
+    .unwrap();
+    let filed = "-Zunstable-options -C ../source --config build.jobs=1 --unverified build \
+                 --target-dir fresh";
+    assert_eq!(produce(&world, &notes, &[], filed), (Some(true), 2));
+    let mut owned = root(&world);
+    owned.sort();
+    let mut both = vec![world.owner.join("fresh"), world.home.join("hidden")];
+    both.sort();
+    assert_eq!(owned, both);
+}
+
+/// THE OWNER IS READ FROM EACH MANIFEST AS TARGO READS IT, OR THE CALL IS REFUSED. Read by
+/// the front's own reader ([`live_read`]), as in production: the package's manifest is the
+/// first that stands from where Targo works up, through a final link (`exists`), and one
+/// that stands and cannot be read is no reason to take a later one; each manifest on the
+/// way to the root is read through a final link (`paths::read`), one that does not stand (a
+/// link that names nothing) passed; a `[project]` is a package, the `[package]` beside one
+/// taken first, and names its workspace as a package does, a root that holds it as a member.
+/// A root whose manifest is a link is owned under the folder the link stands in. One that
+/// stands and cannot be read (no UTF-8, a folder, past the 1 MiB bound) or that Targo
+/// refuses (a `workspace` key that is no string, a package that names a workspace beside its
+/// own `[workspace]`, a pointer to a root that does not hold the package) tells no owner:
+/// the call whose target a config names is refused and nothing is recorded. NEGATIVE
+/// CONTROL: before, the member's own manifest through a link, or past the bound, was
+/// passed for its plain parent package's, which owned the target; a root through a link was
+/// refused (creation took no link); a `[package]` beside a `[project]` was refused; and a
+/// pointer to a root that does not hold the package was owned by it; and a member whose
+/// manifest links outside HOME was judged by the link's target's folder, owing no custody,
+/// so a target it could not own was left to Targo unrecorded. A manifest read outside HOME
+/// through a link is no reading ([`workspace`]): such a member is refused.
+#[test]
+fn the_owner_is_read_from_each_manifest_as_targo_reads_it_or_the_call_is_refused() {
+    use super::super::Tool;
+    const ROOT: &str = "[workspace]\nmembers = [\"member\"]\n";
+    const PACKAGE: &str = "[package]\nname = \"m\"\n";
+    // A workspace at the world's owner whose member's config names the world's target; the
+    // member's manifest is `package`, and `ancestor` lays the root's.
+    let produce = |package: &str, ancestor: &dyn Fn(&Path)| {
+        let world = World::new();
+        let member = world.owner.join("member");
+        std::fs::create_dir_all(member.join(".cargo")).unwrap();
+        std::fs::write(member.join("Cargo.toml"), package).unwrap();
+        std::fs::write(
+            member.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", world.target.display()),
+        )
+        .unwrap();
+        std::fs::remove_file(world.owner.join("Cargo.toml")).unwrap();
+        ancestor(&world.owner);
+        let env = |_: &str| None;
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&member),
+            env: &env,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        let args = ["--unverified".to_owned(), "build".to_owned()];
+        let verdict = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true).ok();
+        let owners: Vec<Vec<PathBuf>> = roots(&world.home)
+            .into_iter()
+            .map(|root| {
+                root.owners
+                    .iter()
+                    .map(|owner| owner.strip_prefix(&world.owner).unwrap().to_path_buf())
+                    .collect()
+            })
+            .collect();
+        (verdict, owners)
+    };
+    let owned_by = |owner: &str| (Some(true), vec![vec![PathBuf::from(owner)]]);
+    let refused = (None, Vec::new());
+    let root = |dir: &Path| std::fs::write(dir.join("Cargo.toml"), ROOT).unwrap();
+    assert_eq!(produce(PACKAGE, &root), owned_by(""));
+    // Targo's root is the folder the link stands in, whose manifest it reads through it.
+    let linked = |dir: &Path| {
+        std::fs::write(dir.join("root.toml"), ROOT).unwrap();
+        std::os::unix::fs::symlink("root.toml", dir.join("Cargo.toml")).unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &linked), owned_by(""));
+    let dangling = |dir: &Path| {
+        std::os::unix::fs::symlink("gone.toml", dir.join("Cargo.toml")).unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &dangling), owned_by("member"));
+    let not_utf8 = |dir: &Path| {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            [ROOT.as_bytes(), b"# \xff\n"].concat(),
+        )
+        .unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &not_utf8), refused);
+    let folder = |dir: &Path| std::fs::create_dir(dir.join("Cargo.toml")).unwrap();
+    assert_eq!(produce(PACKAGE, &folder), refused);
+    // The member's own manifest, through a link or past the reader's bound, is the one Targo
+    // builds, never its parent package's: initial discovery reads no link (only absence lets
+    // it go up), and one past the bound tells no owner, so either is refused.
+    let parent = |dir: &Path| {
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    };
+    let own_link = |dir: &Path| {
+        parent(dir);
+        let member = dir.join("member");
+        std::fs::rename(member.join("Cargo.toml"), member.join("real.toml")).unwrap();
+        std::os::unix::fs::symlink("real.toml", member.join("Cargo.toml")).unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &own_link), refused);
+    let oversized = format!("{PACKAGE}# {}\n", "x".repeat(1 << 20));
+    assert_eq!(produce(&oversized, &parent), refused);
+    // A member whose manifest links to a file outside HOME is Targo's package in HOME, its
+    // root the folder the link stands in, but the link grants no permission to read a file
+    // outside HOME, so no owner is told: custody is owed and refused, the target its config
+    // names never left unrecorded, and so is one atpkg cannot own (a folder no build made).
+    let away = |dir: &Path| {
+        let outside = dir.parent().unwrap().parent().unwrap().join("away");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("Cargo.toml"), PACKAGE).unwrap();
+        let member = dir.join("member/Cargo.toml");
+        std::fs::remove_file(&member).unwrap();
+        std::os::unix::fs::symlink(outside.join("Cargo.toml"), member).unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &away), refused);
+    let stray = |dir: &Path| {
+        away(dir);
+        let target = dir.parent().unwrap().join("outputs.noindex");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("stray"), b"").unwrap();
+    };
+    assert_eq!(produce(PACKAGE, &stray), refused);
+    for package in [
+        "[package]\nname = \"m\"\nworkspace = 1\n",
+        "[package]\nname = \"m\"\nworkspace = \"..\"\n[workspace]\n",
+    ] {
+        assert_eq!(produce(package, &root), refused, "{package}");
+    }
+    // Targo takes the `[package]` beside a `[project]`, and warns.
+    assert_eq!(
+        produce("[package]\nname = \"m\"\n[project]\nname = \"m\"\n", &root),
+        owned_by("")
+    );
+    // A `[project]` names its workspace as a package does, a root that holds it; one that
+    // does not hold it is refused, as Targo refuses it.
+    let elsewhere = |members: &'static str| {
+        move |dir: &Path| {
+            root(dir);
+            std::fs::create_dir(dir.join("member/other")).unwrap();
+            std::fs::write(dir.join("member/other/Cargo.toml"), members).unwrap();
+        }
+    };
+    let pointer = "[project]\nname = \"m\"\nworkspace = \"other\"\n";
+    assert_eq!(
+        produce(pointer, &elsewhere("[workspace]\nmembers = [\"..\"]\n")),
+        owned_by("member/other")
+    );
+    assert_eq!(produce(pointer, &elsewhere("[workspace]\n")), refused);
+}
+
+/// WITHOUT A HOME ONLY A CALL THAT BUILDS NOTHING GOES ON. With HOME unset or relative the
+/// front cannot tell which folders atpkg manages, while Targo, its home the account's, builds
+/// into any target a word or a config names: a call that may build is refused, whether the
+/// shim placed nothing or a producer observes it as typed, and a placement the block never
+/// makes without a home is an invalid claim; help and a version query go on. NEGATIVE
+/// CONTROL: before, every such call went on unobserved, its target unrecorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn without_a_home_only_a_call_that_builds_nothing_goes_on() {
+    use super::super::Tool;
+    let world = World::new();
+    let env = |_: &str| None;
+    let machine = super::super::Machine {
+        home: None,
+        root: None,
+        cwd: Some(&world.owner),
+        env: &env,
+        read: &live_read,
+        read_manifest: &live_read,
+        writable: &|_| Some(true),
+    };
+    let target = world.target.display().to_string();
+    let build = ["--unverified", "build", "--target-dir", target.as_str()].map(str::to_owned);
+    for placed in [Some("-"), None] {
+        assert!(
+            observation_on(&build, Tool::Targo, &machine, true, placed).is_err(),
+            "{placed:?}"
+        );
+        for quiet in [&["--version"][..], &["help"]] {
+            let quiet: Vec<String> = quiet.iter().map(|word| (*word).to_owned()).collect();
+            assert!(
+                !observation_on(&quiet, Tool::Targo, &machine, true, placed).unwrap(),
+                "{quiet:?} {placed:?}"
+            );
+        }
+    }
+    let placed = observation_on(&build, Tool::Targo, &machine, true, Some("env"));
+    assert_eq!(placed.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    assert!(observe_command_with(&build, Tool::Targo, &machine).is_err());
+    assert!(!world.target.exists());
+    assert!(roots(&world.home).is_empty());
+}
+
 /// THE FRONT JUDGES EACH WORD WHERE TARGO READS IT. A help or version query is read on the
 /// line Targo runs: a `--help` after an alias's `--` or a trailing verb's program goes to
 /// the program, and a `-V` before an alias's name, a builtin alias's too, is dropped, so each
@@ -4844,12 +5754,15 @@ fn the_front_judges_the_line_targo_runs() {
 /// `--` before a builtin command with words after it is a call Targo refuses, as is a `--`
 /// before a word that starts with `-`: neither grants a target. An `include` is followed as
 /// Targo merges it: optional ones that name nothing skipped, a later one over an earlier one,
-/// the file's own value over all of them. A package home is the ancestor's whose config it is
-/// through a link, read once. A target's `..` is the kernel's, through a link. A line the
-/// front cannot tell owes custody only where the words typed name a target under HOME, under
-/// either reading of its alias. NEGATIVE CONTROL: each row fails without its rule (an
-/// alias's or an untold line's target, a program word read as Targo's, a typed query, an
-/// include read as untold, a link's `..` read lexically).
+/// the file's own value over all of them; the alias or target it names is owned, as is one a
+/// config Targo parses as TOML 1.1 names, and one named for a workspace whose manifest Targo
+/// parses as TOML 1.1 (an inline table across lines, a time without seconds). A package
+/// home is the ancestor's whose config it is through a link, read once. A target's `..` is
+/// the kernel's, through a link. A line the front cannot tell owes custody only where the
+/// words typed name a target under HOME, under either reading of its alias. NEGATIVE
+/// CONTROL: each row fails without its rule (an alias's or an untold line's target, a
+/// program word read as Targo's, a typed query, an include read as untold, a link's `..`
+/// read lexically, a manifest read as TOML 1.0 or with its seconds required).
 #[test]
 fn the_front_judges_each_word_where_targo_reads_it() {
     use super::super::Tool;
@@ -5073,8 +5986,10 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         produce(&world, &world.owner, false, &[], &tested),
         (None, 0)
     );
-    // A resolved included target grants custody to the exact selected directory for both
-    // command spellings. An independent neutral include selects no output and grants none.
+    // A directory an include names is the config's: `b` builds into it, so the front owns
+    // and records it, as Targo merges the include (before includes were followed, the call
+    // was refused), for both command spellings, each on one world and each on a fresh one.
+    // An independent neutral include selects no output and grants none: it leaves `b` free.
     let world = World::new();
     config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
     let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
@@ -5087,6 +6002,22 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         );
     }
     assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    for typed in [["--unverified", "build"], ["--unverified", "b"]] {
+        let world = World::new();
+        config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
+        let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+        config(&world.owner, "dirs.toml", &named);
+        assert_eq!(
+            produce(&world, &world.owner, false, &[], &words(&typed)),
+            (Some(true), 1),
+            "{typed:?}"
+        );
+        assert_eq!(
+            root(&world),
+            std::slice::from_ref(&world.target),
+            "{typed:?}"
+        );
+    }
     let world = World::new();
     config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
     config(&world.owner, "dirs.toml", "[build]\njobs = 4\n");
@@ -5100,6 +6031,41 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         ),
         (Some(false), 0)
     );
+    // A config in TOML 1.1 (an inline table across lines), which Targo parses, is read for
+    // what it and its include name: nothing, so `b` is free, or the target, which the front
+    // owns and records (read as TOML 1.0, the call was refused either way).
+    let spread =
+        "include = [\"dirs.toml\"]\n[env]\nA = { value = \"1\",\n      relative = true }\n";
+    let world = World::new();
+    config(&world.owner, "config.toml", spread);
+    config(&world.owner, "dirs.toml", "[build]\njobs = 4\n");
+    let b = words(&["--unverified", "b"]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &b),
+        (Some(false), 0)
+    );
+    let world = World::new();
+    config(&world.owner, "config.toml", spread);
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    config(&world.owner, "dirs.toml", &named);
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &b),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // An alias in a TOML 1.1 config is the one Targo reads, its target owned (read as TOML
+    // 1.0, the alias was one the front could not tell).
+    let world = World::new();
+    let spread_alias = format!(
+        "{}[env]\nA = {{ value = \"1\",\n relative = true }}\n",
+        aliased(&world, "aliased")
+    );
+    config(&world.owner, "config.toml", &spread_alias);
+    assert_eq!(
+        produce(&world, &world.owner, true, &[], &xb),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.home.join("aliased")]);
     // Two configs the walk finds may include one file: each has a cycle check of its own.
     let world = World::new();
     std::fs::write(world.home.join("shared.toml"), aliased(&world, "shared")).unwrap();
@@ -5119,9 +6085,10 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     );
     assert_eq!(root(&world), [world.home.join("shared")]);
 
-    // A line whose alias the front cannot tell (two package homes that read it apart) is
-    // judged on each line it may run: the words after its name are Targo's up to a `--`,
-    // after a `--` before it or a name a trailing verb has.
+    // A line whose alias the front cannot tell (two package homes that read it apart: Trust's
+    // main expands `xb` from the `TARGO_HOME`, Targo 16387 reads `~/.cargo`, which defines
+    // none) is judged on each line it may run: the words after its name are Targo's up to a
+    // `--`, after a `--` before it or a name a trailing verb has.
     let world = World::new();
     let twin = world.home.join("twin-home");
     std::fs::create_dir(&twin).unwrap();
@@ -5391,7 +6358,8 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     let args = words(&["--unverified", "install", "--path", &owner]);
     assert_eq!(produce(&world, &noted, false, &[], &args), (Some(false), 0));
 
-    // A `-C` the front resolves is where it judges from: with no target named, none is owed.
+    // A `-C` the front resolves is where it judges from: with no target named, none is owed;
+    // with one named, it is owned for that directory's package.
     let world = World::new();
     let notes = world.home.join("notes");
     std::fs::create_dir(&notes).unwrap();
@@ -5402,6 +6370,156 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         (Some(false), 0)
     );
     assert_eq!(produce(&world, &notes, true, &[], &moved), (Some(true), 1));
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // A line that starts with `#` closes a multi-line string and goes on to name a directory
+    // Targo builds into: the config names it, so that call owes custody, its target owned,
+    // and a build directory owned beside the workspace's default `target`, which Targo writes
+    // its final artifacts to where no target is named (read as a comment, the call was free
+    // and its folder unrecorded).
+    for (key, owned) in [("target-dir", true), ("build-dir", false)] {
+        let world = World::new();
+        let notes = world.home.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let hidden = format!(
+            "build = {{ dep-info-basedir = \"\"\"\n#\"\"\", {key} = \"{}\" }}\n",
+            world.target.display()
+        );
+        config(&world.owner, "config.toml", &hidden);
+        let owner = world.owner.display().to_string();
+        let moved = words(&["-Zunstable-options", "-C", &owner, "--unverified", "build"]);
+        let verdict = if owned {
+            (Some(true), 1)
+        } else {
+            (Some(true), 2)
+        };
+        assert_eq!(
+            produce(&world, &notes, false, &[], &moved),
+            verdict,
+            "{key}"
+        );
+        let mut recorded = root(&world);
+        recorded.sort();
+        let mut expected = vec![world.target.clone()];
+        if !owned {
+            expected.push(world.owner.join("target"));
+        }
+        expected.sort();
+        assert_eq!(recorded, expected, "{key}");
+    }
+    // The same hidden build directory beside a target the call names is the config's, a
+    // folder the target does not hold: both are the call's, each its own root (read as a
+    // comment, the target alone was owned and the build directory unrecorded). Its visible
+    // twin is owned alike.
+    for hidden in [
+        "build = { dep-info-basedir = \"\"\"\n#\"\"\", build-dir = \"{b}\" }\n",
+        "[build]\nbuild-dir = \"{b}\"\n",
+    ] {
+        let world = World::new();
+        let built = world.home.join("built");
+        config(
+            &world.owner,
+            "config.toml",
+            &hidden.replace("{b}", &built.display().to_string()),
+        );
+        assert_eq!(
+            produce(
+                &world,
+                &world.owner,
+                true,
+                &[],
+                &words(&["--unverified", "build"])
+            ),
+            (Some(true), 2),
+            "{hidden}"
+        );
+        let mut owned = root(&world);
+        owned.sort();
+        let mut both = vec![world.target.clone(), built];
+        both.sort();
+        assert_eq!(owned, both, "{hidden}");
+    }
+    // An artifact directory is a folder Targo creates and links final artifacts into, which
+    // no target the front records holds: each spelling is refused, the target it would have
+    // owned unrecorded (read as no directory, the call was free with its target owned).
+    let artifacts = world.home.join("artifacts").display().to_string();
+    let flag = format!("--artifact-dir={artifacts}");
+    let unstable = |rest: &[&str]| {
+        let mut line = words(&["-Zunstable-options", "--unverified", "build"]);
+        line.extend(words(rest));
+        line
+    };
+    let artifact_env = vec![("CARGO_BUILD_ARTIFACT_DIR", artifacts.clone())];
+    let configured = format!("[build]\nartifact-dir = \"{artifacts}\"\n");
+    for (more, args, text) in [
+        (vec![], unstable(&[&flag]), None),
+        (vec![], unstable(&["--artifact-dir", &artifacts]), None),
+        (
+            vec![],
+            unstable(&["--config", &format!("build.artifact-dir='{artifacts}'")]),
+            None,
+        ),
+        (artifact_env, unstable(&[]), None),
+        (vec![], unstable(&[]), Some(configured.as_str())),
+    ] {
+        let world = World::new();
+        if let Some(text) = text {
+            config(&world.owner, "config.toml", text);
+        }
+        assert_eq!(
+            produce(&world, &world.owner, true, &more, &args),
+            (None, 0),
+            "{args:?} {more:?} {text:?}"
+        );
+    }
+    let world = World::new();
+    assert_eq!(
+        produce(&world, &world.owner, true, &[], &unstable(&[])),
+        (Some(true), 1)
+    );
+    // Only `build` reads one: a `check` or `test` in a workspace whose config or
+    // environment names one builds as it would with none, its target owned.
+    for (verb, more, text) in [
+        ("check", vec![], Some(configured.as_str())),
+        (
+            "test",
+            vec![("CARGO_BUILD_ARTIFACT_DIR", artifacts.clone())],
+            None,
+        ),
+    ] {
+        let world = World::new();
+        if let Some(text) = text {
+            config(&world.owner, "config.toml", text);
+        }
+        assert_eq!(
+            produce(
+                &world,
+                &world.owner,
+                true,
+                &more,
+                &words(&["--unverified", verb])
+            ),
+            (Some(true), 1),
+            "{verb}"
+        );
+    }
+    // A configured target holding a control character is refused, though this reader
+    // decodes it as Targo does (its CRLF kept): no such folder is recorded.
+    let world = World::new();
+    let crlf = format!(
+        "[build]\ntarget-dir = \"\"\"\r\n{}/a\r\nb\"\"\"\n",
+        world.home.display()
+    );
+    config(&world.owner, "config.toml", &crlf);
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            false,
+            &[],
+            &words(&["--unverified", "build"])
+        ),
+        (None, 0)
+    );
 
     // An include the walk cannot follow is a config whose directories the front cannot
     // tell, as Targo refuses it: text it cannot parse, an `include` that is no list, an
@@ -5460,12 +6578,28 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         (Some(true), 1)
     );
     assert_eq!(root(&world), std::slice::from_ref(&world.target));
-    // Each config file the walk finds checks its own cycles: `config` and `config.toml` in
-    // one folder may include one file.
+    // Each config file the walk finds checks its own cycles: the package's and the package
+    // home's may include one file.
     let world = World::new();
     config(&world.owner, "shared.toml", "[build]\njobs = 4\n");
     config(&world.owner, "config.toml", "include = [\"shared.toml\"]\n");
-    config(&world.owner, "config", "include = [\"shared.toml\"]\n");
+    let shared = world.owner.join(".cargo/shared.toml");
+    let home_config = format!("include = [\"{}\"]\n", shared.display());
+    config(&world.home, "config.toml", &home_config);
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &built),
+        (Some(false), 0)
+    );
+    // Targo loads the legacy `config` wherever one stands and never the `config.toml` beside
+    // it, so what that file says, even text this reader cannot parse, names nothing (read,
+    // the call was refused).
+    let world = World::new();
+    config(&world.owner, "config", "[env]\nA = \"1\"\n");
+    config(
+        &world.owner,
+        "config.toml",
+        "x = '''a'''\nt = { a = 1 b = 2 }\n",
+    );
     assert_eq!(
         produce(&world, &world.owner, false, &[], &built),
         (Some(false), 0)
@@ -5486,6 +6620,27 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     assert!(recorded.contains(&world.target));
     assert!(recorded.contains(&world.home.join("built")));
     // A key spelled with an escape is the key Targo decodes: an `include`, and a directory.
+    // The target the decoded include or key names is the call's, owned and recorded (read
+    // as no key, the call would be free; before includes were followed, the include's was
+    // refused).
+    for escaped in [
+        "\"incl\\u0075de\" = [\"dirs.toml\"]\n",
+        "[build]\n\"target\\u002ddir\" = \"{target}\"\n",
+    ] {
+        let world = World::new();
+        let target = world.target.display().to_string();
+        let named = format!("[build]\ntarget-dir = \"{target}\"\n");
+        config(&world.owner, "dirs.toml", &named);
+        let text = escaped.replace("{target}", &target);
+        config(&world.owner, "config.toml", &text);
+        assert_eq!(
+            produce(&world, &world.owner, false, &[], &built),
+            (Some(true), 1),
+            "{text}"
+        );
+        assert_eq!(root(&world), std::slice::from_ref(&world.target), "{text}");
+    }
+    // Both escaped spellings on one world: each selects the exact recorded target again.
     let world = World::new();
     let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
     config(&world.owner, "dirs.toml", &named);
@@ -5549,12 +6704,133 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
         Some(false)
     );
-    // The included target belongs to the earlier world; resolving it grants no new owner.
+    // The included target of an earlier world, outside this one's, grants no new owner.
     std::fs::write(dotfiles.join("local.toml"), &named).unwrap();
     assert_eq!(
         observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
         None
     );
+    // This world's own target, read through the link, is owned and recorded.
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    std::fs::write(dotfiles.join("local.toml"), &named).unwrap();
+    assert_eq!(
+        observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
+        Some(true)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // So is a walk's own config reached through a link: the target it names is owned.
+    let world = World::new();
+    let dotfiles = world.home.join("dotfiles");
+    std::fs::create_dir(&dotfiles).unwrap();
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    std::fs::write(dotfiles.join("c.toml"), &named).unwrap();
+    std::fs::create_dir(world.owner.join(".cargo")).unwrap();
+    std::os::unix::fs::symlink(
+        dotfiles.join("c.toml"),
+        world.owner.join(".cargo/config.toml"),
+    )
+    .unwrap();
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        cwd: Some(&world.owner),
+        ..machine
+    };
+    assert_eq!(
+        observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
+        Some(true)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // A package home's `..` is folded as written, as Targo's `homedir` folds it, never
+    // through a link: the home config Targo reads is the folded path's, whatever the link's
+    // target holds, its includes with it.
+    let world = World::new();
+    std::fs::create_dir_all(world.home.join("z/y")).unwrap();
+    std::fs::create_dir_all(world.home.join("z/h")).unwrap();
+    std::fs::create_dir_all(world.home.join("h")).unwrap();
+    std::os::unix::fs::symlink(world.home.join("z/y"), world.home.join("link")).unwrap();
+    std::fs::write(
+        world.home.join("z/h/config.toml"),
+        "include = [\"x.toml\"]\n",
+    )
+    .unwrap();
+    let wrong = world.home.join("wrong.noindex");
+    let wrong_named = format!("[build]\ntarget-dir = \"{}\"\n", wrong.display());
+    std::fs::write(world.home.join("h/x.toml"), &wrong_named).unwrap();
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    std::fs::write(world.home.join("h/config.toml"), &named).unwrap();
+    let cargo_home = [("CARGO_HOME", format!("{}/link/../h", world.home.display()))];
+    assert_eq!(
+        produce(&world, &world.owner, false, &cargo_home, &built),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // The walk stops where `__CARGO_TEST_ROOT` stops Targo's, the package home read after
+    // it: a farther ancestor's target is none Targo builds into.
+    let world = World::new();
+    let member = world.owner.join("member");
+    std::fs::create_dir(&member).unwrap();
+    let wrong = world.home.join("wrong.noindex");
+    let wrong_named = format!("[build]\ntarget-dir = \"{}\"\n", wrong.display());
+    config(&world.owner, "config.toml", &wrong_named);
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    config(&world.home, "config.toml", &named);
+    let stop = [("__CARGO_TEST_ROOT", member.display().to_string())];
+    assert_eq!(
+        produce(&world, &member, false, &stop, &built),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // An alias config's include whose `..` climbs past the root is folded there, as Targo's
+    // `normalize_path` folds it: an optional one where nothing stands is skipped, and the
+    // alias told.
+    let world = World::new();
+    let past = format!(
+        "include = [{{ path = \"{}x.toml\", optional = true }}]\n[alias]\nxb = \"build --target-dir {}\"\n",
+        "../".repeat(40),
+        world.home.join("past").display()
+    );
+    config(&world.owner, "config.toml", &past);
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            false,
+            &[],
+            &words(&["--unverified", "xb"])
+        ),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), [world.home.join("past")]);
+    // A workspace manifest is read as Targo parses it, as TOML 1.1: a target a config names
+    // in a workspace whose manifest holds an inline table across lines is owned.
+    let world = World::new();
+    std::fs::write(
+        world.owner.join("Cargo.toml"),
+        "[workspace]\nmembers = []\n[workspace.dependencies]\nserde = { version = \"1\",\n  default-features = false }\n",
+    )
+    .unwrap();
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    config(&world.owner, "config.toml", &named);
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &built),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    // A time without seconds is TOML 1.1 too, which a manifest's metadata may hold: the
+    // workspace whose manifest holds one is read, and the target its config names owned.
+    let world = World::new();
+    std::fs::write(
+        world.owner.join("Cargo.toml"),
+        "[workspace]\nmembers = []\n[workspace.metadata]\nat = 07:32\n",
+    )
+    .unwrap();
+    let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    config(&world.owner, "config.toml", &named);
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &built),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
     // A `--config` value is the config file standing at that path, whatever it spells.
     for (value, judged) in [("o=1", (Some(true), 1)), ("o=2", (Some(false), 0))] {
         let world = World::new();
@@ -5616,7 +6892,8 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         (Some(false), 0)
     );
 
-    // A `-C` resolved through HOME's other name (macOS's data-volume path) is HOME's.
+    // A `-C` resolved through HOME's other name (macOS's data-volume path) is HOME's: the
+    // target it names there is owned.
     let world = World::new();
     let data = Path::new("/System/Volumes/Data").join(world.owner.strip_prefix("/").unwrap());
     if data.is_dir() {
@@ -5634,6 +6911,13 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         assert_eq!(
             produce(&world, &launcher, false, &[], &moved),
             (Some(true), 1)
+        );
+        assert_eq!(
+            roots(&world.home)
+                .into_iter()
+                .map(|root| root.root)
+                .collect::<Vec<_>>(),
+            [world.home.join("moved")]
         );
     }
     // And a `-C` call that owes nothing leaves the registered receipts as they stand: the
@@ -5693,7 +6977,977 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         .into_iter()
         .map(|made| made.root)
         .collect();
-    assert_eq!(made, [world.home.join("t/miri")]);
+    assert_eq!(made, [world.home.join("t")]);
+
+    // With no `--target-dir` typed, `miri` builds into `cargo metadata`'s target joined with
+    // `miri`: `CARGO_TARGET_DIR`'s, a config's, or the workspace root's `target`, the root
+    // as Targo finds it. Each call has its sysroot (`MIRI_SYSROOT`), so it builds no other.
+    let sysroot = || vec![("MIRI_SYSROOT", "/private/tmp/no-sysroot".to_owned())];
+    let run = words(&["--unverified", "miri", "run"]);
+    let made_roots = |world: &World| {
+        roots(&world.home)
+            .into_iter()
+            .map(|made| made.root)
+            .collect::<Vec<_>>()
+    };
+    let world = World::new();
+    assert_eq!(
+        produce(&world, &world.owner, true, &sysroot(), &run),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), std::slice::from_ref(&world.target));
+    let world = World::new();
+    let cfg = world.home.join("cfg");
+    config(
+        &world.owner,
+        "config.toml",
+        &format!("[build]\ntarget-dir = \"{}\"\n", cfg.display()),
+    );
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &run),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), std::slice::from_ref(&cfg));
+    let world = World::new();
+    let test = words(&["--unverified", "miri", "test"]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &test),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), [world.owner.join("target")]);
+    // That folder is the one recorded, so a build that names it after the `miri` line takes
+    // it: the variable's and the config's are owned, never left a plain folder that a root
+    // inside it keeps every build from owning.
+    for configured in [false, true] {
+        let world = World::new();
+        if configured {
+            config(
+                &world.owner,
+                "config.toml",
+                &format!("[build]\ntarget-dir = \"{}\"\n", world.target.display()),
+            );
+        }
+        let row = format!("configured {configured}");
+        assert_eq!(
+            produce(&world, &world.owner, !configured, &sysroot(), &run),
+            (Some(true), 1),
+            "{row}"
+        );
+        let build = words(&["--unverified", "build"]);
+        assert_eq!(
+            produce(&world, &world.owner, !configured, &[], &build),
+            (Some(true), 1),
+            "{row}"
+        );
+        assert_eq!(
+            made_roots(&world),
+            std::slice::from_ref(&world.target),
+            "{row}"
+        );
+    }
+    // A target cargo made is adopted itself, whatever its `miri` holds (one an interrupted
+    // `cargo-miri` left, which adoption may not take).
+    let world = World::new();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&world.target)
+        .unwrap();
+    std::fs::write(
+        world.target.join("CACHEDIR.TAG"),
+        super::adoption::CARGO_TAG.as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(world.target.join(".rustc_info.json"), b"{}").unwrap();
+    for prepared in ["build", "incremental", ".fingerprint/probe-hash"] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(world.target.join("debug").join(prepared))
+            .unwrap();
+    }
+    let stamp = world
+        .target
+        .join("debug/.fingerprint/probe-hash/invoked.timestamp");
+    std::fs::write(&stamp, b"invoked").unwrap();
+    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::create_dir_all(world.target.join("miri/debug")).unwrap();
+    assert_eq!(
+        produce(&world, &world.owner, true, &sysroot(), &test),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), std::slice::from_ref(&world.target));
+    assert!(!world.target.join("miri").join(MARKER).exists());
+    // A target named through a link to a folder atpkg owns is that folder, as a build's is:
+    // the link's `miri` lies in it.
+    let world = World::new();
+    world.build();
+    let linked = world.home.join("linked");
+    std::os::unix::fs::symlink(&world.target, &linked).unwrap();
+    let through = words(&[
+        "--unverified",
+        "miri",
+        "test",
+        "--target-dir",
+        &linked.display().to_string(),
+    ]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &through),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), std::slice::from_ref(&world.target));
+    assert!(!world.target.join("miri").exists());
+    // Another workspace's `miri` line through the same link is recorded as an owner of the
+    // folder it names, which it writes inside of: never left to the first owner alone,
+    // whose going would retire the folder while this one's `miri` builds there.
+    let other = world.another_owner();
+    assert_eq!(
+        produce(&world, &other, false, &sysroot(), &through),
+        (Some(true), 1)
+    );
+    let recorded = roots(&world.home);
+    assert_eq!(recorded[0].root, world.target);
+    assert!(
+        recorded[0].owners.contains(&other),
+        "{:?}",
+        recorded[0].owners
+    );
+    // A link to a folder atpkg does not own grants nothing: refused, nothing recorded and
+    // nothing made in it.
+    let world = World::new();
+    let bare = world.home.join("bare");
+    std::fs::create_dir(&bare).unwrap();
+    let linked = world.home.join("linked");
+    std::os::unix::fs::symlink(&bare, &linked).unwrap();
+    let through = words(&[
+        "--unverified",
+        "miri",
+        "test",
+        "--target-dir",
+        &linked.display().to_string(),
+    ]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &through),
+        (None, 0)
+    );
+    assert!(!bare.join("miri").exists());
+    assert!(!bare.join(MARKER).exists());
+    // A folder the line writes inside of that stands, holds no marker and cannot be owned
+    // (no build of cargo's made it) leaves the line's own target, its `miri`, to be owned in
+    // its place, so the build runs, recorded there.
+    let world = World::new();
+    let plain = world.home.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let into_plain = words(&[
+        "--unverified",
+        "miri",
+        "test",
+        "--target-dir",
+        &plain.display().to_string(),
+    ]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &into_plain),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), [plain.join("miri")]);
+    assert!(!plain.join(MARKER).exists());
+    // `Targo.toml` is a package's manifest, Targo's canonical name, found before
+    // `Cargo.toml` in each folder: its package owns the target, a typed one's too.
+    let world = World::new();
+    let native = world.home.join("native");
+    std::fs::create_dir(&native).unwrap();
+    std::fs::write(native.join("Targo.toml"), "[package]\nname = \"native\"\n").unwrap();
+    assert_eq!(
+        produce(&world, &native, false, &sysroot(), &test),
+        (Some(true), 1)
+    );
+    let recorded = roots(&world.home);
+    assert_eq!(recorded[0].root, native.join("target"));
+    assert_eq!(recorded[0].owners, std::slice::from_ref(&native));
+    let typed_native = world.home.join("native-out.noindex");
+    let build = words(&[
+        "--unverified",
+        "build",
+        "--target-dir",
+        &typed_native.display().to_string(),
+    ]);
+    assert_eq!(
+        produce(&world, &native, false, &[], &build),
+        (Some(true), 2)
+    );
+    // A member the root excludes is its own workspace's root.
+    let world = World::new();
+    std::fs::write(
+        world.owner.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"m\"]\nexclude = [\"x\"]\n",
+    )
+    .unwrap();
+    for member in ["m", "x"] {
+        std::fs::create_dir(world.owner.join(member)).unwrap();
+        std::fs::write(
+            world.owner.join(member).join("Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\n"),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        produce(&world, &world.owner.join("m"), false, &sysroot(), &run),
+        (Some(true), 1)
+    );
+    assert_eq!(
+        produce(&world, &world.owner.join("x"), false, &sysroot(), &run),
+        (Some(true), 2)
+    );
+    let mut made = made_roots(&world);
+    made.sort();
+    assert_eq!(
+        made,
+        [world.owner.join("target"), world.owner.join("x/target")]
+    );
+    // A package the root neither lists nor excludes is no member, and Targo's metadata
+    // fails on it: `cargo-miri` builds nothing, and nothing is made or recorded.
+    let unlisted = world.owner.join("y");
+    std::fs::create_dir(&unlisted).unwrap();
+    std::fs::write(unlisted.join("Cargo.toml"), "[package]\nname = \"y\"\n").unwrap();
+    assert_eq!(
+        produce(&world, &unlisted, false, &sysroot(), &run),
+        (None, 2)
+    );
+    assert!(!unlisted.join("target").exists());
+    // `cargo-miri` hands `cargo metadata` its first `--manifest-path`, never `-m`: the line
+    // Targo runs reads either as the package it builds, the cache's owner.
+    for (flag, metadata_reads) in [("-m", false), ("--manifest-path", true)] {
+        let world = World::new();
+        let other = world.another_owner();
+        let manifest = other.join("Cargo.toml").display().to_string();
+        let args = words(&["--unverified", "miri", "run", flag, &manifest]);
+        assert_eq!(
+            produce(&world, &world.owner, false, &sysroot(), &args),
+            (Some(true), 1),
+            "{flag}"
+        );
+        let made = if metadata_reads { &other } else { &world.owner };
+        let recorded = roots(&world.home);
+        assert_eq!(recorded[0].root, made.join("target"), "{flag}");
+        assert_eq!(recorded[0].owners, std::slice::from_ref(&other), "{flag}");
+    }
+    // A metadata target the reader cannot tell owes custody: a `--config` naming one, past
+    // the program too, and a manifest above the package it cannot parse.
+    let world = World::new();
+    let aside = world.home.join("p").display().to_string();
+    let config_target = format!("build.target-dir=\"{aside}\"");
+    let told = words(&[
+        "--unverified",
+        "miri",
+        "run",
+        "demo",
+        "--config",
+        &config_target,
+    ]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &told),
+        (None, 0)
+    );
+    let world = World::new();
+    let pkg = world.home.join("pkg");
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(pkg.join("Cargo.toml"), "[package]\nname = \"pkg\"\n").unwrap();
+    std::fs::write(world.home.join("Cargo.toml"), "[").unwrap();
+    assert_eq!(produce(&world, &pkg, false, &sysroot(), &run), (None, 0));
+    assert!(!pkg.join("target").exists());
+    // Where the package is one atpkg never manages, that call is no producer of its own,
+    // and the unread target may be any registered root: each one's owners become unknown.
+    let world = World::new();
+    world.build();
+    let never = world.home.join("Library/p");
+    std::fs::create_dir_all(&never).unwrap();
+    std::fs::write(never.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    let mut walled = sysroot();
+    walled.push(("__CARGO_TEST_ROOT", "/x".to_owned()));
+    assert!(!roots(&world.home)[0].owners_unknown);
+    assert_eq!(
+        produce(&world, &never, false, &walled, &run),
+        (Some(false), 1)
+    );
+    assert!(roots(&world.home)[0].owners_unknown);
+    // An alias the reader cannot tell on the verb `miri` hands back may build into the target
+    // that line names: the call owes it custody, and with no line to judge it is refused.
+    let world = World::new();
+    let mut untold = sysroot();
+    untold.push(("CARGO_ALIAS_T", "-C ../a -C ../b test".to_owned()));
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            false,
+            &untold,
+            &words(&["--unverified", "miri", "t"])
+        ),
+        (None, 0)
+    );
+    assert!(!world.owner.join("target").exists());
+    // `nextest` is handed back with the metadata target too: a user alias of it Targo
+    // expands (`nextest = "test"`) builds there, and that target is owned; with none, Targo
+    // refuses the lane on the external `nextest`, and the front refuses the target that line
+    // names, which it cannot judge after an external verb: nothing builds either way.
+    let world = World::new();
+    let nextest = words(&["--unverified", "miri", "nextest", "run"]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &nextest),
+        (None, 0)
+    );
+    assert!(!world.owner.join("target").exists());
+    let mut aliased = sysroot();
+    aliased.push(("CARGO_ALIAS_NEXTEST", "test".to_owned()));
+    assert_eq!(
+        produce(&world, &world.owner, false, &aliased, &nextest),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), [world.owner.join("target")]);
+    // A call in no lane Targo refuses before `targo-miri` runs: it keeps the line its words
+    // alone give, as before.
+    let world = World::new();
+    let unconsented = words(&["miri", "run"]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &unconsented),
+        (Some(false), 0)
+    );
+    assert!(!world.owner.join("target").exists());
+    // A child of a Targo inherits its lane (`TRUST_TARGO_NESTED_UNVERIFIED_ENDPOINT`), and
+    // Targo runs `miri` there with no `--unverified` typed: its metadata target is owned, and
+    // its setup judged, as a typed lane's are.
+    let inherited = |more: Vec<(&'static str, String)>| {
+        let mut more = more;
+        more.push((
+            super::super::NESTED_UNVERIFIED_ENDPOINT,
+            "endpoint".to_owned(),
+        ));
+        more
+    };
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            false,
+            &inherited(sysroot()),
+            &unconsented
+        ),
+        (Some(true), 1)
+    );
+    assert_eq!(made_roots(&world), [world.owner.join("target")]);
+    let world = World::new();
+    let sysroot_in_home = vec![(
+        "MIRI_SYSROOT",
+        world
+            .owner
+            .join("target/miri-sysroot")
+            .display()
+            .to_string(),
+    )];
+    let bare_setup = words(&["miri", "setup"]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot_in_home, &bare_setup),
+        (Some(false), 0)
+    );
+    assert_eq!(
+        produce(
+            &world,
+            &world.owner,
+            false,
+            &inherited(sysroot_in_home.clone()),
+            &bare_setup
+        ),
+        (None, 0)
+    );
+    assert!(!world.owner.join("target").exists());
+    // A target atpkg owns is the folder the line `miri` hands back writes only inside of:
+    // the call is one of its owners, as it was when its `miri` was read as the target
+    // itself, whether a cargo-made `miri` (no folder adoption may take there) stands in it
+    // or none yet does (a fresh root nested inside a registered one would split their
+    // custody), and none is made there.
+    let cargo_made = |dir: &Path| {
+        std::fs::create_dir_all(dir.join("debug/build")).unwrap();
+        std::fs::write(
+            dir.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n\
+             # For information about cache directory tags see https://bford.info/cachedir/\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".rustc_info.json"), b"{}").unwrap();
+    };
+    let target = |world: &World| world.target.display().to_string();
+    // Setup, where `MIRI_SYSROOT` is unset, builds where no target names, the variable too.
+    for typed in [false, true] {
+        for set_up in [false, true] {
+            for standing in [false, true] {
+                let world = World::new();
+                world.build();
+                if standing {
+                    cargo_made(&world.target.join("miri"));
+                }
+                let mut args = run.clone();
+                if typed {
+                    args.extend(["--target-dir".to_owned(), target(&world)]);
+                }
+                let other = world.another_owner();
+                let more = if set_up { vec![] } else { sysroot() };
+                let row = format!("typed {typed} set up {set_up} standing {standing}");
+                assert_eq!(
+                    produce(&world, &other, !typed, &more, &args),
+                    (Some(true), 1),
+                    "{row}"
+                );
+                let recorded = roots(&world.home);
+                assert_eq!(recorded.len(), 1, "{row}");
+                assert_eq!(recorded[0].root, world.target, "{row}");
+                assert!(recorded[0].owners.contains(&other), "{row}");
+                assert!(!world.target.join("miri").join(MARKER).exists(), "{row}");
+            }
+        }
+    }
+    // So where a user alias takes a builtin alias's name (`t = "miri test"`), which the
+    // placement reads as the builtin's and places under the target `CARGO_TARGET_DIR` names:
+    // the line Targo runs is the `miri` one, an external command that never receives a global
+    // `--config`, so no build writes the placed folder, and the call owns the target it
+    // builds inside of, with no intermediates prepared under a `miri` record it has none of.
+    for standing in [false, true] {
+        let world = World::new();
+        world.build();
+        if standing {
+            cargo_made(&world.target.join("miri"));
+        }
+        let other = world.another_owner();
+        let mut more = sysroot();
+        more.push(("CARGO_ALIAS_T", "miri test".to_owned()));
+        let row = format!("standing {standing}");
+        assert_eq!(
+            produce(&world, &other, true, &more, &words(&["--unverified", "t"])),
+            (Some(true), 1),
+            "{row}"
+        );
+        let recorded = roots(&world.home);
+        assert_eq!(recorded[0].root, world.target, "{row}");
+        assert!(recorded[0].owners.contains(&other), "{row}");
+    }
+
+    // `miri` sets up its sysroot first where `MIRI_SYSROOT` is unset, and `miri setup`
+    // always: a Targo of its own builds the standard library in a fresh workspace in the
+    // temporary folder, its target and build directory that workspace's `target`, which the
+    // builder sets in the variables that outrank every config (`rustc-build-sysroot`'s
+    // `build_from_source`), and stages the result inside the sysroot. Where either folder
+    // lies in one atpkg manages (HOME itself, a folder in it through any spelling, the shared
+    // cache's, the working directory an empty or relative value names), or a variable or a
+    // config Targo reads from where it works names an artifact directory, which copies that
+    // build's output, the call is refused before any build. A target or build directory,
+    // which that build never reads, leaves it clear.
+    // Each row: the variables beside the world's and the words after `--unverified`, `@H`
+    // spelling HOME, `@O` a folder outside it, and the verdict.
+    let typed = "miri run --target-dir @H/t";
+    let alias = ("CARGO_ALIAS_XB", "-C ../a -C ../b build");
+    for (more, line, judged) in [
+        (vec![("TMPDIR", "@H/tmp")], typed, (None, 0)),
+        (
+            vec![("TMPDIR", "@H/tmp"), ("MIRI_SYSROOT", "/private/tmp/s")],
+            typed,
+            (Some(true), 1),
+        ),
+        (vec![("TMPDIR", "@H")], typed, (None, 0)),
+        (vec![("TMPDIR", "")], typed, (None, 0)),
+        (vec![("TMPDIR", "rel")], typed, (None, 0)),
+        (vec![], typed, (Some(true), 1)),
+        (vec![("TMPDIR", "/private/tmp")], typed, (Some(true), 1)),
+        (vec![("TMPDIR", "@O/tmp")], typed, (Some(true), 1)),
+        // A folder outside HOME that links into it is HOME's.
+        (vec![("TMPDIR", "@O/link")], typed, (None, 0)),
+        (
+            vec![("TMPDIR", "@H/Library/Caches/aterm/t")],
+            typed,
+            (None, 0),
+        ),
+        (vec![("TMPDIR", "@H/tmp")], "miri setup", (None, 0)),
+        (
+            vec![("MIRI_SYSROOT", "@H/sysroot")],
+            "miri setup",
+            (None, 0),
+        ),
+        (vec![("MIRI_SYSROOT", "@H")], "miri setup", (None, 0)),
+        // A sysroot outside HOME is clear, unless its `lib` or `lib/rustlib`, which setup
+        // makes and renames its result into, is a link into HOME.
+        (
+            vec![("MIRI_SYSROOT", "@O/sys")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        (
+            vec![("MIRI_SYSROOT", "@O/lib-link")],
+            "miri setup",
+            (None, 0),
+        ),
+        (
+            vec![("MIRI_SYSROOT", "@O/rustlib-link")],
+            "miri setup",
+            (None, 0),
+        ),
+        (vec![("MIRI_SYSROOT", "")], "miri setup", (None, 0)),
+        (vec![("MIRI_SYSROOT", "rel")], "miri setup", (None, 0)),
+        (vec![], "miri setup", (Some(false), 0)),
+        // A spelling under a folder of HOME atpkg never looks into is clear only as the
+        // kernel resolves it: one that is, or whose `lib` is, a link into a folder atpkg
+        // manages is that folder's, as one from outside HOME is.
+        (
+            vec![("MIRI_SYSROOT", "@H/Library/Caches/plain")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        (
+            vec![("MIRI_SYSROOT", "@H/Library/Caches/tmp-link")],
+            "miri setup",
+            (None, 0),
+        ),
+        (
+            vec![("MIRI_SYSROOT", "@H/Library/Caches/lib-link")],
+            "miri setup",
+            (None, 0),
+        ),
+        (
+            vec![("TMPDIR", "@H/Library/Caches/tmp-link")],
+            typed,
+            (None, 0),
+        ),
+        (
+            vec![("TMPDIR", "@H/Library/Caches/plain")],
+            typed,
+            (Some(true), 1),
+        ),
+        (
+            vec![("CARGO_BUILD_ARTIFACT_DIR", "@O/a")],
+            "miri setup",
+            (None, 0),
+        ),
+        (
+            vec![("TARGO_BUILD_ARTIFACT_DIR", "@O/a")],
+            "miri setup",
+            (None, 0),
+        ),
+        // The variables setup's builder sets itself, which outrank the ones inherited.
+        (
+            vec![("CARGO_BUILD_BUILD_DIR", "@H/bd")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        (
+            vec![("TARGO_BUILD_BUILD_DIR", "@H/bd")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        (
+            vec![("CARGO_TARGET_DIR", "@H/x")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        (
+            vec![("CARGO_BUILD_TARGET_DIR", "@H/x")],
+            "miri setup",
+            (Some(false), 0),
+        ),
+        // A target variable moves the line `miri` hands back, never setup's build.
+        (
+            vec![("CARGO_TARGET_DIR", "@H/x")],
+            "miri run",
+            (Some(true), 1),
+        ),
+        (
+            vec![("CARGO_TARGET_DIR", "/private/tmp/x")],
+            "miri test",
+            (Some(false), 0),
+        ),
+        (
+            vec![("CARGO_TARGET_DIR", "@H/x")],
+            "miri run --target-dir @H/t",
+            (Some(true), 1),
+        ),
+        // An alias this reader cannot tell may run `miri` on a call that consents.
+        (vec![("TMPDIR", "@H/tmp"), alias], "xb", (None, 0)),
+        (vec![alias], "xb", (Some(false), 0)),
+    ] {
+        let world = World::new();
+        let home = world.home.display().to_string();
+        let outside = world.home.parent().unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("tmp")).unwrap();
+        std::fs::create_dir_all(world.home.join("tmp")).unwrap();
+        if !outside.join("link").exists() {
+            std::os::unix::fs::symlink(world.home.join("tmp"), outside.join("link")).unwrap();
+        }
+        let caches = world.home.join("Library/Caches");
+        for link in [
+            outside.join("lib-link/lib"),
+            outside.join("rustlib-link/lib/rustlib"),
+            caches.join("tmp-link"),
+            caches.join("lib-link/lib"),
+        ] {
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            if std::fs::symlink_metadata(&link).is_err() {
+                std::os::unix::fs::symlink(world.home.join("tmp"), link).unwrap();
+            }
+        }
+        std::fs::create_dir_all(caches.join("plain")).unwrap();
+        let outside = outside.display().to_string();
+        let spelled = |text: &str| text.replace("@H", &home).replace("@O", &outside);
+        let more: Vec<(&str, String)> = more
+            .iter()
+            .map(|(name, value)| (*name, spelled(value)))
+            .collect();
+        let args: Vec<String> = spelled(&format!("--unverified {line}"))
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            produce(&world, &world.owner, false, &more, &args),
+            judged,
+            "{more:?} {line}"
+        );
+        if judged.0.is_none() {
+            assert!(!world.home.join("t").exists(), "{more:?} {line}");
+        }
+    }
+    // miri's own cache folder, the sysroot where `MIRI_SYSROOT` is unset, is judged as the
+    // kernel resolves it too: a link there, or at its `lib`, into a folder atpkg manages
+    // refuses the call.
+    for link in ["", "lib"] {
+        let world = World::new();
+        let sysroot = world.home.join("Library/Caches/org.rust-lang.miri");
+        let at = if link.is_empty() {
+            sysroot
+        } else {
+            sysroot.join(link)
+        };
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&world.target, &at).unwrap();
+        world.build();
+        let setup = words(&["--unverified", "miri", "setup"]);
+        assert_eq!(
+            produce(&world, &world.owner, false, &[], &setup),
+            (None, 1),
+            "{link}"
+        );
+        assert!(!world.target.join("lib").exists(), "{link}");
+        assert!(!world.target.join("rustlib").exists(), "{link}");
+    }
+    // A config Targo reads where it works that names an artifact directory, or that this
+    // reader cannot read, leaves `setup`'s output unread; one that names a target or build
+    // directory, which that build never reads, leaves the call to the line handed back: a
+    // `miri test` owns the config's target, and the build directory beside its own target.
+    let setup = words(&["--unverified", "miri", "setup"]);
+    let test = words(&["--unverified", "miri", "test"]);
+    for (text, setup_judged, test_judged) in [
+        ("[build]\nartifact-dir = \"a\"\n", (None, 0), (None, 0)),
+        ("include = [\"missing.toml\"]\n", (None, 0), (None, 0)),
+        (
+            "[build]\nbuild-dir = \"bd\"\n",
+            (Some(false), 0),
+            (Some(true), 2),
+        ),
+        (
+            "[build]\ntarget-dir = \"out\"\n",
+            (Some(false), 0),
+            (Some(true), 1),
+        ),
+    ] {
+        let world = World::new();
+        config(&world.owner, "config.toml", text);
+        assert_eq!(
+            produce(&world, &world.owner, false, &[], &setup),
+            setup_judged,
+            "{text}"
+        );
+        assert_eq!(
+            produce(&world, &world.owner, false, &[], &test),
+            test_judged,
+            "{text}"
+        );
+        if text.contains("build-dir") {
+            let bd = world.owner.join("bd");
+            assert!(
+                roots(&world.home)
+                    .iter()
+                    .any(|registered| registered.root == bd),
+                "{text}"
+            );
+        }
+    }
+    // A `miri` line's target is held through the folder it writes only inside of also where a
+    // build directory is named beside it, by a config file, a `--config` or the variable, the
+    // target typed or not: that folder is recorded, never its `miri`, so a later build that
+    // names it owns it.
+    let sorted_roots = |world: &World| {
+        let mut made = made_roots(world);
+        made.sort();
+        made
+    };
+    for typed in [false, true] {
+        for spelling in ["walk", "cli", "env"] {
+            let row = format!("{spelling} typed {typed}");
+            let world = World::new();
+            let bd = world.owner.join("bd");
+            let target = if typed {
+                world.home.join("t")
+            } else {
+                world.owner.join("target")
+            };
+            let mut args = test.clone();
+            if typed {
+                args.extend(["--target-dir".to_owned(), target.display().to_string()]);
+            }
+            let mut more = sysroot();
+            match spelling {
+                "walk" => config(&world.owner, "config.toml", "[build]\nbuild-dir = \"bd\"\n"),
+                "cli" => args.extend([
+                    "--config".to_owned(),
+                    format!("build.build-dir='{}'", bd.display()),
+                ]),
+                _ => more.push((super::super::BUILD_DIR_ENV, bd.display().to_string())),
+            }
+            assert_eq!(
+                produce(&world, &world.owner, false, &more, &args),
+                (Some(true), 2),
+                "{row}"
+            );
+            let mut want = vec![bd.clone(), target.clone()];
+            want.sort();
+            assert_eq!(sorted_roots(&world), want, "{row}");
+            assert!(!target.join("miri").join(MARKER).exists(), "{row}");
+            let _ = std::fs::remove_dir_all(world.owner.join(".cargo"));
+            let build = words(&[
+                "--unverified",
+                "build",
+                "--target-dir",
+                &target.display().to_string(),
+            ]);
+            assert_eq!(
+                produce(&world, &world.owner, false, &[], &build),
+                (Some(true), 2),
+                "{row}"
+            );
+        }
+    }
+    // A recorded target, a cargo-made `miri` standing in it or none, beside a build directory:
+    // the call is its owner, and no root is made inside it.
+    for standing in [false, true] {
+        let world = World::new();
+        world.build();
+        if standing {
+            cargo_made(&world.target.join("miri"));
+        }
+        config(&world.owner, "config.toml", "[build]\nbuild-dir = \"bd\"\n");
+        let mut args = test.clone();
+        args.extend([
+            "--target-dir".to_owned(),
+            world.target.display().to_string(),
+        ]);
+        assert_eq!(
+            produce(&world, &world.owner, false, &sysroot(), &args),
+            (Some(true), 2),
+            "standing {standing}"
+        );
+        assert!(
+            !world.target.join("miri").join(MARKER).exists(),
+            "standing {standing}"
+        );
+    }
+    // A plain folder the line writes inside of, which no build of cargo's made, leaves the
+    // line's own target, its `miri`, to be admitted beside the build directory in its place.
+    let world = World::new();
+    let plain = world.home.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    config(&world.owner, "config.toml", "[build]\nbuild-dir = \"bd\"\n");
+    let mut args = test.clone();
+    args.extend(["--target-dir".to_owned(), plain.display().to_string()]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &sysroot(), &args),
+        (Some(true), 2)
+    );
+    let mut want = vec![world.owner.join("bd"), plain.join("miri")];
+    want.sort();
+    assert_eq!(sorted_roots(&world), want);
+    assert!(!plain.join(MARKER).exists());
+    // A build directory that cannot be owned (a plain folder no build of cargo's made) refuses
+    // the call, and the fresh folder admitted before it takes no root inside it.
+    let world = World::new();
+    let t = world.home.join("t");
+    let bd = world.home.join("x/y/bd");
+    std::fs::create_dir_all(&bd).unwrap();
+    let mut more = sysroot();
+    more.push((super::super::BUILD_DIR_ENV, bd.display().to_string()));
+    let mut args = test.clone();
+    args.extend(["--target-dir".to_owned(), t.display().to_string()]);
+    assert_eq!(
+        produce(&world, &world.owner, false, &more, &args),
+        (None, 1)
+    );
+    assert_eq!(made_roots(&world), std::slice::from_ref(&t));
+    assert!(!t.join("miri").exists());
+    // So does a `TARGO_HOME`'s, the home Trust's main reads where `CARGO_HOME` is unset.
+    // NEGATIVE CONTROL: a set `CARGO_HOME` outranks it.
+    let world = World::new();
+    let twin_home = world.home.join("th");
+    std::fs::create_dir(&twin_home).unwrap();
+    std::fs::write(
+        twin_home.join("config.toml"),
+        "[build]\nartifact-dir = \"a\"\n",
+    )
+    .unwrap();
+    let twin = ("TARGO_HOME", twin_home.display().to_string());
+    let cargo_home = (
+        "CARGO_HOME",
+        world.home.join(".cargo").display().to_string(),
+    );
+    for (more, judged) in [
+        (vec![twin.clone()], (None, 0)),
+        (vec![twin, cargo_home], (Some(false), 0)),
+    ] {
+        assert_eq!(
+            produce(&world, &world.owner, false, &more, &setup),
+            judged,
+            "{more:?}"
+        );
+    }
+
+    // A `--config` value is read as Targo reads it: a file that names nothing, or a target
+    // the call's own outranks (the typed `--target-dir`, or `CARGO_TARGET_DIR`), and an inline
+    // value whose backslash spells no key, leave the call's target owned, and nothing else. A
+    // build directory any value names, hidden from a line scan or not, before the verb or
+    // after it, is the call's beside its target, each owned (read as a comment, or the value
+    // before the verb alone, it was unrecorded). A folder standing where a value points
+    // refuses the call.
+    let jobs = "[build]\njobs = 3\n";
+    let aside = "[build]\ntarget-dir = \"@ASIDE\"\n";
+    let build_dir = "[build]\nbuild-dir = \"@BD\"\n";
+    let hidden = "build = { x = \"\"\"\n#\"\"\", build-dir = \"@BD\" }\n";
+    let mentions = "[alias]\nd = \"build --artifact-dir d\"\n[build]\njobs = 4 # build-dir\n";
+    let long = format!(
+        "build --target-dir @T --config env.LONG=\"{}\"",
+        "x".repeat(300)
+    );
+    let mut wrong = Vec::new();
+    // Each row: the files in the working directory (a name ending in `/` a folder), the
+    // words after `--unverified`, whether `CARGO_TARGET_DIR` names the target, and the
+    // verdict.
+    for (files, line, targeted, judged) in [
+        (
+            vec![("o=3", jobs)],
+            "build --target-dir @T --config o=3",
+            false,
+            (Some(true), 1),
+        ),
+        (
+            vec![("aside.toml", aside)],
+            "build --target-dir @T --config aside.toml",
+            false,
+            (Some(true), 1),
+        ),
+        (
+            vec![],
+            "build --target-dir @T --config env.X=\"a\\\\b\"",
+            false,
+            (Some(true), 1),
+        ),
+        (
+            vec![("o=3", jobs)],
+            "build --config o=3",
+            false,
+            (Some(false), 0),
+        ),
+        (
+            vec![("aside.toml", aside)],
+            "build --config aside.toml",
+            true,
+            (Some(true), 1),
+        ),
+        (
+            vec![],
+            "build --target-dir @T --config build.\"build-dir\"=\"@BD\"",
+            false,
+            (Some(true), 2),
+        ),
+        (
+            vec![("hid.toml", hidden)],
+            "build --target-dir @T --config hid.toml",
+            false,
+            (Some(true), 2),
+        ),
+        (
+            vec![("bd.toml", build_dir)],
+            "--config bd.toml build --target-dir @T --config o=2",
+            false,
+            (Some(true), 2),
+        ),
+        (
+            vec![("o=4/", "")],
+            "build --target-dir @T --config o=4",
+            false,
+            (None, 0),
+        ),
+        // A file is read whole, what its parse names; an inline value too long to name a
+        // file is parsed (Targo's `Path::exists` finds nothing at it), and an empty one,
+        // which Targo refuses, refuses the call.
+        (
+            vec![("ci.toml", mentions)],
+            "build --target-dir @T --config ci.toml",
+            false,
+            (Some(true), 1),
+        ),
+        (vec![], long.as_str(), false, (Some(true), 1)),
+        (vec![], "build --target-dir @T --config ", false, (None, 0)),
+        // An empty `--target-dir` is the working directory, the project's own folder,
+        // which atpkg never makes or adopts.
+        (vec![], "build --target-dir=", false, (None, 0)),
+        (vec![], "build --target-dir ", false, (None, 0)),
+        // `miri` builds into `cargo metadata`'s target, which reads a `--config` past
+        // `run`'s program too.
+        (
+            vec![("aside.toml", aside)],
+            "miri run demo --config aside.toml",
+            false,
+            (None, 0),
+        ),
+    ] {
+        let world = World::new();
+        let spelled = |text: &str| {
+            text.replace("@T", &world.target.display().to_string())
+                .replace("@BD", &world.home.join("bd").display().to_string())
+                .replace("@ASIDE", &world.home.join("aside").display().to_string())
+        };
+        for (name, text) in &files {
+            match name.strip_suffix('/') {
+                Some(folder) => std::fs::create_dir(world.owner.join(folder)).unwrap(),
+                None => std::fs::write(world.owner.join(name), spelled(text)).unwrap(),
+            }
+        }
+        let line = spelled(&format!("--unverified {line}"));
+        let args: Vec<String> = line.split(' ').map(str::to_owned).collect();
+        let got = produce(&world, &world.owner, targeted, &[], &args);
+        if got != judged {
+            wrong.push(format!("{line}: {got:?}, not {judged:?}"));
+            continue;
+        }
+        let mut owned = match judged.1 {
+            1 => vec![world.target.clone()],
+            2 => vec![world.target.clone(), world.home.join("bd")],
+            _ => Vec::new(),
+        };
+        owned.sort();
+        let mut made: Vec<_> = roots(&world.home)
+            .into_iter()
+            .map(|made| made.root)
+            .collect();
+        made.sort();
+        assert_eq!(made, owned, "{line}");
+        if judged.1 < 2 {
+            assert!(!world.home.join("bd").exists(), "{line}");
+        }
+        assert!(!world.home.join("aside").exists(), "{line}");
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 
     // A `--config` file outranks inline syntax. An invalid output setting in that file
     // grants no custody; a dotted key no file stands at is neutral.
@@ -5782,6 +8036,22 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         (Some(false), 1)
     );
     assert!(super::read(&world.path()).unwrap().owners_unknown);
+    // A `TARGO_HOME` is the home Trust's main reloads it from where `CARGO_HOME` is unset
+    // (Targo 16387 reloads it from `~/.cargo`), so that walk is read too.
+    let world = World::new();
+    world.build();
+    let twin_home = world.home.join(".local/share/targo");
+    std::fs::create_dir_all(&twin_home).unwrap();
+    let registered = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
+    config(&world.home.join(".local/share"), "config.toml", &registered);
+    let twinned = [("TARGO_HOME", twin_home.display().to_string())];
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    assert_eq!(
+        produce(&world, &notes, false, &twinned, &registry),
+        (Some(false), 1)
+    );
+    assert!(super::read(&world.path()).unwrap().owners_unknown);
     // An install from a folder outside HOME reads that folder's configs, which it cannot
     // tell, so every registered root's owners turn unknown.
     let world = World::new();
@@ -5822,8 +8092,16 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     assert_eq!(produce(&world, &notes, false, &[], &args), (Some(false), 1));
     assert!(super::read(&world.path()).unwrap().owners_unknown);
 
-    // TOML 1.1 escapes decode in values and keys: `\e` in an unrelated environment value
-    // leaves the default target selected, and `\x2d` spells the target key's hyphen.
+    // A config's escapes are decoded only where one may spell a key's character: TOML 1.1's
+    // `\e` spells none, so its file is read line by line; its `\x` may, and is decoded as
+    // Targo decodes it: the key is the target's, which the call's own target outranks, and
+    // which is owned where none does.
+    let recorded = |world: &World| {
+        roots(&world.home)
+            .into_iter()
+            .map(|record| record.root)
+            .collect::<Vec<_>>()
+    };
     let built = words(&["--unverified", "build"]);
     let world = World::new();
     config(&world.owner, "config.toml", "[env]\nBOLD = \"\\e[1m\"\n");
@@ -5841,6 +8119,18 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         produce(&world, &world.owner, true, &[], &built),
         (Some(true), 1)
     );
+    assert_eq!(recorded(&world), std::slice::from_ref(&world.target));
+    let world = World::new();
+    config(
+        &world.owner,
+        "config.toml",
+        "[build]\n\"target\\x2ddir\" = \"t\"\n",
+    );
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &built),
+        (Some(true), 1)
+    );
+    assert_eq!(recorded(&world), [world.owner.join("t")]);
 
     // An alias config's optional include of a link that names nothing is skipped, as Targo
     // skips it, through the front's own reader, which refuses a link.
@@ -5877,7 +8167,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         Some(true)
     );
     // Nor does TOML 1.1's `\e`, which spells no key, make an alias untold: the alias a
-    // farther config gives is read past a nearer one the TOML 1.0 reader cannot parse.
+    // farther config gives is read past a nearer one, read as TOML 1.1 as Targo reads it.
     let world = World::new();
     config(&world.home, "config.toml", "[alias]\nxb = \"build\"\n");
     config(&world.owner, "config.toml", "[env]\nBOLD = \"\\e[1m\"\n");
@@ -5945,7 +8235,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
 /// A USER ALIAS IS READ AS TARGO'S `aliased_command` READS IT: `.cargo/config` over
 /// `.cargo/config.toml` in one folder, the nearest config's string over a farther one's, the
 /// variable over a config's string; arrays in two configs (which Targo joins), package homes
-/// whose readings differ (the store's Targo reads `CARGO_HOME`'s, Trust's main
+/// whose readings differ (Targo 16387 reads `CARGO_HOME`'s, Trust's main
 /// `TARGO_HOME`'s) and a twin a tool observed as an upstream cargo may read are words the
 /// front cannot tell, so the call owes custody. NEGATIVE CONTROL: the plain variable, which
 /// every tool reads, is its words.
@@ -6691,7 +8981,69 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
             assert!(!fresh.exists(), "{args:?}");
         }
     }
+    // Targo's `miri clean` (`cargo-miri`'s `MiriCommand::Clean`) runs `targo metadata
+    // --no-deps` and removes its target's `miri` and miri's own sysroot cache: it writes
+    // nothing, whatever target or `--config` the call names, as `clean` writes nothing.
+    for words in [
+        vec!["--unverified", "miri", "clean"],
+        vec!["--unverified", "miri", "clean", "--target-dir", &fresh_at],
+        vec!["--config", &config, "--unverified", "miri", "clean"],
+        vec!["miri", "clean"],
+    ] {
+        let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let tool = super::super::Tool::Targo;
+        assert!(non_producing_command(&args, tool, &machine), "{args:?}");
+        assert!(
+            !observe_for_producer(&args, tool, &world.home, &machine, true).unwrap(),
+            "{args:?}"
+        );
+        assert!(
+            !observe_on(&args, tool, &world.home, &machine).unwrap(),
+            "{args:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+        assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+        assert!(!fresh.exists(), "{args:?}");
+    }
+    // Targo's `miri setup` builds only miri's sysroot, from the standard library's sources,
+    // through a Targo of its own whose workspace, target and build directory lie in the
+    // temporary folder, which its builder sets over every variable and config, the
+    // `CARGO_TARGET_DIR` naming the registered target here included, and whose result it
+    // stages inside the sysroot: where both folders lie outside every folder atpkg manages
+    // and nothing names an artifact directory, it writes nothing atpkg could record, and a
+    // call in no lane Targo refuses.
+    for words in [
+        vec!["--unverified", "miri", "setup"],
+        vec!["--unverified", "miri", "setup", "--print-sysroot"],
+        vec!["miri", "setup"],
+    ] {
+        let args = words.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let tool = super::super::Tool::Targo;
+        assert!(non_producing_command(&args, tool, &machine), "{args:?}");
+        assert!(
+            !observe_for_producer(&args, tool, &world.home, &machine, true).unwrap(),
+            "{args:?}"
+        );
+        assert!(
+            !observe_on(&args, tool, &world.home, &machine).unwrap(),
+            "{args:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{args:?}");
+        assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+    }
     for (tool, words) in [
+        // `cargo-miri` reads its subcommand only as the word after `miri`, and an upstream
+        // cargo's `miri` is any `cargo-miri` on PATH, which this reader does not read.
+        (
+            super::super::Tool::Targo,
+            vec!["--unverified", "miri", "-v", "clean"],
+        ),
+        (
+            super::super::Tool::Targo,
+            vec!["--unverified", "miri", "cleanup"],
+        ),
+        (super::super::Tool::Cargo, vec!["miri", "clean"]),
+        (super::super::Tool::Cargo, vec!["miri", "setup"]),
         (
             super::super::Tool::Targo,
             vec!["--config", "fetch", "build"],
@@ -6922,7 +9274,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
     }
     // Each package home's config counts too: `CARGO_HOME` (against the working directory), or
     // `~/.cargo` where it is empty or unset, and its `TARGO_HOME` twin where it is unset.
-    // Trust's main reads that twin's, the store's Targo `~/.cargo`'s, so both count.
+    // Trust's main reads that twin's, Targo 16387 `~/.cargo`'s, so both count.
     let package_home = world.home.join("package-home");
     let package_home_at = package_home.as_os_str().to_owned();
     // Read from outside the home, so no ancestor's config stands in for the package home's.
@@ -7052,11 +9404,13 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
     }
     std::fs::remove_file(linked.join(".cargo").join("config.toml")).unwrap();
     assert!(!lockfile_may_land_in_a_target(&words(&["fetch"]), &through));
-    // Text the TOML 1.0 reader cannot parse sets the lockfile's root only where its words or
-    // an escape that spells any character may: TOML 1.1's `\e` spells none, its `\x` may.
+    // Text is read as TOML 1.1, as Targo parses it: `\e` spells no key, a key `\x` spells is
+    // the lockfile's root, and a word in a comment of an inline table across lines sets
+    // nothing (read as TOML 1.0, the text could not be parsed, and the word might).
     for (text, placed) in [
         ("[env]\nBOLD = \"\\e[1m\"\n", false),
         ("[resolver]\n\"lock\\x66ile-path\" = 'x/Cargo.lock'\n", true),
+        ("[env]\nA = { B = \"1\", # no include\n}\n", false),
     ] {
         std::fs::write(linked.join(".cargo").join("config.toml"), text).unwrap();
         assert_eq!(
@@ -7248,7 +9602,9 @@ fn a_target_named_through_a_link_to_an_owned_folder_is_that_folder() {
 /// A LINK TO A FOLDER ATPKG DOES NOT OWN IS REFUSED, EACH CASE IN ITS OWN WORDS, and nothing is
 /// written: no marker in the folder, no receipt in the index, the link as it was. A folder
 /// with no custody; one cargo made that atpkg never registered (never adopted through the
-/// link, though at its own name it would be); a link to nothing; a link to a link to an owned
+/// link, though at its own name it would be); one cargo tagged that holds only the rustc facts
+/// a resolving verb wrote, no profile a build prepared (no folder cargo built in, so as
+/// unowned as any); a link to nothing; a link to a link to an owned
 /// folder, or to an owned folder through a linked folder on the way, or in a folder reached
 /// through a link; text that climbs past the root; a folder on another volume (`/dev`); a folder whose marker no receipt binds; a
 /// file. NEGATIVE CONTROL: the cargo-made folder named by its own path is adopted.
@@ -7284,6 +9640,14 @@ fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
     .unwrap();
     std::fs::set_permissions(&tag, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::write(cargo_made.join(".rustc_info.json"), b"{}").unwrap();
+    // A profile its build prepared, and a unit it invoked, beside the facts.
+    for prepared in ["build", "incremental"] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(cargo_made.join("debug").join(prepared))
+            .unwrap();
+    }
     let fingerprint = cargo_made.join("debug/.fingerprint/probe-hash");
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -7293,6 +9657,10 @@ fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
     let stamp = fingerprint.join("invoked.timestamp");
     std::fs::write(&stamp, b"invoked").unwrap();
     std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The facts a resolving verb wrote into a tagged folder no build prepared.
+    let resolved = folder("resolved.noindex");
+    std::fs::copy(&tag, resolved.join("CACHEDIR.TAG")).unwrap();
+    std::fs::write(resolved.join(".rustc_info.json"), b"{}").unwrap();
     let foreign = folder("foreign.noindex");
     std::fs::copy(world.target.join(MARKER), foreign.join(MARKER)).unwrap();
     let file = world.home.join("a-file");
@@ -7316,6 +9684,11 @@ fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
             "cargo",
             PathBuf::from("cargo-made.noindex"),
             LinkRefusal::CargoMade,
+        ),
+        (
+            "resolved",
+            PathBuf::from("resolved.noindex"),
+            LinkRefusal::Unowned,
         ),
         (
             "dangling",
@@ -7395,7 +9768,7 @@ fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
         messages.len(),
         "each refusal has its own words"
     );
-    for untouched in [&plain, &cargo_made] {
+    for untouched in [&plain, &cargo_made, &resolved] {
         assert!(!untouched.join(MARKER).exists());
     }
     assert!(!world.home.join("nothing.noindex").exists());
@@ -7970,9 +10343,8 @@ fn a_default_final_target_requires_agreement_even_with_foreign_intermediates() {
         } else {
             vec!["build".into()]
         };
-        let choice =
-            selected_call_outputs(&words, tool, &machine, &|_| super::super::UserAlias::None)
-                .expect("the output graph is known even though manifest readings disagree");
+        let choice = selected_call_outputs(&words, tool, &world.home, &machine)
+            .expect("the output graph is known even though manifest readings disagree");
         assert_eq!(choice.target, super::super::FinalTarget::WorkspaceDefault);
         assert!(
             observe_for_producer(&words, tool, &world.home, &machine, true).is_err(),
@@ -8014,19 +10386,29 @@ fn a_foreign_manifest_default_target_preserves_unrelated_managed_receipts() {
         writable: &|_| Some(true),
     };
     let words = vec!["--unverified".into(), "build".into()];
-    let before = std::fs::read(world.path()).unwrap();
+    // Targo's root is the folder the manifest is named in (`Workspace::root`, the found
+    // manifest's parent, never resolved through its link), so this call builds into the
+    // HOME package's `target`: it owes custody, and an owner read through a link out of HOME
+    // cannot be told, so it is refused. The managed receipt stays recorded, its outputs kept.
     assert!(
-        !observe_for_producer(
+        observe_for_producer(
             &words,
             super::super::Tool::Targo,
             &world.home,
             &machine,
             true,
         )
-        .unwrap()
+        .is_err()
     );
-    assert_eq!(std::fs::read(world.path()).unwrap(), before);
-    assert_eq!(roots(&world.home).len(), 1);
+    assert_eq!(
+        roots(&world.home)
+            .into_iter()
+            .map(|root| root.root)
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&world.target)
+    );
+    assert!(world.target.join("debug/deps/keep").is_file());
+    assert!(!world.owner.join("target").exists());
     assert!(!foreign.join("target").exists());
     assert!(!intermediate.exists());
 }
@@ -8462,31 +10844,54 @@ fn a_deep_native_manifest_never_confers_a_parent_workspaces_custody() {
     }
 }
 
+/// A foreign workspace's `{workspace-root}` template (a manifest under `~/Library`, where atpkg
+/// manages no workspace) is prepared under the root Targo finds for it, with no custody; one
+/// whose root this reader cannot tell (a package its ancestor workspace does not hold as a
+/// member, which Targo refuses) is refused before exec, nothing prepared.
 #[cfg(target_os = "macos")]
 #[test]
 fn quiet_front_refuses_an_unresolved_foreign_workspace_template_before_exec() {
+    use std::os::unix::fs::MetadataExt as _;
     let world = World::new();
     let foreign = world.home.join("Library/ForeignSource");
-    std::fs::create_dir_all(&foreign).unwrap();
+    std::fs::create_dir_all(foreign.join("sub")).unwrap();
     std::fs::write(foreign.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    std::fs::write(
+        foreign.join("sub/Cargo.toml"),
+        "[package]\nname = \"sub\"\n",
+    )
+    .unwrap();
     let cache = super::super::cache_root(&world.home);
     std::fs::create_dir_all(&cache).unwrap();
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let words = vec![
-        "--unverified".into(),
-        "build".into(),
-        format!("--manifest-path={}", foreign.join("Cargo.toml").display()),
-        "--jobs=1".into(),
-    ];
-    let out = through_clean_front(&world, Path::new("/bin/echo"), &words);
+    let words = |manifest: &Path| -> Vec<String> {
+        vec![
+            "--unverified".into(),
+            "build".into(),
+            format!("--manifest-path={}", manifest.display()),
+            "--jobs=1".into(),
+        ]
+    };
+    let unresolved = words(&foreign.join("sub/Cargo.toml"));
+    let refused = through_clean_front(&world, Path::new("/bin/echo"), &unresolved);
+    let resolved = words(&foreign.join("Cargo.toml"));
+    let admitted = through_clean_front(&world, Path::new("/bin/echo"), &resolved);
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    assert_eq!(refused.status.code(), Some(75), "{refused:?}");
     assert!(
-        !String::from_utf8_lossy(&out.stdout)
+        !String::from_utf8_lossy(&refused.stdout)
             .lines()
-            .any(|line| line.ends_with(&words.join(" ")))
+            .any(|line| line.ends_with(&unresolved.join(" ")))
     );
-    assert!(!foreign.join("target").exists());
+    assert!(!foreign.join("sub/target").exists());
+    assert!(admitted.status.success(), "{admitted:?}");
+    assert!(
+        String::from_utf8_lossy(&admitted.stdout)
+            .lines()
+            .any(|line| line.ends_with(&resolved.join(" ")))
+    );
+    let quiet = super::super::target_build_path(&foreign.join("target"));
+    assert_eq!(std::fs::metadata(&quiet).unwrap().mode() & 0o777, 0o700);
     assert!(roots(&world.home).is_empty());
 }
 
@@ -8645,6 +11050,12 @@ fn clean_reaches_the_tool_without_adopting_unknown_or_changing_registered_output
                 target.clone(),
             ],
             vec!["metadata".into(), target.clone()],
+            vec![
+                "--unverified".into(),
+                "miri".into(),
+                "clean".into(),
+                target.clone(),
+            ],
         ] {
             // Echo is an in-place tool, not a copied image or a script. Its output
             // proves the actual front handed it these words and did not return 75.
@@ -9123,6 +11534,99 @@ fn a_real_clean_and_rebuild_publish_fresh_owned_output_over_only_a_missing_root(
             "actual compiler output in the managed target: {}",
             artifact.display()
         );
+    }
+}
+
+/// KI-1111-15: WHAT A REAL `targo metadata` LEAVES IN A TARGET IT NAMES IS NO BUILD'S FOLDER.
+/// In a folder that stands with cargo's own tag, as Targo tags a cargo home's cache where it
+/// stands (`~/.cargo/git`, fetched, and one under another name), the real driver, which the
+/// front runs as it runs every resolving verb, writes the rustc facts and prepares no profile;
+/// a producer naming that folder next is refused (75), with nothing recorded and no marker
+/// written, and what the cache keeps stands.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_real_metadata_into_a_tagged_folder_leaves_nothing_adoptable() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    for at in [".cargo/git", "tagged.noindex"] {
+        let mut world = World::new();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            "[package]\nname = 'metadata-probe'\nversion = '0.0.0'\nedition = '2024'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::create_dir(world.owner.join("src")).unwrap();
+        std::fs::write(world.owner.join("src/lib.rs"), "").unwrap();
+        world.target = world.home.join(at);
+        std::fs::create_dir_all(&world.target).unwrap();
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(world.target.join("CACHEDIR.TAG"))
+                .unwrap(),
+            super::adoption::CARGO_TAG.as_bytes(),
+        )
+        .unwrap();
+        let kept = world.target.join("db/dep-0123456789abcdef");
+        if at == ".cargo/git" {
+            std::fs::create_dir_all(&kept).unwrap();
+            std::fs::write(kept.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+        let driver = Path::new(env!("CARGO"));
+        let out = through_clean_front_in(
+            &world,
+            &world.owner,
+            driver,
+            &[
+                "metadata".into(),
+                "--offline".into(),
+                "--format-version=1".into(),
+            ],
+            Some(&world.target),
+        );
+        assert!(
+            out.status.success(),
+            "{at}: the resolving verb ran: {out:?}"
+        );
+        assert!(
+            world.target.join(".rustc_info.json").is_file(),
+            "{at}: the real driver wrote the rustc facts"
+        );
+        let mut laid = std::fs::read_dir(&world.target)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        laid.sort();
+        let mut expected = vec![".rustc_info.json", "CACHEDIR.TAG"];
+        if at == ".cargo/git" {
+            expected.push("db");
+        }
+        assert_eq!(laid, expected, "{at}: it prepared no profile");
+        let build = vec![
+            "--unverified".to_owned(),
+            "check".to_owned(),
+            "--offline".to_owned(),
+            format!("--target-dir={}", world.target.display()),
+        ];
+        let refused = through_clean_front(&world, Path::new("/bin/echo"), &build);
+        assert_eq!(
+            refused.status.code(),
+            Some(75),
+            "{at}: refused: {refused:?}"
+        );
+        assert!(!world.path().exists(), "{at}: nothing recorded");
+        assert!(
+            !world.target.join(MARKER).exists(),
+            "{at}: no custody declared"
+        );
+        if at == ".cargo/git" {
+            assert_eq!(
+                std::fs::read(kept.join("HEAD")).unwrap(),
+                b"ref: refs/heads/main\n",
+                "{at}: what the cache keeps stands"
+            );
+        }
     }
 }
 
@@ -9663,6 +12167,864 @@ fn quiet_claim_recomputation_requires_the_matching_environment_and_resolvable_ma
             }
         }
     }
+}
+
+/// A `-C` BUILD'S INTERMEDIATES ARE OWNED UNDER ITS TARGET, out of Spotlight: the shim's own
+/// block, run from a launcher folder on a call whose `-C` names the package (relative and
+/// absolute, behind Targo's gate), places it as typed there, and the front admits the
+/// placement, recording the target and making `<target>/.ubd/build.noindex` under its
+/// record: an absolute target, a relative one (the package's folder's, as Targo resolves it
+/// there), and none, the local fallback under the root Targo finds from that folder, which
+/// the front reads there whatever `$PWD` the launcher left it. From HOME itself too, and
+/// with the package named through the data volume's firmlink. The world's cache folder is one
+/// its person cannot write, where the local fallback is the placement. NEGATIVE CONTROL:
+/// without the gate the block leaves the call as typed, and the front, handed it so, makes
+/// nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_builds_intermediates_owned_under_its_target() {
+    use super::super::Tool;
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+    // What the shim's block hands its front for `args` typed at `cwd`.
+    let block = |world: &World, cwd: &Path, args: &[String]| -> Vec<String> {
+        let out = aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{}[ $# -eq 0 ] || printf '%s\\n' \"$@\"",
+                super::super::shim_block("targo").unwrap()
+            ))
+            .arg("sh")
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &world.home)
+            .env("PWD", cwd)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    // The front as the shim starts it: in the launcher's folder, with its `$PWD`.
+    let front = |world: &World, cwd: &Path, placed: &[String], claim: &str| {
+        let pwd = cwd.as_os_str().to_owned();
+        let env = |name: &str| (name == "PWD").then(|| pwd.clone());
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &super::super::read_config,
+            read_manifest: &super::super::read_config,
+            writable: &|_| None,
+        };
+        observe_shim_on(placed, Tool::Targo, claim, &world.home, &machine, true)
+    };
+    // A world whose shared cache folder its person cannot write, so a call that names no
+    // target takes the local fallback: with none there the block writes the shared cache under
+    // the nearest writable ancestor of it (`cache_writable`), as the front does. The folders
+    // above it are laid private, as the index beside it needs them.
+    let unwritable_cache = || {
+        let world = World::new();
+        let cache = world.home.join(super::super::CACHE_UNDER_HOME);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(cache.parent().unwrap())
+            .unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o555)
+            .create(&cache)
+            .unwrap();
+        world
+    };
+    let owner = |world: &World, root: &Path| -> Vec<PathBuf> {
+        roots(&world.home)
+            .into_iter()
+            .filter(|registered| registered.root == root)
+            .flat_map(|registered| registered.owners)
+            .collect()
+    };
+    // From a launcher folder and from HOME itself, the package named relative to it, by its
+    // own spelling and by the data volume's firmlink spelling, which Targo reads back as its
+    // own (`getcwd`) and `realpath` does not.
+    for (from, directory) in [
+        ("launch", "../source"),
+        ("launch", "source-abs"),
+        ("launch", "source-data"),
+        ("", "source"),
+        ("", "source-data"),
+    ] {
+        for target in ["absolute", "out", "none"] {
+            let world = unwritable_cache();
+            let launcher = world.home.join(from);
+            std::fs::create_dir_all(&launcher).unwrap();
+            let named = match directory {
+                "source-abs" => world.owner.display().to_string(),
+                "source-data" => Path::new("/System/Volumes/Data")
+                    .join(world.owner.strip_prefix("/").unwrap())
+                    .display()
+                    .to_string(),
+                _ => directory.to_owned(),
+            };
+            let mut typed = words(&["-Zunstable-options", "-C", &named, "--unverified"]);
+            typed.push("build".into());
+            let root = match target {
+                "absolute" => {
+                    typed.extend(["--target-dir".into(), world.target.display().to_string()]);
+                    world.target.clone()
+                }
+                "out" => {
+                    typed.extend(words(&["--target-dir", "out"]));
+                    world.owner.join("out")
+                }
+                _ => world.owner.join("target"),
+            };
+            let quiet = super::super::target_build_path(&root);
+            let placed = block(&world, &launcher, &typed);
+            let directory_value = if target == "none" {
+                super::super::target_build_path(Path::new("{workspace-root}/target"))
+            } else {
+                quiet.clone()
+            };
+            assert_eq!(
+                placed[..2],
+                [
+                    "--config".to_owned(),
+                    format!("build.build-dir='{}'", directory_value.display())
+                ],
+                "{typed:?}"
+            );
+            assert_eq!(placed[2..], typed);
+            assert!(
+                front(&world, &launcher, &placed, "config").unwrap(),
+                "{typed:?}"
+            );
+            assert!(quiet.is_dir(), "{typed:?}");
+            assert_eq!(
+                owner(&world, &root),
+                std::slice::from_ref(&world.owner),
+                "{typed:?}"
+            );
+        }
+    }
+    // A package where atpkg manages no workspace (in `~/Documents`) gets the intermediates
+    // its `-C` build writes prepared, read from that folder, with no custody.
+    for target in [&[][..], &["--target-dir", "out"]] {
+        let world = unwritable_cache();
+        let launcher = world.home.join("launch");
+        std::fs::create_dir(&launcher).unwrap();
+        let documents = world.home.join("Documents/proj");
+        std::fs::create_dir_all(&documents).unwrap();
+        std::fs::write(documents.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        let mut typed = words(&[
+            "-Zunstable-options",
+            "-C",
+            "../Documents/proj",
+            "--unverified",
+            "build",
+        ]);
+        typed.extend(words(target));
+        let placed = block(&world, &launcher, &typed);
+        assert_eq!(placed[2..], typed);
+        assert!(
+            !front(&world, &launcher, &placed, "config").unwrap(),
+            "{typed:?}"
+        );
+        let root = documents.join(if target.is_empty() { "target" } else { "out" });
+        assert!(super::super::target_build_path(&root).is_dir(), "{typed:?}");
+        assert!(roots(&world.home).is_empty(), "{typed:?}");
+    }
+    let world = unwritable_cache();
+    let launcher = world.home.join("launch");
+    std::fs::create_dir(&launcher).unwrap();
+    let typed = words(&["-C", "../source", "--unverified", "build"]);
+    assert_eq!(block(&world, &launcher, &typed), typed);
+    // The front, handed the call as typed, which Targo refuses for want of its gate, makes
+    // and records nothing.
+    front(&world, &launcher, &typed, "-").unwrap();
+    assert!(!world.owner.join("target").exists());
+    assert!(roots(&world.home).is_empty());
+}
+
+/// THE FRONT PREPARES WHERE TARGO WRITES THE SHIM'S PLACEMENT, and nothing for a call that
+/// builds nothing, read by the front's own reader ([`live_read`]). The local fallback's
+/// `{workspace-root}` is the root Targo finds, and the owner recorded: a package its
+/// ancestor's workspace excludes, or that lies in a `target/package` folder, is its own root,
+/// so its own `target` is recorded under it and no other made; a package whose manifest is a
+/// link is that manifest's, never its parent's. A package where atpkg manages no workspace
+/// (in `~/Documents`) gets its intermediates prepared, with no custody; one whose manifest
+/// cannot be read is refused, nothing prepared. A query Targo answers (`-Zhelp`,
+/// `--explain`) is admitted with nothing prepared. NEGATIVE CONTROL: the excluding root's own
+/// member still writes the root's `target`; before, the owner walk read past
+/// `target/package` (refusing the call where that manifest was past the bound, recording the
+/// workspace above as owner where not), and a member's manifest through a link or past the
+/// bound was passed for its parent's, whose `target` was recorded while Targo wrote the
+/// member's.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_fronts_placement_lands_where_targo_writes_it() {
+    use super::super::{BUILD_DIR_ENV, Tool};
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+    let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"))
+        .display()
+        .to_string();
+    let shim = |world: &World, cwd: &Path, placed: &str, typed: &[String], hidden: bool| {
+        let env = |name: &str| {
+            (hidden && name == BUILD_DIR_ENV).then(|| std::ffi::OsString::from(&fallback))
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        observe_shim_on(typed, Tool::Targo, placed, &world.home, &machine, true)
+    };
+    let trust = words(&["trust", "check"]);
+    let world = World::new();
+    let w = world.home.join("w");
+    for dir in ["a", "pkg"] {
+        std::fs::create_dir_all(w.join(dir)).unwrap();
+        std::fs::write(
+            w.join(dir).join("Cargo.toml"),
+            format!("[package]\nname = \"{dir}\"\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        w.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\"]\nexclude = [\"pkg\"]\n",
+    )
+    .unwrap();
+    assert!(shim(&world, &w.join("pkg"), "env", &trust, true).unwrap());
+    assert!(super::super::target_build_path(&w.join("pkg/target")).is_dir());
+    assert!(!w.join("target").exists());
+    assert!(shim(&world, &w.join("a"), "env", &trust, true).unwrap());
+    assert!(super::super::target_build_path(&w.join("target")).is_dir());
+    let mut made: Vec<_> = roots(&world.home).into_iter().map(|r| r.root).collect();
+    made.sort();
+    assert_eq!(made, [w.join("pkg/target"), w.join("target")]);
+
+    // The root is the one Targo's walk finds, which stops before a folder that ends in
+    // `target/package`: a package there is its own root, whatever the workspace above holds,
+    // one past the reader's bound included, which that walk never reads.
+    for above in [
+        format!("[workspace]\n# {}\n", "x".repeat(1 << 20)),
+        "[workspace]\nmembers = [\"target/package/q\"]\n".to_owned(),
+    ] {
+        let world = World::new();
+        let packaged = world.home.join("w/target/package/q");
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::write(packaged.join("Cargo.toml"), "[package]\nname = \"q\"\n").unwrap();
+        std::fs::write(world.home.join("w/Cargo.toml"), above).unwrap();
+        assert!(shim(&world, &packaged, "env", &trust, true).unwrap());
+        assert!(super::super::target_build_path(&packaged.join("target")).is_dir());
+        let recorded = roots(&world.home);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].root, packaged.join("target"));
+        assert_eq!(recorded[0].owners, std::slice::from_ref(&packaged));
+    }
+
+    // The package's manifest is the first that stands from where Targo works up, and only
+    // absence lets the walk go up: a member whose manifest is a link, or one past the reader's
+    // bound, tells no root, and the call is refused with nothing prepared, never handed to its
+    // parent's.
+    let world = World::new();
+    let w = world.home.join("w");
+    std::fs::create_dir_all(w.join("pkg")).unwrap();
+    std::fs::write(w.join("Cargo.toml"), "[package]\nname = \"w\"\n").unwrap();
+    std::fs::write(w.join("pkg/real.toml"), "[package]\nname = \"p\"\n").unwrap();
+    std::os::unix::fs::symlink("real.toml", w.join("pkg/Cargo.toml")).unwrap();
+    assert!(shim(&world, &w.join("pkg"), "env", &trust, true).is_err());
+    assert!(!w.join("target").exists());
+    assert!(!w.join("pkg/target").exists());
+    assert!(roots(&world.home).is_empty());
+    let world = World::new();
+    let w = world.home.join("w");
+    std::fs::create_dir_all(w.join("pkg")).unwrap();
+    std::fs::write(w.join("Cargo.toml"), "[package]\nname = \"w\"\n").unwrap();
+    let oversized = format!("[package]\nname = \"p\"\n# {}\n", "x".repeat(1 << 20));
+    std::fs::write(w.join("pkg/Cargo.toml"), oversized).unwrap();
+    assert!(shim(&world, &w.join("pkg"), "env", &trust, true).is_err());
+    assert!(!w.join("target").exists());
+    assert!(!w.join("pkg/target").exists());
+    assert!(roots(&world.home).is_empty());
+
+    let world = World::new();
+    let documents = world.home.join("Documents/proj");
+    std::fs::create_dir_all(&documents).unwrap();
+    std::fs::write(documents.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+    assert!(!shim(&world, &documents, "env", &trust, true).unwrap());
+    assert!(super::super::target_build_path(&documents.join("target")).is_dir());
+    assert!(roots(&world.home).is_empty());
+
+    let world = World::new();
+    let out = world.owner.join("out");
+    let explained = words(&[
+        "--unverified",
+        "--explain",
+        "E0308",
+        "build",
+        "--target-dir",
+        "out",
+    ]);
+    let placed = [
+        words(&[
+            "--config",
+            &format!(
+                "build.build-dir='{}'",
+                super::super::target_build_path(&out).display()
+            ),
+        ]),
+        explained,
+    ]
+    .concat();
+    for (placed, typed, hidden) in [
+        ("env", words(&["-Zhelp", "trust", "check"]), true),
+        ("config", placed, false),
+    ] {
+        assert!(
+            !shim(&world, &world.owner, placed, &typed, hidden).unwrap(),
+            "{typed:?}"
+        );
+    }
+    assert!(!world.owner.join("target").exists());
+    assert!(!out.exists());
+    assert!(roots(&world.home).is_empty());
+}
+
+/// THE HOP PICKS ITS COMPILER BY THE LAUNCHER'S trust.lock, so a `-C` whose directory
+/// finds another outcome is refused: a tree with its own lock, a tree with none from a
+/// locked launcher, and a lock that does not read on either side, the same file included.
+/// NEGATIVE CONTROL: a `-C` into the launcher's own locked tree, by an absolute or a
+/// relative path, one between two trees with no lock, a call with no `-C`, and the lint,
+/// whose words are its own.
+#[test]
+fn a_dash_c_whose_trust_lock_differs_from_the_launchers_is_refused() {
+    use super::super::Tool;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(scratch.path()).unwrap();
+    let lock = crate::trust_lock::render_body(&crate::trust_lock::TrustLock {
+        build: 16387,
+        tree_root: "46ca692db799c27b4874df3de5c635ddb0845d32ff2d23cb2546e613dc5626f1".into(),
+        compiler_commit: "29ebb403de7a102850d6cb10a62d5cc3baf723ed".into(),
+        receipt:
+            "SEED-MINT sha256:4cd1415f6a19170ee60a26f5fdb2e799e3fc2dbfc939caff1c64a83fa554c620"
+                .into(),
+        stock_toolchain: "1.99.1".into(),
+    });
+    let tree = |name: &str, lock: Option<&str>| {
+        let dir = base.join(name);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        if let Some(lock) = lock {
+            std::fs::write(dir.join("trust.lock"), lock).unwrap();
+        }
+        dir
+    };
+    let locked = tree("locked", Some(&lock));
+    let other = tree("other", Some(&lock));
+    let bare = tree("bare", None);
+    let bare_too = tree("bare-too", None);
+    let broken = tree("broken", Some("not a lock"));
+    let guard = |cwd: &Path, words: &[&str], tool: Tool| {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        directory_lock_guard(&words, tool, "-", Some(cwd))
+    };
+    let into = |dir: &Path| {
+        vec![
+            "-Zunstable-options".to_owned(),
+            "-C".to_owned(),
+            dir.display().to_string(),
+            "trust".to_owned(),
+            "check".to_owned(),
+        ]
+    };
+    let call = |cwd: &Path, words: Vec<String>, tool: Tool| {
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        guard(cwd, &words, tool)
+    };
+    for (row, launcher, dir) in [
+        ("its own lock", &locked, other.clone()),
+        ("no lock there", &locked, bare.clone()),
+        ("no lock here", &bare, locked.clone()),
+        ("unreadable there", &bare, broken.join("sub")),
+        ("unreadable both", &broken, broken.join("sub")),
+    ] {
+        let refused = call(launcher, into(&dir), Tool::Targo);
+        let why = refused.expect_err(row).to_string();
+        assert!(why.contains("trust.lock"), "{row}: {why}");
+        assert!(
+            why.contains("run the call from the tree it builds"),
+            "{row}: {why}"
+        );
+    }
+    for (row, launcher, words) in [
+        ("same tree", &locked, into(&locked.join("sub"))),
+        (
+            "same tree, relative",
+            &locked,
+            ["-Zunstable-options", "-C", "sub", "trust", "check"]
+                .map(str::to_owned)
+                .to_vec(),
+        ),
+        ("no lock either side", &bare, into(&bare_too)),
+        (
+            "no -C",
+            &locked,
+            ["trust", "check"].map(str::to_owned).to_vec(),
+        ),
+    ] {
+        assert!(call(launcher, words, Tool::Targo).is_ok(), "{row}");
+    }
+    assert!(call(&locked, into(&other), Tool::Tippy).is_ok(), "lint");
+    // The shim's own leading `--config` pair is no word a `-C` is read past.
+    let mut placed = vec![
+        "--config".to_owned(),
+        "build.build-dir='/x/.ubd/build.noindex'".to_owned(),
+    ];
+    placed.extend(into(&other));
+    assert!(directory_lock_guard(&placed, Tool::Targo, "config", Some(&locked)).is_err());
+}
+
+/// A workspace rooted at HOME, which atpkg never manages, builds into `~/target` whenever
+/// its call names no target: the local fallback's `{workspace-root}/target` and a cache
+/// placement's final artifacts alike. Where that folder is a root recorded for another
+/// workspace, its sole recorded owner going would retire it while the HOME workspace still
+/// builds there, so the call holds it in custody (`owners_unknown`); the same member naming
+/// it explicitly is refused, as it owes custody no owner may take. NEGATIVE CONTROL: where
+/// nothing is recorded there, nothing is.
+#[test]
+fn a_home_rooted_workspace_holds_a_recorded_home_target_in_custody() {
+    use super::super::{BUILD_DIR_ENV, Tool};
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+    let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"))
+        .display()
+        .to_string();
+    let call = |world: &World, cwd: &Path, typed: &[String], hop: bool| {
+        let env = |name: &str| {
+            (hop && name == BUILD_DIR_ENV).then(|| std::ffi::OsString::from(&fallback))
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        if hop {
+            observe_shim_on(typed, Tool::Targo, "env", &world.home, &machine, true)
+        } else {
+            observe_for_producer(typed, Tool::Targo, &world.home, &machine, true)
+        }
+    };
+    let package = |dir: &Path, text: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+    };
+    let fallback_check = words(&["trust", "check"]);
+    let cache_build = words(&["--unverified", "build"]);
+    for (typed, hop, recorded) in [
+        (&fallback_check, true, true),
+        (&cache_build, false, true),
+        (&fallback_check, true, false),
+        (&cache_build, false, false),
+    ] {
+        let world = World::new();
+        let home_target = world.home.join("target");
+        if recorded {
+            // Another workspace, its own root, records `~/target` as its explicit target.
+            let w = world.home.join("w");
+            package(&w, "[package]\nname = \"w\"\n[workspace]\n");
+            let mut explicit = words(&["--unverified", "build", "--target-dir"]);
+            explicit.push(home_target.display().to_string());
+            assert!(call(&world, &w, &explicit, false).unwrap());
+            let receipt = &roots(&world.home)[0];
+            assert_eq!(receipt.root, home_target);
+            assert_eq!(receipt.owners, std::slice::from_ref(&w));
+            assert!(!receipt.owners_unknown);
+        }
+        std::fs::write(
+            world.home.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"proj\"]\n",
+        )
+        .unwrap();
+        package(&world.home.join("proj"), "[package]\nname = \"p\"\n");
+        let observed = call(&world, &world.home.join("proj"), typed, hop);
+        assert!(matches!(observed, Ok(false)), "{typed:?}: {observed:?}");
+        let records = roots(&world.home);
+        if recorded {
+            assert_eq!(records.len(), 1, "{typed:?}");
+            assert_eq!(records[0].root, home_target);
+            assert!(
+                records[0].owners_unknown,
+                "{typed:?}: the HOME workspace's target is held in custody"
+            );
+        } else {
+            assert!(records.is_empty(), "{typed:?}: nothing is recorded");
+            assert!(!home_target.join(MARKER).exists());
+        }
+    }
+}
+
+/// A call whose owner atpkg keeps no custody of builds into the build directory it names as
+/// into its target, so a root recorded there for another workspace is held in custody
+/// (`owners_unknown`) as its target would be, never retired once that workspace goes while
+/// this call still builds there: the variable, a `--config` and a config file's spelling, for
+/// a package at HOME itself named by `--manifest-path` from a folder in HOME (a producer, which
+/// owes no custody; run from HOME itself it reads no explicit target), and for a member of a
+/// workspace rooted at HOME as observed (a producer of it owes custody no owner may take, and
+/// is refused). A package outside HOME named so is held too, though not by this arm: its line
+/// names a manifest the explicit reader does not take (`Line::parse`), so the call holds every
+/// recorded root. NEGATIVE CONTROL: where nothing is recorded, nothing is, nor made.
+#[test]
+fn an_ownerless_call_holds_a_recorded_build_dir_in_custody() {
+    use super::super::{BUILD_DIR_ENV, Tool};
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+    let call = |world: &World, cwd: &Path, bd: Option<&Path>, typed: &[String], producer| {
+        let env = |name: &str| {
+            (name == BUILD_DIR_ENV)
+                .then_some(bd)
+                .flatten()
+                .map(|bd| bd.as_os_str().to_owned())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        observe_for_producer(typed, Tool::Targo, &world.home, &machine, producer)
+    };
+    let package = |dir: &Path, text: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+    };
+    for recorded in [true, false] {
+        for owner in ["home", "outside", "home-rooted"] {
+            for spelling in ["env", "cli", "file"] {
+                let row = format!("{owner} {spelling} recorded {recorded}");
+                let world = World::new();
+                let bd = world.home.join("bd");
+                let out = world.home.join("out");
+                if recorded {
+                    // Another workspace, its own root, records `~/bd` as its explicit target.
+                    let w = world.home.join("w");
+                    package(&w, "[package]\nname = \"w\"\n[workspace]\n");
+                    let mut explicit = words(&["--unverified", "build", "--target-dir"]);
+                    explicit.push(bd.display().to_string());
+                    assert!(call(&world, &w, None, &explicit, true).unwrap(), "{row}");
+                    let receipt = &roots(&world.home)[0];
+                    assert_eq!(receipt.root, bd, "{row}");
+                    assert_eq!(receipt.owners, std::slice::from_ref(&w), "{row}");
+                    assert!(!receipt.owners_unknown, "{row}");
+                }
+                let notes = world.home.join("notes");
+                let (cwd, manifest) = match owner {
+                    "home" => {
+                        package(&world.home, "[package]\nname = \"h\"\n");
+                        std::fs::create_dir(&notes).unwrap();
+                        (notes, Some(world.home.join("Cargo.toml")))
+                    }
+                    "outside" => {
+                        let elsewhere = world.home.parent().unwrap().join("elsewhere");
+                        package(&elsewhere, "[package]\nname = \"e\"\n");
+                        std::fs::create_dir(&notes).unwrap();
+                        (notes, Some(elsewhere.join("Cargo.toml")))
+                    }
+                    _ => {
+                        std::fs::write(
+                            world.home.join("Cargo.toml"),
+                            "[workspace]\nmembers = [\"proj\"]\n",
+                        )
+                        .unwrap();
+                        package(&world.home.join("proj"), "[package]\nname = \"p\"\n");
+                        (world.home.join("proj"), None)
+                    }
+                };
+                let mut typed = words(&["--unverified", "build"]);
+                if let Some(manifest) = &manifest {
+                    typed.push("--manifest-path".to_owned());
+                    typed.push(manifest.display().to_string());
+                }
+                typed.push("--target-dir".to_owned());
+                typed.push(out.display().to_string());
+                match spelling {
+                    "env" => {}
+                    "cli" => {
+                        typed.push("--config".to_owned());
+                        typed.push(format!("build.build-dir='{}'", bd.display()));
+                    }
+                    _ => {
+                        std::fs::create_dir_all(cwd.join(".cargo")).unwrap();
+                        std::fs::write(
+                            cwd.join(".cargo/config.toml"),
+                            format!("[build]\nbuild-dir = \"{}\"\n", bd.display()),
+                        )
+                        .unwrap();
+                    }
+                }
+                let variable = (spelling == "env").then_some(bd.as_path());
+                let home_rooted = owner == "home-rooted";
+                if home_rooted {
+                    let refused = call(&world, &cwd, variable, &typed, true);
+                    assert!(refused.is_err(), "{row}: {refused:?}");
+                    assert!(!out.exists(), "{row}");
+                }
+                let observed = call(&world, &cwd, variable, &typed, !home_rooted);
+                assert!(matches!(observed, Ok(false)), "{row}: {observed:?}");
+                let records = roots(&world.home);
+                if recorded {
+                    assert_eq!(records.len(), 1, "{row}");
+                    assert_eq!(records[0].root, bd, "{row}");
+                    assert!(
+                        records[0].owners_unknown,
+                        "{row}: the build directory is held in custody"
+                    );
+                } else {
+                    assert!(records.is_empty(), "{row}: nothing is recorded");
+                    assert!(!bd.join(MARKER).exists(), "{row}");
+                    assert!(!out.join(MARKER).exists(), "{row}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_fronts_owner_is_the_root_targo_finds_where_it_works() {
+    use super::super::{BUILD_DIR_ENV, Tool};
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<String>>();
+    let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"))
+        .display()
+        .to_string();
+    // `typed` from `cwd` with `more` set: through the hop with the fallback exported
+    // (`env`), or as a producer with nothing placed.
+    let call = |world: &World, cwd: &Path, more: &[(&str, String)], typed: &[String], hop| {
+        let env = |name: &str| {
+            if hop && name == BUILD_DIR_ENV {
+                return Some(std::ffi::OsString::from(&fallback));
+            }
+            more.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.into())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(cwd),
+            env: &env,
+            read: &live_read,
+            read_manifest: &live_read,
+            writable: &|_| Some(true),
+        };
+        if hop {
+            observe_shim_on(typed, Tool::Targo, "env", &world.home, &machine, true)
+        } else {
+            observe_for_producer(typed, Tool::Targo, &world.home, &machine, true)
+        }
+    };
+    let package = |dir: &Path, text: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+    };
+    let recorded = |world: &World| -> Vec<(PathBuf, Vec<PathBuf>)> {
+        let mut made: Vec<_> = roots(&world.home)
+            .into_iter()
+            .map(|root| (root.root, root.owners))
+            .collect();
+        made.sort();
+        made
+    };
+    let fresh = |world: &World| world.home.join("fresh");
+
+    // A relative package home is the `-C` directory's, as Targo's `reload_cwd` takes it,
+    // so its root walk stops there. With the launcher's, the walk stops before the
+    // workspace that holds the package, which would record the member as the sole owner of
+    // the workspace's target (freed once that member goes, while the workspace builds).
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/p\"]\n");
+    package(&w.join("crates/p"), "[package]\nname = \"p\"\n");
+    let dot = [("CARGO_HOME", ".".to_owned())];
+    let from_crates = words(&[
+        "-Zunstable-options",
+        "-C",
+        "..",
+        "trust",
+        "check",
+        "--manifest-path",
+        "crates/p/Cargo.toml",
+    ]);
+    assert!(call(&world, &w.join("crates"), &dot, &from_crates, true).unwrap());
+    assert!(super::super::target_build_path(&w.join("target")).is_dir());
+    assert_eq!(recorded(&world), [(w.join("target"), vec![w.clone()])]);
+    // The explicit spelling records the same owner.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/p\"]\n");
+    package(&w.join("crates/p"), "[package]\nname = \"p\"\n");
+    let mut explicit = words(&[
+        "-Zunstable-options",
+        "-C",
+        "..",
+        "--unverified",
+        "build",
+        "--manifest-path",
+        "crates/p/Cargo.toml",
+        "--target-dir",
+    ]);
+    explicit.push(fresh(&world).display().to_string());
+    assert!(call(&world, &w.join("crates"), &dot, &explicit, false).unwrap());
+    assert_eq!(recorded(&world), [(fresh(&world), vec![w.clone()])]);
+    // The reverse: Targo's walk stops at the `-C` directory, where the launcher's would
+    // pass on to a workspace that does not list the package. Read so, the fallback's owner
+    // could not be told and its target was prepared with nothing recorded; the explicit
+    // target was refused, a call Targo builds.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/*\"]\n");
+    package(&w.join("h/p"), "[package]\nname = \"p\"\n");
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let from_notes = words(&[
+        "-Zunstable-options",
+        "-C",
+        "../w/h",
+        "trust",
+        "check",
+        "--manifest-path",
+        "p/Cargo.toml",
+    ]);
+    assert!(call(&world, &notes, &dot, &from_notes, true).unwrap());
+    assert_eq!(
+        recorded(&world),
+        [(w.join("h/p/target"), vec![w.join("h/p")])]
+    );
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/*\"]\n");
+    package(&w.join("h/p"), "[package]\nname = \"p\"\n");
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let mut explicit = words(&[
+        "-Zunstable-options",
+        "-C",
+        "../w/h",
+        "--unverified",
+        "build",
+        "--manifest-path",
+        "p/Cargo.toml",
+        "--target-dir",
+    ]);
+    explicit.push(fresh(&world).display().to_string());
+    assert!(call(&world, &notes, &dot, &explicit, false).unwrap());
+    assert_eq!(recorded(&world), [(fresh(&world), vec![w.join("h/p")])]);
+    // NEGATIVE CONTROL: with no `-C`, the launcher's home is Targo's, and the walk from the
+    // package passes on to that workspace, which does not list it.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/*\"]\n");
+    package(&w.join("h/p"), "[package]\nname = \"p\"\n");
+    let mut plain = words(&["--unverified", "build", "--target-dir"]);
+    plain.push(fresh(&world).display().to_string());
+    assert!(call(&world, &w.join("h/p"), &dot, &plain, false).is_err());
+    assert!(roots(&world.home).is_empty());
+
+    // Where `CARGO_HOME` is unset, Targo 16387's walk stops after `~/.cargo` and Trust's
+    // main's after `TARGO_HOME`: a root they find apart is none either may take, so the
+    // call is refused with nothing prepared, never recorded under one build's root while
+    // the other writes another's. Where they agree, it is that root.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"th/tool\"]\n");
+    package(&w.join("th/tool"), "[package]\nname = \"tool\"\n");
+    let twin = [("TARGO_HOME", w.join("th").display().to_string())];
+    let check = words(&["trust", "check"]);
+    assert!(call(&world, &w.join("th/tool"), &twin, &check, true).is_err());
+    assert!(!w.join("target").exists());
+    assert!(!w.join("th/tool/target").exists());
+    assert!(roots(&world.home).is_empty());
+    let elsewhere = [("TARGO_HOME", world.home.join("th").display().to_string())];
+    assert!(call(&world, &w.join("th/tool"), &elsewhere, &check, true).unwrap());
+    assert_eq!(recorded(&world), [(w.join("target"), vec![w.clone()])]);
+
+    // A package reached through a linked folder builds into its root's `target` as Targo
+    // spells it, which is the folder the link names: that folder is the one recorded and
+    // prepared, as the owner is the root's own.
+    let world = World::new();
+    let real = world.home.join("real/a");
+    package(&real, "[package]\nname = \"a\"\n");
+    let x = world.home.join("x");
+    std::fs::create_dir(&x).unwrap();
+    std::os::unix::fs::symlink(&real, x.join("link")).unwrap();
+    let linked = words(&["trust", "check", "--manifest-path", "link/Cargo.toml"]);
+    assert!(call(&world, &x, &[], &linked, true).unwrap());
+    assert!(super::super::target_build_path(&real.join("target")).is_dir());
+    assert_eq!(
+        recorded(&world),
+        [(real.join("target"), vec![real.clone()])]
+    );
+    // Again, now that it is recorded.
+    assert!(call(&world, &x, &[], &linked, true).unwrap());
+    assert_eq!(
+        recorded(&world),
+        [(real.join("target"), vec![real.clone()])]
+    );
+
+    // A member of a workspace rooted at HOME, which no owner may be, still names a folder it
+    // writes: it is refused, nothing recorded or made.
+    let world = World::new();
+    std::fs::write(
+        world.home.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"proj\"]\n",
+    )
+    .unwrap();
+    package(&world.home.join("proj"), "[package]\nname = \"p\"\n");
+    let mut out = words(&["--unverified", "build", "--target-dir"]);
+    out.push(world.home.join("out").display().to_string());
+    assert!(call(&world, &world.home.join("proj"), &[], &out, false).is_err());
+    assert!(roots(&world.home).is_empty());
+    assert!(!world.home.join("out").exists());
+    // NEGATIVE CONTROL: one folder down, the workspace is one atpkg manages.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"proj\"]\n");
+    package(&w.join("proj"), "[package]\nname = \"p\"\n");
+    let mut out = words(&["--unverified", "build", "--target-dir"]);
+    out.push(world.home.join("out").display().to_string());
+    assert!(call(&world, &w.join("proj"), &[], &out, false).unwrap());
+
+    // A path dependency of a member a glob names is a member too (`find_members` follows
+    // each glob's folders' path dependencies): its root is the workspace's.
+    let world = World::new();
+    let w = world.home.join("w");
+    package(&w, "[workspace]\nmembers = [\"crates/*\"]\n");
+    package(
+        &w.join("crates/a"),
+        "[package]\nname = \"a\"\n[dependencies]\nb = { path = \"../../libs/b\" }\n",
+    );
+    package(&w.join("libs/b"), "[package]\nname = \"b\"\n");
+    package(&w.join("libs/u"), "[package]\nname = \"u\"\n");
+    assert!(call(&world, &w.join("libs/b"), &[], &check, true).unwrap());
+    assert_eq!(recorded(&world), [(w.join("target"), vec![w.clone()])]);
+    let mut explicit = words(&["--unverified", "build", "--target-dir"]);
+    explicit.push(fresh(&world).display().to_string());
+    assert!(call(&world, &w.join("libs/b"), &[], &explicit, false).unwrap());
+    // NEGATIVE CONTROL: a package no member depends on is none.
+    assert!(call(&world, &w.join("libs/u"), &[], &explicit, false).is_err());
 }
 
 /// A NEW HOME'S FIRST BUILD IS ADMITTED IN THE SHARED CACHE: in a home with no `Library`, read
@@ -10369,7 +13731,7 @@ fn compatibility_and_proof_manifest_readings_require_canonical_owner_agreement()
 }
 
 #[test]
-fn native_foreign_manifest_keeps_pass_through_beside_a_managed_cargo_ancestor() {
+fn native_linked_manifest_never_confers_a_managed_cargo_ancestors_custody() {
     let world = World::new();
     let member = world.owner.join("member");
     let foreign = world.home.parent().unwrap().join("foreign.toml");
@@ -10394,14 +13756,17 @@ fn native_foreign_manifest_keeps_pass_through_beside_a_managed_cargo_ancestor() 
         read_manifest: &super::super::read_manifest,
         writable: &|_| Some(true),
     };
-    assert!(!requires_managed_explicit(
+    // Targo's package is the folder its manifest is named in, wherever the link names: a
+    // reader that follows the link finds that folder its own root, which owes custody and
+    // owns the target, never the Cargo ancestor beside it.
+    assert!(requires_managed_explicit(
         &args,
         super::super::Tool::Targo,
         &world.home,
         &machine
     ));
     assert!(
-        !observe_for_producer(
+        observe_for_producer(
             &args,
             super::super::Tool::Targo,
             &world.home,
@@ -10410,8 +13775,10 @@ fn native_foreign_manifest_keeps_pass_through_beside_a_managed_cargo_ancestor() 
         )
         .unwrap()
     );
-    assert!(!world.target.exists());
-    assert!(roots(&world.home).is_empty());
+    let registered = roots(&world.home);
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].root, world.target);
+    assert_eq!(registered[0].owners, vec![member.clone()]);
 }
 
 #[cfg(target_os = "macos")]
@@ -10464,4 +13831,230 @@ fn native_manifest_cannot_acquire_a_cargo_workspace_membership_by_directory() {
             assert!(roots(&world.home).is_empty());
         }
     }
+}
+
+/// A `MIRI` LINE HOLDS THE ROOT ITS TARGET LIES INSIDE OF: `cargo-miri` builds into
+/// `<base>/miri`, so a root recorded at `<base>` (here `CARGO_TARGET_DIR`'s, for another
+/// workspace) is held in custody, its owners unknown and never retired once that workspace goes,
+/// where the call selects no output (a package outside HOME) and where its package's root is one
+/// atpkg records no owner for (HOME's own). NEGATIVE CONTROL: the same calls without `miri`, whose
+/// target is `<base>` itself, hold it the same way.
+#[test]
+fn a_miri_line_holds_the_root_its_target_lies_inside_of() {
+    use super::super::Tool;
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let package = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+    let unknown = |world: &World| {
+        roots(&world.home)
+            .into_iter()
+            .find(|recorded| recorded.root == world.target)
+            .and_then(|recorded| super::read(&recorded.receipt_path))
+            .expect("the world's root is recorded")
+            .owners_unknown
+    };
+    for (row, at_home, verb) in [
+        ("outside", false, "miri"),
+        ("outside, built", false, "build"),
+        ("home", true, "miri"),
+        ("home, built", true, "build"),
+    ] {
+        let world = World::new();
+        world.build();
+        assert!(!unknown(&world), "{row}");
+        let folder = if at_home {
+            world.home.clone()
+        } else {
+            let outside = world.home.parent().unwrap().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            outside
+        };
+        std::fs::write(folder.join("Cargo.toml"), package).unwrap();
+        let manifest = folder.join("Cargo.toml").display().to_string();
+        let mut args = vec!["--unverified".to_owned(), verb.to_owned()];
+        if verb == "miri" {
+            args.push("run".to_owned());
+        }
+        args.extend(["--manifest-path".to_owned(), manifest]);
+        let env = |name: &str| match name {
+            "CARGO_TARGET_DIR" => Some(world.target.clone().into_os_string()),
+            "MIRI_SYSROOT" => Some("/private/tmp/no-sysroot".into()),
+            _ => None,
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let verdict = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true);
+        assert_eq!(verdict.ok(), Some(false), "{row}: {args:?}");
+        assert!(
+            unknown(&world),
+            "{row}: {args:?} left the root it builds inside of with its owners known"
+        );
+    }
+}
+
+/// A `-C` TARGO REFUSES FOR WANT OF ITS GATE, NAMING AN OUTPUT UNDER HOME, IS REFUSED NAMING THE
+/// GATE: such a call is judged as the same call honoured, since a gate the reader misread would
+/// let a build Targo honours through unrecorded, and the refusal says what Targo wants rather
+/// than send the person after fresh output directories. NEGATIVE CONTROL: the same call behind
+/// its gate is owned.
+#[test]
+fn an_ungated_directory_that_names_an_output_is_refused_naming_the_gate() {
+    use super::super::Tool;
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let world = World::new();
+    let notes = world.home.join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let owner = world.owner.display().to_string();
+    let env = |_: &str| None;
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&notes),
+        env: &env,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let words = |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).to_owned()).collect() };
+    let ungated = words(&["-C", &owner, "--unverified", "build", "--target-dir", "out"]);
+    let error = observe_for_producer(&ungated, Tool::Targo, &world.home, &machine, true)
+        .expect_err("an ungated -C naming an output under HOME is refused");
+    assert!(
+        error.to_string().contains("-Z unstable-options"),
+        "the refusal names the gate: {error}"
+    );
+    assert!(roots(&world.home).is_empty());
+    let gated = words(&[
+        "-C",
+        &owner,
+        "-Zunstable-options",
+        "--unverified",
+        "build",
+        "--target-dir",
+        "out",
+    ]);
+    assert_eq!(
+        observe_for_producer(&gated, Tool::Targo, &world.home, &machine, true).ok(),
+        Some(true)
+    );
+}
+
+/// THE FRONT RECORDS THE TARGET OF THE `--config` LIST TARGO MERGES: clap keeps a verb's own
+/// `--config` list in place of the one before it, so `xb --config net.offline=true` over
+/// `xb = --config build.target-dir=A build` builds into the config walk's target, never `A`, and
+/// a typed `--config` the hop moves past an alias's `--` is its program's; the front owns the
+/// config walk's target there and records no `A`. A help call through such an alias builds
+/// nothing and is not refused. NEGATIVE CONTROLS: the same alias with nothing after its name, and
+/// one whose `--config` follows its verb, record `A`.
+#[test]
+fn the_front_records_the_target_of_the_config_list_targo_merges() {
+    use super::super::Tool;
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    };
+    let before = "\"--config\", \"build.target-dir='A'\", \"build\"";
+    let after = "\"build\", \"--config\", \"build.target-dir='A'\"";
+    let program = "\"run\", \"--package\", \"xtask\", \"--\"";
+    for (row, alias, typed, recorded) in [
+        (
+            "before its verb",
+            before,
+            "--unverified xb --config net.offline=true",
+            false,
+        ),
+        ("before its verb, alone", before, "--unverified xb", true),
+        (
+            "after its verb",
+            after,
+            "--unverified xb --config net.offline=true",
+            true,
+        ),
+        (
+            "moved past its --",
+            program,
+            "--config build.target-dir='A' --unverified xb demo --config net.offline=true",
+            false,
+        ),
+    ] {
+        let world = World::new();
+        let named = world.home.join("A");
+        std::fs::create_dir_all(world.owner.join(".cargo")).unwrap();
+        std::fs::write(
+            world.owner.join(".cargo/config.toml"),
+            format!(
+                "[build]\ntarget-dir = \"{}\"\n[alias]\nxb = [{}]\n",
+                world.target.display(),
+                alias,
+            )
+            .replace('A', &named.display().to_string()),
+        )
+        .unwrap();
+        let env = |_: &str| None;
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args: Vec<String> = typed
+            .replace('A', &named.display().to_string())
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        let verdict = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true);
+        let made: Vec<_> = roots(&world.home)
+            .into_iter()
+            .map(|made| made.root)
+            .collect();
+        let expected = if recorded { &named } else { &world.target };
+        assert_eq!(verdict.ok(), Some(true), "{row}: {made:?}");
+        assert_eq!(made, [expected.clone()], "{row}");
+    }
+    // A help call through the alias builds nothing, whatever a variable names.
+    let world = World::new();
+    std::fs::create_dir_all(world.owner.join(".cargo")).unwrap();
+    std::fs::write(
+        world.owner.join(".cargo/config.toml"),
+        "[alias]\nxb = [\"--config\", \"profile.dev.debug=0\", \"build\"]\n",
+    )
+    .unwrap();
+    let env =
+        |name: &str| (name == "CARGO_TARGET_DIR").then(|| world.target.clone().into_os_string());
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&world.owner),
+        env: &env,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let help: Vec<String> = ["xb", "--help"]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+    assert_eq!(
+        observe_for_producer(&help, Tool::Targo, &world.home, &machine, true).ok(),
+        Some(false)
+    );
+    assert!(roots(&world.home).is_empty());
 }

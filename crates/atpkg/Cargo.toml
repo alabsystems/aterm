@@ -79,6 +79,10 @@ aterm-durable = { workspace = true }
 # a private aterm's toolset peers neither listen on nor dial (`peers`), the fleet's rule.
 aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
+# The one agent name table: a harness row is refused when the name table does not read its id or
+# tool as the agent its first led word names, since a tab is read by its foreground program's
+# name (`harness_record`).
+aterm-agent-names = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }
 # First-party bounded regex engine for abrew's `search /regex/` form. It
@@ -169,7 +173,9 @@ aterm-dirfd = { workspace = true }
 aterm-sysprobe = { workspace = true }
 
 # `input_seal::machine_facts`: the OS build and model a sealed identity binds
-# (`aterm_sysprobe::os_build`, `machine_model`). Already in the macOS graph through aterm-capacity.
+# (`aterm_sysprobe::os_build`, `machine_model`), and the work a build cache gate's holder has
+# done (`aterm_sysprobe::jobs::cpu_with_reaped_ns`). Already in the macOS graph through
+# aterm-capacity.
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-sysprobe = { workspace = true }
 

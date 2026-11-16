@@ -927,6 +927,7 @@ fn the_budget_holds_figures_walls_model_weeks_credits_and_resets() {
                 by: "machine0".into(),
                 attempts: 1,
                 cleared: false,
+                seen: None,
             },
         );
     }
@@ -963,6 +964,7 @@ fn the_budget_holds_figures_walls_model_weeks_credits_and_resets() {
         by: "m22".into(),
         attempts: 1,
         cleared: false,
+        seen: None,
     };
     {
         let account = read.state.accounts.get_mut("alpha").expect("the record");

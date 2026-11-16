@@ -1159,12 +1159,17 @@ fn git_wrapper_locates_itself_under_an_empty_or_unset_path() {
             command.env("PATH", "");
         }
         aterm_spec::wait::past_text_busy(|| {
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).map_err(
-                |e| match e {
-                    aterm_uds::deadline::RunError::Spawn(e) => e,
-                    other => std::io::Error::other(other),
-                },
+            aterm_uds::deadline::output_while_process_progressing(
+                &mut command,
+                aterm_spec::wait::MUST_HAPPEN,
+                format!("git wrapper {launch}, PATH unset={unset}"),
             )
+            .map_err(|e| match e {
+                aterm_uds::deadline::ProgressError::Run(aterm_uds::deadline::RunError::Spawn(
+                    e,
+                )) => e,
+                other => std::io::Error::other(other),
+            })
         })
         .expect("run wrapper")
     };

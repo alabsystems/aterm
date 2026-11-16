@@ -278,7 +278,7 @@ fn hand_back_menu_origin_case(change: &str) {
     let source_hold = source_ctx.fabric.holds().person().map(str::to_string);
     let at = std::time::Instant::now();
     if change == "close source" {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.fx.cursor_mut().glow.note_typed_cells(at, 1);
         window.fx.cursor_mut().trail.note_typed(at);
         assert!(window.fx.cursor().glow.move_licensed(at));
@@ -323,7 +323,7 @@ fn hand_back_menu_origin_case(change: &str) {
     );
     assert_eq!(app.windows[&wid].tab_set, tabs);
     assert_eq!(app.windows[&wid].front_content, front);
-    assert_eq!(app.windows[&wid].rename_edit, draft);
+    assert_eq!(app.windows[&wid].rename_edit.as_ref(), draft.as_ref());
     assert_eq!(app.frontmost_window, Some(wid));
     assert_eq!(app.focus_order, focus_order);
     assert_eq!(app.focused_session_id(wid), Some(expected_focus));
@@ -738,7 +738,7 @@ fn session_menu_rows_bind_each_shared_view_and_drop_a_closed_original() {
         ));
     }
     let at = std::time::Instant::now();
-    for window in app.windows.values_mut() {
+    for mut window in app.windows.values_mut() {
         window.fx.cursor_mut().glow.note_typed_cells(at, 1);
         window.fx.cursor_mut().trail.note_typed(at);
         assert!(window.fx.cursor().glow.move_licensed(at));
@@ -1786,7 +1786,7 @@ fn strip_title(app: &mut App, session: u64) -> String {
 
 /// Forget what the strip last read of `session`, so only the drift path can write it again.
 fn forget_strip_reads(app: &mut App, session: u64) {
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
     ws.tab_title_cache.remove(&session);
     ws.tab_chrome_titles.remove(&session);
     ws.tab_title_epochs.remove(&session);

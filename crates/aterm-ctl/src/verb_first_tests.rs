@@ -16,33 +16,42 @@ fn rewritten(line: &str) -> Option<String> {
 #[test]
 fn a_read_takes_its_session_after_the_verb_with_its_words_kept() {
     for (typed, sent) in [
-        ("status @s-ab12", "@s-ab12 status"),
-        ("status s-ab12", "@s-ab12 status"),
-        ("text @s-ab12 tail=3 trim", "@s-ab12 text tail=3 trim"),
-        ("text s-ab12 --json", "@s-ab12 text --json"),
-        ("screen @s-ab12 since=00ff", "@s-ab12 screen since=00ff"),
-        ("cursor s-ab12", "@s-ab12 cursor"),
-        ("modes @s-ab12", "@s-ab12 modes"),
-        ("selection s-ab12", "@s-ab12 selection"),
-        ("blocks @s-ab12 5", "@s-ab12 blocks 5"),
-        ("chrome s-ab12", "@s-ab12 chrome"),
-        ("panes @s-ab12", "@s-ab12 panes"),
+        ("status @tab12xxxxxx", "@tab12xxxxxx status"),
+        ("status tab12xxxxxx", "@tab12xxxxxx status"),
         (
-            "offscreen s-ab12 tail=2 screen=1",
-            "@s-ab12 offscreen tail=2 screen=1",
+            "text @tab12xxxxxx tail=3 trim",
+            "@tab12xxxxxx text tail=3 trim",
         ),
-        ("search @s-ab12 needle case", "@s-ab12 search needle case"),
-        ("inbox s-ab12 3 --peek", "@s-ab12 inbox 3 --peek"),
-        ("inbox @s-ab12 get 7", "@s-ab12 inbox get 7"),
+        ("text tab12xxxxxx --json", "@tab12xxxxxx text --json"),
         (
-            "log @s-ab12 class=turn since=4 ep=2",
-            "@s-ab12 log class=turn since=4 ep=2",
+            "screen @tab12xxxxxx since=00ff",
+            "@tab12xxxxxx screen since=00ff",
         ),
-        ("result s-ab12 full", "@s-ab12 result full"),
-        ("history @s-ab12 5", "@s-ab12 history 5"),
-        ("line s-ab12 40", "@s-ab12 line 40"),
-        ("doc @s-ab12 read d1", "@s-ab12 doc read d1"),
-        ("image s-ab12 read", "@s-ab12 image read"),
+        ("cursor tab12xxxxxx", "@tab12xxxxxx cursor"),
+        ("modes @tab12xxxxxx", "@tab12xxxxxx modes"),
+        ("selection tab12xxxxxx", "@tab12xxxxxx selection"),
+        ("blocks @tab12xxxxxx 5", "@tab12xxxxxx blocks 5"),
+        ("chrome tab12xxxxxx", "@tab12xxxxxx chrome"),
+        ("panes @tab12xxxxxx", "@tab12xxxxxx panes"),
+        (
+            "offscreen tab12xxxxxx tail=2 screen=1",
+            "@tab12xxxxxx offscreen tail=2 screen=1",
+        ),
+        (
+            "search @tab12xxxxxx needle case",
+            "@tab12xxxxxx search needle case",
+        ),
+        ("inbox tab12xxxxxx 3 --peek", "@tab12xxxxxx inbox 3 --peek"),
+        ("inbox @tab12xxxxxx get 7", "@tab12xxxxxx inbox get 7"),
+        (
+            "log @tab12xxxxxx class=turn since=4 ep=2",
+            "@tab12xxxxxx log class=turn since=4 ep=2",
+        ),
+        ("result tab12xxxxxx full", "@tab12xxxxxx result full"),
+        ("history @tab12xxxxxx 5", "@tab12xxxxxx history 5"),
+        ("line tab12xxxxxx 40", "@tab12xxxxxx line 40"),
+        ("doc @tab12xxxxxx read d1", "@tab12xxxxxx doc read d1"),
+        ("image tab12xxxxxx read", "@tab12xxxxxx image read"),
         ("text @self", "@self text"),
         ("text @env", "@env text"),
         ("status @.", "@. status"),
@@ -55,10 +64,13 @@ fn a_read_takes_its_session_after_the_verb_with_its_words_kept() {
 #[test]
 fn read_reads_as_text_on_either_side_of_a_selector() {
     for (typed, sent) in [
-        ("read @s-ab12", "@s-ab12 text"),
-        ("read s-ab12 tail=3", "@s-ab12 text tail=3"),
-        ("@s-ab12 read", "@s-ab12 text"),
-        ("@s-ab12 read trim tail=2", "@s-ab12 text trim tail=2"),
+        ("read @tab12xxxxxx", "@tab12xxxxxx text"),
+        ("read tab12xxxxxx tail=3", "@tab12xxxxxx text tail=3"),
+        ("@tab12xxxxxx read", "@tab12xxxxxx text"),
+        (
+            "@tab12xxxxxx read trim tail=2",
+            "@tab12xxxxxx text trim tail=2",
+        ),
         ("@self read", "@self text"),
     ] {
         assert_eq!(rewritten(typed).as_deref(), Some(sent), "{typed}");
@@ -68,12 +80,12 @@ fn read_reads_as_text_on_either_side_of_a_selector() {
         "read",
         "read trim",
         "read tail=3",
-        "@s-ab12 text",
+        "@tab12xxxxxx text",
         "text",
         "doc read d1",
         "doc read file:///tmp/x lines=1-2",
         "image read",
-        "@s-ab12 doc read d1",
+        "@tab12xxxxxx doc read d1",
     ] {
         assert_eq!(rewritten(alone), None, "{alone}");
     }
@@ -82,8 +94,8 @@ fn read_reads_as_text_on_either_side_of_a_selector() {
 #[test]
 fn close_takes_its_one_session_after_the_verb_and_nothing_else() {
     for (typed, sent) in [
-        ("close @s-ab12", "@s-ab12 close"),
-        ("close s-ab12", "@s-ab12 close"),
+        ("close @tab12xxxxxx", "@tab12xxxxxx close"),
+        ("close tab12xxxxxx", "@tab12xxxxxx close"),
         ("close @self", "@self close"),
         ("close @3", "@3 close"),
     ] {
@@ -93,9 +105,9 @@ fn close_takes_its_one_session_after_the_verb_and_nothing_else() {
         "close",
         "close s-foo",
         "close --help",
-        "close s-ab12 now",
-        "@s-ab12 close",
-        "@s-ab12 close s-cd34",
+        "close tab12xxxxxx now",
+        "@tab12xxxxxx close",
+        "@tab12xxxxxx close tcd34xxxxxx",
     ] {
         assert_eq!(rewritten(alone), None, "{alone}");
     }
@@ -107,23 +119,23 @@ fn close_takes_its_one_session_after_the_verb_and_nothing_else() {
 #[test]
 fn a_verb_that_takes_no_session_after_it_is_left_alone() {
     for typed in [
-        "ls @s-ab12",
-        "survey @s-ab12",
-        "who @s-ab12",
-        "hold s-ab12 on",
-        "raise s-ab12",
+        "ls @tab12xxxxxx",
+        "survey @tab12xxxxxx",
+        "who @tab12xxxxxx",
+        "hold tab12xxxxxx on",
+        "raise tab12xxxxxx",
         "help status",
-        "spawn @s-ab12 agent=claude -",
-        "await task @s-ab12,@s-cd34 since=0",
-        "await @s-ab12 agent idle",
-        "ready @s-ab12",
-        "wait s-ab12",
-        "sys @s-ab12",
-        "subscribe @s-ab12 events",
-        "send @s-ab12 hello",
-        "turn s-ab12 hello",
-        "meta @s-ab12 set title x",
-        "inbox @s-ab12 get @5",
+        "spawn @tab12xxxxxx agent=claude -",
+        "await task @tab12xxxxxx,@tcd34xxxxxx since=0",
+        "await @tab12xxxxxx agent idle",
+        "ready @tab12xxxxxx",
+        "wait tab12xxxxxx",
+        "sys @tab12xxxxxx",
+        "subscribe @tab12xxxxxx events",
+        "send @tab12xxxxxx hello",
+        "turn tab12xxxxxx hello",
+        "meta @tab12xxxxxx set title x",
+        "inbox @tab12xxxxxx get @5",
     ] {
         assert_eq!(rewritten(typed), None, "{typed}");
     }
@@ -134,19 +146,19 @@ fn a_verb_that_takes_no_session_after_it_is_left_alone() {
 #[test]
 fn a_word_that_names_no_session_is_left_alone() {
     for typed in [
-        "search s-ab12",
-        "search s-ab12 needle",
+        "search tab12xxxxxx",
+        "search tab12xxxxxx needle",
         "search s-foo",
         "search @foo",
         "search @ needle",
-        "search @s-ab12:3 x",
+        "search @tab12xxxxxx:3 x",
         "status s-foo",
         "status S-AB12",
         "status s-",
         "text tail=3",
         "blocks 5",
         "log t3",
-        "nosuchverb @s-ab12",
+        "nosuchverb @tab12xxxxxx",
     ] {
         assert_eq!(rewritten(typed), None, "{typed}");
     }
@@ -182,9 +194,9 @@ fn an_at_that_names_nothing_after_a_read_meets_the_empty_selector_refusal() {
 fn self_and_the_multiplexer_boundary_read_the_rewritten_form() {
     let mut parts = rewrite(&words("text @self tail=2")).expect("rewritten");
     assert!(crate::targets_own_session_implicitly(&parts, None, None));
-    crate::expand_self_selector(&mut parts, Some("s-ab12".to_owned())).expect("expanded");
-    assert_eq!(parts, words("@s-ab12 text tail=2"));
-    let named = rewrite(&words("status s-ab12")).expect("rewritten");
+    crate::expand_self_selector(&mut parts, Some("tab12xxxxxx".to_owned())).expect("expanded");
+    assert_eq!(parts, words("@tab12xxxxxx text tail=2"));
+    let named = rewrite(&words("status tab12xxxxxx")).expect("rewritten");
     assert!(!crate::targets_own_session_implicitly(&named, None, None));
     assert!(crate::targets_own_session_implicitly(
         &words("text"),
@@ -206,7 +218,11 @@ fn a_session_after_its_verb_is_followed_to_the_instance_hosting_it() {
     let sock = dir.join("aterm-4004.sock");
     let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
     let sock = sock.to_str().expect("utf8 path").to_owned();
-    std::fs::write(dir.join("graph").join("s-c8c3"), format!("sock {sock}\n")).expect("entry");
+    std::fs::write(
+        dir.join("graph").join("tc8c3xxxxxx"),
+        format!("sock {sock}\n"),
+    )
+    .expect("entry");
     let hosting = |line: &str| {
         let named = crate::redial::target_sid(line);
         let targets = crate::targets_in(Some(dir.clone()), None, None, None, named);
@@ -218,10 +234,10 @@ fn a_session_after_its_verb_is_followed_to_the_instance_hosting_it() {
             .collect::<Vec<_>>()
     };
     for typed in [
-        "text s-c8c3 tail=3",
-        "status @s-c8c3",
-        "read s-c8c3",
-        "@s-c8c3 read trim",
+        "text tc8c3xxxxxx tail=3",
+        "status @tc8c3xxxxxx",
+        "read tc8c3xxxxxx",
+        "@tc8c3xxxxxx read trim",
     ] {
         let sent = rewrite(&words(typed)).unwrap_or_else(|| panic!("{typed}"));
         assert_eq!(
@@ -249,12 +265,18 @@ fn the_socket_hears_the_protocols_form_and_a_word_that_names_no_session_as_typed
     let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let cases: [(&[&str], &str); 7] = [
-        (&["status", "@s-ab12"], "@s-ab12 status"),
-        (&["text", "s-ab12", "tail=3"], "@s-ab12 text tail=3"),
-        (&["read", "@s-ab12"], "@s-ab12 text"),
-        (&["@s-ab12", "read", "trim"], "@s-ab12 text trim"),
-        (&["search", "@s-ab12", "needle"], "@s-ab12 search needle"),
-        (&["search", "s-ab12"], "search s-ab12"),
+        (&["status", "@tab12xxxxxx"], "@tab12xxxxxx status"),
+        (
+            &["text", "tab12xxxxxx", "tail=3"],
+            "@tab12xxxxxx text tail=3",
+        ),
+        (&["read", "@tab12xxxxxx"], "@tab12xxxxxx text"),
+        (&["@tab12xxxxxx", "read", "trim"], "@tab12xxxxxx text trim"),
+        (
+            &["search", "@tab12xxxxxx", "needle"],
+            "@tab12xxxxxx search needle",
+        ),
+        (&["search", "tab12xxxxxx"], "search tab12xxxxxx"),
         (&["blocks", "5"], "blocks 5"),
     ];
     let n = cases.len();
@@ -271,7 +293,7 @@ fn the_socket_hears_the_protocols_form_and_a_word_that_names_no_session_as_typed
             let mut line = String::new();
             r.read_line(&mut line).expect("request");
             let reply: &[u8] = if line.contains("status") {
-                b"OK schema=1 sid=s-ab12\n"
+                b"OK schema=1 sid=tab12xxxxxx\n"
             } else {
                 b"OK 0\n"
             };
@@ -317,9 +339,9 @@ fn help_after_a_verb_first_read_is_its_entry_with_no_dial() {
     let nowhere = scratch.path().join("none.sock");
     let nowhere = nowhere.to_str().expect("utf8 path").to_owned();
     for typed in [
-        "read @s-ab12 --help",
-        "@s-ab12 read --help",
-        "status s-ab12 --help",
+        "read @tab12xxxxxx --help",
+        "@tab12xxxxxx read --help",
+        "status tab12xxxxxx --help",
     ] {
         let argv = ["--sock", nowhere.as_str()]
             .into_iter()

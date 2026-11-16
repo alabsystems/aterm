@@ -26,7 +26,7 @@ default-members = [
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
     "crates/aterm-hash", "crates/aterm-heap-count", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
-    "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-land", "crates/aterm-lexicon", "crates/aterm-libc",
+    "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-land", "crates/aterm-land-trailer", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
     "crates/aterm-macos-ui", "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-mesh-core-islands", "crates/aterm-mesh-core-islands-no-lost-edit", "crates/aterm-mesh-core-islands-p1", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-capacity", "crates/aterm-models-core", "crates/aterm-models-effects",
@@ -39,7 +39,7 @@ default-members = [
     "crates/aterm-pty", "crates/aterm-regex", "crates/aterm-render", "crates/aterm-requests", "crates/aterm-restore",
     "crates/aterm-rle", "crates/aterm-repo-storage",
     "crates/aterm-sandbox", "crates/aterm-scene", "crates/aterm-scrollback",
-    "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
+    "crates/aterm-seal", "crates/aterm-search", "crates/aterm-secrets", "crates/aterm-selection", "crates/aterm-serde", "crates/aterm-serde-derive",
     "crates/aterm-session", "crates/aterm-shell-integration", "crates/aterm-sixel", "crates/aterm-slog",
     "crates/aterm-spec", "crates/aterm-spec-anchor", "crates/aterm-spec-macros",
     "crates/aterm-signin-window", "crates/aterm-spec-models", "crates/aterm-stamp", "crates/aterm-sysprobe", "crates/aterm-telemetry", "crates/aterm-tempfile",
@@ -85,7 +85,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.202.0"
+version = "0.203.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -129,6 +129,8 @@ amacs-term = { path = "crates/amacs-term" }
 aterm-a11y = { path = "crates/aterm-a11y" }
 aterm-agent = { path = "crates/aterm-agent" }
 aterm-land = { path = "crates/aterm-land" }
+# The trailers `verify land` writes on a landing merge and their one reader, std only.
+aterm-land-trailer = { path = "crates/aterm-land-trailer" }
 # The one agent name table (`agent_of`), apart from aterm-phase's screen reader.
 aterm-agent-names = { path = "crates/aterm-agent-names" }
 aterm-alloc = { path = "crates/aterm-alloc" }
@@ -267,6 +269,8 @@ aterm-rle = { path = "crates/aterm-rle" }
 aterm-sandbox = { path = "crates/aterm-sandbox" }
 aterm-scene = { path = "crates/aterm-scene" }
 aterm-scrollback = { path = "crates/aterm-scrollback" }
+# Generated-file seals (`line`, `stamp`, `check`), which the generators stamp and census checks.
+aterm-seal = { path = "crates/aterm-seal" }
 aterm-search = { path = "crates/aterm-search" }
 # The credentials vault, `aterm secrets` (docs/DESIGN-secrets-2026-10-20.md).
 aterm-secrets = { path = "crates/aterm-secrets" }

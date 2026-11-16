@@ -967,14 +967,21 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
         .messages_last_publish
         .expect("opening Settings publishes");
     assert_eq!(app.messages_publish_due_at(), Some(opened + TICK));
-    fn view_mut(app: &mut App, wid: WindowId) -> &mut crate::native_settings::SettingsViewState {
+    fn with_view<R>(
+        app: &mut App,
+        wid: WindowId,
+        run: impl FnOnce(&mut crate::native_settings::SettingsViewState) -> R,
+    ) -> R {
         let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
-        match app.native_runtime.view_state_mut(view) {
-            Some(crate::native_app::AppViewState::Settings(state)) => state,
+        let mut guard = app.native_runtime.view_state_mut(view).unwrap();
+        match &mut *guard {
+            crate::native_app::AppViewState::Settings(state) => run(state),
             _ => unreachable!(),
         }
     }
-    view_mut(&mut app, wid).show_transient_status_for_test("Copied");
+    with_view(&mut app, wid, |state| {
+        state.show_transient_status_for_test("Copied")
+    });
     assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
     app.publish_native_messages_state_if_due(opened + GAP);
     let stamped = app.messages_last_publish.unwrap();
@@ -985,8 +992,9 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     assert!(app.messages_deadline().is_some_and(|d| d <= stamped + WAIT));
     app.publish_native_messages_state_if_due(stamped + WAIT - std::time::Duration::from_millis(1));
     assert_eq!(app.messages_last_publish, Some(stamped), "not yet");
-    view_mut(&mut app, wid)
-        .age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
+    with_view(&mut app, wid, |state| {
+        state.age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS)
+    });
     app.publish_native_messages_state_if_due(stamped + WAIT);
     let cleared = app.messages_last_publish.unwrap();
     assert_ne!(cleared, stamped);
@@ -1015,21 +1023,29 @@ fn a_transient_status_line_clears_on_every_page() {
         None,
         "About with no transient line arms nothing"
     );
-    fn view_mut(app: &mut App, wid: WindowId) -> &mut crate::native_settings::SettingsViewState {
+    fn with_view<R>(
+        app: &mut App,
+        wid: WindowId,
+        run: impl FnOnce(&mut crate::native_settings::SettingsViewState) -> R,
+    ) -> R {
         let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
-        match app.native_runtime.view_state_mut(view) {
-            Some(crate::native_app::AppViewState::Settings(state)) => state,
+        let mut guard = app.native_runtime.view_state_mut(view).unwrap();
+        match &mut *guard {
+            crate::native_app::AppViewState::Settings(state) => run(state),
             _ => unreachable!(),
         }
     }
-    view_mut(&mut app, wid).show_transient_status_for_test("Build information copied");
+    with_view(&mut app, wid, |state| {
+        state.show_transient_status_for_test("Build information copied")
+    });
     assert_eq!(app.messages_publish_due_at(), Some(opened + GAP));
     app.publish_native_messages_state_if_due(opened + GAP);
     let stamped = app.messages_last_publish.unwrap();
     assert_eq!(settings_view(&app, wid).unwrap().status_clock(), Some(true));
     assert_eq!(app.messages_publish_due_at(), Some(stamped + WAIT));
-    view_mut(&mut app, wid)
-        .age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS);
+    with_view(&mut app, wid, |state| {
+        state.age_transient_status_for_test(crate::native_settings::MESSAGES_FEEDBACK_MS)
+    });
     app.publish_native_messages_state_if_due(stamped + WAIT);
     let view = settings_view(&app, wid).unwrap();
     assert_eq!(
@@ -1191,16 +1207,23 @@ fn a_headless_messages_page_republished_at(
     );
     assert_eq!(app.messages_publish_due_at(), Some(fresh + TICK));
 
-    fn view_mut(app: &mut App, wid: WindowId) -> &mut crate::native_settings::SettingsViewState {
+    fn with_view<R>(
+        app: &mut App,
+        wid: WindowId,
+        run: impl FnOnce(&mut crate::native_settings::SettingsViewState) -> R,
+    ) -> R {
         let (_, view) = app.active_native_view(wid).expect("Settings fronts it");
-        match app.native_runtime.view_state_mut(view) {
-            Some(crate::native_app::AppViewState::Settings(state)) => state,
+        let mut guard = app.native_runtime.view_state_mut(view).unwrap();
+        match &mut *guard {
+            crate::native_app::AppViewState::Settings(state) => run(state),
             _ => unreachable!(),
         }
     }
-    view_mut(&mut app, wid).navigate(SettingsRoute::About);
+    with_view(&mut app, wid, |state| state.navigate(SettingsRoute::About));
     assert_eq!(app.messages_publish_due_at(), None, "About says no time");
-    view_mut(&mut app, wid).navigate(SettingsRoute::Messages);
+    with_view(&mut app, wid, |state| {
+        state.navigate(SettingsRoute::Messages)
+    });
     assert_eq!(app.messages_publish_due_at(), Some(fresh + TICK));
 
     let settings_tab = app.windows[&wid].tab_set.active().unwrap().id;
@@ -2079,7 +2102,7 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
 
 #[cfg(unix)]
 fn window_seen(app: &mut App) {
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.window_on_screen_for_test = true;
         ws.occluded = false;
     }
@@ -4329,7 +4352,7 @@ fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
                 aterm you start finishes the update, and update checks wait until then.";
     let secs = std::time::Duration::from_secs;
     let on_screen = |app: &mut App, seen: bool| {
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
         ws.window_on_screen_for_test = true;
         ws.occluded = !seen;
     };
@@ -4369,7 +4392,7 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
                 build 11 is still running: no apply attempt has been recorded for it.";
     let secs = std::time::Duration::from_secs;
     let on_screen = |app: &mut App, seen: bool| {
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
         ws.window_on_screen_for_test = true;
         ws.occluded = !seen;
     };
@@ -4461,7 +4484,7 @@ fn an_owed_warning_is_seen_once_a_window_is_on_screen_and_ends_at_its_hold() {
                 build 11 is still running: no apply attempt has been recorded for it.";
     let secs = std::time::Duration::from_secs;
     let on_screen = |app: &mut App, seen: bool| {
-        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
         ws.window_on_screen_for_test = true;
         ws.occluded = !seen;
     };
@@ -4899,9 +4922,10 @@ fn appstatus_carries_no_motion_words() {
 #[test]
 fn the_messages_page_lists_log_only_records() {
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
     ws.window_on_screen_for_test = true;
     ws.focused = true;
+    drop(ws);
     let first = app.record_message(Message::new(
         tags::TOOLCHAIN,
         Severity::Info,

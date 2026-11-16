@@ -300,7 +300,7 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
         Some(unreclaimable) => (unreclaimable, bytes("SReclaimable").unwrap_or(0)),
         None => (bytes("Slab").unwrap_or(0), 0),
     };
-    let swap_total = bytes("SwapTotal").unwrap_or(0);
+    let swap_total = bytes("SwapTotal");
     let commit = match (bytes("Committed_AS"), bytes("CommitLimit")) {
         (Some(charge), Some(limit)) => Some(Commit {
             charge,
@@ -327,7 +327,9 @@ pub fn memory_detail(text: &str) -> Option<MemoryDetail> {
             .saturating_add(reclaimable),
         app: bytes("AnonPages").unwrap_or(0),
         shared,
-        swap_used: swap_total.saturating_sub(bytes("SwapFree").unwrap_or(swap_total)),
+        swap_used: swap_total
+            .zip(bytes("SwapFree"))
+            .and_then(|(total, free)| total.checked_sub(free)),
         swap_total,
         commit,
         pressure: None,
@@ -516,6 +518,7 @@ fn sys_link(dir: &mut PathBuf, row: NetDev) -> LinkReading {
             None
         },
         name: row.name,
+        byte_counter: crate::LinkByteCounter::Cumulative64,
         rx: row.rx,
         tx: row.tx,
     }

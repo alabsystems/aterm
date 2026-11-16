@@ -12,7 +12,8 @@ pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gp
                          scope= on jobs disk procs (cores gpu mem net take it, rows unchanged), \
                          scope=pane|tab|aterm on left, depth= on \
                          disk, instances=all on overview aterm global cores gpu mem net and procs \
-                         scope=aterm; or sys name job=<id>|task=<id> [--json], sys policy \
+                         scope=aterm; or sys disk held [fresh=<ms>] [since=<ep>.<seq>] [--json], \
+                         sys name job=<id>|task=<id> [--json], sys policy \
                          [status|collect|cancel] [--json] (aterm help sys)\n";
 /// The usage line for a word after `why` that is not its one subject or an option.
 pub const WHY_USAGE: &str = "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json] \
@@ -116,6 +117,30 @@ impl View {
     }
 }
 
+/// A form of the disk view: a word after `disk`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiskForm {
+    /// `held`: who holds home's volume, and what aterm's own passes do with each holding.
+    Held,
+}
+
+impl DiskForm {
+    /// Every form, in the help's order.
+    pub const ALL: [DiskForm; 1] = [Self::Held];
+
+    /// Its word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+        }
+    }
+
+    fn from_word(w: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.word() == w)
+    }
+}
+
 /// A `scope=` word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeArg {
@@ -209,6 +234,8 @@ pub enum NameTarget {
 pub struct SysQuery {
     /// The view (overview by default).
     pub view: View,
+    /// The disk view's form (`disk held`); `None` for the plain view and every other view.
+    pub form: Option<DiskForm>,
     /// `scope=`, where given.
     pub scope: Option<ScopeArg>,
     /// `instances=all`.
@@ -258,11 +285,13 @@ impl SysQuery {
     /// # Errors
     /// [`USAGE`] for an unknown or second view, an unknown key, an invalid value, a bare `name`,
     /// or `scope=`, `depth=` or `instances=` on a view that does not take it, or read options
-    /// other than JSON formatting or the advisory caller label on an explicit `name` action;
-    /// [`WHY_USAGE`] for any other word after `why`.
+    /// other than JSON formatting or the advisory caller label on an explicit `name` action; a
+    /// form word anywhere but once after `disk`, and `scope=`, `depth=` or `top=` with
+    /// `disk held`; [`WHY_USAGE`] for any other word after `why`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut q = Self {
             view: View::Overview,
+            form: None,
             scope: None,
             instances_all: false,
             top: TOP_DEFAULT,
@@ -339,6 +368,12 @@ impl SysQuery {
             } else if !view_seen && let Some(v) = View::from_word(tok) {
                 view_seen = true;
                 q.view = v;
+            } else if view_seen
+                && q.view == View::Disk
+                && q.form.is_none()
+                && let Some(f) = DiskForm::from_word(tok)
+            {
+                q.form = Some(f);
             } else {
                 return Err(USAGE);
             }
@@ -386,17 +421,27 @@ impl SysQuery {
                 return Err(USAGE);
             }
         }
+        // `disk held` reads every holding on home's volume, largest first: no scope, folder
+        // depth or row count shapes it (`instances=` is refused on every disk view above).
+        if q.form == Some(DiskForm::Held) && (q.scope.is_some() || q.depth.is_some() || q.top_set) {
+            return Err(USAGE);
+        }
         Ok(q)
     }
 
-    /// The scope the request reads (`scope=`, else the view's default).
+    /// The scope the request reads (`scope=`, else the view's default); none for `disk held`,
+    /// which reads every holding on home's volume.
     #[must_use]
     pub fn effective_scope(&self) -> Option<ScopeArg> {
+        if self.form == Some(DiskForm::Held) {
+            return None;
+        }
         self.scope.or(self.view.default_scope())
     }
 
     /// Returns whether the request reads only aggregates or the target tab's own rows (`disk` up
-    /// to its window, other tabs' writers withheld and their folders unnamed).
+    /// to its window, other tabs' writers withheld and their folders unnamed). `disk held` reads
+    /// past the target's tab (it has no scope), so it does not.
     #[must_use]
     pub fn target_rows_only(&self) -> bool {
         if self.instances_all || self.name.is_some() {

@@ -173,14 +173,19 @@ impl Arrivals {
                 self.retry = None;
                 Ok(true)
             }
-            // A refusal of this code and another protocol stand for this generation.
-            Err(LanError::Unavailable(Unavailable::Outdated { .. } | Unavailable::Refused(_))) => {
+            // A refusal of this code, another protocol and a job the person switched off stand
+            // for this generation: a broker that starts makes its socket again.
+            Err(LanError::Unavailable(
+                Unavailable::Outdated { .. } | Unavailable::Refused(_) | Unavailable::SwitchedOff,
+            )) => {
                 self.retry = None;
                 Ok(false)
             }
             // No listener yet, a broker that did not judge this process (its code check did not
             // finish, or it was serving its most connections), or a failed exchange.
-            Err(LanError::Unavailable(Unavailable::NotInstalled | Unavailable::Unchecked(_)))
+            Err(LanError::Unavailable(
+                Unavailable::NotInstalled | Unavailable::NotRunning | Unavailable::Unchecked(_),
+            ))
             | Err(LanError::Io(_)) => {
                 self.retry = Some(Instant::now() + self.delay);
                 self.delay = (self.delay * 2).min(Duration::from_secs(30));

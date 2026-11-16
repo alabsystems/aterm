@@ -4,10 +4,29 @@
 use super::*;
 use aterm_spec::interp::State as ModelState;
 
+/// The model's case `case`: 0 to 4 both windows spent (slots swapped, resets in either order or
+/// one missing), 5 the five-hour window alone, 6 the week beside a five-hour share that rounds up
+/// to 100% unspent, 7 nothing spent or refused, 8 an ordinary refusal and 9 a workspace's credits
+/// beside that rounded share, 10 a reached spend control and 11 a workspace's usage limit beside
+/// roomy windows (the five-hour window, then the week, the more used).
 fn reading(case: i64) -> Usage {
-    let session = if case == 6 || case == 7 { 99.1 } else { 100.0 };
-    let session = if case >= 8 { 99.1 } else { session };
-    let week = if case == 5 || case >= 7 { 30.0 } else { 100.0 };
+    let session = match case {
+        6..=9 => 99.1,
+        10 => 20.0,
+        11 => 10.0,
+        _ => 100.0,
+    };
+    let week = match case {
+        5 | 7..=9 => 30.0,
+        10 => 10.0,
+        11 => 60.0,
+        _ => 100.0,
+    };
+    let reached = match case {
+        9 => Some("workspace_member_credits_depleted"),
+        11 => Some("workspace_owner_usage_limit_reached"),
+        _ => None,
+    };
     let (session_reset, week_reset) = if case == 2 {
         (Some(NOW + 2 * HOUR), Some(NOW + HOUR))
     } else {
@@ -27,7 +46,8 @@ fn reading(case: i64) -> Usage {
         &aterm_json::json!({
             "ordinaryUsageAllowed":case != 8,
             "rateLimits":{
-                "rateLimitReachedType":(case == 9).then_some("workspace_member_credits_depleted"),
+                "rateLimitReachedType":reached,
+                "spendControlReached":(case == 10).then_some(true),
                 "primary":windows[0],"secondary":windows[1]
             }
         }),
@@ -42,6 +62,8 @@ fn reading(case: i64) -> Usage {
         5 | 8 | 9 => vec![(accounts::SESSION_LIMIT, session_reset)],
         6 => vec![(accounts::WEEK_LIMIT, week_reset)],
         7 => Vec::new(),
+        10 => vec![(accounts::SESSION_LIMIT, None)],
+        11 => vec![(accounts::WEEK_LIMIT, None)],
         _ => unreachable!(),
     };
     assert_eq!(usage.walls, expected, "case {case}: keep each exact reset");
@@ -59,13 +81,24 @@ fn reading(case: i64) -> Usage {
                 "primary_window":backend_window(&windows[0]),
                 "secondary_window":backend_window(&windows[1])
             },
-            "rate_limit_reached_type":(case == 9).then_some("workspace_member_credits_depleted")
+            "rate_limit_reached_type":reached,
+            "spend_control":(case == 10).then(|| aterm_json::json!({"reached":true}))
         }),
         NOW,
     )
     .unwrap();
     assert_eq!(usage, backend, "case {case}: backend normalization");
     usage
+}
+
+/// Whether a wall of `usage` names a reset of a window its sample shows unspent: a turnover that
+/// says nothing of when the wall ends ([`accounts::Sample::reached_reset`]).
+fn borrowed(usage: &Usage) -> i64 {
+    i64::from(
+        usage.walls.iter().any(|&(window, reset)| {
+            reset.is_some() && usage.sample.reached_reset(window).is_none()
+        }),
+    )
 }
 
 fn mask<'a>(names: impl Iterator<Item = &'a str>) -> i64 {
@@ -149,6 +182,7 @@ pub(crate) fn quota_transition(state: &ModelState, action: &str) -> ModelState {
             let usage = reading(state["case"]);
             next.insert("phase", 1);
             next.insert("parsed", mask(usage.walls.iter().map(|(name, _)| *name)));
+            next.insert("borrowed", borrowed(&usage));
         }
         "Record" => {
             let (stored, blocked) = recorded(state["case"], false);
@@ -189,4 +223,28 @@ fn simultaneous_quota_walls_conform_through_durable_reload_and_unread_launch() {
     assert!(!model.check_invariant("LaterResetStillBlocks", &state));
     state.insert("parsed", stored);
     assert!(!model.check_invariant("ExactParsing", &state));
+    // The old fallback borrowed the most-used window's turnover: a spend control's wall beside
+    // roomy windows ended at the five-hour reset. That reading must violate the model too.
+    for case in [10, 11] {
+        let mut old = reading(case);
+        let window = old.fallback_window();
+        let turnover = if window == accounts::WEEK_LIMIT {
+            old.sample.week_reset
+        } else {
+            old.sample.session_reset
+        };
+        old.walls = vec![(window, turnover)];
+        let mut state = model.init_state();
+        state.insert("case", case);
+        state = quota_transition(&state, "Parse");
+        assert!(
+            model.check_invariant("NoBorrowedReset", &state),
+            "case {case}"
+        );
+        state.insert("borrowed", borrowed(&old));
+        assert!(
+            !model.check_invariant("NoBorrowedReset", &state),
+            "case {case}: a borrowed reset"
+        );
+    }
 }

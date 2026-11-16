@@ -22,6 +22,11 @@ mod restored_worker;
 /// The window's journal off: the negative control's seam (`keeper_link::journal_refusal`).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
 
+/// The window's META pump never starts (`keeper_link::NO_META_SEAM`): once its registrations'
+/// own ops are written, nothing but the keeper's frame wakes its link's worker, where the META a
+/// registration rings for would be an op whose wake drains the keeper's answer too.
+const NO_META_SEAM: &str = "ATERM_DEBUG_KEEPER_NO_META";
+
 #[test]
 fn keeper_runner_death_actor() {
     let Some(root) = std::env::var_os("ATERM_KEEPER_DEATH_ROOT") else {
@@ -572,11 +577,6 @@ fn a_crashed_window_s_turns_are_still_in_history() {
     );
 }
 
-/// The keeper link's worker and the META pump idle an hour (`keeper_link::QUIET_SEAM`), so only
-/// a queued op or the keeper's own frame wakes the worker.
-const QUIET_SEAM: &str = "ATERM_DEBUG_KEEPER_QUIET_MS";
-const AN_HOUR_MS: &str = "3600000";
-
 /// A's sessions in the keeper's custody, each journaling into a region the keeper holds:
 /// session 0 and `more` spawned beside it, each read to its prompt and its journal live.
 fn sessions_in_custody(root: &Path, ctl: &mut Ctl, more: usize) -> Vec<String> {
@@ -623,8 +623,9 @@ fn await_status_of(ctl: &mut Ctl, sid: &str, key: &str, value: &str) {
 }
 
 /// K1 integration coverage: a recovered instance is served after the keeper's SYNC behind
-/// the adopted session's new journal. The link's idle wait and META pump period are an hour;
-/// this checks successful recovery with periodic work quiet, not every earlier worker schedule.
+/// the adopted session's new journal. A connected link's worker waits with no deadline, and B's
+/// META pump never starts ([`NO_META_SEAM`]), so no op follows the SYNC and only the keeper's
+/// own answer can serve it.
 #[test]
 fn a_recovered_window_is_served_once_its_keeper_answers_with_its_link_quiet() {
     let world = world("q");
@@ -634,7 +635,7 @@ fn a_recovered_window_is_served_once_its_keeper_answers_with_its_link_quiet() {
     let mut ctl = Ctl::connect(&sock);
     sessions_in_custody(&root, &mut ctl, 0);
     drop(ctl);
-    let (_b, mut ctl) = crash_and_recover(&root, a, &[(QUIET_SEAM, AN_HOUR_MS)]);
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[(NO_META_SEAM, "1")]);
     await_status(&mut ctl, "restore", "exact");
 }
 
@@ -643,8 +644,9 @@ fn a_recovered_window_is_served_once_its_keeper_answers_with_its_link_quiet() {
 /// replaces A's. B's registration tells the keeper the session has none (COMPANION_RELEASE), the
 /// keeper drops A's region, and its answer to the SYNC behind that lifts B's recovery-count fence:
 /// B is served ([`admitted`], the one-minute must-happen wait), where before it answered
-/// `ERR recovery-count-custody unconfirmed` for the rest of its run. The link idles an hour, so
-/// only the keeper's own answer can lift it.
+/// `ERR recovery-count-custody unconfirmed` for the rest of its run. A connected link waits with
+/// no deadline, and B's META pump never starts ([`NO_META_SEAM`]), so only the keeper's own
+/// answer can lift it.
 #[test]
 fn a_recovered_session_without_a_journal_is_served_once_its_keeper_drops_the_old_one() {
     let world = world("nj");
@@ -654,11 +656,7 @@ fn a_recovered_session_without_a_journal_is_served_once_its_keeper_drops_the_old
     let mut ctl = Ctl::connect(&sock);
     sessions_in_custody(&root, &mut ctl, 0);
     drop(ctl);
-    let (_b, mut ctl) = crash_and_recover(
-        &root,
-        a,
-        &[(NO_JOURNAL_SEAM, "1"), (QUIET_SEAM, AN_HOUR_MS)],
-    );
+    let (_b, mut ctl) = crash_and_recover(&root, a, &[(NO_JOURNAL_SEAM, "1"), (NO_META_SEAM, "1")]);
     await_status(&mut ctl, "journal_off", "seam");
     await_keeper(&root, "claimed=1");
     await_keeper(&root, "journals=0");

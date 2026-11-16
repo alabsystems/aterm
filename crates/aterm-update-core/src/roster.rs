@@ -316,6 +316,43 @@ impl Roster {
     }
 }
 
+impl Roster {
+    /// Verify bytes kept beside an installed build under the roster that authorized them at
+    /// install, judged now: the signer is one of this roster's machines, revoked neither here nor
+    /// in `revoked` (a newer roster's deny-list). Its `not_after` is not judged: it bounds when a
+    /// machine may sign, and these bytes were signed before the install that admitted them under
+    /// it, while it held.
+    pub fn authorize_kept(
+        &self,
+        bytes: &[u8],
+        sig: &[u8],
+        revoked: &[String],
+    ) -> Result<Attribution, RosterReject> {
+        if sig.len() != 64 {
+            return Err(RosterReject::BadSig);
+        }
+        let mut withdrawn = false;
+        for m in &self.machines {
+            if verify_under(&m.pubkey, bytes, sig).is_ok() {
+                if self.is_revoked(&m.id) || revoked.contains(&m.id) {
+                    withdrawn = true;
+                    continue;
+                }
+                return Ok(Attribution {
+                    machine_id: m.id.clone(),
+                    pubkey_b64: m.pubkey.clone(),
+                    roster_seq: self.roster_seq,
+                });
+            }
+        }
+        Err(if withdrawn {
+            RosterReject::Revoked
+        } else {
+            RosterReject::Verify
+        })
+    }
+}
+
 impl Attribution {
     /// Bind the manifest's self-declared identity to what verified.
     pub fn bind(

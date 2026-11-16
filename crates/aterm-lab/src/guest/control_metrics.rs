@@ -56,7 +56,7 @@ fn collect(
         let mut fields = line.split_whitespace();
         fields.next()?.parse::<u64>().ok()?;
         let sid = fields.next()?;
-        aterm_types::tab_id::is_tab_id(sid).then_some(sid)
+        aterm_types::control_verbs::is_minted_sid(sid).then_some(sid)
     });
     let sid = sid.ok_or("no session belonging to the connected GUI")?;
     let metrics = client

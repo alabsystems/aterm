@@ -97,7 +97,7 @@ fn every_full_screen_display_geometry_is_admitted_for_a_pool_of_panes() {
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
     {
-        let ws = app.windows.get_mut(&wid).expect("the headless window");
+        let mut ws = app.windows.get_mut(&wid).expect("the headless window");
         ws.metrics.pad = 24;
         ws.metrics.pad_top = 4;
         ws.metrics.head = 80;

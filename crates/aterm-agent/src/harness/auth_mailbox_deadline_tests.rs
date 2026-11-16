@@ -163,7 +163,7 @@ fn expiry_at_the_next_evaluate_keeps_an_observed_bot_check() {
     now.set(deadline.end());
     let _ = take_met();
     assert_eq!(
-        oauth_time_left(deadline, &bot, Some("claude.ai")),
+        oauth_time_left(deadline, &bot, false, Some("claude.ai")),
         Err(BOT_CHECK_UNCLEARED)
     );
     assert_eq!(
@@ -173,7 +173,7 @@ fn expiry_at_the_next_evaluate_keeps_an_observed_bot_check() {
             Some("claude.ai")
         ))
     );
-    assert!(oauth_time_left(deadline, &BotCheckClock::default(), None).is_err());
+    assert!(oauth_time_left(deadline, &BotCheckClock::default(), false, None).is_err());
     assert_eq!(
         take_met(),
         Some(super::super::open_url::Met::new(MetWord::Stall, None))

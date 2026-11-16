@@ -61,6 +61,8 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
                     (home == home_path).then(|| Usage {
                         sample: near_wall(),
                         walls: Vec::new(),
+                        refusal: None,
+                        limits: Default::default(),
                     })
                 },
             )

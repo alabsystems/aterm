@@ -286,6 +286,8 @@ fn fx_install_release_stamp() {
         trust_verify: "off",
         index_hint: "",
         release_build: true,
+        // A synthetic release identity does not establish executable compile facts.
+        ..aterm_stamp::Stamp::UNSTAMPED
     };
     // Installed the way the shipped binary installs its own: from the record its section holds.
     let record = Box::leak(Box::new(
@@ -500,6 +502,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: cwd.map(str::to_string),
         title: title.to_string(),
@@ -556,13 +559,18 @@ fn fx_capture_leaves(desk: &mut FxDesk) {
         } else {
             return;
         };
-        let (lineage, log_ep) = {
+        let (lineage, opened_ms, log_ep) = {
             let timeline = timeline.lock().unwrap();
-            (timeline.slog().lineage(), timeline.slog().log().ep())
+            (
+                timeline.slog().lineage(),
+                timeline.slog().opened_ms(),
+                timeline.slog().log().ep(),
+            )
         };
         leaf.lineage = lineage
             .map(|lineage| lineage.as_str().to_string())
             .filter(|lineage| *lineage != record.sid && crate::restore::carried_sid(lineage));
+        leaf.opened_ms = opened_ms;
         leaf.sid = Some(record.sid);
         leaf.log_ep = Some(log_ep);
         leaf.user_title = record.user_title;
@@ -4413,163 +4421,205 @@ fn fx_two_drawers(flavour: u8) -> Terminal {
 
 fn fx_engine_state_desk() -> FxDesk {
     use crate::restore::RestoreManifest;
-    let cwd = "/home/dev/src/aterm";
-    let mut shells: Vec<(&str, Terminal, &str)> = Vec::new();
-
-    let mut ssh = fx_shell(ROWS, COLS, 40, "/home/dev", 2);
-    ssh.fx_process(
-        b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ ls\r\n\x1b[38:2::120:200:3",
-    );
-    assert_eq!(ssh.partial_sequence_state(), Some("CsiParam"));
-    shells.push(("ssh", ssh, "/home/dev"));
-
-    let mut vim = fx_editor(ROWS, COLS, 4);
-    vim.fx_process(b"\x1b[2 ");
-    assert_eq!(vim.partial_sequence_state(), Some("CsiIntermediate"));
-    shells.push(("vim", vim, "/home/dev/src"));
-
-    let mut vsplit = fx_shell(ROWS, COLS, 6, cwd, 7);
-    vsplit.fx_process("vim -O a b\r\n\x1b[?1049h\x1b[?69h\x1b[51;100s\x1b[1;50H│".as_bytes());
-    assert!(
-        vsplit.grid().cursor_follows_glyph(),
-        "the bar vim drew up to its split's margin is still the glyph before the cursor"
-    );
-    shells.push(("vim", vsplit, cwd));
-
-    let mut imgcat = fx_shell(ROWS, COLS, 40, cwd, 5);
-    imgcat.fx_process(b"imgcat plot.png\r\n\x1b]1337;File=name=cGxvdC5wbmc=;size=6144;inline=1:");
-    imgcat.fx_process("iVBORw0KGgo".repeat(500).as_bytes());
-    assert_eq!(imgcat.partial_sequence_state(), Some("OscString"));
-    assert!(imgcat.partial_sequence_swallows_picture());
-    shells.push(("imgcat", imgcat, cwd));
-
-    let mut cat = fx_shell(ROWS, COLS, 40, cwd, 6);
-    cat.fx_process("cat README.ja.md\r\n日本語の説明\r\n日本".as_bytes());
-    cat.fx_process(&"語".as_bytes()[..2]);
-    shells.push(("cat", cat, cwd));
-
-    let mut screen = fx_shell(ROWS, COLS, 40, "/home/dev", 7);
-    screen.fx_process("screen -r build\r\n\x1b_build ✓ deploy ".as_bytes());
-    screen.fx_process(&"✓".as_bytes()[..2]);
-    assert_eq!(screen.partial_sequence_state(), Some("SosPmApcString"));
-    shells.push(("screen", screen, "/home/dev"));
-
-    let mut tmux = fx_shell(ROWS, COLS, 40, cwd, 8);
-    tmux.fx_process(b"tmux attach -t work\r\n\x1bPtmux;\x1b\x1b_Gf=100,a=T,m=1;iVBORw0KGgo");
-    assert!(tmux.partial_sequence_state().is_some());
-    shells.push(("tmux", tmux, cwd));
-
-    let mut sixel = fx_shell(ROWS, COLS, 40, cwd, 0);
-    sixel.fx_process(b"img2sixel plot.png\r\n\x1bP0;1;8");
-    assert_eq!(sixel.partial_sequence_state(), Some("DcsParam"));
-    shells.push(("img2sixel", sixel, cwd));
-
-    let mut mc = fx_shell(ROWS, COLS, 40, "/home/dev", 1);
-    mc.set_allow_palette_reconfigure(true);
-    mc.fx_process(
-        b"mc\r\n\x1b]4;1;rgb:cc/24/1d\x07\x1b]4;4;rgb:45/85/88\x07\x1b]10;rgb:eb/db/b2\x07\
-          \x1b]11;rgb:28/28/28\x07\x1b]12;rgb:fe/80/19\x07\x1b]17;rgb:50/49/45\x07\
-          \x1b]19;rgb:fb/f1/c7\x07\x1b]30001\x07\x1b]19;rgb:ff/ff/ff\x07",
-    );
-    mc.fx_process(b"\x1b-A\x1b.F\x1b/L");
-    mc.fx_process(b"\x1b]1;\x07\x1b]2;mc [dev@devhost]:~\x07\x1b[22;0t\x1b]9;4;1;42\x07");
-    mc.fx_process(b"\x1b[?1000h\x1b[?1000s");
-    mc.fx_process(b"\x1b[?1049h\x1b[>1u\x1b[58:2::255:128:0m\x1b[5;7H\x1b7\x1b[?1049l");
-    mc.fx_process(b"\x1b[58:2::255:128:0m\x1b[1\"q\x1b[#{");
-    mc.fx_process(b"\x1b]8;id=mc-help;https://example.invalid/mc/help\x1b\\help ");
-    mc.fx_process("\u{1F469}\u{200D}".as_bytes());
-    shells.push(("mc", mc, "/home/dev"));
-
-    let mut htop = fx_shell(ROWS, COLS, 40, cwd, 3);
-    htop.fx_process(b"htop\r\n\x1b[?1049h\x1b[H\x1b[2J");
-    for r in 1..=ROWS {
-        let row = format!(
-            "  {:>5} dev   20   0  412M  38M S  0.{r}  0.4  0:0{}.12 /home/dev/.local/bin/aterm --sock /tmp/s{r}",
-            4100 + u32::from(r),
-            r % 10
-        );
-        htop.fx_process(format!("\x1b[{r};1H{row:-<99}").as_bytes());
-    }
-    htop.resize(ROWS, COLS - 20);
-    assert!(htop.render_debt().owed(), "htop has not redrawn since");
-    shells.push(("htop", htop, cwd));
-
-    let mut short = fx_shell(ROWS, COLS, 18, "/home/dev", 4);
-    short.resize(ROWS - 12, COLS);
-    shells.push(("zsh", short, "/home/dev"));
-
-    let mut vt52 = fx_shell(ROWS, COLS, 40, "/home/dev", 5);
-    vt52.fx_process(b"./vt52-menu\r\n\x1b[?2l\x1bY%");
-    shells.push(("vt52-menu", vt52, "/home/dev"));
-
-    let mut codex = fx_shell(ROWS, COLS, 12, cwd, 2);
-    codex.fx_process(
-        b"codex\r\n\x1b]7501;state=working:app=codex\x1b\\\
-          \x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
-    );
-    assert_eq!(
-        codex.program_state().state.map(|s| s.state),
-        Some(aterm_core::terminal::program_state::ProgramStateWord::Blocked),
-        "codex stands at a box it reported"
-    );
-    shells.push(("codex", codex, cwd));
-
-    let rev_nonce = [0xa1; 32];
-    let rev_id = fx_hex(&rev_nonce);
-    let mut rev = fx_signed_shell(ROWS, COLS, rev_nonce, cwd, 3);
-    fx_process_at(
-        &mut rev,
-        format!(
-            "cd ../notes\r\n\x1b]133;C;id={rev_id}\x07\x1b]133;D;0;id={rev_id}\x07\
-             \x1b]633;P;AtermIntegration=0123456789abcdef;id={rev_id}\x07\
-             \x1b]633;P;AtermCwd=file://devhost/home/dev/src/notes;id={rev_id}\x07\
-             \x1b]7;file://devhost/home/dev/src/notes\x07\
-             \x1b]133;A;id={rev_id}\x07dev@devhost notes % \x1b]133;B;id={rev_id}\x07"
-        )
-        .as_bytes(),
-        30_000,
-    );
-    shells.push(("zsh", rev, "/home/dev/src/notes"));
-
-    let mut job = fx_signed_shell(ROWS, COLS, [0xa2; 32], cwd, 4);
-    job.fx_process(b"\x1b]7;file://devhost/home/dev/tmp\x07");
-    job.set_foreground_job(true);
-    job.fx_process(b"\x1b]7;file://devhost/home/dev/src/aterm/crates\x07");
-    shells.push(("zsh", job, cwd));
-
-    let stale_nonce = [0xa3; 32];
-    let mut stale = fx_shell(ROWS, COLS, 30, cwd, 6);
-    stale.set_require_shell_integration_nonce(true);
-    stale.authorize_shell_integration_on_first_mark(stale_nonce);
-    fx_process_at(
-        &mut stale,
-        format!("\x1b]133;D;0;id={}\x07", fx_hex(&stale_nonce)).as_bytes(),
-        30_100,
-    );
-    shells.push(("zsh", stale, cwd));
-
-    let (mut cleared, sign) = fx_marked_shell(ROWS, COLS, Some([0xa4; 32]), false, b"", 6, cwd, 3);
-    fx_process_at(
-        &mut cleared,
-        format!(
-            "clear\r\n\x1b]133;C{sign}\x07\x1b[H\x1b[2J\x1b]133;D;0{sign}\x07\
-             \x1b]133;A{sign}\x07dev@devhost aterm % \x1b]133;B{sign}\x07\x1b]133;D;0{sign}\x07"
-        )
-        .as_bytes(),
-        30_200,
-    );
-    shells.push(("zsh", cleared, cwd));
-
-    shells.push(("claude", fx_two_drawers(2), cwd));
-    let mut restored = Terminal::from_checkpoint(&fx_two_drawers(5).checkpoint());
-    restored.fx_process(b"\r\n\x1b[2mresuming\x1b[0m\r\n");
-    shells.push(("claude", restored, cwd));
-
-    // Line sizes and DECSCA protection on the alternate screen and on the saved primary.
-    let mut banner = fx_shell(ROWS, COLS, 12, cwd, 1);
-    banner.fx_process(b"./banner\r\n\x1b#6RELEASE NOTES\r\n\x1b[1\"qread only\x1b[0\"q\r\n");
-    banner.fx_process(b"\x1b[?1049h\x1b[H\x1b#3TOP\r\n\x1b#4TOP\r\n\x1b[1\"qfield:\x1b[0\"q ");
-    shells.push(("banner", banner, cwd));
+    type ShellFixture = (&'static str, Terminal, &'static str);
+    const CWD: &str = "/home/dev/src/aterm";
+    // Each case has its own constructor frame: the generated desk keeps its terminals on the
+    // heap, so their moved values need not share this frame with the later headless window.
+    let builders: [fn() -> ShellFixture; 20] = [
+        || {
+            let mut ssh = fx_shell(ROWS, COLS, 40, "/home/dev", 2);
+            ssh.fx_process(
+                b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ ls\r\n\x1b[38:2::120:200:3",
+            );
+            assert_eq!(ssh.partial_sequence_state(), Some("CsiParam"));
+            ("ssh", ssh, "/home/dev")
+        },
+        || {
+            let mut vim = fx_editor(ROWS, COLS, 4);
+            vim.fx_process(b"\x1b[2 ");
+            assert_eq!(vim.partial_sequence_state(), Some("CsiIntermediate"));
+            ("vim", vim, "/home/dev/src")
+        },
+        || {
+            let mut vsplit = fx_shell(ROWS, COLS, 6, CWD, 7);
+            vsplit
+                .fx_process("vim -O a b\r\n\x1b[?1049h\x1b[?69h\x1b[51;100s\x1b[1;50H│".as_bytes());
+            assert!(
+                vsplit.grid().cursor_follows_glyph(),
+                "the bar vim drew up to its split's margin is still the glyph before the cursor"
+            );
+            ("vim", vsplit, CWD)
+        },
+        || {
+            let mut imgcat = fx_shell(ROWS, COLS, 40, CWD, 5);
+            imgcat.fx_process(
+                b"imgcat plot.png\r\n\x1b]1337;File=name=cGxvdC5wbmc=;size=6144;inline=1:",
+            );
+            imgcat.fx_process("iVBORw0KGgo".repeat(500).as_bytes());
+            assert_eq!(imgcat.partial_sequence_state(), Some("OscString"));
+            assert!(imgcat.partial_sequence_swallows_picture());
+            ("imgcat", imgcat, CWD)
+        },
+        || {
+            let mut cat = fx_shell(ROWS, COLS, 40, CWD, 6);
+            cat.fx_process("cat README.ja.md\r\n日本語の説明\r\n日本".as_bytes());
+            cat.fx_process(&"語".as_bytes()[..2]);
+            ("cat", cat, CWD)
+        },
+        || {
+            let mut screen = fx_shell(ROWS, COLS, 40, "/home/dev", 7);
+            screen.fx_process("screen -r build\r\n\x1b_build ✓ deploy ".as_bytes());
+            screen.fx_process(&"✓".as_bytes()[..2]);
+            assert_eq!(screen.partial_sequence_state(), Some("SosPmApcString"));
+            ("screen", screen, "/home/dev")
+        },
+        || {
+            let mut tmux = fx_shell(ROWS, COLS, 40, CWD, 8);
+            tmux.fx_process(
+                b"tmux attach -t work\r\n\x1bPtmux;\x1b\x1b_Gf=100,a=T,m=1;iVBORw0KGgo",
+            );
+            assert!(tmux.partial_sequence_state().is_some());
+            ("tmux", tmux, CWD)
+        },
+        || {
+            let mut sixel = fx_shell(ROWS, COLS, 40, CWD, 0);
+            sixel.fx_process(b"img2sixel plot.png\r\n\x1bP0;1;8");
+            assert_eq!(sixel.partial_sequence_state(), Some("DcsParam"));
+            ("img2sixel", sixel, CWD)
+        },
+        || {
+            let mut mc = fx_shell(ROWS, COLS, 40, "/home/dev", 1);
+            mc.set_allow_palette_reconfigure(true);
+            mc.fx_process(
+                b"mc\r\n\x1b]4;1;rgb:cc/24/1d\x07\x1b]4;4;rgb:45/85/88\x07\x1b]10;rgb:eb/db/b2\x07\
+                  \x1b]11;rgb:28/28/28\x07\x1b]12;rgb:fe/80/19\x07\x1b]17;rgb:50/49/45\x07\
+                  \x1b]19;rgb:fb/f1/c7\x07\x1b]30001\x07\x1b]19;rgb:ff/ff/ff\x07",
+            );
+            mc.fx_process(b"\x1b-A\x1b.F\x1b/L");
+            mc.fx_process(b"\x1b]1;\x07\x1b]2;mc [dev@devhost]:~\x07\x1b[22;0t\x1b]9;4;1;42\x07");
+            mc.fx_process(b"\x1b[?1000h\x1b[?1000s");
+            mc.fx_process(b"\x1b[?1049h\x1b[>1u\x1b[58:2::255:128:0m\x1b[5;7H\x1b7\x1b[?1049l");
+            mc.fx_process(b"\x1b[58:2::255:128:0m\x1b[1\"q\x1b[#{");
+            mc.fx_process(b"\x1b]8;id=mc-help;https://example.invalid/mc/help\x1b\\help ");
+            mc.fx_process("\u{1F469}\u{200D}".as_bytes());
+            ("mc", mc, "/home/dev")
+        },
+        || {
+            let mut htop = fx_shell(ROWS, COLS, 40, CWD, 3);
+            htop.fx_process(b"htop\r\n\x1b[?1049h\x1b[H\x1b[2J");
+            for r in 1..=ROWS {
+                let row = format!(
+                    "  {:>5} dev   20   0  412M  38M S  0.{r}  0.4  0:0{}.12 /home/dev/.local/bin/aterm --sock /tmp/s{r}",
+                    4100 + u32::from(r),
+                    r % 10
+                );
+                htop.fx_process(format!("\x1b[{r};1H{row:-<99}").as_bytes());
+            }
+            htop.resize(ROWS, COLS - 20);
+            assert!(htop.render_debt().owed(), "htop has not redrawn since");
+            ("htop", htop, CWD)
+        },
+        || {
+            let mut short = fx_shell(ROWS, COLS, 18, "/home/dev", 4);
+            short.resize(ROWS - 12, COLS);
+            ("zsh", short, "/home/dev")
+        },
+        || {
+            let mut vt52 = fx_shell(ROWS, COLS, 40, "/home/dev", 5);
+            vt52.fx_process(b"./vt52-menu\r\n\x1b[?2l\x1bY%");
+            ("vt52-menu", vt52, "/home/dev")
+        },
+        || {
+            let mut codex = fx_shell(ROWS, COLS, 12, CWD, 2);
+            codex.fx_process(
+                b"codex\r\n\x1b]7501;state=working:app=codex\x1b\\\
+                  \x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+            );
+            assert_eq!(
+                codex.program_state().state.map(|s| s.state),
+                Some(aterm_core::terminal::program_state::ProgramStateWord::Blocked),
+                "codex stands at a box it reported"
+            );
+            // Another program's own report stands beside it, in its own slot (HX-15n).
+            codex.fx_process(b"\x1b]7501;state=working:app=kimi-code\x1b\\");
+            assert!(
+                codex.program_state().other.state.is_some(),
+                "another program's report stands apart"
+            );
+            ("codex", codex, CWD)
+        },
+        || {
+            let rev_nonce = [0xa1; 32];
+            let rev_id = fx_hex(&rev_nonce);
+            let mut rev = fx_signed_shell(ROWS, COLS, rev_nonce, CWD, 3);
+            fx_process_at(
+                &mut rev,
+                format!(
+                    "cd ../notes\r\n\x1b]133;C;id={rev_id}\x07\x1b]133;D;0;id={rev_id}\x07\
+                     \x1b]633;P;AtermIntegration=0123456789abcdef;id={rev_id}\x07\
+                     \x1b]633;P;AtermCwd=file://devhost/home/dev/src/notes;id={rev_id}\x07\
+                     \x1b]7;file://devhost/home/dev/src/notes\x07\
+                     \x1b]133;A;id={rev_id}\x07dev@devhost notes % \x1b]133;B;id={rev_id}\x07"
+                )
+                .as_bytes(),
+                30_000,
+            );
+            ("zsh", rev, "/home/dev/src/notes")
+        },
+        || {
+            let mut job = fx_signed_shell(ROWS, COLS, [0xa2; 32], CWD, 4);
+            job.fx_process(b"\x1b]7;file://devhost/home/dev/tmp\x07");
+            job.set_foreground_job(true);
+            job.fx_process(b"\x1b]7;file://devhost/home/dev/src/aterm/crates\x07");
+            ("zsh", job, CWD)
+        },
+        || {
+            let stale_nonce = [0xa3; 32];
+            let mut stale = fx_shell(ROWS, COLS, 30, CWD, 6);
+            stale.set_require_shell_integration_nonce(true);
+            stale.authorize_shell_integration_on_first_mark(stale_nonce);
+            fx_process_at(
+                &mut stale,
+                format!("\x1b]133;D;0;id={}\x07", fx_hex(&stale_nonce)).as_bytes(),
+                30_100,
+            );
+            ("zsh", stale, CWD)
+        },
+        || {
+            let (mut cleared, sign) =
+                fx_marked_shell(ROWS, COLS, Some([0xa4; 32]), false, b"", 6, CWD, 3);
+            fx_process_at(
+                &mut cleared,
+                format!(
+                    "clear\r\n\x1b]133;C{sign}\x07\x1b[H\x1b[2J\x1b]133;D;0{sign}\x07\
+                     \x1b]133;A{sign}\x07dev@devhost aterm % \x1b]133;B{sign}\x07\x1b]133;D;0{sign}\x07"
+                )
+                .as_bytes(),
+                30_200,
+            );
+            ("zsh", cleared, CWD)
+        },
+        || ("claude", fx_two_drawers(2), CWD),
+        || {
+            let mut restored = Terminal::from_checkpoint(&fx_two_drawers(5).checkpoint());
+            restored.fx_process(b"\r\n\x1b[2mresuming\x1b[0m\r\n");
+            ("claude", restored, CWD)
+        },
+        || {
+            // Line sizes and DECSCA protection on the alternate screen and on the saved primary.
+            let mut banner = fx_shell(ROWS, COLS, 12, CWD, 1);
+            banner
+                .fx_process(b"./banner\r\n\x1b#6RELEASE NOTES\r\n\x1b[1\"qread only\x1b[0\"q\r\n");
+            banner.fx_process(
+                b"\x1b[?1049h\x1b[H\x1b#3TOP\r\n\x1b#4TOP\r\n\x1b[1\"qfield:\x1b[0\"q ",
+            );
+            ("banner", banner, CWD)
+        },
+    ];
+    let shells = builders
+        .into_iter()
+        .map(|build| build())
+        .collect::<Vec<_>>();
 
     let mut sessions = Vec::new();
     let mut tabs = Vec::new();

@@ -58,7 +58,7 @@ impl Facts {
     /// windows nothing opened for thirty days. Where `base` is no object ID nothing is kept.
     #[must_use]
     pub fn of(root: &Path, base: &str) -> Self {
-        if !aterm_types::land_trailer::object_id(base) {
+        if !aterm_land_trailer::object_id(base) {
             return Self::none();
         }
         let windows = crate::engine::release_dir(root)
@@ -96,11 +96,7 @@ impl Facts {
         let at = self
             .dir
             .as_ref()
-            .filter(|_| {
-                objects
-                    .iter()
-                    .all(|id| aterm_types::land_trailer::object_id(id))
-            })
+            .filter(|_| objects.iter().all(|id| aterm_land_trailer::object_id(id)))
             .map(|dir| dir.join(name(&self.reader, question)));
         if let Some(at) = &at
             && let Some(kept) = read(at)

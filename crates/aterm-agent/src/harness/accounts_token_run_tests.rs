@@ -20,11 +20,13 @@ const NOW: i64 = 1_800_000_000;
 /// The lab key every test account is keyed by (the lab vault's).
 const KEY: &str = "ac-fedcba9876543210";
 
-/// `work` is the default login's row; `lent`, a login of its own, is held by m7.
+/// `work` is the default login's row; `lent`, a login of its own, is held by m7; `away`, a login
+/// of its own that no Mac holds, was never made here (its directory does not exist).
 const ROSTER: &str = "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \
                       \"person@example.com\"\n\n[[account]]\nlabel = \"lent\"\nclass = \
                       \"dedicated\"\ndir = \"/logins/lent\"\nemail = \"lent@example.com\"\n\
-                      held_by = \"m7\"\n";
+                      held_by = \"m7\"\n\n[[account]]\nlabel = \"away\"\nclass = \"shared\"\n\
+                      dir = \"/logins/away\"\nemail = \"away@example.com\"\n";
 
 fn keyer(_realm: &str, _email: &str) -> Option<String> {
     Some(KEY.to_owned())
@@ -102,8 +104,13 @@ impl World {
 
 /// The lab vault's token for `work`'s account, minted on this Mac (m22) a day ago.
 fn mint(lab: &Lab) {
+    mint_for(lab, "person@example.com");
+}
+
+/// [`mint`] of a token whose record names `email`.
+fn mint_for(lab: &Lab, email: &str) {
     let meta = Meta {
-        email: "person@example.com".to_owned(),
+        email: email.to_owned(),
         account_id: "c-0123456789ab".to_owned(),
         minted_at: 1_800_000_000 - 86_400,
         expires_at: 1_800_000_000 + 300 * 86_400,
@@ -128,9 +135,14 @@ fn mint(lab: &Lab) {
 }
 
 /// What the wrapper decided for `run` in `ctx`, with the lab keyer: the judgment, the read and
-/// the fallback it journals ([`resolved`] adds the build it serves).
+/// the fallback it journals ([`resolved`] adds the build it serves and why it starts nothing).
 fn decided(run: &Run, ctx: &Ctx) -> (Decision, Option<Read>, Option<(TokenEntry, &'static str)>) {
-    let (decision, read, _, noted) = resolved(run, ctx);
+    let Decided {
+        decision,
+        read,
+        noted,
+        ..
+    } = resolved(run, ctx);
     (decision, read, noted)
 }
 
@@ -215,7 +227,7 @@ fn the_wrapper_serves_only_a_build_in_atpkgs_own_store_by_its_real_path() {
     let world = World::new();
     let ctx = world.ctx(&[], None);
     let real = std::fs::canonicalize(world.build()).unwrap();
-    let (_, _, build, _) = resolved(&world.run(None, &[]), &ctx);
+    let build = resolved(&world.run(None, &[]), &ctx).build;
     assert_eq!(build.as_deref(), Some(real.as_path()));
     let elsewhere = world.path().join("x/store/claude/1/bin/claude");
     std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
@@ -224,9 +236,9 @@ fn the_wrapper_serves_only_a_build_in_atpkgs_own_store_by_its_real_path() {
         program: elsewhere.into_os_string(),
         ..world.run(None, &[])
     };
-    let (decision, read, build, _) = resolved(&planted, &ctx);
-    assert_eq!(decision, Decision::Stored(Fallback::Program));
-    assert!(read.is_none() && build.is_none());
+    let planted = resolved(&planted, &ctx);
+    assert_eq!(planted.decision, Decision::Stored(Fallback::Program));
+    assert!(planted.read.is_none() && planted.build.is_none());
     #[cfg(unix)]
     {
         let link = world.path().join("claude-link");
@@ -235,16 +247,16 @@ fn the_wrapper_serves_only_a_build_in_atpkgs_own_store_by_its_real_path() {
             program: link.into_os_string(),
             ..world.run(None, &[])
         };
-        let (_, _, build, _) = resolved(&linked, &ctx);
+        let build = resolved(&linked, &ctx).build;
         assert_eq!(build.as_deref(), Some(real.as_path()), "the link's build");
     }
     let unknown = Ctx {
         builds: None,
         ..world.ctx(&[], None)
     };
-    let (decision, _, build, _) = resolved(&world.run(None, &[]), &unknown);
-    assert_eq!(decision, Decision::Stored(Fallback::Program));
-    assert!(build.is_none());
+    let unknown = resolved(&world.run(None, &[]), &unknown);
+    assert_eq!(unknown.decision, Decision::Stored(Fallback::Program));
+    assert!(unknown.build.is_none());
 }
 
 /// TODAY'S JUDGMENT, NEVER OVERRIDDEN: a gateway in the environment, in the project's settings
@@ -311,17 +323,19 @@ fn a_launch_off_its_stored_login_gets_no_descriptor_and_a_named_reason() {
 }
 
 /// THE CLAIMS SNAPSHOT (an unlabelled run only): a held row is `held`, another Mac's lease or an
-/// off clock `claimed`, read without `accounts.lock`; a labelled line was admitted under it.
+/// off clock `claimed`, read without `accounts.lock`; a labelled line was admitted under it. A
+/// held row's run starts nothing, so it journals no fallback.
 #[test]
 fn an_unlabelled_run_reads_the_claims_ring_from_a_snapshot() {
     let world = World::new();
     let lent = world.ctx(&[(accounts::LOGIN_ENV, "/logins/lent")], None);
-    let (decision, _, noted) = decided(&world.run(None, &[]), &lent);
+    let held = resolved(&world.run(None, &[]), &lent);
     assert_eq!(
-        decision,
+        held.decision,
         Decision::Stored(Fallback::Held("lent is held by m7".to_owned()))
     );
-    assert_eq!(noted, Some((entry(), "held")));
+    assert_eq!(held.noted, None);
+    assert!(held.unstored.is_some());
 
     let ctx = world.ctx(&[], None);
     let store = world.store();
@@ -363,6 +377,127 @@ fn an_unlabelled_run_reads_the_claims_ring_from_a_snapshot() {
     let held = world.store().acquire().expect("accounts.lock");
     let (decision, _, _) = decided(&world.run(None, &[]), &world.ctx(&[], None));
     assert_eq!(decision, Decision::Stored(Fallback::Absent));
+    drop(held);
+}
+
+/// NO SESSION STARTS ON A STORED LOGIN THIS MAC MUST NOT RUN (FL-135): where the judgment falls
+/// back to the row's stored login and that row has none made here (`away`), or another Mac's warm
+/// set holds it (`lent`), the wrapper starts nothing ([`Decided::unstored`], [`NOT_STARTED`]) and
+/// journals no fallback: a vault writer holding the state (`busy`, for a labelled line and for
+/// `--auto` alike), another Mac's lease (`claimed`), the hold (`held`), no token entry
+/// (`absent`), and a program outside atpkg's store (`program`, whose account it resolves after
+/// the judgment). A run the judgment leaves as typed (a subcommand) is no such fallback. A run on
+/// `away` whose token is in use here is served, and one whose token could not then be served
+/// starts nothing too ([`refusal`]). NEGATIVE CONTROLS: the default login's row, enrolled here,
+/// still falls back to its stored login on the same lease and the same busy vault, and runs as
+/// typed where its token could not be served.
+#[cfg(unix)]
+#[test]
+fn a_run_starts_nothing_where_its_fallback_is_a_login_this_mac_must_not_run() {
+    let lab = Lab::new();
+    let world = World::new();
+    let away = world.ctx(&[(accounts::LOGIN_ENV, "/logins/away")], Some(&lab));
+    let lent = world.ctx(&[(accounts::LOGIN_ENV, "/logins/lent")], Some(&lab));
+    let work = world.ctx(&[], Some(&lab));
+    let refused = |run: &Run, ctx: &Ctx, word: &str| {
+        let decided = resolved(run, ctx);
+        assert_eq!(
+            decided.decision.fallback().map(Fallback::word),
+            Some(word),
+            "{:?}",
+            decided.decision
+        );
+        assert!(matches!(decided.decision, Decision::Stored(_)));
+        assert_eq!(decided.noted, None, "nothing started, so no fallback");
+        let why = decided
+            .unstored
+            .clone()
+            .expect("the wrapper starts nothing");
+        assert_eq!(refusal(&decided, false).as_deref(), Some(why.as_str()));
+        why
+    };
+    let falls_back = |run: &Run, ctx: &Ctx, word: &str| {
+        let decided = resolved(run, ctx);
+        assert_eq!(decided.decision.fallback().map(Fallback::word), Some(word));
+        assert_eq!(decided.unstored, None, "CONTROL: it falls back");
+        assert_eq!(refusal(&decided, false), None);
+    };
+
+    // No token entry here: `absent`.
+    let why = refused(&world.run(None, &[]), &away, "absent");
+    assert!(why.contains("away has no login on this Mac"), "{why}");
+    falls_back(&world.run(None, &[]), &work, "absent");
+    // The hold refuses every route, so `--auto` never reaches the vault on `lent`.
+    let why = refused(&world.run(None, &[]), &lent, "held");
+    assert!(why.contains("lent is held by m7"), "{why}");
+    let why = refused(&world.run(Some("lent"), &[]), &lent, "absent");
+    assert!(why.contains("lent is held by m7"), "{why}");
+
+    // A program outside the store: its account is still resolved.
+    std::fs::create_dir_all(world.path().join("bin")).unwrap();
+    std::fs::write(world.path().join("bin/claude"), "").unwrap();
+    let outside_store = Run {
+        program: world.path().join("bin/claude").into_os_string(),
+        ..world.run(None, &[])
+    };
+    assert!(refused(&outside_store, &away, "program").contains("away has no login"));
+    falls_back(&outside_store, &work, "program");
+    // A subcommand runs as typed: no session starts on the login.
+    let typed = resolved(&world.run(None, &["mcp", "list"]), &away);
+    assert!(matches!(typed.decision, Decision::AsTyped(_)));
+    assert_eq!(typed.unstored, None);
+
+    // Another Mac's lease on each row: `claimed`.
+    world
+        .store()
+        .transact(NOW, &mut None, |state| {
+            state.note_lease("away", "m7", NOW + 3600, NOW);
+            state.note_lease("work", "m7", NOW + 3600, NOW);
+            Ok(Vec::new())
+        })
+        .expect("m7's leases");
+    refused(&world.run(None, &[]), &away, "claimed");
+    falls_back(&world.run(None, &[]), &work, "claimed");
+    world
+        .store()
+        .transact(NOW, &mut None, |state| {
+            state.clear_lease("away");
+            state.clear_lease("work");
+            Ok(Vec::new())
+        })
+        .expect("the leases end");
+
+    // `away`'s token in use here: the run on `away` is served, and one whose token could not be
+    // served starts nothing either.
+    crate::harness::journal::with_keyer(keyer, || mint_for(&lab, "away@example.com"));
+    let token = resolved(&world.run(None, &[]), &away);
+    assert!(
+        matches!(token.decision, Decision::Token { .. }),
+        "{:?}",
+        token.decision
+    );
+    assert_eq!(refusal(&token, true), None, "its token is served");
+    let why = refusal(&token, false).expect("an unserved token starts nothing");
+    assert!(
+        why.contains("away has no login on this Mac") && why.contains("token could not be read"),
+        "{why}"
+    );
+    crate::harness::journal::with_keyer(keyer, || mint(&lab));
+    let work_token = resolved(&world.run(None, &[]), &work);
+    assert!(matches!(work_token.decision, Decision::Token { .. }));
+    assert_eq!(
+        refusal(&work_token, false),
+        None,
+        "CONTROL: an unserved token on a login made here runs as typed"
+    );
+
+    // A vault writer holds the state: `busy`, labelled and unlabelled.
+    let held =
+        aterm_secrets::client::test_hold_state_lock(&lab.paths).expect("a pass holds the state");
+    for named in [None, Some("away")] {
+        refused(&world.run(named, &[]), &away, "busy");
+    }
+    falls_back(&world.run(None, &[]), &work, "busy");
     drop(held);
 }
 

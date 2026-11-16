@@ -38,8 +38,8 @@ pub const ACCOUNTED_ATTACHED: &str = "OK resource-admission-v3 accounted-v1 atta
 /// Exact session and unique submission-attempt binding, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
-    /// The session's tab ID in either form ([`crate::control_verbs::is_minted_sid`]): a minted `t`
-    /// ID, or the `s-` ID a tab opened before the `t` form keeps until it closes. The host names
+    /// The local session's ID in either form ([`crate::control_verbs::is_minted_sid`]): a minted
+    /// `t` ID, or the exact `s-` ID a tab opened before the `t` form keeps until it closes. The host names
     /// its journal file by it, so the wire admits exactly what the journal can name.
     pub session: String,
     /// Unique attempt identity, checked for replay by the host.

@@ -57,6 +57,17 @@ pub struct Options {
     pub out: PathBuf,
     /// The checkout to build in; the working directory when `None`.
     pub repo: Option<PathBuf>,
+    /// Sign the receipt (`--sign-with`), writing its attestation beside it.
+    pub sign: Option<Sign>,
+}
+
+/// Who signs a receipt: a builder key and the id it is pinned under (`crate::attest`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sign {
+    /// The PKCS#8 Ed25519 key (`release-key init`).
+    pub key: PathBuf,
+    /// The builder id; this computer's name when `None` (`crate::attest::default_builder`).
+    pub builder: Option<String>,
 }
 
 /// Whether `version` is a release version: dot-separated decimal numbers, at least two.
@@ -92,6 +103,9 @@ impl Options {
                 "release-build: --commit {:?} is not a full lowercase commit",
                 self.commit
             ));
+        }
+        if let Some(builder) = self.sign.as_ref().and_then(|sign| sign.builder.as_deref()) {
+            crate::attest::check_id(builder).map_err(|e| format!("release-build: {e}"))?;
         }
         Ok(())
     }
@@ -307,6 +321,8 @@ pub struct Made {
     pub receipt: PathBuf,
     /// What the receipt says.
     pub admitted: handoff::Receipt,
+    /// The receipt's attestation, beside it, when the run signed (`--sign-with`).
+    pub attestation: Option<PathBuf>,
 }
 
 /// What a run that did not make the pair says, and the exit code it ends with.
@@ -370,7 +386,7 @@ fn clean_at(root: &Path, commit: &str) -> Result<(), String> {
 
 /// The commit's pins, read from the commit itself: the stock release of its `stock_pin.rs`,
 /// the Trust build of its `trust.lock` (none when it has none).
-fn commit_pins(root: &Path, commit: &str) -> Result<(String, Option<String>), String> {
+pub(crate) fn commit_pins(root: &Path, commit: &str) -> Result<(String, Option<String>), String> {
     let source = git(
         root,
         &["show", &format!("{commit}:{}", handoff::STOCK_PIN_FILE)],
@@ -624,6 +640,18 @@ pub fn release_build(opts: &Options, env: &[(String, String)]) -> Result<Made, R
         PathBuf::from(git(&start, &["rev-parse", "--show-toplevel"], GIT_LOCAL).map_err(not_run)?);
     clean_at(&root, &opts.commit).map_err(not_run)?;
     check_cargo_inputs(env, &root).map_err(not_run)?;
+    // The key is read before anything is built: a run that cannot sign builds nothing.
+    let signer = match &opts.sign {
+        Some(sign) => {
+            let key = crate::attest::read_key(&sign.key).map_err(not_run)?;
+            let builder = match &sign.builder {
+                Some(builder) => builder.clone(),
+                None => crate::attest::default_builder(env).map_err(not_run)?,
+            };
+            Some((key, builder))
+        }
+        None => None,
+    };
     let short =
         git(&root, &["rev-parse", "--short=12", &opts.commit], GIT_LOCAL).map_err(not_run)?;
     if short.len() < 12 || !opts.commit.starts_with(&short) {
@@ -691,6 +719,9 @@ pub fn release_build(opts: &Options, env: &[(String, String)]) -> Result<Made, R
             before: &before,
             source_tree: &source_tree,
             pins: &pins,
+            signer: signer
+                .as_ref()
+                .map(|(key, builder)| (key.as_slice(), builder.as_str())),
         })
     });
     // The scratch is this run's own folder: the zip has left it, and the laid-out folder
@@ -710,10 +741,12 @@ struct Built<'a> {
     before: &'a Digests,
     source_tree: &'a str,
     pins: &'a Pins<'a>,
+    /// The PKCS#8 key and builder id that sign the receipt, when the run signs.
+    signer: Option<(&'a [u8], &'a str)>,
 }
 
 /// Holds what the build made to what was asked, moves the zip into `--out`, writes its
-/// receipt and admits the pair as the cutter will.
+/// receipt (and, when the run signs, its attestation) and admits the pair as the cutter will.
 fn finish(built: &Built<'_>) -> Result<Made, String> {
     let Built {
         opts,
@@ -725,6 +758,7 @@ fn finish(built: &Built<'_>) -> Result<Made, String> {
         before,
         source_tree,
         pins,
+        signer,
     } = *built;
     clean_at(root, &opts.commit)
         .map_err(|e| format!("after the build: {e}; its images are not the commit's"))?;
@@ -777,6 +811,9 @@ fn finish(built: &Built<'_>) -> Result<Made, String> {
         file.write_all(text.as_bytes())
             .map_err(|e| format!("{}: {e}", receipt_path.display()))?;
     }
+    let attestation = signer
+        .map(|(key, builder)| crate::attest::write_beside(out, &asset, key, builder))
+        .transpose()?;
     let admitted = handoff::admit(
         out,
         &Cut {
@@ -792,6 +829,7 @@ fn finish(built: &Built<'_>) -> Result<Made, String> {
         zip,
         receipt: receipt_path,
         admitted,
+        attestation,
     })
 }
 

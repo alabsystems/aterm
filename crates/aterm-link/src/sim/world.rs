@@ -22,7 +22,7 @@
 //! gave up unread is no loss once a `link gap` aterm was told for its session holds it (and is one
 //! otherwise: `given up untold`); a post on the bus twice is one copy where every older copy
 //! went with retention unread, and a receipt's answer twice one where every older copy went
-//! before any session was handed it; an `auto` mirror writes nothing onto a broker that retains
+//! before its asker was handed it; an `auto` mirror writes nothing onto a broker that retains
 //! nothing; the raw at-most-once of a mirror's records excuses a copy republished at the
 //! key a cut dropped; and the model's tap follows a give-up ([`conform`]).
 //!
@@ -46,7 +46,7 @@ use std::time::Duration;
 use super::bus::{self, ArmMutant, Escalation, Stop, Tier};
 use super::conform;
 use super::device::Device;
-use super::endpoint::{Endpoint, EpRules};
+use super::endpoint::{Endpoint, EpRules, EpState};
 use super::{lock, Core, Process, Rng, SimKill};
 use crate::body::Body;
 use crate::bridge::{Bridge, Config};
@@ -298,6 +298,8 @@ pub(crate) enum Mutant {
     JudgePinBeforeRecovery,
     /// An own record whose `acked` write or in-flight entry's unlink failed is delivered with its entry standing (`Bridge::settled_before_delivery`).
     DeliverPastAStandingEntry,
+    /// A fetch (`inbox get @<off>`) hands a session an own record whose in-flight entry stands (`Bridge::fetch_record`).
+    FetchPastAStandingEntry,
     /// An own record whose in-flight entry stands for aterm's drain drops the broker link, as
     /// every build before ATERM-KI-1111-3 did, where the bridge holds it alone
     /// (`Bridge::hold_record`).
@@ -417,6 +419,10 @@ pub(crate) enum Mutant {
     /// after the first drop leaves later entries the replay publishes ahead of the dropped
     /// post's send from the drain, out of its sender's order.
     DropBehindLowestFirst,
+    /// The replay publishes an `expired` verdict it read back nowhere at its pin whatever the
+    /// asker's lane holds since (`Bridge::expiry_moot`), as every build before ATERM-KI-1114-3752:
+    /// past a cut, the copy lands behind the ask's answer.
+    ReplayRepostsAMootExpiry,
     /// A hand-off whose heads the disk refused unlinks the journal all the same, as before item
     /// F4 (`StateDir::hand_posts_to_files`): the next bridge publishes each record in flight
     /// again at its pin without reading it back, and past a cut that dropped its key a post or
@@ -512,6 +518,14 @@ pub(crate) enum Mutant {
     /// to then has the bridge's move of its cursor to the fork judged a delivery below its
     /// `since`, a violation of no rule of the bridge's. A found seed pins the law's reading.
     FollowOnTheBrokersLog,
+    /// NOT A BRIDGE RULE: THE RECEIPT AND DEADLINE LAWS' OWN, as every world read them until
+    /// ATERM-KI-1114-1487, first met in the asking world with logs set aside: an older copy of an
+    /// answer ([`World::check_settled`]) or of an `expired` ([`World::expired_once`]) counts as
+    /// handed when any session holds a row at its offset, of any lane and of any log. A replay
+    /// that lands again a copy retention gave up unread is then judged a second answer wherever
+    /// a session was handed another record at that offset, on another lane or on a log since
+    /// retired. A found seed pins the receipt law's reading.
+    AnswerHandedByOffset,
     /// Every presence row reads its session's screen (`@<sid> text --json`) as it is published,
     /// as before critic item D03 (`Bridge::publish_session_presence`). Its control is a bridge
     /// unit test on the scripted verb lane
@@ -646,6 +660,28 @@ pub(crate) enum Mutant {
     /// of it reads its attempt back, so past a cut that carried that attempt unread and dropped
     /// its dedup key, the retry at the pin lands a second copy of its key.
     OwnersPinFromItsKeyHeadless,
+    /// A read back on a log that continues none starts at 0, its start, as ATERM-KI-1111-4's
+    /// rule took every such log under another id (`Bridge::read_back_from`, and a pin's head in
+    /// `StateDir::publication_offset_resets`), not at the head this node read when it met that
+    /// log (`LogWitness::met`): on a log astream gave another id keeping its records (a fresh one
+    /// where its identity sidecar does not read, one derived from its records where the sidecar
+    /// is gone), the read back meets the sender's earlier post of the same words, settles the
+    /// post on it and never publishes it (critic review F1, 2026-11-13). Every sim world's posts
+    /// carry words of their own, so no world meets it, and its control is a bridge unit test on
+    /// a real broker whose identity sidecar rots or goes
+    /// (`a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_the_same_words`).
+    ReadBackFromTheLogsStart,
+    /// A re-base's witness is written as any other witness is, not on the media
+    /// (`Bridge::save_log_witness`, `StateDir::rebase_log_witness`), as every build before critic
+    /// review F1: a power cut may bring back the witness of the log before it, and the next attach
+    /// meets the log again at a later head, above the copies the replay published there. No
+    /// seeded world breaks a law by this alone; its control is a bridge unit test whose state dir
+    /// is on a simulated device
+    /// (`a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cut`). The
+    /// re-base on the media, written after the attach drops the mirror's pin, puts that drop on
+    /// the media too, so [`Mutant::DroppedPinUnderTheFence`] is pinned in a lossy-log world with
+    /// this on (the sim's `lossy_logs_light_rebase`).
+    RebaseWitnessUnflushed,
 }
 
 /// What one run is.
@@ -1419,6 +1455,11 @@ struct World {
     /// `(asker, the answer's offset, the expiry's)`, honest once aterm was told a range of the
     /// asker's lane holding the answer ([`World::check_settled`]).
     expired_over_given_up: Vec<(String, u64, u64)>,
+    /// THE ORACLE'S: each `ack` or `expired` a session read by a fetch (`inbox get @<off>`):
+    /// `(its sid, the offset, the kind, the ask it names, what its `from=` names before any
+    /// `@`: the answer's sender, or the node for an `expired`)`. A fetch answer leaves no row,
+    /// so [`holds_answer`] reads these beside the rows.
+    read_by_fetch: BTreeSet<(String, u64, String, u64, String)>,
     /// `(asker, ask)` of every verdict on an asker's lane (an answer, an `expired`) a broker
     /// stop took with the acked records past what it kept ([`World::broker_stop`]).
     verdicts_lost: BTreeSet<(String, u64)>,
@@ -1475,6 +1516,38 @@ fn sender(src: &str, body: &Body) -> String {
 
 /// A subject of mail on this node's lanes, `/f/<F>/in/<node>/<sid>/<src>/<kind>`: `(sid, src,
 /// kind)`.
+/// WHETHER `asker` HOLDS THE COPY AT `off` OF AN ANSWER: a row of one of its sessions at that
+/// offset that is this answer, of `kind`, naming the ask at `re` and, where `from` names one,
+/// from that sender, or the same answer read by a fetch there (`read_by_fetch`). A row at the
+/// offset of another kind, another ask's or another sender's is another record. A row names no
+/// log, so the same answer to an ask at the same offset, at the same offset of a log since
+/// retired, still counts: the law errs toward a violation there, never past one.
+fn holds_answer(
+    s: &EpState,
+    read_by_fetch: &BTreeSet<(String, u64, String, u64, String)>,
+    asker: &str,
+    off: u64,
+    kind: &str,
+    re: u64,
+    from: Option<&str>,
+) -> bool {
+    let sender = |by: &str| from.is_none_or(|from| by == from);
+    s.sessions
+        .values()
+        .chain(s.gone.iter())
+        .filter(|session| session.sid == asker)
+        .flat_map(|session| session.rows.iter())
+        .any(|row| {
+            row.off == off
+                && row.kind == kind
+                && row.re == Some(re)
+                && sender(row.from.split('@').next().unwrap_or(""))
+        })
+        || read_by_fetch.iter().any(|(sid, at, k, r, by)| {
+            sid == asker && *at == off && k == kind && *r == re && sender(by)
+        })
+}
+
 fn in_lane(subject: &str) -> Option<(&str, &str, &str)> {
     let rest = subject
         .strip_prefix("/f/")?
@@ -1657,6 +1730,7 @@ impl World {
             asks: BTreeMap::new(),
             expiries_judged: BTreeSet::new(),
             expired_over_given_up: Vec::new(),
+            read_by_fetch: BTreeSet::new(),
             verdicts_lost: BTreeSet::new(),
             say_rng: Rng::new(seed ^ 0x05a7_7091_c5f4_0b0b),
             says: BTreeMap::new(),
@@ -2251,6 +2325,19 @@ impl World {
                     continue; // one chunk of a body cut in lines: the world's are a marker each
                 }
                 self.stats.fetched += 1;
+                if let (Some(kind @ ("ack" | "expired")), Some(re), Some(from)) = (
+                    word("kind"),
+                    word("re").and_then(crate::parse_uint::<u64>),
+                    word("from").and_then(|f| f.split('@').next()),
+                ) {
+                    self.read_by_fetch.insert((
+                        sid.clone(),
+                        off,
+                        kind.to_string(),
+                        re,
+                        from.to_string(),
+                    ));
+                }
                 let text = word("text").map(crate::pct::decode);
                 match &at {
                     Some(held) if Some(Body::decode(&held.body).0.text) == text => {
@@ -2416,8 +2503,9 @@ impl World {
 
     /// THE DEADLINE LAW'S ONCE, AT EVERY STEP (item F4): an ask expires on its asker's lane once,
     /// across every bridge that held its deadline. A second `expired` of one ask is excused
-    /// only where every older copy went with retention before any session was handed it: the
-    /// sweep that reads the lane for one then finds none (as a receipt's answer is excused).
+    /// only where every older copy went with retention before its asker was handed it
+    /// ([`holds_answer`]): the sweep that reads the lane for one then finds none (as a
+    /// receipt's answer is excused).
     fn expired_once(&self) -> Vec<String> {
         let gone = self.core.broker.gone();
         let mut copies: BTreeMap<(String, u64), Vec<u64>> = BTreeMap::new();
@@ -2432,20 +2520,25 @@ impl World {
             }
         }
         let s = lock(&self.ep.state);
-        let handed: BTreeSet<u64> = s
-            .sessions
-            .values()
-            .chain(s.gone.iter())
-            .flat_map(|x| x.rows.iter().filter(|r| r.on_log).map(|r| r.off))
-            .collect();
+        let by_offset = self.opts.mutants.contains(&Mutant::AnswerHandedByOffset);
+        let handed = |asker: &str, off: u64, re: u64| {
+            if by_offset {
+                return s
+                    .sessions
+                    .values()
+                    .chain(s.gone.iter())
+                    .any(|x| x.rows.iter().any(|r| r.on_log && r.off == off));
+            }
+            holds_answer(&s, &self.read_by_fetch, asker, off, "expired", re, None)
+        };
         copies
             .into_iter()
-            .filter(|(_, offs)| {
+            .filter(|((asker, re), offs)| {
                 offs.len() > 1
                     && !offs.split_last().is_some_and(|(_, older)| {
                         older
                             .iter()
-                            .all(|o| gone.contains(o) && !handed.contains(o))
+                            .all(|o| gone.contains(o) && !handed(asker, *o, *re))
                     })
             })
             .map(|((asker, re), offs)| {
@@ -4301,22 +4394,36 @@ impl World {
                 answers.entry((re, from)).or_default().push(*off);
             }
         }
-        // Every copy but the newest given up by retention before any session was handed it
-        // (sim item B05): the replay of an entry whose record went unread (an own record is
-        // never delivered while its entry stands) publishes the one copy a reader is handed,
-        // as a post's does. A copy some session holds is an answer it was given.
+        // Every copy but the newest given up by retention before its asker was handed it (sim
+        // item B05): the replay of an entry whose record went unread (an own record is never
+        // delivered while its entry stands) publishes the one copy a reader is handed, as a
+        // post's does. A copy its asker holds is an answer it was given ([`holds_answer`]): an
+        // `ack` from its sender naming the same ask. Another session's row at the offset, of
+        // another lane, is another record (seed 921 of `lossy_keyed` at 1200 steps: the answer
+        // at @21 went unread with a cut and landed again at @41, and sessions long gone held
+        // notes at @21 of logs since retired).
         let gone = self.core.broker.gone();
-        let handed: BTreeSet<u64> = s
-            .sessions
-            .values()
-            .chain(s.gone.iter())
-            .flat_map(|session| session.rows.iter().map(|row| row.off))
-            .collect();
+        let by_offset = self.opts.mutants.contains(&Mutant::AnswerHandedByOffset);
+        let handed = |off: u64, re: u64, from: &str| {
+            if by_offset {
+                return s
+                    .sessions
+                    .values()
+                    .chain(s.gone.iter())
+                    .any(|session| session.rows.iter().any(|row| row.off == off));
+            }
+            by_off
+                .get(&off)
+                .and_then(|subject| in_lane(subject))
+                .is_some_and(|(asker, _, _)| {
+                    holds_answer(&s, &self.read_by_fetch, asker, off, "ack", re, Some(from))
+                })
+        };
         for ((re, from), offs) in answers {
             let once_given = offs.split_last().is_some_and(|(_, older)| {
                 older
                     .iter()
-                    .all(|off| gone.contains(off) && !handed.contains(off))
+                    .all(|off| gone.contains(off) && !handed(*off, re, &from))
             });
             if offs.len() > 1 && !once_given {
                 bad.push(format!(

@@ -167,6 +167,7 @@ fn the_glide_steps_a_whole_pixel_within_its_bounds() {
 fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
     LiveFacts {
         landed: Some(landed),
+        sampled: Some(landed),
         stale_after: Duration::from_secs(3),
         motion,
         beat,
@@ -181,6 +182,31 @@ fn facts(landed: Instant, motion: bool, beat: bool) -> LiveFacts {
         },
         steam: false,
     }
+}
+
+#[test]
+fn adopting_a_delayed_reading_does_not_renew_its_freshness() {
+    let sampled = Instant::now();
+    let landed = sampled + Duration::from_secs(2);
+    let f = LiveFacts {
+        sampled: Some(sampled),
+        ..facts(landed, false, false)
+    };
+    assert_eq!(f.live(landed, OPEN), DeckLive::STILL);
+    assert_eq!(f.next_change(landed, OPEN), Some(sampled + f.stale_after));
+    assert_eq!(f.live(sampled + f.stale_after, OPEN), DeckLive::STALE);
+    let already_old = LiveFacts {
+        landed: Some(sampled + Duration::from_secs(20)),
+        ..f
+    };
+    assert_eq!(
+        already_old.live(already_old.landed.unwrap(), OPEN),
+        DeckLive::STALE
+    );
+    assert_eq!(
+        already_old.next_change(already_old.landed.unwrap(), OPEN),
+        None
+    );
 }
 
 /// How far a frame's glide or slide has run, `None` with every box in its slot.
@@ -591,6 +617,7 @@ fn a_reading_that_opens_no_slot_lets_the_last_ones_move_run_on() {
     };
     let glide = |landed: Instant| LiveFacts {
         landed: Some(landed),
+        sampled: Some(landed),
         stale_after: STALE_FLOOR,
         motion: true,
         beat: true,
@@ -688,6 +715,7 @@ fn frames_over(
         let flow = Flow::of(bands, opened, SlotGrid::SECONDS);
         let f = LiveFacts {
             landed: Some(landed),
+            sampled: Some(landed),
             stale_after: stale_after(cadence, None),
             motion: true,
             beat,
@@ -802,6 +830,7 @@ fn the_needle_asks_its_own_frames_and_none_once_settled() {
             needle = Needle::retarget(needle, landed, Some((target(r), 0.0)), px_per_deg);
             let f = LiveFacts {
                 landed: Some(landed),
+                sampled: Some(landed),
                 stale_after: stale_after(cadence, None),
                 motion: true,
                 beat: true,
@@ -1370,6 +1399,7 @@ pub(crate) fn live_app(landed: Instant) -> (crate::App, crate::WindowId) {
     });
     app.vitals.snapshot = Some(std::sync::Arc::new(snap));
     app.vitals.landed_at = Some(landed);
+    app.vitals.sampled_at = Some(landed);
     app.windows.get_mut(&wid).expect("the window").focused = true;
     (app, wid)
 }
@@ -1401,6 +1431,7 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     };
     let ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_glide.set((FineBand::default(), fine(12.0)));
+    drop(ws);
     let facts = app.live_facts(wid).expect("the deck draws");
     assert_eq!(
         facts.flow,
@@ -1436,6 +1467,7 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
     // A Full strip glides on the wall clock instead, from the reading for a slot.
     let ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_glide.set((fine(8.0), FineBand::default()));
+    drop(ws);
     let facts = app.live_facts(wid).expect("the deck draws");
     assert!(
         matches!(facts.flow, Flow::Glide { from_ms, end_ms, .. } if from_ms == at_ms && end_ms == at_ms + 1_000),
@@ -1487,6 +1519,7 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
         .checked_sub(Duration::from_secs(60))
         .expect("an instant a minute back");
     app.vitals.landed_at = Some(long_ago);
+    app.vitals.sampled_at = Some(long_ago);
     assert_eq!(
         app.live_facts(wid).map(|f| f.live(t0, OPEN)),
         Some(DeckLive::STALE)
@@ -1497,6 +1530,7 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
         "a stalled deck schedules nothing"
     );
     app.vitals.landed_at = Some(t0);
+    app.vitals.sampled_at = Some(t0);
 
     app.config
         .sys
@@ -1565,6 +1599,7 @@ fn a_resting_window_draws_the_deck_still() {
         "the wake's own frame keeps the deck still until a reading lands: {woke:?}"
     );
     app.vitals.landed_at = Some(woke_at + Duration::from_millis(300));
+    app.vitals.sampled_at = app.vitals.landed_at;
     let moving = app.live_facts(wid).expect("the deck draws");
     assert!(
         moving.motion,
@@ -1576,7 +1611,7 @@ fn a_resting_window_draws_the_deck_still() {
 #[cfg(unix)]
 pub(crate) fn fit_deck(app: &mut crate::App, wid: crate::WindowId) {
     let (_, cell) = app.win_cell_size(wid);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.head = crate::stats_deck::reserved_deck_px(
         crate::stats_deck::StatsBars::Deck,
         ws.deck_form,
@@ -1597,6 +1632,7 @@ fn adopt(app: &mut crate::App, share: f64, at: Instant) -> u64 {
     }
     app.vitals.snapshot = Some(std::sync::Arc::new(snap));
     app.vitals.landed_at = Some(at);
+    app.vitals.sampled_at = Some(at);
     app.retarget_needle(at)
 }
 
@@ -1648,7 +1684,8 @@ fn needle_deadlines(
     fired
 }
 
-/// `live_app` with the deck laid out wide in `wids` (window 0 and any it adds), each focused.
+/// `live_app` with the deck laid out wide in `wids` (window 0 and any it adds), each focused
+/// and carrying the System Resources band (a later window is born without it).
 #[cfg(unix)]
 fn needle_app(t0: Instant, wids: &[crate::WindowId]) -> crate::App {
     let (mut app, _) = live_app(t0);
@@ -1657,9 +1694,11 @@ fn needle_app(t0: Instant, wids: &[crate::WindowId]) -> crate::App {
         if !app.windows.contains_key(&wid) {
             app.install_window_state(wid, crate::stub_session(90 + wid.0), 24, 80);
         }
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
+        ws.carries_band = true;
         ws.cols = 160;
         ws.focused = true;
+        drop(ws);
         fit_deck(&mut app, wid);
         let _ = app.stats_deck_fp(wid);
     }
@@ -1822,11 +1861,12 @@ fn the_app_retargets_one_needle_and_rests_it_where_it_must() {
     let swing = busier(&mut app, 0.95, t3);
     assert!(app.deck_clock_deadline(t3).is_some(), "CONTROL: it sweeps");
     // The other form's dial is another size: the needle rests on its reading at once.
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_form = match ws.deck_form {
         DeckForm::Full => DeckForm::Folded,
         DeckForm::Folded => DeckForm::Full,
     };
+    drop(ws);
     fit_deck(&mut app, wid);
     let _ = app.stats_deck_fp(wid);
     let resized = app.windows[&wid].deck_needle_px.get();
@@ -1935,8 +1975,9 @@ fn a_window_never_draws_the_needle_back_where_it_stood() {
     let n = busier(&mut app, share, at);
     let target = n.target().0;
     let set_rate = |app: &mut crate::App, us: u64| {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.frame_interval = Some(Duration::from_micros(us));
+        drop(ws);
         app.deck_frame_interval(&app.windows[&wid])
     };
     let fast = set_rate(&mut app, 8_333);
@@ -1977,7 +2018,7 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
     app.vitals.landed_period = Some(Duration::from_secs(3600));
     let fit = |app: &mut crate::App| {
         let (_, cell) = app.win_cell_size(wid);
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         ws.metrics.head = crate::stats_deck::reserved_deck_px(
             crate::stats_deck::StatsBars::Deck,
             ws.deck_form,
@@ -2046,7 +2087,7 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
     type Change = fn(&mut crate::App, crate::WindowId);
     let changes: [(&str, Change); 3] = [
         ("the other form", |app, wid| {
-            let ws = app.windows.get_mut(&wid).expect("the window");
+            let mut ws = app.windows.get_mut(&wid).expect("the window");
             ws.deck_form = match ws.deck_form {
                 DeckForm::Full => DeckForm::Folded,
                 DeckForm::Folded => DeckForm::Full,
@@ -2057,7 +2098,7 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
         }),
         ("a second tab, in front", |app, wid| {
             let id = app.tab_ids.allocate().expect("a tab id");
-            let ws = app.windows.get_mut(&wid).expect("the window");
+            let mut ws = app.windows.get_mut(&wid).expect("the window");
             let mut tab = ws.tab_set.tabs()[0].clone();
             tab.id = id;
             ws.tab_set.push(tab).expect("a fresh tab id");
@@ -2076,6 +2117,7 @@ fn a_live_frame_lays_the_deck_out_once_over_what_it_kept() {
     // and records its edge, and the next frame patches from there.
     app.config.motion = Some("reduced".into());
     app.vitals.landed_at = Some(Instant::now());
+    app.vitals.sampled_at = app.vitals.landed_at;
     let work = frame(&mut app);
     whole(&app, "a still frame");
     assert_eq!(shows(&app), DeckLive::STILL);
@@ -2117,13 +2159,14 @@ fn a_deck_turned_off_and_on_lays_its_card_out_again() {
     let (mut app, wid) = live_app(Instant::now());
     app.vitals.landed_period = Some(Duration::from_secs(3600));
     let (_, cell) = app.win_cell_size(wid);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.head = crate::stats_deck::reserved_deck_px(
         crate::stats_deck::StatsBars::Deck,
         ws.deck_form,
         ws.scale,
         cell,
     );
+    drop(ws);
     let _ = app.stats_deck_fp(wid);
     app.splice_stats_deck(wid);
     // The edge moves and only a hit test lays the deck out for it.
@@ -2186,6 +2229,7 @@ fn tween_interpolates_exponentially_settles_cleanly_and_snaps_under_reduce_motio
     let t0 = Instant::now();
     let f = LiveFacts {
         landed: Some(t0),
+        sampled: Some(t0),
         stale_after: Duration::from_secs(5),
         motion: true,
         beat: false,
@@ -2341,7 +2385,7 @@ fn the_app_steams_only_a_hot_dial_presented_alone_where_motion_is_allowed() {
     );
     app.serious_mode = false;
 
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.lens_card = Some(crate::SettingsCard {
         rgba: vec![0; 4],
         pw: 1,
@@ -2355,6 +2399,7 @@ fn the_app_steams_only_a_hot_dial_presented_alone_where_motion_is_allowed() {
         delta: None,
         scrim: None,
     });
+    drop(ws);
     assert!(!steams(&app), "a card over the deck takes the steam");
     app.windows.get_mut(&wid).expect("the window").lens_card = None;
 

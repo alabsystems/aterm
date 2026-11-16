@@ -251,12 +251,13 @@ impl Capture {
         helper: bool,
         depth: usize,
     ) -> Option<String> {
-        let Some((harness, tool)) = crate::harness::twin_harness(program) else {
-            return Some(String::new());
-        };
         let layout = crate::store::Layout {
             prefix: prefix.to_path_buf(),
         };
+        let Some((harness, tool)) = crate::harness::twin_harness(&layout, program) else {
+            return Some(String::new());
+        };
+        let (harness, tool) = (harness.as_str(), tool.as_str());
         let shim = prefix.join("bin").join(tool);
         if !executable(&shim)? {
             return Some(String::new());

@@ -24,10 +24,10 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
     let wid = WindowId(0);
     let now = Instant::now();
     let frame = {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = true;
         crate::app_render::pet_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::Present,
             PetSense {
                 caret_drawn: true,
@@ -46,7 +46,7 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
     };
     assert_eq!(frame.alpha, 255, "the first reduced frame has real pixels");
 
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     assert!(
         !ws.fx.companion_mut().brain().needs_frames(),
         "the static placement itself has no unfinished motion"
@@ -61,7 +61,7 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
         "an opaque reduced still owes no follow-up frame train"
     );
     let _ = crate::app_render::pet_tick_for_test(
-        ws,
+        &mut ws,
         aterm_effects::host::CaptureMode::Present,
         PetSense {
             caret_drawn: true,
@@ -88,7 +88,7 @@ fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
     let geom = hit_geom();
     for reduced in [false, true] {
         let mut app = App::headless_for_test();
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window");
         let mut now = Instant::now();
         let mut col = 12;
         for drive in [0.0, 1.0, 0.49, 0.33, 0.1, 0.0] {
@@ -99,7 +99,7 @@ fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
                 }
                 let caret = (4, col);
                 let pet = crate::app_render::pet_owner_tick_for_test(
-                    ws,
+                    &mut ws,
                     aterm_effects::host::CaptureMode::Present,
                     PetSense {
                         caret_drawn: true,
@@ -135,7 +135,7 @@ fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
                 ws.fx.open_words();
                 assert!(pet.on_glass);
                 let fp = super::emit_single_cursor_companion(
-                    ws,
+                    &mut ws,
                     geom,
                     Some(caret),
                     &pet,
@@ -173,7 +173,7 @@ fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
                 );
                 let owned = ws.fx.free_sprites().to_vec();
                 let rejected_head = super::emit_single_cursor_companion(
-                    ws,
+                    &mut ws,
                     geom,
                     Some(caret),
                     &aterm_effects::companion::CompanionFrame {
@@ -360,7 +360,7 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
     app.cursor_frame(wid, seed).expect("seed cursor engines");
     let authored = t0 + Duration::from_millis(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.fx.cursor_mut().cadence.on_keystroke(authored);
         ws.fx.cursor_mut().glow.note_synthetic_move(authored);
         ws.fx.cursor_mut().trail.note_synthetic_move(authored);

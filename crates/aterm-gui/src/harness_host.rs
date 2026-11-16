@@ -89,6 +89,21 @@ pub(crate) fn effective(cfg: &SupervisorConfig) -> SupervisorConfig {
 
 static UPGRADE_ASK: AtomicBool = AtomicBool::new(false);
 
+/// The policy's `stall_term_after_s` in this instance ([`Switches::set`]): 600 until a policy is
+/// read, the policy's default.
+static STALL_TERM_AFTER_S: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(600);
+
+/// HOW LONG A HARNESS MAY STAND FROZEN BEFORE ATERM ENDS IT: the policy's `stall_term_after_s`,
+/// which also bounds how long a scoped harness has to obey `restart`
+/// ([`crate::restart_act`]'s scoped watch); `None` where the policy says `0` (never).
+#[cfg(unix)]
+pub(crate) fn stall_term_after() -> Option<std::time::Duration> {
+    match STALL_TERM_AFTER_S.load(Ordering::SeqCst) {
+        0 => None,
+        s => Some(std::time::Duration::from_secs(u64::from(s))),
+    }
+}
+
 static USAGE_TAP: AtomicBool = AtomicBool::new(false);
 
 static USAGE_CREDITS: AtomicBool = AtomicBool::new(false);
@@ -369,6 +384,7 @@ impl Switches {
             .store(cfg.enabled && cfg.probe_api, Ordering::SeqCst);
         self.ask.store(cfg.upgrade_ask, Ordering::SeqCst);
         UPGRADE_ASK.store(cfg.upgrade_ask, Ordering::SeqCst);
+        STALL_TERM_AFTER_S.store(cfg.stall_term_after_s, Ordering::SeqCst);
         USAGE_CREDITS.store(cfg.usage_credits, Ordering::SeqCst);
         *AGENTS_OFF.lock().unwrap_or_else(PoisonError::into_inner) = cfg.off.clone();
         // The pool's own switches (`accounts_for`, `logins_for`), which a launch and the
@@ -1034,7 +1050,7 @@ fn claimed_by_another(status: &str) -> Option<String> {
 /// replace the existing act's guards with a snapshot-based per-duty permission.
 fn foreign_scoped_coordination(status: &str) -> bool {
     let mut words = status.split_whitespace();
-    words.any(|word| word == "supervisor_contract=3")
+    words.any(|word| matches!(word, "supervisor_contract=3" | "supervisor_contract=4"))
         && status
             .split_whitespace()
             .find_map(|word| word.strip_prefix("supervisor="))
@@ -1475,6 +1491,37 @@ impl ExitWord {
     }
 }
 
+/// How a session's last relaunch snapshot read ended ([`SnapshotRead::refresh`]), each an explicit
+/// outcome: only [`Self::Landed`] and [`Self::Answered`] rest on a read of the tab. A read that
+/// failed, or one that was stale or overtaken before it could answer, and the state before any
+/// read ended, are not "no agent" (LS-15).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SnapshotEnd {
+    /// No read has ended since the session's host kept it: nothing was read.
+    #[default]
+    Unended,
+    /// The read landed its snapshot.
+    Landed,
+    /// The read answered with no agent a lane carries in the tab (the refusal's code,
+    /// [`SnapshotRefusal::Answered`]).
+    Answered(&'static str),
+    /// The read failed before the host answered (the refusal's code, [`SnapshotRefusal::Unread`]).
+    Unread(&'static str),
+    /// The read belonged to a snapshot or account generation no longer kept, or its worker was
+    /// revoked: it was not read, or what it read was not taken.
+    Stale,
+}
+
+impl SnapshotEnd {
+    /// Whether the tab was read and holds no agent this read could keep ([`HostAgent::Absent`]).
+    const fn answered(self) -> bool {
+        match self {
+            Self::Landed | Self::Answered(_) => true,
+            Self::Unended | Self::Unread(_) | Self::Stale => false,
+        }
+    }
+}
+
 /// What the host keeps of one open session for a relaunch, across its workers.
 #[derive(Default)]
 pub(crate) struct Kept {
@@ -1507,10 +1554,9 @@ pub(crate) struct Kept {
     release_hold: Option<Instant>,
     /// The relaunch snapshot read still out ([`start_point_read`]).
     point_read: Option<Arc<PointRead>>,
-    /// The last relaunch snapshot read that ended for its own snapshot was refused unread (the
-    /// refusal's code, [`SnapshotRefusal::Unread`]); none since a snapshot landed or a read was
-    /// answered. Read by [`WorkerIdle::agent_resumed`]: a failed read is not "no agent".
-    snapshot_unread: Option<&'static str>,
+    /// How the last relaunch snapshot read ended ([`SnapshotEnd`]). Read by
+    /// [`WorkerIdle::agent_resumed`]: only a read that answered is "no agent".
+    snapshot_end: SnapshotEnd,
     /// The upgrade read off the idle point ([`due_at_point`]).
     due: DueKept,
     /// The session's work record reads ([`WorkKept`]).
@@ -2782,8 +2828,13 @@ type AskWord = Option<&'static str>;
 /// A relaunch snapshot read ([`Acts::snapshot`]): the snapshot, or what its refusal says of the tab.
 type SnapshotFn = dyn Fn(&str) -> Result<Snapshot, SnapshotRefusal> + Send + Sync;
 type ScopedFn = dyn Fn(&str) -> Option<crate::harness_claim::Scoped> + Send + Sync;
-type ScopedAccountFn = dyn Fn(&str, &str, &accounts_pool::LoginEnv) -> bool + Send + Sync;
+/// Tell session `sid`'s scoped harness to restart its child (`cause`, and the account or model
+/// it restarts on): [`crate::restart_act::record_scoped_restart`].
+type ScopedRestartFn =
+    dyn Fn(&str, &str, Option<&accounts_pool::LoginEnv>, Option<&str>) -> bool + Send + Sync;
 type ObserveSnapshotFn = dyn Fn(&Snapshot) + Send + Sync;
+/// Prove every live contract 4 claim again where the registry changed ([`reprove_claims_now`]).
+type ReproveFn = dyn Fn() + Send + Sync;
 /// The occupancy facts board as session `sid`'s host reads it ([`Acts::occupancy`]).
 type OccupancyFn =
     dyn Fn(&str) -> aterm_agent::supervise::occupancy::OccupancyReading + Send + Sync;
@@ -2839,8 +2890,12 @@ type SelfIdleFn = dyn Fn(&str, u32, &str) -> bool + Send + Sync;
 type SelfRelaunchFn = dyn Fn(&str, u32, &Snapshot, &self_claimed::Resume, Option<restart_stamp::Cause>) -> String
     + Send
     + Sync;
-type SelfSnapshotFn =
-    dyn Fn(&str, &self_claimed::Copy, &self_claimed::Resume) -> Option<Snapshot> + Send + Sync;
+/// The snapshot of a crashed self-claimed agent, read at the shell holding its tab
+/// ([`Acts::self_snapshot`]), or its refusal classified: only one the host answered says no shell
+/// holds the tab ([`SnapshotRefusal::Answered`]).
+type SelfSnapshotFn = dyn Fn(&str, &self_claimed::Copy, &self_claimed::Resume) -> Result<Snapshot, SnapshotRefusal>
+    + Send
+    + Sync;
 /// One attempt at the relaunch of tab `sid`'s agent that left ([`Acts::relaunch`]): its grace, its
 /// snapshot, what its exit left, whether it may upgrade, the restart stamp that asked for it, and
 /// how it is carried ([`ExitHow`]).
@@ -3884,7 +3939,8 @@ pub(crate) struct Acts {
     pub(crate) self_idle: Arc<SelfIdleFn>,
     /// The crash rule's relaunch of such an agent, on the line its copy validated ([`upgrade_drive::self_claimed_after_exit`]).
     pub(crate) self_relaunch: Arc<SelfRelaunchFn>,
-    /// The snapshot of such an agent no read reached while it ran ([`relaunch::self_claimed_snapshot`]).
+    /// The snapshot of such an agent no read reached while it ran ([`relaunch::self_claimed_snapshot`]),
+    /// or why there is none, classified ([`SnapshotRefusal::of`]).
     pub(crate) self_snapshot: Arc<SelfSnapshotFn>,
     /// Whether the harness's own restart (the upgrade's or the restart in place's, left in flight
     /// by its step) ended the agent that left ([`relaunch::restarted`], by the snapshot's pid).
@@ -3978,8 +4034,12 @@ pub(crate) struct Acts {
     pub(crate) tap_born: Arc<TapBornFn>,
     /// The label of the account move whose restart signalled the agent (`relaunch::account_restart`: the restart's own record, in flight or just stopped).
     pub(crate) account_restart: Arc<AccountRestartFn>,
-    /// Publish a typed account-home move to the scoped external harness.
-    pub(crate) scoped_account: Arc<ScopedAccountFn>,
+    /// Tell the scoped external harness to restart its child on another account or model
+    /// ([`ScopedRestartFn`]).
+    pub(crate) scoped_restart: Arc<ScopedRestartFn>,
+    /// Prove every live contract 4 claim again once the registry changed, dropping one that
+    /// fails ([`reprove_claims_now`]); the activation loop calls it at every wake.
+    pub(crate) reprove_claims: Arc<ReproveFn>,
     /// Whether the agent's own background work holds its restart in place
     /// ([`relaunch::background_holds`], the relaunch's own test): an account move asks it before it
     /// takes its row ([`WorkerIdle::account_move`]).
@@ -5455,10 +5515,43 @@ impl WorkerIdle {
         self.pool_advice_for(cli, supervisor, point)
     }
 
-    fn scoped_kimi(&self) -> bool {
-        self.agent.name() == "kimi" && (self.hooks.acts.scoped)(&self.sid).is_some()
+    /// THE POOL A SCOPED HARNESS MOVES ITS CHILD THROUGH: the pooled CLI of this tab's agent
+    /// other than Claude Code (whose account flow is the built-in host's), where the tab's live
+    /// claim hears `restart` ([`crate::harness_claim::Scoped::hears_restart`]: `relaunch`, or
+    /// `accounts` under contract 4), whichever harness holds it. Such a tab's account advice is
+    /// this pool's ([`Self::pool_advice_for`]), and a move is planned and told only for a claim
+    /// granted `accounts` ([`Self::scoped_pool_plan`]), so a claim holding `relaunch` alone stays
+    /// on its account.
+    fn scoped_pool(&self) -> Option<accounts::Cli> {
+        let cli = accounts::Cli::of(self.agent).filter(|cli| *cli != accounts::Cli::Claude)?;
+        (self.hooks.acts.scoped)(&self.sid)
+            .is_some_and(|scoped| scoped.hears_restart())
+            .then_some(cli)
     }
 
+    /// Whether a scoped harness holds this tab's account pool ([`Self::scoped_pool`]); it is told
+    /// a move only where it was granted `accounts` ([`Self::scoped_pool_plan`]).
+    fn scoped_pooled(&self) -> bool {
+        self.scoped_pool().is_some()
+    }
+
+    /// The model a scoped harness is told to restart its child on ([`Restart::Model`], or
+    /// [`Restart::ModelBack`] naming one): only where the tab's live claim hears `restart`. A
+    /// move back that names no model is not sent, since the event names the model it asks for.
+    fn scoped_model<'w>(&self, why: &'w Restart) -> Option<&'w str> {
+        let to = match why {
+            Restart::Model { to } | Restart::ModelBack { to: Some(to) } => to.as_str(),
+            _ => return None,
+        };
+        (self.hooks.acts.scoped)(&self.sid)
+            .is_some_and(|scoped| scoped.hears_restart())
+            .then_some(to)
+    }
+
+    /// The pool's plan for the scoped harness's child at `point`, and the seat it read: only for a
+    /// claim told an account move ([`crate::harness_claim::Scoped::hears_account_move`], granted
+    /// `accounts`), since the move names the account's home; for any other claim no plan is made,
+    /// nothing is committed and no move is advised.
     fn scoped_pool_plan(
         &self,
         point: AccountPoint,
@@ -5466,17 +5559,12 @@ impl WorkerIdle {
         accounts_pool::SessionPlan<accounts_pool::LoginEnv>,
         AccountSeat,
     )> {
+        let cli = self.scoped_pool()?;
         let scoped = (self.hooks.acts.scoped)(&self.sid)?;
-        if !scoped
-            .claim
-            .scopes
-            .contains(aterm_agent::harness::contract::Scope::Relaunch)
-            || restart_stamp::kernel_start(scoped.proven.pid).as_deref()
-                != Some(scoped.proven.start.as_str())
-        {
+        if !scoped.hears_account_move() {
             return None;
         }
-        let args = atpkg::caller_shell::process_args(scoped.proven.pid)?;
+        let args = scoped_vendor_args(&scoped)?;
         if (self.hooks.acts.scoped)(&self.sid).as_ref() != Some(&scoped) {
             return None;
         }
@@ -5504,14 +5592,15 @@ impl WorkerIdle {
                 at: Some(seat.now),
             },
         };
-        let mode = self.switches.pool_controls(accounts::Cli::Kimi).mode;
+        let mode = self.switches.pool_controls(cli).mode;
         // The plan is the observed account's, as the look, the hold and the sighting are
         // (`docs/DESIGN-account-discovery-2026-11-09.md`).
-        let seen = scoped_kimi_seen(&args, &seat.home);
+        let roster = pool_seat.bound_roster(cli).ok();
+        let seen = scoped_seen(cli, &args, &seat.home, roster.as_ref());
         let plan = accounts_pool::session_login_plan(
             &pool_seat,
             &accounts_pool::Session {
-                cli: accounts::Cli::Kimi,
+                cli,
                 sid: &self.sid,
                 supervisor: accounts::Supervisor::Aterm,
                 env: &pairs,
@@ -5538,6 +5627,7 @@ impl WorkerIdle {
     }
 
     fn scoped_pool_advice(&self, point: AccountPoint) -> Option<AccountAdvice> {
+        let cli = self.scoped_pool()?;
         let (planned, seat) = self.scoped_pool_plan(point)?;
         if let accounts::Advice::Move { to, yields, .. } = planned.advice() {
             aterm_log::info!("harness @{}: scoped account advice: move to {to}", self.sid);
@@ -5557,7 +5647,7 @@ impl WorkerIdle {
             home: &seat.home,
             now: seat.now,
         }
-        .bound_roster(accounts::Cli::Kimi)
+        .bound_roster(cli)
         .ok()?;
         let (state, _) = accounts_pool::Seat {
             config_dir: seat.roster.as_deref()?.parent()?,
@@ -5565,10 +5655,10 @@ impl WorkerIdle {
             home: &seat.home,
             now: seat.now,
         }
-        .store(accounts::Cli::Kimi)
+        .store(cli)
         .load(seat.now)
         .ok()?;
-        let enrolled = accounts::enrolled_for(accounts::Cli::Kimi, &roster);
+        let enrolled = accounts::enrolled_for(cli, &roster);
         let opening = accounts::next_opening(&roster, &state, &enrolled, seat.now);
         account_advice_of(
             planned.advice(),
@@ -5595,7 +5685,7 @@ impl WorkerIdle {
         if env.label != to {
             return RestartAnswer::unread(CHANGED);
         }
-        if !(self.hooks.acts.scoped_account)(&self.sid, why.word(), &env) {
+        if !(self.hooks.acts.scoped_restart)(&self.sid, why.word(), Some(&env), None) {
             return RestartAnswer::unread("failed:scoped-account-event");
         }
         RestartAnswer::unread("relaunched:scoped-account")
@@ -5607,7 +5697,7 @@ impl WorkerIdle {
         supervisor: accounts::Supervisor,
         point: AccountPoint,
     ) -> Option<AccountAdvice> {
-        if cli == accounts::Cli::Kimi && (self.hooks.acts.scoped)(&self.sid).is_some() {
+        if self.scoped_pool() == Some(cli) {
             return self.scoped_pool_advice(point);
         }
         let seat = (self.hooks.acts.account_seat)()?;
@@ -5735,14 +5825,36 @@ impl WorkerIdle {
     }
 }
 
-/// What the login file of a scoped Kimi Code process says it runs on ([`observe::kimi`]), read
-/// by the argv and exec environment `args` its plan is made from, in the user home `home`.
-fn scoped_kimi_seen(args: &atpkg::caller_shell::ProcArgs, home: &Path) -> Observation {
+/// The argv and exec environment a scoped harness's vendor runs with: its kept child's while
+/// that child still reads at its birth, else the claimant's
+/// ([`crate::harness_claim::Scoped::vendor_pid`]); `None` once the claimant no longer reads at
+/// its proven start, or the kernel gives no arguments.
+fn scoped_vendor_args(
+    scoped: &crate::harness_claim::Scoped,
+) -> Option<atpkg::caller_shell::ProcArgs> {
+    if restart_stamp::kernel_start(scoped.proven.pid).as_deref()
+        != Some(scoped.proven.start.as_str())
+    {
+        return None;
+    }
+    atpkg::caller_shell::process_args(scoped.vendor_pid(&aterm_uds::process::read_birth))
+}
+
+/// What the login file of a scoped harness's `cli` process says it runs on ([`observe::pooled`]),
+/// read by the argv and exec environment `args` its plan is made from, in the user home `home`,
+/// with the CLI's own `roster` where it is bound.
+fn scoped_seen(
+    cli: accounts::Cli,
+    args: &atpkg::caller_shell::ProcArgs,
+    home: &Path,
+    roster: Option<&accounts::Roster>,
+) -> Observation {
     let who = accounts::ProcessLogin::of_env_for(
-        accounts::Cli::Kimi,
+        cli,
         args.env.iter().filter_map(|entry| entry.split_once('=')),
     );
-    observe::kimi(
+    observe::pooled(
+        cli,
         &observe::Process {
             argv: &args.argv,
             env: &args.env,
@@ -5750,6 +5862,7 @@ fn scoped_kimi_seen(args: &atpkg::caller_shell::ProcArgs, home: &Path) -> Observ
         },
         home,
         &who,
+        roster,
     )
 }
 
@@ -5794,6 +5907,28 @@ pub(crate) struct TapKept {
     /// The account no row lists, the windows and the time of the reading this worker last sent
     /// to the journal ([`WorkerIdle::tap_unlisted`]).
     unlisted: Option<TapUnlisted>,
+    /// The account key whose vault token a stored-login reading last looked for with no row of
+    /// this Mac's token table awaiting a verdict, and when ([`basis_standing`]): one look per
+    /// [`accounts::READING_HEARTBEAT_S`], so a peer Mac's token is compared here without a vault
+    /// read at every reading.
+    basis_looked: Option<(String, i64)>,
+    /// The account key whose split pair this worker last asked the vault to settle, and when
+    /// ([`token_split`]): once per [`BUSY_TAP_S`] at most, so a Mac whose turn it is not reads the
+    /// vault no more often than that.
+    settled: Option<(String, i64)>,
+}
+
+/// Whether the look `last` (an account key and when) leaves one for the account `key` due at
+/// `now`, `every` seconds apart, and records it where it does: another account, or the last look
+/// that far back, or a clock set back.
+fn look_due(last: &mut Option<(String, i64)>, key: &str, now: i64, every: i64) -> bool {
+    let due = last
+        .as_ref()
+        .is_none_or(|(was, at)| was != key || !(0..every).contains(&now.saturating_sub(*at)));
+    if due {
+        *last = Some((key.to_owned(), now));
+    }
+    due
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6351,12 +6486,14 @@ impl IdleHost for WorkerIdle {
     }
 
     fn scoped_restart(&self, why: &Restart) -> bool {
-        matches!(why, Restart::Account { .. }) && self.scoped_kimi()
+        (matches!(why, Restart::Account { .. }) && self.scoped_pooled())
+            || self.scoped_model(why).is_some()
     }
 
-    /// Whether a built-in lane or a scoped Kimi harness can restart this agent, and `[harness] relaunch` allows it.
+    /// Whether a built-in lane or a scoped harness that moves its child's account can restart
+    /// this agent, and `[harness] relaunch` allows it.
     fn can_restart(&self) -> bool {
-        (self.relaunch_lane() || self.scoped_kimi()) && self.switches.relaunch()
+        (self.relaunch_lane() || self.scoped_pooled()) && self.switches.relaunch()
     }
 
     /// What the agent's own launch says of its model: the argv of the kept snapshot while its agent
@@ -6410,11 +6547,20 @@ impl IdleHost for WorkerIdle {
             .restart_left
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
-        let scoped_account = matches!(why, Restart::Account { .. }) && self.scoped_kimi();
-        if (!scoped_account && !self.can_restart())
-            || (!scoped_account && (self.beside() || self.native_stands_down()))
-        {
+        let scoped_model = self.scoped_model(why);
+        let scoped = scoped_model.is_some()
+            || (matches!(why, Restart::Account { .. }) && self.scoped_pooled());
+        if !scoped && (!self.can_restart() || self.beside() || self.native_stands_down()) {
             return None;
+        }
+        if let Some(model) = scoped_model {
+            let step = if (self.hooks.acts.scoped_restart)(&self.sid, "model", None, Some(model)) {
+                "relaunched:scoped-model"
+            } else {
+                "failed:scoped-model-event"
+            };
+            aterm_log::info!("harness @{}: model move to {model}: {step}", self.sid);
+            return self.on().then(|| RestartAnswer::unread(step));
         }
         if let Restart::Account { to, at } = why {
             let answer = self.account_move(why, ask, to, *at);
@@ -6532,9 +6678,10 @@ impl IdleHost for WorkerIdle {
                     return HostAgent::Unread;
                 }
                 let Some(snap) = self.kept_in_tab() else {
-                    return match with_kept_of(&self.kept, |k| k.snapshot_unread) {
-                        Some(_) => HostAgent::Unread,
-                        None => HostAgent::Absent,
+                    return if with_kept_of(&self.kept, |k| k.snapshot_end.answered()) {
+                        HostAgent::Absent
+                    } else {
+                        HostAgent::Unread
                     };
                 };
                 snap
@@ -7157,7 +7304,7 @@ impl IdleHost for WorkerIdle {
         let advice = self.account_advice(point, owed, &mut judged);
         let progress =
             self.read_account_progress(&request, point, advice.as_ref(), judged.as_mut());
-        let scoped = self.scoped_kimi();
+        let scoped = self.scoped_pooled();
         let scoped_advice = scoped.then(|| advice.clone()).flatten();
         let advice = request.publish_scoped(&self.kept, advice, point, progress, scoped);
         (self.hooks.note)(HostNote::AccountProgress);
@@ -7404,7 +7551,7 @@ impl IdleHost for WorkerIdle {
 
     /// The renewable login the session runs on ([`IdleHost::login_label`]).
     fn login_label(&self) -> Option<String> {
-        if self.scoped_kimi() {
+        if self.scoped_pooled() {
             return self.scoped_renewal().map(|(label, _)| label);
         }
         self.renewable_look().map(|(_, _, label)| label)
@@ -7424,7 +7571,7 @@ impl IdleHost for WorkerIdle {
 
     /// Whether the session's process holds a login a renewal replaced ([`IdleHost::login_superseded`]).
     fn login_superseded(&self) -> bool {
-        if self.scoped_kimi() {
+        if self.scoped_pooled() {
             return self.scoped_renewal().is_some_and(|(_, replaced)| replaced);
         }
         self.renewable_look()
@@ -7848,16 +7995,11 @@ impl WorkerIdle {
         let Some(config_dir) = seat.roster.as_deref().and_then(Path::parent) else {
             return;
         };
-        let scoped = (cli == accounts::Cli::Kimi)
+        let scoped = (self.scoped_pool() == Some(cli))
             .then(|| (self.hooks.acts.scoped)(&self.sid))
             .flatten();
         let (env, snap) = if let Some(scoped) = &scoped {
-            if restart_stamp::kernel_start(scoped.proven.pid).as_deref()
-                != Some(scoped.proven.start.as_str())
-            {
-                return;
-            }
-            let Some(args) = atpkg::caller_shell::process_args(scoped.proven.pid) else {
+            let Some(args) = scoped_vendor_args(scoped) else {
                 return;
             };
             (args.env, None)
@@ -7934,11 +8076,13 @@ impl WorkerIdle {
     /// its process holds: with or without an email, a renewal route, `logins` or `accounts`
     /// on. The renewal lifecycle keeps its own asks ([`Self::login_ended`],
     /// [`Self::login_served`]); this starts none. A session the token wrapper served marks
-    /// its token refused instead ([`token_refused_at`]), and a process on a login a renewal
-    /// replaced says nothing of the renewed one. Whatever it leaves as it stood is one line of
-    /// aterm's log, once per change ([`Self::login_unrecorded`]). A served turn is evidence of
-    /// the time it served: `served_at`, the model's reply that ended a break's turn
-    /// ([`IdleHost::login_served_at`]; no later than now), else now, a point's own time.
+    /// its token refused instead ([`token_refused_at`]), a process on a login a renewal
+    /// replaced says nothing of the renewed one, and one on a row whose login was never made
+    /// here ([`accounts::login_made_here`]) says nothing of the row. Whatever it leaves as it
+    /// stood is one line of aterm's log, once per change ([`Self::login_unrecorded`]). A served
+    /// turn is evidence of the time it served: `served_at`, the model's reply that ended a
+    /// break's turn ([`IdleHost::login_served_at`]; no later than now), else now, a point's own
+    /// time.
     fn claude_login_seen(&self, seen: LoginSeen, served_at: Option<i64>) {
         let what = format!("{} login {}", self.agent.name(), login_seen_word(seen));
         let Some(seat) = (self.hooks.acts.account_seat)() else {
@@ -7970,6 +8114,14 @@ impl WorkerIdle {
         let Some(row) = roster.row(label) else {
             return self.login_unrecorded(&what, &format!("account {label}: its row is gone"));
         };
+        // A process on a row's empty directory holds no login of it: its sign-in wall ends none,
+        // and recording one would ask this Mac to sign in an account it only borrows (FL-135).
+        if !accounts::login_made_here(row) {
+            return self.login_unrecorded(
+                &what,
+                &format!("account {label}: no login of it was made on this Mac"),
+            );
+        }
         let state = match seat.bounded_claude_store().load(seat.now) {
             Ok((state, _)) => state,
             Err(why) => {
@@ -8046,18 +8198,14 @@ impl WorkerIdle {
 
     /// The scoped Kimi session's renewable row and whether its bound credential home changed.
     fn scoped_renewal(&self) -> Option<(String, bool)> {
-        if !self.switches.pool_controls(accounts::Cli::Kimi).logins {
+        let cli = self.scoped_pool()?;
+        if !self.switches.pool_controls(cli).logins {
             return None;
         }
         let scoped = (self.hooks.acts.scoped)(&self.sid)?;
-        if restart_stamp::kernel_start(scoped.proven.pid).as_deref()
-            != Some(scoped.proven.start.as_str())
-        {
-            return None;
-        }
-        let args = atpkg::caller_shell::process_args(scoped.proven.pid)?;
+        let args = scoped_vendor_args(&scoped)?;
         let who = accounts::ProcessLogin::of_env_for(
-            accounts::Cli::Kimi,
+            cli,
             args.env.iter().filter_map(|entry| entry.split_once('=')),
         );
         if !who.route.on_account() {
@@ -8070,7 +8218,7 @@ impl WorkerIdle {
             home: &seat.home,
             now: seat.now,
         }
-        .bound_roster(accounts::Cli::Kimi)
+        .bound_roster(cli)
         .ok()?;
         let label = who.me(&roster).label()?.to_string();
         let row = roster.row(&label).filter(|row| row.email.is_some())?;
@@ -8222,6 +8370,23 @@ impl WorkerIdle {
             TokenLook::Absent => return Some(TAP_OTHER_TOKEN),
             TokenLook::Found(standing) => Some(*standing),
         };
+        // A pair two Macs wrote at once serves no Mac until one writes it again: where this
+        // reading's standing finds it so, the settle goes first (§5.6), before the reading is
+        // judged for the token it is on. A split pair's meta is its register's winner, which may
+        // be one this build does not read (a later build's refutation): its standing then names
+        // no token, and a session on the token reads as one on another, which would leave the
+        // split to the accounts upkeep.
+        let settle_first = |standing: &TokenStanding| {
+            if let Some(settle) = token_split(standing, |key| {
+                let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
+                look_due(&mut kept.settled, key, seat.now, BUSY_TAP_S)
+            }) {
+                token_write(&seat, settle);
+            }
+        };
+        if let Some(standing) = &token {
+            settle_first(standing);
+        }
         // A reading counts for the token the session runs on: the one its wrapper named beside
         // the marker, or, for a session an earlier wrapper served, a token made before it began;
         // of any other (one a `--replace` has since replaced, or none it can be), nothing is the
@@ -8239,10 +8404,21 @@ impl WorkerIdle {
         // A session on the row's stored login: where the row's token, in use here, waits for a
         // verdict, this reading is its basis once the fold credits it to the row (§5.6).
         let basis = if token.is_none() && look.who.route.is_stored() {
-            basis_standing(&seat, row, &look.who)
+            basis_standing(&seat, row, &look.who, |key| {
+                let mut kept = self.tap.lock().unwrap_or_else(PoisonError::into_inner);
+                look_due(
+                    &mut kept.basis_looked,
+                    key,
+                    seat.now,
+                    accounts::READING_HEARTBEAT_S,
+                )
+            })
         } else {
             None
         };
+        if let Some(standing) = &basis {
+            settle_first(standing);
+        }
         let key = match row.expected_identity_email() {
             // A profile read: a token session's profile may be stale, so it keys nothing.
             _ if !look.who.route.is_stored() => None,
@@ -9612,7 +9788,7 @@ impl WorkerIdle {
 
     /// The session's own usage wall for its account, as the loop's limit episode opens ([`IdleHost::limited`]).
     fn account_wall(&self) -> &'static str {
-        if self.scoped_kimi() {
+        if self.scoped_pooled() {
             return "scoped";
         }
         if !accounts_for(self.agent) {
@@ -11359,11 +11535,12 @@ impl WorkerIdle {
         const CHANGED: &str = "wait:account-changed";
         const STATE: &str = "wait:account-state";
         let hooks = &self.hooks;
-        let scoped = self.scoped_kimi();
+        let scoped_cli = self.scoped_pool();
+        let scoped = scoped_cli.is_some();
         let at_wall = at == AccountAt::Wall;
         let advised = with_kept_of(&self.kept, |k| advised_for(k, to, at_wall));
-        let controls = if scoped {
-            self.switches.pool_controls(accounts::Cli::Kimi)
+        let controls = if let Some(cli) = scoped_cli {
+            self.switches.pool_controls(cli)
         } else {
             self.switches.account_controls()
         };
@@ -11493,13 +11670,12 @@ impl WorkerIdle {
             aterm_agent::harness::claims::Act::Claim(to),
             seat.now,
         );
-        if matches!(
-            claim,
-            aterm_agent::harness::claims::Touched::HeldElsewhere(_)
-                | aterm_agent::harness::claims::Touched::PreparationOnly
-        ) || (matches!(claim, aterm_agent::harness::claims::Touched::Unrecorded(_))
-            && !state.home_accounts.contains(to))
-        {
+        // A row only its vault token runs here moves a session only under a claim this Mac
+        // recorded (FL-135, `accounts_pool::claim_admits`).
+        let token_only = roster
+            .row(to)
+            .is_some_and(|row| accounts::token_only(row, &state, &enrolled, seat.now));
+        if !accounts_pool::claim_admits(&claim, &state, to, token_only) {
             return RestartAnswer::unread(CHANGED);
         }
         let mut canary = None;
@@ -11850,19 +12026,36 @@ impl SnapshotRead {
     ) -> bool {
         let stale =
             |k: &Kept| !self.current(k) || revoked.is_some_and(|r| r.load(Ordering::SeqCst));
-        if with_kept_of(kept, |k| stale(k)) {
+        // A stale or overtaken read ends explicitly ([`SnapshotEnd::Stale`]): what the worker
+        // waiting on it learns is that it was not read, never the outcome an earlier read left.
+        let ended_stale = |k: &mut Kept| k.snapshot_end = SnapshotEnd::Stale;
+        if with_kept_of(kept, |k| {
+            let stale = stale(k);
+            if stale {
+                ended_stale(k);
+            }
+            stale
+        }) {
             return false;
         }
         match (hooks.acts.snapshot)(sid) {
-            Ok(snap) => land_snapshot(sid, kept, hooks, snap, stale),
+            Ok(snap) => {
+                let landed = land_snapshot(sid, kept, hooks, snap, stale);
+                if !landed {
+                    with_kept_of(kept, ended_stale);
+                }
+                landed
+            }
             Err(refused) => {
                 with_kept_of(kept, |k| {
-                    if !stale(k) {
-                        k.snapshot_unread = match refused {
-                            SnapshotRefusal::Unread(why) => Some(why),
-                            SnapshotRefusal::Answered(_) => None,
-                        };
-                    }
+                    k.snapshot_end = if stale(k) {
+                        SnapshotEnd::Stale
+                    } else {
+                        match refused {
+                            SnapshotRefusal::Unread(why) => SnapshotEnd::Unread(why),
+                            SnapshotRefusal::Answered(why) => SnapshotEnd::Answered(why),
+                        }
+                    };
                 });
                 self.follow(sid, kept, hooks, revoked);
                 false
@@ -11888,7 +12081,7 @@ fn land_snapshot(
         let moved = publish_snapshot(sid, Some(&snap));
         let said = asked_runs(sid, &mut kept, &snap);
         kept.snapshot = Some(snap);
-        kept.snapshot_unread = None;
+        kept.snapshot_end = SnapshotEnd::Landed;
         (moved, said)
     };
     observe_published_snapshot(sid, hooks);
@@ -13478,7 +13671,24 @@ fn self_claimed_exit(
             return None;
         }
     };
-    let snap = crash_snapshot(snap, copy).or_else(|| {
+    // The snapshot the crash is relaunched from: the one read while it ran, else one read now at
+    // the shell holding the tab, which is owed its line from then on.
+    let owe = |snap: Snapshot| {
+        let mut owed = snap.clone();
+        if let Some(run) = owed.codex_mut() {
+            run.self_claimed = Some(resume.clone());
+        }
+        with_kept(job, |k| {
+            if !job.revoked.load(Ordering::SeqCst) {
+                k.owed = Some(OwedRelaunch {
+                    snap: owed.clone(),
+                    asked,
+                });
+            }
+        });
+        (snap, owed)
+    };
+    let read_at_shell = || -> Result<Snapshot, SnapshotRefusal> {
         let snap = (hooks.acts.self_snapshot)(sid, copy, &resume)?;
         aterm_log::info!(
             "harness @{sid}: no snapshot of the crashed codex-alab {} was read while it ran; \
@@ -13486,35 +13696,38 @@ fn self_claimed_exit(
             copy.pid,
             snap.shell
         );
-        Some(snap)
-    });
-    let Some(snap) = snap else {
-        settled(job);
-        forget_snapshot(job, hooks);
-        task_exited(job, hooks);
-        aterm_log::info!(
-            "harness @{sid}: the self-supervised codex-alab crashed; not relaunched: it was the \
-             tab's own program, with no shell to relaunch it at"
-        );
-        inform(format!(
-            "codex-alab ({}) crashed and is not relaunched: it was this tab's own program, with \
-             no shell to start it again at",
-            copy.pid
-        ));
-        return None;
+        Ok(snap)
     };
-    let mut owed = snap.clone();
-    if let Some(run) = owed.codex_mut() {
-        run.self_claimed = Some(resume.clone());
-    }
-    with_kept(job, |k| {
-        if !job.revoked.load(Ordering::SeqCst) {
-            k.owed = Some(OwedRelaunch {
-                snap: owed.clone(),
-                asked,
-            });
+    // Only a read the host answered says no shell holds the tab. One that failed before it
+    // answered (the roster, the shell's terminal or its arguments not read, as on a loaded host)
+    // is no answer (LS-15): the relaunch's attempts read it again, each waiting as on a shell not
+    // back yet, where taking it for no shell left a crashed agent for good.
+    let mut from = match crash_snapshot(snap, copy).map_or_else(read_at_shell, Ok) {
+        Ok(snap) => Some(owe(snap)),
+        Err(SnapshotRefusal::Unread(why)) => {
+            aterm_log::info!(
+                "harness @{sid}: the shell holding the crashed codex-alab {}'s tab was not read \
+                 ({why}); it is read again at each attempt of its relaunch",
+                copy.pid
+            );
+            None
         }
-    });
+        Err(SnapshotRefusal::Answered(why)) => {
+            settled(job);
+            forget_snapshot(job, hooks);
+            task_exited(job, hooks);
+            aterm_log::info!(
+                "harness @{sid}: the self-supervised codex-alab crashed; not relaunched: it was \
+                 the tab's own program, with no shell to relaunch it at ({why})"
+            );
+            inform(format!(
+                "codex-alab ({}) crashed and is not relaunched: it was this tab's own program, \
+                 with no shell to start it again at",
+                copy.pid
+            ));
+            return None;
+        }
+    };
     // The crash rule's journal line, once per crash at its first admitted attempt: what
     // `lab codex-alab-proof` counts as the crash rule's relaunch, and what a reader of the log
     // has to tell this relaunch from codex-alab's own.
@@ -13540,15 +13753,30 @@ fn self_claimed_exit(
         asked.map(|_| &line_grace as &dyn Fn() -> u32),
         GoneUnread::HandedBack,
         || {
+            let (snap, owed) = match &from {
+                Some(read) => read,
+                None => match read_at_shell() {
+                    Ok(snap) => &*from.insert(owe(snap)),
+                    Err(SnapshotRefusal::Unread(why)) => return format!("wait:{why}"),
+                    Err(SnapshotRefusal::Answered(why)) => {
+                        aterm_log::info!(
+                            "harness @{sid}: the self-supervised codex-alab crashed; not \
+                             relaunched: it was the tab's own program, with no shell to relaunch \
+                             it at ({why})"
+                        );
+                        return "refused:not-a-shell-job".to_string();
+                    }
+                },
+            };
             // Retry admission after each wait, before publishing or typing a new line.
-            let moved = match (hooks.acts.codex_cold)(&owed, &cold_use) {
+            let moved = match (hooks.acts.codex_cold)(owed, &cold_use) {
                 Ok(moved) => moved,
                 Err(why) => {
                     aterm_log::info!("harness @{sid}: cold account admission waits: {why}");
                     return COLD_ACCOUNT_WAIT.into();
                 }
             };
-            let selected = moved.as_ref().unwrap_or(&owed);
+            let selected = moved.as_ref().unwrap_or(owed);
             let next = selected
                 .codex()
                 .and_then(|run| run.self_claimed.as_ref())
@@ -13570,7 +13798,7 @@ fn self_claimed_exit(
                     });
                 }
             });
-            let step = (hooks.acts.self_relaunch)(sid, grace, &snap, next, asked);
+            let step = (hooks.acts.self_relaunch)(sid, grace, snap, next, asked);
             if relaunch::outcome(&step) == Outcome::Relaunched {
                 tell_kept(hooks, sid, copy.pid, &cold_use);
             }
@@ -20881,7 +21109,7 @@ pub(crate) fn note_codex_report(
     use aterm_core::terminal::program_state::ProgramApp;
     let codex = match shown {
         Some(ProgramApp::Codex) => true,
-        Some(ProgramApp::ClaudeCode | ProgramApp::GrokBuild) | None => false,
+        Some(ProgramApp::ClaudeCode | ProgramApp::GrokBuild | ProgramApp::Other(_)) | None => false,
     };
     let mut reports = CODEX_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
     if codex {
@@ -21037,11 +21265,16 @@ fn scoped_now(store: &Store, sid: &str) -> Option<crate::harness_claim::Scoped> 
         })
 }
 
-fn scoped_account_now(
+/// [`Acts::scoped_restart`], live: the event recorded on `sid`'s timeline
+/// ([`crate::restart_act::record_scoped_restart`]); an account move then waits up to 30 s for the
+/// same claimant to claim again naming the account's label in `login=`, its child's login claim.
+/// A model move has no claim word to wait for: recorded is told.
+fn scoped_restart_now(
     store: &Store,
     sid: &str,
     cause: &str,
-    env: &accounts_pool::LoginEnv,
+    account: Option<&accounts_pool::LoginEnv>,
+    model: Option<&str>,
 ) -> bool {
     let Some(ctx) = store
         .read()
@@ -21054,9 +21287,12 @@ fn scoped_account_now(
     let Some(before) = scoped_now(store, sid) else {
         return false;
     };
-    if !crate::restart_act::record_scoped_account(&ctx, cause, env) {
+    if !crate::restart_act::record_scoped_restart(&ctx, cause, account, model) {
         return false;
     }
+    let Some(env) = account else {
+        return true;
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if scoped_now(store, sid).is_some_and(|current| {
@@ -21069,6 +21305,45 @@ fn scoped_account_now(
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The registry generation [`reprove_claims_now`] last proved the live claims under.
+static REPROVED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// [`Acts::reprove_claims`], live: where the registry read now is another generation than the one
+/// last proved under, prove each session's live contract 4 claim again against that read's rows
+/// and image rule ([`crate::harness_claim::reprove`],
+/// [`crate::harness_claim::runs_harness_build_in`]) and drop the ones that fail
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2). The registry and its generation are one
+/// read ([`aterm_agent::harness::registry::current_at`]), so the generation recorded is the one
+/// whose rows were judged: read by two calls, a read another thread made between them was recorded
+/// as proven unjudged, and every later pass skipped it (HX-05's review, findings 5 and 11).
+fn reprove_claims_now(store: &Store) {
+    let (registry, generation) = aterm_agent::harness::registry::current_at();
+    if REPROVED_AT.swap(generation, Ordering::SeqCst) == generation {
+        return;
+    }
+    let ctxs: Vec<Arc<crate::SessionCtx>> = store
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .live_handles()
+        .map(|h| Arc::clone(&h.ctx))
+        .collect();
+    for ctx in ctxs {
+        let _ = crate::harness_claim::reprove(
+            &ctx,
+            registry.rows(),
+            &|row, pid| {
+                crate::harness_claim::runs_harness_build_in(
+                    &registry,
+                    row,
+                    aterm_agent::harness::contract::UNIVERSAL,
+                    pid,
+                )
+            },
+            crate::metrics::now_us(),
+        );
     }
 }
 
@@ -21763,17 +22038,14 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
             r.step
         }),
         self_snapshot: Arc::new(move |sid, copy, resume| {
-            let o = o_snap(sid, 0)?;
-            match relaunch::self_claimed_snapshot(&o, copy, resume) {
-                Ok(snap) => Some(snap),
-                Err(why) => {
-                    aterm_log::info!(
-                        "harness @{sid}: no shell holds the tab at the crashed codex-alab's exit \
-                         ({why})"
-                    );
-                    None
-                }
-            }
+            let o = o_snap(sid, 0).ok_or(SnapshotRefusal::Unread(SNAPSHOT_NO_OPTS))?;
+            relaunch::self_claimed_snapshot(&o, copy, resume).map_err(|why| {
+                aterm_log::info!(
+                    "harness @{sid}: no snapshot at the shell holding the tab at the crashed \
+                     codex-alab's exit ({why})"
+                );
+                SnapshotRefusal::of(why)
+            })
         }),
         end_asked: Arc::new(move |sid, group, began| end_asked(&end_store, sid, group, began)),
         driven: Arc::new(move |sid| driven(&driven_store, sid)),
@@ -22017,9 +22289,15 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         account_restart: Arc::new(move |sid, pid| {
             o19(sid, 0).and_then(|o| relaunch::account_restart(&o, pid))
         }),
-        scoped_account: {
+        scoped_restart: {
             let store = scoped_store.clone();
-            Arc::new(move |sid, cause, env| scoped_account_now(&store, sid, cause, env))
+            Arc::new(move |sid, cause, account, model| {
+                scoped_restart_now(&store, sid, cause, account, model)
+            })
+        },
+        reprove_claims: {
+            let store = scoped_store.clone();
+            Arc::new(move || reprove_claims_now(&store))
         },
         background: Arc::new(relaunch::background_holds),
         account_made: Arc::new(|sid, to, at| {
@@ -23959,10 +24237,10 @@ type TokenStanding = aterm_secrets::claude_token::Standing;
 #[cfg(not(unix))]
 type TokenStanding = std::convert::Infallible;
 
-/// An account's current windows as a token's verification compares them
+/// Another account's current windows, by its row, as a token's verification compares them
 /// ([`token_others`], [`token_basis`]).
 #[cfg(unix)]
-type TokenWindows = aterm_agent::harness::accounts_tokens::Windows;
+type TokenWindows = aterm_agent::harness::accounts_tokens::Other;
 #[cfg(not(unix))]
 type TokenWindows = std::convert::Infallible;
 
@@ -23975,6 +24253,9 @@ enum TokenWrite {
         aterm_secrets::claude_token::Key,
         aterm_agent::harness::accounts_tokens::Verify,
     ),
+    /// The pair two Macs wrote at once, read `mismatched (draft)`, written again in one draft
+    /// where it is this Mac's turn ([`token_split`]).
+    Settle(aterm_secrets::claude_token::Key),
 }
 #[cfg(not(unix))]
 type TokenWrite = std::convert::Infallible;
@@ -24040,17 +24321,21 @@ fn token_standing(
 }
 
 /// The standing of `row`'s vault token where the session whose process login is `who` runs on
-/// the row's stored login (`AuthRoute::Stored`) and this Mac's token table holds a row of the
-/// account a stored-login reading gives a basis
-/// ([`aterm_agent::harness::accounts_tokens::basis_wanted`], a table read with no vault read):
-/// then read value-free from this Mac's vault, never waiting past `claude_token::standing`'s
-/// brief wait. What the reading records of it is judged by its standing ([`token_basis`]: a
-/// token in use here and not verified, wherever it was minted).
+/// the row's stored login (`AuthRoute::Stored`): read value-free from this Mac's vault, never
+/// waiting past `claude_token::standing`'s brief wait, at every reading where this Mac's token
+/// table holds a row of the account a stored-login reading gives a basis
+/// ([`aterm_agent::harness::accounts_tokens::basis_wanted`], a table read with no vault read),
+/// and otherwise where `look_due` says a look is due (once per
+/// [`accounts::READING_HEARTBEAT_S`]): a token another Mac minted, which no session here has
+/// held, is compared on any Mac where the account's stored login works. What the reading records
+/// of it is judged by its standing ([`token_basis`]: a token in use here and not verified,
+/// wherever it was minted).
 #[cfg(unix)]
 fn basis_standing(
     seat: &AccountSeat,
     row: &accounts::Row,
     who: &accounts::ProcessLogin,
+    look_due: impl FnOnce(&str) -> bool,
 ) -> Option<TokenStanding> {
     use aterm_secrets::claude_token::{self, Key, Lookup};
     let entry = accounts::TokenEntry::of_row(row)?;
@@ -24058,7 +24343,9 @@ fn basis_standing(
         return None;
     }
     let key = Key::parse(entry.key().as_str())?;
-    if !aterm_agent::harness::accounts_tokens::basis_wanted(&seat.claude_store(), &key) {
+    if !aterm_agent::harness::accounts_tokens::basis_wanted(&seat.claude_store(), &key)
+        && !look_due(key.as_str())
+    {
         return None;
     }
     match claude_token::standing(&aterm_secrets::client::Paths::for_home(&seat.home), &key) {
@@ -24072,8 +24359,26 @@ fn basis_standing(
     _seat: &AccountSeat,
     _row: &accounts::Row,
     _who: &accounts::ProcessLogin,
+    _look_due: impl FnOnce(&str) -> bool,
 ) -> Option<TokenStanding> {
     None
+}
+
+/// What a reading's vault token `standing` leaves to write first: where the pair reads
+/// `mismatched (draft)` (two Macs wrote it at once, so no Mac serves it), its settle
+/// ([`aterm_agent::harness::accounts_tokens::settle_split`]), where `due` says one is (once per
+/// [`BUSY_TAP_S`] for the account). Written at once, before the fold and outside every store's
+/// lock; the reading then goes on as read.
+#[cfg(unix)]
+fn token_split(standing: &TokenStanding, due: impl FnOnce(&str) -> bool) -> Option<TokenWrite> {
+    use aterm_secrets::claude_token::{Check, Mismatch};
+    (standing.check == Check::Mismatched(Mismatch::Draft) && due(standing.key.as_str()))
+        .then(|| TokenWrite::Settle(standing.key.clone()))
+}
+
+#[cfg(not(unix))]
+fn token_split(standing: &TokenStanding, _due: impl FnOnce(&str) -> bool) -> Option<TokenWrite> {
+    match *standing {}
 }
 
 /// Records the windows of `read`, a reading of a session on the row `label`'s stored login that
@@ -24116,23 +24421,24 @@ fn token_basis(
     match *standing {}
 }
 
-/// The other accounts' current windows on this Mac, as their samples in `state` hold them at
-/// `now` (`accounts_tokens::Windows::current`), every account but the row `label`'s, each naming
-/// a week: what a comparison of the row's token's windows reads for `shared`.
+/// The other accounts' current windows on this Mac, by row, as their samples in `state` hold them
+/// at `now` (`accounts_tokens::Windows::current`), every account but the row `label`'s, each
+/// naming a week: what a comparison of the row's token's windows reads for `shared`, and whose
+/// labels a `shared` verdict keeps.
 #[cfg(unix)]
 fn token_others(state: &accounts::State, label: &str, now: i64) -> Vec<TokenWindows> {
-    use aterm_agent::harness::accounts_tokens::Windows;
+    use aterm_agent::harness::accounts_tokens::{Other, Windows};
     state
         .accounts
         .iter()
         .filter(|(other, _)| other.as_str() != label)
-        .filter_map(|(_, account)| {
-            account
-                .sample
-                .as_ref()
-                .map(|sample| Windows::current(sample, now))
+        .filter_map(|(other, account)| {
+            account.sample.as_ref().map(|sample| Other {
+                label: other.clone(),
+                windows: Windows::current(sample, now),
+            })
         })
-        .filter(|windows| windows.week_reset.is_some())
+        .filter(|other| other.windows.week_reset.is_some())
         .collect()
 }
 
@@ -24217,23 +24523,32 @@ fn token_served(
     match *standing {}
 }
 
-/// Writes what [`token_served`] or [`token_basis`] left for the vault: `verified` for the token
-/// found equal windows for ([`aterm_agent::harness::accounts_tokens::verify_served`]). After the
-/// fold and outside every store's lock: a vault write, refused where the vault no longer holds the
-/// token compared. One the vault holds off is tried again at the token's next reading.
+/// Writes what [`token_served`], [`token_basis`] or [`token_split`] left for the vault:
+/// `verified` for the token found equal windows for
+/// ([`aterm_agent::harness::accounts_tokens::verify_served`]), refused where the vault no longer
+/// holds the token compared, or a split pair's settle
+/// ([`aterm_agent::harness::accounts_tokens::settle_split`]), which another Mac's turn leaves
+/// unwritten. Outside every store's lock: a vault write. One the vault holds off is tried again
+/// at the token's next reading.
 #[cfg(unix)]
 fn token_write(seat: &AccountSeat, write: TokenWrite) {
     use aterm_agent::harness::accounts_tokens::{self, Vault};
     let vault = Vault(aterm_secrets::client::Paths::for_home(&seat.home));
-    let _ = match write {
-        TokenWrite::Verify(key, verify) => accounts_tokens::verify_served(
-            &seat.claude_store(),
-            &vault,
-            &key,
-            verify,
-            u64::try_from(seat.now).unwrap_or(0),
-        ),
-    };
+    match write {
+        TokenWrite::Verify(key, verify) => {
+            let _ = accounts_tokens::verify_served(
+                &seat.claude_store(),
+                &vault,
+                &key,
+                verify,
+                u64::try_from(seat.now).unwrap_or(0),
+            );
+        }
+        TokenWrite::Settle(key) => {
+            let _ =
+                accounts_tokens::settle_split(&vault, &key, u64::try_from(seat.now).unwrap_or(0));
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -27294,8 +27609,135 @@ static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::n
 static DISK_BUDGET_BEGAN: Mutex<Option<i64>> = Mutex::new(None);
 /// Whether this process read the record of the last sizing yet ([`disk_budget_record`]).
 static DISK_BUDGET_READ: AtomicBool = AtomicBool::new(false);
-/// Whether a sizing runs on its thread now ([`disk_budget_look`]): one at a time.
+/// Whether a sizing, or a page of the budget's pass, runs on its thread now
+/// ([`disk_budget_look`], [`disk_budget_spawn`]): one at a time.
 static DISK_BUDGET_SIZING: AtomicBool = AtomicBool::new(false);
+/// The last sizing this process knows of ([`disk_budget_known`]): what a look reads to tell
+/// whether the volume is over its cap, neither the record each minute nor the board, which no
+/// level, wait or alert reads.
+static DISK_BUDGET_LAST: Mutex<Option<aterm_agent::harness::disk::budget::Sizing>> =
+    Mutex::new(None);
+/// Where the budget's pass stands in this window: its run against the last sizing, and the
+/// discovery cursor of its own its pages advance ([`disk_budget_page`]).
+struct DiskBudgetRun {
+    run: aterm_agent::harness::disk::budget::Run,
+    cursor: aterm_agent::harness::disk::discover::Cursor,
+}
+static DISK_BUDGET_RUN: Mutex<DiskBudgetRun> = Mutex::new(DiskBudgetRun {
+    run: aterm_agent::harness::disk::budget::Run {
+        from: None,
+        pages: 0,
+        open: false,
+    },
+    cursor: aterm_agent::harness::disk::discover::Cursor::new(),
+});
+/// A look that admits no budget pass stands: a pressure pass is due at it, an agent's demand or
+/// a fill projection stands, or the budget or removal is off
+/// (`aterm_agent::harness::disk::budget::pass_admitted`). A budget page asks it before each
+/// removal ([`DiskBudgetHold::lock_for`]) and reads no measure while it stands, so it stops
+/// before its next removal.
+static DISK_BUDGET_YIELD: AtomicBool = AtomicBool::new(false);
+/// The page a look prepared ([`disk_budget_pass_look`]), started once that look's ask step let
+/// its pass lock go ([`disk_budget_spawn`]): a page started while the look held the lock would
+/// find it held and stand down.
+static DISK_BUDGET_NEXT: Mutex<Option<DiskBudgetPage>> = Mutex::new(None);
+/// Whether a budget page runs on its thread now: no look adopts [`DISK_BUDGET_DONE`] meanwhile,
+/// as the page may take that lock back before its next removal.
+static DISK_BUDGET_PAGE: AtomicBool = AtomicBool::new(false);
+/// The pass lock a budget page ran under, and the bytes it freed under it that no look has yet
+/// taken for the ask's step: the next look that runs while no page does adopts both
+/// ([`disk_look_pass`]), so another instance's look reads a pass running until the step has
+/// recorded them.
+struct DiskBudgetDone {
+    lock: aterm_agent::harness::disk::reserve::PassLock,
+    freed: u64,
+}
+static DISK_BUDGET_DONE: Mutex<Option<DiskBudgetDone>> = Mutex::new(None);
+
+/// The pass lock a budget page holds, and what it freed under it ([`disk_budget_page`]): taken
+/// before the page's first removal and not before ([`Self::lock_for`]), so a page that walks
+/// and finds nothing to take holds no lock while it walks, and parked at the page's end for the
+/// next look ([`Self::park`]).
+#[derive(Default)]
+struct DiskBudgetHold {
+    lock: Option<aterm_agent::harness::disk::reserve::PassLock>,
+    freed: u64,
+}
+
+impl DiskBudgetHold {
+    /// Hold the pass lock at `path` for the removal about to be made: refused while a look that
+    /// admits no budget pass stands ([`DISK_BUDGET_YIELD`]), else the one this page holds, one
+    /// an earlier page parked that no look adopted ([`DISK_BUDGET_DONE`], with what it freed), or
+    /// one taken now. `Err` says why not, and the removal is not made.
+    fn lock_for(&mut self, path: &Path) -> Result<(), String> {
+        if DISK_BUDGET_YIELD.load(Ordering::SeqCst) {
+            return Err(
+                "a look that admits no budget pass stands (a pressure pass due, an agent's \
+                 demand, a fill projection, or the budget off)"
+                    .to_owned(),
+            );
+        }
+        if self.lock.is_some() {
+            return Ok(());
+        }
+        let parked = DISK_BUDGET_DONE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(done) = parked {
+            self.lock = Some(done.lock);
+            self.credit(done.freed);
+            return Ok(());
+        }
+        match aterm_agent::harness::disk::reserve::take_pass(path) {
+            Ok(Some(lock)) => {
+                self.lock = Some(lock);
+                Ok(())
+            }
+            Ok(None) => Err(format!("another pass holds {}", path.display())),
+            Err(e) => Err(format!(
+                "the pass lock {} could not be taken: {e}",
+                path.display()
+            )),
+        }
+    }
+
+    /// `bytes` freed under the lock.
+    fn credit(&mut self, bytes: u64) {
+        self.freed = self.freed.saturating_add(bytes);
+    }
+
+    /// The lock, and what was freed under it, for the next look to adopt ([`DISK_BUDGET_DONE`]);
+    /// nothing where the page took no lock.
+    fn park(self) {
+        if let Some(lock) = self.lock {
+            *DISK_BUDGET_DONE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(DiskBudgetDone {
+                lock,
+                freed: self.freed,
+            });
+        }
+    }
+}
+
+/// A sizing this process knows of now (its own, or the record's): the look's copy
+/// ([`DISK_BUDGET_LAST`]) and the board's, which `sys disk` prints, each kept unless the one it
+/// holds ended later.
+fn disk_budget_known(sizing: aterm_agent::harness::disk::budget::Sizing) {
+    {
+        let mut last = DISK_BUDGET_LAST
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last
+            .as_ref()
+            .is_none_or(|kept| kept.sized_unix <= sizing.sized_unix)
+        {
+            *last = Some(sizing.clone());
+        }
+    }
+    crate::disk_board::publish(|b| b.budget_sized(sizing));
+}
 
 /// At this process's first look of the disk watch, the record of the last sizing in the
 /// harness state directory `state`: when it began, and its figures, which `sys disk` prints
@@ -27309,7 +27751,7 @@ fn disk_budget_record(state: &Path) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = record.began_unix;
     if let Some(last) = record.last {
-        crate::disk_board::publish(|b| b.budget_sized(last));
+        disk_budget_known(last);
     }
 }
 
@@ -27382,7 +27824,7 @@ fn disk_budget_size(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = record.began_unix;
             if let Some(last) = record.last {
-                crate::disk_board::publish(|b| b.budget_sized(last));
+                disk_budget_known(last);
             }
             return;
         }
@@ -27432,7 +27874,439 @@ fn disk_budget_size(
             if budget.over() > 0 { "over" } else { "under" },
         );
     }
-    crate::disk_board::publish(|b| b.budget_sized(sizing));
+    disk_budget_known(sizing);
+}
+
+/// What a look read that the budget's pass runs against ([`disk_budget_pass_look`]).
+struct DiskBudgetAt<'a> {
+    /// This process is the owner's disk watch (no private state root).
+    owner: bool,
+    /// An agent's demand stands.
+    demand: bool,
+    /// A fill projection stands.
+    projected: bool,
+    config: aterm_agent::harness::disk::Config,
+    /// The home volume's key, where its free space was read.
+    key: Option<&'a aterm_sysprobe::volumes::VolumeKey>,
+    free: Option<u64>,
+    state: &'a Path,
+    home: &'a Path,
+    table: &'a aterm_sysprobe::volumes::Table,
+    cwds: &'a [PathBuf],
+    agents: &'a [u32],
+    store: &'a Store,
+    room: Option<u64>,
+    now: i64,
+}
+
+/// One page of the budget's pass, as its thread runs it ([`disk_budget_page`]).
+struct DiskBudgetPage {
+    state: PathBuf,
+    home: PathBuf,
+    table: aterm_sysprobe::volumes::Table,
+    cwds: Vec<PathBuf>,
+    agents: Vec<u32>,
+    store: Store,
+    config: aterm_agent::harness::disk::Config,
+    room: Option<u64>,
+    now: i64,
+    key: aterm_sysprobe::volumes::VolumeKey,
+    /// The sizing the run began from, and how far over its cap it reads the volume now.
+    sizing: aterm_agent::harness::disk::budget::Sizing,
+    over: aterm_agent::harness::disk::budget::Over,
+    /// The page of the run, from 1.
+    page: u32,
+}
+
+/// Prepare a page of the budget's pass ([`disk_budget_page`]) where the look admits one
+/// (`aterm_agent::harness::disk::budget::pass_admitted`), the last sizing reads the home volume
+/// over its cap (`budget::over`), the run has a page left for that sizing (`budget::Run`), and
+/// no sizing or page runs now: [`disk_look`] starts it on a thread of its own once the look's
+/// ask step is done ([`disk_budget_spawn`]). [`disk_look_pass`] calls it from a look that runs
+/// no pressure pass.
+fn disk_budget_pass_look(at: &DiskBudgetAt<'_>) {
+    use aterm_agent::harness::disk::budget;
+    let cap = at.config.cap_used_gib;
+    let (Some(key), Some(free)) = (at.key, at.free) else {
+        return;
+    };
+    if !budget::pass_admitted(
+        at.owner,
+        at.demand,
+        at.projected,
+        cap,
+        at.config.auto_free_gib,
+    ) {
+        return;
+    }
+    let Some(sizing) = DISK_BUDGET_LAST
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    let Some(over) = budget::over(&sizing, cap, &key.spelled(), free) else {
+        return;
+    };
+    let Some(page) = DISK_BUDGET_RUN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .run
+        .next(sizing.sized_unix)
+    else {
+        return;
+    };
+    if DISK_BUDGET_SIZING.load(Ordering::SeqCst) {
+        return;
+    }
+    let job = DiskBudgetPage {
+        state: at.state.to_path_buf(),
+        home: at.home.to_path_buf(),
+        table: at.table.clone(),
+        cwds: at.cwds.to_vec(),
+        agents: at.agents.to_vec(),
+        store: Arc::clone(at.store),
+        config: at.config,
+        room: at.room,
+        now: at.now,
+        key: key.clone(),
+        sizing,
+        over,
+        page,
+    };
+    *DISK_BUDGET_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(job);
+}
+
+/// Start the page a look prepared ([`disk_budget_pass_look`]) on a thread of its own
+/// ([`disk_budget_page`]) where no sizing or page runs now: [`disk_look`] calls it once the
+/// look's ask step let its pass lock go, and returns at once.
+fn disk_budget_spawn() {
+    let Some(job) = DISK_BUDGET_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    if DISK_BUDGET_SIZING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    DISK_BUDGET_PAGE.store(true, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new()
+        .name(format!("{THREAD_PREFIX}disk-budget"))
+        .spawn(move || {
+            let _quiet = aterm_sysprobe::quiet_errors();
+            let ran = caught(
+                "the rebuildable budget's pass",
+                "it runs again from the next sizing",
+                || disk_budget_page(&job),
+            );
+            if ran.is_none() {
+                disk_budget_ran(job.sizing.sized_unix, job.page, false);
+            }
+            DISK_BUDGET_PAGE.store(false, Ordering::SeqCst);
+            DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        });
+    if let Err(e) = spawned {
+        DISK_BUDGET_PAGE.store(false, Ordering::SeqCst);
+        DISK_BUDGET_SIZING.store(false, Ordering::SeqCst);
+        aterm_log::warn!("harness disk watch: the rebuildable budget's pass could not start: {e}");
+    }
+}
+
+/// Page `page` of the run from the sizing that ended at `sized_unix` ran: the run goes on only
+/// where it ended unfinished (`aterm_agent::harness::disk::budget::Run::ran`).
+fn disk_budget_ran(sized_unix: i64, page: u32, unfinished: bool) {
+    DISK_BUDGET_RUN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .run
+        .ran(sized_unix, page, unfinished);
+}
+
+/// The ids of the sessions this window holds now.
+fn disk_live_ids(store: &Store) -> Vec<String> {
+    let g = store.read().unwrap_or_else(PoisonError::into_inner);
+    g.live_handles()
+        .map(|h| h.sid.as_str().to_owned())
+        .collect()
+}
+
+/// Whether an aterm instance other than this process is listed on this machine, or the list
+/// could not be read whole: its sessions' builds are not this window's to read, so it runs no
+/// budget pass (`aterm disk watch` reads every instance's).
+fn disk_other_instances() -> bool {
+    let me = std::process::id();
+    match aterm_ctl::local_instances_complete() {
+        Ok(all) => all.iter().any(|(pid, _)| *pid != me),
+        Err(_) => true,
+    }
+}
+
+/// What keeps this window's sessions' builds now (`aterm_agent::harness::disk::budget::Live`):
+/// its sessions and the working directory each reports, read again from the store rather than
+/// taken from a look's copy, and the build-start lines they wrote.
+fn disk_budget_live(store: &Store) -> aterm_agent::harness::disk::budget::Live {
+    let sessions = disk_sessions_now(store);
+    aterm_agent::harness::disk::budget::Live::read(
+        disk_live_ids(store),
+        sessions.cwds,
+        sessions.unknown,
+    )
+}
+
+/// ONE PAGE OF THE BUDGET'S PASS ([`disk_budget_spawn`]'s thread), while this window is the only
+/// aterm instance listed ([`disk_other_instances`]), what keeps its sessions' builds reads whole
+/// ([`disk_budget_live`], read at the page's start and again before its rows), and no
+/// `cannot-meet` row stands for what it would run against (`budget::plans`): on the run's first
+/// page the shared build cache's parts no live session's builds used (`disk_budget_sweep`,
+/// macOS), then tier 1, 2 and 3 rows of what no live session keeps ([`disk_budget_tick`]), each
+/// stopping at the volume's free target, and before any removal once a look that admits no
+/// budget pass stands ([`DISK_BUDGET_YIELD`]). The pass lock is taken before the first removal
+/// and not before ([`DiskBudgetHold`]), and goes with what was freed under it to
+/// [`DISK_BUDGET_DONE`] for the next look. One log line; no note, alert or banner.
+fn disk_budget_page(job: &DiskBudgetPage) {
+    use aterm_agent::harness::cli::BudgetEnd;
+    use aterm_agent::harness::disk::{self, budget};
+    let (sized_unix, page) = (job.sizing.sized_unix, job.page);
+    if disk_other_instances() {
+        disk_budget_ran(sized_unix, page, false);
+        return;
+    }
+    let live = disk_budget_live(&job.store);
+    if live.blind() {
+        disk_budget_ran(sized_unix, page, false);
+        aterm_log::info!(
+            "harness disk watch: over the rebuildable budget, and no budget pass: what this \
+             window's sessions build could not be read whole"
+        );
+        return;
+    }
+    let inputs = budget::Inputs::of(
+        &job.sizing,
+        &job.over.budget,
+        live.digest(),
+        job.sizing.sized.partial,
+    );
+    if !budget::plans(budget::load(&job.state).as_ref(), &inputs, job.now) {
+        disk_budget_ran(sized_unix, page, false);
+        return;
+    }
+    let lock_path = disk::reserve::pass_lock_for(&job.home);
+    let mut hold = DiskBudgetHold::default();
+    // One sweep a run: its walk reaches the whole shared cache, so a later page would walk again
+    // only what the first one kept.
+    #[cfg(target_os = "macos")]
+    let swept = if page == 1 {
+        disk_budget_sweep(job, &live, &mut hold, &lock_path)
+    } else {
+        0
+    };
+    #[cfg(not(target_os = "macos"))]
+    let swept: u64 = 0;
+    let after = disk::volume_of(&job.home, &job.table).ok();
+    let (end, freed) = if after
+        .as_ref()
+        .is_some_and(|r| r.free >= job.over.free_target)
+    {
+        // The memo goes under the pass lock, as a page writes it under that lock.
+        match hold.lock_for(&lock_path) {
+            Ok(()) => {
+                if let Err(e) = budget::met(&job.state) {
+                    aterm_log::warn!("harness disk watch: the budget's memo was not removed: {e}");
+                }
+                (BudgetEnd::Met, swept)
+            }
+            Err(why) => (BudgetEnd::StoodDown(why), swept),
+        }
+    } else {
+        // The sweep may have walked for minutes: what keeps a session's builds is read again.
+        let live = disk_budget_live(&job.store);
+        if live.blind() {
+            let why = "what this window's sessions build could not be read whole".to_owned();
+            (BudgetEnd::StoodDown(why), swept)
+        } else {
+            let free = after.map(|r| r.free);
+            let (end, paged) = disk_budget_tick(job, &live, free, &mut hold, &lock_path);
+            (end, swept.saturating_add(paged))
+        }
+    };
+    hold.park();
+    disk_budget_ran(sized_unix, page, matches!(end, BudgetEnd::Unfinished));
+    aterm_log::info!(
+        "harness disk watch: budget pass page {page} ({} over a cap of {}): {} back; {}",
+        disk::human_bytes(job.over.budget.over()),
+        disk::human_bytes(job.over.budget.cap),
+        disk::human_bytes(freed),
+        end.describe()
+    );
+}
+
+/// A budget page's sweep of the shared build cache (`atpkg::build_cache::reclaim_over_budget`):
+/// the parts no live session's builds used, unwritten an hour, each removal journalled and asked
+/// first of the shortfall (what the entries put on record so far were sized at, against what
+/// free space was short of the volume's free target before the sweep: a snapshot that holds the
+/// blocks keeps free space from moving), of the pass lock ([`DiskBudgetHold::lock_for`], which a
+/// look that admits no budget pass refuses) and of the free target. What it freed, credited to
+/// `hold`.
+#[cfg(target_os = "macos")]
+fn disk_budget_sweep(
+    job: &DiskBudgetPage,
+    live: &aterm_agent::harness::disk::budget::Live,
+    hold: &mut DiskBudgetHold,
+    lock_path: &Path,
+) -> u64 {
+    use aterm_agent::harness::disk::{self, budget};
+    let measure = || disk::volume_of(&job.home, &job.table).ok();
+    let free_target = job.over.free_target;
+    let at = Instant::now();
+    let before = measure().map(|r| r.free);
+    let short = before.map_or(0, |free| free_target.saturating_sub(free));
+    let placing = disk::discover::placing_of(&job.home, &job.table);
+    let keeps = |leaf: &Path, workspace: &Path| {
+        budget::keeps_leaf(live, leaf, workspace, Some(&job.table), job.now)
+    };
+    let pass = disk_sweep_journalled_counted(
+        &job.state,
+        job.now,
+        &crate::disk_board::SHELF,
+        |record, recorded| {
+            atpkg::build_cache::reclaim_over_budget(
+                &job.home,
+                std::time::SystemTime::now(),
+                &keeps,
+                placing.as_ref(),
+                &mut |path, why| {
+                    recorded() < short
+                        && hold.lock_for(lock_path).is_ok()
+                        && measure().is_some_and(|r| r.free < free_target)
+                        && record(path, why)
+                },
+            )
+        },
+    );
+    let (freed, went) = disk_swept(&pass.swept, &pass.sized);
+    hold.credit(freed);
+    if freed > 0 {
+        disk_fill_credit(
+            &job.key.spelled(),
+            freed,
+            before,
+            measure().map(|r| r.free),
+            at.elapsed(),
+        );
+        aterm_log::info!(
+            "harness disk watch: over the rebuildable budget, swept {} build cache entr{}, about \
+             {} back: {}",
+            went.len(),
+            if went.len() == 1 { "y" } else { "ies" },
+            disk::human_bytes(freed),
+            went.join("; "),
+        );
+    }
+    freed
+}
+
+/// A budget page's tier 1, 2 and 3 rows (`aterm_agent::harness::cli::disk_tick_budget`), on
+/// the volume with `free` bytes free: the look a pressure pass builds, with no demand or
+/// projection and the sessions' working directories as `live` read them, the window's remover,
+/// and the run's own cursor; the pass lock asked of `hold` once its rows are planned, before
+/// anything is journalled or removed, and no measure read once a look that admits no budget
+/// pass stands ([`DISK_BUDGET_YIELD`]). How it ended, and what it freed, credited to `hold`.
+fn disk_budget_tick(
+    job: &DiskBudgetPage,
+    live: &aterm_agent::harness::disk::budget::Live,
+    free: Option<u64>,
+    hold: &mut DiskBudgetHold,
+    lock_path: &Path,
+) -> (aterm_agent::harness::cli::BudgetEnd, u64) {
+    use aterm_agent::harness::cli::{self, DiskTick};
+    use aterm_agent::harness::disk;
+    let home = job.home.as_path();
+    let roots = disk_roots(
+        &job.cwds,
+        &job.agents,
+        home,
+        disk::discover::running_claude_census(Some(home)),
+    );
+    let transcripts = home.join(".claude").join("projects");
+    let links = cli::default_link_dirs(home);
+    let look = cli::DiskLook {
+        state: &job.state,
+        volume: home,
+        free,
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: Some(&transcripts),
+        now: job.now,
+        room: job.room,
+        table: Some(&job.table),
+        demand: None,
+        projected: None,
+        session_cwds: &live.cwds,
+        session_cwd_unknown: live.cwd_unknown.as_deref(),
+        link_dirs: &links,
+    };
+    let judge = disk::Judge {
+        now: job.now,
+        threshold_days: job.config.target_stale_days,
+        device: disk::target::dev_of(home),
+        volume: disk::target::VolumeGuid::of_key(&job.key),
+    };
+    let page_of = cli::BudgetLook {
+        sizing: &job.sizing,
+        over: job.over,
+        live,
+        page: job.page,
+    };
+    let mut cursor = std::mem::take(
+        &mut DISK_BUDGET_RUN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursor,
+    );
+    if job.page == 1 {
+        cursor.reset_cycle();
+    }
+    let started = Instant::now();
+    let mut take = || hold.lock_for(lock_path);
+    let mut measure = || {
+        if DISK_BUDGET_YIELD.load(Ordering::SeqCst) {
+            None
+        } else {
+            disk::volume_of(home, &job.table).ok().map(|r| r.free)
+        }
+    };
+    let tick = cli::disk_tick_budget(
+        &look,
+        job.config,
+        &page_of,
+        &mut take,
+        &mut disk_remover(judge, &job.store),
+        &mut measure,
+        &mut cursor,
+    );
+    DISK_BUDGET_RUN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .cursor = cursor;
+    crate::disk_board::SHELF.tally_freed(&disk_pass_removals(&tick.tick));
+    let freed = match &tick.tick {
+        DiskTick::Reclaimed(done, _) => done.freed_bytes,
+        DiskTick::Plenty => 0,
+    };
+    disk_fill_credit(
+        &job.key.spelled(),
+        freed,
+        free,
+        disk::volume_of(home, &job.table).ok().map(|r| r.free),
+        started.elapsed(),
+    );
+    hold.credit(freed);
+    (tick.end, freed)
 }
 
 /// The log line for a look below the warning line, or with an agent's demand waiting, in a
@@ -27469,7 +28343,8 @@ fn disk_private_said(said: &Mutex<Option<String>>, line: Option<String>) -> Opti
 
 /// One look of the disk watch over `cwds` and `agents` (off the host thread): the ask's take-over
 /// of what an ended host left of this process's sessions ([`disk_ask::before_pass`]), the pass,
-/// then the ask's step over what it left ([`disk_ask::after_look`]).
+/// the ask's step over what it left ([`disk_ask::after_look`]), then the budget page the pass
+/// prepared, once the step let the look's pass lock go ([`disk_budget_spawn`]).
 fn disk_look(
     sids: &[String],
     cwds: &[std::path::PathBuf],
@@ -27478,10 +28353,17 @@ fn disk_look(
     store: &Store,
     note: &NoteFn,
 ) {
+    // A page an earlier look prepared and did not start (it ended in a panic first) was that
+    // look's.
+    *DISK_BUDGET_NEXT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
     disk_ask::before_pass(sids, store);
     let mut looked = disk_ask::Looked::default();
     disk_look_pass(sids, cwds, agents, seen, store, note, &mut looked);
     disk_ask::after_look(&looked, sids, store, note);
+    drop(looked);
+    disk_budget_spawn();
 }
 
 /// What aterm itself freed at this look (`bytes`, ended now), for the ask's step to record
@@ -27501,9 +28383,10 @@ fn disk_reclaimed(looked: &mut disk_ask::Looked, bytes: u64) {
 }
 
 /// The look's worktree step (`aterm_agent::harness::cli::disk_worktree_step`), hourly at most,
-/// under the pass lock, which another host's pass may hold (then it runs at a later look): a
-/// merged, clean worktree no session uses goes, with its merged branch. What it freed is this
-/// look's; what went is one log line.
+/// under the pass lock (the one the look adopted from a budget page, else one taken now, which
+/// another host's pass may hold: then it runs at a later look): a merged, clean worktree no
+/// session uses goes, with its merged branch. What it freed is this look's; what went is one
+/// log line.
 #[cfg(target_os = "macos")]
 fn disk_worktree_look(
     home: &Path,
@@ -27521,17 +28404,21 @@ fn disk_worktree_look(
         return;
     }
     let lock_path = reserve::pass_lock_for(home);
-    let lock = match reserve::take_pass(&lock_path) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return,
-        Err(e) => {
-            aterm_log::warn!(
-                "harness disk watch: the pass lock {} could not be taken ({e}); the worktree \
-                 step is deferred",
-                lock_path.display()
-            );
-            return;
-        }
+    let mut taken = None;
+    let lock: &reserve::PassLock = match looked.pass_lock.as_ref() {
+        Some(adopted) => adopted,
+        None => match reserve::take_pass(&lock_path) {
+            Ok(Some(lock)) => taken.insert(lock),
+            Ok(None) => return,
+            Err(e) => {
+                aterm_log::warn!(
+                    "harness disk watch: the pass lock {} could not be taken ({e}); the worktree \
+                     step is deferred",
+                    lock_path.display()
+                );
+                return;
+            }
+        },
     };
     let cwds: Vec<PathBuf> = DISK_ALL_CWDS
         .lock()
@@ -27560,7 +28447,7 @@ fn disk_worktree_look(
     let done = aterm_agent::harness::cli::disk_worktree_step(&look, config, &mut schedule, &|| {
         lock.validate_for(&lock_path).is_ok()
     });
-    drop(lock);
+    drop(taken);
     disk_reclaimed(looked, done.freed());
     if !done.removed.is_empty() {
         aterm_log::info!(
@@ -27594,6 +28481,20 @@ fn disk_look_pass(
         let _ = DISK_RUNS.admit(false, board);
         return;
     };
+    // A budget page's pass lock, and what it freed, are this look's to hand the ask's step,
+    // unless a page runs now: it may take them back before its next removal.
+    let budget_done = if DISK_BUDGET_PAGE.load(Ordering::SeqCst) {
+        None
+    } else {
+        DISK_BUDGET_DONE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    };
+    if let Some(done) = budget_done {
+        looked.pass_lock = Some(done.lock);
+        disk_reclaimed(looked, done.freed);
+    }
     // Every look reads the recorded dangling links again, whatever its pass then does.
     board.keep_dangling(Vec::new());
     let config_path = crate::app_config::config_path();
@@ -27725,6 +28626,33 @@ fn disk_look_pass(
         if b.watched { b.adopt(k) } else { None }
     });
     let demand = adopted.as_ref().map(|(need, _)| *need);
+    // A budget page running now stops before its next removal where this look admits none.
+    DISK_BUDGET_YIELD.store(
+        !aterm_agent::harness::disk::budget::pass_admitted(
+            private.is_none(),
+            demand.is_some(),
+            projected.is_some(),
+            config.cap_used_gib,
+            config.auto_free_gib,
+        ),
+        Ordering::SeqCst,
+    );
+    let budget_at = DiskBudgetAt {
+        owner: private.is_none(),
+        demand: demand.is_some(),
+        projected: projected.is_some(),
+        config,
+        key: home_key.as_ref(),
+        free,
+        state: &state,
+        home: &home,
+        table: &table,
+        cwds,
+        agents,
+        store,
+        room,
+        now,
+    };
     let line = disk_private_line(private, config.below_warn(free), demand.is_some(), level);
     if let Some(line) = disk_private_said(&DISK_PRIVATE_SAID, line) {
         aterm_log::info!("{line}");
@@ -27845,6 +28773,7 @@ fn disk_look_pass(
                 now,
             );
         }
+        disk_budget_pass_look(&budget_at);
         return;
     }
     let started = Instant::now();
@@ -27889,32 +28818,49 @@ fn disk_look_pass(
                 note,
             );
         }
+        disk_budget_pass_look(&budget_at);
         return;
     }
+    // A budget page running now stops before its next removal, and a lock one parked since this
+    // look began is this look's.
+    DISK_BUDGET_YIELD.store(true, Ordering::SeqCst);
+    if looked.pass_lock.is_none() {
+        let parked = DISK_BUDGET_DONE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(done) = parked {
+            looked.pass_lock = Some(done.lock);
+            disk_reclaimed(looked, done.freed);
+        }
+    }
     let lock_path = aterm_agent::harness::disk::reserve::pass_lock_for(&home);
-    // Held until the ask's step records what this pass freed ([`disk_ask::after_look`]).
-    looked.pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
-        Ok(Some(lock)) => Some(lock),
-        Ok(None) => {
-            aterm_log::info!(
-                "harness disk watch: another instance's pass holds {}; this look runs none",
-                lock_path.display()
-            );
-            looked.contended = true;
-            disk_episode_after(board, level, 0, &[]);
-            return;
-        }
-        Err(e) => {
-            aterm_log::warn!(
-                "harness disk watch: the pass lock {} could not be taken ({e}); the pass is \
-                 deferred",
-                lock_path.display()
-            );
-            looked.contended = true;
-            disk_episode_after(board, level, 0, &[]);
-            return;
-        }
-    };
+    // Held until the ask's step records what this pass freed ([`disk_ask::after_look`]); a
+    // budget page's lock this look adopted is already that.
+    if looked.pass_lock.is_none() {
+        looked.pass_lock = match aterm_agent::harness::disk::reserve::take_pass(&lock_path) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                aterm_log::info!(
+                    "harness disk watch: another pass holds {}; this look runs none",
+                    lock_path.display()
+                );
+                looked.contended = true;
+                disk_episode_after(board, level, 0, &[]);
+                return;
+            }
+            Err(e) => {
+                aterm_log::warn!(
+                    "harness disk watch: the pass lock {} could not be taken ({e}); the pass \
+                     is deferred",
+                    lock_path.display()
+                );
+                looked.contended = true;
+                disk_episode_after(board, level, 0, &[]);
+                return;
+            }
+        };
+    }
     let short = config.below_auto_floor(free);
     let placing = aterm_agent::harness::disk::discover::placing_of(&home, &table);
     // Known producer receipts are independent of broad discovery's 128-result budget. Keep
@@ -28936,7 +29882,21 @@ fn disk_sweep_journalled(
         &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
     ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
 ) -> SweepJournalled {
-    let pass = aterm_agent::harness::cli::disk_sweep_journalled(state, now, sweep);
+    disk_sweep_journalled_counted(state, now, board, |record, _| sweep(record))
+}
+
+/// [`disk_sweep_journalled`], `sweep` also given what the entries it put on record so far were
+/// sized at (`aterm_agent::harness::cli::disk_sweep_journalled_counted`).
+fn disk_sweep_journalled_counted(
+    state: &Path,
+    now: i64,
+    board: &Shelf,
+    sweep: impl FnOnce(
+        &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
+        &dyn Fn() -> u64,
+    ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
+) -> SweepJournalled {
+    let pass = aterm_agent::harness::cli::disk_sweep_journalled_counted(state, now, sweep);
     let removals = disk_sweep_removals(&pass.swept, &pass.sized);
     board.tally_freed(&removals);
     pass
@@ -29597,6 +30557,9 @@ fn activation_loop(host: &HostHandle, mut wait: impl FnMut() -> bool) {
         if host.shared.lock().shutting_down {
             break;
         }
+        // An install, a yank or a removed link reaches this wake (or its fallback): a live
+        // contract 4 claim is proven again under the registry as it now reads.
+        (host.hooks.acts.reprove_claims)();
         if newer {
             aterm_log::info!(
                 "harness: an activation notice — a newer agent build may be installed (atpkg \
@@ -30811,7 +31774,7 @@ impl Acts {
             live_self_copy: Arc::new(|_| None),
             self_idle: Arc::new(|_, _, _| false),
             self_relaunch: Arc::new(|_, _, _, _, _| "refused:inert".to_string()),
-            self_snapshot: Arc::new(|_, _, _| None),
+            self_snapshot: Arc::new(|_, _, _| Err(NO_AGENT)),
             restarted: Arc::new(|_, _, _| false),
             carry: Arc::new(|_, _, _, _, _, _| "refused:inert".to_string()),
             line_grace: Arc::new(|_, grace, _, _| grace),
@@ -30852,7 +31815,8 @@ impl Acts {
             login_pin: Arc::new(|_, _, _| aterm_agent::supervise::policy::login::LoginPin::Picker),
             tap_born: Arc::new(|_| None),
             account_restart: Arc::new(|_, _| None),
-            scoped_account: Arc::new(|_, _, _| false),
+            scoped_restart: Arc::new(|_, _, _, _| false),
+            reprove_claims: Arc::new(|| {}),
             background: Arc::new(|_| false),
             account_made: Arc::new(|_, _, _| {}),
             account_cold: Arc::new(|_, _, _| Ok(relaunch::ColdAdmission::Immediate(None))),

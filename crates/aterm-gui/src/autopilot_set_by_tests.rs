@@ -535,6 +535,7 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         pinned: false,
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: None,
         title: String::new(),
@@ -664,7 +665,7 @@ fn a_later_wake_never_replaces_the_fires_record() {
 #[test]
 fn a_fleet_setter_is_named_by_its_mac() {
     let node = "87be5228aaaaaaaaaaaaaaaaaaaaaaaa";
-    let sid = "s-0123456789abcdef0123";
+    let sid = "t0123456789";
     let words = |actor: Actor, name: Option<&str>| {
         SetByWords::of(
             Some(AutopilotSetBy {
@@ -684,7 +685,7 @@ fn a_fleet_setter_is_named_by_its_mac() {
     };
     assert_eq!(
         words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
-        "over the fleet from m9 (session s-0123)"
+        "over the fleet from m9 (session t0123)"
     );
     assert_eq!(
         words(Actor::fleet_drive(node, None), Some("m9")),
@@ -692,7 +693,20 @@ fn a_fleet_setter_is_named_by_its_mac() {
     );
     assert_eq!(
         words(Actor::fleet_drive(node, Some(sid)), None),
-        "over the fleet from node 87be5228 (session s-0123)",
+        "over the fleet from node 87be5228 (session t0123)",
         "CONTROL"
+    );
+    assert_eq!(
+        words(
+            Actor::fleet_drive(node, Some("s-0123456789abcdef0123")),
+            Some("m9")
+        ),
+        "over the fleet from m9 (session s-0123)",
+        "a drive from a tab opened before the t form names it as its requester line does"
+    );
+    assert_eq!(
+        words(Actor::fleet_drive(node, Some("s-7725")), Some("m9")),
+        "over the fleet from m9",
+        "CONTROL: a loose s- word names no session"
     );
 }

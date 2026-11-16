@@ -1291,6 +1291,22 @@ fn a_windows_declaration_the_draft_did_not_sign_is_refused() {
         adopt(&mut lab.ctx).unwrap();
         assert_eq!(lab.ctx.windows.as_ref(), Some(&declared));
     }
+    // A pulled declaration (`--windows-attested`) of the directory whose zip the draft bound to
+    // a typed digest is another anchor: refused, naming both.
+    lab.ctx.windows = Some(Handoff::declared(dir.path(), None, true).unwrap());
+    let refused = adopt(&mut lab.ctx).unwrap_err().to_string();
+    assert!(
+        refused.contains(&named) && refused.contains("attested"),
+        "{refused}"
+    );
+    // A draft that froze an attested pair is adopted by the pulled declaration of its directory.
+    let attested = Handoff::declared(dir.path(), None, true).unwrap();
+    let mut journal = Journal::load(&lab.ctx.journal_path).unwrap().unwrap();
+    journal.windows = Some(attested.clone());
+    journal.save(&lab.ctx.journal_path).unwrap();
+    lab.ctx.windows = Some(attested.clone());
+    adopt(&mut lab.ctx).unwrap();
+    assert_eq!(lab.ctx.windows.as_ref(), Some(&attested));
 }
 
 /// A REAL CUT NAMES THE DIGEST OF A WINDOWS ZIP IT WILL ADMIT ITSELF BEFORE IT CLAIMS: with no
@@ -1313,6 +1329,13 @@ fn a_real_cut_names_the_windows_digest_before_it_claims() {
     );
     let named = Handoff::new(dir.path(), Some(&"a".repeat(64))).unwrap();
     bound(Some(&named), dist.path()).unwrap();
+    // A pulled pair is bound by its attestation, admitted with the same pins as a typed digest.
+    let attested = Handoff::declared(dir.path(), None, true).unwrap();
+    bound(Some(&attested), dist.path()).unwrap();
+    assert!(
+        Handoff::declared(dir.path(), Some(&"a".repeat(64)), true).is_err(),
+        "two anchors"
+    );
     bound(None, dist.path()).unwrap();
     fs::write(dist.path().join(JOURNAL), "").unwrap();
     bound(Some(&unbound), dist.path()).unwrap();

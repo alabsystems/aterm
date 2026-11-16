@@ -49,6 +49,9 @@ mod converge_end_reread_tests;
 #[path = "keeper_hint_tests.rs"]
 mod keeper_hint_tests;
 
+#[path = "status_observation_tests.rs"]
+mod status_observation_tests;
+
 use super::*;
 use aterm_cli::macos_doctor::{
     InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,
@@ -772,6 +775,16 @@ fn as_read(row: &Observation) -> Observation {
 
 /// What the worker asked of the outside under [`TestIo`], and how it answers.
 struct Script {
+    /// An optional private journal for status and operation identity reads; otherwise the
+    /// test binary's own saved setup is read, without looking up a configured vault.
+    status_root: Option<std::path::PathBuf>,
+    status_reads: usize,
+    observation_reads: usize,
+    accounts_reads: usize,
+    accounts_hold: bool,
+    accounts_observation: Option<Observation>,
+    alab_reads: usize,
+    alab: bool,
     /// Readings started: their plan, their rows, and whether they used the
     /// network.
     reads: Vec<(Plan, Vec<Subject>, bool)>,
@@ -814,6 +827,8 @@ struct Script {
     registers: Option<u64>,
     /// The runs admitted choices started.
     runs: Vec<u64>,
+    /// Runs whose busy-slot drop and its status publication finished.
+    finished_runs: usize,
     /// The revision in force: the last one admitted.
     revision: u64,
     /// The startup's read of the plan in force waits while this is set.
@@ -852,6 +867,8 @@ struct Script {
     setup_converges: usize,
     /// What bringing a restored setup forward found.
     brought_forward: aterm_cli::macos_doctor::BroughtForward,
+    bring_forward_hold: bool,
+    bring_forward_reads: usize,
     /// Check again's looks at the LAN.
     vault_looks: usize,
     /// Lifts of the run's parked stages a press of Check again asked for.
@@ -883,6 +900,14 @@ struct Script {
 
 impl Script {
     const NEW: Self = Self {
+        status_root: None,
+        status_reads: 0,
+        observation_reads: 0,
+        accounts_reads: 0,
+        accounts_hold: false,
+        accounts_observation: None,
+        alab_reads: 0,
+        alab: false,
         reads: Vec::new(),
         read_checks: Vec::new(),
         readings: VecDeque::new(),
@@ -902,6 +927,7 @@ impl Script {
         admits: VecDeque::new(),
         registers: None,
         runs: Vec::new(),
+        finished_runs: 0,
         revision: 1,
         initial_hold: false,
         startup_reading: false,
@@ -919,6 +945,8 @@ impl Script {
         converge_lanes: 0,
         setup_converges: 0,
         brought_forward: aterm_cli::macos_doctor::BroughtForward::Nothing,
+        bring_forward_hold: false,
+        bring_forward_reads: 0,
         vault_looks: 0,
         lifts: 0,
         startups: 0,
@@ -1030,16 +1058,35 @@ struct TestIo {
 /// Serialises every [`TestIo`]. Taken inside [`globals`], which every
 /// test that installs one holds first.
 static TEST_IO: Mutex<()> = Mutex::new(());
+static TEST_IO_OPERATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn test_io_idle() -> bool {
+    observe_idle()
+        && stop_worker_idle()
+        && !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire)
+        && TEST_IO_OPERATIONS.load(std::sync::atomic::Ordering::Acquire) == 0
+}
 
 impl TestIo {
     fn install() -> Self {
         let serial = TEST_IO.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(test_io_idle(), "the prior scripted setup still owns work");
         let claims = aterm_tempfile::tempdir().unwrap();
         *CLAIM_ROOT.lock().unwrap_or_else(PoisonError::into_inner) = Some(claims.path().to_owned());
         *script() = Script::NEW;
         *SETUP_IO.write().unwrap_or_else(PoisonError::into_inner) = SetupIo {
+            operation: || {
+                TEST_IO_OPERATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                SetupIoOperation(Some(|| {
+                    TEST_IO_OPERATIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }))
+            },
             scope_refused: || false,
             history_store: || None,
+            snapshot: Self::snapshot,
+            observation: Self::observation,
+            accounts: Self::accounts,
+            alab: Self::alab,
             read: Self::read,
             now_secs: || script().now_secs,
             save_stop: Self::save_stop,
@@ -1052,7 +1099,10 @@ impl TestIo {
             converge_setup: || change(|script| script.setup_converges += 1),
             put_back: |_| Ok(false),
             start_follow_up: || change(|script| script.follow_ups += 1),
-            bring_forward: || Ok(script().brought_forward),
+            bring_forward: || {
+                change(|script| script.bring_forward_reads += 1);
+                Ok(wait_while(script(), |script| script.bring_forward_hold).brought_forward)
+            },
             look_again: || change(|script| script.vault_looks += 1),
             lift_parks: || {
                 change(|script| script.lifts += 1);
@@ -1095,6 +1145,40 @@ impl TestIo {
             _claims: claims,
             _serial: serial,
         }
+    }
+
+    fn status_root() -> std::path::PathBuf {
+        script().status_root.clone().unwrap_or_else(|| {
+            aterm_types::dirs::state_dir()
+                .expect("the test binary's private state root")
+                .join("doctor")
+        })
+    }
+
+    fn snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+        change(|script| script.status_reads += 1);
+        initial_setup_snapshot_at(&Self::status_root(), Plan::default())
+    }
+
+    fn observation() -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
+        change(|script| script.observation_reads += 1);
+        aterm_cli::macos_doctor::initial_setup_observation_at(&Self::status_root())
+    }
+
+    fn accounts() -> Observation {
+        let mut script = script();
+        script.accounts_reads += 1;
+        SCRIPT_MOVED.notify_all();
+        let script = wait_while(script, |script| script.accounts_hold);
+        script.accounts_observation.clone().unwrap_or_else(|| {
+            Observation::withheld(Subject::Sync(aterm_types::macos_setup::SyncKind::Accounts))
+        })
+    }
+
+    fn alab() -> bool {
+        let mut script = script();
+        script.alab_reads += 1;
+        script.alab
     }
 
     fn read(
@@ -1215,6 +1299,7 @@ impl TestIo {
         });
         drop(claim);
         drop(busy);
+        change(|script| script.finished_runs += 1);
     }
 }
 
@@ -1229,14 +1314,18 @@ impl Drop for TestIo {
             script.authorize_hold = false;
             script.startup_backoff_hold = false;
             script.startup_answer_hold = false;
+            script.bring_forward_hold = false;
+            script.accounts_hold = false;
         });
         let deadline = Instant::now() + HANG;
-        while !(observe_idle()
-            && stop_worker_idle()
-            && !INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire))
-            && Instant::now() < deadline
-        {
+        while !test_io_idle() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
+        }
+        if !test_io_idle() {
+            if std::thread::panicking() {
+                return;
+            }
+            panic!("the scripted setup workers did not finish their publications");
         }
         *SETUP_IO.write().unwrap_or_else(PoisonError::into_inner) = SetupIo::LIVE;
         reset_worker_state();

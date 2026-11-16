@@ -12,6 +12,30 @@ fn zero_assignment_is_an_explicit_startup_mode_with_no_boundary() {
         pid: 42,
         birth: 123,
     };
+    let canonical = key(&caller).unwrap();
+    let legacy = Caller {
+        sid: "s-0123456789abcdef0123".into(),
+        ..caller.clone()
+    };
+    assert_ne!(
+        canonical,
+        key(&legacy).unwrap(),
+        "local identities keep distinct assignment keys"
+    );
+    for sid in [
+        "../../escape",
+        "s-1",
+        "s-0123456789ABCDEF0123",
+        "t000000000u",
+    ] {
+        assert!(
+            key(&Caller {
+                sid: sid.into(),
+                ..caller.clone()
+            })
+            .is_err()
+        );
+    }
     let mut book: Book = aterm_json::from_value(aterm_json::json!({
         "schema":2,"caller":{"sid":caller.sid,"pid":42,"birth":123},
         "consumer":{"pid":42,"birth":123,"parent":2,"group":42,"session":42,

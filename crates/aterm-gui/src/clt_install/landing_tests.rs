@@ -146,11 +146,12 @@ fn page() -> (App, WindowId) {
     // A person at the page: the install's authorization is a person stage's.
     app.user_input_recent = |_| true;
     let wid = WindowId(0);
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     ws.os_window_for_test = true;
     ws.focused = true;
     ws.rows = 90;
     ws.cols = 160;
+    drop(ws);
     assert!(app.open_system_state_tab());
     app.note_system_state_touch();
     app.note_system_state_apply(crate::system_state::Admission::Person);

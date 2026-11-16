@@ -6,7 +6,7 @@
 //!
 //! `.gitattributes` names the generated files (`linguist-generated`, which GitHub also folds
 //! in a diff and `git check-attr` reports), and each one carries its generator's seal
-//! ([`crate::seal`]): a line naming the generator and a digest of the file as the generator
+//! ([`aterm_seal`]): a line naming the generator and a digest of the file as the generator
 //! wrote it. A hand edit, such as a comment prune, breaks the seal; the next run of the
 //! generator would revert it, and in the meantime the edit can cut something the file means
 //! (the libc oracle's sibling marker, a cell's `!! … ABSENT` lines). The rule needs no
@@ -17,7 +17,7 @@
 //! itself but is not declared, so a prune that took its whole header would go unseen.
 
 use super::{Finding, Rule, Tree};
-use crate::seal::{self, HEAD_LINES, MARK, Seal};
+use aterm_seal::{self as seal, HEAD_LINES, MARK, Seal};
 
 pub(super) const GENERATED_SEAL: Rule = Rule {
     id: "generated-seal",
@@ -82,7 +82,7 @@ fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 format!(
                     "{ATTRIBUTES} marks it {ATTRIBUTE}, but no `{MARK} … seal` line sits in \
                      its first {HEAD_LINES} lines: its generator writes one \
-                     (aterm_census::seal::line) and stamps it (seal::stamp)"
+                     (aterm_seal::line) and stamps it (aterm_seal::stamp)"
                 ),
             )),
             Seal::Absent => {}

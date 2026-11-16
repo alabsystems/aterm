@@ -215,9 +215,10 @@ fn next_frame(app: &mut App, wid: WindowId) {
 
 fn point_at(app: &mut App, wid: WindowId, cell: (usize, usize)) -> crate::claude_lights::OverChips {
     let (x, y) = cell_px(app, wid, cell);
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.last_cursor_px = (x, y);
     ws.pointer_position_known = true;
+    drop(ws);
     app.track_claude_light_hover(wid, x, y)
 }
 

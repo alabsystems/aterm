@@ -3401,6 +3401,7 @@ impl Pool {
                 thread: "00000000-0000-0000-0000-000000000001".into(),
                 wall: "00000000-0000-0000-0000-000000000002".into(),
                 identity: proposal.source_identity.clone(),
+                limit: None,
             },
             sid: "s-law".into(),
             old_pid: 10,
@@ -5018,10 +5019,15 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
                 store.save(&accounts::State::default()).unwrap();
             }
             let roster = pool.env.accounts_roster_for(cli).unwrap();
-            let sign_in = |at, why: &str| {
+            // A sign-in's line on record, and with `check` the account's check it met
+            // (`accounts::CheckStop`), as a renewal that met a bot protection records both.
+            let sign_in = |at, why: &str, check: bool| {
                 store
-                    .transact_pool_logins_within(&[], &roster, at, &mut None, |_, _, logins| {
+                    .transact_pool_logins_within(&[], &roster, at, &mut None, |raw, _, logins| {
                         accounts::admit_workflow(logins, "work")?;
+                        if check && let Some(row) = raw.row("work") {
+                            accounts::note_check_stop(logins, row, at);
+                        }
                         Ok(vec![
                             accounts::Event::new(at, accounts::Kind::SignIn, "work").because(why),
                         ])
@@ -5029,7 +5035,7 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
                     .unwrap();
             };
             let now = pool.env.now + 10;
-            sign_in(now - 1, "auth.vendor.example browser bot-check");
+            sign_in(now - 1, "auth.vendor.example browser bot-check", true);
             let (text, _) = pool.report_on(&build.program(&pool));
             let said = line(&text, "not next:");
             assert!(
@@ -5037,7 +5043,7 @@ fn a_row_nobody_runs_on_waits_only_where_its_sign_in_has_a_route() {
                 "{at}: a bot check on record: {text}"
             );
             assert!(said.contains("accounts browser work"), "{at}: {text}");
-            sign_in(now, "auth.vendor.example window done session-kept");
+            sign_in(now, "auth.vendor.example window done session-kept", false);
             let (text, _) = pool.report_on(&build.program(&pool));
             assert!(
                 line(&text, "not next:").contains("waits for"),
@@ -5529,27 +5535,30 @@ fn the_report_names_the_sync_that_folds_a_twin_only_where_one_does() {
     assert!(!line(&text).contains("accounts sync"), "no source: {text}");
     assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(false));
 
-    let home = pool.env.home.as_deref().expect("a home");
-    crate::vault_entry::put(
-        home,
-        &crate::harness::accounts_sync::cli_fleet_file(Cli::Codex),
-        "[[account]]\nlabel = \"twin\"\nemail = \"ann@example.com\"\nmachines = [\"m16\"]\n",
-    );
-    pool.config("[fleet]\nmachine = \"m16\"\n");
-    let (text, json) = pool.report_on(&host);
-    assert!(
-        line(&text).contains("`aterm harness accounts sync --cli codex` folds `twin`"),
-        "{text}"
-    );
-    assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(true));
+    #[cfg(unix)]
+    {
+        let home = pool.env.home.as_deref().expect("a home");
+        crate::vault_entry::put(
+            home,
+            &crate::harness::accounts_sync::cli_fleet_file(Cli::Codex),
+            "[[account]]\nlabel = \"twin\"\nemail = \"ann@example.com\"\nmachines = [\"m16\"]\n",
+        );
+        pool.config("[fleet]\nmachine = \"m16\"\n");
+        let (text, json) = pool.report_on(&host);
+        assert!(
+            line(&text).contains("`aterm harness accounts sync --cli codex` folds `twin`"),
+            "{text}"
+        );
+        assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(true));
 
-    std::fs::write(twin.join("auth.json"), "{}").expect("the twin's own login");
-    let (text, json) = pool.report_on(&host);
-    assert!(
-        line(&text).contains("both stay"),
-        "a login of its own: {text}"
-    );
-    assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(false));
+        std::fs::write(twin.join("auth.json"), "{}").expect("the twin's own login");
+        let (text, json) = pool.report_on(&host);
+        assert!(
+            line(&text).contains("both stay"),
+            "a login of its own: {text}"
+        );
+        assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(false));
+    }
 }
 
 /// `accounts use` CITES THE REPORT'S WEEKLY-LIMIT LINE ONLY WHERE THAT LINE PRINTS: a lone row's pin

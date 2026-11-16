@@ -5,7 +5,7 @@
 //!
 //! | Row | Subject | What it holds |
 //! |---|---|---|
-//! | [`QuotaRow`] | `shared/quota/<cli>/<account>` | an account's condition, both windows, wall, last use, sign-in, sessions and plan |
+//! | [`QuotaRow`] | `shared/quota/<cli>/<account>` | an account's condition, both windows, wall, last use, sign-in, sessions, plan and newest lift of each window |
 //! | [`AgyRow`] | `shared/quota/agy/<home>` | an agy home's pools: each one's share left and refill |
 //! | [`PlaceRow`] | `shared/now/place/<account>` | where an account is placed here (`fill`, `borrow`, …) |
 //! | [`NeedsRow`] | `shared/now/needs` | the sessions that need a person, held sessions and managers |
@@ -22,26 +22,37 @@
 //! (`work.max-2`), which the roster's grammar allows and this one keeps. A word the reader does
 //! not know (a condition a later build adds) still reads, as itself.
 //!
-//! **One encoding per value.** Every row starts with a kind byte and [`VERSION`]; every
-//! number after them is an unsigned LEB128 varint, every text a length byte and its bytes,
+//! **One encoding per value.** Every row starts with a kind byte and its kind's version
+//! ([`version`]); every number after them is an unsigned LEB128 varint, every text a length byte and its bytes,
 //! every `Option` a tag byte (0 none, 1 some) before its value, every list a count before
-//! its entries. A tab ID is its text (`tqn5r6e0148`, or the `s-` and 20 hex digits of a tab
-//! opened before the `t` form, which keeps that ID until it closes), read back by
-//! [`TabId::parse`], which takes both. Decoding is strict: a different kind, an unknown
+//! its entries. A tab ID is its canonical text (`tqn5r6e0148`), read back by
+//! [`TabId::parse`]. Decoding is strict: a different kind, an unknown
 //! version, a truncation, trailing bytes, a non-minimal varint, a tag or bool byte other than
 //! 0 or 1, a text its grammar refuses, a bound passed, or a body that disagrees with its
 //! subject is refused, never misread. So every accepted body is the one [`Row::encode`] writes
 //! for its value, and a publisher detects a change by comparing bytes.
+//!
+//! **Each kind has its own version.** A reader refuses a version it does not read, and a reader
+//! of the mesh's rows leaves out a row it refuses (`aterm_mesh::view`), so a version moves for
+//! one kind alone: the quota row is at [`QUOTA_VERSION`] since it carries its account's lifts
+//! ([`Lift`]), and every other kind at [`VERSION`], which every build since the first reads.
+//! A Mac on an older build refuses this Mac's quota rows as `RowError::Version(2)` and reads
+//! its needs, activity, place, unread, agy and window rows as before; no older build reads
+//! another Mac's quota row, so it loses nothing. This build refuses a version-1 quota row,
+//! which holds no lifts, so each value keeps one encoding: its publisher writes its own rows
+//! again at version 2 on its first pass, and a peer's lift is read only from a row that has
+//! one.
 //!
 //! **A reader takes what a writer writes.** A list longer than its bound is written to its
 //! bound (its first entries), and a percent or a share past its bound at the bound, so no
 //! reader refuses a row a publisher made; a value within the bounds reads back as itself.
 //!
 //! ```text
-//! QuotaRow     'Q' 1 | at | cli | account | label | condition | enrolled | ?pct5 | ?pct7
+//! QuotaRow     'Q' 2 | at | cli | account | label | condition | enrolled | ?pct5 | ?pct7
 //!                    | ?five_hour_reset | ?week_reset | ?walled_until | ?last_used
 //!                    | ?(signin state | t)
 //!                    | ?last_start | ?last_end | sessions_7d | ?plan
+//!                    | n | n × (lift window | at | ?reset)
 //! AgyRow       'A' 1 | at | home | n | n × (id | ?remaining | ?reset_at | off)
 //! PlaceRow     'P' 1 | at | account | place | since | until
 //! NeedsRow     'N' 1 | at | n | n × (sid | word | harness | ?worker_of | ?since)
@@ -64,7 +75,7 @@ pub use aterm_types::tab_id::TabId;
 
 use crate::subject::{AccountKey, Cli, HomeKey, Metric, Node, Now, Subject, Width};
 
-/// A row's session: its tab ID, in either form. The name the GUI's callers still use until LT-01
+/// A row's session: its canonical tab ID. The name the GUI's callers still use until LT-01
 /// moves them onto [`TabId`] (slice S3), when it goes.
 pub type Sid = TabId;
 
@@ -82,8 +93,21 @@ pub const KIND_UNREAD: u8 = b'U';
 pub const KIND_ACTIVITY: u8 = b'T';
 /// The kind byte of a [`WindowRecord`].
 pub const KIND_WINDOW: u8 = b'W';
-/// The version of every row kind, the one this build writes and reads.
+/// The version of every row kind but the quota row's: the one this build writes and reads of
+/// each, and every build before it.
 pub const VERSION: u8 = 1;
+/// The version of a [`QuotaRow`], the one this build writes and reads: 2 since the row carries
+/// its account's lifts ([`QuotaRow::lifts`]).
+pub const QUOTA_VERSION: u8 = 2;
+
+/// The version this build writes and reads of the row whose kind byte is `kind`.
+#[must_use]
+pub const fn version(kind: u8) -> u8 {
+    match kind {
+        KIND_QUOTA => QUOTA_VERSION,
+        _ => VERSION,
+    }
+}
 
 /// The highest percent a window reads: the harness's own bound (`accounts.rs` `PCT_MAX`), past
 /// 100 because a provider can report use past its window.
@@ -96,6 +120,9 @@ pub const AGY_GROUPS_MAX: usize = 32;
 pub const NEEDS_MAX: usize = 128;
 /// The most pools an [`UnreadRow`] names.
 pub const UNREAD_MAX: usize = 16;
+/// The most lifts a [`QuotaRow`] holds: one a window, as many as the harness keeps walls of an
+/// account (`accounts.rs` `MAX_WALLS`).
+pub const LIFTS_MAX: usize = 8;
 /// The most agent sessions an [`ActivityRow`] lists by id: the Fleet glance's own bound on one
 /// Mac's sessions (`aterm-gui` `fleet_glance::SESSIONS_MAX`).
 pub const AGENTS_LISTED_MAX: usize = 32;
@@ -252,7 +279,7 @@ impl Out {
     fn with_capacity(kind: u8, cap: usize) -> Out {
         let mut v = Vec::with_capacity(cap.max(2));
         v.push(kind);
-        v.push(VERSION);
+        v.push(version(kind));
         Out(v)
     }
 
@@ -357,9 +384,9 @@ impl<'a> In<'a> {
                 found,
             });
         }
-        let version = r.byte()?;
-        if version != VERSION {
-            return Err(RowError::Version(version));
+        let found = r.byte()?;
+        if found != version(kind) {
+            return Err(RowError::Version(found));
         }
         Ok(r)
     }
@@ -492,6 +519,21 @@ pub struct SignIn {
     pub t: u64,
 }
 
+/// A wall this Mac lifted on an account (a refill, a read with room, its own reset step): its
+/// window, when the proof that lifted it was served and the reset the wall had named. Another Mac
+/// whose own wall of that window it last saw standing before that proof, and which names the same
+/// reset, lifts it too (`aterm-agent` `accounts::note_peer_lift`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Lift {
+    /// The wall's window, as the harness names it (`five_hour`, `seven_day`).
+    pub window: Word,
+    /// When the proof that lifted it was served, Unix seconds by this Mac's clock: a read's
+    /// time, a refill's, or its own reset step's claim, not when the lift was recorded.
+    pub at: u64,
+    /// The reset the lifted wall named, Unix seconds; `None` where it named none.
+    pub reset: Option<u64>,
+}
+
 /// An account's current row (§4.14 "Quota row"): what `aterm harness accounts` shows for it on
 /// this Mac, and the journal book's facts. About 100 bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -532,6 +574,10 @@ pub struct QuotaRow {
     /// The plan as this Mac's accounts view names it: its word, then `-` and its tier where one
     /// was seen (`max-20x`, `pro`, `plus`).
     pub plan: Option<Word>,
+    /// The walls this Mac lifted on it, the newest of each window in the windows' order, which
+    /// other Macs lift theirs by: one read can lift two windows at once, and another Mac may hold
+    /// the wall of either alone. At most [`LIFTS_MAX`] are written.
+    pub lifts: Vec<Lift>,
 }
 
 impl QuotaRow {
@@ -553,8 +599,8 @@ impl QuotaRow {
     }
 
     /// This row as its account's end on its Mac at `at`: the same CLI, account and label, the
-    /// condition [`QuotaRow::REMOVED`], and no figure, reset, wall, use, sign-in, session or
-    /// plan, so a reader that does not know the word counts nothing of it either.
+    /// condition [`QuotaRow::REMOVED`], and no figure, reset, wall, use, sign-in, session, plan
+    /// or lift, so a reader that does not know the word counts nothing of it either.
     #[must_use]
     pub fn ended(&self, at: u64) -> QuotaRow {
         QuotaRow {
@@ -575,10 +621,11 @@ impl QuotaRow {
             last_end: None,
             sessions_7d: 0,
             plan: None,
+            lifts: Vec::new(),
         }
     }
 
-    /// The canonical encoding; each percent at most [`PCT_MAX`].
+    /// The canonical encoding; each percent at most [`PCT_MAX`], its first [`LIFTS_MAX`] lifts.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Out::with_capacity(KIND_QUOTA, 128);
@@ -603,6 +650,12 @@ impl QuotaRow {
         o.opt(self.last_end);
         o.varint(u64::from(self.sessions_7d));
         o.opt_text(self.plan.as_ref().map(Word::as_str));
+        let n = o.count(&self.lifts, LIFTS_MAX);
+        for lift in self.lifts.iter().take(n) {
+            o.text(lift.window.as_str());
+            o.varint(lift.at);
+            o.opt(lift.reset);
+        }
         o.0
     }
 
@@ -638,6 +691,15 @@ impl QuotaRow {
         let last_end = r.opt()?;
         let sessions_7d = r.u32("sessions in 7 days")?;
         let plan = r.opt_word("the plan")?;
+        let n = r.count(LIFTS_MAX, "lifts")?;
+        let mut lifts = Vec::with_capacity(n);
+        for _ in 0..n {
+            lifts.push(Lift {
+                window: r.word("a lift's window")?,
+                at: r.varint()?,
+                reset: r.opt()?,
+            });
+        }
         r.finish()?;
         Ok(QuotaRow {
             at,
@@ -657,6 +719,7 @@ impl QuotaRow {
             last_end,
             sessions_7d,
             plan,
+            lifts,
         })
     }
 }

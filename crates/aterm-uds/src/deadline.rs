@@ -35,6 +35,9 @@ mod input_windows;
 #[cfg(windows)]
 pub use input_windows::{JobHold, spawn_in_job};
 
+mod owned_input_timeout;
+pub use owned_input_timeout::{OwnedInputState, OwnedInputTimeout, OwnedInputTimeoutStage};
+
 mod complete;
 #[cfg(unix)]
 mod custody;
@@ -634,6 +637,9 @@ pub const OUTPUT_KEEP: usize = 1024 * 1024;
 /// Spawn, input, output or wait errors; `InvalidData` if either output exceeds its bound;
 /// `TimedOut` if execution or complete EOF outlives the deadline. An early stdin `BrokenPipe`
 /// preserves the direct child's result. Unsupported owned-process operations are refused.
+/// Expiry of this call's exchange or retirement deadline carries [`OwnedInputTimeout`],
+/// recording observations made before cleanup. Cleanup cannot turn pending input, output or
+/// execution into a completed observation; unrelated OS errors retain their original payload.
 pub fn output_with_input_until(
     cmd: &mut Command,
     input: crate::secret::Secret,

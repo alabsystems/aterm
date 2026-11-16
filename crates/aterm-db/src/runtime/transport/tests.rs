@@ -108,7 +108,7 @@ impl Lab {
     }
 }
 
-fn accept_ready(listener: &Listener) -> Connection {
+fn accept_ready(listener: &RecheckedListener) -> Connection {
     let until = Instant::now() + Duration::from_secs(60);
     loop {
         match listener.accept() {
@@ -126,7 +126,7 @@ fn accept_ready(listener: &Listener) -> Connection {
 /// the connection at its listener, and a tick tries each listener's accept once, without
 /// blocking, so a test that judges what one tick accepts ticks only once the connection is
 /// queued.
-fn queued(listener: &Listener) {
+fn queued(listener: &RecheckedListener) {
     assert!(
         listener
             .pending_within(aterm_spec::wait::MUST_HAPPEN)
@@ -140,7 +140,7 @@ fn queued(listener: &Listener) {
 fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
     let lab = Lab::new();
     let listener =
-        Arc::new(Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
+        Arc::new(RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
     let addr = listener.local_addr().unwrap();
     let client = Worker::start(
         lab.endpoints[1].clone(),
@@ -276,7 +276,8 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
             parent = update.id();
         }
     }
-    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let listener =
+        RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
     let address = listener.local_addr().unwrap();
     let other = SocketAddr::from(([127, 0, 0, 2], address.port()));
     let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
@@ -364,7 +365,7 @@ fn cancellation_before_socket_install_cannot_be_reversed() {
 fn round_at(
     client: &Arc<Endpoint>,
     server: &Arc<Endpoint>,
-    listener: &Listener,
+    listener: &RecheckedListener,
     repair: Repair,
 ) -> (Worker, Worker) {
     let address = listener.local_addr().unwrap();
@@ -490,8 +491,9 @@ fn the_owner_waits_on_its_doorbell_and_listeners_and_no_multicast_socket() {
     transport.endpoint = Some(lab.endpoints[0].clone());
     let link = |listener: bool| Link {
         source: Ipv4Addr::LOCALHOST.into(),
-        listener: listener
-            .then(|| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()),
+        listener: listener.then(|| {
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()
+        }),
         hints: Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap(),
         delivering: None,
     };
@@ -515,6 +517,41 @@ fn the_owner_waits_on_its_doorbell_and_listeners_and_no_multicast_socket() {
             .is_empty(),
         "a waiting beacon wakes nothing"
     );
+}
+
+/// A link's listener opens no route-change socket ([`Link::listener`]): the serving loop waits on
+/// no change of route or interface and each turn rechecks every listener, so a routing socket
+/// there would be handed every routing message on the Mac, the kernel copying each, until its
+/// room filled, and nobody would read it (ATERM-KI-1108-2). A LAN bind on the loopback shows which
+/// bind the refresh made without reaching the LAN: its attachment check refuses it after the
+/// socket a heard listener subscribes with first, as the heard bind before it shows.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `RecheckedListener::bind` subscribing as
+/// `Listener::bind` does, the refresh opened one (`left: 1, right: 0`).
+#[test]
+fn a_links_listener_opens_no_route_change_socket() {
+    let lab = Lab::new();
+    assert!(!lab.endpoints[0].pending(), "a member's link listens");
+    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let opened = aterm_net::lan::route_changes_opened;
+    let before = opened();
+    assert!(
+        aterm_net::lan::Listener::bind(loopback, Scope::Lan).is_err(),
+        "no LAN here"
+    );
+    assert_eq!(opened() - before, 1, "a heard bind subscribes first");
+    let mut transport = Transport::unopened(None, Scope::Lan, 0).unwrap();
+    transport.endpoint = Some(lab.endpoints[0].clone());
+    let before = opened();
+    assert!(!transport.refresh(&[loopback]), "no link opened");
+    assert!(
+        transport
+            .failure()
+            .is_some_and(|failure| failure.starts_with("listener bind on 127.0.0.1")),
+        "{:?}",
+        transport.failure()
+    );
+    assert_eq!(opened() - before, 0, "its listener subscribes to none");
 }
 
 /// Beacons wait in their socket until a hearing turn, which reads every one of them: with 40
@@ -676,7 +713,8 @@ fn a_dropped_datagram_does_not_end_a_hearing_turns_read() {
 #[test]
 fn a_rounds_end_counts_once_by_who_dialled_it() {
     let lab = Lab::new();
-    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let listener =
+        RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
     let mut dialler = loopback_mode(None, 0, [71; 32]);
     let mut server = loopback_mode(None, 0, [72; 32]);
     let now = Instant::now();
@@ -748,8 +786,9 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
     for unvouched in [false, true] {
         let lab = Lab::new();
         let mut a = loopback_mode(None, 0, [71; 32]);
-        let old = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
-        let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let old = RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let ours =
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
         let address = old.local_addr().unwrap();
         let mut now = Instant::now();
         a.hints
@@ -851,8 +890,10 @@ fn a_round_dialled_in_leaves_a_resting_endpoints_audit_where_it_was() {
     for repulls in [false, true] {
         let lab = Lab::new();
         let mut a = loopback_mode(None, 0, [71; 32]);
-        let theirs = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
-        let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let theirs =
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let ours =
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
         let address = theirs.local_addr().unwrap();
         let mut now = Instant::now();
         a.hints
@@ -942,7 +983,7 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
     let mut hints = Hints::new([61; 32]);
     // Bind all three first so the kernel cannot reuse an old listener's port.
     let listeners: Vec<_> = (0..3)
-        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .map(|_| RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
     let mut now = Instant::now();
     let mut old_addresses = Vec::new();
@@ -1055,7 +1096,8 @@ fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
         .unwrap()
         .local_addr()
         .unwrap();
-    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let listener =
+        RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
     let second = listener.local_addr().unwrap();
     // Distinct loopback listeners stand in for two physical attachment entries.
     transport.links.push(Link {
@@ -1108,7 +1150,7 @@ fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
 fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
     let lab = Lab::new();
     let stalled: Vec<_> = (0..4)
-        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .map(|_| RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
     let mut transport = loopback(lab.endpoints[0].clone(), 0, [11; 32]);
     let mut held = Vec::new();
@@ -1178,7 +1220,7 @@ fn stalled_outgoing_repairs_leave_room_for_an_incoming_peer() {
 fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
     let lab = Lab::new();
     let mut listeners: Vec<_> = (0..3)
-        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .map(|_| RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
     listeners.sort_by_key(|listener| listener.local_addr().unwrap());
     let known = listeners.pop().unwrap();
@@ -1308,7 +1350,7 @@ fn pending_enrollment_uses_all_workers_without_a_listener() {
     let endpoint = Arc::new(lab.pending());
     let rounds = ROUNDS + INCOMING;
     let stalled: Vec<_> = (0..rounds)
-        .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        .map(|_| RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
         .collect();
     let mut transport = loopback(endpoint.clone(), 0, [81; 32]);
     assert!(transport.links.iter().all(|link| link.listener.is_none()));
@@ -1369,7 +1411,9 @@ fn a_peer_is_dialled_and_repairs_beside_two_stalled_dials() {
     for unstaggered in [true, false] {
         let lab = Lab::new();
         let mut listeners: Vec<_> = (0..3)
-            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+            .map(|_| {
+                RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()
+            })
             .collect();
         listeners.sort_by_key(|listener| listener.local_addr().unwrap());
         let peer = listeners.pop().unwrap();
@@ -1474,7 +1518,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         .as_ref()
         .is_some_and(|endpoint| !endpoint.pending())
     {
-        Some(Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
+        Some(RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap())
     } else {
         None
     };
@@ -2532,7 +2576,8 @@ fn a_dial_disowns_its_endpoint_only_on_evidence() {
         (&other.endpoints[1], true, false),
         (&lab.endpoints[1], false, true),
     ] {
-        let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let listener =
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
         let (dialled, served) = round_at(&lab.endpoints[0], server, &listener, Repair::default());
         assert_eq!(ended(dialled), (disowned, heard), "disowned, heard");
         drop(served.task.join().unwrap());
@@ -2715,8 +2760,9 @@ fn a_table_written_here_is_offered_to_a_resting_peer_and_not_back_to_its_source(
         let endpoints = [0, 1].map(|node| {
             Arc::new(endpoint(&lab, &tables, node).with_witnesses(!(witnessless && node == 1)))
         });
-        let listeners = [0, 1]
-            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
+        let listeners = [0, 1].map(|_| {
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()
+        });
         let mut macs = [
             loopback_mode(None, 0, [81; 32]),
             loopback_mode(None, 0, [82; 32]),
@@ -2856,8 +2902,9 @@ fn a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_t
         let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
         let tables = tables(&lab, 4);
         let endpoints = [0, 1].map(|node| Arc::new(endpoint(&lab, &tables, node)));
-        let listeners = [0, 1]
-            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
+        let listeners = [0, 1].map(|_| {
+            RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()
+        });
         let addresses = [0, 1].map(|node| listeners[node].local_addr().unwrap());
         let tokens = [[91; 32], [92; 32]];
         let mut macs = tokens.map(|token| loopback_mode(None, 0, token));
@@ -2977,7 +3024,7 @@ fn a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_t
 fn a_peer_whose_listener_closed_is_told_gone_by_its_first_refused_dial() {
     let lab = Lab::new();
     let mut a = loopback_mode(None, 0, [73; 32]);
-    let old = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let old = RecheckedListener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
     let address = old.local_addr().unwrap();
     let mut now = Instant::now();
     a.hints

@@ -259,8 +259,8 @@ fn with_mem(mut s: Sample, t: u64, compress: u64, decompress: u64) -> Sample {
         stored: Some(3 << 30),
         cached: 8 << 30,
         free: 9 << 30,
-        swap_used: 1 << 30,
-        swap_total: 2 << 30,
+        swap_used: Some(1 << 30),
+        swap_total: Some(2 << 30),
         counters: Some(MemCounters {
             compressions: compress * t,
             decompressions: decompress * t,

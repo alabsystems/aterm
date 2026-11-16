@@ -98,9 +98,16 @@ fn the_survey_reads_every_session_of_an_instance() {
         .filter(|line| line.starts_with("  update "))
         .collect();
     assert_eq!(updaters.len(), 1, "the instance's updater: {text}");
+    // The instance's own disk watch may have sized its scratch home's build output by now, and
+    // its home then says it on a line of its own (`  build output …`); when that happens is the
+    // watch's, so the line is left out as the quota and updater lines are.
     let lines: Vec<&str> = rest
         .lines()
-        .filter(|line| !line.starts_with("  github_rate ") && !line.starts_with("  update "))
+        .filter(|line| {
+            !line.starts_with("  github_rate ")
+                && !line.starts_with("  update ")
+                && !line.starts_with("  build output ")
+        })
         .collect();
     assert_eq!(
         lines.len(),

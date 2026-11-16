@@ -74,3 +74,53 @@ fn batch_preflight_counts_only_distinct_additions_and_rechecks_capacity() {
     );
     assert_eq!(index.check_insert_many([&first, &first]), Ok(0));
 }
+
+/// Unlike all-or-error preflight, a partial batch continues after each refusal.
+/// Every answer and running charge must match actual sequential insertions,
+/// including a collision with an earlier proposal and a duplicate at capacity.
+#[test]
+fn incremental_proposals_match_sequential_insertion_after_every_refusal() {
+    let mut collision = header(2);
+    collision.actor = [9; 48];
+    let mut malformed = header(1);
+    malformed.sequence = 0;
+    let choices = [header(1), header(2), collision, header(3), malformed];
+    let mut seen = Vec::new();
+    for capacity in 0..=4 {
+        for retained in 0..=capacity.min(2) {
+            let mut index = Index::new(capacity);
+            for id in 1..=retained {
+                index.insert(header(id as u8)).unwrap();
+            }
+            let before: Vec<_> = index.inventory().copied().collect();
+            for length in 0..=4 {
+                for mut word in 0..choices.len().pow(length) {
+                    let mut sequential = index.clone();
+                    let mut proposal = index.proposal();
+                    let mut added = 0;
+                    for _ in 0..length {
+                        let next = &choices[word % choices.len()];
+                        word /= choices.len();
+                        let expected = sequential.insert(next.clone());
+                        added += usize::from(expected == Ok(true));
+                        assert_eq!(proposal.check_insert(next), expected);
+                        assert_eq!(proposal.new_records(), added);
+                        if !seen.contains(&expected) {
+                            seen.push(expected);
+                        }
+                    }
+                    assert_eq!(index.inventory().copied().collect::<Vec<_>>(), before);
+                }
+            }
+        }
+    }
+    for outcome in [
+        Ok(true),
+        Ok(false),
+        Err(Refusal::Shape),
+        Err(Refusal::DigestCollision),
+        Err(Refusal::Capacity),
+    ] {
+        assert!(seen.contains(&outcome), "unexercised outcome: {outcome:?}");
+    }
+}

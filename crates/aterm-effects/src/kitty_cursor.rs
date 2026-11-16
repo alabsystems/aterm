@@ -282,6 +282,9 @@ thread_local! {
     /// (the stride's bob and footfall squash, every squash and stretch, the lean that follows
     /// speed, the oops and wince recoils, the wince's tumble and the every-beat dance).
     pub static FLIER_CALM_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the glide's still landing: the meteor's whip comes back under the
+    /// glide, which it pulls a cell's half back and springs on over its first frames there.
+    pub static GLIDE_WHIPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The glide's rise at `phase` (cycles): `0..=`[`BOB_AMP`], resting at whole cycles.
@@ -1284,10 +1287,19 @@ impl CursorCat {
         } else {
             LEAD_MAX * bank
         };
+        // The glide is never snapped to a far caret: it flies there, or fades out and in
+        // ([`crate::word_decorations::WordDecorations::fly_glide_jump`]). The whip that answers
+        // the head's snap pulled it back half a cell and sprang it on a pixel a frame where it
+        // came in, its art stepped over the pixels under it past the flash law (Home and End in
+        // turn, `the_flier_never_flashes`'s `home-end`).
+        #[cfg(any(test, debug_assertions))]
+        let whips = !self.glides() || GLIDE_WHIPS.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let whips = !self.glides();
         if let Some(m) = self.meteor {
             if now >= m.settled_at() {
                 self.meteor = None;
-            } else {
+            } else if whips {
                 lead += m.lead_at(now) - FLYING_LEAD_MAX;
             }
         }

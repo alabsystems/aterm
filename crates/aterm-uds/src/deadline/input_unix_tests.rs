@@ -346,6 +346,7 @@ fn uncertain_input_wait_retains_the_original_caller_lock_until_actual_reap() {
                 let _resource = resource;
                 let mut run = Run {
                     child,
+                    input_len: None,
                     input: None,
                     to_child: None,
                     sent: 0,
@@ -425,26 +426,44 @@ fn neither_complete_output_is_silently_truncated() {
 }
 
 #[test]
-fn an_expired_input_deadline_does_not_spawn() {
+fn owned_input_timeout_expired_deadline_does_not_spawn() {
     let mut cmd = crate::spawnfd::command("/no-such-owned-input-program");
+    cmd.arg("owned-timeout-inert-argument");
     let refused = output_with_input_until(
         &mut cmd,
-        Secret::from_vec(vec![b'z'; 16]),
+        Secret::from_vec(b"private-owned-input-payload".to_vec()),
         Instant::now(),
         16,
     )
     .expect_err("expired before spawn");
     assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+    let observed = refused
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<OwnedInputTimeout>()
+        .unwrap();
+    assert!(!observed.spawned && !observed.natural_exit_observed);
+    assert_eq!(observed.stdin, super::super::OwnedInputState::NotStarted);
+    assert!(!observed.stdout_eof && !observed.stderr_eof);
+    assert_eq!(
+        (
+            observed.stdin_bytes_sent,
+            observed.stdout_bytes_observed,
+            observed.stderr_bytes_observed
+        ),
+        (0, 0, 0)
+    );
+    assert!(!refused.to_string().contains("/no-such-owned-input-program"));
+    assert!(!refused.to_string().contains("owned-timeout-inert-argument"));
+    assert!(!refused.to_string().contains("private-owned-input-payload"));
 }
 
 /// The clock crosses the deadline only after the child proves it ran without reading stdin.
 /// A full input pipe cannot block this caller, and cleanup retains the unreaped root's authority.
 #[test]
-fn a_nonreading_child_cannot_hold_secret_input_past_the_deadline() {
-    let dir = std::env::temp_dir().join(format!("uds-owned-input-{}.noindex", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("owned scratch");
-    let witness = dir.join("pid");
-    let _ = std::fs::remove_file(&witness);
+fn owned_input_timeout_nonreading_child_keeps_pending_input_in_its_observation() {
+    let dir = aterm_tempfile::tempdir().expect("owned scratch");
+    let witness = dir.path().join("pid");
     let mut cmd = shell("printf '%s\\n' \"$$\" > \"$0\"; exec \"$1\" 600");
     cmd.arg(&witness)
         .arg(super::super::stand_in(std::path::Path::new("/bin/sleep")));
@@ -482,10 +501,72 @@ fn a_nonreading_child_cannot_hold_secret_input_past_the_deadline() {
         .parse::<i32>()
         .expect("child pid");
     let presence = crate::process::process_presence(pid);
-    std::fs::remove_dir_all(&dir).expect("owned scratch removed after execution");
+    drop(dir);
     assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+    let observed = refused
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<OwnedInputTimeout>()
+        .unwrap();
+    assert!(observed.spawned && !observed.natural_exit_observed);
+    assert_eq!(observed.stdin, super::super::OwnedInputState::Pending);
+    assert!(observed.stdin_bytes_sent < 8 * 1024 * 1024);
+    assert!(!observed.stdout_eof && !observed.stderr_eof);
+    assert_eq!(
+        (
+            observed.stdout_bytes_observed,
+            observed.stderr_bytes_observed
+        ),
+        (0, 0)
+    );
     assert!(matches!(
         presence,
         crate::process::ProcessPresence::Absent | crate::process::ProcessPresence::Exited
     ));
+}
+
+#[test]
+fn owned_input_timeout_pending_output_is_not_eof_from_cleanup_closure() {
+    let mut streams = [
+        Capture::empty(ChildOutput::Stdout),
+        Capture::empty(ChildOutput::Stderr),
+    ];
+    let (stdout, mut out_writer) = crate::pipe().unwrap();
+    let (stderr, mut err_writer) = crate::pipe().unwrap();
+    streams[0].attach(stdout.into()).unwrap();
+    streams[1].attach(stderr.into()).unwrap();
+    out_writer.write_all(b"out").unwrap();
+    err_writer.write_all(b"error").unwrap();
+    drop(err_writer);
+    let mut delivered = [0; 2];
+    let mut accept = |stream, chunk: &[u8]| {
+        let index = match stream {
+            ChildOutput::Stdout => 0,
+            ChildOutput::Stderr => 1,
+        };
+        delivered[index] += chunk.len();
+        Ok(())
+    };
+    streams[0].read_ready(&mut accept).unwrap();
+    streams[1].read_ready(&mut accept).unwrap();
+    streams[1].read_ready(&mut accept).unwrap();
+    assert_eq!(delivered, [3, 5]);
+    let before = timeout_observations(Some(3), 3, false, true, &streams);
+    assert!(before.spawned && before.natural_exit_observed);
+    assert_eq!(before.stdin, super::super::OwnedInputState::Complete);
+    assert!(!before.stdout_eof && before.stderr_eof);
+    assert_eq!(
+        (before.stdout_bytes_observed, before.stderr_bytes_observed),
+        (3, 5)
+    );
+    // Retirement drops readers; it does not observe either writer's EOF or more bytes.
+    for stream in &mut streams {
+        stream.pipe = None;
+    }
+    let after = timeout_observations(Some(3), 3, false, true, &streams);
+    assert_eq!(after, before);
+    // CONTROL: the same drain state with an unobserved root exit must remain execution-pending.
+    let executing = timeout_observations(Some(3), 3, false, false, &streams);
+    assert!(!executing.natural_exit_observed);
+    assert_eq!((executing.stdout_eof, executing.stderr_eof), (false, true));
 }

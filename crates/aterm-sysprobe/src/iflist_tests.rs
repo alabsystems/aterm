@@ -134,6 +134,7 @@ fn the_interface_list_reads_each_interfaces_counters_and_name() {
     );
     assert!(en.up && !en.loopback && en.physical.is_none(), "{en:?}");
     assert_eq!(en.rate_bps, Some(183_200_000));
+    assert_eq!(en.byte_counter, crate::LinkByteCounter::DarwinModulo32);
     assert_eq!(
         en.rx,
         LinkCounters {
@@ -158,6 +159,63 @@ fn the_interface_list_reads_each_interfaces_counters_and_name() {
     let nameless = &links[2];
     assert_eq!((nameless.name.as_str(), nameless.index), ("", 17));
     assert!(!nameless.up, "IFF_UP without IFF_RUNNING is not up");
+}
+
+/// A 10 Gb/s controller can saturate the routing-list baudrate at UINT32_MAX. Its current
+/// speed restores the full rate; a missing or inactive controller leaves the rate unknown.
+#[test]
+fn a_saturated_baudrate_reads_only_the_active_interfaces_controller() {
+    let mut link = links_of(&ifinfo2(
+        8,
+        IFF_UP | IFF_RUNNING,
+        Some("en0"),
+        760_828_281_509,
+        805_926_702_269,
+        u64::from(u32::MAX),
+    ))
+    .remove(0);
+    assert_eq!(
+        link_rate(&link, || Some(10_000_000_000)),
+        Some(10_000_000_000)
+    );
+    assert_eq!(link_rate(&link, || None), None);
+    for invalid in [0, u64::from(u32::MAX)] {
+        assert_eq!(link_rate(&link, || Some(invalid)), None);
+    }
+    assert_eq!(
+        (link.rx.bytes, link.tx.bytes),
+        (760_828_281_509, 805_926_702_269)
+    );
+
+    let never = || panic!("this interface must not ask its controller");
+    link.up = false;
+    assert_eq!(link_rate(&link, never), None);
+    link.up = true;
+    link.loopback = true;
+    assert_eq!(link_rate(&link, never), None);
+    link.loopback = false;
+    link.name = "utun4".into();
+    assert_eq!(link_rate(&link, never), None);
+    link.name.clear();
+    assert_eq!(link_rate(&link, never), None);
+    link.name = "en0".into();
+    for rate in [None, Some(183_200_000), Some(10_000_000_000)] {
+        link.rate_bps = rate;
+        assert_eq!(link_rate(&link, never), rate);
+    }
+
+    for status in [0, LINK_VALID, LINK_ACTIVE] {
+        assert_eq!(controller_rate(status, 10_000_000_000), None);
+    }
+    assert_eq!(
+        controller_rate(LINK_VALID | LINK_ACTIVE, 10_000_000_000),
+        Some(10_000_000_000)
+    );
+    assert_eq!(controller_rate(LINK_VALID | LINK_ACTIVE, 0), None);
+    assert_eq!(
+        controller_rate(LINK_VALID | LINK_ACTIVE, u64::from(u32::MAX)),
+        None
+    );
 }
 
 /// NEGATIVE CONTROLS: a message of another version is skipped; a

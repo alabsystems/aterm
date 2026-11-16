@@ -1600,10 +1600,13 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
     let roster_plan = plan(&listed(&[], &noisy_macs), &Cells::new()).unwrap();
     let m77 = keys::machine_pk("n-0123456789abcdef");
     assert_eq!(planned(&roster_plan, "machine", &m77, "node"), None);
-    assert_eq!(
-        planned(&roster_plan, "machine", &m77, "hosts"),
-        Some(&json!(["m77.local"]))
-    );
+    let hosts: Vec<&Value> = roster_plan
+        .planned
+        .iter()
+        .filter(|p| p.collection == "machine" && p.pk == m77 && p.column.starts_with("hosts."))
+        .map(|p| &p.x)
+        .collect();
+    assert_eq!(hosts, [&json!("m77.local")]);
 }
 
 /// A run that reads no vault sheet leaves what the vault sheet said about a row: a paused account
@@ -2023,7 +2026,7 @@ fn computers_emails_and_phones_sheets_import_and_protect_private_addresses() {
     assert!(!kinds(&plan1).contains(&"credential-shaped"));
     let cells = apply(&mut book, &plan1);
     let (lab_findings, generic_findings) =
-        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &cells);
+        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_4, &cells);
     assert!(lab_findings.is_empty(), "{lab_findings:?}");
     assert!(generic_findings.is_empty(), "{generic_findings:?}");
 
@@ -2117,4 +2120,64 @@ fn a_held_reference_to_an_entry_not_the_cells_own_is_never_compared() {
     assert!(store_holds(&store, cell, &reference(Memory::VAULT, &own), &wanted).unwrap());
     assert!(!store_holds(&store, cell, &reference(Memory::VAULT, &other), &wanted).unwrap());
     assert!(!store_holds(&store, cell, &reference("other-vault", &own), &wanted).unwrap());
+}
+
+/// An import planned against registry.2, a generation that holds a phone's number sealed and a
+/// Mac's nickname aliases as one list: the number is planned in the planner's own form and
+/// sealed as that generation holds it, the aliases go as the list it holds, and the review types
+/// each as its plan holds it (LT-15B).
+/// NEGATIVE CONTROL (run 2026-11-15): with `finish` building every change through the
+/// generation's own collection (`writing` answering `form` always), the plan is refused: `` a
+/// secret cell holds an authenticated opaque token ``.
+#[test]
+fn a_sealed_generation_takes_its_numbers_sealed_and_its_aliases_as_a_list() {
+    use crate::alab::registry::REGISTRY_2;
+    use crate::typed::{Ty, secret::Fixed};
+    let phones = Sheet::parse(
+        SheetKind::Phones,
+        "alab-phones.csv",
+        b"Phone Number,Carrier / Provider,Line Type,Associated Device / Person,Notes\n\
+          415-555-0199,Tello Mobile,eSIM,Desk Phone,Primary test line\n",
+    )
+    .unwrap();
+    let computers = Sheet::parse(
+        SheetKind::Computers,
+        "alab-computers.csv",
+        b"ID,Make,Arch,OS,Processor,RAM,HD,Aliases,Nickname,Nickname Aliases,Location,Notes\n\
+          m2,Apple,arm64,macOS,M3 Max,64,2000,,fb,\"redballoon, Red Balloon\",SF,Desk Mac\n",
+    )
+    .unwrap();
+    let sealer = Fixed("alab/registry.2");
+    let plan = plan_unheld(
+        &input(&[phones, computers], &[]),
+        &REGISTRY_2,
+        Some(Sealed {
+            table: &REGISTRY_2,
+            sealer: &sealer,
+        }),
+    )
+    .unwrap();
+    let mut rows: Vec<crate::database::Change> = plan.rows.iter().flatten().cloned().collect();
+    crate::att::conform(&REGISTRY_2, &mut rows).unwrap();
+    let held = |collection: &str, column: &str| {
+        rows.iter()
+            .find(|c| c.collection == collection && c.key.ends_with(&format!(".{column}")))
+            .and_then(|c| c.value.as_ref())
+            .and_then(|v| v.get("x"))
+            .cloned()
+    };
+    let number = held("phone", "number").unwrap();
+    assert!(
+        number.as_str().is_some_and(crate::typed::secret::is_sealed),
+        "the number is sealed"
+    );
+    assert_eq!(
+        held("machine", "nickname_aliases"),
+        Some(json!(["redballoon", "Red Balloon"]))
+    );
+    assert_eq!(plan.ty("phone", "number"), Some(Ty::Phone));
+    assert!(matches!(
+        plan.ty("machine", "nickname_aliases"),
+        Some(Ty::List(..))
+    ));
 }

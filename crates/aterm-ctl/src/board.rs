@@ -624,7 +624,7 @@ impl Board {
     }
 
     /// [`Board::prune`] as of `now_ms`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn prune_at(&self, now_ms: u64) {
         let board = self.bind(true).expect("the board");
         let _lock = board.lock().expect("the board's lock");
@@ -632,7 +632,7 @@ impl Board {
     }
 
     /// The keeper's settle of what the rows of `sids` owe the log ([`BoundBoard::settle`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn settle(&self, sids: &[String], now_ms: u64) -> io::Result<()> {
         self.bind(false)?.settle(sids, now_ms)
     }
@@ -871,7 +871,7 @@ impl BoundBoard {
     /// board's lock, at `now_ms`: the keeper's retry of a row no answer moves again ([`keep`]).
     /// # Errors
     /// As [`Board::record`].
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     fn settle(&self, sids: &[String], now_ms: u64) -> io::Result<()> {
         let _lock = self.lock()?;
         let held = sids
@@ -1280,7 +1280,7 @@ thread_local! {
 
 /// Tell this thread's next pay its append came to `kept`, whatever it did ([`append_kept`]): a
 /// write the log took whole, said `Unsure`, is one a failed cut back left.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn pay_says(kept: aterm_telemetry::direct::Kept) {
     PAY_SAYS.with(|said| said.set(Some(kept)));
 }
@@ -1288,24 +1288,24 @@ pub(crate) fn pay_says(kept: aterm_telemetry::direct::Kept) {
 /// A test's fault in this thread's board writes ([`BoundBoard::write`]): `Before` refuses the
 /// write, its file left as it was; `After` writes it, then answers the error of a folder's flush
 /// that failed after the rename.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteFault {
     Before,
     After,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type FaultOf = Box<dyn FnMut(&Row) -> Option<WriteFault>>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static WRITE_FAULTS: std::cell::RefCell<Option<FaultOf>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Fault this thread's board writes as `fault` says of each row written, until the guard drops.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn fault_writes(
     fault: impl FnMut(&Row) -> Option<WriteFault> + 'static,
 ) -> FaultedWrites {
@@ -1314,10 +1314,10 @@ pub(crate) fn fault_writes(
 }
 
 /// This thread's board writes faulted ([`fault_writes`]) until it drops.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct FaultedWrites;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for FaultedWrites {
     fn drop(&mut self) {
         WRITE_FAULTS.with(|f| *f.borrow_mut() = None);
@@ -2131,8 +2131,8 @@ fn seen_sid(row: &str) -> Option<&str> {
 }
 
 /// Whether `word` is a global session id, as the wire reads one
-/// ([`aterm_types::control_request::Sid::parse`]): a tab ID (`tqn5r6e0148`), or `s-` and hex
-/// digits, the form a tab opened before the `t` form keeps until it closes; 64 bytes at most.
+/// ([`aterm_types::control_request::Sid::parse`]): a tab ID (`tqn5r6e0148`), or `s-` and twenty
+/// lowercase hex digits, the form an older tab keeps until it closes; 64 bytes at most.
 #[must_use]
 pub fn is_sid(word: &str) -> bool {
     word.len() <= 64 && aterm_types::control_request::Sid::parse(word).is_some()

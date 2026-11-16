@@ -150,9 +150,9 @@ const fn unresolved_program_recheck(attempts: u8) -> Duration {
     }
 }
 
-/// The hash of what an agent verdict is read from: the zone's rows, the cursor, and the title's
-/// run bit ([`crate::presence::title_runs`]), so a title that alone says a turn runs or ended is
-/// read again though no row moved.
+/// The hash of what an agent verdict is read from: the zone's rows, the cursor, and the run bit
+/// ([`crate::presence::runs_bit`]), so a title or a program-status report that alone says a turn
+/// runs or ended is read again though no row moved.
 fn zone_hash(rows: &[String], cursor: crate::presence::Cursor, runs: bool) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     for row in rows {
@@ -188,7 +188,7 @@ struct AgentWatch {
     /// every [`PROGRAM_RECHECK`] whether or not its screen moves, since the front writes a line
     /// only about once a minute while the claims ahead of it come and go.
     build_waiting: bool,
-    /// The title's run bit at the last read ([`crate::presence::title_runs`]).
+    /// The run bit at the last read ([`crate::presence::runs_bit`]).
     runs_seen: bool,
     /// When a read saw the run bit fall: a reading short of a turn's end taken within
     /// [`AGENT_MIN_INTERVAL`] of it is read again then rather than published
@@ -3824,8 +3824,8 @@ pub(crate) struct StatusObserver {
     policy: StatusPolicy,
     min_interval: Duration,
     badge: bool,
-    sessions: std::collections::HashMap<u64, SessionSlot>,
-    next_due_any: Option<Instant>,
+    sessions: ScheduledStatuses,
+    census_initialized: bool,
     swept_pool_epoch: u64,
     /// The last native sweep's time and whether it left an operation open.
     native_swept: Option<(Instant, bool)>,
@@ -3861,7 +3861,6 @@ struct FooterAsk {
 #[derive(Debug)]
 struct SessionSlot {
     fsm: StatusFsm,
-    next_due: Instant,
     revision: u64,
     lifecycle: Option<Lifecycle>,
     failure: FailureMark,
@@ -3875,13 +3874,107 @@ impl SessionSlot {
     fn new(policy: StatusPolicy, now: Instant) -> Self {
         Self {
             fsm: StatusFsm::new(policy, now),
-            next_due: now,
             revision: 1,
             lifecycle: None,
             failure: FailureMark::default(),
             evented: None,
             screen: None,
         }
+    }
+}
+
+/// Owns both classifier membership and its observation deadlines. Mutable classifier access
+/// cannot change a deadline; insertion, rescheduling and removal maintain the ordered index here.
+#[derive(Debug, Default)]
+struct ScheduledStatuses {
+    slots: std::collections::HashMap<u64, ScheduledStatus>,
+    deadlines: std::collections::BTreeSet<(Instant, u64)>,
+}
+
+#[derive(Debug)]
+struct ScheduledStatus {
+    state: SessionSlot,
+    next_due: Instant,
+}
+
+impl std::ops::Deref for ScheduledStatus {
+    type Target = SessionSlot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl ScheduledStatuses {
+    fn ensure(&mut self, id: u64, policy: StatusPolicy, now: Instant) -> &mut SessionSlot {
+        let slot = self.slots.entry(id).or_insert_with(|| {
+            self.deadlines.insert((now, id));
+            ScheduledStatus {
+                state: SessionSlot::new(policy, now),
+                next_due: now,
+            }
+        });
+        &mut slot.state
+    }
+
+    fn get(&self, id: &u64) -> Option<&ScheduledStatus> {
+        self.slots.get(id)
+    }
+
+    fn get_mut(&mut self, id: &u64) -> Option<&mut SessionSlot> {
+        self.slots.get_mut(id).map(|slot| &mut slot.state)
+    }
+
+    fn contains_key(&self, id: &u64) -> bool {
+        self.slots.contains_key(id)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ScheduledStatus> {
+        self.slots.values()
+    }
+
+    fn reschedule(&mut self, id: u64, due: Instant) {
+        if let Some(slot) = self.slots.get_mut(&id) {
+            self.deadlines.remove(&(slot.next_due, id));
+            slot.next_due = due;
+            self.deadlines.insert((due, id));
+        }
+    }
+
+    fn any_due(&self, now: Instant) -> bool {
+        self.deadlines.first().is_some_and(|(due, _)| *due <= now)
+    }
+
+    fn due_ids(&self, now: Instant) -> Vec<u64> {
+        self.deadlines
+            .iter()
+            .take_while(|(due, _)| *due <= now)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    fn remove(&mut self, id: &u64) {
+        if let Some(slot) = self.slots.remove(id) {
+            self.deadlines.remove(&(slot.next_due, *id));
+        }
+    }
+
+    fn reconfigure(&mut self, policy: StatusPolicy, latest: Instant) {
+        self.deadlines.clear();
+        for (id, slot) in &mut self.slots {
+            slot.state.fsm.policy = policy;
+            slot.next_due = slot.next_due.min(latest);
+            self.deadlines.insert((slot.next_due, *id));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.deadlines.clear();
     }
 }
 
@@ -3927,8 +4020,8 @@ impl StatusObserver {
             policy,
             min_interval,
             badge: true,
-            sessions: std::collections::HashMap::new(),
-            next_due_any: None,
+            sessions: ScheduledStatuses::default(),
+            census_initialized: false,
             swept_pool_epoch: 0,
             native_swept: None,
             unclassified: Vec::new(),
@@ -4132,14 +4225,14 @@ impl StatusObserver {
 
     /// Returns whether any tracked session may be due for classification at `now`.
     pub(crate) fn any_due(&self, now: Instant) -> bool {
-        self.next_due_any.is_none_or(|due| now >= due)
+        self.sessions.any_due(now)
     }
 
-    /// Updates the next-due watermark and records `pool_epoch` and any unclassified session IDs after a sweep.
+    /// Records the topology census and sessions that still need their first classification.
     pub(crate) fn note_swept(&mut self, pool_epoch: u64, unclassified: Vec<u64>) {
         self.swept_pool_epoch = pool_epoch;
         self.unclassified = unclassified;
-        self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
+        self.census_initialized = true;
     }
 
     /// Returns whether the last sweep left any pooled session unclassified.
@@ -4194,13 +4287,11 @@ impl StatusObserver {
 
     /// Advances `session`'s next-allowed observation time when a sweep skips it due to lock contention.
     pub(crate) fn note_skipped(&mut self, session: u64, now: Instant) {
-        let Some(slot) = self.sessions.get_mut(&session) else {
+        if !self.sessions.contains_key(&session) {
             return;
-        };
-        let due = now + self.min_interval;
-        slot.next_due = due;
+        }
+        self.sessions.reschedule(session, now + self.min_interval);
         self.note_output(session, now);
-        self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
     }
 
     /// The print of `session`'s visible screen at `clock` ([`screen_clock`], [`screen_print`]):
@@ -4215,10 +4306,7 @@ impl StatusObserver {
         print: impl FnOnce() -> u64,
     ) -> u64 {
         let policy = self.policy;
-        let slot = self
-            .sessions
-            .entry(session)
-            .or_insert_with(|| SessionSlot::new(policy, now));
+        let slot = self.sessions.ensure(session, policy, now);
         match slot.screen {
             Some((at, screen)) if at == clock => screen,
             _ => {
@@ -4232,11 +4320,7 @@ impl StatusObserver {
     /// Folds `evidence` into `session`'s [`StatusFsm`] at `now` and returns whether its status changed.
     pub(crate) fn observe(&mut self, session: u64, evidence: &Evidence, now: Instant) -> bool {
         let policy = self.policy;
-        let slot = self
-            .sessions
-            .entry(session)
-            .or_insert_with(|| SessionSlot::new(policy, now));
-        slot.next_due = now + self.min_interval;
+        let slot = self.sessions.ensure(session, policy, now);
         let changed = match slot.lifecycle {
             Some(lifecycle) => {
                 let mut evidence = *evidence;
@@ -4252,8 +4336,7 @@ impl StatusObserver {
             slot.fsm.status().last_outcome.is_failure(),
             evidence.completed_block.map(|b| b.id),
         );
-        let due = now + self.min_interval;
-        self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
+        self.sessions.reschedule(session, now + self.min_interval);
         changed
     }
 
@@ -4266,10 +4349,7 @@ impl StatusObserver {
         now: Instant,
     ) -> bool {
         let policy = self.policy;
-        self.sessions
-            .entry(session)
-            .or_insert_with(|| SessionSlot::new(policy, now))
-            .lifecycle = Some(lifecycle);
+        self.sessions.ensure(session, policy, now).lifecycle = Some(lifecycle);
         self.observe(session, evidence, now)
     }
 
@@ -4493,8 +4573,8 @@ impl StatusObserver {
     }
 
     /// Returns whether the current sweep should read `session`'s terminal screen rows for agent
-    /// classification. `runs` is the title's run bit ([`crate::presence::title_runs`]): a move of
-    /// it alone is a move, since a title-only OSC moves neither the screen nor the cursor, and so
+    /// classification. `runs` is the run bit ([`crate::presence::runs_bit`]): a move of it alone
+    /// is a move, since a title or a program-status OSC moves neither the screen nor the cursor, and so
     /// is a rest settle come due ([`AgentWatch::rest_at`]). So is input its program read under a
     /// standing Kimi box: a key answers a box when Kimi reads it, and Kimi may draw the box after
     /// it cell for cell, so a box judged against an earlier moment is judged again
@@ -4544,18 +4624,20 @@ impl StatusObserver {
         reason = "one observation's facts, each read under a different lock or \
                   syscall by the sweep; a struct would only rename the list"
     )]
-    /// Runs one agent screen-classification step for `session`. `title` is the program's window
-    /// title, read under the lock `rows` were (`""` where it set none).
+    /// Runs one agent screen-classification step for `session`. `signs` are the program's run
+    /// signs, read under the lock `rows` were ([`crate::presence::RunSigns`]: its window title,
+    /// `""` where it set none, and the program-status report standing).
     ///
     /// THE REST SETTLE. Claude Code rests its title about 23 ms before the frame that draws its
-    /// reply's last line and its done row (2.1.311 lab `mr`), so a read between the two is a
-    /// reply short of its end under a title at rest. A reading that is no busy, taken within
-    /// [`AGENT_MIN_INTERVAL`] of a read that saw the title's run bit fall, is not published unless
+    /// reply's last line and its done row (2.1.311 lab `mr`), and with its query answered writes
+    /// `done` before that frame (2.1.323 lab), so a read between the two is a reply short of its
+    /// end under a run sign at rest. A reading that is no busy, taken within
+    /// [`AGENT_MIN_INTERVAL`] of a read that saw the run bit fall, is not published unless
     /// the reader sees the program's own end drawn ([`aterm_phase::ScreenReader::end_drawn`]):
     /// the watch reads again at that instant ([`StatusObserver::next_wake`]), so the frame drawn
     /// just after the rest is the one published, and a turn that ends with no later frame is
     /// published by then.
-    pub(crate) fn agent_observe(
+    pub(crate) fn agent_observe<'a>(
         &mut self,
         session: u64,
         generation: crate::control::ScreenGen,
@@ -4564,9 +4646,10 @@ impl StatusObserver {
         program: Option<String>,
         pgid: i32,
         resolving: bool,
-        title: &str,
+        signs: impl Into<crate::presence::RunSigns<'a>>,
         now: Instant,
     ) -> AgentStep {
+        let signs = signs.into();
         let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
             pgid: -1,
             ..AgentWatch::default()
@@ -4624,11 +4707,10 @@ impl StatusObserver {
                 if handback
                     && w.classified_at
                         .is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL)
-                    && let Some(slot) = self.sessions.get_mut(&session)
+                    && self.sessions.contains_key(&session)
                 {
                     w.output_at = None;
-                    slot.next_due = now;
-                    self.next_due_any = Some(self.next_due_any.map_or(now, |due| due.min(now)));
+                    self.sessions.reschedule(session, now);
                 }
             }
             return AgentStep::default();
@@ -4641,7 +4723,7 @@ impl StatusObserver {
         w.seq_seen = Some(generation);
         w.cursor_seen = Some(cursor);
         w.followup = moved || resolving;
-        let runs = crate::presence::title_runs(title);
+        let runs = crate::presence::runs_bit(signs);
         if runs {
             w.rest_at = None;
         } else if w.runs_seen {
@@ -4670,7 +4752,7 @@ impl StatusObserver {
             known,
             &rows,
             cursor,
-            title,
+            signs,
             now,
         );
         // A Kimi Bash box the screen reads as read-only is judged against Kimi's own record too.
@@ -4864,7 +4946,6 @@ impl StatusObserver {
     }
 
     /// Folds an OSC 7501 program-state reading for `session` and returns whether it changed.
-    #[cfg(test)]
     pub(crate) fn observe_program_state(
         &mut self,
         session: u64,
@@ -4879,26 +4960,32 @@ impl StatusObserver {
             .observe(report, honoured, group_moved, now)
     }
 
-    /// Folds an OSC 7501 program-state reading for `session` and returns whether it changed, with
-    /// the edges of its codex's turns no shown move claims
-    /// ([`crate::program_state::ProgramStateGate::observe_fed`]; `codex_front`: a codex is the
-    /// program in front).
-    pub(crate) fn observe_program_fed(
+    /// Folds `session`'s reading of another program's OSC 7501 report
+    /// ([`crate::program_state::ProgramStateGate::observe_other`]) and returns what it shows when
+    /// that moved: `Some(None)` when it shows none now, `None` when nothing moved.
+    pub(crate) fn observe_program_other(
         &mut self,
         session: u64,
-        report: aterm_core::terminal::program_state::ProgramStateReport,
+        other: aterm_core::terminal::program_state::OtherReport,
         honoured: bool,
-        codex_front: bool,
         group_moved: bool,
         now: Instant,
-    ) -> (bool, Vec<crate::program_state::FedEdge>) {
-        self.program_states.entry(session).or_default().observe_fed(
-            report,
-            honoured,
-            codex_front,
-            group_moved,
-            now,
-        )
+    ) -> Option<Option<aterm_core::terminal::program_state::ProgramState>> {
+        let gate = self.program_states.entry(session).or_default();
+        gate.observe_other(other, honoured, group_moved, now)
+            .then(|| gate.other().map(|(state, _)| state))
+    }
+
+    /// The OSC 7501 `(state, since)` the words say for `session`
+    /// ([`crate::program_state::ProgramStateGate::said`]): the active reading, else another
+    /// program's. Only the words read it.
+    pub(crate) fn program_said(
+        &self,
+        session: u64,
+    ) -> Option<(aterm_core::terminal::program_state::ProgramState, Instant)> {
+        self.program_states
+            .get(&session)
+            .and_then(crate::program_state::ProgramStateGate::said)
     }
 
     /// Returns the active OSC 7501 `(state, since)` reading for `session`, if any.
@@ -4962,9 +5049,7 @@ impl StatusObserver {
         crate::codex_rollout_tap::retire_session(session);
         self.rollout_asked.remove(&session);
         crate::kimi_record::forget(session);
-        if self.sessions.remove(&session).is_some() {
-            self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
-        }
+        self.sessions.remove(&session);
     }
 
     /// Applies a new [`StatusPolicy`] and minimum interval across all live sessions.
@@ -4982,11 +5067,7 @@ impl StatusObserver {
         }
         self.policy = policy;
         self.min_interval = min_interval;
-        for slot in self.sessions.values_mut() {
-            slot.fsm.policy = policy;
-            slot.next_due = slot.next_due.min(now + min_interval);
-        }
-        self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
+        self.sessions.reconfigure(policy, now + min_interval);
         true
     }
 
@@ -5000,7 +5081,7 @@ impl StatusObserver {
         self.agents.clear();
         self.agent_seq += 1;
         self.agent_cleared_at = self.agent_seq;
-        self.next_due_any = None;
+        self.census_initialized = false;
         self.unclassified.clear();
         had
     }
@@ -5032,19 +5113,30 @@ impl crate::App {
             return Vec::new();
         }
         let pool_epoch = self.pool.insert_epoch();
-        let retry_only = pool_epoch == self.session_status.swept_pool_epoch()
-            && !self.session_status.any_due(now);
+        let census = !self.session_status.census_initialized
+            || pool_epoch != self.session_status.swept_pool_epoch();
         let edged = self.session_factory.edge_inbox.take();
-        if retry_only && !self.session_status.has_unclassified() && edged.is_empty() {
+        if !census
+            && !self.session_status.any_due(now)
+            && !self.session_status.has_unclassified()
+            && edged.is_empty()
+        {
             return Vec::new();
         }
         let _timed = crate::metrics::SweepTimer::start();
-        let retry = if retry_only {
-            self.session_status.take_unclassified()
-        } else {
+        let retry = if census {
             Vec::new()
+        } else {
+            self.session_status.take_unclassified()
+        };
+        let due = if census {
+            Vec::new()
+        } else {
+            self.session_status.sessions.due_ids(now)
         };
         let pool = &self.pool;
+        // Edges retain priority and bypass the interval. A failed edge is put back into its
+        // inbox; a later scheduled visit may still retry it, as on a topology census.
         let sessions = edged
             .iter()
             .filter_map(|id| pool.get(*id))
@@ -5052,8 +5144,9 @@ impl crate::App {
             .chain(
                 retry
                     .iter()
+                    .chain(due.iter())
                     .filter_map(|id| pool.get(*id))
-                    .chain((!retry_only).then(|| pool.iter()).into_iter().flatten())
+                    .chain(census.then(|| pool.iter()).into_iter().flatten())
                     .map(|session| (session, false)),
             );
         let mut changed = Vec::new();
@@ -5123,7 +5216,7 @@ impl crate::App {
                 -1
             };
             let program_report = guard.program_state();
-            let (from, since_wall) = {
+            let (from, since_wall, program_cursor) = {
                 let timeline = session
                     .ctx
                     .timeline
@@ -5132,8 +5225,10 @@ impl crate::App {
                 (
                     timeline.slog().block_cursor(),
                     timeline.slog().opened_wall(),
+                    timeline.slog().program_cursor(),
                 )
             };
+            let mut program_read = crate::session_log::ProgramRead::of(&guard, program_cursor);
             let blocks = block_read(&guard, from, since_wall, &session.ctx.ran);
             crate::telemetry_host::commands_seen(session.ctx.job_feed.meter(), id, &guard, &blocks);
             let (program, front_agent) = {
@@ -5148,17 +5243,23 @@ impl crate::App {
                 )
             };
             let cursor = crate::presence::Cursor::At(Some(usize::from(guard.cursor().row)));
-            // The program's own title, read in the hold the rows are: under a status line it is
-            // the one sign that a reply still being drawn is a turn running. Never the roster's
-            // title, which a person's tab name overrides.
+            // The program's own title and its program-status report standing, read in the hold
+            // the rows are: under a status line they are the signs that a reply still being drawn
+            // is a turn running (the report first, where Claude Code's answered query leaves its
+            // title no glyph). Never the roster's title, which a person's tab name overrides.
             let title = guard.title_arc();
+            let report = program_report.run_sign();
+            let signs = crate::presence::RunSigns {
+                title: &title,
+                report: report.as_deref(),
+            };
             let read = (!guard.frame_unfinished_at(now)
                 && self.session_status.agent_zone_wanted(
                     id,
                     generation,
                     cursor,
                     &program,
-                    crate::presence::title_runs(&title),
+                    crate::presence::runs_bit(signs),
                     now,
                 ))
             .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
@@ -5231,17 +5332,22 @@ impl crate::App {
                 timeline.slog_mut().observe_status(facts, at);
                 timeline.record(STATUS_CHANGE);
             }
-            let (previous_group, wake, program_honoured, codex_front, build_waiting) = {
+            let (previous_group, wake, program_honoured, other_honoured, build_waiting) = {
                 let mut timeline = session
                     .ctx
                     .timeline
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 timeline.witness_cwd_report(cwd_report, pgid);
-                let previous = timeline.sweep_slog(&blocks, seen, pid, pgid);
+                let previous =
+                    timeline.sweep_slog_turns(&blocks, seen, pid, pgid, &mut program_read);
                 let at = timeline.slog().now();
                 timeline.slog_mut().observe_engine(&engine, at);
+                // Tick, then the edges, then the move's mark: a held box the tick writes hangs
+                // from the turn the edges the earlier sweeps fed opened, before this sweep's
+                // edges can close it.
                 timeline.slog_mut().program_tick(at);
+                timeline.feed_program_turns(&mut program_read);
                 timeline.slog_mut().shown_tick(at);
                 // A program state the tick wrote is a `program-state` row: its watchers hear it
                 // now, not at the next record.
@@ -5249,21 +5355,24 @@ impl crate::App {
                 // The claim is judged by the program in front once this sweep's foreground move
                 // is noted (unnamed right after one), never by the name read before it, and only
                 // where the report names that program.
+                // Another program's report needs a job in front, or a root that is no shell: a
+                // shell writes none.
+                let job = foreground_job == Some(true);
                 let honoured = crate::program_state::honoured_for(
                     timeline.agent().program.as_deref(),
                     program_report.state.map(|s| s.app),
+                    job,
                 );
-                // The edges of a codex's turns are fed by the same judgement, the report standing
-                // or not.
-                let codex_front = crate::program_state::honoured_for(
+                let other_honoured = crate::program_state::honoured_for(
                     timeline.agent().program.as_deref(),
-                    Some(aterm_core::terminal::program_state::ProgramApp::Codex),
+                    program_report.other.state.map(|s| s.app),
+                    job,
                 );
                 (
                     previous,
                     timeline.slog_wake(),
                     honoured,
-                    codex_front,
+                    other_honoured,
                     timeline.build_wait().is_some(),
                 )
             };
@@ -5281,35 +5390,43 @@ impl crate::App {
                 claims_cleared.push(id);
             }
             let turn_begun = program_report.turns != self.session_status.program_turns(id);
-            let (program_state_moved, fed) = self.session_status.observe_program_fed(
+            let program_state_moved = self.session_status.observe_program_state(
                 id,
                 program_report,
                 program_honoured,
-                codex_front,
                 group_changed,
                 now,
             );
             if turn_begun {
                 turns_moved.push(id);
             }
+            // Another program's report is the words' alone: it moves no mark, edge or turn.
+            let other_moved = self.session_status.observe_program_other(
+                id,
+                program_report.other,
+                other_honoured,
+                group_changed,
+                now,
+            );
+            if let Some(other) = other_moved {
+                session
+                    .ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_other_program(other);
+            }
             let shown = self
                 .session_status
                 .program_state(id)
                 .map(|(state, _)| state);
-            if program_state_moved || !fed.is_empty() {
-                let mut timeline = session
+            if program_state_moved {
+                session
                     .ctx
                     .timeline
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                // Tick, then the edges, then the move's mark: a held `working` the tick wrote
-                // opens its turn before the edge that ended it closes it.
-                if !fed.is_empty() {
-                    timeline.note_program_edges(&fed);
-                }
-                if program_state_moved {
-                    timeline.note_program_state(shown, program_report.began);
-                }
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_program_state(shown, program_report.began);
             }
             if program_state_moved
                 && session
@@ -5414,7 +5531,7 @@ impl crate::App {
             self.session_status
                 .note_input(id, look, crate::kimi_record::wall_ms());
             let step = self.session_status.agent_observe(
-                id, generation, zone, cursor, program, pgid, resolve, &title, now,
+                id, generation, zone, cursor, program, pgid, resolve, signs, now,
             );
             if blocks.more {
                 self.session_status.owe_look(id);
@@ -5510,6 +5627,7 @@ impl crate::App {
                 || seen
                 || step.reading_changed
                 || program_state_moved
+                || other_moved.is_some()
             {
                 changed.push(id);
             }
@@ -5560,7 +5678,7 @@ impl crate::App {
         if self.integration_notices.owes() {
             self.say_integration();
         }
-        if retry_only {
+        if !census {
             let still: Vec<u64> = retry
                 .into_iter()
                 .filter(|id| self.pool.get(*id).is_some() && !self.session_status.knows(*id))
@@ -5652,11 +5770,7 @@ impl crate::App {
 
     /// Marks `session` as seen when it is the focused view of an active, unoccluded window `wid`.
     pub(crate) fn note_session_seen(&mut self, wid: crate::WindowId, session: u64) {
-        let looking = self
-            .windows
-            .get(&wid)
-            .map(Box::as_ref)
-            .is_some_and(crate::os_window_focused)
+        let looking = self.windows.get(&wid).is_some_and(crate::os_window_focused)
             && self.focused_session_id(wid) == Some(session);
         if looking && self.session_status.note_seen(session) {
             // THE SESSION LOG: `mark - seen` lifts the failure's need; its
@@ -5728,9 +5842,9 @@ impl crate::App {
             // itself (OSC 7501), as the hover's state line does; only while the sweep keeps that
             // report current (Tab Status on: off, nothing folds it and it would stand stale).
             if self.config.tab_status_or_default()
-                && let Some((state, _)) = self.session_status.program_state(session)
+                && let Some((state, _)) = self.session_status.program_said(session)
             {
-                return Some(crate::program_state::row_word(state).to_string());
+                return Some(crate::program_state::row_word(state).into_owned());
             }
         }
         status.and_then(summary_text)

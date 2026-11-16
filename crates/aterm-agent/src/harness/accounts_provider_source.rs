@@ -180,7 +180,7 @@ impl ProviderSource {
     }
 
     #[cfg_attr(
-        any(test, debug_assertions),
+        all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
             machine = "AccountProviderCapture",
             action = "Admit",

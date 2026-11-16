@@ -61,6 +61,24 @@ pub const REPROVE_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How long, on the link's clock, a peer has to answer a re-proof before the link ends.
 pub const REPROVE_WITHIN: Duration = Duration::from_secs(60);
 
+/// How long a link's socket sits idle before its kernel probes the peer (`TCP_KEEPALIVE` on macOS,
+/// `TCP_KEEPIDLE` on Linux).
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+
+/// The wait between two unanswered keepalive probes (`TCP_KEEPINTVL`).
+pub const KEEPALIVE_EVERY: Duration = Duration::from_secs(1);
+
+/// The unanswered probes after which the kernel ends the connection (`TCP_KEEPCNT`).
+pub const KEEPALIVE_PROBES: u32 = 5;
+
+/// How long a link's socket may go without its peer acknowledging data sent before the kernel
+/// ends the connection (`TCP_RXT_CONNDROPTIME` on macOS, `TCP_USER_TIMEOUT` on Linux): an idle
+/// link ends [`KEEPALIVE_IDLE`] plus [`KEEPALIVE_PROBES`] × [`KEEPALIVE_EVERY`] after its peer
+/// went silent, and a busy one this long after; either way within about 15 s, so a neighbour
+/// that went away without a word (its Mac asleep, its network gone) is dropped and replaced by
+/// then rather than at the next re-proof.
+pub const SILENCE_DROP: Duration = Duration::from_secs(15);
+
 /// The maximum time a local Close may drain before its socket is shut down.
 pub const CLOSE_DRAIN: Duration = Duration::from_millis(250);
 
@@ -779,14 +797,61 @@ impl Shared {
         Ok(())
     }
 
+    /// A round's nonce, drawn before the state lock so no system call runs under it; `None` where
+    /// the system's random source failed.
+    fn draw_nonce() -> Option<[u8; NONCE_LEN]> {
+        let mut nonce = [0u8; NONCE_LEN];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+            .is_ok()
+            .then_some(nonce)
+    }
+
+    /// Ask the peer to re-prove under `state`, with `nonce` drawn for it, answered by `overdue_at`
+    /// (the link's clock); the next round falls due [`REPROVE_EVERY`] after `now`.
+    fn ask_reproof(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        nonce: [u8; NONCE_LEN],
+        now: Duration,
+        overdue_at: Duration,
+    ) {
+        state.reproof.pending = Some(Pending { nonce, overdue_at });
+        state.reproof.next_at = now.saturating_add(REPROVE_EVERY);
+        state.reproof.sent = state.reproof.sent.saturating_add(1);
+        Self::queue_control(&mut state, frame(Kind::Reprove, 0, &nonce));
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Re-prove the peer now, answered within `within` of the link's clock: a round already
+    /// pending keeps its nonce, its deadline brought forward to `within` from now where that is
+    /// sooner. The round's deadline, or `None` where the link ended (or ends now, its nonce not
+    /// drawn).
+    fn reprove_now(&self, within: Duration) -> Option<Duration> {
+        let now = self.cfg.clock.now();
+        let nonce = Self::draw_nonce();
+        let mut state = self.link_state();
+        if state.closed.is_some() || state.close_reason.is_some() {
+            return None;
+        }
+        let overdue_at = now.saturating_add(within);
+        if let Some(pending) = state.reproof.pending.as_mut() {
+            pending.overdue_at = pending.overdue_at.min(overdue_at);
+            return Some(pending.overdue_at);
+        }
+        let Some(nonce) = nonce else {
+            self.fail_held(state, "the system's random source failed");
+            return None;
+        };
+        self.ask_reproof(state, nonce, now, overdue_at);
+        Some(overdue_at)
+    }
+
     /// Start the re-proof that is due, end the link for one overdue; the next deadline.
     fn tick(&self) -> Option<Duration> {
         let now = self.cfg.clock.now();
-        // A round's nonce is drawn before the state lock, so no system call runs under it.
-        let mut nonce = [0u8; NONCE_LEN];
-        let drawn =
-            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce).is_ok();
-        let mut state = self.link_state();
+        let nonce = Self::draw_nonce();
+        let state = self.link_state();
         if state.closed.is_some() {
             return None;
         }
@@ -802,17 +867,12 @@ impl Shared {
         if now < state.reproof.next_at {
             return Some(state.reproof.next_at);
         }
-        if !drawn {
+        let Some(nonce) = nonce else {
             self.fail_held(state, "the system's random source failed");
             return None;
-        }
+        };
         let overdue_at = now.saturating_add(REPROVE_WITHIN);
-        state.reproof.pending = Some(Pending { nonce, overdue_at });
-        state.reproof.next_at = now.saturating_add(REPROVE_EVERY);
-        state.reproof.sent = state.reproof.sent.saturating_add(1);
-        Self::queue_control(&mut state, frame(Kind::Reprove, 0, &nonce));
-        drop(state);
-        self.changed.notify_all();
+        self.ask_reproof(state, nonce, now, overdue_at);
         Some(overdue_at)
     }
 
@@ -954,6 +1014,9 @@ impl Link {
         let addr = sock.peer_addr()?;
         let local = sock.local_addr()?;
         let _ = aterm_uds::keep_out_of_children(&sock);
+        // Best effort: a peer that already shut the socket refuses options (Apple answers EINVAL),
+        // and such a link ends at its first read; the re-proof bounds a link whose options failed.
+        let _ = keep_alive(&sock);
         let reader = aterm_uds::kept_out(|| sock.try_clone())?;
         let writer = aterm_uds::kept_out(|| sock.try_clone())?;
         sock.set_read_timeout(None)?;
@@ -1187,6 +1250,17 @@ impl Link {
     /// once it ended.
     pub fn tick(&self) -> Option<Duration> {
         self.shared.tick()
+    }
+
+    /// Re-prove the peer now rather than at the next round, answered within `within` of the
+    /// link's clock or the link ends at its timer's next run after that ([`Self::tick`]): what a
+    /// wake from sleep or a change of this Mac's network path asks, so a link whose peer is gone
+    /// ends within `within` rather than at a round that, on a clock that stood still in sleep,
+    /// is minutes away. A round already pending keeps its nonce, its deadline brought forward
+    /// where `within` ends sooner. The round's deadline, or `None` where the link ended or is
+    /// closing.
+    pub fn reprove_now(&self, within: Duration) -> Option<Duration> {
+        self.shared.reprove_now(within)
     }
 
     /// End the link: try to drain a `Close` and TLS close for [`CLOSE_DRAIN`], then shut down
@@ -1641,6 +1715,74 @@ impl Write for &LinkStream {
     }
 }
 
+/// `TCP_RXT_CONNDROPTIME` (`<netinet/tcp.h>`), which the generated libc cell does not name.
+#[cfg(target_os = "macos")]
+const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+
+/// Set one integer option of `sock`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn set_int(sock: &TcpStream, level: libc::c_int, name: libc::c_int, value: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let value = libc::c_int::try_from(value).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `value` is a live c_int read for exactly its size, on a descriptor `sock` owns.
+    let set = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            std::ptr::from_ref(&value).cast(),
+            libc::socklen_t::try_from(std::mem::size_of_val(&value)).unwrap_or(4),
+        )
+    };
+    if set == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Make the kernel end `sock` within about [`SILENCE_DROP`] of its peer's silence: keepalive
+/// probes after [`KEEPALIVE_IDLE`] idle, [`KEEPALIVE_PROBES`] of them [`KEEPALIVE_EVERY`] apart,
+/// and unacknowledged data dropped after [`SILENCE_DROP`]. Elsewhere than macOS and Linux it sets
+/// nothing, and the re-proof alone bounds a silent peer.
+/// # Errors
+/// The first option the kernel refused.
+pub(crate) fn keep_alive(sock: &TcpStream) -> io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let (idle, drop_after, drop_value) = (
+            libc::TCP_KEEPALIVE,
+            TCP_RXT_CONNDROPTIME,
+            SILENCE_DROP.as_secs(),
+        );
+        #[cfg(target_os = "linux")]
+        let (idle, drop_after, drop_value) = (
+            libc::TCP_KEEPIDLE,
+            libc::TCP_USER_TIMEOUT,
+            u64::try_from(SILENCE_DROP.as_millis()).unwrap_or(u64::MAX),
+        );
+        set_int(sock, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+        set_int(sock, libc::IPPROTO_TCP, idle, KEEPALIVE_IDLE.as_secs())?;
+        set_int(
+            sock,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            KEEPALIVE_EVERY.as_secs(),
+        )?;
+        set_int(
+            sock,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            u64::from(KEEPALIVE_PROBES),
+        )?;
+        set_int(sock, libc::IPPROTO_TCP, drop_after, drop_value)?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = sock;
+    Ok(())
+}
+
 /// Dial a neighbour link on `tcp` as `me`, within `within`: an [`ALPN_MESH`](super::ALPN_MESH)
 /// handshake for [`FleetOp::Neighbour`] alone, judging the listener by `me`'s verdict
 /// ([`NodeIdentity::dialing_mesh`]), then a link run as `cfg` says.
@@ -1841,6 +1983,18 @@ impl Neighbours {
                 }
             }
         }
+    }
+
+    /// Ask every live link to re-prove its peer now, answered within `within` ([`Link::reprove_now`]),
+    /// and wake the timer so it ends each one left unanswered at that deadline. The links asked.
+    pub fn reprove_all(&self, within: Duration) -> usize {
+        let asked = self
+            .links()
+            .iter()
+            .filter(|link| link.reprove_now(within).is_some())
+            .count();
+        self.bell.ring();
+        asked
     }
 
     /// Run [`Self::tick`] whenever the clock reaches the next deadline, until [`Self::stop`].

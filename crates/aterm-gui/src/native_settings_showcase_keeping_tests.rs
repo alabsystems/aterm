@@ -475,14 +475,16 @@ impl StatusBar {
             .semantic(&UiKey::new("settings/status-dock"))
             .is_some();
         let cx = cx_of(drawn);
-        let state = view_state(runtime, view);
-        let most = state.status_bar_most.replace(Some(0.0));
-        let least = feedback_bar_height(
-            state,
-            SettingsWidth::for_viewport(cx.viewport.width),
-            cx.viewport,
-        );
-        state.status_bar_most.set(most);
+        let least = with_view_state(runtime, view, |state| {
+            let most = state.status_bar_most.replace(Some(0.0));
+            let least = feedback_bar_height(
+                state,
+                SettingsWidth::for_viewport(cx.viewport.width),
+                cx.viewport,
+            );
+            state.status_bar_most.set(most);
+            least
+        });
         Some(Self {
             tall,
             least,
@@ -1180,9 +1182,11 @@ impl Sweep {
         let walks_held =
             PAGE_CHROME_HELD.with(|held| held.replace(key.chrome.map(|chrome| chrome.0)));
         let (mut runtime, instance, view) = self.opened(drawn);
-        if Held::of(view_state(&mut runtime, view)) != key.held {
-            key.held.put(view_state(&mut runtime, view));
-        }
+        with_view_state(&mut runtime, view, |state| {
+            if Held::of(state) != key.held {
+                key.held.put(state);
+            }
+        });
         if key.keyboard != self.control
             && let Some(keyboard) = key.keyboard.as_deref()
         {
@@ -1193,25 +1197,27 @@ impl Sweep {
                 AppEvent::FocusChanged(Some(UiKey::new(keyboard))),
             );
         }
-        let state = view_state(&mut runtime, view);
-        if !key.filter.is_empty() {
-            state.showcase.filter =
-                crate::native_text_input::TextInputState::new(key.filter.clone());
-            state.invalidate_result_page_limit();
-        }
+        with_view_state(&mut runtime, view, |state| {
+            if !key.filter.is_empty() {
+                state.showcase.filter =
+                    crate::native_text_input::TextInputState::new(key.filter.clone());
+                state.invalidate_result_page_limit();
+            }
+        });
         let first = draw(&mut runtime, instance, view, drawn);
         // The most room the list can have in this chrome: its body under the bar at its least.
         let body_least = matches!(key.reads, Reads::Beside(_)).then(|| {
-            let state = view_state(&mut runtime, view);
-            let cx = cx_of(drawn);
-            let most = state.status_bar_most.replace(Some(0.0));
-            let body = settings_list_body_height(
-                state,
-                SettingsWidth::for_viewport(cx.viewport.width),
-                cx.viewport,
-            );
-            state.status_bar_most.set(most);
-            body
+            with_view_state(&mut runtime, view, |state| {
+                let cx = cx_of(drawn);
+                let most = state.status_bar_most.replace(Some(0.0));
+                let body = settings_list_body_height(
+                    state,
+                    SettingsWidth::for_viewport(cx.viewport.width),
+                    cx.viewport,
+                );
+                state.status_bar_most.set(most);
+                body
+            })
         });
         // Every screen in one chrome: the key's, else the page's choice.
         let chrome = key.chrome.map_or(first.chrome, |chrome| chrome.0);
@@ -1258,11 +1264,12 @@ impl Sweep {
                 return reach.screens.get(&at?).copied();
             }
             if first.list {
-                let state = view_state(&mut runtime, view);
-                state.scroll_page_to(top);
-                state.page_reveal.clone_from(&key.reveal);
-                state.reveal_as = scroll::Reveal::Hold;
-                state.drop_list_nudge();
+                with_view_state(&mut runtime, view, |state| {
+                    state.scroll_page_to(top);
+                    state.page_reveal.clone_from(&key.reveal);
+                    state.reveal_as = scroll::Reveal::Hold;
+                    state.drop_list_nudge();
+                });
             }
             let frame = draw(&mut runtime, instance, view, drawn);
             self.screens.fetch_add(1, Ordering::Relaxed);
@@ -1509,14 +1516,16 @@ struct Findings {
     ended: Option<(Option<usize>, f32)>,
 }
 
-fn view_state(
+fn with_view_state<R>(
     runtime: &mut NativeRuntime,
     view: crate::native_app::ViewId,
-) -> &mut SettingsViewState {
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    run: impl FnOnce(&mut SettingsViewState) -> R,
+) -> R {
+    let mut guard = runtime.view_state_mut(view).expect("live Settings view");
+    let AppViewState::Settings(state) = &mut *guard else {
         unreachable!()
     };
-    state
+    run(state)
 }
 
 fn cx_of(drawn: Drawn) -> ViewCx<'static> {
@@ -1531,9 +1540,10 @@ fn draw(
     drawn: Drawn,
 ) -> Frame {
     set_text_scale(f32::from(drawn.scale));
-    let bars = view_state(runtime, view);
-    bars.config_watch_status = drawn.warning.then(|| WARNING.to_string());
-    bars.feedback = drawn.status.then(|| REFUSED.to_string());
+    with_view_state(runtime, view, |bars| {
+        bars.config_watch_status = drawn.warning.then(|| WARNING.to_string());
+        bars.feedback = drawn.status.then(|| REFUSED.to_string());
+    });
     let screen = compile_settings_view(runtime, instance, view, &cx_of(drawn));
     let state = state(runtime, view);
     let (key, list) = [LIST, SHEET_LIST]

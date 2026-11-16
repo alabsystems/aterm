@@ -64,6 +64,54 @@ fn quota_capability_requires_host_support_and_is_owner_only() {
     );
 }
 
+/// THE REFUSAL WORD STANDS BESIDE THE QUOTA WORD, ON THE OWNER'S REPLY ALONE: with the native
+/// policy's quota rotation on, the owner's reply carries ` codex_rotation_refusal=1` beside
+/// `codex_rotation=1` (this host leaves a wall its fresh read shows refusing ordinary use, which
+/// no window's reset explains: a spend control, a workspace's refusal, a credit-only plan out of
+/// credits). With quota rotation off, whether or not login rotation is on, or for an edge token,
+/// the reply carries no such word.
+#[test]
+fn the_refusal_word_stands_beside_the_quota_word_on_the_owners_reply_alone() {
+    const WORD: &str = "codex_rotation_refusal";
+    for login in [false, true] {
+        let mut value = facts(SupervisorConfig::default());
+        value.codex_login_rotation = login;
+        let off = reply(&value, None, true);
+        assert_eq!(field(&off, WORD), None, "login={login}: {off}");
+        value.codex_rotation = true;
+        let line = reply(&value, None, true);
+        assert_eq!(field(&line, "codex_rotation").as_deref(), Some("1"));
+        assert_eq!(field(&line, WORD).as_deref(), Some("1"), "login={login}");
+        let edge = reply(&value, None, false);
+        assert_eq!(field(&edge, WORD), None, "login={login}");
+        assert_eq!(edge, "OK effective=on\n");
+    }
+}
+
+/// THE LIMITS WORD STANDS BESIDE THE QUOTA WORD, ON THE OWNER'S REPLY ALONE: with the native
+/// policy's quota rotation on, the owner's reply carries ` codex_rotation_limits=1` beside
+/// `codex_rotation=1` (this host takes `limit=<id>` on a usage-limit `prepare` and judges that
+/// model's own limit, so a codex-alab sends the limit its wall names only to a host that says
+/// so). With quota rotation off, whether or not login rotation is on, or for an edge token, the
+/// reply carries no such word.
+#[test]
+fn the_limits_word_stands_beside_the_quota_word_on_the_owners_reply_alone() {
+    const WORD: &str = "codex_rotation_limits";
+    for login in [false, true] {
+        let mut value = facts(SupervisorConfig::default());
+        value.codex_login_rotation = login;
+        let off = reply(&value, None, true);
+        assert_eq!(field(&off, WORD), None, "login={login}: {off}");
+        value.codex_rotation = true;
+        let line = reply(&value, None, true);
+        assert_eq!(field(&line, "codex_rotation").as_deref(), Some("1"));
+        assert_eq!(field(&line, WORD).as_deref(), Some("1"), "login={login}");
+        let edge = reply(&value, None, false);
+        assert_eq!(field(&edge, WORD), None, "login={login}");
+        assert_eq!(edge, "OK effective=on\n");
+    }
+}
+
 /// THE LOST-LOGIN MOVE'S WORD IS THE OWNER'S, AND STANDS APART FROM THE QUOTA WORDS: with the
 /// native policy's login rotation on, the owner's reply carries ` codex_rotation_login=1` whether
 /// or not quota rotation is on, and the quota words are as they were; with it off, or for an edge
@@ -217,7 +265,7 @@ fn the_owners_reply_is_every_key_in_its_own_spelling_and_reads_back() {
         .expect("a list");
     let line = reply(&facts(cfg.clone()), None, true);
     assert!(
-        line.starts_with("OK gen=7 effective=on why=enabled contract=2,3 "),
+        line.starts_with("OK gen=7 effective=on why=enabled contract=2,3,4 "),
         "{line}"
     );
     assert!(line.ends_with('\n') && !line.trim_end().contains('\n'));
@@ -258,20 +306,20 @@ fn the_owners_reply_is_every_key_in_its_own_spelling_and_reads_back() {
 }
 
 /// THE HANDSHAKE (contract v3 §8.1 item 1): the owner's reply lists the contracts this aterm
-/// serves, codex-alab's 2 and the roster's 3, effective or not; an edge token's reply, which
+/// serves, codex-alab's 2 and the registry's 3 and 4, effective or not; an edge token's reply, which
 /// can claim nothing, does not; and an aterm serving none (the negative control's seam,
 /// `crate::harness_claim::served`) has no `contract=` key, the rest of its reply as before.
 #[test]
 fn the_owners_reply_lists_the_served_contracts() {
     let on = reply(&facts(SupervisorConfig::default()), None, true);
-    assert_eq!(field(&on, "contract").as_deref(), Some("2,3"), "{on}");
+    assert_eq!(field(&on, "contract").as_deref(), Some("2,3,4"), "{on}");
     let off = PolicyFacts {
         effective: (false, "autopilot-off"),
         ..facts(SupervisorConfig::default())
     };
     assert_eq!(
         field(&reply(&off, None, true), "contract").as_deref(),
-        Some("2,3")
+        Some("2,3,4")
     );
     assert_eq!(field(&reply(&off, None, false), "contract"), None);
     let before = reply_serving(&facts(SupervisorConfig::default()), None, true, None);

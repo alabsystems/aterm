@@ -1674,7 +1674,7 @@ fn vim_insert_is_refused_by_its_own_check_and_normal_is_not() {
         let (mut app, wid, session, mut reader) = rig();
         draw_measured(&mut app, wid, session, text, |_| {});
         let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-        let screen = lights::read_screen(&rows, None).expect(name);
+        let screen = lights::read_screen(&rows, None, None).expect(name);
         assert_eq!(
             (screen.mode, screen.vim_insert),
             (Some(lights::Mode::Auto), insert),
@@ -1806,7 +1806,7 @@ pub(super) fn project_slash_press(
     let read = app.slash_engine_read(session);
     let screen = read
         .as_ref()
-        .and_then(|r| lights::read_screen(&r.rows, Some(&r.title)));
+        .and_then(|r| lights::read_screen(&r.rows, Some(&r.title), r.report.as_deref()));
     observed.insert("boxed", i64::from(screen.is_none()));
     if let (Some(r), Some(screen)) = (&read, &screen) {
         observed.insert(

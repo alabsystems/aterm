@@ -841,7 +841,7 @@ fn the_plan_says_every_file_and_an_overlay_changes_it() {
     }
     let hosting = config::read(&lab.site()).unwrap();
     let mut overlay = BTreeMap::new();
-    overlay.insert("index.html".to_string(), b"<p>planned</p>".to_vec());
+    overlay.insert("index.html".to_string(), Some(b"<p>planned</p>".to_vec()));
     let planned = Plan::of(&lab.site(), &hosting, None, &overlay).unwrap();
     let index = |p: &Plan| {
         p.files

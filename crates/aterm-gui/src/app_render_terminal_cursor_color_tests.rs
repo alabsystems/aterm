@@ -242,10 +242,11 @@ fn the_caret_floor_reads_the_cell_under_the_caret_from_the_rendered_frame() {
         } else {
             b"x\x1b[H"
         });
-        let ws = app.windows.get_mut(&wid).expect("fixture window");
+        let mut ws = app.windows.get_mut(&wid).expect("fixture window");
         ws.focused = true;
         ws.input_scratch = term.cell_frame(24, 80);
         let cell = aterm_render::rgb_to_u32(ws.input_scratch.cells[0][0].bg);
+        drop(ws);
         let fill = app
             .cursor_frame(
                 wid,

@@ -16,7 +16,7 @@ fn invalid() -> io::Error {
         "invalid native custody observation",
     )
 }
-/// Read the actual ancestor custodian without creating or repairing account state.
+/// Read the actual ancestor custodian for a local session without creating or repairing account state.
 /// # Errors
 /// No unique native ancestor/cached image exists, provenance or peer checks fail,
 /// the endpoint is unavailable, or its bounded custody response is malformed.
@@ -28,7 +28,7 @@ fn lookup_at(root: &Path, session: &str) -> io::Result<Value> {
 }
 
 fn lookup_started(root: &Path, session: &str, started: Instant) -> io::Result<Value> {
-    if !aterm_types::control_verbs::is_minted_sid(session) {
+    if aterm_types::control_request::Sid::parse(session).is_none() {
         return Err(invalid());
     }
     let deadline = crate::runtime::control_deadline(started);

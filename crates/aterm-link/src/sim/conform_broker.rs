@@ -302,6 +302,11 @@ pub(crate) enum Step {
     /// The stopped log is set aside on both arms, as `aterm link broker --retire-log` does
     /// (`bus::Broker::retire_log`, [`Real::retire_log`]): the next open starts another log.
     RetireLog,
+    /// The stopped log's identity sidecar no longer reads on both arms
+    /// (`bus::Broker::lose_identity`, [`Real::lose_identity`]): the next open mints another log
+    /// that keeps every record. The file arm's alone: the simulated device keeps its sidecar
+    /// where nothing outside astream writes.
+    LoseIdentity,
 }
 
 /// THE RUN'S CLOCK for its retention ticks: an hour past the wall clock when the run began,
@@ -747,6 +752,23 @@ impl Real {
                 std::fs::rename(entry.path(), aside.join(&name)).expect("set the log aside");
             }
         }
+    }
+
+    /// THE STOPPED LOG'S IDENTITY SIDECAR NO LONGER READS: bytes no build reads as a sidecar
+    /// where `<log>.id` is, as rot or another build's format leaves it. astream's next open
+    /// settles `Prior::Unreadable`: a fresh id over every record the log kept.
+    fn lose_identity(&mut self) {
+        assert!(
+            self.up.is_none(),
+            "a log's identity is lost while its broker is down"
+        );
+        assert!(
+            self.device.is_none(),
+            "the refinement arm's device keeps its sidecar where nothing outside astream writes"
+        );
+        let log = self.dir.path().join("bus.log");
+        std::fs::write(astream_broker::identity_path(&log), b"not an identity")
+            .expect("rot the identity sidecar");
     }
 
     /// The identity and lineage this arm's `Hello` names now, on a connection of its own.
@@ -1419,6 +1441,16 @@ fn run_arms(
                 // The log set aside takes the run with it: the next open judges another log.
                 lossy = None;
             }
+            Step::LoseIdentity => {
+                real.lose_identity();
+                model
+                    .core
+                    .broker
+                    .lose_identity()
+                    .ok_or_else(|| at("the model's broker is up"))?;
+                // The run's records stand, but under another log the next open judges.
+                lossy = None;
+            }
         }
         // ANOTHER LOG starts its durable head and its escalated acks again at 0.
         if opens && opened(&mut real, &model, &mut last_ids, &mut lossy).map_err(|e| at(&e))? {
@@ -1753,6 +1785,7 @@ fn refine(
             another_log: false,
             lossy: s.lossy,
             retired: false,
+            reminted: false,
             held_from: s.poison.and_then(|p| p.held_from),
         };
         (s.allowed_cuts(Stop::PowerLoss), s.oracle.clone(), restart)
@@ -1883,6 +1916,7 @@ fn replay(journal: &[Event]) -> Vec<Step> {
             }
             Event::FailFullFlush => steps.push(Step::FailFullFlush),
             Event::RetireLog => steps.push(Step::RetireLog),
+            Event::LoseIdentity => steps.push(Step::LoseIdentity),
         }
     }
     steps
@@ -2779,6 +2813,40 @@ pub(crate) mod lossy {
         s
     }
 
+    /// A LOG WHOSE IDENTITY SIDECAR NO LONGER READS (astream's `logid::settle`, `Prior::Unreadable`)
+    /// is ANOTHER LOG THAT KEEPS EVERY RECORD: after a clean stop its sidecar rots, and the next
+    /// open's `Hello` names a fresh id at generation 0 whose lineage continues nothing, while a
+    /// fetch from 0 shows both records it held, a resend of the second is answered at its old
+    /// offset (the dedup key stood), a new publish lands after them, and a conditional `Retire`
+    /// naming the first log is refused `log: ` while one naming the new log is served. The words
+    /// a reader matches on a log like this are older than any read-back head it held: a reader
+    /// that took the fresh id for an empty log would read back from 0 and match them
+    /// (aterm-link's `Bridge::read_back_from` and `StateDir::publication_offset_resets`, which
+    /// start at the head the node met the log at, `state::Met::floor`).
+    pub(crate) fn reminted() -> Vec<Step> {
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 1), LANE, "m1")),
+            Step::Send(1, publish(P, seq(1, 2), LANE, "m2")),
+            Step::Stop(Stop::Clean),
+            Step::LoseIdentity,
+            Step::Start,
+            Step::Dial(2),
+            Step::Send(2, Request::Hello),
+            Step::Send(2, fetch(0, "/>", 100)),
+            Step::Send(2, publish(P, seq(1, 2), LANE, "m2")), // deduped @1
+            Step::Send(2, publish(P, seq(1, 3), LANE, "m3")), // @2
+            Step::Send(
+                2,
+                retire_on(P, LANE, 2, super::bus::LOG_ID, 0), // the first log: log:
+            ),
+            Step::Send(2, retire_on(P, LANE, 2, minted(1), 0)), // this log: retired @3
+        ];
+        s.extend(look(2));
+        s
+    }
+
     /// A POISONED LOG (astream's `BrokerLog::full_flush_failed`), on a weak tier: a plain record
     /// a `Settle` covers; then the full flush an escalated publish asks for fails, answered
     /// "outcome unknown", its record held out of sight; `Hello` latched to Strict; a publish, a
@@ -3646,6 +3714,39 @@ fn the_model_settles_every_empty_open_as_another_log() {
         (ArmMutant::MintKeepsGeneration, Tier::Relaxed),
     ] {
         let Err(e) = run(tier, mutant, &lossy::empty_restarts()) else {
+            panic!("CONTROL {mutant:?} at {tier}: answered as astream answers it");
+        };
+        eprintln!("CONTROL {mutant:?} caught: {e}");
+    }
+}
+
+/// **A LOG WHOSE IDENTITY NO LONGER READS IS ANOTHER LOG THAT KEEPS EVERY RECORD, ON THE MODEL
+/// AS ON ASTREAM**: [`lossy::reminted`] on every tier the host serves, on the file arm (the
+/// device keeps its sidecar where nothing outside astream writes), the open's fresh id compared
+/// ([`opened`]) and every answer after it: the records kept, the dedup key that answers a resend
+/// at its old offset, the next offset, and the conditional retires naming each log. Not vacuous:
+/// the one open of each run settled another log on both arms. NEGATIVE CONTROLS: a model that
+/// keeps the id, or one that forgets the records as a log set aside does, is caught.
+#[test]
+fn a_log_whose_identity_no_longer_reads_keeps_its_records_under_another_id() {
+    let tiers: Vec<Tier> = [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+        .collect();
+    for &tier in &tiers {
+        let real = run_keeping(tier, None, None, None, ArmMutant::None, &lossy::reminted())
+            .unwrap_or_else(|e| panic!("the file arm at {tier}: {e}"));
+        assert_eq!(
+            real.refined.fresh_ids, 1,
+            "{tier}: the open after the sidecar rotted settled no other log"
+        );
+    }
+    let tier = *tiers.first().expect("a tier this host serves");
+    for mutant in [
+        ArmMutant::RemintKeepsTheId,
+        ArmMutant::RemintForgetsTheRecords,
+    ] {
+        let Err(e) = run_keeping(tier, None, None, None, mutant, &lossy::reminted()) else {
             panic!("CONTROL {mutant:?} at {tier}: answered as astream answers it");
         };
         eprintln!("CONTROL {mutant:?} caught: {e}");

@@ -3,7 +3,8 @@
 
 //! Native custody for one cooperative, same-PID account replacement. Selection
 //! stays in the shared pool. A checkpoint and a kernel image are never grants
-//! without this live operation and its original claim/owner fence.
+//! without this live operation and its original claim/owner fence. A tab keeps
+//! one operation for each process that armed one ([`ProcessKey`]).
 
 use super::*;
 use crate::session_timeline::{NativeCustody, SupervisorAuthority};
@@ -24,9 +25,19 @@ pub(in crate::native_act) struct Operation {
     command: ExecCommand,
     checkpoint: String,
     proposal: codex_rotation::Proposal<ExecCommand>,
+    /// What this operation keeps of `proposal` for its `reserve`s to judge a writer by: the one
+    /// its `arm` took ([`arm_selection`]), read only by [`Kept::reserve_refused`].
+    armed: Kept,
     preparation: Arc<Preparation>,
     tree: Option<aterm_agent::harness::codex_exec_handoff::tree::Admission>,
     gate: settlement::Execution,
+}
+
+impl Operation {
+    /// The process whose source armed this, as its tab keeps it.
+    pub(super) fn process(&self) -> ProcessKey {
+        ProcessKey::of(&self.source.process)
+    }
 }
 
 fn fields(line: &str) -> Option<(&str, BTreeMap<&str, &str>)> {
@@ -81,6 +92,19 @@ fn admitted(
         && ctx.native_policy.quota_rotation_enabled()
         && ctx.human_input.seq() == op.human_seq
         && *authority == op.authority
+}
+
+/// What `codex-exec-handoff complete` answers once its gates passed, for what the completion's
+/// writer `recorded` ([`codex_renewal::record_completed_rotation`]): `state=completed` for a
+/// recorded proof; `state=waiting` where a lock stood in the way (another writer's
+/// `accounts.lock`, the sign-in turn, or a login's auth lock a token refresh holds a moment),
+/// which the exec successor asks again; and `denied` where the records refuse it.
+pub(super) fn completion_reply(recorded: Result<(), codex_renewal::Unrecorded>) -> String {
+    match recorded {
+        Ok(()) => "OK codex-exec-handoff state=completed\n".into(),
+        Err(codex_renewal::Unrecorded::Busy) => "OK codex-exec-handoff state=waiting\n".into(),
+        Err(codex_renewal::Unrecorded::Refused(_)) => DENIED.into(),
+    }
 }
 
 fn grant(launch: &Operation, op: &settlement::State, state: &str) -> String {
@@ -142,16 +166,6 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     let (Some(id), Some(cap)) = (fields.get("id"), fields.get("cap")) else {
         return DENIED.into();
     };
-    let operation = ctx
-        .fenced_writes
-        .native
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .exec_operation
-        .clone();
-    let Some(operation) = operation else {
-        return DENIED.into();
-    };
     let Some(pid) = crate::control::serving_peer_pid() else {
         return DENIED.into();
     };
@@ -159,6 +173,20 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         return DENIED.into();
     };
     let Some(generation) = current.exec_generation else {
+        return DENIED.into();
+    };
+    // Every id/cap verb is its operation's own process's, the source that armed it or the
+    // successor its same-PID execve made, which keeps its key; the verb's id and cap are checked
+    // under the operation's lock below.
+    let operation = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .exec
+        .operation(ProcessKey::of(&current.process))
+        .cloned();
+    let Some(operation) = operation else {
         return DENIED.into();
     };
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
@@ -171,6 +199,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         command,
         checkpoint,
         proposal,
+        armed,
         preparation,
         tree,
         gate,
@@ -284,11 +313,7 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         && ctx.human_input.seq() == op.human_seq
     {
         if verb == "complete" {
-            return match codex_renewal::record_completed_rotation(&env, &op.receipt) {
-                Ok(Some(())) => "OK codex-exec-handoff state=completed\n".into(),
-                Ok(None) => "OK codex-exec-handoff state=waiting\n".into(),
-                Err(_) => DENIED.into(),
-            };
+            return completion_reply(codex_renewal::record_completed_rotation(&env, &op.receipt));
         }
         let _ = codex_renewal::retire_pool_record(&env, &op.receipt);
         return if matches!(verb, "load" | "consume") {
@@ -306,16 +331,22 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
                 return DENIED.into();
             }
             if proposal.commit(&op.receipt, env.now).is_err() {
-                // A healthy destination may still be another session's canary.
-                // An invalid preparation must instead be retired and selected
-                // again while the original quota-waiting turn is still alive.
-                if codex_rotation::with_prepared_writer(&env, &op.receipt, |_, _| Ok(())).is_err() {
-                    preparation.invalidate_selection(&op.receipt);
-                    return DENIED.into();
-                }
-                return format!(
-                    "OK codex-exec-handoff state=waiting deadline_us={}\n",
-                    op.deadline
+                // A healthy destination may still be another session's canary, and a writer
+                // that was busy says nothing of the selection: both wait, the second only while
+                // the selection's read is young enough to be offered, unless a writer of an
+                // earlier reserve held it. A selection its writer refutes is retired and selected
+                // again while the original quota-waiting turn is still alive. The writer waits for
+                // no lock: this holds the session's. The commit above still waits for
+                // accounts.lock, up to two seconds at each of its two takes and, where this Mac's
+                // fleet claims apply, as long as another writer holds it as it claims the target.
+                return armed.reserve_refused(
+                    &preparation.progress,
+                    &preparation.intent,
+                    op.deadline,
+                    &op.receipt,
+                    |receipt| {
+                        codex_rotation::with_prepared_writer_now(&env, receipt, |_, _| Ok(()))
+                    },
                 );
             }
             if !admitted(ctx, &op, &authority) || !op.tx.reserve(generation) {
@@ -464,6 +495,8 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     let Some(env) = environment() else {
         return DENIED.into();
     };
+    let key = ProcessKey::of(&source.process);
+    forget_gone(&ctx.fenced_writes.native);
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = meta.supervisor_authority(crate::metrics::now_us());
     let mut table = ctx
@@ -471,7 +504,7 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         .native
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if let Some(existing) = &table.exec_operation {
+    if let Some(existing) = table.exec.operation(key) {
         let launch = existing.lock().unwrap_or_else(|p| p.into_inner());
         let op = launch.gate.lock();
         if op.custody.is_some() {
@@ -497,7 +530,7 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     {
         return DENIED.into();
     }
-    let Some(job) = table.exec_prepare.as_ref() else {
+    let Some(job) = table.exec.job(key).cloned() else {
         return DENIED.into();
     };
     if !job.matches(
@@ -509,18 +542,9 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     ) {
         return DENIED.into();
     }
-    let progress = job.progress.lock().unwrap_or_else(|p| p.into_inner());
-    let Progress::Selected(proposal, observed) = &*progress else {
+    let Some((proposal, armed)) = arm_selection(&job.progress, target_account, target_user) else {
         return DENIED.into();
     };
-    if observed.elapsed() >= Duration::from_secs(60)
-        || proposal.destination_identity.account != target_account
-        || proposal.destination_identity.user != target_user
-    {
-        return DENIED.into();
-    }
-    let proposal = (**proposal).clone();
-    drop(progress);
     let Some(command) = proposal.plan.prepared_command().cloned() else {
         return DENIED.into();
     };
@@ -556,7 +580,7 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         destination: Some(proposal.destination_identity.clone()),
         id: id.clone(),
         intent,
-        sid: ctx.self_id.as_str().into(),
+        sid: job.mover.clone(),
         old_pid: pid,
         old_birth: source.process.birth,
         claim_revision: authority.revision(),
@@ -595,14 +619,18 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     let Some(connection) = crate::control::serving_connection() else {
         return DENIED.into();
     };
-    if !matches!(
-        codex_rotation::with_prepared_writer(&env, &receipt, |_, writer| writer.create(&receipt)),
-        Ok(Some(()))
-    ) {
-        // Preparation can become stale before an operation exists. Do not
-        // keep advertising that rejected selection until its cache expires.
-        job.invalidate_selection(&receipt);
-        return DENIED.into();
+    // Preparation can become stale before an operation exists: a selection its writer refutes
+    // is not advertised until its cache expires. A writer that was busy, or that could not
+    // read or write, says nothing of the selection, and the next arm takes it with no read. The
+    // writer waits for no lock: this holds the session's.
+    if let Some(refusal) =
+        writer_answered(&job.progress, &job.intent, Step::Arm, &receipt, |receipt| {
+            codex_rotation::with_prepared_writer_now(&env, receipt, |_, writer| {
+                writer.create(receipt)
+            })
+        })
+    {
+        return refusal;
     }
     let (gate, cleanup) = settlement::Execution::new(
         env,
@@ -617,7 +645,7 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
             custody: Arc::new(custody),
         },
     );
-    let op = Arc::new(Mutex::new(Operation {
+    let op = table.exec.keep(Operation {
         binding: Binding { id, capability },
         source,
         successor: None,
@@ -625,14 +653,14 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         checkpoint,
         gate,
         proposal,
-        preparation: Arc::clone(job),
+        armed,
+        preparation: job,
         tree: None,
-    }));
+    });
     {
         let launch = op.lock().unwrap_or_else(|p| p.into_inner());
         monitor.start(ctx, &launch.source, cleanup);
     }
-    table.exec_operation = Some(Arc::clone(&op));
     drop(table);
     drop(meta);
     let wait = op
@@ -678,61 +706,73 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     grant(&launch, &op, "armed")
 }
 
-pub(in crate::native_act) fn retain_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
-    let active = ctx
-        .fenced_writes
-        .native
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .exec_operation
-        .clone();
-    let Some(active) = active else { return false };
-    let launch = active.lock().unwrap_or_else(|p| p.into_inner());
-    let mut op = launch.gate.lock();
-    if op.source_connection != connection || op.custody.is_none() {
-        return false;
-    }
-    op.source_disconnected = true;
-    true
-}
-
-pub(in crate::native_act) fn pending(ctx: &crate::SessionCtx) -> bool {
+/// Every exec operation `ctx`'s tab keeps, taken from its table, which is unlocked again before
+/// any of them is locked.
+fn launched(ctx: &crate::SessionCtx) -> Vec<Arc<Mutex<Operation>>> {
     ctx.fenced_writes
         .native
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .exec_operation
-        .as_ref()
-        .is_some_and(|op| {
-            op.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .gate
-                .lock()
-                .custody
-                .is_some()
-        })
+        .exec
+        .operations()
 }
 
+/// Whether `operation` holds nothing its tab keeps it for: no native custody, and no verb of it
+/// running, which this does not wait for under the table's lock.
+pub(super) fn idle(operation: &Mutex<Operation>) -> bool {
+    let launch = match operation.try_lock() {
+        Ok(launch) => launch,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    launch.gate.lock().custody.is_none()
+}
+
+pub(in crate::native_act) fn retain_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
+    let mut retained = false;
+    for active in launched(ctx) {
+        let launch = active.lock().unwrap_or_else(|p| p.into_inner());
+        let mut op = launch.gate.lock();
+        if op.source_connection == connection && op.custody.is_some() {
+            op.source_disconnected = true;
+            retained = true;
+        }
+    }
+    retained
+}
+
+pub(in crate::native_act) fn pending(ctx: &crate::SessionCtx) -> bool {
+    launched(ctx).iter().any(|op| {
+        op.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .gate
+            .lock()
+            .custody
+            .is_some()
+    })
+}
+
+/// A person's Stop in the tab: close every exec operation there that holds native custody.
 pub(in crate::native_act) fn cancel_owner(ctx: &crate::SessionCtx) -> bool {
     let _meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let active = ctx
-        .fenced_writes
-        .native
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .exec_operation
-        .clone();
-    let Some(active) = active else { return false };
-    let launch = active.lock().unwrap_or_else(|p| p.into_inner());
-    let mut op = launch.gate.lock();
-    if op.custody.is_none() {
-        return false;
+    let mut closed = false;
+    for active in launched(ctx) {
+        let launch = active.lock().unwrap_or_else(|p| p.into_inner());
+        let mut op = launch.gate.lock();
+        if op.custody.is_none() {
+            continue;
+        }
+        op.close(
+            codex_renewal::CancellationKind::OwnerStop,
+            ctx.human_input.seq(),
+            true,
+            std::time::Instant::now(),
+        );
+        closed = true;
     }
-    op.close(
-        codex_renewal::CancellationKind::OwnerStop,
-        ctx.human_input.seq(),
-        true,
-        std::time::Instant::now(),
-    );
-    true
+    closed
 }
+
+#[cfg(test)]
+#[path = "codex_exec_operation_tests.rs"]
+mod tests;

@@ -31,9 +31,9 @@
 //! The CPU Stats clock is read as the A4 recordings read it: each channel's active residency
 //! weighted by its DVFS state's frequency, the state's ordinal into the pmgr `voltage-states`
 //! table (`voltage-states1-sram` Efficiency, `voltage-states5-sram` Super), read once from `ioreg`
-//! because `cpu_hardware` reads no table on this chip. The complex channels (`PCPU`, `ECPU`)
-//! are the recordings' read; the per-core channels, weighted by each core's active residency, are
-//! reported beside them.
+//! because `cpu_hardware` read no table on an M5 when they were made. The complex channels
+//! (`PCPU`, `ECPU`) are the recordings' read; the per-core channels, weighted by each core's
+//! active residency, are reported beside them.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

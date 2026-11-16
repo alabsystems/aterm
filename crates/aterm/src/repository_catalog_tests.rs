@@ -391,6 +391,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         &published,
         &doc,
         Instant::now() + Duration::from_secs(60),
+        Author::Person,
     )
     .unwrap();
     let published = client::admin_open(&paths).unwrap();
@@ -472,6 +473,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         &current,
         &doc,
         Instant::now() + Duration::from_secs(60),
+        Author::Person,
     )
     .unwrap();
     assert_eq!(
@@ -559,6 +561,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
                 &current,
                 &doc,
                 Instant::now() + Duration::from_secs(60),
+                Author::Person,
             )
             .unwrap();
             let newer = client::admin_open(&paths).unwrap();
@@ -688,6 +691,7 @@ pub(in crate::shared_login) fn exercise_owned_upkeep() {
         &current,
         &doc,
         Instant::now() + Duration::from_secs(60),
+        Author::Person,
     )
     .unwrap();
     let current = client::admin_open(&paths).unwrap();
@@ -1134,4 +1138,393 @@ pub(in crate::shared_login) fn exercise_pause_keeps_the_schedule() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(release);
+}
+
+/// The catalog a provider that lists `rows` refreshes `input` to.
+fn listed(input: Input, rows: &[Value]) -> Candidate {
+    let catalog = RepositoryCatalog::parse(&input.catalog).unwrap();
+    let bytes = catalog
+        .refresh(
+            "fixture-user",
+            7,
+            rows,
+            RepositoryCatalogVisibility::TokenVisible,
+        )
+        .unwrap();
+    Candidate {
+        changes: catalog.changes(&bytes).unwrap(),
+        bytes,
+        binding: input.binding,
+        visibility: RepositoryCatalogVisibility::TokenVisible,
+        observed: rows.len(),
+        observed_at: Instant::now(),
+    }
+}
+
+/// The rows of a provider that lists `repositories` repositories, each name 24 characters as a
+/// lab's longer ones are, and one more at each `look`: the lean rows a refresh keeps, a little
+/// under 300 bytes each.
+fn lean(repositories: u64, look: usize) -> Vec<Value> {
+    (0..repositories)
+        .map(|n| repository(100 + n, &format!("code-{n:04}-{}", "x".repeat(15))))
+        .chain([repository(5_000 + look as u64, &format!("look-{look}"))])
+        .collect()
+}
+
+/// The rows of a provider that lists 800 repositories with long names and one more at each
+/// `look`: a catalog of some 380 KiB.
+fn large(look: usize) -> Vec<Value> {
+    (0..800_u64)
+        .map(|n| repository(100 + n, &format!("code-{n:04}-{}", "x".repeat(80))))
+        .chain([repository(5_000 + look as u64, &format!("look-{look}"))])
+        .collect()
+}
+
+/// A vault this Mac administers that publishes a one-repository catalog and its token, and what
+/// its membership log holds.
+fn published_lab() -> aterm_db::table::fixture::Lab {
+    use aterm_secrets::commons::roster::Role;
+    let lab = aterm_db::table::fixture::Lab::with_foundation(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    client::seed_vault_genesis(paths, &lab._home.path().join("genesis.v2")).unwrap();
+    let opened = client::admin_open(paths).unwrap();
+    let mut doc = opened.doc.clone();
+    let initial = aterm_json::to_vec(&json!({"schema": 2, "account": "fixture-user",
+        "repositories": [repository(1, "kept-code")]}))
+    .unwrap();
+    doc.set_entry(&Audience::Everyone, NAME, &initial).unwrap();
+    doc.set_entry(&Audience::Everyone, TOKEN, b"github_pat_fixture_only")
+        .unwrap();
+    client::admin_publish(paths, &opened, &doc).unwrap();
+    assert!(allowed(paths));
+    lab
+}
+
+/// The bytes of the complete records `paths`' membership log holds.
+fn held(paths: &Paths) -> usize {
+    client::load_records(paths)
+        .unwrap()
+        .log()
+        .expect("CONTROL: the vault writes a membership log")
+        .fill(None)
+        .bytes
+}
+
+fn far() -> Instant {
+    Instant::now() + Duration::from_secs(60)
+}
+
+/// One look: this Mac reads the version it published, as the approver's pass does before each
+/// step, and the wait for the look is spent; then a step asks the provider and the next drains
+/// the read into `publish`.
+fn look(upkeep: &mut Upkeep, paths: &Paths) -> Result<usize, String> {
+    client::sync_reader_until(paths, far()).unwrap();
+    spend_the_wait(upkeep);
+    let admin = client::admin_open(paths).unwrap();
+    assert_eq!(upkeep.step(paths, &admin, far()), Ok(0));
+    wait_for_result(&upkeep.mailbox);
+    upkeep.step(paths, &admin, far())
+}
+
+/// A refused catalog is retired and its next look waits the whole 15 minutes, never the 60 s
+/// of a retry: no read is held, and the wait runs past a retry's.
+fn assert_waits_a_look(upkeep: &Upkeep) {
+    assert_eq!(jobs(upkeep), 0, "the refused candidate is retired");
+    assert!(
+        upkeep.due.is_some_and(|due| due > Instant::now() + RETRY),
+        "a refusal waits a look, not a retry"
+    );
+}
+
+/// The upkeep is an automatic writer of the vault's membership log (FL-145): once this Mac's
+/// seat signed 1 MiB of `Put`s in a day, the log's fill refuses the next catalog. The upkeep
+/// then signs and publishes nothing, retires that candidate instead of offering it at every
+/// step, waits the whole 15 minutes for its next look, and says the refusal once, in the fill's
+/// words; a later look that is refused too says nothing. A person's publish of the same entry
+/// from the same seat lands.
+///
+/// CONTROL, in the test: the first look, within the budget, publishes.
+#[test]
+fn vault_fill_refusal_retires_the_repository_catalog_and_is_said_once() {
+    let lab = published_lab();
+    let paths = &lab.paths[0];
+    let mut upkeep = Upkeep::default();
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&fetches);
+    upkeep.fetch = Arc::new(move |input, _| {
+        Ok(listed(
+            input,
+            &lean(60, counted.fetch_add(1, Ordering::SeqCst)),
+        ))
+    });
+    assert_eq!(
+        look(&mut upkeep, paths),
+        Ok(1),
+        "CONTROL: the first catalog"
+    );
+
+    // The seat's day is spent by what a person signs from it too: four 300 KiB values of a
+    // name that is no configuration's.
+    for version in 0..4_u8 {
+        let admin = client::admin_open(paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "lab_archive",
+            &vec![b'a' + version; 300 * 1024],
+        )
+        .unwrap();
+        client::admin_publish(paths, &admin, &doc).expect("a person's write is never held to it");
+    }
+
+    let (seq, bytes) = (client::admin_open(paths).unwrap().seq(), held(paths));
+    let refusal = look(&mut upkeep, paths).expect_err("a catalog past the seat's day");
+    assert!(
+        refusal.starts_with(
+            "private repository catalog was not refreshed: the repository inventory upkeep's \
+             write was not signed: this Mac's seat signed "
+        ) && refusal.contains(" would pass the 1 MiB an automatic writer may sign in a day")
+            && refusal.ends_with("; it is looked at again every 15 minutes"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("code-"),
+        "no repository's name: {refusal}"
+    );
+    assert_eq!(held(paths), bytes, "nothing is signed");
+    assert_eq!(
+        client::admin_open(paths).unwrap().seq(),
+        seq,
+        "and no version published"
+    );
+    assert_waits_a_look(&upkeep);
+    // A step before the next look asks nothing and says nothing.
+    let admin = client::admin_open(paths).unwrap();
+    assert_eq!(upkeep.step(paths, &admin, far()), Ok(0));
+    assert_eq!((jobs(&upkeep), fetches.load(Ordering::SeqCst)), (0, 2));
+    // The next look is refused too: said once, not again.
+    assert_eq!(
+        look(&mut upkeep, paths),
+        Ok(0),
+        "a second refusal is not said again"
+    );
+    assert_eq!(fetches.load(Ordering::SeqCst), 3);
+    assert_eq!(held(paths), bytes, "nothing is signed");
+    assert_waits_a_look(&upkeep);
+
+    // A person's publish of that catalog, from the same seat, is never held to the day.
+    let admin = client::admin_open(paths).unwrap();
+    let input = Input::capture(paths, &admin).unwrap();
+    let catalog = listed(input, &lean(60, 9)).bytes;
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, NAME, &catalog).unwrap();
+    client::admin_publish(paths, &admin, &doc).expect("a person's write");
+    assert!(held(paths) > bytes + catalog.len(), "it is signed");
+}
+
+/// A refusal is said once while it stands, and a later one is said again once something ended
+/// it: a look whose catalog the vault already holds (the provider lists again what was
+/// published), or a change of the entries the upkeep is kept for (a person's new token). Each
+/// refusal after that is a new one, said once.
+///
+/// CONTROL, in the test: between the ends, a refusal is not said again.
+#[test]
+fn vault_fill_upkeep_says_a_refusal_again_once_it_has_ended() {
+    let lab = published_lab();
+    let paths = &lab.paths[0];
+    let mut upkeep = Upkeep::default();
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&fetches);
+    // The provider lists what was published at the first and the third look, and something new
+    // at every other.
+    upkeep.fetch = Arc::new(move |input, _| {
+        let at = counted.fetch_add(1, Ordering::SeqCst);
+        let rows = if at == 2 { lean(60, 0) } else { lean(60, at) };
+        Ok(listed(input, &rows))
+    });
+    assert_eq!(
+        look(&mut upkeep, paths),
+        Ok(1),
+        "CONTROL: the first catalog"
+    );
+    for version in 0..4_u8 {
+        let admin = client::admin_open(paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            "lab_archive",
+            &vec![b'a' + version; 300 * 1024],
+        )
+        .unwrap();
+        client::admin_publish(paths, &admin, &doc).expect("a person's write");
+    }
+    let said = |result: Result<usize, String>| match result {
+        Err(refusal) => {
+            assert!(
+                refusal.starts_with("private repository catalog was not refreshed: ")
+                    && refusal.contains(" would pass the 1 MiB an automatic writer may sign"),
+                "{refusal}"
+            );
+            true
+        }
+        Ok(0) => false,
+        other => panic!("nothing is published past the seat's day: {other:?}"),
+    };
+    assert!(said(look(&mut upkeep, paths)), "the refusal is said");
+    // The provider lists what the vault holds: nothing to publish, and the refusal has ended.
+    assert_eq!(
+        look(&mut upkeep, paths),
+        Ok(0),
+        "the vault holds the catalog"
+    );
+    assert!(
+        said(look(&mut upkeep, paths)),
+        "a refusal after the vault held the catalog is said again"
+    );
+    assert!(
+        !said(look(&mut upkeep, paths)),
+        "CONTROL: while it stands it is not said again"
+    );
+    // A person's new token changes what the upkeep is kept for.
+    let admin = client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, TOKEN, b"github_pat_fixture_again")
+        .unwrap();
+    client::admin_publish(paths, &admin, &doc).expect("a person's new token");
+    assert!(
+        said(look(&mut upkeep, paths)),
+        "a refusal after the entries changed is said again"
+    );
+    assert!(
+        !said(look(&mut upkeep, paths)),
+        "CONTROL: while it stands it is not said again"
+    );
+}
+
+/// The upkeep's catalog is held to 64 KiB at any fill. A catalog over it is refused by the
+/// vault text's door, in words that name the entry, its size and the limit, in a log that is
+/// all but empty; one that the door takes and whose `Put` record is over 64 KiB is refused by
+/// the log's fill, in words that name the writer, the size and the limit. Either way the upkeep
+/// signs and publishes nothing, retires the candidate, waits a look (15 minutes, not the 60 s
+/// of a retry) and says the refusal once. When the provider's listing is lean again the catalog
+/// is published and the log says so.
+///
+/// CONTROL, in the test: a lean catalog of 80 repositories, more than the lab lists, is under
+/// 32 KiB and is published by the same upkeep.
+#[test]
+fn vault_fill_size_limit_retires_a_repository_catalog_over_64_kib_and_waits_a_look() {
+    const LIMIT: usize = 64 * 1024;
+    let lab = published_lab();
+    let paths = &lab.paths[0];
+    let mut upkeep = Upkeep::default();
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&fetches);
+    upkeep.fetch = Arc::new(move |input: Input, _| {
+        let at = counted.fetch_add(1, Ordering::SeqCst);
+        Ok(match at {
+            0 | 1 => listed(input, &large(at)),
+            2 => {
+                // A catalog a few bytes under the limit: the door takes its value, and the
+                // `Put` record that seals it, a few hundred bytes more, is over the limit.
+                let size = |rows: &[Value]| {
+                    let again = Input {
+                        binding: input.binding.clone(),
+                        catalog: input.catalog.clone(),
+                        token: SecretBytes::from(b"unused".as_slice()),
+                    };
+                    listed(again, rows).bytes.len()
+                };
+                let with = |repositories: u64, name: &str| {
+                    let mut rows = lean(repositories, at);
+                    rows.push(repository(9_000, name));
+                    rows
+                };
+                // As many lean rows as fit, then one whose name fills what is left: each
+                // character of a name is in its row three times.
+                let row = size(&with(201, "p")) - size(&with(200, "p"));
+                let fit = 200 + (LIMIT - 40 - size(&with(200, "p"))) / row;
+                let fit = u64::try_from(fit).unwrap();
+                let left = LIMIT - 40 - size(&with(fit, "p"));
+                let rows = with(fit, &"p".repeat(1 + left / 3));
+                listed(input, &rows)
+            }
+            _ => listed(input, &lean(80, at)),
+        })
+    });
+
+    let (seq, bytes) = (client::admin_open(paths).unwrap().seq(), held(paths));
+    assert!(bytes < LIMIT, "CONTROL: the log is all but empty: {bytes}");
+    let refusal = look(&mut upkeep, paths).expect_err("a 380 KiB catalog");
+    assert!(
+        refusal.starts_with(
+            "private repository catalog was not refreshed: `github-repositories.json` was not \
+             set: the value it would take is 3"
+        ) && refusal
+            .contains(" KiB, and a fleet configuration value over 64 KiB is not set or changed")
+            && refusal.ends_with("; it is looked at again every 15 minutes"),
+        "{refusal}"
+    );
+    assert!(
+        !refusal.contains("code-"),
+        "no repository's name: {refusal}"
+    );
+    assert_eq!(held(paths), bytes, "nothing is signed");
+    assert_eq!(
+        client::admin_open(paths).unwrap().seq(),
+        seq,
+        "and no version published"
+    );
+    assert_waits_a_look(&upkeep);
+    assert_eq!(
+        look(&mut upkeep, paths),
+        Ok(0),
+        "a second refusal is not said again"
+    );
+    assert_waits_a_look(&upkeep);
+
+    // A value the door takes whose record is over the limit: the fill's refusal, by the
+    // writer's name. A publication did not end the first refusal, so the step says nothing;
+    // `publish` says it.
+    let admin = client::admin_open(paths).unwrap();
+    let input = Input::capture(paths, &admin).unwrap();
+    let near = (upkeep.fetch)(input, Arc::new(AtomicBool::new(false))).unwrap();
+    assert!(
+        near.bytes.len() <= LIMIT && near.bytes.len() > LIMIT - 200,
+        "CONTROL: the door takes the value: {}",
+        near.bytes.len()
+    );
+    let Err(Unpublished::Refused(refusal)) = publish(paths, &admin, near, far()) else {
+        panic!("a Put over the limit is refused by the fill");
+    };
+    assert!(
+        refusal.starts_with(
+            "the repository inventory upkeep's write was not signed: one Put of it is 64"
+        ) && refusal.ends_with(
+            " KiB, and an automatic writer signs no Put over 64 KiB, at any fill of the vault log"
+        ),
+        "{refusal}"
+    );
+    assert_eq!(held(paths), bytes, "nothing is signed");
+
+    // The listing is lean again: 80 repositories, published, and the log says the refusal
+    // ended.
+    let (published, logged) = logged_on_this_thread(|| look(&mut upkeep, paths));
+    assert_eq!(published, Ok(1), "CONTROL: a lean catalog is published");
+    assert!(
+        logged.iter().any(|line| line
+            .ends_with("private repository catalog is refreshed again: the vault takes it")),
+        "{logged:?}"
+    );
+    let catalog = client::admin_open(paths)
+        .unwrap()
+        .published_entry(&Audience::Everyone, NAME)
+        .unwrap()
+        .value
+        .as_slice()
+        .len();
+    assert!(
+        (16 * 1024..32 * 1024).contains(&catalog),
+        "CONTROL: a lean catalog of 80 repositories is far under the limit: {catalog}"
+    );
+    assert_eq!(fetches.load(Ordering::SeqCst), 4);
 }

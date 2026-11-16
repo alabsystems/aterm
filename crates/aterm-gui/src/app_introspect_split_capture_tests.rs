@@ -81,7 +81,7 @@ fn a_split_paints_a_streak_anchored_in_the_pane_that_produced_it() {
         let sid = app.split_active_stub_tab(wid);
         app.recompute_sparkle();
         {
-            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut ws = app.windows.get_mut(&wid).expect("window");
             ws.focused = true;
         }
         app.capture_words(wid, t0);
@@ -122,7 +122,7 @@ fn a_capture_carries_the_output_streak_and_an_off_config_carries_none() {
         });
         let wid = WindowId(0);
         {
-            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut ws = app.windows.get_mut(&wid).expect("window");
             ws.focused = true;
         }
         let term = app
@@ -156,7 +156,7 @@ fn split_capture_splices_decorations() {
     let sid = app.split_active_stub_tab(wid);
     app.recompute_sparkle();
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = true;
     }
     app.capture_words(wid, t0);

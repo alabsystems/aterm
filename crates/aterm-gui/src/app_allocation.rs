@@ -68,22 +68,26 @@ impl App {
                     .stage_allocation_tab(wid)
                     .map_err(|error| format!("Allocation could not open: {error:?}"))?,
             };
-            let window = self
+            let mut route_guard_window = self
                 .windows
                 .get_mut(&wid)
                 .ok_or("Allocation window closed")?;
+            let window = &mut **route_guard_window;
             window.tab_set.switch_to(tab);
             if let Some(tab) = window.tab_set.active_mut() {
                 tab.set_focus(view);
             }
+            drop(route_guard_window);
             self.resync_active_or_window(wid);
         }
-        let window = self
+        let mut route_guard_window = self
             .windows
             .get_mut(&wid)
             .ok_or("Allocation window closed")?;
+        let window = &mut **route_guard_window;
         crate::app_tabs::cancel_pending_close(window);
         window.last_present = None;
+        drop(route_guard_window);
         self.publish_allocation();
         self.sync_active_session();
         Ok(())

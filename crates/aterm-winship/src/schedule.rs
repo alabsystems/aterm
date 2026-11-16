@@ -1,29 +1,90 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `schedule`: a per-user Scheduled Task that runs `update` once a day.
+//! `schedule`: two per-user Scheduled Tasks, [`Task::Update`] running `update` once a day
+//! and [`Task::Serve`] running `release-serve --once` every ten minutes.
 //!
-//! The task is registered with `schtasks.exe /Create /XML` for the calling
+//! Each task is registered with `schtasks.exe /Create /XML` for the calling
 //! account, at the least privilege: no administrator is asked. The XML says
 //! what `schtasks`' flags cannot: the task starts on battery, is not stopped
 //! when the PC goes on battery, and a start missed while the PC slept or was
-//! off runs once it is back ([`CONDITIONS`]). It does not wake the PC.
+//! off runs once it is back ([`CONDITIONS`]); a start while a run of it is
+//! still going is passed over, so each runs once at a time. It does not wake
+//! the PC.
 //!
-//! The task runs a copy of this tool kept beside the build tree, so cleaning a
-//! cargo target directory does not break it, names the repository by its
-//! absolute path, so it does not depend on where it was started or built, and
-//! runs under `conhost.exe --headless`, so a build puts no console window on
+//! The tasks run a copy of this tool kept beside the build tree, so cleaning a
+//! cargo target directory does not break them, name the repository by its
+//! absolute path, so they do not depend on where they were started or built,
+//! and run under `conhost.exe --headless`, so a build puts no console window on
 //! the desktop.
 
 use std::path::Path;
 
-/// The task's name.
+/// The daily update task's name.
 pub const TASK: &str = "aterm-winship-update";
-/// When the task runs when `--daily` names no time.
+/// The release-serve task's name.
+pub const SERVE_TASK: &str = "aterm-winship-release-serve";
+/// How often the release-serve task starts, as Task Scheduler writes a duration.
+pub const SERVE_EVERY: &str = "PT10M";
+/// When the update task runs when `--daily` names no time.
 pub const DEFAULT_TIME: &str = "04:30";
-/// What the registered task does, for the person who registered it.
+/// What a registered task does, for the person who registered it.
 pub const CONDITIONS: &str = "runs while you are logged on, on battery too, is not stopped when the PC goes on battery, \
      and a start missed while the PC slept or was off runs once it is back (the PC is not woken for it)";
+
+/// One of the two tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Task {
+    /// `update --log`, daily.
+    Update,
+    /// `release-serve --once --log`, every [`SERVE_EVERY`].
+    Serve,
+}
+
+impl Task {
+    /// Both tasks, in the order they are registered.
+    pub const ALL: [Self; 2] = [Self::Update, Self::Serve];
+
+    /// Its name in Task Scheduler.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Update => TASK,
+            Self::Serve => SERVE_TASK,
+        }
+    }
+
+    /// The verb and flags it runs the kept tool with, before `--repo`.
+    #[must_use]
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Update => "update --log",
+            Self::Serve => "release-serve --once --log",
+        }
+    }
+
+    /// When it runs, for the person who registers it.
+    #[must_use]
+    pub const fn when(self) -> &'static str {
+        match self {
+            Self::Update => "daily",
+            Self::Serve => "every 10 minutes",
+        }
+    }
+
+    /// What it does, as its description in Task Scheduler.
+    #[must_use]
+    pub const fn what(self) -> &'static str {
+        match self {
+            Self::Update => {
+                "Builds, smokes and stages aterm's origin/main once a day (aterm-winship update --log)."
+            }
+            Self::Serve => {
+                "Builds, signs and hands off the Windows zip a release cut asks for through the dev repository, every ten minutes (aterm-winship release-serve --once --log)."
+            }
+        }
+    }
+}
 
 /// A `--daily` time: `HH:MM`, 24-hour.
 ///
@@ -48,7 +109,13 @@ fn minute_of_day(text: &str) -> Result<u64, String> {
     }
 }
 
-/// The task's first start, `YYYY-MM-DDTHH:MM:00` on the local clock: the next
+fn local_text(secs: u64) -> String {
+    crate::pointer::rfc3339(secs)
+        .trim_end_matches('Z')
+        .to_string()
+}
+
+/// The update task's first start, `YYYY-MM-DDTHH:MM:00` on the local clock: the next
 /// `at` after `local_now` (seconds since the epoch, shifted to the local
 /// clock). Never a time already past: a task that starts when a start was
 /// missed would take a boundary in the past as one, and build the moment it
@@ -65,9 +132,14 @@ pub fn start_boundary(local_now: u64, at: &str) -> Result<String, String> {
     } else {
         midnight + DAY + at
     };
-    Ok(crate::pointer::rfc3339(start)
-        .trim_end_matches('Z')
-        .to_string())
+    Ok(local_text(start))
+}
+
+/// The serve task's first start on the local clock: the start of the second whole minute after
+/// `local_now`, never already past when Task Scheduler reads it.
+#[must_use]
+pub fn soon_boundary(local_now: u64) -> String {
+    local_text((local_now / 60 + 2) * 60)
 }
 
 /// `text` as one argument of a Windows command line, by the rule the C runtime
@@ -87,20 +159,21 @@ pub fn quoted(text: &str) -> Result<String, String> {
     Ok(format!("\"{text}{}\"", "\\".repeat(tail)))
 }
 
-/// The arguments `conhost.exe` is started with: `--headless`, then the kept
-/// tool's `update --log --repo <repo>`.
+/// The arguments `conhost.exe` is started with for `task`: `--headless`, then the kept
+/// tool's [`Task::verb`] and `--repo <repo>`.
 ///
 /// # Errors
 /// A path holds a double quote, or `repo` is not absolute (the task starts in
 /// the system directory, where a relative path names nothing).
-pub fn arguments(tool: &Path, repo: &Path) -> Result<String, String> {
+pub fn arguments(task: Task, tool: &Path, repo: &Path) -> Result<String, String> {
     let repo = repo.to_string_lossy();
     if !windows_absolute(&repo) {
         return Err(format!("the repository {repo} is not an absolute path"));
     }
     Ok(format!(
-        "--headless {} update --log --repo {}",
+        "--headless {} {} --repo {}",
         quoted(&tool.to_string_lossy())?,
+        task.verb(),
         quoted(&repo)?
     ))
 }
@@ -128,21 +201,48 @@ fn xml_text(text: &str) -> String {
     out
 }
 
-/// The task as Task Scheduler's XML: started daily from `start`
-/// ([`start_boundary`]), for `user` (`DOMAIN\name`; the caller when `None`) at
-/// the least privilege with the token of their logon, running `host`
+/// The task's trigger from `start`: daily for [`Task::Update`]; every [`SERVE_EVERY`], with
+/// no end, for [`Task::Serve`].
+fn trigger(task: Task, start: &str) -> String {
+    match task {
+        Task::Update => format!(
+            "    <CalendarTrigger>
+      <StartBoundary>{start}</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>"
+        ),
+        Task::Serve => format!(
+            "    <TimeTrigger>
+      <Repetition>
+        <Interval>{SERVE_EVERY}</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>{start}</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>"
+        ),
+    }
+}
+
+/// `task` as Task Scheduler's XML: started from `start` ([`start_boundary`] for the update,
+/// [`soon_boundary`] for the serve task) on its trigger, for `user` (`DOMAIN\name`; the
+/// caller when `None`) at the least privilege with the token of their logon, running `host`
 /// (`conhost.exe`) with [`arguments`].
 ///
 /// # Errors
 /// What [`arguments`] refuses.
 pub fn task_xml(
+    task: Task,
     host: &Path,
     tool: &Path,
     repo: &Path,
     start: &str,
     user: Option<&str>,
 ) -> Result<String, String> {
-    let arguments = arguments(tool, repo)?;
+    let arguments = arguments(task, tool, repo)?;
     let user = user.map_or_else(String::new, |user| {
         format!("\n      <UserId>{}</UserId>", xml_text(user))
     });
@@ -150,16 +250,10 @@ pub fn task_xml(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Builds, smokes and stages aterm's origin/main once a day (aterm-winship update --log).</Description>
+    <Description>{}</Description>
   </RegistrationInfo>
   <Triggers>
-    <CalendarTrigger>
-      <StartBoundary>{start}</StartBoundary>
-      <Enabled>true</Enabled>
-      <ScheduleByDay>
-        <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
-    </CalendarTrigger>
+{}
   </Triggers>
   <Principals>
     <Principal id="Author">{user}
@@ -194,6 +288,8 @@ pub fn task_xml(
   </Actions>
 </Task>
 "#,
+        xml_text(task.what()),
+        trigger(task, start),
         xml_text(&host.to_string_lossy()),
         xml_text(&arguments),
     ))
@@ -209,21 +305,29 @@ pub fn utf16(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// `schtasks.exe`'s arguments that register the task from the XML file `xml`
+/// `schtasks.exe`'s arguments that register `task` from the XML file `xml`
 /// (replacing one of its name).
 #[must_use]
-pub fn create_args(xml: &Path) -> Vec<String> {
-    let mut args = ["/Create", "/F", "/TN", TASK, "/XML"]
+pub fn create_args(task: Task, xml: &Path) -> Vec<String> {
+    let mut args = ["/Create", "/F", "/TN", task.name(), "/XML"]
         .map(String::from)
         .to_vec();
     args.push(xml.to_string_lossy().into_owned());
     args
 }
 
-/// `schtasks.exe`'s arguments that remove the task.
+/// `schtasks.exe`'s arguments that ask whether `task` is registered.
 #[must_use]
-pub fn delete_args() -> Vec<String> {
-    ["/Delete", "/F", "/TN", TASK].map(String::from).to_vec()
+pub fn query_args(task: Task) -> Vec<String> {
+    ["/Query", "/TN", task.name()].map(String::from).to_vec()
+}
+
+/// `schtasks.exe`'s arguments that remove `task`.
+#[must_use]
+pub fn delete_args(task: Task) -> Vec<String> {
+    ["/Delete", "/F", "/TN", task.name()]
+        .map(String::from)
+        .to_vec()
 }
 
 /// The command line as a person would type it at `cmd.exe`, for `--dry-run`.

@@ -913,11 +913,28 @@ fn run_launchctl(sys: &dyn System, args: Vec<String>) -> Result<Ran, String> {
     sys.run(&cmd).map_err(|e| format!("{}: {e}", cmd.display()))
 }
 
-/// (Re)start the system job `label` that `plist_path` defines: `bootout` where it is loaded (one
-/// not loaded is no error), then `enable`, `bootstrap` and `kickstart`.
+/// `launchctl enable system/<label>`: clear a switch-off launchd holds for the job, so the
+/// explicit baseline that wants it on ([`VaultServer`]) can start it.
 ///
 /// # Errors
-/// The first `launchctl` call that failed, in one line.
+/// The `launchctl` call failed, in one line.
+fn enable_system_job(sys: &dyn System, label: &str) -> Result<(), String> {
+    let enable = run_launchctl(sys, vec!["enable".into(), format!("system/{label}")])?;
+    if !enable.success() {
+        return Err(format!(
+            "launchctl enable system/{label}: {}",
+            enable.describe()
+        ));
+    }
+    Ok(())
+}
+
+/// (Re)start the system job `label` that `plist_path` defines: `bootout` where it is loaded (one
+/// not loaded is no error), then `bootstrap` and `kickstart`. It never runs `launchctl enable`: a
+/// job launchd lists switched off stays so, and launchd refuses its `bootstrap` in its own words.
+///
+/// # Errors
+/// The first `launchctl` call that failed, with launchd's reason, in one line.
 pub(crate) fn start_system_job(
     sys: &dyn System,
     plist_path: &Path,
@@ -937,13 +954,6 @@ pub(crate) fn start_system_job(
                 ran.describe()
             ));
         }
-    }
-    let enable = run_launchctl(sys, vec!["enable".into(), format!("system/{label}")])?;
-    if !enable.success() {
-        return Err(format!(
-            "launchctl enable system/{label}: {}",
-            enable.describe()
-        ));
     }
     let bootstrap = run_launchctl(
         sys,
@@ -1144,6 +1154,7 @@ impl Item for VaultServer {
             .map_err(|e| format!("{}: {e}", plist_path.display()))?;
         sys.chown(plist_path, 0, 0)
             .map_err(|e| format!("chown {}: {e}", plist_path.display()))?;
+        enable_system_job(sys, label)?;
         start_system_job(sys, plist_path, label)
     }
 

@@ -14,7 +14,7 @@ fn a_reduced_motion_resident_keeps_full_body_cursor_home_and_no_frame_debt() {
         rows: 30,
         cols: 80,
     };
-    let ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
+    let mut ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
     let start = Instant::now();
     let mut tick = 0;
     for caret_col in [12_u16, 60] {
@@ -24,7 +24,7 @@ fn a_reduced_motion_resident_keeps_full_body_cursor_home_and_no_frame_debt() {
             let now = start + Duration::from_millis(tick * 16);
             tick += 1;
             let pet = crate::app_render::pet_owner_tick_for_test(
-                ws,
+                &mut ws,
                 CaptureMode::Present,
                 PetSense {
                     caret_drawn: true,
@@ -58,7 +58,7 @@ fn a_reduced_motion_resident_keeps_full_body_cursor_home_and_no_frame_debt() {
             ws.fx.open_words();
             let head = ws.fx.companions_mut().cursor_cat.static_frame(now);
             let fp = super::emit_single_cursor_companion(
-                ws,
+                &mut ws,
                 geom,
                 Some(caret),
                 &pet,

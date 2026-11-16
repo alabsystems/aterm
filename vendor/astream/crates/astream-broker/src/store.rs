@@ -7538,7 +7538,7 @@ impl BrokerLog {
     /// ([`set_producer_lineage`](Self::set_producer_lineage)), under a predecessor's id at the same
     /// sequence. A relayed record keeps its origin's key on every broker and a will its own
     /// producer's, so neither asks this.
-    fn produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
+    pub(crate) fn produced_dup(&self, producer_id: u64, producer_seq: u64) -> Option<Offset> {
         self.continued(producer_id, producer_seq, true)
     }
 

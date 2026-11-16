@@ -524,6 +524,7 @@ pub fn put_entry(
             // A put stands over whatever the entry holds: each value a write puts takes an
             // entry of its own, so nothing newer is ever replaced.
             read_as: None,
+            settles: None,
         };
         return match super::member_write(
             paths,

@@ -335,6 +335,79 @@ fn a_log_whose_every_failure_carries_the_sentinel_is_the_machines() {
     );
 }
 
+/// A passing fixture's nested verifier event and a quoted should-panic echo do not
+/// become reasons for the seven actual Chromium refusals. A real finding beside a
+/// refusal remains a finding even when the same nested event appears in its transcript.
+#[test]
+fn a_refusal_detail_only_names_the_failed_blocks_standalone_reasons() {
+    let why = "no pinned chrome-headless-shell";
+    let chrome = refused(why);
+    let echoed = format!("{chrome}\npanic message: \"{COULD_NOT_RUN_SENTINEL} — {why}\"\n");
+    let fixture_event = format!(
+        "verify-event: {}\n",
+        aterm_json::json!({
+            "event": "test-case-failed",
+            "output": format!("{COULD_NOT_RUN_SENTINEL} — no fish\n"),
+            "sample_complete": false,
+            "test": "timed-cases",
+        })
+    );
+    let run = |output| crate::exec::Run {
+        case_observations: None,
+        stopped_at: None,
+        hung: None,
+        ok: false,
+        output,
+        code: Some(101),
+        spawn_error: None,
+        usage: None,
+    };
+    let refused_log = failed_binary(
+        "chromium",
+        &[
+            ("chrome_a", &chrome),
+            ("chrome_b", &chrome),
+            ("chrome_c", &chrome),
+            ("chrome_d", &echoed),
+            ("chrome_e", &chrome),
+            ("chrome_f", &chrome),
+            ("chrome_g", &chrome),
+        ],
+    )
+    .replacen("running 3 tests\n", "running 8 tests\n", 1);
+    let log = format!("{fixture_event}{refused_log}");
+    assert_eq!(
+        environment_refusals(&log),
+        Some(
+            (b'a'..=b'g')
+                .map(|c| format!("chrome_{}", char::from(c)))
+                .collect()
+        )
+    );
+    assert_eq!(
+        run(log).environment_failure().as_deref(),
+        Some(
+            "every failing test refused the machine, not the tree (chrome_a, chrome_b, chrome_c, chrome_d and 3 more) — no pinned chrome-headless-shell"
+        )
+    );
+
+    let mixed = failed_binary(
+        "mixed",
+        &[
+            ("refuses", &chrome),
+            (
+                "finds",
+                "thread 'finds' panicked at x.rs:1:1:\nassertion failed: ready()",
+            ),
+        ],
+    );
+    assert_eq!(
+        run(format!("{fixture_event}{mixed}")).environment_failure(),
+        None,
+        "the diagnostic change must not launder a real assertion failure"
+    );
+}
+
 /// A test that re-runs itself alone in a child (aterm-render's
 /// `alone::in_own_process`) re-raises the child's refusal with the child's
 /// why on its own sentinel line and the child's stderr below it: one

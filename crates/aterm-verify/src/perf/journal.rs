@@ -71,7 +71,7 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
             String::from_utf8_lossy(&built.stderr)
         )));
     }
-    let executable = bench_build::built_executable(
+    let executable = super::driver::built_executable(
         &String::from_utf8_lossy(&built.stdout),
         "journal_note",
         "test",

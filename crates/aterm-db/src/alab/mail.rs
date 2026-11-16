@@ -27,7 +27,7 @@ use super::{
 use crate::{
     Result,
     typed::{
-        cell::{Projection, Row},
+        cell::{self, Projection, Row},
         keys,
         secret::{Cell, Secret, Store, entry_of},
     },
@@ -362,16 +362,9 @@ fn mailbox_of(addresses: &Projection, pk: &str, row: &Row) -> Option<Mailbox> {
         .map(str::to_ascii_lowercase)
         .collect();
     let mut any = false;
-    for domain in row
-        .fields
-        .get("receives_domains")
-        .filter(|field| !field.conflicted())
-        .and_then(|field| field.value())
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
+    // Only a settled domain routes: a conflicted list routes none, and a text set's element some
+    // write removed while another added it is no route (LT-15B).
+    for domain in cell::settled_texts(row.fields.get("receives_domains")) {
         if domain == "*" {
             any = true;
         } else {

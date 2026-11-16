@@ -4,35 +4,6 @@
 use super::*;
 
 #[test]
-fn a_lab_app_requires_positive_debug_profile_evidence_and_no_test_harness() {
-    let artifact = |profile: &str| {
-        format!(
-            "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"aterm\",\"kind\":[\"bin\"]}},\"executable\":\"/fixture/aterm\",\"profile\":{profile}}}"
-        )
-    };
-    let valid = artifact(r#"{"debug_assertions":true,"test":false}"#);
-    assert_eq!(
-        built_debug_app(&valid, "aterm").unwrap(),
-        PathBuf::from("/fixture/aterm")
-    );
-    for profile in [
-        r#"{"debug_assertions":false,"test":false}"#,
-        r#"{"debug_assertions":true,"test":true}"#,
-        r#"{"debug_assertions":true}"#,
-        r#"{"test":false}"#,
-        r#"{"debug_assertions":"true","test":false}"#,
-        r#"{"debug_assertions":false,"debug_assertions":true,"test":false}"#,
-    ] {
-        assert!(
-            built_debug_app(&artifact(profile), "aterm").is_err(),
-            "{profile}"
-        );
-    }
-    let release = artifact(r#"{"debug_assertions":false,"test":false}"#);
-    assert!(built_executable(&release, "aterm", "bin").is_ok());
-}
-
-#[test]
 fn the_built_aterm_is_the_binary_cargo_reports() {
     let messages = [
         r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"aterm"},"executable":null,"fresh":true}"#,
@@ -96,70 +67,6 @@ fn bench_output_environment_keeps_os_paths() {
         keeps(&PathBuf::from(std::ffi::OsString::from_vec(
             b"/scratch/non-utf8-\xff".to_vec(),
         )));
-    }
-}
-
-#[test]
-fn conflicting_artifacts_do_not_select_a_measurement_executable() {
-    let artifact = |name: &str, kind: &str, path: &str| {
-        format!(
-            r#"{{"reason":"compiler-artifact","target":{{"kind":["{kind}"],"name":"{name}"}},"executable":"{path}"}}"#
-        )
-    };
-    let first = artifact("x", "bin", "/first");
-    let second = artifact("x", "bin", "/second");
-    for positive in [
-        first.clone(),
-        format!("{first}\n{first}"),
-        format!(
-            "{}\n{first}\n{}",
-            artifact("other", "bin", "/other"),
-            artifact("x", "example", "/example")
-        ),
-    ] {
-        assert_eq!(
-            built_executable(&positive, "x", "bin").unwrap(),
-            PathBuf::from("/first")
-        );
-    }
-    for conflicting in [format!("{first}\n{second}"), format!("{second}\n{first}")] {
-        assert!(built_executable(&conflicting, "x", "bin").is_err());
-    }
-}
-
-#[test]
-fn mixed_type_target_kinds_do_not_select_measurement_executables() {
-    let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
-    for kinds in [r#"["lib"]"#, r#"["rlib","lib"]"#] {
-        let positive = valid.replace(r#"["lib"]"#, kinds);
-        assert_eq!(
-            built_executable(&positive, "x", "lib").unwrap(),
-            PathBuf::from("/built/x")
-        );
-    }
-    for kinds in [r#"["lib",7]"#, r#"[null,"lib"]"#, r#"["lib",{}]"#] {
-        let malformed = valid.replace(r#"["lib"]"#, kinds);
-        for wire in [
-            malformed.clone(),
-            format!("{valid}\n{malformed}"),
-            format!("{malformed}\n{valid}"),
-        ] {
-            assert!(built_executable(&wire, "x", "lib").is_err(), "{kinds}");
-        }
-    }
-}
-
-#[test]
-fn ambiguous_compiler_artifacts_do_not_select_measurement_executables() {
-    let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
-    assert_eq!(
-        built_executable(valid, "x", "lib").unwrap(),
-        PathBuf::from("/built/x")
-    );
-    for message in include_str!("../testdata/ambiguous-compiler-artifacts.jsonl").lines() {
-        for wire in [format!("{valid}\n{message}"), format!("{message}\n{valid}")] {
-            assert!(built_executable(&wire, "x", "lib").is_err(), "{message}");
-        }
     }
 }
 

@@ -129,6 +129,9 @@ impl Anchor {
 pub struct TrustedRoster {
     roster: Roster,
     now_unix: i64,
+    /// The roster's published bytes and the master's signature over them, kept so a build
+    /// this roster authorized can be verified again later ([`verify_kept_pkg`]).
+    published: (Vec<u8>, Vec<u8>),
 }
 
 /// Steps 1–7: verify the roster's exact bytes under the pinned master, parse it only from `VerifiedRoster`, and admit it against the replay floor and its freshness window.
@@ -144,12 +147,52 @@ pub fn admit_roster(
     if !anchor.is_armed() {
         return Err(Reject::Disabled);
     }
-    let verified: VerifiedRoster = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
+    let verified: VerifiedRoster =
+        verify_roster(&anchor.keys(), raw.clone(), sig).map_err(from_roster)?;
     let roster = Roster::parse(&verified).map_err(from_roster)?;
     roster
         .admit(anchor.roster_floor, now_unix)
         .map_err(from_roster)?;
-    Ok(TrustedRoster { roster, now_unix })
+    Ok(TrustedRoster {
+        roster,
+        now_unix,
+        published: (raw, sig.to_vec()),
+    })
+}
+
+/// A roster's bytes that verify under `anchor`'s masters, parsed, with no freshness or floor
+/// judged: what a kept record ([`verify_kept_pkg`]) and a revocation read need.
+///
+/// # Errors
+/// An unarmed anchor, a signature no master made, or bytes that do not parse.
+pub fn signed_roster(anchor: &Anchor, raw: Vec<u8>, sig: &[u8]) -> Result<Roster, Reject> {
+    if !anchor.is_armed() {
+        return Err(Reject::Disabled);
+    }
+    let verified = verify_roster(&anchor.keys(), raw, sig).map_err(from_roster)?;
+    Roster::parse(&verified).map_err(from_roster)
+}
+
+/// Verify a package manifest kept beside an installed build: its roster pair verifies under
+/// `anchor`'s masters, and a machine of that roster that neither it nor `revoked` (the
+/// deny-lists of the rosters this machine has seen since) withdrew signed the manifest. The
+/// roster's freshness and the machine's `not_after` were judged at install
+/// ([`Roster::authorize_kept`]); judging them again now would drop every record on a machine
+/// that has been offline.
+///
+/// # Errors
+/// As [`signed_roster`], then [`Reject::Revoked`] or [`Reject::Verify`].
+pub fn verify_kept_pkg(
+    anchor: &Anchor,
+    (roster_raw, roster_sig): (Vec<u8>, &[u8]),
+    (raw, sig): (Vec<u8>, &[u8]),
+    revoked: &[String],
+) -> Result<VerifiedBytes, Reject> {
+    let roster = signed_roster(anchor, roster_raw, roster_sig)?;
+    roster
+        .authorize_kept(&raw, sig, revoked)
+        .map_err(from_roster)?;
+    Ok(VerifiedBytes(raw))
 }
 
 impl TrustedRoster {
@@ -235,6 +278,12 @@ impl TrustedIndex {
     #[must_use]
     pub fn authorizing_seq(&self) -> u64 {
         self.index.roster_seq.unwrap_or(0)
+    }
+
+    /// The authorizing roster's published bytes and master signature.
+    #[must_use]
+    pub fn roster_pair(&self) -> (&[u8], &[u8]) {
+        (&self.roster.published.0, &self.roster.published.1)
     }
 
     /// Verify a `pkg-<program>-<build>.toml`'s raw bytes under the roster generation that authorized this index.

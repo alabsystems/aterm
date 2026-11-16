@@ -11,9 +11,14 @@
 //! the loaded root process's designated requirement before swapping it over
 //! [`aterm_uds::lan::IMAGE_BUNDLE`] (removing the image it replaced), writes
 //! [`aterm_uds::lan::PLIST_PATH`] (`0644 root:wheel`, [`aterm_uds::lan::install::plist_text`]),
-//! and (re)starts the job with `launchctl bootout`/`enable`/`bootstrap`/`kickstart`, as
-//! [`super::aterm`]'s vault server does. launchd runs only the clone, never the person-owned
-//! bundle.
+//! and (re)starts the job with `launchctl bootout`/`bootstrap`/`kickstart`
+//! ([`super::aterm::start_system_job`], which [`super::aterm`]'s vault server starts its job with
+//! too, after the `launchctl enable` its own baseline asks for). launchd runs only the clone,
+//! never the person-owned bundle.
+//!
+//! A job launchd lists switched off ([`switched_off`]: its background item turned off in Login
+//! Items, or `launchctl disable`) is the person's: the item does not apply to it, and nothing here
+//! runs `launchctl enable`, so no run undoes that choice. Putting it back is theirs.
 //!
 //! The clone is APFS `clonefile(2)`: `/Applications` and `/Library` are one volume, so it takes
 //! no space. An app kept on another volume cannot be cloned there (`EXDEV`), and Apple's
@@ -153,6 +158,8 @@ enum StageError {
     Check(CheckError),
     SourceChanged,
     Lost(String),
+    /// launchd lists the job switched off ([`switched_off`]), so it is not launched.
+    SwitchedOff,
 }
 
 impl std::fmt::Display for StageError {
@@ -162,6 +169,7 @@ impl std::fmt::Display for StageError {
             Self::Check(error) => error.fmt(f),
             Self::SourceChanged => f.write_str("the source changed before image publication"),
             Self::Lost(why) => f.write_str(why),
+            Self::SwitchedOff => lan::Unavailable::SwitchedOff.fmt(f),
         }
     }
 }
@@ -353,6 +361,11 @@ impl<'a> Installing<'a> {
             Readiness::Start | Readiness::Pending(_) => {
                 current().map_err(StageError::Lost)?;
                 published.check(sys)?;
+                // The probe read no switch-off; a person may switch it off while this run holds
+                // root.
+                if switched_off(sys) == Ok(true) {
+                    return Err(StageError::SwitchedOff);
+                }
                 match super::aterm::start_system_job(sys, Path::new(lan::PLIST_PATH), lan::LABEL) {
                     Ok(()) => {
                         self.launched = true;
@@ -378,7 +391,8 @@ impl<'a> Installing<'a> {
         match error {
             StageError::Check(CheckError::Refused(_))
             | StageError::Files(app_image::Error::Refused(_))
-            | StageError::Lost(_) => false,
+            | StageError::Lost(_)
+            | StageError::SwitchedOff => false,
             StageError::Check(CheckError::Unanswered(_)) => true,
             StageError::Check(CheckError::Unchecked(_))
             | StageError::Files(app_image::Error::Io(_))
@@ -409,13 +423,42 @@ fn readiness(sys: &dyn System) -> Readiness {
 }
 
 /// Full effect-boundary readiness for a root result that otherwise looks short.
-/// The GUI's ordinary `reading` remains metadata-only.
+/// The GUI's ordinary `reading` remains metadata-only. A job launchd lists switched off is the
+/// person's, and leaves nothing for the result to wait on.
 pub(crate) fn ready(sys: &dyn System) -> Result<bool, String> {
     let Some(files) = reading(sys) else {
         return Ok(true);
     };
-    Ok(files?.current() && matches!(readiness(sys), Readiness::Ready(_)))
+    Ok(
+        (files?.current() && matches!(readiness(sys), Readiness::Ready(_)))
+            || switched_off(sys) == Ok(true),
+    )
 }
+
+/// Whether launchd lists the broker's job switched off (`launchctl print-disabled system`,
+/// [`aterm_uds::launchd::job_switch_in`]): its background item turned off in Login Items, or
+/// `launchctl disable`. That choice is the person's, and stays theirs. A job with no row is not
+/// switched off: the broker's plist sets no `Disabled` key.
+///
+/// # Errors
+/// `launchctl` could not be asked, failed, or printed no readable switch for the job, in one
+/// line.
+pub(crate) fn switched_off(sys: &dyn System) -> Result<bool, String> {
+    use aterm_uds::launchd::{JobSwitch, job_switch_in};
+    let cmd = super::person::print_disabled_cmd();
+    match sys.run(&cmd) {
+        Ok(ran) if ran.success() => job_switch_in(&ran.out(), lan::LABEL)
+            .map(|switch| switch == JobSwitch::Off)
+            .map_err(|why| format!("{}: {why}", cmd.display())),
+        Ok(ran) => Err(format!("{}: {}", cmd.display(), ran.describe())),
+        Err(e) => Err(format!("{}: {e}", cmd.display())),
+    }
+}
+
+/// The most rounds one root run makes to publish, launch and reach the broker before it gives up
+/// with the last round's reason (launchd's own words where launchd refused the job): with
+/// [`aterm_secrets::converge::RunnerRetry`]'s pauses between them, about two and a half minutes.
+const ROUNDS: u32 = 6;
 
 impl LanBroker {
     fn note(&self, why: Option<crate::init_clt::Unfinished>) {
@@ -427,8 +470,9 @@ impl LanBroker {
 
     /// Keep the authenticated root process through publication and strict readiness.
     /// Launch and protocol I/O retain their existing per-call deadlines. The retry rate is
-    /// capped, with no total wait limit.
-    /// Stop or lost custody ends the transaction.
+    /// capped, and at most [`ROUNDS`] rounds run: a launch launchd still refuses, or a broker
+    /// still not serving, then ends the transaction with that round's reason.
+    /// Stop, lost custody or a job switched off ends the transaction.
     fn apply_owned(&self, sys: &dyn System, source: &Path) -> Result<(), String> {
         use aterm_secrets::converge::{Last, RunnerRetry};
         let pid = std::process::id();
@@ -452,6 +496,7 @@ impl LanBroker {
         let mut retry = RunnerRetry::default();
         let clock = std::time::Instant::now();
         let mut said = None;
+        let mut rounds = 0_u32;
         loop {
             let why = match installing.round(self, sys, source, &current) {
                 Ok(None) => return Ok(()),
@@ -463,6 +508,13 @@ impl LanBroker {
                     error.to_string()
                 }
             };
+            rounds += 1;
+            if rounds >= ROUNDS {
+                return Err(format!(
+                    "the LAN broker is not serving after {rounds} attempts in this root run, the \
+                     last: {why}; `sudo aterm machines here apply --plain` tries again"
+                ));
+            }
             if said.as_ref() != Some(&why) {
                 aterm_log::warn!("LAN broker: {why}; retaining this root transaction for recovery");
                 said = Some(why);
@@ -591,22 +643,27 @@ impl Item for LanBroker {
             lan::LABEL,
             source.display()
         );
-        if !reading.current() {
-            return Probe::Change {
-                from: reading.words(),
-                to,
+        let from = if reading.current() {
+            match readiness(sys) {
+                Readiness::Ready(pid) => {
+                    return Probe::Ok {
+                        now: format!("{} running in system (pid {pid})", lan::LABEL),
+                    };
+                }
+                Readiness::Start => "installed, not serving".into(),
+                Readiness::Pending(why) => why,
+            }
+        } else {
+            reading.words()
+        };
+        // A change would boot out, replace or start the job: never one the person switched off.
+        // Where launchd cannot say, the change stands, and the launch never enables the job.
+        if switched_off(sys) == Ok(true) {
+            return Probe::NotApplicable {
+                why: lan::Unavailable::SwitchedOff.to_string(),
             };
         }
-        match readiness(sys) {
-            Readiness::Ready(pid) => Probe::Ok {
-                now: format!("{} running in system (pid {pid})", lan::LABEL),
-            },
-            Readiness::Start => Probe::Change {
-                from: "installed, not serving".into(),
-                to,
-            },
-            Readiness::Pending(why) => Probe::Change { from: why, to },
-        }
+        Probe::Change { from, to }
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {

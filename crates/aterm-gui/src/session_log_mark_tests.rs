@@ -13,7 +13,10 @@ fn the_status_fields_name_the_open_path_and_the_observed_need() {
     let (tl, hand) = opened();
     assert_eq!(
         tl.lock().unwrap().slog().status_fields(WALL0),
-        "log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=-"
+        format!(
+            "log_seq=1 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- \
+             opened_ms={WALL0}"
+        )
     );
     with_claude(&tl);
     let mut g = tl.lock().unwrap();
@@ -37,7 +40,8 @@ fn the_status_fields_name_the_open_path_and_the_observed_need() {
     assert_eq!(
         g.slog().status_fields(WALL0 + 2_500),
         format!(
-            "log_seq={head} log_ep=1 log_base=1 run=r1 turn=t1 step=p1 need=approval:bash need_since_ms=500"
+            "log_seq={head} log_ep=1 log_base=1 run=r1 turn=t1 step=p1 need=approval:bash need_since_ms=500 \
+             opened_ms={WALL0}"
         )
     );
 }
@@ -59,7 +63,7 @@ fn a_claimed_need_is_never_the_status_need() {
     assert!(
         g.slog()
             .status_fields(WALL0)
-            .ends_with(" need=- need_since_ms=-"),
+            .ends_with(&format!(" need=- need_since_ms=- opened_ms={WALL0}")),
         "a claim's need is brief's, not status's"
     );
 }
@@ -560,7 +564,7 @@ fn a_failure_seen_wakes_the_logs_watchers() {
     for carried in [false, true] {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.os_window_for_test = true;
             ws.focused = false;
         }
@@ -588,7 +592,7 @@ fn a_failure_seen_wakes_the_logs_watchers() {
             app.note_carried_exit(session, true, block);
             woke_and_took(&sub, &timeline, "a carried exit seen");
         } else {
-            for ws in app.windows.values_mut() {
+            for mut ws in app.windows.values_mut() {
                 ws.focused = true;
             }
             app.note_session_seen(wid, session);

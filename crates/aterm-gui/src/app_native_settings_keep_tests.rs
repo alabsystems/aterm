@@ -436,7 +436,7 @@ fn click_still(app: &mut App, (x, y): (f64, f64), when: std::time::Instant) {
 fn a_double_click_on_keep_never_opens_what_takes_its_place() {
     let mut app = app();
     {
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window");
         ws.cols = 102;
         ws.rows = 29;
     }

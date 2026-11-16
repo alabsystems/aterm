@@ -6,6 +6,7 @@ use crate::harness::alab_roster::{Lab, SourceSnapshot, TestSourceOverride, test_
 use aterm_spec::interp::State;
 use std::sync::Arc;
 
+#[cfg(unix)]
 const AI_POOL: &str = super::super::super::ai_pool::AI_POOL_FILE;
 
 fn pool_text(cli: Cli) -> String {
@@ -43,16 +44,19 @@ impl Bed {
     }
 
     /// The vault's pool holds one account, `new`, warm on m16.
+    #[cfg(unix)]
     fn pool(&self, cli: Cli) {
         self.put(AI_POOL, &pool_text(cli));
     }
 
     /// The vault entry `name` holds `text` (an empty `text` removes it), read in place.
+    #[cfg(unix)]
     fn put(&self, name: &str, text: &str) {
         crate::vault_entry::seed(&self.home, &[(name, text.as_bytes())]);
     }
 
     /// What the vault entry `name` holds now.
+    #[cfg(unix)]
     fn held(&self, name: &str) -> Option<String> {
         crate::vault_entry::read_text(&self.home, name, 1 << 20)
             .text()
@@ -296,6 +300,7 @@ fn native_producers_reach_the_receipt_guard_without_publishing_first() {
 #[test]
 fn completion_uses_the_native_source_and_refuses_pending_registry_state() {
     let bed = Bed::new();
+    #[cfg(unix)]
     bed.pool(Cli::Codex);
     let registry = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
         me: Some(test_machine("m16")),
@@ -315,10 +320,16 @@ fn completion_uses_the_native_source_and_refuses_pending_registry_state() {
     assert!(codex_completion_source(&bed.env(), &row).is_err());
     registry.set(SourceSnapshot::Absent);
     let source = codex_completion_source(&bed.env(), &row).unwrap();
-    assert!(source.pool_text.is_some());
-    assert_eq!(source.fleet.unwrap().roster.accounts[0].label, "new");
+    #[cfg(unix)]
+    {
+        assert!(source.pool_text.is_some());
+        assert_eq!(source.fleet.unwrap().roster.accounts[0].label, "new");
+    }
+    #[cfg(not(unix))]
+    assert!(source.pool_text.is_none() && source.fleet.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn completion_ignores_pool_bytes_in_a_sheet_without_a_provider_column() {
     let bed = Bed::new();
@@ -347,21 +358,24 @@ fn already_retired_empty_assignments_need_no_writer() {
             } else {
                 SourceSnapshot::Absent
             });
+            #[cfg(unix)]
             bed.put(AI_POOL, "version=1\naccount=[]\n");
             let store = bed.store(cli);
             let held = store.acquire().unwrap();
             store.retire_source_held(&held, 1).unwrap();
             let before = bed.images(cli);
-            assert!(matches!(
-                sync_cli_with(
-                    cli,
-                    (&bed.home, &bed.state, &bed.config),
-                    (None, None),
-                    2,
-                    (&fetch_source_text, &[]),
-                ),
-                Ok(CliSync::Unlisted { .. })
-            ));
+            let result = sync_cli_with(
+                cli,
+                (&bed.home, &bed.state, &bed.config),
+                (None, None),
+                2,
+                (&fetch_source_text, &[]),
+            );
+            if !native && cfg!(not(unix)) {
+                assert!(matches!(result, Ok(CliSync::NoSource)), "{result:?}");
+            } else {
+                assert!(matches!(result, Ok(CliSync::Unlisted { .. })), "{result:?}");
+            }
             assert_eq!(bed.images(cli), before);
         }
     }
@@ -448,51 +462,75 @@ fn a_valid_migration_stays_committed_when_a_later_sync_plan_is_refused() {
 #[test]
 fn every_provider_refuses_changed_sources_after_signin_custody() {
     for cli in OTHER_CLIS {
-        for change in 0..5 {
-            // Vault-backed pool identity exists only on Unix. Source bytes,
-            // configuration and account policy changes run on every platform.
-            #[cfg(not(unix))]
-            if change == 3 {
-                continue;
-            }
-            let bed = Bed::new();
-            bed.pool(cli);
-            let registry = TestSourceOverride::new(SourceSnapshot::Absent);
-            let mut before = bed.images(cli);
-            let mut replanned = false;
-            let result = sync_cli_with_replan(
-                cli,
-                (&bed.home, &bed.state, &bed.config),
-                (None, None),
-                false,
-                1,
-                (&fetch_source_text, &[]),
-                || {
-                    replanned = true;
-                    match change {
-                        0 => bed.put(AI_POOL, "version=1\naccount=[]\n"),
-                        1 => fs::write(&bed.config, "[fleet]\nmachine='m17'\n").unwrap(),
-                        2 => registry.set(SourceSnapshot::Pending),
-                        #[cfg(unix)]
-                        3 => super::super::super::ai_pool::tests::seed_local_swarm_roster(
-                            &bed.home,
-                            "m100",
-                            &["m16"],
-                        ),
-                        4 => {
-                            let store = bed.store(cli);
-                            let held = store.acquire().unwrap();
-                            store.retire_source_held(&held, 2).unwrap();
-                            before = bed.images(cli);
-                        }
-                        _ => unreachable!(),
+        for vault in [
+            false,
+            #[cfg(unix)]
+            true,
+        ] {
+            for change in 0..5 {
+                if !vault && matches!(change, 0 | 3) {
+                    continue;
+                }
+                let bed = Bed::new();
+                let registry = if vault {
+                    #[cfg(unix)]
+                    {
+                        bed.pool(cli);
+                        TestSourceOverride::new(SourceSnapshot::Absent)
                     }
-                },
-            );
-            assert!(replanned);
-            assert!(result.is_err(), "{cli:?}/{change}: {result:?}");
-            assert_eq!(bed.images(cli), before);
-            assert!(!bed.store(cli).login_dir("new").unwrap().exists());
+                    #[cfg(not(unix))]
+                    panic!("vault capture fixtures require Unix");
+                } else {
+                    let mut account = native_account("new", "new@example.test", 1);
+                    account.cli = cli;
+                    account.vendor.region =
+                        (cli == Cli::Kimi).then_some(crate::ai::connector::Region::Global);
+                    TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
+                        me: Some(test_machine("m16")),
+                        accounts: vec![account],
+                        ..Lab::default()
+                    })))
+                };
+                let mut before = bed.images(cli);
+                let mut replanned = false;
+                let result = sync_cli_with_replan(
+                    cli,
+                    (&bed.home, &bed.state, &bed.config),
+                    (None, None),
+                    false,
+                    1,
+                    (&fetch_source_text, &[]),
+                    || {
+                        replanned = true;
+                        match change {
+                            #[cfg(unix)]
+                            0 => bed.put(AI_POOL, "version=1\naccount=[]\n"),
+                            1 => fs::write(&bed.config, "[fleet]\nmachine='m17'\n").unwrap(),
+                            2 => registry.set(SourceSnapshot::Pending),
+                            #[cfg(unix)]
+                            3 => super::super::super::ai_pool::tests::seed_local_swarm_roster(
+                                &bed.home,
+                                "m100",
+                                &["m16"],
+                            ),
+                            4 => {
+                                let store = bed.store(cli);
+                                let held = store.acquire().unwrap();
+                                store.retire_source_held(&held, 2).unwrap();
+                                before = bed.images(cli);
+                            }
+                            _ => unreachable!(),
+                        }
+                    },
+                );
+                assert!(replanned, "{cli:?}/{change}/vault={vault}");
+                assert!(
+                    result.is_err(),
+                    "{cli:?}/{change}/vault={vault}: {result:?}"
+                );
+                assert_eq!(bed.images(cli), before);
+                assert!(!bed.store(cli).login_dir("new").unwrap().exists());
+            }
         }
     }
 }
@@ -500,7 +538,11 @@ fn every_provider_refuses_changed_sources_after_signin_custody() {
 #[test]
 fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
     for cli in OTHER_CLIS {
-        for native in [false, true] {
+        for native in [
+            #[cfg(unix)]
+            false,
+            true,
+        ] {
             let bed = Bed::new();
             let registry = TestSourceOverride::new(if native {
                 SourceSnapshot::Present(Arc::new(Lab {
@@ -516,6 +558,7 @@ fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
             let legacy = bed.home.join(".secrets").join(cli_fleet_file(cli));
             fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             fs::write(&legacy, "retained legacy bytes").unwrap();
+            #[cfg(unix)]
             if !native {
                 bed.put(AI_POOL, "version=1\naccount=[]\n");
             }
@@ -584,7 +627,9 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
             .unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
         let legacy = cli_fleet_file(cli);
+        #[cfg(unix)]
         bed.put(&legacy, "preserved legacy input");
         let _source = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
             me: Some(test_machine("m16")),
@@ -626,6 +671,7 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
                 .row("native")
                 .is_some()
         );
+        #[cfg(unix)]
         assert_eq!(bed.held(&legacy).as_deref(), Some("preserved legacy input"));
     }
 }
@@ -648,7 +694,10 @@ fn transition_for(state: &State, action: &str, cli: Cli, bypass: bool) -> State 
         next.insert(input, state[input] + 1);
         return next;
     }
+    #[cfg(not(unix))]
+    assert_ne!(state["origin"], 0, "vault capture fixtures require Unix");
     let bed = Bed::new();
+    #[cfg(unix)]
     bed.pool(cli);
     let lab = Lab {
         me: Some(test_machine("m16")),
@@ -685,6 +734,7 @@ fn transition_for(state: &State, action: &str, cli: Cli, bypass: bool) -> State 
         }),
         2 => registry.set(SourceSnapshot::Disabled),
         3 => registry.set(SourceSnapshot::Pending),
+        #[cfg(unix)]
         4 if state["origin"] == 0 => bed.put(AI_POOL, "version=1\naccount=[]\n"),
         4 => registry.set(SourceSnapshot::Present(Arc::new(Lab {
             me: Some(test_machine("m17")),
@@ -715,6 +765,10 @@ fn provider_capture_model_executes_real_observations_and_writer_reacquisition() 
         for state in aterm_spec::interp::reachable_states(&model) {
             for action in &model.actions {
                 if model.action_enabled(action.name, &state) {
+                    #[cfg(not(unix))]
+                    if action.name == "Admit" && state["origin"] == 0 {
+                        continue;
+                    }
                     let actual = if cli == Cli::Codex {
                         transition(&state, action.name)
                     } else {
@@ -729,6 +783,8 @@ fn provider_capture_model_executes_real_observations_and_writer_reacquisition() 
         }
     }
     let mut stale = model.init_state();
+    #[cfg(not(unix))]
+    stale.insert("origin", 1);
     stale.insert("change", 2);
     stale.insert("stage", 1);
     let bypassed = transition_for(&stale, "Admit", Cli::Codex, true);

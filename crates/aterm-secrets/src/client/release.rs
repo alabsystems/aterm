@@ -461,7 +461,7 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     };
     if crate::release_ring::newest_roster(
         anchors,
-        [(0, pair.roster.as_slice(), pair.signature.as_slice())].into_iter(),
+        [(0, pair.roster.as_slice(), pair.signature.as_slice())],
     )
     .is_none()
     {

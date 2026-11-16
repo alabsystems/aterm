@@ -89,9 +89,12 @@ fn a_file_that_is_no_program_is_a_start_error_and_raises_no_box() {
                 "the mode child: {stdout}\n{}",
                 String::from_utf8_lossy(&child.stderr)
             );
+            // Under `--nocapture` the harness writes `test <name> ... ` before the test runs, so
+            // the child's line follows that on the same line.
             let line = stdout
                 .lines()
-                .find_map(|line| line.strip_prefix("process error mode 0x"))
+                .find_map(|line| line.split_once("process error mode 0x"))
+                .map(|(_, mode)| mode)
                 .expect("the mode child's line");
             let inherited = u32::from_str_radix(line.trim(), 16).expect("a hex mode");
             assert_eq!(

@@ -30,7 +30,9 @@ pub struct Caller {
 
 impl Caller {
     fn valid(&self) -> bool {
-        self.pid > 1 && self.birth > 0 && aterm_types::control_verbs::is_minted_sid(&self.sid)
+        self.pid > 1
+            && self.birth > 0
+            && aterm_types::control_request::Sid::parse(&self.sid).is_some()
     }
 }
 

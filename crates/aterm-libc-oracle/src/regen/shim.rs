@@ -325,7 +325,7 @@ fn header(cell: &Cell, out: &mut Vec<String>) {
         ]
         .map(String::from),
     );
-    out.push(aterm_census::seal::line("//", super::GENERATOR));
+    out.push(aterm_seal::line("//", super::GENERATOR));
     out.push(String::new());
     out.push(format!("//! `libc` for `{}`.", cell.triple));
     out.extend(

@@ -559,7 +559,8 @@ fn mux_nested(env: &dyn EnvSource) -> bool {
 
 impl SessionNotifier {
     /// The notifier of the session `env` names: `ATERM_PARENT_SESSION_ID`, a tab
-    /// ID, unless the shell is inside a multiplexer nested in that session (aterm-ctl's
+    /// ID or the `s-` ID a tab opened before the `t` form keeps on this Mac until it
+    /// closes, unless the shell is inside a multiplexer nested in that session (aterm-ctl's
     /// rule, `mux_nested`: `Skipped("mux")`, as `aterm ctl @self post` refuses there). No
     /// session: `Skipped("no-session")` on every post.
     #[must_use]

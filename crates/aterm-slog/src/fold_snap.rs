@@ -25,7 +25,7 @@ pub enum SnapError {
     Version,
     /// A line this build does not read, or a value of the wrong shape.
     Line,
-    /// More needs, open nodes, closed slots or fields than a fold holds.
+    /// More needs, open nodes, closed slots, fields or description claims than a fold holds.
     Bound,
     /// An open node the log the fold crossed with does not hold open as the fold says: refused, never repaired.
     Log,
@@ -39,17 +39,21 @@ fn kv(line: &str, skip: usize) -> impl Iterator<Item = (&str, &str)> {
         .filter_map(|t| t.split_once('='))
 }
 
-fn get<'a>(line: &'a str, skip: usize, key: &str) -> Option<&'a str> {
+pub(super) fn get<'a>(line: &'a str, skip: usize, key: &str) -> Option<&'a str> {
     kv(line, skip).find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
-fn num<T: std::str::FromStr>(line: &str, skip: usize, key: &str) -> Result<T, SnapError> {
+pub(super) fn num<T: std::str::FromStr>(
+    line: &str,
+    skip: usize,
+    key: &str,
+) -> Result<T, SnapError> {
     get(line, skip, key)
         .and_then(crate::line::parse_u)
         .ok_or(SnapError::Line)
 }
 
-fn opt_num<T: std::str::FromStr>(
+pub(super) fn opt_num<T: std::str::FromStr>(
     line: &str,
     skip: usize,
     key: &str,
@@ -72,7 +76,7 @@ fn phase_word(raw: &str) -> &'static str {
         .unwrap_or(UNKNOWN)
 }
 
-fn node_at(line: &str, i: usize) -> Result<Node, SnapError> {
+pub(super) fn node_at(line: &str, i: usize) -> Result<Node, SnapError> {
     line.split(' ')
         .filter(|t| !t.is_empty())
         .nth(i)
@@ -80,7 +84,7 @@ fn node_at(line: &str, i: usize) -> Result<Node, SnapError> {
         .ok_or(SnapError::Line)
 }
 
-fn tok_at(line: &str, i: usize) -> Result<&str, SnapError> {
+pub(super) fn tok_at(line: &str, i: usize) -> Result<&str, SnapError> {
     line.split(' ')
         .filter(|t| !t.is_empty())
         .nth(i)
@@ -354,18 +358,23 @@ impl Fold {
         self.snapshot_lines(true)
     }
 
-    /// [`Fold::snapshot`] without the mail latch and the waiting mails: a closed session's summary (`Log::closed_summary`), which waits for no turn.
+    /// [`Fold::snapshot`] without the mail latch and the waiting mails, and without the description claims: a closed session's summary (`Log::closed_summary`), which waits for no turn and keeps to a kilobyte.
     #[must_use]
     pub(crate) fn closed_snapshot(&self) -> Vec<String> {
         self.snapshot_lines(false)
     }
 
-    fn snapshot_lines(&self, mail: bool) -> Vec<String> {
+    /// The lines; `carry` adds what only a live session's carry holds: the mail latch and the waiting mails, the description claims and the turn closes they are charged ([`super::Described::carry_lines`]).
+    fn snapshot_lines(&self, carry: bool) -> Vec<String> {
         let st = &self.st;
-        let mut out = vec![format!(
+        let mut head = format!(
             "fold v=1 as_of={} ep={} rev={} last_t={} mail_open={}",
             st.as_of, st.ep, st.rev, st.last_t, st.mail_open
-        )];
+        );
+        if carry {
+            st.desc.push_turns(&mut head);
+        }
+        let mut out = vec![head];
         out.push(phase_line("phase", &st.phase));
         if let Some(p) = &self.shell_phase {
             out.push(phase_line("shell", p));
@@ -397,7 +406,7 @@ impl Fold {
             if t.mail_amb > 0 {
                 let _ = write!(line, " mail_amb={}", t.mail_amb);
             }
-            if mail {
+            if carry {
                 push_mail(line, self.in_since_human, &self.mail);
             }
         }
@@ -464,6 +473,9 @@ impl Fold {
                 st.label_proven.as_ref(),
             ));
         }
+        if carry {
+            st.desc.carry_lines(&mut out);
+        }
         out
     }
 
@@ -483,6 +495,7 @@ impl Fold {
         st.rev = num(head, 2, "rev")?;
         st.last_t = num(head, 2, "last_t")?;
         st.mail_open = num(head, 2, "mail_open")?;
+        st.desc.read_turns(head)?;
         let mut needs: Vec<Need> = Vec::new();
         for line in it {
             let tag = tok_at(line, 1)?;
@@ -609,12 +622,21 @@ impl Fold {
                     fold.st.label_trusted = trusted;
                     fold.st.label_proven = proven;
                 }
+                "desc" | "desc-sub" | "desc-left" => {
+                    fold.st.desc.read_line(tag, line, &fold.tracked)?;
+                }
                 _ => return Err(SnapError::Line),
             }
         }
         for (slot, n) in fold.st.needs.iter_mut().zip(needs) {
             *slot = Some(n);
         }
+        // The session's description claims count every closed turn, which the totals hold by outcome.
+        let t = &fold.st.totals;
+        let closed_turns = [t.done, t.asked, t.walled, t.interrupted, t.errors, t.other]
+            .iter()
+            .fold(0u32, |n, b| n.saturating_add(*b));
+        fold.st.desc.finish_read(closed_turns);
         fold.links.sort_by_key(|(n, _)| *n);
         fold.links.dedup_by_key(|(n, _)| *n);
         fold.reproject();

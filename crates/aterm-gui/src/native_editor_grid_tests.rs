@@ -396,7 +396,7 @@ fn t8_closing_with_a_cell_open_commits_it_first() {
         panic!("{outcome:?}");
     };
     // The view hears the other writer, as a peer view's commit is published to it.
-    match app.native_runtime.view_state_mut(view) {
+    match app.native_runtime.view_state_mut(view).as_deref_mut() {
         Some(AppViewState::Editor(state)) => state
             .buffer
             .as_mut()

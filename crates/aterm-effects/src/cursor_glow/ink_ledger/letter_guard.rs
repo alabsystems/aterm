@@ -56,7 +56,7 @@ use aterm_render::{GlowEnd, GlowRamp, Laid, glow_end};
 
 mod ring;
 mod thin_caret;
-pub(crate) use thin_caret::ThinCaret;
+pub(crate) use thin_caret::{ThinCaret, ThinHeld, ThinHood, ThinLift, bar_width};
 
 /// The bar every letter a light lies on keeps (WCAG AA for text, with a
 /// hair of room for the judge's rounding).
@@ -88,6 +88,28 @@ const SOLID_SHARE: f32 = crate::rainbow_kitty::prism_glass::colour::SOLID_SHARE 
 /// third, `a_dim_page_s_rail_is_one_stroke`). A letter read by its solid ink
 /// keeps the room still.
 const OWN_SHARE: f32 = 0.97;
+
+/// The least, in colour contrast against its page, a word's self-glow on paper leaves a letter
+/// whose own colour reads `own` (`word_decorations`' paper glow): the share of its own reading
+/// the judge keeps ([`OWN_SHARE`]) with a level's room ([`LEVEL_ROOM`]), so a raster read at a
+/// level's rounding keeps that share too; past what keeps the legibility bar by the raster
+/// ([`WCAG_AA`], its room and a stroke's antialiased edge, [`GLOW_EDGE_SHARE`]), never under
+/// the nine tenths it kept before. In colour contrast, as the glow's scale bisects it: a raster
+/// reading of the bar ([`raster_bar`]) is the wrong unit there (an ink of 4.8 floored at 4.6
+/// read 4.41).
+#[inline]
+#[must_use]
+pub(crate) const fn word_glow_floor(own: f32) -> f32 {
+    let kept = own * OWN_SHARE * LEVEL_ROOM;
+    let bar = WCAG_AA * LEVEL_ROOM / GLOW_EDGE_SHARE;
+    let tight = if kept < bar { kept } else { bar };
+    let before = 0.9 * own;
+    if tight > before { tight } else { before }
+}
+
+/// The least share of its colour's contrast a letter's raster reads in a glyph's
+/// antialiased strokes ([`word_glow_floor`]).
+const GLOW_EDGE_SHARE: f32 = 0.85;
 /// The room a letter read by its solid ink (one whose glyph the face's table
 /// holds no raster for, or that does not draw it alone: an accented, Cyrillic,
 /// Greek or Han letter, a slanted or decorated one) keeps over [`OWN_SHARE`]
@@ -308,8 +330,13 @@ struct LaidHalo {
     color: u32,
 }
 
-/// A frame's caret, grid `(cw, ch, ox, oy)` and switches ([`FrameMemo`]).
-type MemoFrame = (Option<(u16, u16)>, (i32, i32, i32, i32), u16);
+/// A frame's caret (its cell, and a thin caret's shape: a bar where `true`), grid
+/// `(cw, ch, ox, oy)` and switches ([`FrameMemo`]).
+type MemoFrame = (
+    (Option<(u16, u16)>, Option<bool>),
+    (i32, i32, i32, i32),
+    u16,
+);
 /// Rail spans of a stream, `[from, to)` and whether each lies in its row's
 /// foot band ([`InkLedger::note_rail`]).
 type RailSpans = Vec<(u32, u32, bool)>;
@@ -367,6 +394,9 @@ struct FrameMemo {
         GlowRamps,
         GlowRamps,
     ),
+    /// The frame's spans as the guard left them, mapped through its cuts
+    /// ([`InkLedger::spans`]): a frame the memo lays again names its pieces.
+    made_spans: super::Spans,
     /// The frame's print.
     print: u64,
 }
@@ -488,14 +518,9 @@ pub(crate) struct LetterGuard {
     /// ([`CursorGlow::verify_cuts`]): a cell the pass lowers lowers the cuts the next pass lays,
     /// never what a later cell of this pass was laid at.
     verify_laid: LaidCuts,
-    /// The ledger's rail and light-owned spans as the frame noted them, which a cut spends
+    /// The ledger's spans as the frame noted them, which a cut maps to its pieces
     /// ([`InkLedger::guard_mask_stream`]): a cut laid again reads them as noted.
-    seen_spans: (
-        RailSpans,
-        RailSpans,
-        Vec<super::OwnedSpan>,
-        Vec<super::OwnedSpan>,
-    ),
+    seen_spans: super::Spans,
     /// The row being read's ramp lights.
     ramp_rows: RampRows,
     /// The page shades' cuts ([`CursorGlow::hold_page_shades`]), each judged cell's ring box and
@@ -573,6 +598,13 @@ pub(crate) struct LetterGuard {
     /// and greatest luminance, as before round 27.
     #[cfg(any(test, debug_assertions))]
     pub(crate) ring_off: bool,
+    /// A test's negative control: the guard passes over the letter under a bar or underline
+    /// caret as under a block, as before CT-51 ([`CursorGlow::set_letter_guard_thin_caret`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_skip: bool,
+    /// The frame's caret is a focused bar (`Some(true)`) or underline (`Some(false)`)
+    /// ([`CursorGlow::guard_letters`]).
+    caret_thin: Option<bool>,
     /// A test's negative control: the guard blind to the cursor trail's fill, each letter's
     /// ring read on its page's ground under the lights, as before round 27.
     #[cfg(any(test, debug_assertions))]
@@ -672,7 +704,14 @@ impl LetterGuard {
         verify_under: Vec::new(),
         verify_ramps: GlowRamps::EMPTY,
         verify_laid: (Vec::new(), Vec::new()),
-        seen_spans: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        seen_spans: (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
         ramp_rows: RampRows {
             under: Vec::new(),
             over: Vec::new(),
@@ -709,6 +748,9 @@ impl LetterGuard {
         comb: false,
         #[cfg(any(test, debug_assertions))]
         ring_off: false,
+        #[cfg(any(test, debug_assertions))]
+        thin_skip: false,
+        caret_thin: None,
         #[cfg(any(test, debug_assertions))]
         trail_off: false,
         #[cfg(any(test, debug_assertions))]
@@ -1130,6 +1172,45 @@ fn ring_cells(
         model = fold(model, u64::from(base));
     }
     Some((model, cells))
+}
+
+/// A thin caret's line (`caret`'s cell; a bar where `thin` is `Some(true)`, an underline where
+/// `Some(false)`) in the ring box of the cell at `(row, col)`, cells `cw` x `ch` px: `[x0, y0, x1,
+/// y1)` box px where it meets the box, and with it `model` folded with it
+/// ([`ring::RingCell::read_lined`]).
+#[inline]
+fn caret_line_in_box(
+    (caret, thin): (Option<(u16, u16)>, Option<bool>),
+    (row, col): (i32, i32),
+    (cw, ch): (i32, i32),
+    model: u64,
+) -> (u64, Option<[u16; 4]>) {
+    let (Some((cr, cc)), Some(bar)) = (caret, thin) else {
+        return (model, None);
+    };
+    let (dr, dc) = (i32::from(cr) - row, i32::from(cc) - col);
+    if dr.abs() > 1 || dc.abs() > 1 {
+        return (model, None);
+    }
+    let line = ThinCaret {
+        cell: (cr, cc),
+        bar,
+        page: 0,
+        pin: None,
+    }
+    .line(cw, ch);
+    let (bx, by) = (RING + dc * cw, RING + dr * ch);
+    let (w, h) = (cw + 2 * RING, ch + 2 * RING);
+    let (x0, y0) = ((bx + line.0).max(0), (by + line.1).max(0));
+    let (x1, y1) = ((bx + line.2).min(w), (by + line.3).min(h));
+    if x0 >= x1 || y0 >= y1 {
+        return (model, None);
+    }
+    let at = [x0, y0, x1, y1].map(|v| u16::try_from(v).unwrap_or(u16::MAX));
+    let word = at
+        .iter()
+        .fold(0x4C49_4E45u64, |h, &v| h.rotate_left(16) ^ u64::from(v));
+    (fold(model, word), Some(at))
 }
 
 /// One cell being judged: its ring box (`[x0, x1) × [y0, y1)`, window px),
@@ -3379,6 +3460,21 @@ impl LetterGuard {
     }
 }
 
+/// How a cut piece's ends are fitted to bytes ([`mask_cut_end`]): a piece that keeps less than
+/// its whole light is truncated, as the guard's model truncates (`quad_at`), and a whole one keeps
+/// its gradient's own ends, rounded. A cut made after the guard's verify passes (the thin caret's
+/// hold, [`InkLedger::owned_in_strip`]) truncates every end, a whole piece's too: no pass reads
+/// its pieces again, and a whole piece's end rounded up laid a level of light the guard never
+/// weighed beside the letter next to the bar (dark typing's `n` read 4.55 where the guard laid
+/// 4.60, CT-51). Truncated, a piece's every pixel lays no more than the quad laid there.
+#[derive(Clone, Copy, Debug)]
+struct CutFit {
+    /// A test's control: every end rounded (`InkLedger::round_cuts`).
+    round: bool,
+    /// The cut is the thin caret hold's, after the guard's verify passes.
+    after_verify: bool,
+}
+
 #[inline(always)]
 const fn mask_cut_end(
     x: i32,
@@ -3387,11 +3483,11 @@ const fn mask_cut_end(
     c0: [f32; 4],
     dc: [f32; 4],
     m: f32,
-    round_cuts: bool,
+    cut: CutFit,
 ) -> (u32, u8) {
     #[inline(always)]
-    const fn fit(v: f32, m: f32, round_cuts: bool) -> u32 {
-        let u = if m < 1.0 && !round_cuts {
+    const fn fit(v: f32, m: f32, cut: CutFit) -> u32 {
+        let u = if (m < 1.0 || cut.after_verify) && !cut.round {
             v.trunc()
         } else {
             v.round()
@@ -3399,10 +3495,10 @@ const fn mask_cut_end(
         if u < 255 { u } else { 255 }
     }
     let t = (x - x0) as f32 * inv_w;
-    let r = fit((c0[0] + dc[0] * t) * m, m, round_cuts);
-    let g = fit((c0[1] + dc[1] * t) * m, m, round_cuts);
-    let b = fit((c0[2] + dc[2] * t) * m, m, round_cuts);
-    let a = fit((c0[3] + dc[3] * t) * m, m, round_cuts) as u8;
+    let r = fit((c0[0] + dc[0] * t) * m, m, cut);
+    let g = fit((c0[1] + dc[1] * t) * m, m, cut);
+    let b = fit((c0[2] + dc[2] * t) * m, m, cut);
+    let a = fit((c0[3] + dc[3] * t) * m, m, cut) as u8;
     ((r << 16) | (g << 8) | b, a)
 }
 
@@ -3800,7 +3896,8 @@ impl InkLedger {
     /// its row's ring ([`Self::note_rail`]) is cut only where it meets a
     /// dimmed cell's box, and a quad of a rail in its row's foot band
     /// ([`Self::note_foot_rail`]) is never cut, nor is a light-owned quad
-    /// ([`Self::note_light_owned_laid`]).
+    /// ([`Self::note_light_owned_laid`]) but by the hard dims of a thin
+    /// caret's held strip ([`Self::owned_in_strip`]).
     #[inline]
     fn guard_mask_quads<const RAMPS: bool>(
         &mut self,
@@ -3820,6 +3917,10 @@ impl InkLedger {
         let round_cuts = self.round_cuts;
         #[cfg(not(any(test, debug_assertions)))]
         let round_cuts = false;
+        let cut_fit = CutFit {
+            round: round_cuts,
+            after_verify: self.owned_in_strip,
+        };
         #[cfg(any(test, debug_assertions))]
         let rails = rails && !self.rails_feathered;
         let feet_whole = self.foot_rails_whole();
@@ -3833,11 +3934,16 @@ impl InkLedger {
         let mut span = 0usize;
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.clear();
+        let mut starts = std::mem::take(&mut self.starts);
+        starts.clear();
         let mut cut = false;
         let mut next = 0;
         let mut i = 0;
         while i < quads.len() {
             let q = quads[i];
+            if rails {
+                starts.push(pieces.len() as u32);
+            }
             if RAMPS {
                 while next < ramps.len() && ramps[next].at as usize <= i {
                     ramps[next].at = pieces.len() as u32;
@@ -3850,8 +3956,15 @@ impl InkLedger {
                 span += 1;
             }
             let rail = span < spans.len() && spans[span].0 as usize <= i;
-            if (rail && feet_whole && spans[span].2)
-                || Self::in_owned_span(&owned, i, &mut owned_at)
+            // A light-owned light is cut only in a thin caret's held strip, by its hard dims; a
+            // foot rail (the trail's underline, a page shade among them) never: the trail is not
+            // dimmed to buy the caret's reading.
+            let own = Self::in_owned_span(&owned, i, &mut owned_at);
+            let foot = rail && feet_whole && spans[span].2;
+            let soft = !(own || foot);
+            let in_strip = own && self.owned_in_strip && self.meets_hard((x0, y0, x1, y1));
+            if foot
+                || (own && !in_strip)
                 || q.w == 0
                 || q.h == 0
                 || x1 <= bx0
@@ -3899,47 +4012,54 @@ impl InkLedger {
                 let ya_u = ya as u16;
                 let h_u = (yb - ya) as u16;
                 let mut xa = x0_knot;
-                let mut ca = mask_cut_end(
-                    xa,
-                    x0,
-                    inv_w,
-                    c0,
-                    dc,
-                    self.mask_at_with(xa as f32, ym, feather),
-                    round_cuts,
-                );
+                let soft_at = |l: &Self, x: i32| {
+                    if soft {
+                        l.mask_at_with(x as f32, ym, feather)
+                    } else {
+                        1.0
+                    }
+                };
+                let mut ma = soft_at(self, xa);
+                let mut ca = mask_cut_end(xa, x0, inv_w, c0, dc, ma, cut_fit);
                 let mut xi = 0;
                 while xi < nx {
                     let xb = self.knots_x[xi + 1];
-                    let cb = mask_cut_end(
-                        xb,
-                        x0,
-                        inv_w,
-                        c0,
-                        dc,
-                        self.mask_at_with(xb as f32, ym, feather),
-                        round_cuts,
-                    );
-                    if ca.0 | cb.0 != 0 || ca.1 | cb.1 != 0 {
+                    let mb = soft_at(self, xb);
+                    let cb = mask_cut_end(xb, x0, inv_w, c0, dc, mb, cut_fit);
+                    // A hard dim holds the piece it holds whole, both its ends.
+                    let hard = self.hard_at(0.5 * (xa + xb) as f32, ym);
+                    let (pa, pb) = if hard < 1.0 {
+                        (
+                            mask_cut_end(xa, x0, inv_w, c0, dc, ma.min(hard), cut_fit),
+                            mask_cut_end(xb, x0, inv_w, c0, dc, mb.min(hard), cut_fit),
+                        )
+                    } else {
+                        (ca, cb)
+                    };
+                    if pa.0 | pb.0 != 0 || pa.1 | pb.1 != 0 {
                         pieces.push(GlowQuad {
                             row: q.row,
                             x: xa as u16,
                             y: ya_u,
                             w: (xb - xa) as u16,
                             h: h_u,
-                            color: ca.0,
-                            alpha: ca.1,
-                            color2: cb.0,
-                            alpha2: cb.1,
+                            color: pa.0,
+                            alpha: pa.1,
+                            color2: pb.0,
+                            alpha2: pb.1,
                         });
                     }
                     xa = xb;
+                    ma = mb;
                     ca = cb;
                     xi += 1;
                 }
                 yi += 1;
             }
             i += 1;
+        }
+        if rails {
+            starts.push(pieces.len() as u32);
         }
         if RAMPS {
             while next < ramps.len() {
@@ -3953,15 +4073,26 @@ impl InkLedger {
         pieces.clear();
         self.pieces = pieces;
         if rails {
-            // The quads' indices moved with the cuts: the spans are spent.
+            // The quads' indices moved with the cuts: each span is mapped to the pieces its
+            // quads were cut into, so a later cut of the frame (a thin caret's hold) keeps
+            // what this one kept.
+            let mut spans = spans;
+            let mut owned = owned;
+            #[cfg(test)]
+            if self.spans_spent {
+                starts.clear();
+                spans.clear();
+                owned.clear();
+            }
+            remap_spans(&starts, &mut spans);
+            remap_owned(&starts, &mut owned);
+            let mut shades = std::mem::take(&mut self.page_shades);
+            remap_owned(&starts, &mut shades);
             self.rails = spans;
-            self.rails.clear();
-        }
-        if rails {
-            // Kept whole, the light-owned lights moved with the cuts too.
             self.light_owned = owned;
-            self.light_owned.clear();
+            self.page_shades = shades;
         }
+        self.starts = starts;
     }
 
     /// Whether the window px box `[x0, x1) × [y0, y1)` meets a dimmed
@@ -3993,8 +4124,10 @@ impl InkLedger {
     /// pieces are one light apiece (a run of each slice's ramp), as the
     /// quad's are. With `rails`, a ramp of a rail laid clear of its row's
     /// ring ([`Self::note_rail_laid`]) has a row (a run, its one quad) cut
-    /// only where it meets a dimmed cell's box, as its quad would be, and a
-    /// light-owned ramp ([`Self::note_light_owned_laid`]) is never cut.
+    /// only where it meets a dimmed cell's box, as its quad would be, a foot
+    /// rail's is never cut, and a light-owned ramp
+    /// ([`Self::note_light_owned_laid`]) is cut only by the hard dims of a
+    /// thin caret's held strip.
     #[inline]
     fn guard_mask_ramps(&mut self, ramps: &mut GlowRamps, rails: bool) {
         let owned = if rails {
@@ -4009,6 +4142,10 @@ impl InkLedger {
         let round_cuts = self.round_cuts;
         #[cfg(not(any(test, debug_assertions)))]
         let round_cuts = false;
+        let cut_fit = CutFit {
+            round: round_cuts,
+            after_verify: self.owned_in_strip,
+        };
         #[cfg(any(test, debug_assertions))]
         let rails = rails && !self.rails_feathered;
         let feet_whole = self.foot_rails_whole();
@@ -4025,10 +4162,15 @@ impl InkLedger {
         let mut masks = std::mem::take(&mut self.row_masks);
         let mut masks_for: Option<u64> = None;
         self.row_near_on = true;
+        let mut starts = std::mem::take(&mut self.starts);
+        starts.clear();
         let mut cut = false;
         let mut k = 0;
         while k < ramps.items.len() {
             let r = ramps.items[k];
+            if rails {
+                starts.push(if cut { out.items.len() } else { k } as u32);
+            }
             let (x0, y0) = (i32::from(r.x), i32::from(r.y));
             let (x1, y1) = (x0 + i32::from(r.w), y0 + i32::from(r.h));
             while span < spans.len() && spans[span].1 as usize <= k {
@@ -4043,8 +4185,12 @@ impl InkLedger {
                 });
                 out.ends.extend_from_slice(r.kept_ends(ends));
             }
-            if (rail && feet_whole && spans[span].2)
-                || Self::in_owned_span(&owned, k, &mut owned_at)
+            let own = Self::in_owned_span(&owned, k, &mut owned_at);
+            let foot = rail && feet_whole && spans[span].2;
+            let soft = !(own || foot);
+            let in_strip = own && self.owned_in_strip && self.meets_hard((x0, y0, x1, y1));
+            if foot
+                || (own && !in_strip)
                 || r.w == 0
                 || x1 <= bx0
                 || x0 >= bx1
@@ -4208,26 +4354,48 @@ impl InkLedger {
                     }
                     ni += 1;
                 }
-                if !(flat && masks_for == Some(self.near_gen) && masks.len() == run_knots.len()) {
+                if !(soft
+                    && flat
+                    && masks_for == Some(self.near_gen)
+                    && masks.len() == run_knots.len())
+                {
                     masks.clear();
                     let mut ki = 0;
                     while ki < run_knots.len() {
-                        masks.push(self.mask_at_with(run_knots[ki] as f32, ym, feather));
+                        masks.push(if soft {
+                            self.mask_at_with(run_knots[ki] as f32, ym, feather)
+                        } else {
+                            1.0
+                        });
                         ki += 1;
                     }
-                    masks_for = if flat { Some(self.near_gen) } else { None };
+                    masks_for = if flat && soft {
+                        Some(self.near_gen)
+                    } else {
+                        None
+                    };
                 }
-                let (rgb0, al0) =
-                    mask_cut_end(run_knots[0], x0, inv_w, c0, dc, masks[0], round_cuts);
+                let (rgb0, al0) = mask_cut_end(run_knots[0], x0, inv_w, c0, dc, masks[0], cut_fit);
                 let mut ca = glow_end(rgb0, al0);
                 let mut xi = 1;
                 while xi < run_knots.len() {
                     let xb = run_knots[xi];
-                    let (rgbb, alb) = mask_cut_end(xb, x0, inv_w, c0, dc, masks[xi], round_cuts);
+                    let (rgbb, alb) = mask_cut_end(xb, x0, inv_w, c0, dc, masks[xi], cut_fit);
                     let cb = glow_end(rgbb, alb);
-                    // A piece of no light is never laid: a dark row (two
-                    // zero ends already).
-                    run_ends.extend([ca, cb]);
+                    // A hard dim holds the piece it holds whole, both its ends.
+                    let xa = run_knots[xi - 1];
+                    let hard = self.hard_at(0.5 * (xa + xb) as f32, ym);
+                    if hard < 1.0 {
+                        let (ra, aa) =
+                            mask_cut_end(xa, x0, inv_w, c0, dc, masks[xi - 1].min(hard), cut_fit);
+                        let (rb, ab) =
+                            mask_cut_end(xb, x0, inv_w, c0, dc, masks[xi].min(hard), cut_fit);
+                        run_ends.extend([glow_end(ra, aa), glow_end(rb, ab)]);
+                    } else {
+                        // A piece of no light is never laid: a dark row (two
+                        // zero ends already).
+                        run_ends.extend([ca, cb]);
+                    }
                     ca = cb;
                     xi += 1;
                 }
@@ -4241,6 +4409,13 @@ impl InkLedger {
         self.row_near_on = false;
         self.row_near = None;
         self.row_masks = masks;
+        if rails {
+            starts.push(if cut {
+                out.items.len()
+            } else {
+                ramps.items.len()
+            } as u32);
+        }
         if cut {
             out.lit = out.count_lit();
             std::mem::swap(ramps, &mut out);
@@ -4248,15 +4423,25 @@ impl InkLedger {
         out.clear();
         self.ramp_pieces = out;
         if rails {
-            // The ramps' indices moved with the cuts: the spans are spent.
+            // The ramps' indices moved with the cuts: each span is mapped to the ramps its own
+            // were cut into, as the quads' are.
+            let mut spans = spans;
+            let mut owned = owned;
+            #[cfg(test)]
+            if self.spans_spent {
+                starts.clear();
+                spans.clear();
+                owned.clear();
+            }
+            remap_spans(&starts, &mut spans);
+            remap_owned(&starts, &mut owned);
+            let mut shades = std::mem::take(&mut self.page_shade_ramps);
+            remap_owned(&starts, &mut shades);
             self.rail_ramps = spans;
-            self.rail_ramps.clear();
-        }
-        if rails {
-            // Kept whole, the light-owned lights moved with the cuts too.
             self.light_owned_ramps = owned;
-            self.light_owned_ramps.clear();
+            self.page_shade_ramps = shades;
         }
+        self.starts = starts;
     }
 
     /// Cut every halo of `halos` to the guard's dims: an additive halo's
@@ -4303,7 +4488,8 @@ impl InkLedger {
                 while xi < nx {
                     xi += 1;
                     let xb = self.knots_x[xi];
-                    let m = self.mask_at_with(0.5 * (xa + xb) as f32, ym, feather);
+                    let xm = 0.5 * (xa + xb) as f32;
+                    let m = self.mask_at_with(xm, ym, feather).min(self.hard_at(xm, ym));
                     let color = match h.mode {
                         HaloMode::Add => scale_rgb(h.color & 0x00FF_FFFF, m),
                         HaloMode::Over => match over_cap(h.color, m) {
@@ -4425,6 +4611,10 @@ impl CursorGlow {
     /// read a `(` at 3.19:1 in the trail gallery's `move-up` (looks8 round 2).
     /// Returns a print of the cuts. `caret_block`: the caret is drawn as a
     /// block, filling its cell, so no pixel of it is a neighbour's ground.
+    /// `caret_thin`: the caret is a focused bar (`Some(true)`) or underline
+    /// (`Some(false)`), which leaves its letter on the cell's light, so that
+    /// letter is guarded as any other, and whose line is no letter's ground;
+    /// any other caret's cell is passed over (CT-51 Rule D).
     /// `trail`: the frame's cursor trail cells and their colour, each cell's
     /// fill the ground its letters' rings read under the lights.
     ///
@@ -4435,13 +4625,14 @@ impl CursorGlow {
     pub(crate) fn guard_letters(
         &mut self,
         over: &mut Vec<GlowQuad>,
-        (caret, caret_block): (Option<(u16, u16)>, bool),
+        (caret, caret_block, caret_thin): (Option<(u16, u16)>, bool, Option<bool>),
         (geom, cfg): (Geom, &GlowConfig),
         trail: Trail<'_>,
     ) -> u64 {
         if self.letter_guard.unseen {
             return 0;
         }
+        self.letter_guard.caret_thin = caret_thin;
         self.letter_guard.glass_ink = cfg.light.glass().then_some(cfg.theme_fg & 0x00FF_FFFF);
         let style = cfg.style;
         #[cfg(any(test, debug_assertions))]
@@ -4474,14 +4665,17 @@ impl CursorGlow {
             self.ink_ledger.guard_judged = self.guard_judges(over, geom, spared);
         }
         let frame = (
-            caret,
+            (caret, caret_thin),
             (
                 geom.cw as i32,
                 geom.ch as i32,
                 i32::from(geom.origin_x),
                 i32::from(geom.origin_y),
             ),
-            seams | u16::from(caret_block) << 6 | u16::from(spared) << 7,
+            seams
+                | u16::from(caret_thin.is_some()) << 2
+                | u16::from(caret_block) << 6
+                | u16::from(spared) << 7,
         );
         // The rails and the page shades are read in order, kept or not.
         self.ink_ledger.rails.sort_unstable();
@@ -4519,6 +4713,13 @@ impl CursorGlow {
             self.halo_out.clone_from(&memo.made.2);
             copy_ramps(&mut self.under_ramps, &memo.made.3);
             copy_ramps(&mut self.out_ramps, &memo.made.4);
+            #[cfg(test)]
+            let restore = !self.ink_ledger.memo_spans_off;
+            #[cfg(not(test))]
+            let restore = true;
+            if restore {
+                self.ink_ledger.set_spans(&memo.made_spans);
+            }
             let print = memo.print;
             self.letter_guard.memo = Some(memo);
             #[cfg(any(test, debug_assertions))]
@@ -4556,6 +4757,7 @@ impl CursorGlow {
         memo.made.2.clone_from(&self.halo_out);
         copy_ramps(&mut memo.made.3, &self.under_ramps);
         copy_ramps(&mut memo.made.4, &self.out_ramps);
+        memo.made_spans = self.ink_ledger.spans();
         memo.print = print;
         memo.kept = true;
         self.letter_guard.memo = Some(memo);
@@ -4564,8 +4766,8 @@ impl CursorGlow {
 
     /// The tests' switches that change what [`Self::guard_letters`] makes of a frame, as one word
     /// ([`LetterGuard::seams`]): the guard's controls, the ledger's, and [`letter_bar`]'s
-    /// ([`with_share_over_aa`], [`with_aa_unrounded`]). Bits 6 and 7 are the frame memo's own (the
-    /// caret's shape, a spared style).
+    /// ([`with_share_over_aa`], [`with_aa_unrounded`]). Bits 2, 6 and 7 are the frame memo's own (a
+    /// focused thin caret, the caret's shape, a spared style).
     #[cfg(any(test, debug_assertions))]
     #[inline]
     fn guard_seams(&self) -> u16 {
@@ -4583,6 +4785,7 @@ impl CursorGlow {
             | u16::from(g.shades_at_bar) << 12
             | u16::from(share_over_aa()) << 13
             | u16::from(AA_UNROUNDED.with(std::cell::Cell::get)) << 14
+            | u16::from(g.thin_skip) << 15
     }
 
     /// Whether [`Self::guard_letters`] judges this frame's lights against its
@@ -4636,6 +4839,10 @@ impl CursorGlow {
         let (cw, ch) = (geom.cw as i32, geom.ch as i32);
         let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
         let mut guard = std::mem::take(&mut self.letter_guard);
+        #[cfg(any(test, debug_assertions))]
+        let skips_caret = guard.caret_thin.is_none() || guard.thin_skip;
+        #[cfg(not(any(test, debug_assertions)))]
+        let skips_caret = guard.caret_thin.is_none();
         self.ink_ledger.grid = (ox as f32, oy as f32, cw as f32, ch as f32);
         self.ink_ledger.dims.clear();
         let bounds = StreamBounds::of(
@@ -4712,8 +4919,10 @@ impl CursorGlow {
                     continue;
                 }
                 let (min_x, max_x) = row_bounds;
+                // A block caret cuts its letter out of its fill; a bar or underline leaves it
+                // on the cell's light, guarded as any other.
                 let skip = match caret {
-                    Some((r, c)) if i32::from(r) == row => Some(i32::from(c)),
+                    Some((r, c)) if skips_caret && i32::from(r) == row => Some(i32::from(c)),
                     _ => None,
                 };
                 let from = cuts.len();
@@ -4754,7 +4963,15 @@ impl CursorGlow {
                             (caret, caret_block),
                             trail,
                         )
-                        .map(|(model, cells)| (model, cells, inks))
+                        .map(|(model, cells)| {
+                            let (model, line) = caret_line_in_box(
+                                (caret, guard.caret_thin),
+                                (row, col),
+                                (cw, ch),
+                                model,
+                            );
+                            (model, (cells, line), inks)
+                        })
                     });
                     let model = ringed.as_ref().map(|r| r.0);
                     // A cell whose ring box, text and lights are the last
@@ -4773,12 +4990,12 @@ impl CursorGlow {
                     let share = if let Some(share) = guard.verdict(key) {
                         share
                     } else {
-                        if let Some((_, cells, inks)) = &ringed {
-                            guard.ring.read(
+                        if let Some((_, (cells, line), inks)) = &ringed {
+                            guard.ring.read_lined(
                                 ((cx1 - cx0) as usize, (ry1 - ry0) as usize),
                                 (cw as usize, ch as usize),
                                 RING as usize,
-                                cells,
+                                (cells, *line),
                                 (inks.raster_table(), inks.corrected()),
                             );
                         }
@@ -4830,11 +5047,7 @@ impl CursorGlow {
             seen.2.clone_from(&self.halo_out);
             copy_ramps(&mut seen.3, &self.under_ramps);
             copy_ramps(&mut seen.4, &self.out_ramps);
-            let (spans, l) = (&mut guard.seen_spans, &self.ink_ledger);
-            spans.0.clone_from(&l.rails);
-            spans.1.clone_from(&l.rail_ramps);
-            spans.2.clone_from(&l.light_owned);
-            spans.3.clone_from(&l.light_owned_ramps);
+            guard.seen_spans = self.ink_ledger.spans();
         }
         let mut print = self.lay_cuts(over, &guard, (&rows_cut, &cuts));
         let night = (!checks.is_empty())
@@ -4867,11 +5080,7 @@ impl CursorGlow {
             self.halo_out.clone_from(&guard.seen.2);
             copy_ramps(&mut self.under_ramps, &guard.seen.3);
             copy_ramps(&mut self.out_ramps, &guard.seen.4);
-            let (spans, l) = (&guard.seen_spans, &mut self.ink_ledger);
-            l.rails.clone_from(&spans.0);
-            l.rail_ramps.clone_from(&spans.1);
-            l.light_owned.clone_from(&spans.2);
-            l.light_owned_ramps.clone_from(&spans.3);
+            self.ink_ledger.set_spans(&guard.seen_spans);
             print = self.lay_cuts(over, &guard, (&rows_cut, &cuts));
             if pass > VERIFY_PASSES {
                 break;
@@ -4925,6 +5134,10 @@ impl CursorGlow {
         let (whole, ring_off, at_bar) = (guard.shades_whole, guard.ring_off, guard.shades_at_bar);
         #[cfg(not(any(test, debug_assertions)))]
         let (whole, ring_off, at_bar) = (false, false, false);
+        #[cfg(any(test, debug_assertions))]
+        let skips_caret = guard.caret_thin.is_none() || guard.thin_skip;
+        #[cfg(not(any(test, debug_assertions)))]
+        let skips_caret = guard.caret_thin.is_none();
         let hold = if at_bar {
             RasterHold::Bar
         } else {
@@ -4968,7 +5181,7 @@ impl CursorGlow {
                 continue;
             }
             let skip = match caret {
-                Some((r, c)) if i32::from(r) == row => Some(i32::from(c)),
+                Some((r, c)) if skips_caret && i32::from(r) == row => Some(i32::from(c)),
                 _ => None,
             };
             for col in first..end {
@@ -5003,6 +5216,8 @@ impl CursorGlow {
                 }) else {
                     continue;
                 };
+                let (model, line) =
+                    caret_line_in_box((caret, guard.caret_thin), (row, col), (cw, ch), model);
                 let key = guard.cell_key(
                     (cx0, ry0, cx1, ry1),
                     (ink, ground),
@@ -5012,11 +5227,11 @@ impl CursorGlow {
                 let share = if let Some(share) = guard.verdict(key) {
                     share
                 } else {
-                    guard.ring.read(
+                    guard.ring.read_lined(
                         ((cx1 - cx0) as usize, (ry1 - ry0) as usize),
                         (cw as usize, ch as usize),
                         RING as usize,
-                        &cells,
+                        (&cells, line),
                         (inks.raster_table(), inks.corrected()),
                     );
                     let share = guard.judge(
@@ -5036,6 +5251,7 @@ impl CursorGlow {
                         x1: cx1 as f32,
                         y1: ry1 as f32,
                         share,
+                        hard: false,
                     });
                 }
             }
@@ -5081,6 +5297,7 @@ impl CursorGlow {
                     x1: (ox + (col + 1) * cw + RING) as f32,
                     y1: ry1 as f32,
                     share,
+                    hard: false,
                 });
                 print = aterm_hash::fnv_mix_u64(
                     print | 1,
@@ -5104,6 +5321,7 @@ impl CursorGlow {
                             x1: (ox + (col + 1) * cw + RING) as f32,
                             y1: ry1 as f32,
                             share,
+                            hard: false,
                         }),
                     }
                     print = aterm_hash::fnv_mix_u64(
@@ -5207,6 +5425,8 @@ impl CursorGlow {
             else {
                 continue;
             };
+            let (model, line) =
+                caret_line_in_box((caret.0, guard.caret_thin), (r.row, c.col), (cw, ch), model);
             let (ry0, ry1) = r.band;
             let streams = Streams {
                 quads: [&under, &ramp_rows.under, over, &ramp_rows.over],
@@ -5224,11 +5444,11 @@ impl CursorGlow {
             {
                 continue;
             }
-            guard.ring.read(
+            guard.ring.read_lined(
                 ((cx1 - cx0) as usize, (ry1 - ry0) as usize),
                 (cw as usize, ch as usize),
                 RING as usize,
-                &cells,
+                (&cells, line),
                 (inks.raster_table(), inks.corrected()),
             );
             let bar = raster_bar(guard.ring.own);
@@ -5331,6 +5551,14 @@ impl CursorGlow {
     #[inline]
     pub const fn set_letter_guard_ring(&mut self, on: bool) {
         self.letter_guard.ring_off = !on;
+    }
+
+    /// A test's negative control: `on` (as shipped), the guard keeps the letter under a bar or
+    /// underline caret as any other; off, it passes over the caret's cell as under a block.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_thin_caret(&mut self, on: bool) {
+        self.letter_guard.thin_skip = !on;
     }
 
     /// A test's negative control: each page shade kept whole (`false`), unjudged

@@ -223,7 +223,7 @@ fn memory_detail_maps_the_windows_classes() {
     assert_eq!(m.available, status.avail_phys, "Windows' ullAvailPhys");
     assert_ne!(m.available, m.free, "not the free pages alone");
     assert_eq!(m.used(), m.app + m.wired);
-    assert_eq!((m.swap_used, m.swap_total), (GIB / 2, 2 * GIB));
+    assert_eq!((m.swap_used, m.swap_total), (Some(GIB / 2), Some(2 * GIB)));
     assert_eq!(
         m.commit,
         Some(Commit {
@@ -246,9 +246,15 @@ fn memory_detail_maps_the_windows_classes() {
         assert_eq!(class, None);
     }
     assert_eq!(
-        windows::memory_detail_of(&status, &perf, None, false).map(|m| m.swap_total),
-        Some(0)
+        windows::memory_detail_of(&status, &perf, None, false).and_then(|m| m.swap_total),
+        None
     );
+    let zero = windows::memory_detail_of(&status, &perf, Some((0, 0)), false)
+        .expect("measured page files");
+    assert_eq!((zero.swap_used, zero.swap_total), (Some(0), Some(0)));
+    let unread =
+        windows::memory_detail_of(&status, &perf, None, false).expect("other memory is still read");
+    assert_eq!(zero.used(), unread.used());
 }
 
 #[test]

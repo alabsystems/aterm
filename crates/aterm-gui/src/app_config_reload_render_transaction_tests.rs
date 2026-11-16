@@ -197,9 +197,10 @@ fn a_same_cell_box_face_rebuild_repaints_the_cpu_window() {
         let crate::Backend::Cpu(renderer) = backend.ready_mut() else {
             panic!("headless test backend is CPU")
         };
-        let ws = windows
+        let mut route_guard_ws = windows
             .get_mut(&crate::WindowId(0))
             .expect("headless fixture window");
+        let ws = &mut **route_guard_ws;
         let _ = renderer.render_input_cached(&mut ws.cpu_cache, input);
         (
             ws.cpu_cache.presented_pixels().to_vec(),

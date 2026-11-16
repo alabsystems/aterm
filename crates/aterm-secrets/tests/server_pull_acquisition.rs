@@ -216,6 +216,7 @@ impl Peer {
                 seq: 1,
                 head: [0; 32],
                 label: Some("m9".into()),
+                rec: None,
             }),
         }
     }

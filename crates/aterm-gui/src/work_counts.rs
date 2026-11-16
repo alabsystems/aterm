@@ -10,6 +10,8 @@ use std::cell::Cell;
 /// writes only; they exclude captured titles, tooltips, presentation and native copies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TitleRefreshWork {
+    pub window_gates: usize,
+    pub membership_probes: usize,
     pub drift_tabs: usize,
     pub drift_cache_probes: usize,
     pub eligibility_reads: usize,
@@ -22,11 +24,26 @@ pub(crate) struct TitleRefreshWork {
 
 thread_local! {
     static TITLE_REFRESH: Cell<TitleRefreshWork> = const { Cell::new(TitleRefreshWork {
+        window_gates: 0, membership_probes: 0,
         drift_tabs: 0, drift_cache_probes: 0, eligibility_reads: 0,
         identities: 0, reads: 0, cache_probes: 0, cache_writes: 0, chrome_bytes: 0,
     }) };
 }
 
+pub(crate) fn title_window_gate() {
+    TITLE_REFRESH.with(|c| {
+        let mut work = c.get();
+        work.window_gates += 1;
+        c.set(work);
+    });
+}
+pub(crate) fn title_membership_probe() {
+    TITLE_REFRESH.with(|c| {
+        let mut work = c.get();
+        work.membership_probes += 1;
+        c.set(work);
+    });
+}
 pub(crate) fn title_drift_tab_visited() {
     TITLE_REFRESH.with(|c| {
         let mut v = c.get();

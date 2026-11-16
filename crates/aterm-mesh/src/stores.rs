@@ -135,7 +135,10 @@ pub trait Stores: Send + Sync {
         let tables = self.tables()?;
         let mut out = Vec::with_capacity(tables.len());
         for table in tables {
-            let ids = self.table_inventory(table)?.unwrap_or_default();
+            let ids = self
+                .table_inventory(table)?
+                .map(|held| held.ids().copied().collect())
+                .unwrap_or_default();
             let proofs = self.table_proofs(table)?.unwrap_or_default();
             out.push((table, ids, proofs));
         }
@@ -165,10 +168,18 @@ pub trait Stores: Send + Sync {
     /// Where the stores cannot be read.
     fn takes(&self, table: Digest) -> io::Result<bool>;
 
-    /// The digests of the operations `table`'s store holds, `None` where this Mac holds none.
+    /// The digests of the operations `table`'s store holds, as a range reconciliation snapshot
+    /// over its causal index (`aterm_db::replica::Snapshot`), `None` where this Mac holds none.
     /// # Errors
     /// Where the store cannot be read.
-    fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>>;
+    fn table_inventory(&self, table: Digest) -> io::Result<Option<aterm_db::replica::Snapshot>>;
+
+    /// `ids` of `table` in causal order: a record follows every parent of it among `ids`, so a
+    /// neighbour sent them in this order never receives a child before a parent it is also being
+    /// sent.
+    /// # Errors
+    /// Where the store cannot be read.
+    fn table_order(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Digest>>;
 
     /// The wires of the operations `ids` of `table` that its store holds.
     /// # Errors

@@ -30,11 +30,11 @@ mod watch;
 
 #[path = "app_restore_document.rs"]
 mod restore_document;
-pub(crate) use restore_document::{RestoreAdmitted, RestoreDocumentAdmission};
+#[cfg(test)]
+pub(crate) use restore_document::with_headless_restore_admission_for_test;
 #[cfg(all(test, unix))]
-pub(crate) use restore_document::{
-    with_headless_restore_admission_for_test, with_restore_read_gate_for_test,
-};
+pub(crate) use restore_document::with_restore_read_gate_for_test;
+pub(crate) use restore_document::{RestoreAdmitted, RestoreDocumentAdmission};
 
 #[path = "app_document_preparation.rs"]
 mod preparation;
@@ -1667,8 +1667,9 @@ impl App {
             .snapshot(document)
             .ok_or_else(|| "native config document disappeared during reveal".to_string())?;
         let decision = config_editor_reveal_decision(&snapshot.text, target)?;
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return Err("native config editor view disappeared during reveal".to_string());
         };
@@ -1709,6 +1710,7 @@ impl App {
                     state.reveal_status = Some(note);
                     return Ok(());
                 };
+                drop(route_native_guard);
                 let _ = self.dispatch_editor_event(
                     instance,
                     view,
@@ -1719,8 +1721,9 @@ impl App {
                     .snapshot(document)
                     .ok_or_else(|| "native config document disappeared during reveal".to_string())?
                     .text;
+                let mut route_native_guard = self.native_runtime.view_state_mut(view);
                 let Some(crate::native_app::AppViewState::Editor(state)) =
-                    self.native_runtime.view_state_mut(view)
+                    route_native_guard.as_deref_mut()
                 else {
                     return Err("native config editor view disappeared during reveal".to_string());
                 };
@@ -1961,7 +1964,8 @@ impl App {
                 &mut self.editor_workspace,
                 &mut self.document_store,
             );
-            let Some(AppViewState::Editor(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
                 return Err("editor view state disappeared".to_string());
             };
             let Some(buffer) = state.buffer.as_mut() else {
@@ -2244,7 +2248,8 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             for view in document_views {
-                if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+                if let Some(AppViewState::Editor(state)) =
+                    self.native_runtime.view_state_mut(view).as_deref_mut()
                 {
                     for (seq, deltas) in &commits {
                         if view != source_view
@@ -3346,15 +3351,19 @@ impl App {
                 self.save_document_checkpoint(document, source_view)?;
             }
             EditorEffect::Status(message) => {
-                if let Some(AppViewState::Editor(state)) =
-                    self.native_runtime.view_state_mut(source_view)
+                if let Some(AppViewState::Editor(state)) = self
+                    .native_runtime
+                    .view_state_mut(source_view)
+                    .as_deref_mut()
                 {
                     state.status = Some(message);
                 }
             }
             EditorEffect::Bell => {
-                if let Some(AppViewState::Editor(state)) =
-                    self.native_runtime.view_state_mut(source_view)
+                if let Some(AppViewState::Editor(state)) = self
+                    .native_runtime
+                    .view_state_mut(source_view)
+                    .as_deref_mut()
                 {
                     state.status = None;
                 }
@@ -3363,8 +3372,10 @@ impl App {
                 self.switch_to_open_editor_buffer(source_view, &query);
             }
             EditorEffect::ShowCommands => {
-                if let Some(AppViewState::Editor(state)) =
-                    self.native_runtime.view_state_mut(source_view)
+                if let Some(AppViewState::Editor(state)) = self
+                    .native_runtime
+                    .view_state_mut(source_view)
+                    .as_deref_mut()
                 {
                     state.status = Some("Type a command name".to_string());
                 }
@@ -3430,7 +3441,9 @@ impl App {
             "editor: {:?} refused: {refusal}",
             crate::command_registry::editor_command(command)
         );
-        if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+        if let Some(AppViewState::Editor(state)) =
+            self.native_runtime.view_state_mut(view).as_deref_mut()
+        {
             state.status = Some(refusal.clone());
             state.common.presentation_revision =
                 state.common.presentation_revision.saturating_add(1);
@@ -3513,7 +3526,7 @@ impl App {
         if target_view == source_view {
             return;
         }
-        let source = self.windows.iter_mut().find_map(|(wid, ws)| {
+        let source = self.windows.iter_mut().find_map(|(wid, mut ws)| {
             let tab = ws
                 .tab_set
                 .tabs()
@@ -3542,7 +3555,8 @@ impl App {
                     return;
                 }
             };
-        let focused = self.windows.get_mut(&wid).is_some_and(|window| {
+        let focused = self.windows.get_mut(&wid).is_some_and(|mut window| {
+            let window = &mut **window;
             let focused = window.tab_set.switch_to_index(index)
                 && window
                     .tab_set
@@ -3654,7 +3668,9 @@ impl App {
     }
 
     pub(crate) fn set_editor_view_status(&mut self, view: crate::tab_model::ViewId, message: &str) {
-        if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+        if let Some(AppViewState::Editor(state)) =
+            self.native_runtime.view_state_mut(view).as_deref_mut()
+        {
             state.status = Some(message.to_string());
         }
     }
@@ -3925,7 +3941,9 @@ impl App {
 
         let views = self.document_native_views(document);
         for (_, _, view) in &views {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(*view) {
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(*view).as_deref_mut()
+            {
                 if let Some(buffer) = state.buffer.as_mut() {
                     buffer.observe_external(seq, &deltas);
                 }
@@ -3997,19 +4015,51 @@ impl App {
         )
     }
 
-    /// File > Save follows the active editor's own Save command.
+    /// File > Save follows the active editor's own Save command; on the Tables page it is
+    /// Write, while cells are staged that a Write would send.
     pub(crate) fn can_save_document(&self, wid: WindowId) -> bool {
         let Some((instance, view)) = self.active_native_view(wid) else {
             return false;
         };
-        matches!(
-            (
-                self.native_runtime.app(instance),
-                self.native_runtime.view_state(view)
-            ),
-            (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state)))
-                if editor.can_save(state)
-        )
+        match (
+            self.native_runtime.app(instance),
+            self.native_runtime.view_state(view),
+        ) {
+            (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state))) => {
+                editor.can_save(state)
+            }
+            (Some(NativeApp::Tables(tables)), Some(AppViewState::Tables(state))) => {
+                tables.can_save(state)
+            }
+            _ => false,
+        }
+    }
+
+    /// Press Write on the Tables page in front of `wid`, where there is something to write:
+    /// what File ▸ Save and its key do there. Whether the page took it.
+    pub(crate) fn write_front_tables(&mut self, wid: WindowId) -> bool {
+        let tables = self
+            .active_native_view(wid)
+            .is_some_and(|(instance, view)| {
+                matches!(
+                    (
+                        self.native_runtime.app(instance),
+                        self.native_runtime.view_state(view),
+                    ),
+                    (Some(NativeApp::Tables(tables)), Some(AppViewState::Tables(state)))
+                        if tables.can_save(state)
+                )
+            });
+        tables
+            && self
+                .dispatch_native_event(
+                    wid,
+                    AppEvent::Action(crate::native_app::ActionInvocation {
+                        id: crate::native_ui::ActionId::new(crate::native_tables::WRITE),
+                        value: None,
+                    }),
+                )
+                .is_ok()
     }
 
     /// Why the save of `document` now is refused ([`crate::owner_keys_save`]): it is the
@@ -4043,6 +4093,9 @@ impl App {
             .frontmost_window
             .filter(|&wid| self.can_save_document(wid))
             .ok_or_else(|| "Save is disabled for the active content".to_string())?;
+        if self.write_front_tables(wid) {
+            return Ok(());
+        }
         self.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::Save))
             .map(|_| ())
     }
@@ -4578,7 +4631,8 @@ impl App {
         let Some(document) = self.native_runtime.document_id(native.instance) else {
             return true;
         };
-        let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             return true;
         };
         let Some(buffer) = state.buffer.as_mut() else {
@@ -4594,6 +4648,7 @@ impl App {
         if let Err(refusal) = &committed {
             state.status = Some(format!("The cell stays open: {refusal}"));
         }
+        drop(route_native_guard);
         self.native_runtime.set_editor_history_availability(
             document,
             self.editor_workspace.can_undo(document),
@@ -4690,7 +4745,7 @@ impl App {
                     .is_some_and(|window| window.tab_set.get(close.tab).is_some())
                 {
                     if let Some(active) = active
-                        && let Some(window) = self.windows.get_mut(&window)
+                        && let Some(mut window) = self.windows.get_mut(&window)
                     {
                         window.tab_set.switch_to(active);
                     }
@@ -4713,6 +4768,7 @@ impl App {
                 let removed = self
                     .windows
                     .get_mut(&window)
+                    .as_deref_mut()
                     .and_then(|window| {
                         let index = window
                             .tab_set
@@ -5317,17 +5373,25 @@ impl App {
     fn mark_document_shutdown_failure(&mut self, document: DocumentId, message: &str) {
         let _ = self.document_store.checkpoint_fail(document);
         for (window, _, view) in self.document_native_views(document) {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
+            {
                 state.status = Some(message.to_string());
             }
-            if let Some(presentation) = self.windows.get_mut(&window).and_then(|state| {
-                let index = state
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .position(|tab| tab.root.contains(view))?;
-                state.tab_set.presentation_at_mut(index)
-            }) {
+            if let Some(route_guard_presentation) = self
+                .windows
+                .get_mut(&window)
+                .as_deref_mut()
+                .and_then(|state| {
+                    let index = state
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .position(|tab| tab.root.contains(view))?;
+                    state.tab_set.presentation_at_mut(index)
+                })
+            {
+                let presentation = &mut *route_guard_presentation;
                 presentation.indicators.attention = true;
                 presentation.tooltip = Some(message.to_string());
             }
@@ -5340,7 +5404,9 @@ impl App {
         self.set_document_recovery_status(document, None);
         let dirty = self.document_store.dirty(document).unwrap_or(false);
         for (window, _, view) in self.document_native_views(document) {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
+            {
                 state.status = Some(if dirty {
                     "Modified · newer changes are not saved".to_string()
                 } else {
@@ -5348,14 +5414,20 @@ impl App {
                 });
             }
             let edit_mark = self.edit_attention_in_tab_of(window, view);
-            if let Some(presentation) = self.windows.get_mut(&window).and_then(|state| {
-                let index = state
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .position(|tab| tab.root.contains(view))?;
-                state.tab_set.presentation_at_mut(index)
-            }) {
+            if let Some(route_guard_presentation) = self
+                .windows
+                .get_mut(&window)
+                .as_deref_mut()
+                .and_then(|state| {
+                    let index = state
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .position(|tab| tab.root.contains(view))?;
+                    state.tab_set.presentation_at_mut(index)
+                })
+            {
+                let presentation = &mut *route_guard_presentation;
                 presentation.indicators.attention = edit_mark;
             }
             self.request_native_redraw(window);
@@ -5742,7 +5814,8 @@ impl App {
             crate::native_markdown::local_anchor(&parsed, &format!("#{fragment}"))
                 .ok_or_else(|| format!("the linked heading #{fragment} was not found"))?
         };
-        let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             return Err("the linked document is not an editor workspace".into());
         };
         let workspace = state
@@ -5778,6 +5851,7 @@ impl App {
             .visit(crate::native_markdown::MarkdownLocation::new(offset, 0));
         state.common.retire_input();
         state.common.presentation_revision = state.common.presentation_revision.saturating_add(1);
+        drop(route_native_guard);
         self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
         self.refresh_native_presentation(wid, instance, view);
         self.request_native_redraw(wid);
@@ -5818,8 +5892,9 @@ impl App {
         let offset = crate::path_link::line_col_offset(&snapshot.text, reveal.line, reveal.col);
         self.native_runtime
             .set_editor_markdown_mode(instance, view, MarkdownWorkspaceMode::Edit);
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return Ok(());
         };
@@ -5832,6 +5907,7 @@ impl App {
         buffer.clear_minibuffer();
         buffer.ensure_primary_visible(&snapshot.text, buffer.viewport_lines());
         state.status = Some(format!("Line {}", reveal.line));
+        drop(route_native_guard);
         for (window, instance, view) in self.document_native_views(document) {
             self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
             self.refresh_native_presentation(window, instance, view);
@@ -6126,7 +6202,8 @@ impl App {
             .snapshot(document)
             .ok_or("directory disappeared")?;
         for (view, point) in points {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
                 && let Some(buffer) = &mut state.buffer
             {
                 buffer.observe_external(snapshot.seq, &deltas);
@@ -7052,7 +7129,7 @@ impl App {
                     state.page = 0;
                     state.notice = Some(STILL_COULD_NOT_OPEN.to_string());
                 });
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
                 ws.tab_set.switch_to(tab);
                 if let Some(target) = ws.tab_set.active_mut() {
                     target.set_focus(view);
@@ -7184,7 +7261,7 @@ impl App {
             return;
         }
         if !matches!(placement, Placement::NewTabAfter { .. })
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
             && let Some(index) = ws.tab_set.tabs().iter().position(|tab| tab.id == failure)
         {
             ws.tab_set.place(installed.tab, index);
@@ -7606,7 +7683,8 @@ impl App {
                 );
                 self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
             }
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.tab_set.switch_to(tab);
                 if let Some(target) = ws.tab_set.active_mut() {
                     target.set_focus(view);
@@ -7699,7 +7777,8 @@ impl App {
             self.document_store.dirty(document).unwrap_or(false),
         );
         if let Some(listing) = self.document_store.directory(document)
-            && let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+            && let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
             && let Some(buffer) = &mut state.buffer
         {
             buffer.selections = vec![crate::native_editor::Selection::caret(
@@ -7827,8 +7906,8 @@ impl App {
                         .set_face(&self.document_store, &mut buffer, Some(delimiter))
                         .err()
                 });
-                let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
-                else {
+                let mut route_native_guard = self.native_runtime.view_state_mut(view);
+                let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
                     return Err("editor runtime view disappeared during attach".to_string());
                 };
                 state.buffer = Some(buffer);
@@ -7879,6 +7958,7 @@ impl App {
         } else {
             self.windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|ws| ws.tab_set.remove(tab))
         };
         if let Some(tab) = removed {
@@ -8040,7 +8120,8 @@ impl App {
     }
 
     pub(crate) fn request_native_redraw(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_present = None;
         }
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {

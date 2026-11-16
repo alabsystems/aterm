@@ -340,7 +340,8 @@ fn named_usage_refuses_reloaded_and_refreshed_email_changes() {
                     &format!("{base}/oauth/token"),
                     Duration::from_secs(60),
                     NOW,
-                    Some("alice@example.test")
+                    Some("alice@example.test"),
+                    None,
                 )
                 .is_none()
             );

@@ -35,14 +35,14 @@ pub(crate) const MAX_TABLES: usize = 63;
 /// them before any declaration in causal order (docs/DESIGN-alab-lab-model-2026-11-01.md
 /// §3.10): each registry generation this build compiles, since a roll restates one into the
 /// next and both hold storage until the storage release frees the sealed one ([`release`]).
-pub(crate) const RESERVED_SLOTS: usize = 3;
+pub(crate) const RESERVED_SLOTS: usize = 4;
 /// The slots of [`MAX_TABLES`] the catalog's declared tables share: the rest stay for the rings
 /// (`ring::RING_SLOTS`) and the reserved tables ([`RESERVED_SLOTS`]), whose storage never
 /// counts against these.
 pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS - RESERVED_SLOTS;
 
 /// The compiled tables that take the reserved slots: the lab registry's generations
-/// (`alab/registry`, `alab/registry.2` and `alab/registry.3`, each at version 1). Catalog slots otherwise go to
+/// (`alab/registry` and `alab/registry.2` to `.4`, each at version 1). Catalog slots otherwise go to
 /// declarations in causal order, so a new Mac that meets more subscribable declarations ahead of
 /// the registry than there are slots could never hold it, and the owner keeps adding Macs; a
 /// reserved table is subscribed whatever its causal order and whoever declared it, while there
@@ -121,10 +121,18 @@ pub struct Directory {
     trust: Trust,
     region: crate::table::store::Region,
 }
+/// The folder every Commons table's storage lies in, one folder a table: what
+/// [`Directory::new`] roots at, for a reader that sizes the tables without opening one (`sys
+/// disk`'s store lines).
+#[must_use]
+pub fn tables_root(paths: &Paths) -> PathBuf {
+    paths.dir.join("commons/tables")
+}
+
 impl Directory {
     pub fn new(paths: &Paths, trust: Trust) -> Self {
         Self {
-            root: paths.dir.join("commons/tables"),
+            root: tables_root(paths),
             trust,
             region: crate::table::store::Region::Primary,
         }
@@ -198,13 +206,12 @@ impl Directory {
     }
 
     /// [`Self::observe_table`] for the one read that answers a fenced home's displaced table
-    /// from the records it holds ([`Self::observe_displaced`]): the declared-table read
-    /// `documents::application::observe_store_if_here` makes. Every other reader takes
-    /// `observe_table` and refuses such a table.
+    /// from the records it holds ([`Self::observe_held`]), as a bound table is answered: the
+    /// declared-table read `documents::application::observe_store_if_here` makes. Every other
+    /// reader takes `observe_table` and refuses such a table.
     ///
     /// # Errors
-    /// As [`Self::observe_table`], but for what [`Self::observe_displaced`] answers; where that
-    /// read was tried and refused, the ordinary refusal with the held read's as context.
+    /// As [`Self::observe_table`], but for what [`Self::observe_held`] answers or refuses.
     pub(crate) fn observe_held_table(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
         match self.observe_table_if_exists_as(session, scope, true)? {
             Some(store) => Ok(store),
@@ -257,11 +264,8 @@ impl Directory {
         self.observe_table_if_exists_as(session, scope, false)
     }
 
-    /// [`Self::observe_table_if_exists`]; and where `held`, a primary observation that refuses,
-    /// for which no recovery replica answers, is tried as a fenced home's displaced table
-    /// ([`Self::observe_displaced`]), unless the recovery replica's own observation was busy:
-    /// that read is busy too, since the replica may answer the next one. What a recovery replica
-    /// answers is the same either way.
+    /// [`Self::observe_table_if_exists`]; and where `held`, a primary observation that refuses
+    /// is answered by [`Self::observe_held`].
     fn observe_table_if_exists_as(
         &self,
         session: &Session<'_>,
@@ -288,51 +292,87 @@ impl Directory {
             }
             Ok(None) => Ok(None),
             Err(error) if self.is_recovery() || error.is_busy() => Err(error),
+            Err(original) if held => self.observe_held(session, scope, original).map(Some),
             Err(original) => match self.recovery().observe_store_if_exists(session, scope) {
                 Ok(Some(store)) => Ok(Some(store)),
-                Err(error) if held && error.is_busy() => Err(error),
-                _ if held => Self::observe_displaced(session, scope, original).map(Some),
                 _ => Err(original),
             },
+        }
+    }
+
+    /// The held read of the session's own primary table `scope`, whose ordinary observation
+    /// refused with `original` (not busy). Where the table's witnessed prefix reads
+    /// ([`Self::observe_displaced`]), it stands for the primary, and the answer is the one a
+    /// bound primary gets: combined with the table's recovery replica where one is enrolled
+    /// (the replica may hold records the prefix lacks, and the prefix records the replica
+    /// lacks), the prefix alone where none is, and for the catalog the prefix alone, since a
+    /// bound catalog is never combined. Where the prefix does not read, the answer is the
+    /// strict read's: the recovery replica, where one answers.
+    ///
+    /// # Errors
+    /// Where the prefix reads: the replica's busy observation, as it is (the next read may be
+    /// answered); a replica that refuses otherwise, as `original` with the replica's refusal as
+    /// context, since the prefix alone is not the whole table (it reads once the replica does,
+    /// or once the writer succession's import, which reads both, completes); and what the
+    /// combined view refuses (the two disagree, or exceed the table's bounds), as a strict read
+    /// beside a bound primary does. Where it does not: busy, where the held read is, or where
+    /// the replica's observation is; otherwise where no replica answers, `original`, as it is
+    /// where the home has no selection and nothing else fences it (no succession was reserved
+    /// there) or the table's claim is pending or holds its folder (nothing is displaced: the
+    /// ordinary refusal was of something else), or where the held read refuses in its words;
+    /// and `original` with the held read's refusal as context where that refusal is another
+    /// ([`Self::observe_displaced`]'s errors).
+    fn observe_held(&self, session: &Session<'_>, scope: Scope, original: Error) -> Result<Store> {
+        let refused = match Self::observe_displaced(session, scope) {
+            Ok(Some(primary)) if scope == self.catalog_scope() => return Ok(primary),
+            Ok(Some(primary)) => {
+                return match self.recovery().observe_store_if_exists(session, scope) {
+                    Ok(Some(recovery)) => recovery.with_observed_primary(session, primary),
+                    Ok(None) => Ok(primary),
+                    Err(replica) if replica.is_busy() => Err(replica),
+                    Err(replica) => Err(original.context(&format!(
+                        "the held read of this table refused: its recovery replica, which may \
+                         hold records the displaced primary's prefix lacks, refused ({replica}); \
+                         the table reads once that replica does, or once the writer \
+                         succession's import, which reads both, completes"
+                    ))),
+                };
+            }
+            Ok(None) => original,
+            Err(held) if held.is_busy() => return Err(held),
+            Err(held) if held.0 == original.0 => original,
+            Err(held) => original.context(&format!("the held read of this table refused ({held})")),
+        };
+        match self.recovery().observe_store_if_exists(session, scope) {
+            Ok(Some(store)) => Ok(store),
+            Err(replica) if replica.is_busy() => Err(replica),
+            _ => Err(refused),
         }
     }
 
     /// The session's own primary table `scope`, read from its witnessed prefix where its
     /// directory binding was lost to a relocation and its home is a fenced original whose
     /// selection record holds no completion and that holds no completion mark
-    /// ([`Store::observe_displaced`], [`crate::generation::Preserving`]); `original` is what the ordinary observation of it
-    /// refused with, no recovery replica having answered. The read is of the table's folder in
-    /// the session's own home, which `Store::observe_displaced` names itself.
+    /// ([`Store::observe_displaced`], [`crate::generation::Preserving`]). The read is of the
+    /// table's folder in the session's own home, which `Store::observe_displaced` names itself.
+    /// `None` where the home has no selection and nothing else fences it (no succession was
+    /// reserved there), or where the table's claim is pending or holds its folder (nothing is
+    /// displaced).
     ///
     /// # Errors
     /// The gate ([`crate::generation::Preserving::of`]) is asked first, of the home alone,
-    /// before anything knows whether the table is displaced. `original`, as it is, where the
-    /// home has no selection and nothing else fences it (no succession was reserved there); or
-    /// where the home's selection is the session's standing fence and the table's claim is
-    /// pending or holds its folder (nothing is displaced: the ordinary refusal was of something
-    /// else), or the held open refuses in the ordinary refusal's words. `original` with the
-    /// refusal as context where the gate refuses, whatever the ordinary refusal was of, a
-    /// table that is not displaced included (a fenced home whose selection record is missing; a
+    /// before anything knows whether the table is displaced, and refuses whatever the table is,
+    /// one that is not displaced included: a fenced home whose selection record is missing; a
     /// selection that completed or names another writer or lab; a home that holds a completion
     /// mark; a selection, the mark, or where there is no selection the reservation or the
-    /// candidate link, that cannot be read), or where the held open
-    /// refuses otherwise (a prefix the claim does not witness, a record that does not
-    /// authenticate). Busy, where the held open is, or what it stood on moved while it read.
-    fn observe_displaced(session: &Session<'_>, scope: Scope, original: Error) -> Result<Store> {
-        let held = crate::generation::Preserving::of(session).and_then(|held| {
-            held.map_or(Ok(None), |held| {
-                Store::observe_displaced(session, scope, held)
-            })
-        });
-        match held {
-            Ok(Some(store)) => Ok(store),
-            Ok(None) => Err(original),
-            Err(held) if held.is_busy() => Err(held),
-            Err(held) if held.0 == original.0 => Err(original),
-            Err(held) => {
-                Err(original.context(&format!("the held read of this table refused ({held})")))
-            }
-        }
+    /// candidate link, that cannot be read. Then the held open refuses: a prefix the claim does
+    /// not witness, a record that does not authenticate, or a refusal in the ordinary
+    /// observation's words. Busy, where the held open is, or what it stood on moved while it
+    /// read.
+    fn observe_displaced(session: &Session<'_>, scope: Scope) -> Result<Option<Store>> {
+        crate::generation::Preserving::of(session)?.map_or(Ok(None), |held| {
+            Store::observe_displaced(session, scope, held)
+        })
     }
 
     fn join_store(&self, session: &Session<'_>, path: &Path, scope: Scope) -> Result<Store> {

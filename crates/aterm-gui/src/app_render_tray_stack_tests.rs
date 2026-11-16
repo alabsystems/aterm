@@ -782,11 +782,12 @@ fn metal_deck_app(scale: f64) -> (crate::App, crate::WindowId) {
         app.config.window_padding_or_default(),
         app.config.window_padding_top_or_default(),
     );
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.scale = scale;
     ws.metrics = crate::MetricsView::for_scale_padded(size, scale, pad, pad_top);
+    drop(ws);
     let (_, cell) = app.win_cell_size(wid);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.head = crate::stats_deck::reserved_deck_px(
         crate::stats_deck::StatsBars::Deck,
         ws.deck_form,
@@ -805,6 +806,7 @@ fn metal_deck_app(scale: f64) -> (crate::App, crate::WindowId) {
         aterm_spec::host::could_not_run(format_args!("this GPU folds no tray stack"));
     }
     app.backend = crate::BackendSlot::Ready(crate::Backend::Gpu(crate::GpuBackend::new(renderer)));
+    drop(ws);
     app.bind_window_renderer_state(wid);
     app.windows.get_mut(&wid).expect("the window").present = Some(crate::PresentTarget::Virtual {
         window_gpu: WindowGpu::new(),
@@ -1023,8 +1025,9 @@ fn overlay_only_present_cost() {
     let _attached = crate::stats_deck::tests::attach_stats();
     let (mut app, wid) = metal_deck_app(2.0);
     // The harness's window (design §6.1): 110×32 cells at 2×.
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     (ws.cols, ws.rows) = (110, 32);
+    drop(ws);
     for _ in 0..4 {
         app.redraw_window(wid);
     }

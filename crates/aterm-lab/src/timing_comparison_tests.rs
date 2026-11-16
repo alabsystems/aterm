@@ -475,6 +475,15 @@ fn memory_record_refuses_nonpositive_insufficient_unknown_and_unbound_components
             .bytes,
         4096
     );
+    // Even an internally consistent old tab-count record cannot be relabeled as a
+    // real-window capture. The reader checks each capture's case, not just its hash.
+    for case in ["windows1", "windows2", "windows8"] {
+        let mut real_windows = experiment_fixture(&builds, "experiment");
+        real_windows.case = case.into();
+        assert!(Memory::read(record.clone(), &real_windows).is_err());
+        real_windows.key = crate::measure::sha256(case);
+        assert!(Memory::read(record.clone(), &real_windows).is_err());
+    }
     for semantics in [
         aterm_json::Value::Null,
         aterm_json::json!("old_atomic_pair"),

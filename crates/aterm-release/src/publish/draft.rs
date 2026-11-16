@@ -130,9 +130,10 @@ fn agrees(ctx: &CutCtx, draft: &Journal) -> Result<()> {
 
 /// The Windows declaration this cut makes (`declared`) is the one `draft` froze when it signed:
 /// neither declares a Windows zip, or both name one handoff directory, and a digest the cut
-/// names (`--windows-sha256`) is the one the draft's zip was bound to. The draft's signed bytes
-/// are the release's, and a cut adopting it takes its Windows handoff, so a declaration made
-/// after the draft would vanish without a word; it is refused, naming how the draft leaves.
+/// names (`--windows-sha256`) is the one the draft's zip was bound to, and an attestation it
+/// names (`--windows-attested`) is what bound the draft's. The draft's signed bytes are the
+/// release's, and a cut adopting it takes its Windows handoff, so a declaration made after the
+/// draft would vanish without a word; it is refused, naming how the draft leaves.
 fn windows_agrees(
     ctx: &CutCtx,
     declared: Option<&buildplan::windows::Handoff>,
@@ -144,18 +145,20 @@ fn windows_agrees(
     let same_digest = declared
         .and_then(|handoff| handoff.sha256.as_ref())
         .is_none_or(|named| frozen.and_then(|handoff| handoff.sha256.as_ref()) == Some(named));
-    if same_directory && same_digest {
+    let same_attestation = !declared.is_some_and(|handoff| handoff.attested)
+        || frozen.is_some_and(|handoff| handoff.attested);
+    if same_directory && same_digest && same_attestation {
         return Ok(());
     }
     let words = |handoff: Option<&buildplan::windows::Handoff>| {
         handoff.map_or_else(
             || "no Windows zip".to_string(),
             |handoff| {
-                let digest = handoff
-                    .sha256
-                    .as_ref()
-                    .map_or_else(String::new, |sha| format!(" (SHA-256 {sha})"));
-                format!("the Windows zip of {}{digest}", handoff.directory.display())
+                format!(
+                    "the Windows zip of {} ({})",
+                    handoff.directory.display(),
+                    handoff.anchor_words()
+                )
             },
         )
     };
@@ -320,7 +323,14 @@ pub(super) fn prepare(ctx: &mut CutCtx, opts: &CutOptions) -> Result<()> {
     let windows = opts
         .windows_artifacts
         .as_deref()
-        .map(|dir| buildplan::windows::Handoff::new(dir, opts.windows_sha256.as_deref()))
+        .map(|dir| {
+            buildplan::windows::Handoff::declared(
+                dir,
+                opts.windows_sha256.as_deref(),
+                opts.windows_attested,
+            )?
+            .attested_on(opts.windows_attested_on.as_deref())
+        })
         .transpose()?;
     if let Some(draft) = Journal::load(&path)? {
         agrees(ctx, &draft)?;

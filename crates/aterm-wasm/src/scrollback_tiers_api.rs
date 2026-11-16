@@ -129,13 +129,11 @@ web_terminal_impl!(bind);
 
 /// The pure JSON rendering.
 fn render_tier_capabilities_json(caps: aterm_core::scrollback::TierCapabilities) -> String {
-    let codec = match caps.cold_codec {
-        aterm_core::scrollback::ColdTierCodec::Lz4 => "lz4",
-    };
-    format!(
-        "{{\"coldCodec\":\"{codec}\",\"diskSpill\":{}}}",
-        caps.disk_spill
-    )
+    use aterm_core::scrollback::ColdTierCodec;
+    match (caps.cold_codec, caps.disk_spill) {
+        (ColdTierCodec::Lz4, false) => r#"{"coldCodec":"lz4","diskSpill":false}"#.to_owned(),
+        (ColdTierCodec::Lz4, true) => r#"{"coldCodec":"lz4","diskSpill":true}"#.to_owned(),
+    }
 }
 
 /// This crate's own tests of the surface.

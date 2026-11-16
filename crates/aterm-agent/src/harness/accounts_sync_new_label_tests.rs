@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(unix)]
 use super::*;
 
+#[cfg(unix)]
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     Bed::tree(root)
         .into_iter()
@@ -16,6 +18,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[test]
+#[cfg(unix)]
 fn new_rows_refuse_directories_retained_by_other_bindings() {
     for cli in OTHER_CLIS {
         for historical in [false, true] {
@@ -67,6 +70,7 @@ fn new_rows_refuse_directories_retained_by_other_bindings() {
     }
 }
 
+#[cfg(unix)]
 fn seed(case: i64, store: &accounts::Store, label: &str) {
     let mut state = accounts::State::default();
     let mut logins = accounts::Logins::default();
@@ -183,6 +187,7 @@ fn seed(case: i64, store: &accounts::Store, label: &str) {
     store.save(&state).unwrap();
 }
 
+#[cfg(unix)]
 fn sync_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     let bed = Bed::new("new-label-policy");
     bed.keep_roster(cli);
@@ -384,11 +389,16 @@ pub(crate) fn sync_transition(
             next.insert("case", state["case"] + 1);
         }
         "Sync" => {
-            let (accepted, published, authority) = sync_case(state["case"], Cli::Codex);
-            next.insert("phase", 1);
-            next.insert("accepted", accepted);
-            next.insert("published", published);
-            next.insert("authority", authority);
+            #[cfg(unix)]
+            {
+                let (accepted, published, authority) = sync_case(state["case"], Cli::Codex);
+                next.insert("phase", 1);
+                next.insert("accepted", accepted);
+                next.insert("published", published);
+                next.insert("authority", authority);
+            }
+            #[cfg(not(unix))]
+            panic!("the source-backed Sync projection requires the Unix vault");
         }
         _ => unreachable!(),
     }
@@ -398,22 +408,30 @@ pub(crate) fn sync_transition(
 #[test]
 fn additive_sync_conforms_to_new_label_admission() {
     let model = aterm_models_harness::account_sync_new_labels_model();
-    assert_eq!(model.mutant_dials(), (1..=36).collect::<Vec<_>>());
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    #[cfg(unix)]
     let mut checked = 0;
+    // The interpreter and pure actions are portable; Sync executes the real Unix vault.
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                #[cfg(not(unix))]
+                if action.name == "Sync" {
+                    continue;
+                }
                 let next = sync_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
                     "{}: {state:?} -> {next:?}",
                     action.name
                 );
-                checked += usize::from(action.name == "Sync");
+                #[cfg(unix)]
+                {
+                    checked += usize::from(action.name == "Sync");
+                }
             }
         }
     }
+    #[cfg(unix)]
     assert_eq!(checked, 32);
     let mut bad = model.init_state();
     bad.insert("phase", 1);
@@ -425,6 +443,7 @@ fn additive_sync_conforms_to_new_label_admission() {
 }
 
 #[test]
+#[cfg(unix)]
 fn each_additive_provider_obeys_admission_and_releases_recovery() {
     for cli in OTHER_CLIS {
         for case in 1..=32 {

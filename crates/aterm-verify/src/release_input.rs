@@ -6,7 +6,7 @@
 
 use crate::release_input_facts::Facts;
 use crate::{Ctx, EnvSnapshot, Show, checks::Check};
-use aterm_types::land_trailer::{Checked, Stated};
+use aterm_land_trailer::{Checked, Stated};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
@@ -312,7 +312,7 @@ fn remaining_paths(
 /// `rev` as the commit it names now; an object ID is its own name. Everything after this
 /// asks about that one commit, whatever a ref does meanwhile.
 fn commit_id(root: &Path, path: &OsStr, rev: &str) -> Result<String, String> {
-    if aterm_types::land_trailer::object_id(rev) {
+    if aterm_land_trailer::object_id(rev) {
         return Ok(rev.to_owned());
     }
     let commit = format!("{rev}^{{commit}}");
@@ -409,8 +409,15 @@ fn discover_with(
         question.extend([parent.as_bytes(), onto.as_bytes(), tree.as_bytes()]);
         facts
             .answer(&question, &[parent, onto, tree], || {
-                crate::land::receipt_composition(root, path, parent, onto, tree)
-                    .map(|holds| if holds { "holds" } else { "refused" }.to_owned())
+                #[cfg(unix)]
+                let holds = crate::land::receipt_composition(root, path, parent, onto, tree);
+                // `verify land`, whose rule this is, builds on unix only: off unix no
+                // composition is established here, so the receipt grants no coverage.
+                #[cfg(not(unix))]
+                let holds: Result<bool, String> = Err(
+                    "the landing's composition rule (`verify land`) is judged on unix only".into(),
+                );
+                holds.map(|holds| if holds { "holds" } else { "refused" }.to_owned())
             })
             .is_ok_and(|answer| answer == "holds")
     };

@@ -1258,3 +1258,154 @@ fn a_record_beside_a_slot_is_read_found_and_pruned_by_its_own_path() {
     let never = lane_record("t", "never", "red", old);
     assert!(!published(&one, after.as_deref(), &never, deadline()).unwrap());
 }
+
+#[test]
+fn journal_timeout_does_not_spawn_after_the_inherited_budget_expires() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let sentinel = "journal-argument-and-input-sentinel";
+    // A spawn would fail with NotFound. Expiry must instead retain the owned-input
+    // pre-start facts without running or naming this nonexistent command.
+    for watching in [false, true] {
+        let check = || {
+            let mut cmd = aterm_uds::spawnfd::command(dir.path().join(sentinel));
+            cmd.arg(sentinel);
+            let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            let why = capture_until(&mut cmd, Some(sentinel.as_bytes()), expired).unwrap_err();
+            assert!(why.contains("inherited_remaining_ms=0"), "{why}");
+            assert!(why.contains("return_elapsed_ms="), "{why}");
+            assert!(!why.contains(sentinel), "{why}");
+            why
+        };
+        let why = if watching {
+            interruptible(check)
+        } else {
+            check()
+        };
+        assert!(why.contains("not-started"), "{why}");
+    }
+}
+
+#[test]
+fn journal_timeout_read_context_survives_a_transport_failure() {
+    use std::cell::Cell;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let sentinel = "journal-remote-name-sentinel";
+    let mut diagnostics = std::collections::BTreeSet::new();
+    for context in [
+        ReadContext::Read,
+        ReadContext::AppendHead,
+        ReadContext::AfterPushFailure,
+    ] {
+        let calls = Cell::new(0);
+        let run = |_, _: &[std::ffi::OsString]| {
+            calls.set(calls.get() + 1);
+            Err("controlled transport failure".into())
+        };
+        let why = read_head(dir.path(), sentinel, context, &run).unwrap_err();
+        assert_eq!(calls.get(), 1, "a failure starts no later read");
+        assert!(why.ends_with("controlled transport failure"), "{why}");
+        assert!(!why.contains(sentinel), "{why}");
+        diagnostics.insert(why);
+    }
+    assert_eq!(
+        diagnostics.len(),
+        3,
+        "ordinary reads, append heads and post-push rechecks must remain distinguishable"
+    );
+}
+
+#[test]
+fn journal_timeout_head_retains_an_already_exhausted_deadline() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    for context in [
+        ReadContext::Read,
+        ReadContext::AppendHead,
+        ReadContext::AfterPushFailure,
+    ] {
+        let why = head_in(dir.path(), "origin", expired, context).unwrap_err();
+        assert!(
+            why.contains("inherited_remaining_ms=0"),
+            "a journal read must not renew its inherited budget: {why}"
+        );
+        assert!(why.contains("not-started"), "{why}");
+    }
+}
+
+#[test]
+fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retries() {
+    use crate::remote::Tool;
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let parent = "1111111111111111111111111111111111111111";
+    let sha = "2222222222222222222222222222222222222222";
+    for code in [0, 9, 13] {
+        let pushes = Cell::new(0);
+        let reads = Cell::new(0);
+        let run = |tool, args: &[std::ffi::OsString]| {
+            let output = |code: i32, stdout: &[u8], stderr: &[u8]| std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.to_vec(),
+                stderr: stderr.to_vec(),
+            };
+            match tool {
+                Tool::Git => {
+                    let words: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+                    assert!(
+                        words == ["remote", "get-url", "--all", "origin"]
+                            || words == ["remote", "get-url", "--all", "--push", "origin"],
+                        "GitHub journal transport must not fall back to git: {words:?}"
+                    );
+                    Ok(output(0, b"https://github.com/fixture/repo.git\n", b""))
+                }
+                Tool::Agh if args.get(1).is_some_and(|word| word == "push") => {
+                    assert_eq!(pushes.replace(pushes.get() + 1), 0);
+                    assert_eq!(args[0], "repo");
+                    assert_eq!(args[2], "fixture/repo");
+                    let input = args.iter().position(|word| word == "--input").unwrap();
+                    let batch: aterm_json::Value = aterm_json::from_slice(
+                        &std::fs::read(Path::new(&args[input + 1])).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        batch,
+                        aterm_json::json!([{"ref":REF,"before":parent,"after":sha}])
+                    );
+                    Ok(output(code, b"", b"original push refusal"))
+                }
+                Tool::Agh => {
+                    reads.set(reads.get() + 1);
+                    Err("controlled head lookup failure".to_owned())
+                }
+            }
+        };
+        let result = push_journal(dir.path(), "origin", Some(parent), sha, &run);
+        assert_eq!(pushes.get(), 1);
+        if let Err(why) = &result {
+            assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
+            assert!(why.contains(&format!("journal_before={parent}")), "{why}");
+            assert!(why.contains(&format!("journal_after={sha}")), "{why}");
+        }
+        match code {
+            0 => {
+                assert_eq!(result, Ok(Some(sha.to_owned())));
+                assert_eq!(reads.get(), 0);
+            }
+            9 => {
+                let why = result.unwrap_err();
+                assert!(why.contains("original push refusal"), "{why}");
+                assert!(why.contains("controlled head lookup failure"), "{why}");
+                assert!(why.contains("journal-after-push-failure"), "{why}");
+                assert_eq!(reads.get(), 1);
+            }
+            13 => {
+                let why = result.unwrap_err();
+                assert!(why.contains("outcome unknown"), "{why}");
+                assert_eq!(reads.get(), 0, "unknown sends are never retried or raced");
+            }
+            _ => unreachable!(),
+        }
+    }
+}

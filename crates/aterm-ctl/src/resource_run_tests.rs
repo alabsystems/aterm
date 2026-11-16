@@ -44,6 +44,8 @@ fn registered_exec_fixture() {
             r#"printf 'RUN pid=%s stale=%s owner=%s arg=<%s>\n' "$$" "$ATERM_SESSION_ID" "$ATERM_PARENT_SESSION_ID" "$1"; exit 37"#
         }
         "fds" => r#"printf 'first-descriptor\n' >&3; printf 'second-descriptor\n' >&4; exit 37"#,
+        #[cfg(target_vendor = "apple")]
+        "reading" => "printf 'UNGUARDED-EXEC\\n'; exit 37",
         "signal" => {
             default_dispositions(&GROUP_STOPS);
             r#"trap 'printf "SIGNAL\n"; while read release && [ "$release" != release ]; do :; done; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request; done"#
@@ -66,11 +68,18 @@ fn registered_exec_fixture() {
     ]
     .map(OsString::from)
     .to_vec();
-    std::process::exit(if run_registered_command(args).is_ok() {
-        0
-    } else {
-        1
+    #[cfg(target_vendor = "apple")]
+    let reading = (mode == "reading").then(|| {
+        aterm_sysprobe::exec_gate::reading().expect("the fixture's exec gate starts open")
     });
+    let result = run_registered_command(args);
+    #[cfg(target_vendor = "apple")]
+    if mode == "reading" {
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        drop(reading);
+        std::process::exit(0);
+    }
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
 struct Host {
@@ -98,7 +107,7 @@ impl Host {
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
-            assert!(request.starts_with("@s-a resources register start="));
+            assert!(request.starts_with("@taxxxxxxxxx resources register start="));
             assert!(request.ends_with(" job=tree:program\n"));
             let pid = aterm_uds::fdpass::peer_pid(&stream).unwrap();
             let start = aterm_uds::process::read_process_start(i32::try_from(pid).unwrap())
@@ -112,7 +121,7 @@ impl Host {
             } else {
                 writeln!(
                     stream,
-                    "OK resources version=1 root_pid={pid} start={start} session=s-a"
+                    "OK resources version=1 root_pid={pid} start={start} session=taxxxxxxxxx"
                 )
                 .unwrap();
             }
@@ -139,8 +148,8 @@ impl Host {
         command
             .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
             .env(FIXTURE, format!("{}\n{mode}", self.sock.display()))
-            .env("ATERM_PARENT_SESSION_ID", "s-a")
-            .env("ATERM_SESSION_ID", "s-dead")
+            .env("ATERM_PARENT_SESSION_ID", "taxxxxxxxxx")
+            .env("ATERM_SESSION_ID", "tdeadxxxxxx")
             .env_remove("ATERM_CONTROL_SOCK")
             .env_remove("ATERM_CTL_TOKEN");
         command
@@ -155,11 +164,9 @@ fn exec_keeps_the_registered_identity_exact_arguments_environment_and_status() {
             .unwrap();
     assert_eq!(output.status.code(), Some(37));
     let peer = host.peer.recv_timeout(HANG).unwrap();
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains(&format!("RUN pid={peer} stale=s-dead owner=s-a arg=<>"))
-    );
+    assert!(String::from_utf8(output.stdout).unwrap().contains(&format!(
+        "RUN pid={peer} stale=tdeadxxxxxx owner=taxxxxxxxxx arg=<>"
+    )));
     host.done.join().unwrap();
 }
 
@@ -174,6 +181,22 @@ fn a_refused_registration_never_executes_the_command() {
         !String::from_utf8(output.stdout)
             .unwrap()
             .contains("RUN pid=")
+    );
+    host.done.join().unwrap();
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_registered_command_refuses_exec_while_its_process_read_is_unsettled() {
+    let host = Host::new(false);
+    let output =
+        aterm_uds::deadline::output_until(&mut host.command("reading"), Instant::now() + HANG)
+            .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("UNGUARDED-EXEC")
     );
     host.done.join().unwrap();
 }
@@ -260,8 +283,11 @@ fn exec_preserves_explicit_inherited_descriptors_above_stdio() {
     command.env_exactly([
         ("PATH".to_string(), "/usr/bin:/bin".to_string()),
         ("HOME".to_string(), host._dir.path().display().to_string()),
-        ("ATERM_PARENT_SESSION_ID".to_string(), "s-a".to_string()),
-        ("ATERM_SESSION_ID".to_string(), "s-dead".to_string()),
+        (
+            "ATERM_PARENT_SESSION_ID".to_string(),
+            "taxxxxxxxxx".to_string(),
+        ),
+        ("ATERM_SESSION_ID".to_string(), "tdeadxxxxxx".to_string()),
         (FIXTURE.to_string(), format!("{}\nfds", host.sock.display())),
     ]);
     let mut child = aterm_uds::spawnfd::spawn_with_two_fds(

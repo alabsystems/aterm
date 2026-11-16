@@ -62,7 +62,8 @@ impl App {
             return;
         };
         let staged = StagedNativeAccessibility::new(owners, projection);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.native_a11y_staged = Some(staged);
         }
     }
@@ -101,7 +102,8 @@ impl App {
             return;
         };
         let staged = StagedNativeAccessibility::new(owners, projection);
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.native_a11y_staged = Some(staged);
         }
     }
@@ -118,9 +120,10 @@ impl App {
     /// holds tells it the same way. An overlay's tree does not follow the page.
     #[cfg(a11y_tree)]
     pub(crate) fn publish_in_a_parked_window(&mut self, wid: WindowId, now: Instant) {
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         if window.overlay.is_some() || !window.a11y_active {
             return;
         }
@@ -132,6 +135,7 @@ impl App {
         window.a11y_parked_next = Some(next);
         window.a11y_parked_due = None;
         let staged = window.native_a11y_staged.is_some();
+        drop(route_guard_window);
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return;
         };
@@ -171,9 +175,10 @@ impl App {
                         .synchronized_output()
                 })
         });
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return true;
         };
+        let window = &mut **route_guard_window;
         let waits = open_update && !window.a11y_parked_held;
         window.a11y_parked_held = waits;
         if waits {
@@ -198,7 +203,7 @@ impl App {
             .windows
             .iter_mut()
             .filter(|(_, window)| window.a11y_parked_due.is_some_and(|at| at <= now))
-            .map(|(wid, window)| {
+            .map(|(wid, mut window)| {
                 window.a11y_parked_due = None;
                 *wid
             })
@@ -242,7 +247,7 @@ impl App {
         let staged = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.native_a11y_staged.take())
+            .and_then(|mut ws| ws.native_a11y_staged.take())
             .filter(|staged| {
                 self.windows
                     .get(&wid)
@@ -547,7 +552,8 @@ impl App {
                 (
                     usize::from(window.cols)
                         .saturating_mul(cw)
-                        .saturating_add(pad.saturating_mul(2)),
+                        .saturating_add(pad.saturating_mul(2))
+                        .saturating_add(self.win_side_inset_px(wid)),
                     self.native_content_origin_y(wid)
                         .saturating_add(usize::from(window.rows).saturating_mul(ch))
                         .saturating_add(pad),
@@ -564,13 +570,15 @@ impl App {
     }
 
     fn clear_staged_native_accessibility(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.native_a11y_staged = None;
         }
     }
 
     pub(crate) fn clear_native_accessibility_routes(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.native_a11y_staged = None;
             ws.native_a11y_published = None;
         }
@@ -614,6 +622,7 @@ impl App {
             let moved = self
                 .windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|window| window.tab_set.active_mut())
                 .is_some_and(|tab| tab.set_focus(owner.view));
             if !moved {

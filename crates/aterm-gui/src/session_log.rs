@@ -703,6 +703,10 @@ pub(crate) struct SessionLog {
     seq_ceiling: Option<u64>,
     restored_from: Option<ShortId>,
     lineage: Option<ShortId>,
+    /// The Unix ms at which this session's lineage first opened ([`Self::opened_ms`]): stamped
+    /// by the first open this log takes, else the carried log's own, and replaced by the time a
+    /// restore leaf carries ([`Self::seed_opened`]).
+    lineage_opened: Option<u64>,
     journal_start: Option<u64>,
     mirror_shared: Option<std::sync::Arc<crate::session_log_mirror::Shared>>,
     mirror_seen: u64,
@@ -720,6 +724,8 @@ pub(crate) struct SessionLog {
     ask: Option<AskedEnd>,
     /// The runs that left the front for the shell before the open command's D, at most [`LEFT_FRONT_MAX`].
     left_front: Vec<LeftFront>,
+    /// Where the log has read the engine's turn edges to ([`Self::program_cursor`]).
+    program_cursor: Option<aterm_core::terminal::program_state::TurnCursor>,
     /// The frame the next key lands on (fix E8, [`Self::note_frame`]).
     keys: keys::KeyWitness,
     /// Where the session's tab took its place, as its `tab act=open` said ([`tab::TabPlace`]).
@@ -802,6 +808,7 @@ impl SessionLog {
             seq_ceiling: None,
             restored_from: None,
             lineage: None,
+            lineage_opened: None,
             journal_start: None,
             mirror_shared: None,
             mirror_seen: 0,
@@ -815,6 +822,7 @@ impl SessionLog {
             front_pgid: 0,
             ask: None,
             left_front: Vec::new(),
+            program_cursor: None,
             keys: keys::KeyWitness::default(),
             tab: None,
             spend: tab::TabSpend::default(),
@@ -1206,6 +1214,7 @@ impl SessionLog {
         self.front_pgid = 0;
         self.ask = None;
         self.left_front.clear();
+        self.program_cursor = None;
     }
 
     /// This session is a restore's new shell, standing in for `prev` (the session its leaf was, when the leaf names one), whose chain of restores began at `lineage` (`prev` itself when none is named).
@@ -1241,6 +1250,29 @@ impl SessionLog {
         self.lineage
     }
 
+    /// The time a restore leaf carries for this session's lineage's first open
+    /// (`TerminalLeafRestore::opened_ms`): it replaces the time this log stamped, before or after
+    /// its open, since a cold restore, a seamless update or a reopened tab makes a new shell or
+    /// log for a session whose chain began before it, and the age a reader computes is the
+    /// chain's (`docs/DESIGN-comprehension-2026-11-14.md` §2.2). `None`, a leaf from a build
+    /// before the field, and `0`, a time no clock gave, change nothing: the session then keeps
+    /// what this log already holds, the earliest time aterm knows: its own open (a cold
+    /// restore's new shell, or a handoff whose log did not carry), or the carried log's open
+    /// (`adopt_carried`).
+    pub(crate) fn seed_opened(&mut self, opened_ms: Option<u64>) {
+        if let Some(ms) = opened_ms.filter(|&ms| ms > 0) {
+            self.lineage_opened = Some(ms);
+        }
+    }
+
+    /// `opened_ms=`: the Unix ms at which this session's lineage first opened, as a restore leaf
+    /// carried it ([`Self::seed_opened`]), else this log's first open, else the open of the log a
+    /// seamless update carried; `None` before the log opened. The age is not kept: a reader
+    /// computes it, now minus this.
+    pub(crate) const fn opened_ms(&self) -> Option<u64> {
+        self.lineage_opened
+    }
+
     /// `open - spawn|adopt|restore parent=<sid> epoch=<ep> state=<w>`: the registry took the session in, in lifecycle state `state`.
     pub(crate) fn open_session(&mut self, parent: Option<&str>, state: Option<&str>, at: Stamp) {
         let f = with(
@@ -1270,7 +1302,10 @@ impl SessionLog {
             said(f),
             at,
         ) {
-            Ok(_) => self.opened_wall = Some(at.wall_ms),
+            Ok(_) => {
+                self.opened_wall = Some(at.wall_ms);
+                self.lineage_opened.get_or_insert(at.wall_ms);
+            }
             Err(aterm_slog::Refused::AlreadyOpen) if state.is_some() => {
                 let f = said(Fields::new());
                 let f = f.clone().u(Key::Carried, 1).unwrap_or(f);
@@ -1708,7 +1743,10 @@ impl SessionLog {
         close: Close,
         at: Stamp,
     ) -> Result<u64, aterm_slog::Refused> {
-        self.settle_program(node, at);
+        let mut close = close;
+        if let Some(dropped) = self.settle_program(node, at) {
+            let _ = close.f.set(Key::Dropped, Val::U(dropped));
+        }
         self.harness_last(node, at);
         self.log.close(node, close, at)
     }
@@ -3404,8 +3442,13 @@ pub(crate) use carry::{PreparedSlogCarry, SlogCarrySource};
 #[cfg(test)]
 pub(crate) use mark::{AWAIT_LOG_USAGE, MARK_USAGE, MarkReq};
 pub(crate) use mark::{
-    CAUSE_USAGE, CauseRef, InputAct, InputVerb, LogAwait, LogAwaitStep, cmd_mark, validate_cause,
+    CAUSE_USAGE, CauseRef, DESC_VALUE_MAX, DescRefused, DescWrite, InputAct, InputVerb, LogAwait,
+    LogAwaitStep, cmd_mark, desc_stored, validate_cause,
 };
+
+#[path = "session_log_desc.rs"]
+mod desc;
+pub(crate) use desc::{cmd_described, cmd_described_json};
 
 #[path = "session_log_closed.rs"]
 mod closed;
@@ -3421,6 +3464,10 @@ pub(crate) mod transcript;
 #[path = "session_log_observed.rs"]
 pub(crate) mod observed;
 
+#[path = "session_log_turns.rs"]
+mod turns;
+pub(crate) use turns::{Front, Leaving, ProgramRead};
+
 #[cfg(test)]
 #[path = "session_log_tests.rs"]
 mod tests;
@@ -3428,6 +3475,10 @@ mod tests;
 #[cfg(test)]
 #[path = "session_log_mark_tests.rs"]
 mod mark_tests;
+
+#[cfg(test)]
+#[path = "session_log_desc_tests.rs"]
+mod desc_tests;
 
 #[cfg(test)]
 #[path = "session_log_end_tests.rs"]

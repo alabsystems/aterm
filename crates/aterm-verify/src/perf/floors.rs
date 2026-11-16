@@ -613,6 +613,7 @@ pub(crate) fn measure_example_with(
 }
 
 /// The performance-core-cycle lane deliberately judges cycles at the load it finds.
+#[cfg(unix)]
 pub(crate) fn measure_cycle_example_with(
     example: &str,
     features: &[&str],
@@ -683,7 +684,7 @@ fn measure_example_for(
             String::from_utf8_lossy(&built.stderr)
         )));
     }
-    let executable = super::bench_build::built_executable(
+    let executable = super::driver::built_executable(
         &String::from_utf8_lossy(&built.stdout),
         example,
         "example",

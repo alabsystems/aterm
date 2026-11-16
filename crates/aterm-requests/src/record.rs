@@ -1124,7 +1124,7 @@ pub fn is_mail_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
-/// A tab's sid: a session aterm minted.
+/// A tab's sid: a session aterm minted ([`aterm_types::control_verbs::is_minted_sid`]).
 fn sid(value: &str) -> Option<String> {
     aterm_types::control_verbs::is_minted_sid(value).then(|| value.to_owned())
 }

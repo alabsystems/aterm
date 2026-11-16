@@ -191,9 +191,23 @@ pub(super) fn prepare(
     Ok(())
 }
 
+/// Retire the permit of a group none of whose records reached the journal: a writing
+/// open's replay, under the exclusive writer lock, stopped at the custody witness the
+/// permit starts at. It runs before any append: that append moves custody past the
+/// permit's start without reaching its end, and a permit left in place would then
+/// refuse every later open. The caller's flush of `dir`, which that open makes before
+/// any append, makes the removal durable; a crash before it may keep the permit as it
+/// was, and the next writing open retires it again.
+pub(super) fn retire(dir: &Path, claim_name: &str) -> Result<()> {
+    private_file::remove_private(dir, &name(claim_name))?;
+    Ok(())
+}
+
 /// Read after a lock-free journal read, or while holding its exclusive writer
 /// lock. A new checkpoint therefore precedes this read of its durable permit.
 /// Recheck the claim to reject a permit from a later group under an older snapshot.
+/// A pending permit starts at the custody witness: a writing open that finds none of
+/// its group in the log retires it ([`retire`]) before any append moves that witness.
 pub(super) fn read(dir: &Path, claim_name: &str, claim: &[u8]) -> Result<Boundary> {
     if claim.len() != CLAIM_LEN {
         return Err(Error::new("invalid table custody for group check"));

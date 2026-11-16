@@ -116,7 +116,7 @@ impl Ask for Held {
     }
 }
 
-const EVERY: [&str; 7] = crate::provision::CELL_TARGETS;
+const EVERY: [&str; 7] = super::CELL_TARGETS;
 
 /// EVERY LANE RIDES THE PIN, NEVER THE FIRST TOOLCHAIN THAT HAS THE STD: with `stable` listed
 /// first (rustup's own order) and carrying every cell's std and clippy, each cell's std is

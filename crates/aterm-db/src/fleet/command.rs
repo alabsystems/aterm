@@ -30,7 +30,20 @@ pub const USAGE: &str = "aterm db fleet — machines, AI accounts and agents as 
                  every registry machine by number, and each answer no registry row names\n\
   accounts [--where col=val]... [--tsv|--json]\n\
                  every registry account by provider and label: usage as last read, the\n\
-                 machines its preferences expect it on, and where evidence says it runs\n\
+                 machines its preferences expect it on, and where evidence says it runs.\n\
+                 What the registry states (status, a stated plan, expected) is a person's\n\
+                 word; what a machine observed stands beside it, with when it was read\n\
+                 (<fact>_at) and the machine that read it (<fact>_by), and never replaces\n\
+                 it: plan is the stated plan, else the newest observed (plan_source says\n\
+                 which), plan_observed the observed one, plan_mismatch where they differ;\n\
+                 status is the registry's word (pending, paused, ...) and observed what\n\
+                 machines saw: signed-in, seen, signed-out, place-only or never-seen;\n\
+                 last_seen is the newest sighting of its login and seen_on every machine\n\
+                 whose login files name it, with the tabs running it now and when.\n\
+                 Facts and their provenance: w5h/w7d figures (w5h_at, w5h_by, ...), a\n\
+                 standing limit (wall_at, wall_by), last_use (last_use_on), plan_observed\n\
+                 (plan_at, plan_by), observed (observed_at, observed_by), last_seen\n\
+                 (last_seen_by). A machine no registry row binds is named by 8 hex digits\n\
   agents   [--where col=val]... [--tsv|--json]\n\
                  every agent session a fleet read sighted, by machine and session\n\
   schema   [machines|accounts|agents] [--tsv|--json]\n\

@@ -27,6 +27,8 @@
 //! | 13   | [`ERR_ORIGIN_REFUSED`] | is refused again: the relayed record is not its origin's |
 //! | 14   | [`ERR_RELAY_NOT_READY`] | lands once this broker has been given origin keys |
 //! | 15   | [`ERR_ORIGIN_UNKNOWN`] | lands once this broker takes the record's origin |
+//! | 16   | [`ERR_FRESH_HELD`]     | its key was held; choose a new key after reconnect |
+//! | 17   | [`ERR_FRESH_FENCED`]   | was not attempted after an earlier fresh failure |
 //!
 //! Codes 2, 3, 7, 8, 9 and 13 are PERMANENT for the request that drew them: sent again,
 //! unchanged, on the same connection, it is refused again, so a retry is a loop.
@@ -54,6 +56,10 @@
 //! holds such a record while its embedder says so
 //! ([`FederationBridge::hold_while`](crate::federation::FederationBridge::hold_while)).
 //! A broker older than code 15 answers it with 13.
+//!
+//! Codes 16 and 17 identify fresh-publish recovery, not permanently invalid records. Either
+//! leaves later fresh publishes fenced until reconnect. An unknown transport outcome is not
+//! one of these refusals and says nothing about whether a complete request committed.
 //!
 //! One code-8 refusal is told apart by its WORDS, not by a code of its own: an
 //! expired capability's message starts [`CAP_EXPIRED_PREFIX`], and
@@ -310,6 +316,16 @@ pub const ERR_RELAY_NOT_READY: u8 = 14;
 /// broker that predates this code sends [`ERR_ORIGIN_REFUSED`].
 pub const ERR_ORIGIN_UNKNOWN: u8 = 15;
 
+/// A [`Request::FreshPublish`] key was already held, including through producer lineage.
+/// Nothing was appended, even when the subject and body equal the held record. Every later
+/// fresh publish on this connection is refused until reconnect; ordinary publishes keep their
+/// existing semantics. A caller may choose a new producer key after handling the collision.
+pub const ERR_FRESH_HELD: u8 = 16;
+
+/// A [`Request::FreshPublish`] followed a failed fresh publish on this connection. Nothing was
+/// appended. Reconnect before sending fresh publishes again; this is not another key collision.
+pub const ERR_FRESH_FENCED: u8 = 17;
+
 /// Fixed prefix for every [`ERR_RATE_LIMITED`] refusal, followed immediately by the
 /// minimum millisecond wait `<ms>` (`>= 1`) before the bucket refills enough to admit
 /// the request (or, if a single record exceeds `burst_bytes`, the burst-deficit hint).
@@ -356,6 +372,7 @@ const TAG_BURST_MARKS: u8 = 0x16;
 const TAG_RELAY: u8 = 0x17;
 const TAG_ORIGIN_STAMPS: u8 = 0x18;
 const TAG_SETTLE: u8 = 0x19;
+const TAG_FRESH_PUBLISH: u8 = 0x1A;
 const TAG_ACK: u8 = 0x81;
 const TAG_DELIVERY: u8 = 0x82;
 const TAG_ERROR: u8 = 0x83;
@@ -364,6 +381,12 @@ const TAG_NONCE: u8 = 0x85;
 const TAG_BUDGET_REPLY: u8 = 0x86;
 const TAG_GAP: u8 = 0x87;
 const TAG_STATS_RESP: u8 = 0x88;
+
+/// Whether a payload names the fresh-publish opcode in this protocol, even when its remaining
+/// fields are malformed. Used to order a decoding refusal with this connection's fresh writes.
+pub(crate) fn is_fresh_request(payload: &[u8]) -> bool {
+    payload.starts_with(&[PROTO_VERSION, TAG_FRESH_PUBLISH])
+}
 
 /// Bit 0 of [`NonceExt::requests`]: the broker accepts [`Request::Retire`] (`0x10`).
 pub const REQUEST_RETIRE: u64 = 1 << 0;
@@ -419,6 +442,13 @@ pub const REQUEST_RELAY: u64 = 1 << 7;
 /// with the durable head after it. Read beside the log's device ([`NonceExt::device`],
 /// [`LogDevice`]), it is what settles a writer's own barriered writes on that device.
 pub const REQUEST_SETTLE: u64 = 1 << 8;
+
+/// Bit 9 of [`NonceExt::requests`]: [`Request::FreshPublish`] (`0x1A`) is supported. A fresh
+/// publish appends only when its producer key is absent. A staging refusal fences later fresh
+/// publishes before they stage. A late commit, flush or quorum error fences subsequent staging;
+/// requests already staged in that batch follow their own commit outcomes. The fence lasts until
+/// reconnect, independently of the optional gap-fence setting. Ordinary `Publish` is unchanged.
+pub const REQUEST_FRESH_PUBLISH: u64 = 1 << 9;
 
 const STATS_MAX_ITEMS: usize = 65_536;
 
@@ -558,6 +588,19 @@ contract_fn! {
 pub enum Request {
     /// Append `body` to `subject`, deduped by `(producer_id, producer_seq)`.
     Publish {
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    },
+    /// Append only if the producer key is absent, including from the staged batch and producer
+    /// lineage. A held key is [`ERR_FRESH_HELD`] even for an equal subject and body. A staging
+    /// refusal fences later fresh publishes on this connection with [`ERR_FRESH_FENCED`] before
+    /// they stage. Late commit, flush or quorum errors fence subsequent staging, but requests
+    /// already staged in the same batch retain their own outcomes. Reconnect clears the fence.
+    /// Success uses the ordinary publish acknowledgement and durability tier. A transport failure
+    /// leaves the outcome unknown; it is not success.
+    FreshPublish {
         producer_id: u64,
         producer_seq: u64,
         subject: String,
@@ -1405,7 +1448,7 @@ const fn take_ext_entry_header(b: &[u8]) -> Option<(u8, usize, &[u8])> {
 /// |------|------------|-------|
 /// | 0x01 | durability | `requested u8, served u8, reason u8, horizon_ms u32 LE, rules u16 LE` ([`ServedInfo`]) |
 /// | 0x02 | lineage    | `n u8`, then `n × (generation u64 LE, common u64 LE)` ([`Lineage`]) |
-/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`], bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`], bit 6 = [`REQUEST_BURST_MARKS`], bit 7 = [`REQUEST_RELAY`], bit 8 = [`REQUEST_SETTLE`]) |
+/// | 0x03 | 8 bytes    | the request set a broker announces (`u64` LE bitmask; bit 0 = [`REQUEST_RETIRE`], bit 1 = [`REQUEST_GAP_NOTICES`], bit 2 = [`REQUEST_TOLD_FETCH`], bit 3 = [`REQUEST_BROKER_TIMES`], bit 4 = [`REQUEST_STATS`], bit 5 = [`REQUEST_GAP_FENCES`], bit 6 = [`REQUEST_BURST_MARKS`], bit 7 = [`REQUEST_RELAY`], bit 8 = [`REQUEST_SETTLE`], bit 9 = [`REQUEST_FRESH_PUBLISH`]) |
 /// | 0x04 | health     | `flags u8` (bit 0: poisoned), `barrier u64 LE, full u64 LE, skipped u64 LE, failed u64 LE`, `n u16 LE`, `n` bytes of the poison's reason (UTF-8); bytes after it are a later build's, skipped ([`HelloHealth`]) |
 /// | 0x05 | retention  | the rules the log is retained by, as `Retention::encode` writes them (the `retention` feature) |
 /// | 0x06 | device     | `dev u64 LE` (the log file's `st_dev`), `flags u8` (bit 0: its full flush drains the device); bytes after it are a later build's, skipped ([`LogDevice`]) |
@@ -1673,6 +1716,16 @@ impl NonceExt {
     pub const fn supports_settle(&self) -> bool {
         match self.requests {
             Some(r) => (r & REQUEST_SETTLE) != 0,
+            None => false,
+        }
+    }
+
+    /// Whether this `Hello` extension announces [`Request::FreshPublish`] and its mandatory
+    /// connection fence ([`REQUEST_FRESH_PUBLISH`]).
+    #[must_use]
+    pub const fn supports_fresh_publish(&self) -> bool {
+        match self.requests {
+            Some(r) => (r & REQUEST_FRESH_PUBLISH) != 0,
             None => false,
         }
     }
@@ -2051,6 +2104,18 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             put_str(&mut p, subject);
             put_bytes(&mut p, body);
         }
+        Request::FreshPublish {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        } => {
+            p[1] = TAG_FRESH_PUBLISH;
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_id));
+            p.extend_from_slice(&encode_u64_le_bytes(*producer_seq));
+            put_str(&mut p, subject);
+            put_bytes(&mut p, body);
+        }
         Request::Subscribe {
             from_offset,
             filter,
@@ -2285,6 +2350,12 @@ pub(crate) fn decode_request_with_bt(p: &[u8]) -> Option<(Request, Option<u64>)>
     }
     let req = match r.u8()? {
         TAG_PUBLISH => Request::Publish {
+            producer_id: r.u64()?,
+            producer_seq: r.u64()?,
+            subject: r.string()?,
+            body: r.bytes()?,
+        },
+        TAG_FRESH_PUBLISH => Request::FreshPublish {
             producer_id: r.u64()?,
             producer_seq: r.u64()?,
             subject: r.string()?,
@@ -2613,6 +2684,42 @@ pub(crate) fn append_publish_frame(
     out.extend_from_slice(&[0u8; HEADER_SIZE]);
     let payload_start = out.len();
     put_publish(out, producer_id, producer_seq, subject, body);
+    let _ = finish_framed(out, start, payload_start, None)?;
+    Ok(())
+}
+
+/// The exact framed size of a fresh publish, checked before allocating or copying its fields.
+pub(crate) fn fresh_publish_frame_len(subject_len: usize, body_len: usize) -> io::Result<usize> {
+    let payload_len = 26usize
+        .checked_add(subject_len)
+        .and_then(|n| n.checked_add(body_len))
+        .filter(|&n| n <= MAX_PAYLOAD_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "payload exceeds cap"))?;
+    payload_len
+        .checked_add(HEADER_SIZE)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "framed payload exceeds cap"))
+}
+
+/// Append one framed [`Request::FreshPublish`] from borrowed fields.
+pub(crate) fn append_fresh_publish_frame(
+    out: &mut Vec<u8>,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let _ = fresh_publish_frame_len(subject.len(), body.len())?;
+    let start = out.len();
+    out.extend_from_slice(&[0u8; HEADER_SIZE]);
+    let payload_start = out.len();
+    put_keyed(
+        out,
+        TAG_FRESH_PUBLISH,
+        producer_id,
+        producer_seq,
+        subject,
+        body,
+    );
     let _ = finish_framed(out, start, payload_start, None)?;
     Ok(())
 }
@@ -3022,6 +3129,103 @@ mod tests {
     }
 
     #[test]
+    fn fresh_publish_changes_only_the_request_tag_and_checks_frame_lengths() {
+        let plain = Request::Publish {
+            producer_id: 0x0102_0304_0506_0708,
+            producer_seq: 0x1112_1314_1516_1718,
+            subject: "/fresh/β".into(),
+            body: vec![0, 1, 127, 255],
+        };
+        let fresh = Request::FreshPublish {
+            producer_id: 0x0102_0304_0506_0708,
+            producer_seq: 0x1112_1314_1516_1718,
+            subject: "/fresh/β".into(),
+            body: vec![0, 1, 127, 255],
+        };
+        let normal_bytes = encode_request(&plain);
+        assert_eq!(
+            &normal_bytes[..18],
+            &[
+                PROTO_VERSION,
+                0x01,
+                8,
+                7,
+                6,
+                5,
+                4,
+                3,
+                2,
+                1,
+                24,
+                23,
+                22,
+                21,
+                20,
+                19,
+                18,
+                17,
+            ]
+        );
+        let mut expected = normal_bytes.clone();
+        expected[1] = 0x1A;
+        assert_eq!(encode_request(&fresh), expected);
+        assert_eq!(decode_request(&expected), Some(fresh));
+        assert!(is_fresh_request(&expected));
+        assert!(is_fresh_request(&[PROTO_VERSION, 0x1A]));
+        assert!(!is_fresh_request(&[PROTO_VERSION + 1, 0x1A]));
+        assert!(!is_fresh_request(&normal_bytes));
+        for cut in 0..expected.len() {
+            assert!(decode_request(&expected[..cut]).is_none(), "cut={cut}");
+        }
+        let mut framed = Vec::new();
+        append_fresh_publish_frame(
+            &mut framed,
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            "/fresh/β",
+            &[0, 1, 127, 255],
+        )
+        .unwrap();
+        assert_eq!(
+            framed.len(),
+            fresh_publish_frame_len("/fresh/β".len(), 4).unwrap()
+        );
+        assert_eq!(read_frame(&mut framed.as_slice()).unwrap(), Some(expected));
+        assert!(fresh_publish_frame_len(usize::MAX, 0).is_err());
+        assert!(fresh_publish_frame_len(0, usize::MAX).is_err());
+        assert_eq!(
+            fresh_publish_frame_len(0, MAX_PAYLOAD_LEN - 26).unwrap(),
+            HEADER_SIZE + MAX_PAYLOAD_LEN
+        );
+        assert!(fresh_publish_frame_len(0, MAX_PAYLOAD_LEN - 25).is_err());
+    }
+
+    #[test]
+    fn fresh_publish_offer_uses_only_bit_nine() {
+        let offered = NonceExt {
+            requests: Some(REQUEST_FRESH_PUBLISH),
+            ..NonceExt::default()
+        };
+        assert_eq!(REQUEST_FRESH_PUBLISH, 1 << 9);
+        assert!(offered.supports_fresh_publish());
+        assert!(!NonceExt::default().supports_fresh_publish());
+        assert!(!NonceExt {
+            requests: Some(!REQUEST_FRESH_PUBLISH),
+            ..NonceExt::default()
+        }
+        .supports_fresh_publish());
+        let reply = Response::Nonce {
+            nonce: vec![0; 32],
+            log: Some(LogIdentity {
+                id: [7; 16],
+                generation: 4,
+            }),
+            ext: offered,
+        };
+        assert_eq!(decode_response(&encode_response(&reply)), Some(reply));
+    }
+
+    #[test]
     fn replicate_round_trips_with_and_without_a_commit() {
         let plain = Request::Replicate {
             seq: 11,
@@ -3281,14 +3485,14 @@ mod tests {
     /// retention gave up, broker-stamped wall times (`bt=`), read-grant-gated operator
     /// `Stats`, a gap fence a connection asks for and its producer lifts once it read its
     /// answers, burst marks, relayed records and their origin stamps, and a settle of the
-    /// log's device — rides on TWENTY-FIVE request tags and EIGHT response tags. This test is
+    /// log's device and conditional fresh publishes — rides on TWENTY-SIX request tags and EIGHT response tags. This test is
     /// the budget: it enumerates every byte and fails if an undeclared request tag or a
     /// ninth response tag ever decodes, and it pins each tag's NUMBER, so a renumbering that
     /// would silently re-interpret an old client's frames breaks the build instead.
     /// `Keepalive` at 0x0D, `IdleMarks` at 0x0E, `Budget` at 0x0F, `Retire` at 0x10,
     /// `GapNotices` at 0x11, `BrokerTimes` at 0x12, `Stats` at 0x13, `ClearGapFences` at
     /// 0x14, `FenceGaps` at 0x15, `BurstMarks` at 0x16, `Relay` at 0x17, `OriginStamps` at 0x18,
-    /// `Settle` at 0x19, `Budget`'s reply at 0x86, `Gap` at 0x87 and `Stats` reply
+    /// `Settle` at 0x19, `FreshPublish` at 0x1A, `Budget`'s reply at 0x86, `Gap` at 0x87 and `Stats` reply
     /// at 0x88 took numbers no earlier version
     /// decoded: an older broker refuses each request as malformed and keeps the connection,
     /// and never sends the reply. Additions, not reinterpretations; no version change.
@@ -3338,7 +3542,7 @@ mod tests {
         );
 
         // Every tag's NUMBER, pinned against the variant that carries it.
-        let request_tags: [(u8, Request); 25] = [
+        let request_tags: [(u8, Request); 26] = [
             (
                 0x01,
                 Request::Publish {
@@ -3471,6 +3675,15 @@ mod tests {
             ),
             (0x18, Request::OriginStamps),
             (0x19, Request::Settle),
+            (
+                0x1A,
+                Request::FreshPublish {
+                    producer_id: 0,
+                    producer_seq: 0,
+                    subject: String::new(),
+                    body: Vec::new(),
+                },
+            ),
         ];
         for (tag, req) in &request_tags {
             let bytes = encode_request(req);

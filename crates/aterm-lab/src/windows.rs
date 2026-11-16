@@ -2965,9 +2965,10 @@ fn vm_procs(l: &Layout) -> Vec<u32> {
 
 /// [`lane_lock`] for a run that boots the VM: QEMU and swtpm found, the VM's turn to boot taken
 /// ([`LaneLock::turn`]), then the boot's disk claimed ([`crate::linux::claim_boot_disk`]) before
-/// the lane is waited for, so no run holds the lane while it waits for disk, and runs of the VM
-/// queued behind one that boots it claim no disk until it is over. The turn and the claim are
-/// held, and the VM's directory measured, until the lock is let go at the run's end.
+/// the lane is waited for, so no run holds the lane while its disk claim is relieved and decided,
+/// and runs of the VM queued behind one that boots it claim no disk until it is over. The turn
+/// and the claim are held, and the VM's directory measured, until the lock is let go at the
+/// run's end.
 /// # Errors
 /// A tool missing, the turn's or the claim's NOT RUN, or [`lane_lock`]'s.
 pub fn boot_lane(l: &Layout) -> Result<LaneLock, Fail> {

@@ -102,7 +102,7 @@ fn controls_settings_lists_showcase_rows() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 160;
         window.rows = 50;
     }
@@ -189,7 +189,7 @@ fn controls_theme_options_are_quoted_and_split_whole() {
             .unwrap();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 160;
         window.rows = 50;
     }

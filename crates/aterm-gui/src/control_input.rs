@@ -825,7 +825,9 @@ pub(crate) fn input_if_fenced_observed(
     }
     // Input queued for the program in order goes first: a write now would overtake it, and the
     // screen any fence would judge is one that input has not reached, so none is judged.
-    if ctx.sink.ordered_egress_count() > 0 {
+    // The person's sequence is published before dispatch reaches the writer. A claimant that
+    // reads that new sequence must also wait for the gesture whose bytes it names.
+    if ctx.human_input.delivery_pending() || ctx.sink.ordered_egress_count() > 0 {
         return GuardedInput::Queued;
     }
     if fence.reads_rows() && crate::frame_unfinished_now(&terminal) {

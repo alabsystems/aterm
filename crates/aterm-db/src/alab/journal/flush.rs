@@ -517,6 +517,10 @@ pub(crate) fn read_window(
     let relays = owned::read_owned(&RELAY, ops, resolve);
     let places = owned::read_owned(&super::PLACE, ops, resolve);
     let upds = owned::read_owned(&super::UPD, ops, resolve);
+    // The shared files' rows (`ai/logins`, `ai/usage`) carry this writer's counter too: a lost
+    // book restarts above them as well, so no key of theirs is written again at a lower `n`.
+    let logins = owned::read_owned(&super::LOGIN, ops, resolve);
+    let usages = owned::read_owned(&super::USAGE, ops, resolve);
     let mut heard = Heard::default();
     let mut batches = Vec::new();
     let mut in_window: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
@@ -534,6 +538,8 @@ pub(crate) fn read_window(
                 .chain(relays.rows.values())
                 .chain(places.rows.values())
                 .chain(upds.rows.values())
+                .chain(logins.rows.values())
+                .chain(usages.rows.values())
                 .filter(|row| row.machine == *me)
                 .map(|row| counter(&row.value)),
         )

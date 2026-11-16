@@ -10,8 +10,9 @@
 //! seat the cached node view holds that the log does not, under no label. The command joins
 //! survey answers through the full public key in a seat and its signed book entry. Unproved,
 //! ambiguous or unread observations stay unknown. Builds from the book remain explicitly
-//! distinguished from builds just observed. Free disk, sessions and account use come only
-//! from the survey. Cached GUI composition still accepts its node view without network I/O.
+//! distinguished from builds just observed. The home volume's size, free space and build output,
+//! sessions and account use come only from the survey. Cached GUI composition still accepts its
+//! node view without network I/O.
 //!
 //! **Needs update** names a member whose build is below what the lab needs now: below the record
 //! fence ([`RECORD_FENCE`]) once this Mac's log has crossed past what such builds hold; or, while
@@ -78,6 +79,10 @@ pub struct Fleet {
 pub struct Observation {
     /// Local time at which this survey completed (Unix ms).
     pub at_ms: u64,
+    /// When the peer answered, on its own clock (its `instance` header's `at_ms=`, Unix ms): the
+    /// clock its own times are told against (when its build output was sized), never this
+    /// Mac's, which may be hours off a peer's. `None` where its header says no time.
+    pub said_at_ms: Option<u64>,
     /// The peer's validated instance and account facts.
     pub facts: crate::survey_facts::SwarmSurveyFacts,
     /// Whether the instance declared its account rows (older peers may omit them).
@@ -396,14 +401,21 @@ fn observe(
                 .or_default() += 1;
             continue;
         }
-        let accounts_known = lines
+        // The header the facts were read from: the last `instance` line, as the parser reads it.
+        let instance = lines
             .iter()
             .rev()
-            .find(|line| line.starts_with("instance "))
-            .is_some_and(|line| {
-                line.split_ascii_whitespace()
-                    .any(|field| field.starts_with("accounts="))
-            });
+            .find(|line| line.starts_with("instance "));
+        let accounts_known = instance.is_some_and(|line| {
+            line.split_ascii_whitespace()
+                .any(|field| field.starts_with("accounts="))
+        });
+        let said_at_ms = instance.and_then(|line| {
+            line.split_ascii_whitespace()
+                .find_map(|field| field.strip_prefix("at_ms="))
+                .and_then(crate::parse_uint::<u64>)
+                .filter(|at| *at > 0)
+        });
         row.presence = Some(Presence::Up);
         row.build = Some(facts.version.clone());
         row.needs_update = crossed && below(&facts.version, RECORD_FENCE);
@@ -411,6 +423,7 @@ fn observe(
             row.label.clone(),
             Observation {
                 at_ms: now_ms,
+                said_at_ms,
                 facts,
                 accounts_known,
             },
@@ -520,6 +533,34 @@ fn usage_words(observation: Option<&Observation>, week: bool) -> String {
     }
 }
 
+/// A seat's `BUILD_MB` cell: the build output its survey said, in MiB (`84992`, or `84992+` where
+/// that sizing was cut short and the figure is a floor), with how long before its answer the
+/// sizing ended (`(2 h)`), told on the sizing Mac's one clock ([`Observation::said_at_ms`] less
+/// the sizing's end, never this Mac's clock), a sizing that clock puts after the answer reading
+/// `0 s`, never negative, and no age where the answer said no time; `-` where it said no build
+/// output (an older aterm, or no sizing recorded).
+fn build_words(observation: &Observation) -> String {
+    observation.facts.home_build.map_or_else(
+        || "-".to_owned(),
+        |build| {
+            let age = observation.said_at_ms.map_or_else(String::new, |said| {
+                format!(" ({})", words::age_words(said.saturating_sub(build.at_ms)))
+            });
+            format!("{}{}{age}", build.mb, if build.partial { "+" } else { "" })
+        },
+    )
+}
+
+/// A seat's `STORE` cell: the fullest of the stores aterm keeps there that refuse writes at a
+/// bound, by its fixed word, and the share of its bound it holds (`vault-records 83%`); `-`
+/// where its survey said none (an older aterm, or no such store sized).
+fn store_words(observation: &Observation) -> String {
+    observation.facts.store_worst.as_ref().map_or_else(
+        || "-".to_owned(),
+        |worst| format!("{} {}%", worst.name, worst.pct),
+    )
+}
+
 /// `aterm fleet`'s text: the status line, why no presence was read where none was, then one row
 /// per seat.
 #[must_use]
@@ -529,7 +570,7 @@ pub fn render(fleet: &Fleet, at_ms: Option<u64>) -> String {
     if let Some(why) = &fleet.unserved {
         let _ = writeln!(out, "presence: {why}");
     }
-    let table: Vec<[String; 9]> = fleet
+    let table: Vec<[String; 12]> = fleet
         .rows
         .iter()
         .map(|row| {
@@ -550,8 +591,13 @@ pub fn render(fleet: &Fleet, at_ms: Option<u64>) -> String {
                     (None, false) => "-".to_owned(),
                 },
                 observation
+                    .and_then(|observation| observation.facts.home_total_mb)
+                    .map_or_else(|| "-".to_owned(), |total| total.to_string()),
+                observation
                     .and_then(|observation| observation.facts.home_free_mb)
                     .map_or_else(|| "-".to_owned(), |free| free.to_string()),
+                observation.map_or_else(|| "-".to_owned(), build_words),
+                observation.map_or_else(|| "-".to_owned(), store_words),
                 observation.map_or_else(
                     || "-".to_owned(),
                     |observation| observation.facts.sessions.to_string(),
@@ -562,7 +608,8 @@ pub fn render(fleet: &Fleet, at_ms: Option<u64>) -> String {
         })
         .collect();
     let head = [
-        "LABEL", "NAME", "NODE", "UP", "BUILD", "FREE_MB", "SESSIONS", "5H", "7D",
+        "LABEL", "NAME", "NODE", "UP", "BUILD", "TOTAL_MB", "FREE_MB", "BUILD_MB", "STORE",
+        "SESSIONS", "5H", "7D",
     ]
     .map(str::to_owned);
     let mut widths = head.clone().map(|h| h.chars().count());
@@ -603,6 +650,8 @@ pub fn to_json(fleet: &Fleet) -> Value {
                 ),
             };
             let observation = fleet.observations.get(&row.label);
+            let build = observation.and_then(|observation| observation.facts.home_build);
+            let store = observation.and_then(|observation| observation.facts.store_worst.as_ref());
             let accounts = observation.filter(|observation| observation.accounts_known).map(|observation| {
                 observation.facts.accounts.iter().map(|account| json!({
                     "pool": account.pool.as_str(), "id": account.id.as_str(),
@@ -622,7 +671,14 @@ pub fn to_json(fleet: &Fleet) -> Value {
                 "needs_update": row.needs_update,
                 "build_source": if observation.is_some() { Some("survey") } else if row.build.is_some() { Some("book") } else { None },
                 "observed_at_ms": observation.map(|observation| observation.at_ms),
+                "said_at_ms": observation.and_then(|observation| observation.said_at_ms),
+                "home_total_mb": observation.and_then(|observation| observation.facts.home_total_mb),
                 "home_free_mb": observation.and_then(|observation| observation.facts.home_free_mb),
+                "home_build_mb": build.map(|build| build.mb),
+                "home_build_at_ms": build.map(|build| build.at_ms),
+                "home_build_partial": build.map(|build| build.partial),
+                "store_worst": store.map(|store| store.name.as_str()),
+                "store_worst_pct": store.map(|store| store.pct),
                 "sessions": observation.map(|observation| observation.facts.sessions),
                 "accounts": accounts,
                 "accounts_unread": observation.map(|observation| &observation.facts.accounts_unread),

@@ -463,7 +463,9 @@ fn a_prior_tail_without_scope_coverage_cannot_restore_an_exact_reading() {
         rings: vec![(9, sample), (11, sample)],
         proc_starts: None,
         time_gaps: Vec::new(),
-        strip_events: Vec::new()
+        strip_events: Vec::new(),
+        spans: Vec::new(),
+        usual: Vec::new(),
     }));
     assert_eq!(saved.aterm[0].buckets[0].1.mean, 0.4);
     assert_eq!(saved.aterm_unread[0].buckets[0].1.mean, 1.0);
@@ -1344,8 +1346,8 @@ fn sample(at_s: u64, busy: &[u64], procs: Vec<ProcSample>) -> Sample {
             compressed: Some(1 << 30),
             cached: 8 << 30,
             free: 10 << 30,
-            swap_used: 0,
-            swap_total: 0,
+            swap_used: Some(0),
+            swap_total: Some(0),
             pressure: Pressure::Normal,
             commit: None,
             ..MemSample::default()
@@ -2026,6 +2028,7 @@ fn rig(mono_ms: u64, wall_ms: i64, cadence_ms: u32) -> Sample {
         cadence_ms,
         load1: Some(0.5),
         links: Some(vec![LinkSample {
+            byte_counter: crate::net_counter::ByteCounter::Cumulative64,
             name: "en0".into(),
             kind: LinkKind::Wifi,
             up: true,
@@ -4097,6 +4100,50 @@ fn a_restored_free_history_reads_on_only_from_its_volume() {
     assert_eq!(read(&v.absorb(&moved)), 1, "another volume starts afresh");
 }
 
+/// DC-09c: the Snapshot carries the three-week free history the model keeps from its disk
+/// readings, an hour bucket a reading an hour apart, and a restored one reads on from its kept
+/// hours on the same volume. Negative controls: the Snapshot handing a default series, the model
+/// not noting its readings into it, or `restore_free_weeks` dropping what it is given each fails
+/// a count; a restore read on another volume starts afresh.
+#[test]
+fn the_snapshot_carries_the_three_week_free_history_across_a_restore() {
+    let hourly = |h: i64, free: u64| disk_reading(h * 360, free, None);
+    let read = |s: &Snapshot| {
+        s.free_weeks
+            .window(s.at_unix_ms)
+            .into_iter()
+            .flatten()
+            .count()
+    };
+    let mut before = Vitals::new();
+    let mut last = Snapshot::default();
+    for h in 0..3 {
+        last = before.absorb(&hourly(h, 400_000_000_000 - h as u64));
+    }
+    assert_eq!(read(&last), 3, "an hour bucket a reading");
+    let saved = before.free_weeks().saved().expect("three hours read");
+    assert_eq!(saved.rows.len(), 3);
+    let after = hourly(4, 1);
+    let mut v = Vitals::new();
+    v.restore_free_weeks(FreeWeeks::restored(&saved, after.at_unix_ms));
+    assert_eq!(
+        read(&v.absorb(&after)),
+        4,
+        "three kept hours and the new one"
+    );
+    let mut moved = after.clone();
+    if let Some(vol) = moved.volume.as_mut() {
+        vol.mount = "/Volumes/Backup".into();
+    }
+    let mut v = Vitals::new();
+    v.restore_free_weeks(FreeWeeks::restored(&saved, after.at_unix_ms));
+    assert_eq!(
+        read(&v.absorb(&moved)),
+        1,
+        "control: another volume starts afresh"
+    );
+}
+
 #[test]
 fn over_is_a_queue_on_the_cores_or_heavy_swapping() {
     let run = |load1: f64, busy_half: bool, swap_kib_per_s: u64| {
@@ -4286,8 +4333,66 @@ fn the_processes_state_follows_the_jobs_well() {
 }
 
 #[test]
+fn modulo_network_rates_reuse_checked_deltas_and_never_sum_an_unknown_link_as_zero() {
+    use crate::net_counter::{ByteCounter, DeltaError};
+    let link = |name: &str, index, rx, packets, rate_bps| LinkSample {
+        name: name.into(),
+        index,
+        byte_counter: ByteCounter::DarwinModulo32,
+        up: true,
+        counts: true,
+        rx,
+        rx_packets: packets,
+        rate_bps,
+        ..LinkSample::default()
+    };
+    let read = |t, rx, packets, idle_rx, idle_packets| {
+        let mut s = at(t, 1000);
+        s.links = Some(vec![
+            link("en0", 16, rx, packets, Some(10_000_000_000)),
+            link("en2", 17, idle_rx, idle_packets, None),
+        ]);
+        s
+    };
+    let mut v = Vitals::new();
+    v.absorb(&read(0, (1 << 32) - 2048, 100, 0, 0));
+    let wrapped = v.absorb(&read(1000, 4096, 110, 0, 0));
+    let net = wrapped.net.as_ref().unwrap();
+    assert_eq!(net.rates.unwrap().rx_bps, 6144.0);
+    assert_eq!(net.links[0].rates.unwrap().rx_bps, 6144.0);
+    assert_eq!(
+        net.links[0].sample.rx, 4096,
+        "raw modulo counter is not unwrapped"
+    );
+    assert_eq!(
+        net.links[1].rates.unwrap().rx_bps,
+        0.0,
+        "idle uncapacitated interface is harmless"
+    );
+    let partial = v.absorb(&read(2000, 8192, 120, 1024, 1));
+    let net = partial.net.as_ref().unwrap();
+    assert_eq!(net.links[0].rates.unwrap().rx_bps, 4096.0);
+    assert!(
+        net.rates.is_none(),
+        "a measured interface cannot conceal another's unknown traffic"
+    );
+    assert_eq!(net.rates_why, Some(DeltaError::AmbiguousWrap));
+    assert_eq!(
+        net.state,
+        NetState::Online,
+        "packet activity remains known while its byte rate is unknown"
+    );
+    let reset = v.absorb(&read(3000, 1024, 10, 1024, 1));
+    assert_eq!(
+        reset.net.unwrap().rates_why,
+        Some(DeltaError::Discontinuity)
+    );
+}
+
+#[test]
 fn the_measured_link_holds_while_the_mix_holds() {
     let link = |name: &str, kind, total: u64, rate_bps| LinkSample {
+        byte_counter: crate::net_counter::ByteCounter::Cumulative64,
         name: name.into(),
         kind,
         up: true,
@@ -4871,6 +4976,7 @@ fn bar_shares_nest_tab_inside_aterm_inside_global_across_all_five_resources() {
         },
     ]);
     s0.links = Some(vec![LinkSample {
+        byte_counter: crate::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: LinkKind::Wifi,
         up: true,
@@ -5489,4 +5595,69 @@ fn cgroup_limits_bound_cpu_and_memory_row_capacities() {
         ),
         "CONTROL"
     );
+}
+
+/// Reading `t_s` (seconds, 1 s cadence) whose coalitions have started `started` and ended
+/// `exited` tasks since boot.
+fn tasks_at(t_s: u64, started: u64, exited: u64) -> Sample {
+    use crate::starts::{CoalTaskRead, CoalTasks, StartCount};
+    Sample {
+        starts: Some(StartCount::Coalitions {
+            read: CoalTaskRead::of(
+                Some(9),
+                false,
+                [CoalTasks {
+                    id: 9,
+                    started,
+                    exited,
+                }],
+            ),
+            own: None,
+        }),
+        ..rig(t_s * 1000, i64::try_from(t_s).expect("small") * 1000, 1000)
+    }
+}
+
+/// The exits ring beside the starts (A4 §6.2, N3): a box of it is the exits a second the
+/// coalitions' counters gave, apart from the starts the Processes ring holds, and it is kept and
+/// restored with the strip.
+/// CONTROL: Linux's fork counter says no exits, so its exits ring reads nothing, never zero
+/// exits, while its starts ring reads.
+#[test]
+fn the_exits_ring_keeps_exits_a_second_beside_the_starts() {
+    let k = (T0 + 10_000).div_euclid(BUCKET_MS);
+    let mean_at = |ring: &crate::ring::SavedRing| {
+        ring.buckets
+            .iter()
+            .find(|(bk, _)| *bk == k)
+            .map(|(_, a)| a.mean)
+    };
+    let mut v = Vitals::new();
+    for t in 1..=25u64 {
+        // 12 starts and 5 exits a second.
+        let _ = v.absorb(&tasks_at(t, 1_000 + 12 * t, 400 + 5 * t));
+    }
+    let kept = v.saved_strip(false);
+    assert_eq!(mean_at(&kept.proc_exits), Some(5.0));
+    assert_eq!(mean_at(&kept.rings[Processes as usize]), Some(12.0));
+    assert_eq!(kept.proc_starts, Some(true));
+    let mut relaunched = Vitals::new();
+    relaunched.restore_strip_history(kept.clone(), T0 + 26_000);
+    assert_eq!(
+        mean_at(&relaunched.saved_strip(false).proc_exits),
+        Some(5.0)
+    );
+
+    // CONTROL
+    let mut linux = Vitals::new();
+    for t in 1..=25u64 {
+        let _ = linux.absorb(&forks_at(
+            t * 1000,
+            i64::try_from(t).expect("small") * 1000,
+            Some(1_000 + 12 * t),
+        ));
+    }
+    let kept = linux.saved_strip(false);
+    assert_eq!(kept.proc_exits.buckets, Vec::new());
+    assert_eq!(mean_at(&kept.rings[Processes as usize]), Some(12.0));
 }

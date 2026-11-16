@@ -27,6 +27,10 @@ pub struct MembershipHistoryInspection {
     pub waiting: usize,
     pub bytes: usize,
     pub budgets: crate::membership_log::RecordBudgets,
+    /// How full the log is ([`crate::membership_log::Log::fill`]): the reading `aterm secrets
+    /// status` says on its `log:` line and a refusal names, of complete records alone, since a
+    /// class stop judges those. `bytes` above counts the waiting records too.
+    pub fill: crate::membership_log::budgets::Fill,
 }
 
 impl MembershipHistoryInspection {
@@ -81,6 +85,7 @@ pub fn inspect_membership_history_until(
         waiting: log.waiting(),
         bytes: log.total_bytes(),
         budgets: log.budgets(),
+        fill: log.fill(aterm_time::unix_millis()),
     }))
 }
 

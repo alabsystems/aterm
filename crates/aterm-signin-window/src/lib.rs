@@ -31,6 +31,22 @@ pub const VERB: &str = "__sign-in-window";
 /// The host's exit where this process has no desktop session to open a window in.
 pub const EXIT_NO_DESKTOP: u8 = 3;
 
+/// Whether this process's session is a desktop one a window can open in: on macOS, its audit
+/// session has the window server and was not made over the network (an SSH login's has
+/// neither); never elsewhere. The host refuses to open its window in any other session
+/// ([`EXIT_NO_DESKTOP`]), so a caller that starts a sign-in nobody watches asks first.
+#[must_use]
+pub fn desktop_session() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        host::graphic_session()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Runs the window until its opener closes it, a person closes it, or its standard input
 /// ends; `args` are the words after [`VERB`], and there are none.
 pub fn main_entry(args: &[std::ffi::OsString]) -> std::process::ExitCode {

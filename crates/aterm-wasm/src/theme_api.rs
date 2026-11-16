@@ -299,7 +299,9 @@ impl WebThemeState {
             source: "registered",
             warnings: &theme.meta.warnings,
         });
-        let mut out = String::with_capacity(1024);
+        // Built-ins alone already need the 4 KiB allocation class; avoid growing through
+        // smaller buffers before appending the registered themes.
+        let mut out = String::with_capacity(4096);
         out.push_str("{\"unset\":");
         write_json_string(&mut out, UNSET_THEME);
         out.push_str(",\"themes\":[");
@@ -394,21 +396,29 @@ impl WebTerminal {
     }
 
     /// Resolve `raw` for the current appearance and install it.
-    pub(crate) fn install_selector(&mut self, raw: String) -> Result<(), String> {
-        let draw = self.web_theme.resolve(&raw, self.web_theme.appearance)?;
+    pub(crate) fn install_selector(&mut self, raw: &str) -> Result<(), String> {
+        let draw = self.web_theme.resolve(raw, self.web_theme.appearance)?;
         self.install_draw(draw);
         self.web_theme.selector = Some(raw.trim().to_string());
         Ok(())
     }
 
+    fn refresh_selector(&mut self) {
+        let Some(raw) = self.web_theme.selector.as_deref() else {
+            return;
+        };
+        if let Ok(draw) = self.web_theme.resolve(raw, self.web_theme.appearance) {
+            self.install_draw(draw);
+        }
+    }
+
     /// The host's appearance changed: a selector picks its side, else the legacy behaviour.
     pub(crate) fn follow_appearance(&mut self, scheme: Appearance) {
         self.web_theme.appearance = scheme;
-        match self.web_theme.selector.clone() {
-            Some(raw) => {
-                let _ = self.install_selector(raw);
-            }
-            None => self.term.set_color_scheme(scheme),
+        if self.web_theme.selector.is_some() {
+            self.refresh_selector();
+        } else {
+            self.term.set_color_scheme(scheme);
         }
     }
 }
@@ -444,9 +454,7 @@ macro_rules! bind {
                 if has_selector {
                     let id = theme.id.clone();
                     if self.web_theme.selector_names(&id) {
-                        if let Some(raw) = self.web_theme.selector.clone() {
-                            let _ = self.install_selector(raw);
-                        }
+                        self.refresh_selector();
                     }
                 }
                 Ok(out)
@@ -459,7 +467,7 @@ macro_rules! bind {
 
             /// Install a theme by name.
             pub fn set_theme_by_name(&mut self, selector: &str) -> Result<String, String> {
-                self.install_selector(selector.to_string())?;
+                self.install_selector(selector)?;
                 Ok(self.theme_state())
             }
 

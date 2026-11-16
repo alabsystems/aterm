@@ -81,7 +81,7 @@ fn caller_loader_overrides_refuse_before_an_actual_managed_ay_probe() {
     let marker = root.join("candidate-ran");
     let mut request = Submission {
         binding: Binding {
-            session: "s-0000000000000000000a".into(),
+            session: "t000000000a".into(),
             attempt: [31; 16],
         },
         peer_pid: std::process::id(),
@@ -234,7 +234,7 @@ fn an_actual_native_capability_read_survives_scheduling_delay() {
 fn malformed_metadata_purpose_cannot_fall_back_to_a_legacy_preparation_probe() {
     let mut request = Submission {
         binding: Binding {
-            session: "s-0000000000000000000a".into(),
+            session: "t000000000a".into(),
             attempt: [1; 16],
         },
         peer_pid: std::process::id(),
@@ -291,7 +291,7 @@ fn arbitrary_command_budget_is_not_a_qualified_memory_enforcement_recipe() {
     let pid = std::process::id();
     let request = Submission {
         binding: Binding {
-            session: "s-0000000000000000000a".into(),
+            session: "t000000000a".into(),
             attempt: [1; 16],
         },
         peer_pid: pid,

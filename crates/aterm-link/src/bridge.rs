@@ -30,7 +30,7 @@ use crate::pipeline::{HeldCommit, Link, Publish};
 use crate::presence::{Fields, Marked, Mode, Slot};
 use crate::render::trust_of;
 use crate::state::{
-    asks, Asked, BridgeLock, Deadline, InFlight, LogWitness, PublishIdentity, PublishPin,
+    asks, Asked, BridgeLock, Deadline, InFlight, LogWitness, Met, PublishIdentity, PublishPin,
     StandingHalt, StateDir, TopicCursor, ASKED_KEEP, DEADLINES_KEEP, INC_MAX,
 };
 use crate::subject::{self, Reject};
@@ -1633,6 +1633,9 @@ pub struct Bridge {
     halt_retry: (u64, u64),
     bus_high: u64,
     bus_log: Option<astream_broker::LogIdentity>,
+    /// Where this node met the line of the log it reads ([`Met`]), as this run knows it: the
+    /// witness's once it is written ([`Bridge::save_log_witness`]), the attach's before.
+    bus_met: Option<Met>,
     indexed_subjects: BTreeSet<String>,
     /// The subject budget the running drain or mirror pass read ([`BudgetScope`], critic item G04).
     budget_scope: BudgetScope,
@@ -2195,6 +2198,7 @@ impl Bridge {
             halt_retry: (0, 0),
             bus_high: log_witness.high,
             bus_log: last_log,
+            bus_met: log_witness.met.filter(|_| log_witness.id.is_some()),
             indexed_subjects: BTreeSet::new(),
             budget_scope: BudgetScope::Out,
             #[cfg(test)]
@@ -6430,6 +6434,24 @@ impl Bridge {
         if addr.src == self.node && self.is_forged_self(off) {
             return Err("forged-self".into());
         }
+        // HELD FROM A FETCH AS FROM A DELIVERY (ATERM-KI-1113-957): an own record whose in-flight
+        // entry stands (for aterm's drain, or one the state dir refused to end, which the check
+        // tries to end again as a delivery's does) may yet be landed again by the replay, a cut
+        // having given this copy up; a session that read this copy would then read its post or
+        // answer twice. Until the entry ends, the fetch fails `unsettled`, and a later one reads
+        // the record. The sim's fetching world, seed 5434: a decision whose entry a full disk would
+        // not clear, fetched at @156, given up by a cut, landed again at @179 and handed to the
+        // asker. A fetched answer's deadline is not waited for as a delivery's is
+        // (ATERM-KI-1115-9210). NEGATIVE CONTROL: `Mutant::FetchPastAStandingEntry`.
+        #[cfg(test)]
+        let held = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::FetchPastAStandingEntry);
+        #[cfg(not(test))]
+        let held = true;
+        if held && addr.src == self.node && !self.settled_before_delivery(off) {
+            return Err("unsettled".into());
+        }
         let (body, _) = Body::decode(&raw);
         if !body.via.as_deref().is_none_or(via_ok) {
             return Err("via".into());
@@ -6778,7 +6800,9 @@ impl Bridge {
     ///    (F21's review: the first cut held by the record's `from=`, whatever aterm listed,
     ///    `Mutant::HoldPastTheListing`). So does every entry where no whole listing could be read
     ///    (`more`, a refusal, a failure) and every entry no outbox lists (an `expired` verdict,
-    ///    which names no sender): each is published at its pin, as before F21. NOT HELD EITHER:
+    ///    which names no sender): each is published at its pin, as before F21, but for an
+    ///    `expired` the read back found nowhere whose ask its asker's lane settled since, which
+    ///    is dropped ([`Bridge::expiry_moot`]). NOT HELD EITHER:
     ///    an older build's entry, which names no head to read back from, and one journaled on
     ///    another log, which nothing here binds, are published again at their pins as before
     ///    (their dedup answers where they landed): there a first attempt that never landed lands
@@ -6884,16 +6908,19 @@ impl Bridge {
                 .mutant(crate::sim::world::Mutant::ReplayWithoutReadingBack);
             #[cfg(not(test))]
             let read_back = true;
-            // An older build's entry names no head, and one journaled on a log that keeps its id
-            // and continues nothing, or whose lineage is unknown, is bound by nothing here: each
-            // published again as before. One journaled on another log is read back from its start
-            // (`Bridge::read_back_from`). An entry in words its pin's attempt never published (a
-            // retry's that read that attempt back and found none, `Bridge::reworded_landing`) is
-            // read back by the pin's identity too, and published at the pin only once so read.
+            // An older build's entry names no head, and is bound by nothing here: published again
+            // as before. One journaled on a log the one it reads continues none of (another id,
+            // the same id continuing nothing, a lineage unknown) is read back from the head this
+            // node met the log it reads at, but for one journaled on a generation since that
+            // meeting, published again at its pin (`Bridge::read_back_from`). An entry in words
+            // its pin's attempt never published (a retry's that read that attempt back and found
+            // none, `Bridge::reworded_landing`) is read back by the pin's identity too, and
+            // published at the pin only once so read.
             let mut wants = vec![publication_identity(&entry.subject, &entry.body)];
             let reworded = !reconstructs(&entry.pin, &entry.body);
             wants.extend(entry.pin.identity.clone().filter(|_| reworded));
             let mut read = false;
+            let mut unread = false;
             if let Some(from) = self
                 .read_back_from(entry.log, entry.at)
                 .filter(|_| read_back)
@@ -6912,7 +6939,10 @@ impl Bridge {
                         self.land_replayed(seq, off, ours);
                         continue;
                     }
-                    Ok((None, decided)) => read = decided,
+                    Ok((None, decided)) => {
+                        read = decided;
+                        unread = true;
+                    }
                     Err(e) => {
                         stderr_line!(
                             "aterm-link: the in-flight record at sequence {seq} could not be \
@@ -6938,6 +6968,32 @@ impl Bridge {
                     );
                     self.drop_in_flight(seq);
                     continue;
+                }
+            }
+            // AN `expired` VERDICT THE READ BACK FOUND NOWHERE, its ask settled since
+            // ([`Bridge::expiry_moot`]): dropped, never published again. One not read back (no
+            // head, a log nothing here binds) is published at its pin as before, where its dedup
+            // lands it on a first copy the bus may still hold.
+            match if unread {
+                self.expiry_moot(&entry.subject, decoded.re)
+            } else {
+                Ok(false)
+            } {
+                Ok(true) => {
+                    stderr_line!(
+                        "aterm-link: the in-flight expiry at sequence {seq} is not on the bus, and \
+                         its ask is settled there; it is not published again"
+                    );
+                    self.drop_in_flight(seq);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    stderr_line!(
+                        "aterm-link: the in-flight expiry at sequence {seq} could not read its \
+                         ask's lane: {e}"
+                    );
+                    return false;
                 }
             }
             // A KEYED RE-POST'S ENTRY, its own words not read back on the bus: its key's winner,
@@ -7062,17 +7118,21 @@ impl Bridge {
     /// that the offsets name records published since the move, a copy an earlier replay
     /// published among them, which the entry's head on its own log may lie above (aterm-link
     /// B05 review: a replay at a head above the new log's put the copy below it, and the next
-    /// replay, missing it, published a second); 0 on ANOTHER LOG (another id, told with its
-    /// lineage: `state::another_log`), since every record on it landed after the entry was
-    /// journaled, so a copy found there is one an earlier attempt on this very log published,
-    /// whose settle the disk then refused (ATERM-KI-1111-4: the sim's seed 104 of
-    /// `Opts::lossy_logs` met a replay on another log whose `land_replayed` write failed, and
-    /// the next attach, reading nothing back, published a second copy once a cut dropped the
-    /// first one's key); `None` for no head, for a log whose lineage the link cannot read, and
-    /// for one that keeps the id and continues nothing (a restored or shortened copy, a move
-    /// older than the lineage's window), which may still hold records from before the entry: a
-    /// read back from 0 there would settle the entry on an earlier identical record and never
-    /// publish it, so it is published again, as before.
+    /// replay, missing it, published a second); and on one that continues none as far as the
+    /// broker told (another id; the same id continuing nothing; a lineage the link cannot
+    /// read), the head this node met that log's line at ([`Met::floor`]). Every record that
+    /// landed before the node met it, the sender's earlier post of the same words among them,
+    /// lies below that head if the log holds it at all, and every copy an attempt published
+    /// there since (one whose settle the disk then refused, ATERM-KI-1111-4's seed 104 of
+    /// `Opts::lossy_logs`) at or above it. Not 0: astream gives a log that kept its records
+    /// another id, told with an empty lineage, as it gives an empty one (a fresh id where its
+    /// identity sidecar does not read, one derived from its records where the sidecar is gone:
+    /// `logid::settle`'s `Prior::Unreadable` and `Prior::Absent`), and a read back from 0 there
+    /// settled the entry on that earlier post and never published it, a post aterm was told
+    /// landed (critic review F1, 2026-11-13). `None` for no head, where the node met no line of
+    /// this log, and for a head kept on a generation of that line since the meeting that the
+    /// lineage does not relate: there the entry is published again at its pin, and astream's
+    /// dedup answers a copy whose key stands.
     fn read_back_from(
         &self,
         log: Option<astream_broker::LogIdentity>,
@@ -7084,30 +7144,40 @@ impl Bridge {
         if was == now {
             return Some(at);
         }
-        let lineage = conn.log_lineage()?;
-        if crate::state::another_log(Some(was), Some(now), Some(lineage)) {
+        if let Some(fork) = conn
+            .log_lineage()
+            .and_then(|lineage| now.continues(was, lineage))
+        {
             #[cfg(test)]
             if self
                 .fx
-                .mutant(crate::sim::world::Mutant::NoReadBackOnAnotherLog)
+                .mutant(crate::sim::world::Mutant::ReadBackFromTheJournaledHead)
             {
-                return None;
-            }
-            #[cfg(test)]
-            if self.fx.mutant(crate::sim::world::Mutant::AnotherLogAsAMove) {
                 return Some(at);
             }
-            return Some(0);
+            return Some(at.min(fork));
         }
-        let fork = now.continues(was, lineage)?;
         #[cfg(test)]
         if self
             .fx
-            .mutant(crate::sim::world::Mutant::ReadBackFromTheJournaledHead)
+            .mutant(crate::sim::world::Mutant::NoReadBackOnAnotherLog)
         {
+            return None;
+        }
+        #[cfg(test)]
+        if self.fx.mutant(crate::sim::world::Mutant::AnotherLogAsAMove) {
             return Some(at);
         }
-        Some(at.min(fork))
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReadBackFromTheLogsStart)
+        {
+            return Some(0);
+        }
+        self.bus_met
+            .filter(|_| self.bus_log == Some(now))?
+            .floor(was, now)
     }
 
     /// `off` holds `seq`'s record: a copy the replay or a retry published there, or read back
@@ -7267,7 +7337,8 @@ impl Bridge {
     /// this bridge knows its sequence's record is ([`Bridge::claims`]: the attach's replay
     /// settled its entry there, or an earlier retry published it), or else read back
     /// ([`Bridge::landed_since`]) from the head the pin was made at (`PublishPin::at`, which a
-    /// move brings down to where the new log continues the old, and another log to its start:
+    /// move brings down to where the new log continues the old, and a log that continues none to
+    /// the head this node met it at:
     /// `StateDir::publication_offset_resets` for a post's, [`Bridge::receipt_pin_now`] for a
     /// receipt's), or, for a pin that keeps no head (a receipt's before it kept one), from that
     /// of its record in flight while it stands. `None` for none, and for a pin that names no
@@ -7895,6 +7966,56 @@ impl Bridge {
             }
         }
         false
+    }
+
+    /// WHETHER A JOURNALED `expired` VERDICT ON `subject`, OF THE ASK AT `re`, IS MOOT: the replay
+    /// read it back nowhere, and the asker's lane now holds an answer to that ask (or another
+    /// verdict on it), on the bus ([`Bridge::settled_on_bus`]) or read into the mailbox and not
+    /// yet handled ([`Bridge::answer_queued`]). The verdict was right where it first landed, ahead
+    /// of the answer; a cut then gave that copy up, so the replay cannot tell whether the asker
+    /// read it. Published again, it would land behind the answer and say no answer came: the
+    /// sweep never publishes an `expired` its ask's answer precedes, and the replay holds to the
+    /// same. Dropped, it costs nothing an asker can miss: one that read the first copy has its
+    /// verdict, and one that did not has the answer. The sim's asking world, seed 3752: `expired`
+    /// at @26, the answer at @44, cuts to 45 and 59, the relaunch's read back refused below 27,
+    /// and the copy at @100. NEGATIVE CONTROL (`Mutant::ReplayRepostsAMootExpiry`): every such
+    /// verdict is published again at its pin.
+    fn expiry_moot(&mut self, subject: &str, re: Option<u64>) -> io::Result<bool> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayRepostsAMootExpiry)
+        {
+            return Ok(false);
+        }
+        let Some(re) = re else {
+            return Ok(false);
+        };
+        let mut parts = subject.split('/');
+        let (Some(""), Some("f"), Some(fleet), Some("in"), Some(node), Some(sid), Some(src)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Ok(false);
+        };
+        if parts.next() != Some("expired")
+            || parts.next().is_some()
+            || fleet != self.cfg.fleet
+            || node != self.node
+            || !self.is_my_node(src)
+        {
+            return Ok(false);
+        }
+        let sid = sid.to_string();
+        if self.answer_queued(&sid, re) {
+            return Ok(true);
+        }
+        Ok(self.settled_on_bus(&sid, re)?.is_some())
     }
 
     fn settled_on_bus(&mut self, sid: &str, off: u64) -> io::Result<Option<&'static str>> {
@@ -9536,6 +9657,7 @@ impl Bridge {
         let seen = LogWitness {
             high,
             id: self.bus_log,
+            met: self.bus_met,
         };
         let continues = seen
             .continues(ident, lineage)
@@ -9607,13 +9729,31 @@ impl Bridge {
         true
     }
 
-    fn note_log(&mut self, head: u64, ident: Option<astream_broker::LogIdentity>, rebase: bool) {
-        if rebase {
+    /// What an attach read of the log: its `head` and identity, and, where it found the log
+    /// replaced ([`Bridge::judge_log`]), whether the new log continues the old to a fork
+    /// (`replaced`: `Some(continues)`). The node stands met ([`Met::after`]) where it stood on
+    /// the same log, down to the fork on a move that continues it, and at this head on a log
+    /// that continues none or where it stood met nowhere.
+    fn note_log(
+        &mut self,
+        head: u64,
+        ident: Option<astream_broker::LogIdentity>,
+        replaced: Option<Option<u64>>,
+    ) {
+        let met = Met::after(
+            self.bus_met,
+            ident,
+            head,
+            replaced.map(|continues| continues.map(|fork| fork.min(head))),
+        );
+        if replaced.is_some() {
             self.bus_high = head;
             self.bus_log = ident;
+            self.bus_met = met;
         } else {
             self.bus_high = self.bus_high.max(head);
             self.bus_log = ident.or(self.bus_log);
+            self.bus_met = met.or(self.bus_met);
         }
     }
 
@@ -9640,6 +9780,11 @@ impl Bridge {
             self.fx
                 .mutant(crate::sim::world::Mutant::PinHeadGoneOnAnotherLog),
         );
+        #[cfg(test)]
+        self.state.heads_from_the_logs_start(
+            self.fx
+                .mutant(crate::sim::world::Mutant::ReadBackFromTheLogsStart),
+        );
         let keep_below = keep_below.map(|f| f.min(head));
         let kept = |off: u64| keep_below.is_some_and(|f| off < f);
         #[cfg(test)]
@@ -9654,9 +9799,9 @@ impl Bridge {
         if forget_pin {
             self.mirror_forget_log()?;
         }
-        let dropped =
-            self.state
-                .forget_log_offsets(head, self.bus_log, log, keep_below, lineage)?;
+        let dropped = self
+            .state
+            .forget_log_offsets(head, log, keep_below, lineage)?;
         for (seq, face) in &dropped {
             stderr_line!(
                 "aterm-link: the in-flight record at sequence {seq} on {face} was decided on \
@@ -9733,25 +9878,46 @@ impl Bridge {
         }
     }
 
+    /// Write the bus log's witness: the log this node reads, its high water and where the node
+    /// met its line ([`Met`]), on the media for a re-base onto a log the attach judged replaced
+    /// ([`StateDir::rebase_log_witness`]).
     fn save_log_witness(&mut self, rebase: bool) -> bool {
         let witness = if rebase {
             LogWitness {
                 high: self.bus_high,
                 id: self.bus_log,
+                met: self.bus_met,
             }
         } else {
             if self.log_replaced.is_some() {
                 return false;
             }
+            let id = self.log_witness.id.or(self.bus_log);
             LogWitness {
                 high: self.bus_high.max(self.log_witness.high),
-                id: self.log_witness.id.or(self.bus_log),
+                id,
+                met: if id == self.bus_log {
+                    self.bus_met
+                } else {
+                    self.log_witness.met
+                },
             }
         };
         if witness == self.log_witness {
             return true;
         }
-        match self.state.set_log_witness(&witness) {
+        let on_the_media = rebase;
+        #[cfg(test)]
+        let on_the_media = on_the_media
+            && !self
+                .fx
+                .mutant(crate::sim::world::Mutant::RebaseWitnessUnflushed);
+        let wrote = if on_the_media {
+            self.state.rebase_log_witness(&witness)
+        } else {
+            self.state.set_log_witness(&witness)
+        };
+        match wrote {
             Ok(()) => {
                 self.log_witness = witness;
                 true
@@ -11428,9 +11594,9 @@ impl Bridge {
     /// Owed receipt `rid` of `sid`'s pin, with the head kept for it beside its pin file
     /// (`StateDir::receipt_head`) read on the log the link reads, as an in-flight entry's is
     /// ([`Bridge::read_back_from`]): as written on that log, brought down to where a log that
-    /// continues it forks, and to 0 on another log. None where the file names another pin or a
-    /// log the link cannot relate to its own (a build before the heads moves and re-pins past
-    /// the file without touching it).
+    /// continues it forks, and to the head this node met a log that continues none of it at.
+    /// None where the file names another pin, and where read_back_from relates its log to none
+    /// (a build before the heads moves and re-pins past the file without touching it).
     fn receipt_pin_now(&self, sid: &str, rid: u64) -> io::Result<Option<PublishPin>> {
         let Some(mut pin) = self.state.receipt_pin(sid, rid)? else {
             return Ok(None);
@@ -13412,7 +13578,7 @@ impl Bridge {
             self.conn = None;
             return false;
         }
-        self.note_log(head, ident, found.is_some());
+        self.note_log(head, ident, found.map(|found| found.continues));
         if let Err(e) = self.bring_presence_up() {
             stderr_line!("aterm-link: presence could not come up: {e}");
             if e.kind() == io::ErrorKind::Other {

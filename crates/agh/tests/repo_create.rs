@@ -15,6 +15,10 @@ use agh_fake::{FakeGithub, Fault, Match, RepoSpec};
 
 const REPO: &str = "alabsystems/aterm";
 const PATH: &str = "/repos/alabsystems/aterm";
+const VISIBILITIES: [(RepoVisibility, bool, &str); 2] = [
+    (RepoVisibility::Public, false, "--public"),
+    (RepoVisibility::Private, true, "--private"),
+];
 
 struct World {
     root: aterm_tempfile::TempDir,
@@ -40,18 +44,32 @@ fn world() -> World {
 
 impl World {
     fn permit(&self) -> RepoCreatePermit {
+        self.permit_with(RepoVisibility::Public)
+    }
+
+    fn permit_with(&self, visibility: RepoVisibility) -> RepoCreatePermit {
         self.gh
             .repos()
             .permit_create(
                 &RouteRequest::write(RouteTarget::Repo(common::slug(REPO)))
                     .with_named(common::granted(&self.gh, REPO)),
-                RepoVisibility::Public,
+                visibility,
             )
             .expect("the file grants this caller this repository")
     }
 
     fn create(&self, journal: &Journal) -> agh::Result<Outcome<Ensured<agh::model::RepoObject>>> {
         self.gh.repos().create(&self.permit(), journal)
+    }
+
+    fn create_with(
+        &self,
+        journal: &Journal,
+        visibility: RepoVisibility,
+    ) -> agh::Result<Outcome<Ensured<agh::model::RepoObject>>> {
+        self.gh
+            .repos()
+            .create(&self.permit_with(visibility), journal)
     }
 
     fn posts(&self) -> usize {
@@ -69,161 +87,304 @@ impl World {
 }
 
 fn done(outcome: Outcome<Ensured<agh::model::RepoObject>>, effect: Effect) -> u64 {
+    done_with(outcome, effect, false)
+}
+
+fn done_with(
+    outcome: Outcome<Ensured<agh::model::RepoObject>>,
+    effect: Effect,
+    private: bool,
+) -> u64 {
     let Outcome::Done(ensured) = outcome else {
         panic!("wanted Done: {outcome:?}")
     };
     assert_eq!(ensured.effect, effect);
     assert_eq!(ensured.object.full_name, REPO);
-    assert_eq!(ensured.object.visibility.as_deref(), Some("public"));
-    assert!(!ensured.object.private);
+    assert_eq!(
+        ensured.object.visibility.as_deref(),
+        Some(if private { "private" } else { "public" })
+    );
+    assert_eq!(ensured.object.private, private);
     ensured.object.id
 }
 
 #[test]
-fn creates_public_with_exact_payload_and_records_grant_then_converges_without_posting() {
-    let w = world();
-    let journal = w.gh.journal(&common::slug(REPO)).unwrap();
-    let id = done(w.create(&journal).unwrap(), Effect::Created);
-    done(w.create(&journal).unwrap(), Effect::Converged);
-    assert_eq!(w.posts(), 1);
-    let seen = w.fake.seen();
-    let post = seen.iter().position(|r| r.method == "POST").unwrap();
-    assert_eq!(seen[post].path_and_query, "/user/repos");
-    assert_eq!(seen[post].as_login.as_deref(), Some("alabsystems"));
-    let bodies = w.fake.bodies();
-    let body = bodies.iter().find(|b| b.seen == post).unwrap();
-    assert_eq!(
-        aterm_json::from_str::<aterm_json::Value>(body.json.as_ref().unwrap()).unwrap(),
-        aterm_json::json!({"name":"aterm", "private":false, "auto_init":false})
-    );
-    let (records, _) = journal.read().unwrap();
-    let JournalRecord::Intent(intent) = &records[0].1 else {
-        panic!("intent")
-    };
-    assert_eq!(intent.grant.as_deref(), Some("fixture-caller"));
-    assert_eq!(intent.op.slug(), "repo.create");
-    assert!(intent.body_digest.is_some());
-    assert!(records.iter().any(|(_, r)| matches!(r,
+fn creates_each_visibility_with_exact_payload_and_grant_then_converges_without_posting() {
+    for (visibility, private, _) in VISIBILITIES {
+        let w = world();
+        let journal = w.gh.journal(&common::slug(REPO)).unwrap();
+        assert_eq!(w.permit_with(visibility).visibility(), visibility);
+        let id = done_with(
+            w.create_with(&journal, visibility).unwrap(),
+            Effect::Created,
+            private,
+        );
+        done_with(
+            w.create_with(&journal, visibility).unwrap(),
+            Effect::Converged,
+            private,
+        );
+        assert_eq!(w.posts(), 1);
+        let seen = w.fake.seen();
+        let post = seen.iter().position(|r| r.method == "POST").unwrap();
+        assert_eq!(seen[post].path_and_query, "/user/repos");
+        assert_eq!(seen[post].as_login.as_deref(), Some("alabsystems"));
+        let bodies = w.fake.bodies();
+        let body = bodies.iter().find(|b| b.seen == post).unwrap();
+        assert_eq!(
+            aterm_json::from_str::<aterm_json::Value>(body.json.as_ref().unwrap()).unwrap(),
+            aterm_json::json!({"name":"aterm", "private":private, "auto_init":false})
+        );
+        let (records, _) = journal.read().unwrap();
+        let JournalRecord::Intent(intent) = &records[0].1 else {
+            panic!("intent")
+        };
+        assert_eq!(intent.grant.as_deref(), Some("fixture-caller"));
+        assert_eq!(intent.op.slug(), "repo.create");
+        let digest =
+            agh::model::Sha256Digest::of(body.json.as_ref().unwrap().as_bytes()).to_string();
+        assert_eq!(intent.body_digest.as_deref(), Some(digest.as_str()));
+        assert!(records.iter().any(|(_, r)| matches!(r,
         JournalRecord::Settled { outcome: agh::journal::Settled::Created { id: made, .. }, .. } if *made == id)));
+    }
 }
 
 #[test]
 fn owner_and_user_type_are_proved_even_for_file_credentials() {
-    for wrong in ["other-user", "Organization"] {
-        let w = world();
-        if wrong == "Organization" {
-            w.fake.fault(
-                Match::api("/user").method("GET"),
-                Fault::Status {
-                    status: 200,
-                    body: r#"{"id":1,"login":"alabsystems","type":"Organization"}"#.into(),
-                    headers: Vec::new(),
-                },
-            );
-        } else {
-            w.fake.add_token(&agh_fake::token("release"), wrong);
+    for (visibility, _, _) in VISIBILITIES {
+        for wrong in ["other-user", "Organization"] {
+            let w = world();
+            if wrong == "Organization" {
+                w.fake.fault(
+                    Match::api("/user").method("GET"),
+                    Fault::Status {
+                        status: 200,
+                        body: r#"{"id":1,"login":"alabsystems","type":"Organization"}"#.into(),
+                        headers: Vec::new(),
+                    },
+                );
+            } else {
+                w.fake.add_token(&agh_fake::token("release"), wrong);
+            }
+            let error =
+                w.gh.repos()
+                    .check_create(&w.permit_with(visibility))
+                    .unwrap_err();
+            assert_eq!(error.kind, Kind::Refused);
+            assert_eq!(w.posts(), 0);
+            assert!(!w.dirs.journal().exists());
         }
-        let error = w.gh.repos().check_create(&w.permit()).unwrap_err();
-        assert_eq!(error.kind, Kind::Refused);
-        assert_eq!(w.posts(), 0);
-        assert!(!w.dirs.journal().exists());
     }
 }
 
 #[test]
 fn ordinary_route_requires_release_literal_or_real_file_grant_and_rejects_wrong_tier() {
-    let w = world();
-    let route = RouteRequest::write(RouteTarget::Repo(common::slug(REPO)));
-    assert!(
-        w.gh.repos()
-            .permit_create(&route, RepoVisibility::Public)
-            .is_err()
-    );
-    let wrong = route
-        .clone()
-        .with_named(common::granted(&w.gh, REPO))
-        .with_as(Some("dev".into()));
-    assert!(
-        w.gh.repos()
-            .permit_create(&wrong, RepoVisibility::Public)
-            .is_err()
-    );
-    let text_router = common::router(
-        &format!(
-            "{}{}",
-            common::canonical_config(w.root.path()),
-            common::WRITERS
-        ),
-        w.root.path(),
-    );
-    assert!(
-        text_router
-            .grant("fixture-caller", &common::slug(REPO))
-            .is_err()
-    );
-    assert!(
-        w.gh.repos()
-            .permit_create(
-                &RouteRequest::write(RouteTarget::Identity),
-                RepoVisibility::Public
-            )
-            .is_err()
-    );
-    assert!(w.fake.seen().is_empty());
+    for (visibility, _, _) in VISIBILITIES {
+        let w = world();
+        let route = RouteRequest::write(RouteTarget::Repo(common::slug(REPO)));
+        assert!(w.gh.repos().permit_create(&route, visibility).is_err());
+        let wrong = route
+            .clone()
+            .with_named(common::granted(&w.gh, REPO))
+            .with_as(Some("dev".into()));
+        assert!(w.gh.repos().permit_create(&wrong, visibility).is_err());
+        let text_router = common::router(
+            &format!(
+                "{}{}",
+                common::canonical_config(w.root.path()),
+                common::WRITERS
+            ),
+            w.root.path(),
+        );
+        assert!(
+            text_router
+                .grant("fixture-caller", &common::slug(REPO))
+                .is_err()
+        );
+        assert!(
+            w.gh.repos()
+                .permit_create(&RouteRequest::write(RouteTarget::Identity), visibility)
+                .is_err()
+        );
+        assert!(w.fake.seen().is_empty());
+    }
 }
 
 #[test]
-fn existing_public_is_unchanged_and_private_is_never_made_public() {
-    for private in [false, true] {
-        let w = world();
-        w.fake.add_repo(
-            REPO,
-            if private {
-                RepoSpec::private().push("alabsystems")
+fn existing_matching_visibility_is_unchanged_and_conflicting_visibility_is_never_changed() {
+    for (visibility, requested_private, flag) in VISIBILITIES {
+        for private in [false, true] {
+            let w = world();
+            w.fake.add_repo(
+                REPO,
+                if private {
+                    RepoSpec::private().push("alabsystems")
+                } else {
+                    RepoSpec::public()
+                },
+            );
+            let journal = w.gh.journal(&common::slug(REPO)).unwrap();
+            if private != requested_private {
+                assert_eq!(
+                    w.create_with(&journal, visibility).unwrap_err().kind,
+                    Kind::Conflict
+                );
             } else {
-                RepoSpec::public()
-            },
-        );
-        let journal = w.gh.journal(&common::slug(REPO)).unwrap();
-        if private {
-            assert_eq!(w.create(&journal).unwrap_err().kind, Kind::Conflict);
-        } else {
-            done(w.create(&journal).unwrap(), Effect::Unchanged);
+                done_with(
+                    w.create_with(&journal, visibility).unwrap(),
+                    Effect::Unchanged,
+                    private,
+                );
+            }
+            let (exit, out) = w.cli(&["repo", "create", REPO, flag, "--dry-run"]);
+            assert_eq!(
+                exit,
+                if private == requested_private { 0 } else { 9 },
+                "{}",
+                out.stderr_text()
+            );
+            assert_eq!(w.posts(), 0);
+            assert!(journal.read().unwrap().0.is_empty());
         }
-        assert_eq!(w.posts(), 0);
-        assert!(journal.read().unwrap().0.is_empty());
+    }
+}
+
+#[test]
+fn readback_requires_both_explicit_consistent_visibility_fields() {
+    for (visibility, private, _) in VISIBILITIES {
+        for missing_or_wrong in ["private", "visibility", "opposite-private", "internal"] {
+            let w = world();
+            let mut response = aterm_json::json!({
+                "id":1, "full_name":REPO, "name":"aterm",
+                "owner":{"id":1,"login":"alabsystems","type":"User"},
+                "private":private, "visibility":if private { "private" } else { "public" },
+            });
+            match missing_or_wrong {
+                "private" | "visibility" => {
+                    response.as_object_mut().unwrap().remove(missing_or_wrong);
+                }
+                "opposite-private" => {
+                    response
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("private".into(), (!private).into());
+                }
+                "internal" => {
+                    response
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("visibility".into(), "internal".into());
+                }
+                _ => unreachable!(),
+            }
+            w.fake.fault(
+                Match::api(PATH).method("GET"),
+                Fault::Status {
+                    status: 200,
+                    body: response.to_string(),
+                    headers: Vec::new(),
+                },
+            );
+            let error =
+                w.gh.repos()
+                    .check_create(&w.permit_with(visibility))
+                    .unwrap_err();
+            assert_eq!(
+                error.kind,
+                Kind::Conflict,
+                "{visibility:?}/{missing_or_wrong}"
+            );
+            assert_eq!(w.posts(), 0);
+            assert!(!w.dirs.journal().exists());
+        }
     }
 }
 
 #[test]
 fn lost_applied_response_converges_and_lost_unapplied_response_never_reposts() {
-    for lands in [false, true] {
+    for (visibility, private, _) in VISIBILITIES {
+        for lands in [false, true] {
+            let w = world();
+            let journal = w.gh.journal(&common::slug(REPO)).unwrap();
+            w.fake.fault(
+                Match::api("/user/repos").method("POST"),
+                if lands {
+                    Fault::LandThenClose
+                } else {
+                    Fault::Close
+                },
+            );
+            let first = w.create_with(&journal, visibility).unwrap();
+            if lands {
+                done_with(first, Effect::Converged, private);
+                done_with(
+                    w.create_with(&journal, visibility).unwrap(),
+                    Effect::Converged,
+                    private,
+                );
+                assert!(journal.open().unwrap().is_empty());
+            } else {
+                assert!(matches!(first, Outcome::Unknown { .. }));
+                assert!(matches!(
+                    w.create_with(&journal, visibility).unwrap(),
+                    Outcome::Unknown { .. }
+                ));
+                assert_eq!(journal.open().unwrap().len(), 1);
+                // A later matching owner readback reconciles, without another POST.
+                w.fake.add_repo(
+                    REPO,
+                    if private {
+                        RepoSpec::private().push("alabsystems")
+                    } else {
+                        RepoSpec::public()
+                    },
+                );
+                done_with(
+                    w.create_with(&journal, visibility).unwrap(),
+                    Effect::Converged,
+                    private,
+                );
+            }
+            assert_eq!(w.posts(), 1);
+        }
+    }
+}
+
+#[test]
+fn changing_visibility_cannot_reconcile_or_repeat_an_unknown_creation() {
+    for (visibility, private, flag) in VISIBILITIES {
         let w = world();
         let journal = w.gh.journal(&common::slug(REPO)).unwrap();
-        w.fake.fault(
-            Match::api("/user/repos").method("POST"),
-            if lands {
-                Fault::LandThenClose
+        w.fake
+            .fault(Match::api("/user/repos").method("POST"), Fault::Close);
+        let Outcome::Unknown { intent, .. } = w.create_with(&journal, visibility).unwrap() else {
+            panic!("the original creation must remain unknown")
+        };
+        let before = std::fs::read(journal.path()).unwrap();
+        let other = if private {
+            RepoVisibility::Public
+        } else {
+            RepoVisibility::Private
+        };
+        // Even a visible object matching the new request cannot settle the old body.
+        w.fake.add_repo(
+            REPO,
+            if private {
+                RepoSpec::public()
             } else {
-                Fault::Close
+                RepoSpec::private().push("alabsystems")
             },
         );
-        let first = w.create(&journal).unwrap();
-        if lands {
-            done(first, Effect::Converged);
-            done(w.create(&journal).unwrap(), Effect::Converged);
-            assert!(journal.open().unwrap().is_empty());
-        } else {
-            assert!(matches!(first, Outcome::Unknown { .. }));
-            assert!(matches!(
-                w.create(&journal).unwrap(),
-                Outcome::Unknown { .. }
-            ));
-            assert_eq!(journal.open().unwrap().len(), 1);
-            // A later matching owner readback reconciles, without another POST.
-            w.fake.add_repo(REPO, RepoSpec::public());
-            done(w.create(&journal).unwrap(), Effect::Converged);
+        let Outcome::Unknown { intent: again, .. } = w.create_with(&journal, other).unwrap() else {
+            panic!("a different visibility must not reconcile the old intent")
+        };
+        assert_eq!(again, intent);
+        for preview_flag in [flag, if private { "--public" } else { "--private" }] {
+            let (exit, _) = w.cli(&["repo", "create", REPO, preview_flag, "--dry-run"]);
+            assert_eq!(exit, 13);
         }
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+        assert_eq!(journal.open().unwrap().len(), 1);
         assert_eq!(w.posts(), 1);
     }
 }
@@ -281,39 +442,62 @@ fn duplicate_422_is_read_back_without_repeating_post() {
 }
 
 #[test]
-fn cli_requires_explicit_public_and_dry_run_has_no_creation_journal_or_learning() {
+fn cli_requires_exactly_one_visibility_before_any_github_calls() {
     let w = world();
-    let config = std::fs::read(w.dirs.config.join("agh.toml")).unwrap();
-    let (exit, _) = w.cli(&["repo", "create", REPO, "--dry-run"]);
-    assert_eq!(exit, 2);
-    assert!(w.fake.seen().is_empty());
-    let (exit, out) = w.cli(&["repo", "create", REPO, "--public", "--dry-run"]);
-    assert_eq!(exit, 0, "{}", out.stderr_text());
-    let value = common::stdout_json(&out);
-    assert_eq!(value["outcome"].as_str(), Some("would_send"));
-    assert_eq!(value["dry_run"].as_bool(), Some(true));
-    assert_eq!(w.posts(), 0);
-    assert!(!w.dirs.journal().exists());
-    assert_eq!(
-        std::fs::read(w.dirs.config.join("agh.toml")).unwrap(),
-        config
-    );
-    assert_eq!(
-        w.fake
-            .seen()
-            .iter()
-            .filter(|s| s.path_and_query == "/user")
-            .count(),
-        1
-    );
-    // A literal command is sufficient; the library's default target was refused above.
-    let (exit, out) = w.cli(&["repo", "create", REPO, "--public"]);
-    assert_eq!(exit, 0, "{}", out.stderr_text());
-    assert_eq!(
-        common::stdout_json(&out)["outcome"].as_str(),
-        Some("created")
-    );
-    assert_eq!(w.posts(), 1);
+    for flags in [
+        vec![],
+        vec!["--public", "--private"],
+        vec!["--private", "--public"],
+        vec!["--public", "--public"],
+        vec!["--private", "--private"],
+    ] {
+        let mut args = vec!["repo", "create", REPO, "--dry-run"];
+        args.extend(flags);
+        let (exit, _) = w.cli(&args);
+        assert_eq!(exit, 2);
+        assert!(w.fake.seen().is_empty());
+        assert!(!w.dirs.journal().exists());
+    }
+}
+
+#[test]
+fn both_cli_visibilities_dry_run_without_posting_journaling_or_learning_then_create() {
+    for (_, private, flag) in VISIBILITIES {
+        let w = world();
+        let config = std::fs::read(w.dirs.config.join("agh.toml")).unwrap();
+        let (exit, out) = w.cli(&["repo", "create", REPO, flag, "--dry-run"]);
+        assert_eq!(exit, 0, "{}", out.stderr_text());
+        let value = common::stdout_json(&out);
+        assert_eq!(value["outcome"].as_str(), Some("would_send"));
+        assert_eq!(value["dry_run"].as_bool(), Some(true));
+        assert_eq!(w.posts(), 0);
+        assert!(!w.dirs.journal().exists());
+        assert_eq!(
+            std::fs::read(w.dirs.config.join("agh.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            w.fake
+                .seen()
+                .iter()
+                .filter(|s| s.path_and_query == "/user")
+                .count(),
+            1
+        );
+        // A literal command is sufficient; the library's default target was refused above.
+        let (exit, out) = w.cli(&["repo", "create", REPO, flag]);
+        assert_eq!(exit, 0, "{}", out.stderr_text());
+        assert_eq!(
+            common::stdout_json(&out)["outcome"].as_str(),
+            Some("created")
+        );
+        assert_eq!(w.posts(), 1);
+        let body = w.fake.bodies().into_iter().find_map(|b| b.json).unwrap();
+        assert_eq!(
+            aterm_json::from_str::<aterm_json::Value>(&body).unwrap()["private"].as_bool(),
+            Some(private)
+        );
+    }
 }
 
 #[test]
@@ -517,43 +701,45 @@ fn timeout_leaves_one_unknown_intent_and_retry_does_not_send_again() {
 #[test]
 fn dry_run_and_loopback_recording_never_learn_unrecorded_vault_tokens() {
     use agh::identity::vault;
-    for record in [false, true] {
-        let w = world();
-        let explicit = common::canonical_config(w.root.path())
-            .replace("profiles.dev", "profiles.explicit-dev")
-            .replace("profiles.release", "profiles.explicit-release")
-            .replace("read = [\"dev\"", "read = [\"explicit-dev\"")
-            .replace("write = \"dev\"", "write = \"explicit-dev\"")
-            .replace("write = \"release\"", "write = \"explicit-release\"");
-        common::write_config(
-            &w.dirs,
-            &format!("vault = true\n{explicit}{}", common::WRITERS),
-        );
-        for (slot, seed, login) in [
-            (vault::Slot::Dev, "unlearned-dev", "new-dev"),
-            (vault::Slot::Release, "unlearned-release", "new-release"),
-        ] {
-            let token = agh_fake::token(seed);
-            common::vault_entry(&w.dirs.home, slot.entry(), &token);
-            w.fake.add_token(&token, login);
+    for (_, _, flag) in VISIBILITIES {
+        for record in [false, true] {
+            let w = world();
+            let explicit = common::canonical_config(w.root.path())
+                .replace("profiles.dev", "profiles.explicit-dev")
+                .replace("profiles.release", "profiles.explicit-release")
+                .replace("read = [\"dev\"", "read = [\"explicit-dev\"")
+                .replace("write = \"dev\"", "write = \"explicit-dev\"")
+                .replace("write = \"release\"", "write = \"explicit-release\"");
+            common::write_config(
+                &w.dirs,
+                &format!("vault = true\n{explicit}{}", common::WRITERS),
+            );
+            for (slot, seed, login) in [
+                (vault::Slot::Dev, "unlearned-dev", "new-dev"),
+                (vault::Slot::Release, "unlearned-release", "new-release"),
+            ] {
+                let token = agh_fake::token(seed);
+                common::vault_entry(&w.dirs.home, slot.entry(), &token);
+                w.fake.add_token(&token, login);
+            }
+            let tape = w.root.path().join("dry.atape");
+            let mut args = vec!["repo", "create", REPO, flag, "--dry-run"];
+            if record {
+                args.extend(["--record", tape.to_str().unwrap()]);
+            }
+            let (exit, out) = w.cli(&args);
+            assert_eq!(exit, 0, "{}", out.stderr_text());
+            assert_eq!(w.posts(), 0);
+            assert!(!w.dirs.config.join(vault::RECORD_FILE).exists());
+            assert!(!w.dirs.journal().exists());
+            assert_eq!(
+                w.fake
+                    .seen()
+                    .iter()
+                    .filter(|s| s.path_and_query == "/user")
+                    .count(),
+                1
+            );
         }
-        let tape = w.root.path().join("dry.atape");
-        let mut args = vec!["repo", "create", REPO, "--public", "--dry-run"];
-        if record {
-            args.extend(["--record", tape.to_str().unwrap()]);
-        }
-        let (exit, out) = w.cli(&args);
-        assert_eq!(exit, 0, "{}", out.stderr_text());
-        assert_eq!(w.posts(), 0);
-        assert!(!w.dirs.config.join(vault::RECORD_FILE).exists());
-        assert!(!w.dirs.journal().exists());
-        assert_eq!(
-            w.fake
-                .seen()
-                .iter()
-                .filter(|s| s.path_and_query == "/user")
-                .count(),
-            1
-        );
     }
 }

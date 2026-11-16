@@ -93,11 +93,7 @@ pub fn range(
         let mut count = 0;
         for row in listed.lines() {
             let ids: Vec<_> = row.split_whitespace().collect();
-            if ids.is_empty()
-                || !ids
-                    .iter()
-                    .all(|id| aterm_types::land_trailer::object_id(id))
-            {
+            if ids.is_empty() || !ids.iter().all(|id| aterm_land_trailer::object_id(id)) {
                 return Err("git rev-list wrote a malformed commit/parent row".into());
             }
             paths.extend(commit(read, ids[0], &ids[1..], mode, restrict)?);

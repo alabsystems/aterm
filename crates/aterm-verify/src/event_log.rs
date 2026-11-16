@@ -753,6 +753,7 @@ impl Judged {
     /// Fold the raw file's completed record lines. A final fragment cannot
     /// establish a check or terminal; later partial diagnostics do not erase
     /// an earlier completed terminal or change its existing accounting policy.
+    #[cfg(any(unix, test))]
     pub(crate) fn from_events(text: &str, code: i32, secs: u64) -> Self {
         let lines = text
             .split_inclusive('\n')

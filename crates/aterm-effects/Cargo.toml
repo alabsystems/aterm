@@ -16,8 +16,6 @@ description = "aterm visual-effects engines: the host-agnostic cursor aurora/com
 autotests = false
 
 [dependencies]
-# aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
-aterm-cores = { workspace = true }
 # Engine snapshot types (Terminal for the rescan, RenderCell, selection view).
 aterm-core = { path = "../aterm-core", default-features = false }
 # Explicit terminal progress facts; already part of the core dependency graph.
@@ -77,12 +75,15 @@ dev-seams = []
 libc = { workspace = true }
 
 [dev-dependencies]
+# aterm-cores: the cores the tests' replay pool (src/test_pool.rs) may use
+# (`available_parallelism`, bounded by a test's grant).
+aterm-cores = { workspace = true }
 # Compare the card's ground decision with the chrome that surrounds it.
 aterm-messages = { workspace = true }
 # Models and cfg(test) anchors for the effect state machines.
 aterm-spec = { workspace = true }
-# The seal `examples/art_rig.rs dogs` stamps on the breed TOMLs it writes (`aterm_census::seal`).
-aterm-census = { workspace = true }
+# The seal `examples/art_rig.rs dogs` stamps on the breed TOMLs it writes (`aterm_seal`).
+aterm-seal = { workspace = true }
 # Atlas PNG dumps for the art gallery examples.
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-aos = { workspace = true }

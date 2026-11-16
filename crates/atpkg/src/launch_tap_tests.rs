@@ -41,8 +41,9 @@ fn the_block_asks_the_aterm_beside_atpkg() {
     assert!(block.starts_with("# atpkg: aterm's usage tap"), "{block}");
     assert!(
         block.contains(
-            "__atpkg_tap=$('/it'\\''s/MacOS/aterm' harness tap --launch -- \"$@\" </dev/null \
-             2>/dev/null) || __atpkg_tap=\n"
+            "  if [ -t 1 ]; then __atpkg_tty=1; else __atpkg_tty=0; fi\n  \
+             __atpkg_tap=$(ATERM_LAUNCH_STDOUT_TTY=$__atpkg_tty '/it'\\''s/MacOS/aterm' harness \
+             tap --launch -- \"$@\" </dev/null 2>/dev/null) || __atpkg_tap=\n"
         ),
         "{block}"
     );
@@ -233,6 +234,53 @@ fn the_twin_taps_a_launch_in_an_aterm_tab_and_otherwise_runs_it_as_typed() {
         typed,
         "no aterm there"
     );
+}
+
+/// THE BLOCK TELLS ATERM WHETHER THE LAUNCH'S OUTPUT IS A TERMINAL, EXECUTED: the aterm it asks
+/// reads [`STDOUT_TTY_ENV`] as `1` where the twin's standard output is a terminal and `0` where
+/// it is a pipe (a tool's shell, `claude … | tee`), judged before the command substitution that
+/// captures aterm's answer, whose own output is always a pipe. The variable is that one
+/// command's: the build the twin then runs does not hold it.
+#[cfg(unix)]
+#[test]
+fn the_block_tells_aterm_whether_the_launchs_output_is_a_terminal() {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let laid = Laid::new();
+    let said = laid.root.join("said");
+    laid.aterm(&format!(
+        "printf '%s' \"${{{STDOUT_TTY_ENV}-unset}}\" > '{}'",
+        said.display()
+    ));
+    exe(
+        &laid.root.join("store-build"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"${{{STDOUT_TTY_ENV}-unset}}\"\n"),
+    );
+    let tab = ("ATERM_PARENT_SESSION_ID", "s-60776b6e2ed1b73bd013");
+    // This test's own capture of the twin's output is a pipe.
+    assert_eq!(
+        laid.run(&["--model", "opus"], &[tab]),
+        "unset\n",
+        "the build does not hold the variable"
+    );
+    assert_eq!(std::fs::read_to_string(&said).unwrap(), "0", "a pipe");
+    // The same twin with a terminal for its output.
+    let (master, slave) = aterm_pty::open_pty_pair().expect("a terminal");
+    // SAFETY: each fresh PTY descriptor has exactly one owner here.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let twin = laid.root.join("claude");
+    let status = aterm_spec::wait::past_text_busy(|| {
+        std::process::Command::new(&twin)
+            .args(["--model", "opus"])
+            .env(tab.0, tab.1)
+            .env_remove("ATERM_NO_HARNESS")
+            .stdin(std::process::Stdio::null())
+            .stdout(slave.try_clone().expect("the terminal's descriptor"))
+            .status()
+    })
+    .unwrap();
+    assert!(status.success(), "{status:?}");
+    assert_eq!(std::fs::read_to_string(&said).unwrap(), "1", "a terminal");
+    drop((master, slave));
 }
 
 /// THE RENDERER BLOCK, EXECUTED: a launch in an aterm tab that names no renderer runs with

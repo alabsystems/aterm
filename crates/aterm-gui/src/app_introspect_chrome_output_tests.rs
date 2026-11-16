@@ -191,7 +191,7 @@ fn strip_version_line_reports_what_was_laid_out() {
 #[cfg(windows)]
 #[test]
 fn the_strip_version_reason_reads_the_layout_it_reports() {
-    let line = |app: &crate::App| {
+    let line = |app: &mut crate::App| {
         app.read_native_chrome()
             .into_iter()
             .find(|line| line.starts_with("strip-version "))
@@ -202,43 +202,47 @@ fn the_strip_version_reason_reads_the_layout_it_reports() {
     let wid = crate::WindowId(0);
     app.tab_strip_rows = 0;
     assert!(
-        line(&app).contains("shown=no reason=no-strip"),
+        line(&mut app).contains("shown=no reason=no-strip"),
         "{}",
-        line(&app)
+        line(&mut app)
     );
     app.tab_strip_rows = 1;
     assert!(
-        line(&app).contains("shown=no reason=not-laid-out"),
+        line(&mut app).contains("shown=no reason=not-laid-out"),
         "nothing has laid the strip out yet: {}",
-        line(&app)
+        line(&mut app)
     );
     app.splice_tab_strip_with(wid, 1);
     assert!(
-        line(&app).contains("shown=no reason=no-ui-face"),
+        line(&mut app).contains("shown=no reason=no-ui-face"),
         "laid out before the UI face: {}",
-        line(&app)
+        line(&mut app)
     );
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
     assert!(
-        line(&app).contains("shown=no reason=no-ui-face"),
+        line(&mut app).contains("shown=no reason=no-ui-face"),
         "the face landing re-lays nothing by itself — the layout reported is \
          still the faceless one: {}",
-        line(&app)
+        line(&mut app)
     );
     app.splice_tab_strip_with(wid, 1);
     assert!(
-        line(&app).contains("shown=yes rung=full"),
+        line(&mut app).contains("shown=yes rung=full"),
         "the next frame lays the label out in the face: {}",
-        line(&app)
+        line(&mut app)
     );
     app.windows.get_mut(&wid).expect("window").last_strip_fp = None;
-    assert!(line(&app).contains("shown=yes rung=full"), "{}", line(&app));
+    assert!(
+        line(&mut app).contains("shown=yes rung=full"),
+        "{}",
+        line(&mut app)
+    );
     app.windows.get_mut(&wid).expect("window").cols = 32;
     app.splice_tab_strip_with(wid, 1);
     assert!(
-        line(&app).contains("shown=no reason=strip-full"),
+        line(&mut app).contains("shown=no reason=strip-full"),
         "{}",
-        line(&app)
+        line(&mut app)
     );
     app.windows
         .get_mut(&wid)
@@ -246,9 +250,9 @@ fn the_strip_version_reason_reads_the_layout_it_reports() {
         .tab_segments
         .clear();
     assert!(
-        line(&app).contains("shown=no reason=not-laid-out"),
+        line(&mut app).contains("shown=no reason=not-laid-out"),
         "{}",
-        line(&app)
+        line(&mut app)
     );
     crate::tray_raster::clear_ui_fonts_for_test();
 }

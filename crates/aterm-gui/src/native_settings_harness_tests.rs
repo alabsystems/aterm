@@ -228,7 +228,8 @@ fn pages_while(
     let mut page = 0;
     loop {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.scroll_page_to(page);
@@ -1120,7 +1121,8 @@ fn the_harness_route_is_whole_on_every_host() {
         let (mut runtime, instance, view) = harness_route(fixture_led(true));
         for &(width, height, open) in &hosts {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.harness_config_open = open;
@@ -3249,7 +3251,8 @@ fn decided_for_you_is_whole_on_every_host() {
     at_each_text_scale(&[1.0, 1.25, 2.0], "Decided for you", |scale| {
         let (mut runtime, instance, view) = harness_route(state.clone());
         {
-            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(view_state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             view_state.harness_decided_open = true;
@@ -3291,7 +3294,8 @@ fn decided_for_you_is_whole_on_every_host() {
             );
         }
         {
-            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(view_state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             view_state.harness_decided_open = false;
@@ -4638,7 +4642,8 @@ fn a_computer_listed_above_the_screen_moves_nothing_on_it() {
     let mut page = 0;
     let before = loop {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.scroll_page_to(page);

@@ -16,7 +16,7 @@ fn composed_frame(app: &mut App, wid: WindowId) {
         .term
         .clone();
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let mut term = term_lock(&terminal);
         term.resize(rows, cols);
         term.cell_frame_into(&mut ws.input_scratch, rows as usize, cols as usize);
@@ -115,8 +115,8 @@ fn the_repaint_key_term_moves_on_open_highlight_and_close() {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .tab_menu
-        .as_mut()
+        .routing
+        .menu_mut()
         .unwrap()
         .highlight = Some(0);
     assert_ne!(fp(&app), open, "a highlight step forces its own frame");
@@ -147,7 +147,7 @@ fn a_resize_that_leaves_no_room_closes_the_card_instead_of_hiding_it() {
     );
 
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.input_scratch.cells.truncate(2);
     }
     app.splice_tab_menu(wid);
@@ -166,7 +166,7 @@ fn the_card_is_pinned_out_of_the_sub_row_scroll_band() {
     assert!(app.open_tab_context_menu(wid, 0, 0, false));
     composed_frame(&mut app, wid);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.input_scratch.grid_top_row = 1;
         ws.input_scratch.grid_bot_row = ws.input_scratch.cells.len();
     }
@@ -187,7 +187,7 @@ fn the_card_is_pinned_out_of_the_sub_row_scroll_band() {
     app.close_tab_menu(wid);
     composed_frame(&mut app, wid);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.input_scratch.grid_top_row = 1;
         ws.input_scratch.grid_bot_row = ws.input_scratch.cells.len();
     }

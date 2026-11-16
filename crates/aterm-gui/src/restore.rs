@@ -167,6 +167,15 @@ pub(crate) struct TerminalLeafRestore {
     pub sid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
+    /// The Unix ms at which the session's lineage first opened (`opened_ms=` on `status`, `ls`
+    /// and survey, `SessionLog::opened_ms`), so the session a cold restore, a seamless update or
+    /// a reopened tab brings back in a new shell or log says when its chain began, not when that
+    /// shell opened (`SessionLog::seed_opened`). A layout from a build before it has none. A cold
+    /// restore's session then says its own open, the restore's. A seamless update's session keeps
+    /// the open the log it carried names (`SessionLog::adopt_carried`), or the adoption's own time
+    /// when that log did not carry. In each case this is the earliest time aterm knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ep: Option<u32>,
 }
@@ -1019,6 +1028,7 @@ impl TerminalLeafRestore {
             .filter(|profile| profile.len() <= MAX_SETTINGS_ROUTE_BYTES && !profile.contains('\0'));
         self.sid = self.sid.take().filter(|sid| carried_sid(sid));
         self.lineage = self.lineage.take().filter(|sid| carried_sid(sid));
+        self.opened_ms = self.opened_ms.filter(|&ms| ms > 0);
         self.log_ep = self.log_ep.and_then(crate::session_log::told_epoch);
         self.holds = crate::fabric::render_holds(&self.carried_holds());
         self.sanitize_user_metadata();
@@ -1196,6 +1206,13 @@ impl NativeLeafRestore {
         descriptor
     }
 
+    /// The Tables page: one per app, with no document or route of its own.
+    pub(crate) fn tables() -> Self {
+        let mut descriptor = Self::about();
+        descriptor.restore_tag = "tables".into();
+        descriptor
+    }
+
     pub(crate) fn settings(route: String) -> Self {
         Self {
             restore_tag: "settings".to_string(),
@@ -1300,6 +1317,8 @@ impl NativeLeafRestore {
                 .then_some("About has no document or Settings route"),
             "system-state" => (self.route.is_some() || self.uri.is_some())
                 .then_some("System State has no document or Settings route"),
+            "tables" => (self.route.is_some() || self.uri.is_some())
+                .then_some("Tables has no document or Settings route"),
             "settings" => self
                 .route
                 .as_deref()
@@ -2296,6 +2315,7 @@ impl RestoredTab {
                     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
                         sid: None,
                         lineage: None,
+                        opened_ms: None,
                         log_ep: None,
                         cwd: cwd.clone(),
                         title: title.clone(),
@@ -2692,7 +2712,8 @@ impl RestoreManifest {
     }
 
     fn fill_terminals(&mut self, fill: &mut impl FnMut(&mut TerminalLeafRestore)) {
-        for window in &mut self.windows {
+        for route_guard_window in &mut self.windows {
+            let window = &mut *route_guard_window;
             for tab in &mut window.restored_tabs {
                 tab.root.visit_terminals_mut(fill);
             }
@@ -2724,7 +2745,8 @@ impl RestoreManifest {
             .filter(|id| handed.binary_search(id).is_err())
             .collect::<Vec<_>>();
         if !unhanded.is_empty() {
-            for window in &mut self.windows {
+            for route_guard_window in &mut self.windows {
+                let window = &mut *route_guard_window;
                 for tab in &mut window.restored_tabs {
                     tab.root.retire_unhanded_terminals(&unhanded);
                 }
@@ -2820,6 +2842,7 @@ impl RestoreManifest {
                     pinned: false,
                     sid: Some("s-0123abcd".into()),
                     lineage: None,
+                    opened_ms: None,
                     log_ep,
                     cwd: None,
                     title: "zsh".into(),

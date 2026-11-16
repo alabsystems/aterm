@@ -167,11 +167,13 @@ fn pages(
     };
     let mut out = Vec::new();
     for page in 0..=512 {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         state.scroll_page_to(page);
         state.page_reveal = None;
+        drop(route_native_guard);
         out.push(
             runtime
                 .render(instance, view, &cx)

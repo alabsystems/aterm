@@ -93,7 +93,8 @@ pub fn account_workflow_scope_model() -> Model {
 }
 
 /// Native guards use workflow custody and wall-clock person-task expiry without releasing
-/// another hold, a newer claim or active work.
+/// another hold, a newer claim or active work. A bot protection's check is its account's, not
+/// its workflow's: it holds the row again when the row comes back to that account (case 7).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn account_workflow_runtime_model() -> Model {
@@ -109,18 +110,17 @@ pub fn account_workflow_runtime_model() -> Model {
                     else if (case == 10 && Buggy == 11) || (case == 11 && Buggy == 12)
                         || (case == 12 && Buggy == 13) || (case == 13 && Buggy == 14)
                         || (case == 14 && Buggy == 15) {0} else {1}
-                } else if case == 1 || case == 4 || case == 5 {
+                } else if case == 1 || case == 4 || case == 5 || case == 7 {
                     if (case == 1 && Buggy == 1) || (case == 4 && Buggy == 4)
-                        || (case == 5 && Buggy == 5) {0} else {1}
+                        || (case == 5 && Buggy == 5) || (case == 7 && Buggy == 7) {0} else {1}
                 } else if (case == 2 && Buggy == 2) || (case == 3 && Buggy == 3)
-                    || (case == 6 && Buggy == 6) || (case == 7 && Buggy == 7)
-                    || (case == 8 && Buggy == 8) {1} else {0};
+                    || (case == 6 && Buggy == 6) || (case == 8 && Buggy == 8) {1} else {0};
                 preserved = if Buggy == 9 {0} else {1};
             }
             invariant CurrentHoldsRemain: phase == 0 || held == 1
-                || (case > 1 && 4 > case) || case > 5;
+                || (case > 1 && 4 > case) || case == 6 || case > 7;
             invariant RetiredHoldsGone: phase == 0 || case > 8
-                || case == 1 || case == 4 || case == 5 || case == 6 || held == 0;
+                || case == 1 || case == 4 || case == 5 || case == 6 || case == 7 || held == 0;
             invariant CompletionRequiresWorkflowCustody: phase == 0 || 5 > case || case > 6
                 || held == if case == 5 {1} else {0};
             invariant OldFinishCannotRepark: phase == 0 || 8 > case || case > 8 || held == 0;

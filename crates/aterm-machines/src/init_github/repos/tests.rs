@@ -229,7 +229,7 @@ fn a_clone_runs_only_while_it_leaves_the_disk_watchs_floor_free() {
     assert_eq!(
         short_of_room(Some(&volume), &left, "try again").unwrap(),
         "2 repositories not cloned, for want of disk space: ~/big, ~/big (about 10 GiB); \
-         /System/Volumes/Data has 8 GiB free and keeps 8 GiB free; free space, then try again"
+         /System/Volumes/Data has 8 GiB free and keeps 8 GiB free; try again"
     );
 }
 

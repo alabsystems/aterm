@@ -127,6 +127,7 @@ fn managed_markers_stop_legacy_snapshot_refresh_and_retained_reply_replay() {
                 &format!("{issuer}/oauth/token"),
                 Duration::from_secs(4),
                 now,
+                None,
                 |_| true,
                 |_, _| panic!("managed legacy publication")
             ),

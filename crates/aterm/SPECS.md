@@ -110,24 +110,25 @@ doctor-instance-census	contract	aterm doctor census	∀ set of running aterm ins
 headless-never-window-server	invariant	aterm --headless event loop (aterm-window headless.rs)	∀ run of `aterm --headless` on macOS, driven or idle: the process never opens a WindowServer connection (no tccd ListenEvent preflight with accessing pid = its pid), is not registered with LaunchServices as an activatable app, and is never the frontmost app.	headless_activation::a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front, window_server_census_live_headless::a_driven_headless_instance_draws_no_window_server_preflight	8	VERY HARD: needs a platform model of AppKit/WindowServer; the injected-probe rule (AGENTS.md) is the structural half
 commons-lan-first-use-turn	contract	commons_lan::when_sharing_on, commons_lan::install_sharing, commons_lan::SHARING_LOOK	when_sharing_on(home, look, start) runs start at once and returns true where aterm_secrets::swarm::Switch(home).enabled_saying(log) == Ok(true) now; otherwise it returns false and a thread of its own reads the switch again each look and runs start once, the first time it reads Ok(true) (where that thread cannot start, start does not run and the failure is logged); a switch that cannot be read holds start as an off one does, logged once per change. install_sharing(home) installs aterm_types::macos_setup::sharing's reader as aterm_secrets::swarm::Switch(home).enabled_saying(log) == Ok(true) (the first reader installed wins), in every ordinary window and the node job; the Commons runtime of a window, an interactive session lane and the node job starts through when_sharing_on(home, SHARING_LOOK, start), SHARING_LOOK = 5 s.	commons_lan::tests::swarm_off_starts_no_commons_runtime_until_it_is_on	1,13	FnOnce closures, a Mutex-held switch, a private file read, a detached thread
 identity-own-names-rule-gate	contract	converge::{own_name_due_through, own_name_by_rule, own_names_applied, mac_name_pending, MacNamePending::with_rule}, machine_status::name_area, aterm_machines::root_steps::{name_rule_reading, name_rule_current, name_by_rule, owed}	∀ sys, read, target, names, own. Let Cur = name_rule_reading(sys): Err(e) where sys.identity() cannot be read or names an account other than this process's (uid ≠ euid), root, or one no rule carries, or where the rule cannot be stat'd (any answer but not-found) or read; else Ok(Missing) where no root-owned 0440 regular file of nonzero length stands at the rule's path, Ok(Current) where its bytes are this build's name_rule for this process's ordinary account (not root), and Ok(Other) otherwise; name_rule_current(sys) is Cur with Ok(Current) as Ok(true) and Ok(Missing) or Ok(Other) as Ok(false). Let Owed = own_name_repairable(target, names, own). (a) own_name_due_through(sys, read, target, names, own) is Due iff read is Current ∧ Owed ∧ Cur = Ok(Current), else read; Cur is read only when Owed. (b) For a pending name macOS can take, mac_name_pending is ThroughRule on Ok(Current), Elevation on Ok(Missing), Renewal on Ok(Other) and Unread(why ++ "; " ++ e) on Err(e); a collision alias is Collision whatever Cur. (c) own_name_by_rule runs no sudo unless Cur = Ok(Current); then name_by_rule's Err(w) is Err("this Mac's own names left as they are: " ++ w), which own_names_applied returns, so sync.identity's row fails with w (CV-READBACK's apply Err) and no apply answers Ok having set nothing. A rule file that passes only the stat (root, 0440, nonzero length) admits no automatic attempt. (d) name_area's step for that pending names setup's password step only on Elevation, the one reading owed(sys) holds NameRule for (unless a rule visudo refused stands); on Renewal and Unread, for which owed(sys) never holds NameRule, its step is `aterm init` alone, which renews the rule.	converge::a_naming_rule_this_build_did_not_write_leaves_the_identity_row_quiet, converge::the_name_status_offers_the_password_step_only_where_setup_owes_the_rule, converge::a_current_naming_rule_names_the_mac_and_reads_back_current, converge::a_refused_naming_attempt_fails_the_identity_row_with_sudos_reason	1,4,8	MEDIUM: String/enum carriers, Result composition with the callee name_rule_reading and owed's metadata reading; the sudo, scutil and owned-file reads are effects through the System port
+test-copies-leave	invariant	tests/support/aterm_under_test.rs: aterm_executable, snapshot, mark, remark, sweep, passing, aged, prove, ThisHost::uses	∀ folder f of `<target>/debug/.ubd/aterm-under-test.noindex` other than the sweeping process's own, at `now`. A sweep removes f only if (a) no use marked it for over its wait (aged: UNUSED, 1 h, doubled for each run of its copy that wrote no line, the length of f's `.unproven`, at most DOUBLINGS = 7 times, while f has no `ran` mark; from the time of f's `.used`, else of f), (b) no record `.user.<pid>[.<serial>]` in f names a listed pid whose process has the recorded serial, (c) a whole reading of this account's processes finds none that runs (its executable's path as the kernel names it), maps, holds open or works in anything under f, one reading for every aged folder (b) did not keep, and (d) f holds no copy, or its `ran` mark, or its copy, run with `--version` (at most PROOFS = 1 copy a sweep), wrote a line on its stdout or stderr (which writes the mark) and a listing and a reading taken after that run find no live record or use of f; f is checked again under `.lock`, the lock every use is marked under, renamed to `.leaving.<f>.<pid>` there and removed after. A folder kept by (b) or (c), or for want of a whole reading or of a proof, is marked used at `now`, and a run that wrote no line lengthens its `.unproven` by one; an unproven folder past the sweep's proof is left as it is; with the processes unlisted, nothing leaves and each aged folder is marked used. Every `aterm_executable()` caller's copy is marked under `.lock` with its record, so no sweep removes it while that process lives, and a later call a minute or more after its last mark marks it again (remark).	aterm_under_test_tests::an_unused_copy_of_aterm_leaves_after_an_hour_and_one_a_live_process_runs_stays, aterm_under_test_tests::a_copy_no_run_proved_is_run_again_only_after_a_doubled_wait, aterm_under_test_tests::a_copy_its_proof_left_running_stays_while_that_process_lives, aterm_under_test_tests::a_copy_a_live_process_runs_stays_by_this_hosts_own_reading, aterm_under_test_tests::a_use_is_recorded_with_its_mark_and_marked_again_after_a_minute	1,5,7,8,13	HARD: fs and process-table effects, a child's run, flock, a thread; the pure core is `passing`'s decision over the aged folders' records, uses and proofs
 ```
 
-Gap histogram (number of specs each gap blocks; gap 0 blocks all 63):
+Gap histogram (number of specs each gap blocks; gap 0 blocks all 64):
 
 | gap | specs |
 |---|---|
-| 1 | 42 |
+| 1 | 43 |
 | 2 | 3 |
 | 3 | 13 |
 | 4 | 8 |
-| 5 | 13 |
+| 5 | 14 |
 | 6 | 1 |
-| 7 | 18 |
-| 8 | 41 |
+| 7 | 19 |
+| 8 | 42 |
 | 9 | 3 |
 | 10 | 15 |
 | 12 | 19 |
-| 13 | 23 |
+| 13 | 24 |
 
 ## 2. Test → spec map (TSV)
 
@@ -289,6 +290,11 @@ crates/aterm/src/commons_lan.rs	only_a_windows_door_watches_its_question	commons
 crates/aterm/src/commons_lan.rs	only_the_gates_ask_past_the_wait_asks_at_the_door	commons-lan-first-use-turn	
 crates/aterm/src/commons_lan.rs	the_gates_slot_is_readied_before_the_use_and_holds_its_question_from_it	commons-lan-first-use-turn	
 crates/aterm/src/main.rs	the_update_line_and_the_fleets_standing_are_one_decision	update-summary-decision	
+crates/aterm/tests/support/aterm_under_test_tests.rs	an_unused_copy_of_aterm_leaves_after_an_hour_and_one_a_live_process_runs_stays	test-copies-leave	
+crates/aterm/tests/support/aterm_under_test_tests.rs	a_copy_no_run_proved_is_run_again_only_after_a_doubled_wait	test-copies-leave	
+crates/aterm/tests/support/aterm_under_test_tests.rs	a_copy_its_proof_left_running_stays_while_that_process_lives	test-copies-leave	
+crates/aterm/tests/support/aterm_under_test_tests.rs	a_copy_a_live_process_runs_stays_by_this_hosts_own_reading	test-copies-leave	
+crates/aterm/tests/support/aterm_under_test_tests.rs	a_use_is_recorded_with_its_mark_and_marked_again_after_a_minute	test-copies-leave	
 ```
 
 ## 4. Tests that are not spec samples

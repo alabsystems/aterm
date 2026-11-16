@@ -386,14 +386,15 @@ impl ReadBatch<'_, '_> {
             .ok_or_else(|| Error::new("table payload authentication failed"))
     }
 
-    /// Replay authenticates the borrowed envelope and returns its cutoff, never application plaintext.
-    /// Only a non-cutoff fact can be reused, after the same historical grant and current key
+    /// Replay authenticates the borrowed envelope and returns what it is to the table (a cutoff, a
+    /// checkpoint), never application plaintext. Only an application operation's fact can be
+    /// reused, after the same historical grant and current key
     /// read as a full opening. The enclosing batch still revalidates reused keys and custody.
     fn replay_metadata(
         &self,
         wire: &signatures::Identified,
         envelope: &Envelope<'_>,
-    ) -> Result<Option<store::cutoff::Cut>> {
+    ) -> Result<store::Control> {
         if envelope.header.id != wire.id() {
             return Err(Error::new(
                 "replay envelope differs from identified ciphertext",
@@ -408,8 +409,8 @@ impl ReadBatch<'_, '_> {
                 self.keys.as_ref(),
                 |key, identity| {
                     let identity = identity.get_or_init(|| crypto::payload_key_identity(key));
-                    if wire.verified_non_cut(identity) {
-                        return Ok(Some(None));
+                    if wire.verified_non_control(identity) {
+                        return Ok(Some(store::Control::default()));
                     }
                     let mut payload = Zeroizing::new(envelope.body.to_vec());
                     let opened = crypto::cipher(key, &envelope.salt, envelope.aad)?
@@ -419,9 +420,9 @@ impl ReadBatch<'_, '_> {
                             &mut payload,
                         )
                         .ok()
-                        .map(|plain| store::cutoff::decode(plain));
-                    if matches!(opened, Some(None)) {
-                        wire.remember_non_cut(*identity);
+                        .map(|plain| store::Control::of(plain));
+                    if opened.as_ref().is_some_and(store::Control::is_none) {
+                        wire.remember_non_control(*identity);
                     }
                     Ok(opened)
                 },

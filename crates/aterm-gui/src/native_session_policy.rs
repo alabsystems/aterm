@@ -15,12 +15,45 @@ use aterm_agent::supervise::SupervisorConfig;
 #[path = "codex_retained_service.rs"]
 mod retained_service;
 
+#[cfg(unix)]
+pub(crate) use retained_service::StartOwner;
+
 pub(crate) const fn cold_restart_qualified() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
+/// What a claim's proof reads the registry as: its rows, the generation they were read as, and the
+/// registry whose image rule judges the claimant, the three from one read
+/// ([`aterm_agent::harness::registry::current_at`]); a fixture's rows (generation 0) are judged by
+/// its captured images, with no registry.
+pub(crate) struct ProofRead {
+    /// The claim rows.
+    pub(crate) rows: &'static [Row],
+    generation: u64,
+    registry: Option<std::sync::Arc<aterm_agent::harness::registry::Registry>>,
+}
+
+impl ProofRead {
+    /// The proof read of a registry and its generation, taken together.
+    fn of(
+        read: (
+            std::sync::Arc<aterm_agent::harness::registry::Registry>,
+            u64,
+        ),
+    ) -> Self {
+        let (registry, generation) = read;
+        Self {
+            rows: registry.rows(),
+            generation,
+            registry: Some(registry),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SessionPolicy {
+    /// The image verdict this session's claimant last passed ([`Self::claimant_image`]).
+    kept_image: crate::harness_claim::KeptImage,
     #[cfg(unix)]
     retained: std::sync::Mutex<Vec<retained_service::Controller>>,
     #[cfg(all(unix, any(test, debug_assertions)))]
@@ -33,6 +66,7 @@ impl SessionPolicy {
     #[cfg(all(unix, debug_assertions))]
     pub(crate) fn observe_retained_backends(
         &self,
+        resources: bool,
     ) -> Result<
         Vec<aterm_agent::harness::native_act::Process>,
         aterm_agent::harness::codex_source_registry::Error,
@@ -41,6 +75,16 @@ impl SessionPolicy {
         let services = self.retained.try_lock().map_err(|_| Error::Busy)?;
         if services.is_empty() {
             return Err(Error::Unavailable);
+        }
+        // Use the native owner's sealed startup selection, independently of
+        // frontend checkpoint data and its reported qualification phases.
+        if services
+            .iter()
+            .filter(|service| service.is_resource_qualification())
+            .count()
+            != usize::from(resources)
+        {
+            return Err(Error::Denied);
         }
         services
             .iter()
@@ -96,6 +140,14 @@ impl SessionPolicy {
         false
     }
     #[cfg(unix)]
+    pub(crate) fn retained_startup_mode(&self) -> &'static str {
+        if self.retained_constructor_enabled() {
+            "retained"
+        } else {
+            "embedded"
+        }
+    }
+    #[cfg(unix)]
     pub(crate) fn retained_start(
         &self,
         ctx: &std::sync::Arc<crate::SessionCtx>,
@@ -103,6 +155,7 @@ impl SessionPolicy {
         lifetime: &aterm_agent::harness::account_work::Lifetime,
         peer: &aterm_agent::harness::codex_source_registry::Peer,
         settings: retained_service::Settings,
+        owner: StartOwner,
     ) -> Result<(String, &'static str), aterm_agent::harness::codex_source_registry::Error> {
         use aterm_agent::harness::codex_source_registry::Error;
         // No production qualification is advertised before the native/source
@@ -119,11 +172,14 @@ impl SessionPolicy {
         let mut services = self.retained.lock().map_err(|_| Error::Unavailable)?;
         if let Some(service) = services
             .iter()
-            .find(|service| service.matches(&selection, sources))
+            .find(|service| service.same_start(&owner, sources))
         {
+            if !service.matches(&selection, sources) {
+                return Err(Error::Denied);
+            }
             return Ok((service.id().into(), service.state()?));
         }
-        let service = retained_service::Controller::start(ctx, sources, lifetime, selection)
+        let service = retained_service::Controller::start(ctx, sources, lifetime, selection, owner)
             .inspect_err(|_error| {
                 #[cfg(debug_assertions)]
                 eprintln!("Retained native startup: controller={_error:?}");
@@ -196,11 +252,79 @@ impl SessionPolicy {
         if let Some(fixture) = &self.fixture {
             return fixture.rows;
         }
-        contract::ROSTER
+        aterm_agent::harness::registry::current().rows()
     }
 
     pub(crate) fn holder(&self, holder: &str) -> Option<(&'static Row, u32)> {
         contract::holder_in(self.rows(), holder)
+    }
+
+    /// The registry A CLAIM'S PROOF reads: as the store and aterm.toml stand now, its rows,
+    /// generation and image rule from one read ([`aterm_agent::harness::registry::current_at`]);
+    /// a fixture's catalog under a fixture.
+    pub(crate) fn read_now(&self) -> ProofRead {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(fixture) = &self.fixture {
+            return ProofRead {
+                rows: fixture.rows,
+                generation: 0,
+                registry: None,
+            };
+        }
+        ProofRead::of(aterm_agent::harness::registry::current_at())
+    }
+
+    /// The registry A STANDING CLAIM'S RE-PROOF reads (a fenced input's, an act's or a write's on
+    /// another connection): the one this process read last, with no file read
+    /// ([`aterm_agent::harness::registry::snapshot_at`]), or [`Self::read_now`]'s before any read.
+    /// A change to the store or aterm.toml reaches it at the registry's next read (a claim, a
+    /// spawn's glance, the host's activation loop at least every 60 s), which moves its generation
+    /// and so lapses every kept image verdict ([`Self::claimant_image`]).
+    pub(crate) fn read_seen(&self) -> ProofRead {
+        use aterm_agent::harness::registry;
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(fixture) = &self.fixture {
+            return ProofRead {
+                rows: fixture.rows,
+                generation: 0,
+                registry: None,
+            };
+        }
+        ProofRead::of(registry::snapshot_at().unwrap_or_else(registry::current_at))
+    }
+
+    /// Whether the CLAIMANT RUNS AS ITS ROW'S HARNESS under its contract's image rule, judged under
+    /// `read` ([`crate::harness_claim::image_by`], this user's configured atpkg prefix). With
+    /// `reuse` (a standing claim's re-proof) the verdict this session's claimant last passed stands
+    /// while its key holds ([`crate::harness_claim::ImageKey`]: the same holder, contract and
+    /// kernel start, the same executable file, the same registry generation), so no signature is
+    /// verified, no tree hashed and no setting read again; without it (a claim being made) the
+    /// image is judged in full. Either way a pass is kept for the next re-proof
+    /// ([`crate::harness_claim::KeptImage`]; HX-05's review, finding 1). A fixture's captured
+    /// images judge, and nothing is kept.
+    pub(crate) fn claimant_image(
+        &self,
+        read: &ProofRead,
+        claimant: crate::harness_claim::Claimant<'_>,
+        reuse: bool,
+    ) -> bool {
+        let Some(registry) = read.registry.as_deref() else {
+            return self.actor_image(claimant.row, claimant.contract, claimant.pid);
+        };
+        let Some(exe) = i32::try_from(claimant.pid)
+            .ok()
+            .and_then(aterm_uds::sudo::exe_path)
+        else {
+            return false;
+        };
+        let key = crate::harness_claim::ImageKey::of(&claimant, &exe, read.generation);
+        let (row, contract) = (claimant.row, claimant.contract);
+        self.kept_image.passes(key, reuse, || {
+            let Some(layout) = atpkg::store::resolve_configured() else {
+                return false;
+            };
+            crate::harness_claim::image_by(registry, &layout, row, contract, &exe)
+        })
     }
 
     pub(crate) fn read<'a>(&self, holder: &str, words: &'a [&'a str]) -> Words<'a> {
@@ -334,13 +458,16 @@ impl SessionPolicy {
         None
     }
 
-    pub(crate) fn actor_image(&self, row: &Row, pid: u32) -> bool {
+    /// Whether process `pid` runs as `row`'s claimant under `contract`'s image rule
+    /// ([`crate::harness_claim::runs_harness_build`]); a fixture's captured images stand for
+    /// either contract's.
+    pub(crate) fn actor_image(&self, row: &Row, contract: u32, pid: u32) -> bool {
         #[cfg(all(unix, any(test, debug_assertions)))]
         if self.fixture.is_some() {
             return Process::observe(pid)
                 .is_some_and(|actual| self.captured_image(row, &actual.image) == Some(true));
         }
-        crate::harness_claim::runs_harness_build(row, pid)
+        crate::harness_claim::runs_harness_build(row, contract, pid)
     }
 
     pub(crate) fn target_image(&self, row: &Row, target: &Image) -> bool {
@@ -502,7 +629,8 @@ impl FixturePolicy {
         self
     }
 
-    /// Pin the isolated HTTPS usage server's roots for this Rust-only fixture.
+    /// Pin the roots of this Rust-only fixture's isolated loopback provider: its HTTPS usage
+    /// server and, for a login whose issuer it serves too, that login's token endpoint.
     #[must_use]
     pub fn with_quota_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
         self.quota_roots = Some(roots);

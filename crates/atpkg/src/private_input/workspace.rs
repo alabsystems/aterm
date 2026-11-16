@@ -5,7 +5,7 @@
 //! A workspace is neither source/config custody nor a seed, SDK or admission.
 //! Native settlement and any original input owners remain separate obligations.
 
-use super::Producer;
+use super::{Owner, Producer, Refused};
 use crate::cargo_cache::SourceCacheGuard;
 use aterm_uds::private_file::PrivateDirectory;
 use std::{
@@ -128,6 +128,48 @@ impl MaterializationWorkspace {
         self.deadline
     }
 
+    /// Move only this same producer/cache/directory into its private ready owner.
+    pub(super) fn finish_with_transition(
+        self,
+        transition: impl FnOnce(Producer) -> Result<Owner, Refused<Producer>>,
+    ) -> Result<ReadyWorkspace, Refused<Self>> {
+        if let Err(error) = self.check_current() {
+            self.quarantine();
+            return Err(Refused::new(error, self));
+        }
+        let Self {
+            producer,
+            cache,
+            directory,
+            cargo_home,
+            deadline,
+            revoked,
+        } = self;
+        match transition(producer) {
+            Ok(owner) => Ok(ReadyWorkspace {
+                owner,
+                cache,
+                directory,
+                cargo_home,
+                deadline,
+                revoked,
+            }),
+            Err(refused) => {
+                let (error, producer) = refused.into_parts();
+                let original = Self {
+                    producer,
+                    cache,
+                    directory,
+                    cargo_home,
+                    deadline,
+                    revoked,
+                };
+                original.quarantine();
+                Err(Refused::new(error, original))
+            }
+        }
+    }
+
     /// Borrow the actual producer's original readonly contents-directory FD.
     /// This does not reopen a path, create an input use, or grant execution,
     /// source, seed, SDK, completion or availability authority. A native caller
@@ -216,6 +258,60 @@ impl MaterializationWorkspace {
             .as_ref()
             .expect("same original workspace producer")
             .quarantine();
+    }
+}
+
+/// Private lifecycle transition only. The actual original cache, directory,
+/// endpoint and revocation state move intact; no capture or reacquisition.
+pub(super) struct ReadyWorkspace {
+    owner: Owner,
+    cache: SourceCacheGuard,
+    directory: PrivateDirectory,
+    cargo_home: PathBuf,
+    deadline: Instant,
+    revoked: AtomicBool,
+}
+impl ReadyWorkspace {
+    pub(super) fn path(&self) -> &Path {
+        &self
+            .owner
+            .inner
+            .as_ref()
+            .expect("same original ready owner")
+            .contents_path
+    }
+    pub(super) fn cargo_home(&self) -> &Path {
+        &self.cargo_home
+    }
+    pub(super) fn quarantine(&self) {
+        self.revoked.store(true, Ordering::Release);
+        self.owner
+            .inner
+            .as_ref()
+            .expect("same original ready owner")
+            .quarantine();
+    }
+    pub(super) fn check_current(&self) -> io::Result<()> {
+        let current = (|| {
+            if self.revoked.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            before(self.deadline)?;
+            self.owner.check_current()?;
+            if !self.directory.is_at(&self.cargo_home)? {
+                return Err(io::Error::other("original ready Cargo directory changed"));
+            }
+            self.cache.check_current()?;
+            if !self.directory.is_at(&self.cargo_home)? {
+                return Err(io::Error::other("original ready Cargo directory changed"));
+            }
+            self.owner.check_current()?;
+            before(self.deadline)
+        })();
+        if current.is_err() {
+            self.quarantine();
+        }
+        current
     }
 }
 

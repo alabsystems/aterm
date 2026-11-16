@@ -1,0 +1,10 @@
+claude
+codex
+agy
+muse
+kimi
+grok
+gemini
+anthropic
+openai
+antigravity

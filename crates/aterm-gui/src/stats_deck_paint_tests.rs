@@ -426,8 +426,8 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
             compressed: Some((4.0 * GIB) as u64),
             cached: (cached * GIB) as u64,
             free: ((cap - now - cached).max(0.0) * GIB) as u64,
-            swap_used: (swap * GIB) as u64,
-            swap_total: (swap * GIB) as u64,
+            swap_used: Some((swap * GIB) as u64),
+            swap_total: Some((swap * GIB) as u64),
             pressure,
             commit: None,
             ..MemSample::default()
@@ -544,6 +544,7 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     };
     s.resources[4] = net;
     f.link = Some(LinkSample {
+        byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
         name: if worst { "en10" } else { "en0" }.into(),
         kind: LinkKind::Wifi,
         up: true,
@@ -675,6 +676,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         network: None,
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
+        disk_span: crate::stats_lens::DiskSpan::Day,
         lab: None,
         fleet: None,
         snap: Some(snap),

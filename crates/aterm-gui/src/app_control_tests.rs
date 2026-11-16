@@ -13,7 +13,7 @@ fn act_scrolls_a_listed_row_into_view_before_pressing_it() {
     let (cell_width, cell_height) = app.win_cell_size(wid);
     let pad = app.win_pad(wid);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         let scale = window.scale;
         let px = |points: f64| (points * scale) as usize;
         window.cols =
@@ -218,7 +218,7 @@ fn manual_diagnostic_footer_keeps_a_remedy_that_fits_the_default_window() {
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 80;
         window.rows = 24;
     }
@@ -308,7 +308,7 @@ fn tabs_inspection_uses_the_effective_label_with_stable_fallback() {
     let wid = WindowId(0);
 
     let tab_id = {
-        let window = app.windows.get_mut(&wid).expect("headless window");
+        let mut window = app.windows.get_mut(&wid).expect("headless window");
         window.tab_chrome_titles_by_tab.clear();
         let tab = window.tab_set.tab_at_mut(0).expect("terminal tab");
         tab.presentation.title.clear();
@@ -382,7 +382,7 @@ fn tabs_inspection_keeps_distinct_labels_for_tabs_sharing_one_session() {
     assert_eq!(app.pool.views(0), Some(2));
 
     {
-        let window = app.windows.get_mut(&source).unwrap();
+        let mut window = app.windows.get_mut(&source).unwrap();
         window.tab_title_cache.clear();
         window.tab_chrome_titles_by_tab.clear();
         for index in 0..window.tab_set.len() {
@@ -428,7 +428,7 @@ fn tabs_inspection_keeps_distinct_labels_for_tabs_sharing_one_session() {
 #[test]
 fn document_open_uses_host_grant_and_native_tab_path() {
     let mut app = App::headless_for_test();
-    if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+    if let Some(mut window) = app.windows.get_mut(&WindowId(0)) {
         // The stacked Split needs room for both document panes below their chrome.
         window.rows = 24;
     }
@@ -747,7 +747,7 @@ fn advertised_editor_buffer_action_focuses_only_its_live_view() {
 #[test]
 fn settings_inspection_and_exact_action_are_end_to_end() {
     let mut app = App::headless_for_test();
-    if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+    if let Some(mut window) = app.windows.get_mut(&WindowId(0)) {
         window.cols = 140;
         window.rows = 100;
     }
@@ -867,20 +867,28 @@ fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
         ..MacosAccess::default()
     };
     let mut app = App::headless_for_test();
-    if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+    if let Some(mut window) = app.windows.get_mut(&WindowId(0)) {
         window.cols = 140;
         window.rows = 160;
     }
     assert!(app.open_settings_tab(SettingsRoute::Security));
-    fn state(app: &mut App, view: ViewId) -> &mut crate::native_settings::SettingsViewState {
-        match app.native_runtime.view_state_mut(view) {
-            Some(crate::native_app::AppViewState::Settings(state)) => state,
+    fn with_state<R>(
+        app: &mut App,
+        view: ViewId,
+        run: impl FnOnce(&mut crate::native_settings::SettingsViewState) -> R,
+    ) -> R {
+        let mut guard = app
+            .native_runtime
+            .view_state_mut(view)
+            .expect("live Settings view");
+        match &mut *guard {
+            crate::native_app::AppViewState::Settings(state) => run(state),
             _ => panic!("the Settings view is live"),
         }
     }
     let wid = WindowId(0);
     let (_, view) = app.active_native_view(wid).unwrap();
-    state(&mut app, view).replace_macos_access(access);
+    with_state(&mut app, view, |state| state.replace_macos_access(access));
 
     let controls = app
         .inspect_app(InspectRequest::View {
@@ -910,26 +918,27 @@ fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
             .unwrap_err();
         assert!(refused.contains("does not press"), "{refused}");
     }
-    let panel = state(&mut app, view);
-    assert!(
-        panel
-            .macos_access_for_test()
-            .is_some_and(|access| access.reset.is_none()),
-        "the refused Ask Again cleared nothing"
-    );
-    assert_eq!(panel.take_claimant_retire_request(), None);
-    assert_eq!(
-        panel.take_debugger_change_request(),
-        None,
-        "the refused Allow recorded no change"
-    );
-    assert!(
-        !panel.take_devtools_hand_over_request(),
-        "the refused Open Developer Tools asked the host for nothing"
-    );
-
-    state(&mut app, view)
-        .arm_consent_gestures(crate::native_settings::ConsentGestures::confirming());
+    with_state(&mut app, view, |panel| {
+        assert!(
+            panel
+                .macos_access_for_test()
+                .is_some_and(|access| access.reset.is_none()),
+            "the refused Ask Again cleared nothing"
+        );
+        assert_eq!(panel.take_claimant_retire_request(), None);
+        assert_eq!(
+            panel.take_debugger_change_request(),
+            None,
+            "the refused Allow recorded no change"
+        );
+        assert!(
+            !panel.take_devtools_hand_over_request(),
+            "the refused Open Developer Tools asked the host for nothing"
+        );
+    });
+    with_state(&mut app, view, |state| {
+        state.arm_consent_gestures(crate::native_settings::ConsentGestures::confirming())
+    });
     for action in [
         MACOS_ACCESS_ASK_AGAIN,
         MACOS_ACCESS_TRASH,
@@ -946,26 +955,27 @@ fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
         )
         .unwrap();
     }
-    let panel = state(&mut app, view);
-    assert!(
-        panel
-            .macos_access_for_test()
-            .is_some_and(|access| access.reset.is_some())
-    );
-    assert_eq!(
-        panel.take_claimant_retire_request(),
-        Some(vec![std::path::PathBuf::from("/A/x.app.rollback")])
-    );
-    assert_eq!(
-        panel
-            .take_debugger_change_request()
-            .map(|(change, _)| change),
-        Some(DebuggerChange::On)
-    );
-    assert!(
-        panel.take_devtools_hand_over_request(),
-        "the pressed Open Developer Tools asks the host for the hand-over"
-    );
+    with_state(&mut app, view, |panel| {
+        assert!(
+            panel
+                .macos_access_for_test()
+                .is_some_and(|access| access.reset.is_some())
+        );
+        assert_eq!(
+            panel.take_claimant_retire_request(),
+            Some(vec![std::path::PathBuf::from("/A/x.app.rollback")])
+        );
+        assert_eq!(
+            panel
+                .take_debugger_change_request()
+                .map(|(change, _)| change),
+            Some(DebuggerChange::On)
+        );
+        assert!(
+            panel.take_devtools_hand_over_request(),
+            "the pressed Open Developer Tools asks the host for the hand-over"
+        );
+    });
 }
 
 /// `act` refuses an action of Settings ▸ Harness's Owner rules card by its prefix alone,
@@ -975,7 +985,7 @@ fn the_security_panels_owner_gestures_are_refused_on_the_control_surface() {
 fn act_refuses_the_owner_rules_presses_and_presses_another_harness_action() {
     use crate::native_settings::{OWNER_RULES_PREFIX, SettingsRoute};
     let mut app = App::headless_for_test();
-    if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+    if let Some(mut window) = app.windows.get_mut(&WindowId(0)) {
         window.cols = 140;
         window.rows = 160;
     }
@@ -1052,7 +1062,7 @@ fn a_person_only_button_is_pressed_by_no_accessibility_or_control_client() {
     let wid = WindowId(0);
     for by in [By::Assistive, By::Controller, By::Relayed, By::Person] {
         let mut app = App::headless_for_test();
-        if let Some(window) = app.windows.get_mut(&wid) {
+        if let Some(mut window) = app.windows.get_mut(&wid) {
             window.cols = 160;
             window.rows = 60;
         }
@@ -1168,7 +1178,7 @@ fn this_macs_writes_are_pressed_by_no_accessibility_or_control_client() {
     ] {
         for by in [By::Assistive, By::Controller, By::Relayed, By::Person] {
             let mut app = App::headless_for_test();
-            if let Some(window) = app.windows.get_mut(&wid) {
+            if let Some(mut window) = app.windows.get_mut(&wid) {
                 window.cols = 160;
                 window.rows = 120;
             }
@@ -1285,13 +1295,15 @@ fn askpass_settings_controller_keys_need_an_owner_answer() {
     ] {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 180;
         window.rows = 200;
+        drop(window);
         assert!(app.open_settings_tab(SettingsRoute::Security));
         let (_, view) = app.active_native_view(wid).unwrap();
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("Settings is active");
         };
@@ -1301,6 +1313,7 @@ fn askpass_settings_controller_keys_need_an_owner_answer() {
             ..MacosAccess::default()
         });
         state.common.last_focus = Some(UiKey::new(action));
+        drop(route_native_guard);
         let compiled = app.compiled_native_ui(wid).unwrap();
         assert!(
             compiled.semantic(&UiKey::new(action)).is_some(),
@@ -1329,8 +1342,9 @@ fn askpass_settings_controller_keys_need_an_owner_answer() {
             ),
             crate::input::InputOutcome::Ok
         );
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("Settings remains active");
         };
@@ -1351,7 +1365,7 @@ fn inspection_reuses_staged_glass_after_responsive_resize_and_route_change() {
     let wide_columns = (2_100usize.saturating_sub(pad * 2) / cell_width.max(1)).max(1);
     let medium_columns = (2_000usize.saturating_sub(pad * 2) / cell_width.max(1)).max(1);
     let rows = (1_200usize.saturating_sub(pad * 2) / cell_height.max(1)).max(1);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.scale = 2.0;
         window.cols = u16::try_from(wide_columns).unwrap();
         window.rows = u16::try_from(rows).unwrap();
@@ -1372,7 +1386,7 @@ fn inspection_reuses_staged_glass_after_responsive_resize_and_route_change() {
         .rect
         .width;
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = u16::try_from(medium_columns).unwrap();
     }
     assert!(app.prepare_native_input_scratch(wid));
@@ -1509,15 +1523,16 @@ fn an_invalidated_retained_sibling_inspects_as_shown_not_current() {
     app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
     app.prepare_heterogeneous_input_scratch(wid)
         .expect("mixed frame is retained");
-    let raster = app
-        .windows
-        .get_mut(&wid)
-        .and_then(|window| window.leaf_render_cache.get_mut(&native_view))
+    let mut window_guard = app.windows.get_mut(&wid).unwrap();
+    let raster = window_guard
+        .leaf_render_cache
+        .get_mut(&native_view)
         .and_then(|cache| cache.native.as_mut())
         .unwrap();
     raster.presented = true;
     let retained = raster.compiled.clone();
     let stamp = raster.stamp;
+    drop(window_guard);
     assert!(app.compile_view(native_view).unwrap().model_current);
 
     // Hover, pressed and focus marks owe pixels, not a different tree.
@@ -1572,7 +1587,7 @@ fn settings_preview_and_inactive_inspection_use_logical_window_font_size() {
     let next_session = app.next_session_id;
     let second = app.insert_logical_window(crate::stub_session(next_session), 50, 140);
     {
-        let window = app.windows.get_mut(&second).unwrap();
+        let mut window = app.windows.get_mut(&second).unwrap();
         window.metrics.font_px = 36.0;
         window.scale = 2.0;
     }
@@ -1590,9 +1605,10 @@ fn settings_preview_and_inactive_inspection_use_logical_window_font_size() {
             .expect("Typography specimen")
     };
     for scale in [1.0, 1.25, 2.0, 3.0] {
-        let window = app.windows.get_mut(&second).unwrap();
+        let mut window = app.windows.get_mut(&second).unwrap();
         window.scale = scale;
         window.metrics.font_px = 18.0 * scale as f32;
+        drop(window);
         let compiled = app.compiled_native_ui(second).unwrap();
         let logical = specimen_size(&compiled);
         assert_eq!(logical, 18.0, "display scale {scale}");
@@ -1644,7 +1660,7 @@ fn settings_preview_and_inactive_inspection_use_logical_window_font_size() {
 fn editor_inspection_and_command_controls_share_the_live_reducer() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 92;
         window.rows = 34;
     }
@@ -1664,38 +1680,40 @@ fn editor_inspection_and_command_controls_share_the_live_reducer() {
     let (instance, view) = app.active_native_view(wid).unwrap();
     let document = app.native_runtime.document_id(instance).unwrap();
 
-    let inspect = |app: &App, projection| {
+    let inspect = |app: &mut App, projection| {
         app.inspect_app(InspectRequest::View { view, projection })
             .unwrap()
     };
-    let lines = inspect(&app, InspectionProjection::Text);
+    let lines = inspect(&mut app, InspectionProjection::Text);
     assert!(lines.iter().any(|line| {
         line.contains("editor-row")
             && line.contains(r#"text="alpha needle""#)
             && line.contains("carets=[0@0:primary]")
             && line.contains("selections=[]")
     }));
-    let Some(crate::native_app::AppViewState::Editor(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Editor(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("editor state remains live");
     };
     state.buffer.as_mut().unwrap().selections =
         vec![crate::native_editor::Selection { anchor: 0, head: 5 }];
-    let selected_tree = inspect(&app, InspectionProjection::Tree);
+    drop(route_native_guard);
+    let selected_tree = inspect(&mut app, InspectionProjection::Tree);
     assert!(selected_tree.iter().any(|line| {
         line.contains("editor-row")
             && line.contains("carets=[5@5:primary]")
             && line.contains("selections=[0..5@0..5:primary]")
     }));
-    let Some(crate::native_app::AppViewState::Editor(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Editor(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("editor state remains live");
     };
     state.buffer.as_mut().unwrap().selections = vec![crate::native_editor::Selection::caret(0)];
 
-    let before_find_revision = inspect(&app, InspectionProjection::Text)[0].clone();
+    drop(route_native_guard);
+    let before_find_revision = inspect(&mut app, InspectionProjection::Text)[0].clone();
     app.act_app(ActRequest {
         view,
         ui_key: "editor/find-button".to_string(),
@@ -1703,7 +1721,7 @@ fn editor_inspection_and_command_controls_share_the_live_reducer() {
         value: None,
     })
     .unwrap();
-    let find_inspection = inspect(&app, InspectionProjection::Text);
+    let find_inspection = inspect(&mut app, InspectionProjection::Text);
     assert_ne!(find_inspection[0], before_find_revision);
     assert!(find_inspection.iter().any(|line| {
         line.contains("editor-minibuffer")
@@ -1736,7 +1754,7 @@ fn editor_inspection_and_command_controls_share_the_live_reducer() {
         app.document_store.snapshot(document).unwrap().text.as_ref(),
         original
     );
-    let search_text = inspect(&app, InspectionProjection::Text);
+    let search_text = inspect(&mut app, InspectionProjection::Text);
     assert_ne!(search_text[0], before_paste_revision);
     assert!(search_text.iter().any(|line| {
         line.contains("editor-minibuffer")
@@ -1762,7 +1780,7 @@ fn editor_inspection_and_command_controls_share_the_live_reducer() {
         })
         .unwrap();
         assert!(
-            inspect(&app, InspectionProjection::Text)
+            inspect(&mut app, InspectionProjection::Text)
                 .iter()
                 .any(|line| line.contains("editor-minibuffer") && line.contains(expected))
         );
@@ -1812,7 +1830,7 @@ fn editor_inspection_and_command_controls_share_the_live_reducer() {
         format!("!{original}")
     );
     assert!(
-        inspect(&app, InspectionProjection::Text)
+        inspect(&mut app, InspectionProjection::Text)
             .iter()
             .any(|line| { line.contains("editor-status") && line.contains(r#"value="Saved""#) })
     );

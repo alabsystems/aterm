@@ -241,7 +241,7 @@ OUTPUT:
 STDIN PAYLOADS:
     Inline arguments are joined with single spaces and may not contain a
     newline or carriage return. These forms read STDIN instead, every byte
-    kept except where `send -` says:
+    kept except where `send -` and `mark … value=-` say:
     feed-bin      feed the STDIN bytes (<= 256 KiB) to the PTY verbatim (a
                   length-prefixed frame; no inline argument); prints the
                   server's OK <n> bytes.
@@ -254,10 +254,20 @@ STDIN PAYLOADS:
                   handling (control bytes sanitized; ESC[200~/201~ bracketing
                   when the app enabled DECSET 2004), not as a raw feed.
     paste-bin     the frame `paste -` sends (no inline argument).
+    mark <node> desc field=<slot> value=-
+                  the claim's value from STDIN: its first line, without the
+                  line ending, percent-encoded into value=; the rest is not
+                  read. No line, or a blank one, is refused: leave value= out
+                  to withdraw a claim.
     spawn agent=<a> [model=<m>] [effort=<level>] [cwd=<path>] [label=<word>] -
-                  the worker's task (1 byte to 64 KiB); the client writes len=
-                  itself, adds cwd=<this directory> when absent, and makes a
-                  relative cwd= absolute. With no from=, it adds
+                  a separate full agent session. Prefer native subagents for
+                  same-machine delegation; work directly if unavailable.
+                  New sessions need an explicit request or a concrete need
+                  native tools cannot meet. State the reason before spawning
+                  (`aterm help workers`).
+                  The worker's task (1 byte to 64 KiB) comes from stdin; the
+                  client writes len= itself, adds cwd=<this directory> when
+                  absent, and makes a relative cwd= absolute. With no from=, it adds
                   from=$ATERM_PARENT_SESSION_ID only for an aterm that holds
                   that session: the one a spawn addressed to it (@self)
                   reaches, as an aterm refuses one for a session it does not
@@ -270,9 +280,11 @@ STDIN PAYLOADS:
                   another environment (a `lab instance`) is that aterm's
                   alone.
     spawn program=<p> [arg=<a>]... [cwd=<path>] [label=<word>] -
-                  the same, for a program no harness reads: its task file is
-                  the program's standard input, and each of program= and arg=
-                  goes as one word whatever it holds.
+                  a separate terminal for a program no harness reads. Use your
+                  own shell/background tools for ordinary commands and scripts;
+                  the same explicit-request or concrete-need rule applies.
+                  Its task file is the program's standard input, and each of
+                  program= and arg= goes as one word whatever it holds.
     board [--json] [from=<sid>] [label=<word>|<prefix>*]
                   this Mac's board, read from its state folder (with --host,
                   that Mac's, over a drive); `board accept <@sid|label>
@@ -426,12 +438,14 @@ CLIENT VERBS (answered by aterm-ctl itself; not in the protocol table):
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>
                   land_at=<unix-s|-> task=<open|landed|theirs|->
                   pause=<unix-s|-> task_state=<working|done|exited|stalled|failed|->
-                  task_rev=<n>[ *]
+                  task_rev=<n> opened_ms=<unix-ms|->[ *]
                   `help sessions` explains each field. detail=, program= and
                   agent= say whether a peer is another agent: a tab whose
                   foreground is an agent reads what you type as its prompt,
                   not as a shell line. A codex's agent= stays unknown;
                   program_state= is its own report (a claim, - elsewhere).
+                  opened_ms= is when the session's lineage first opened (a
+                  restored tab keeps its first open's); its age is now minus it.
     instances     one line per live same-user instance:
                   <pid> <session-count> <sock>[ self]
                   (self = the instance hosting the calling terminal).
@@ -4115,7 +4129,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         return sudo_run::run(command, sock, pid);
     }
 
-    // A read's session named after its verb (`text @s-…`, `status s-…`, `read` for `text`)
+    // A read's session named after its verb (`text @t…`, `status t…`, `read` for `text`)
     // moves in front of it first, so every reader below, `--help` and `--host` included, sees
     // the protocol's one form.
     if let Some(rewritten) = verb_first::rewrite(&request_parts) {
@@ -4270,6 +4284,9 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     }
 
     validate_request_parts(&request_parts)?;
+    if let Some(at) = desc_stdin_word(&request_parts) {
+        request_parts[at] = desc_value_word(&read_desc_line(io::stdin().lock())?);
+    }
 
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
@@ -4599,6 +4616,62 @@ fn read_stdin_payload() -> io::Result<Vec<u8>> {
         return Err(oversized_feed_bin_error());
     }
     Ok(buf)
+}
+
+/// Where `parts` holds the `value=-` of a `mark <node> desc …` request: the one word this
+/// client fills from a line of stdin ([`read_desc_line`]). No other mark kind takes a `value=`,
+/// so a `value=-` in any other request is sent as typed.
+fn desc_stdin_word(parts: &[String]) -> Option<usize> {
+    let lead = usize::from(parts.first().is_some_and(|p| p.starts_with('@')));
+    let rest = parts.get(lead..)?;
+    if rest.first().map(String::as_str) != Some("mark")
+        || rest.get(2).map(String::as_str) != Some("desc")
+    {
+        return None;
+    }
+    let at = rest.iter().skip(3).position(|word| word == "value=-")?;
+    Some(lead + 3 + at)
+}
+
+/// The description a `mark … desc … value=-` claims: the first line of `input`, without its
+/// line ending; what follows that line is not read. No line, or a blank one, is refused here:
+/// a request with no `value=` withdraws the caller's claim, and an empty pipe must never do
+/// that. A line no request line could carry is refused before it is sent; the server judges
+/// every other bound of a value.
+fn read_desc_line(input: impl BufRead) -> io::Result<String> {
+    let refuse =
+        |why: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("mark desc: {why}"));
+    let mut line = Vec::new();
+    input
+        .take(MAX_REQUEST_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    } else if line.len() > MAX_REQUEST_LINE {
+        return Err(refuse(&format!(
+            "the line on stdin is over {MAX_REQUEST_LINE} bytes"
+        )));
+    }
+    let line = String::from_utf8(line).map_err(|_| refuse("the line on stdin is not UTF-8"))?;
+    if line.trim().is_empty() {
+        return Err(refuse(
+            "stdin holds no line to claim (to withdraw a claim, leave value= out)",
+        ));
+    }
+    Ok(line)
+}
+
+/// The request word that carries `line` as a claim's value: percent-encoded, as the server
+/// decodes `value=`. A line that is the one character `-` goes as `%2D`: the escape leaves a
+/// `-` as it is, and a bare `-` is how an unset value prints.
+fn desc_value_word(line: &str) -> String {
+    match aterm_codec::pct::encode(line).as_str() {
+        "-" => "value=%2D".to_string(),
+        encoded => format!("value={encoded}"),
+    }
 }
 
 fn read_task_payload() -> io::Result<Vec<u8>> {
@@ -6097,6 +6170,26 @@ fn print_stdout_line(line: &str) -> io::Result<()> {
     out.write_all(b"\n")
 }
 
+/// Whether the `OK <n> …` header of `verb`'s line reply goes to stderr, its lines alone to
+/// stdout: the verbs whose header says more than the count (`tail` is the header after `OK`),
+/// so a reader of stdout gets records only and a person still sees the header. `history` has
+/// such a header only when it says `unheld_below=`.
+fn header_to_stderr(verb: &str, tail: &str) -> bool {
+    matches!(
+        verb,
+        "inbox"
+            | "offscreen"
+            | "search"
+            | "resizes"
+            | "result"
+            | "log"
+            | "brief"
+            | "described"
+            | "sys"
+            | "end"
+    ) || (verb == "history" && tail.split_whitespace().nth(1).is_some())
+}
+
 fn streams_payload(verb: &str, request: &str) -> bool {
     aterm_types::control_verbs::framing_of(verb, request)
         == aterm_types::control_verbs::Framing::Lines
@@ -6454,17 +6547,7 @@ fn exchange_on(
                 ));
             }
             print_stdout_line(status_line)?;
-        } else if verb == "inbox"
-            || verb == "offscreen"
-            || verb == "search"
-            || verb == "resizes"
-            || verb == "result"
-            || verb == "log"
-            || verb == "brief"
-            || verb == "sys"
-            || verb == "end"
-            || (verb == "history" && tail.split_whitespace().nth(1).is_some())
-        {
+        } else if header_to_stderr(verb, tail) {
             stderr_line(status_line)?;
         } else if count == 0 {
             let mut msg = String::from(status_line);

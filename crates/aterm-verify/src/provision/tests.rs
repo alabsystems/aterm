@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::rustup::CELL_TARGETS;
 
 enum Member<'a> {
     Dir,

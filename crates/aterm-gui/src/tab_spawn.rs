@@ -1397,6 +1397,11 @@ impl App {
             Err("theme")
         } else if !can_adopt_spare(&ask) {
             Err("ask")
+        } else if !aterm_agent::harness::registry::shell_strip_list_holds() {
+            // What the shells' strip list is read from moved since it was read: the cold job
+            // reads it again off the loop before it forks (`spawn_session`), and the spare,
+            // forked under the list read before, waits for its fingerprint to be judged then.
+            Err("strip")
         } else {
             self.try_adopt_spare(window, place.asked_from(window), grid, &ask)
         };
@@ -1628,7 +1633,7 @@ impl App {
                 app.replay_window_event(el, winit_id, event, origin);
             }
         });
-        if let Some(ws) = repair.and_then(|at| self.windows.get_mut(&at)) {
+        if let Some(mut ws) = repair.and_then(|at| self.windows.get_mut(&at)) {
             ws.mods = ModifiersState::empty();
         }
     }

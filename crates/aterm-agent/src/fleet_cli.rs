@@ -95,9 +95,11 @@ fn gone_to(mode: &str) -> Option<&'static str> {
     Some(match mode {
         "events" => "use `aterm ctl survey` or `aterm ctl subscribe @a,@b events`",
         "exec" => "use `aterm ctl @<sid> <verb>`",
-        "status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack" | "reconcile"
-        | "clear-fault" | "propose" => {
-            "use `aterm ctl survey` and `aterm ctl @self spawn agent=claude -`"
+        "status" | "inspect" => "use `aterm ctl survey`",
+        "manage" | "unmanage" | "next" | "extend" | "ack" | "reconcile" | "clear-fault"
+        | "propose" => {
+            "use `aterm ctl survey` to inspect existing sessions; use your harness's native \
+             subagents for same-machine delegation and your own shell/background tools for commands"
         }
         _ => return None,
     })

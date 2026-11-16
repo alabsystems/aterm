@@ -216,6 +216,38 @@ fn with_a_display_that_answers_session_zero_forks_before_the_event_loop_is_built
     forks_before_the_held_build("aterm-s0x11", Some(&xvfb.display));
 }
 
+/// A headless boot whose `DISPLAY` names an X display nothing serves (a stale `DISPLAY` over
+/// SSH or in a detached multiplexer) runs without one: the event loop's build falls back to the
+/// windowless loop, and session 0 still forks before it, as where no display is named.
+#[cfg(target_os = "linux")]
+#[test]
+fn with_a_display_nothing_answers_a_headless_boot_runs_without_one() {
+    forks_before_the_held_build("aterm-s0gone", Some(&display_nothing_answers()));
+}
+
+/// `:<n>` for an X display number nothing serves where libxcb looks for a `:<n>` with no host:
+/// the abstract socket and the socket file `/tmp/.X11-unix/X<n>`, then TCP port 6000 + n on
+/// localhost.
+#[cfg(target_os = "linux")]
+fn display_nothing_answers() -> String {
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::net::{SocketAddr, UnixStream};
+    let answers = |n: u32| {
+        let name = format!("/tmp/.X11-unix/X{n}");
+        Path::new(&name).exists()
+            || SocketAddr::from_abstract_name(&name)
+                .and_then(|address| UnixStream::connect_addr(&address))
+                .is_ok()
+            || u16::try_from(6000 + n).map_or(true, |port| {
+                std::net::TcpStream::connect(("localhost", port)).is_ok()
+            })
+    };
+    let n = (4000..5000)
+        .find(|&n| !answers(n))
+        .expect("an X display number nothing serves");
+    format!(":{n}")
+}
+
 /// The dev seam `ATERM_DEBUG_LOOP_FIRST` (WIN-1's windowed A/B of LAG-11): with it set,
 /// the event loop is built first on every launch, the order before LAG-11, so session 0's
 /// shell is forked only after the held build has passed.

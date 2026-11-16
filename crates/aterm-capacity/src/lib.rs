@@ -18,22 +18,23 @@
 //! STEPS down to what its run phase claims once its tree runs a program its build made, and
 //! back up should its run outgrow that ([`mod@phase`], CAP3). That is
 //! admission, not a retry, and it has no deadline: each wait ends when the claims it waits for
-//! end. A waiter whose disk need is more than the volume has free above its floor now
-//! ([`Short::unservable`]) reserves none of it: what a claim wrote stays on the volume once it
-//! ends, unless its disk is scratch ([`Need::scratch`]), so only space freed, or what a scratch
-//! claim held there may give back by its end, can make room for it, and the waiters behind it go
-//! first while it waits for that, so it is not kept from being overtaken (the trade, in
-//! [`mod@admit`]). Its relief runs at once, and a look still beyond the room after it, with no
-//! scratch claim held there that could meet it, is refused ([`Error::Unmet`], UNMET): nothing it
-//! would wait for frees disk. A memory need with no margin that does not fit, where no other
-//! claim holds memory or waits ahead for it (a waiter no claim's end can start aside,
-//! [`Spared::Stuck`]), is admitted ALONE: what it is short of is work no claim holds, whose end
-//! no claim's end brings, so a wait for it would
+//! end. Disk is not waited for: what a claim wrote stays on the volume once it ends, so no
+//! claim's end is sure to make room. A need short of disk gets one relief at once (the build
+//! cache's pass, one pass of the window's disk watch), and the look after it judges its disk
+//! once, by the room the running claims leave (what the volume holds above its floor less what
+//! the claims held there have still to write), not by what waiters reserve: within that room it
+//! starts, or waits on for the rest with its disk no longer judged, and beyond it it ends at
+//! once ([`Error::Unmet`], UNMET), with one admission row ([`mod@admit`]). A waiter beyond the
+//! room ([`Short::unservable`]) reserves none of its disk, so the waiters behind it are not held
+//! to it. A memory need with no margin that
+//! does not fit, where no other claim holds memory or waits ahead for it (a waiter no claim's
+//! end can start aside, [`Spared::Stuck`]), is admitted ALONE: what it is short of is work no
+//! claim holds, whose end no claim's end brings, so a wait for it would
 //! have no bound; it runs with no other memory claim beside it, each waiting while it is held
 //! ([`Short::Alone`]). Resource-only admission refuses at once a need that can never fit here: all the memory
 //! that can ever be available or more (physical memory less what is wired,
 //! [`Reading::reachable`]) unless it asks to be admitted alone ([`Need::alone`]), or more disk
-//! than the volume holds above its floor; and, once it waits, a disk need UNMET as above.
+//! than the volume holds above its floor; and, once its relief ran, a disk need UNMET as above.
 //! Requested Timing also refuses unknown CPU/load
 //! provenance and immediate overrides before starting work.
 //! Explicit load-only quiet work waits within its [`Patience`] and may start at its bound.
@@ -435,7 +436,8 @@ pub struct Need {
     /// where it never stepped, and in a need asked: a waiter is never stepped.
     pub stepped: Option<u64>,
     /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
-    /// they may make none first. The waiter's own, never in a [`Record`].
+    /// they may make none first. The waiter's own, never in a [`Record`]. A wait for memory,
+    /// cores or the quiet machine: a need short only of disk does not wait ([`Error::Unmet`]).
     pub stuck_ends: Option<std::time::Duration>,
     /// What a measured claim ([`QuietPolicy::Timing`]) does when the machine stays busy through
     /// its patience ([`AtBound`], [`Self::runs_loaded`]). The waiter's own, never in a [`Record`]:
@@ -686,11 +688,12 @@ impl Need {
     }
 
     /// Its disk is scratch: its claim's end may return up to what it writes there (a profile
-    /// pilot's cold intermediates). A disk need beyond the room ([`Short::unservable`]) waits
-    /// while such claims are held where that upper bound would bring it within the room, then
-    /// rechecks once each ends; if the writes stayed, that look relieves or refuses it rather
-    /// than waiting again ([`Error::Unmet`]). A claim whose writes are durable (a build's caches,
-    /// a Trust run's held slots, a VM's disk) is not scratch.
+    /// pilot's cold intermediates). A look that counts reservations names such claims beside a
+    /// disk need beyond the room ([`Short::unservable`]) where that upper bound would bring it
+    /// within the room ([`Short::Disk`]'s `held`); no waiter waits for them, since a need
+    /// beyond the room once its one relief ran ends at once ([`Error::Unmet`]). A claim whose
+    /// writes are durable (a build's caches, a Trust run's held slots, a VM's disk) is not
+    /// scratch.
     #[must_use]
     pub const fn scratch(mut self) -> Need {
         self.scratch = true;
@@ -703,8 +706,9 @@ impl Need {
     /// them ([`Error::Stuck`]): the claim leaves the queue, naming them, and nobody signals them
     /// (CW-WAIT-UNBOUNDED). A holder that is itself waiting in a chain is as stuck as what it
     /// waits behind (its mark in this user's waits). Its looks judge a tree busy over a minute,
-    /// or over `after` where that is shorter. Unset, a wait lasts as long as its holders hold,
-    /// its line naming each that has made no progress for
+    /// or over `after` where that is shorter. It ends a wait for memory, cores or the quiet
+    /// machine; a need short only of disk never waits. Unset, a wait lasts as long as its
+    /// holders hold, its line naming each that has made no progress for
     /// [`aterm_toolchain::stall::STALLED_AFTER`]: what a caller with no end of its own for such a
     /// wait asks, so a tool that waits on a person's stopped job resumes with it.
     #[must_use]

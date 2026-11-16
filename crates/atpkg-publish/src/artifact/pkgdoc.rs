@@ -58,7 +58,7 @@ pub fn asset_name(program: &str, build: Build, triple: Triple) -> String {
 }
 
 /// Package manifest header fields.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Header {
     /// The program.
     pub program: String,
@@ -70,6 +70,9 @@ pub struct Header {
     pub exposes: Vec<String>,
     /// Exact validated environment exported by the managed invocation.
     pub shim_env: Vec<String>,
+    /// A harness's declaration (its checkout's `alab-harness.toml` `[harness]` table), copied
+    /// into the signed manifest ([`atpkg::harness_record`]); `None` for anything else.
+    pub harness: Option<aterm_toml::Value>,
 }
 
 /// One target's `[[artifact]]` row.
@@ -426,6 +429,7 @@ pub fn fresh(header: &Header, row: &Row) -> Result<Doc> {
         header.program, header.version, header.build
     );
     append_environment(&mut s, header)?;
+    append_harness(&mut s, header)?;
     s.push_str(&render_row(row)?);
     Ok(Doc {
         bytes: s.into_bytes(),
@@ -446,6 +450,21 @@ fn append_environment(text: &mut String, header: &Header) -> Result<()> {
         );
         text.push_str(&format!("shim_env = {values}\n\n"));
     }
+    Ok(())
+}
+
+/// The `[harness]` table, rendered ahead of the first `[[artifact]]` row.
+fn append_harness(text: &mut String, header: &Header) -> Result<()> {
+    let Some(table) = &header.harness else {
+        return Ok(());
+    };
+    atpkg::harness_record::Declaration::from_table(table, true).map_err(Error::refused)?;
+    let mut root = aterm_toml::Table::new();
+    root.insert("harness".to_string(), table.clone());
+    let rendered = aterm_toml::to_string(&aterm_toml::Value::Table(root))
+        .map_err(|e| Error::refused(format!("the [harness] table does not render: {e}")))?;
+    text.push_str(&rendered);
+    text.push('\n');
     Ok(())
 }
 
@@ -547,6 +566,11 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
         )));
     }
     check_base_environment(&doc, header)?;
+    if doc.get("harness") != header.harness.as_ref() {
+        return Err(Error::refused(
+            "the merge base's [harness] declaration differs from this pack's",
+        ));
+    }
     let base_exposes = base_exposes(&doc, program)?;
     if tool_set(base_exposes.iter().copied()) != tool_set(header.exposes.iter().map(String::as_str))
     {
@@ -602,6 +626,12 @@ pub fn check_parsed(parsed: &atpkg::PkgManifest, header: &Header, row: &Row) -> 
         return Err(Error::refused(format!(
             "the parsed manifest is {}@{}, not {}@{}",
             parsed.program, parsed.build_number, header.program, header.build
+        )));
+    }
+    if parsed.harness != header.harness {
+        return Err(Error::refused(format!(
+            "the client parses {}'s [harness] declaration otherwise than it was packed",
+            header.program
         )));
     }
     if parsed.version != header.version

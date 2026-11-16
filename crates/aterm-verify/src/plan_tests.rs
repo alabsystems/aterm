@@ -132,18 +132,6 @@ fn a_release_plans_its_tree_half_and_its_bundle_half_together() {
     );
 }
 
-/// A repeatable tree spends its independently admitted stage grants one at a time even
-/// though it has no outer build slot. NEGATIVE CONTROL: the same ordinary plan retains
-/// parallel lanes.
-#[test]
-fn a_background_plan_is_exclusive_without_an_outer_slot() {
-    let ordinary = ctx(&DEV, Scope::workspace());
-    assert!(plan(&ordinary).iter().any(|stage| !stage.exclusive));
-    let mut background = ctx(&DEV, Scope::workspace());
-    background.background = true;
-    assert!(plan(&background).iter().all(|stage| stage.exclusive));
-}
-
 fn every_check() -> Vec<Check> {
     CHECKS.iter().map(|s| s.check).collect()
 }
@@ -776,7 +764,7 @@ fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
             let p = plan(&c);
             crate::sched::check_waits(&p)
                 .unwrap_or_else(|e| panic!("{checks:?} could deadlock: {e}"));
-            let mut want = crate::checks::stages_of(&checks);
+            let mut want = crate::checks::stages_of(&checks, c.checkers_in_tests);
             // The measuring rows' compile is planned only where their matrices run and the
             // release's test compile does not build them ([`folds_measuring`]).
             want.retain(|id| *id != StageId::MeasurePrebuild || app);

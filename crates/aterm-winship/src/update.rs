@@ -12,6 +12,7 @@
 //! failed build leaves the installed copy, the staged build and the pointer
 //! as they were, and the pointer never names a folder that is being filled.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -60,6 +61,13 @@ impl Layout {
             .join("aterm-winship.exe")
     }
 
+    /// The folder `build.ps1 -Tool` puts the build tree's own `aterm-winship.exe`
+    /// in: the tool that smokes that tree's build and then becomes [`Self::tool`].
+    #[must_use]
+    pub fn tree_tool_dir(&self) -> PathBuf {
+        self.local.join("aterm").join("build").join("tool")
+    }
+
     /// The repository the build tree is a worktree of, recorded for the runs
     /// that are given no `--repo` (`crate::repo`).
     #[must_use]
@@ -67,13 +75,71 @@ impl Layout {
         self.local.join("aterm").join("build").join("repo.txt")
     }
 
-    /// The scheduled task's definition, as it was handed to `schtasks.exe`.
+    /// A scheduled task's definition, as it was handed to `schtasks.exe`.
     #[must_use]
-    pub fn task_xml(&self) -> PathBuf {
+    pub fn task_xml(&self, task: crate::schedule::Task) -> PathBuf {
         self.local
             .join("aterm")
             .join("build")
-            .join(format!("{}.xml", crate::schedule::TASK))
+            .join(format!("{}.xml", task.name()))
+    }
+
+    /// Where `release-serve` keeps its files.
+    #[must_use]
+    pub fn release_root(&self) -> PathBuf {
+        self.local.join("aterm").join("release")
+    }
+
+    /// The release tree: a git worktree of the repository that `release-serve` checks a
+    /// requested release commit out in and builds.
+    #[must_use]
+    pub fn release_src(&self) -> PathBuf {
+        self.release_root().join("src")
+    }
+
+    /// The folder `release-build` writes the requested release's zip and receipt into.
+    #[must_use]
+    pub fn release_out(&self, key: &str) -> PathBuf {
+        self.release_root().join("out").join(key)
+    }
+
+    /// The folder a handoff's files are laid out in before they are committed.
+    #[must_use]
+    pub fn release_stage(&self, key: &str) -> PathBuf {
+        self.release_root().join("stage").join(key)
+    }
+
+    /// The build log of the requested release `key`.
+    #[must_use]
+    pub fn release_build_log(&self, key: &str) -> PathBuf {
+        self.release_root()
+            .join("logs")
+            .join(format!("{key}.build.log"))
+    }
+
+    /// How many times `release-serve` has built the requested release `key`.
+    #[must_use]
+    pub fn release_attempts(&self, key: &str) -> PathBuf {
+        self.release_root().join("attempts").join(key)
+    }
+
+    /// The lock that keeps `release-serve` to one run at a time.
+    #[must_use]
+    pub fn serve_lock(&self) -> PathBuf {
+        self.release_root().join("serve.lock")
+    }
+
+    /// The log a scheduled `release-serve` appends to.
+    #[must_use]
+    pub fn serve_log(&self) -> PathBuf {
+        self.release_root().join("serve.log")
+    }
+
+    /// The lock that keeps `update` to one run at a time; `release-serve` holds it too while
+    /// it builds, so the two never build at once.
+    #[must_use]
+    pub fn update_lock(&self) -> PathBuf {
+        self.dist_root().join("update.lock")
     }
 
     /// The folder of dists and the pointer.
@@ -163,7 +229,7 @@ impl Out {
 
     /// Where a child's output goes: the log when there is one (a scheduled run
     /// has no terminal), else this process's own stream.
-    fn stdio(&self) -> Stdio {
+    pub(crate) fn stdio(&self) -> Stdio {
         self.log
             .as_ref()
             .and_then(|log| log.try_clone().ok())
@@ -192,25 +258,43 @@ pub struct Options {
 /// is refused, never silently built in `repo`'s name.
 pub(crate) fn ensure_tree(repo: &Repo, layout: &Layout, out: &mut Out) -> Result<(), String> {
     let src = layout.src();
+    if src.join(".git").exists() && repo.from == Source::Tree {
+        return Ok(());
+    }
+    let made = ensure_worktree("update", repo, &src, out)?;
+    if made {
+        // The scheduled copy is given no working directory to find it from.
+        repo::record(layout, &repo.dir)?;
+    }
+    Ok(())
+}
+
+/// Makes a detached worktree of `repo` at origin/main at `src` where there is none
+/// (`Ok(true)`). Where there is one, it must be a worktree of `repo` (`Ok(false)`): a tree of
+/// another repository is refused, never silently built in `repo`'s name. The update's build
+/// tree and `release-serve`'s release tree are each one.
+pub(crate) fn ensure_worktree(
+    verb: &str,
+    repo: &Repo,
+    src: &Path,
+    out: &mut Out,
+) -> Result<bool, String> {
     if src.join(".git").exists() {
-        if repo.from == Source::Tree {
-            return Ok(());
-        }
-        let owner = repo::main_checkout(&src).map_or_else(
+        let owner = repo::main_checkout(src).map_or_else(
             |_| "a repository that is gone".to_string(),
             |dir| dir.display().to_string(),
         );
-        return match repo::same(&src, &repo.dir) {
-            Ok(true) => Ok(()),
+        return match repo::same(src, &repo.dir) {
+            Ok(true) => Ok(false),
             Ok(false) => Err(format!(
-                "the build tree {} is a worktree of {owner}, not of {} ({}); to switch, remove it (git -C \"{owner}\" worktree remove --force \"{}\") and run again",
+                "the tree {} is a worktree of {owner}, not of {} ({}); to switch, remove it (git -C \"{owner}\" worktree remove --force \"{}\") and run again",
                 src.display(),
                 repo.dir.display(),
                 repo.from.word(),
                 src.display()
             )),
             Err(e) => Err(format!(
-                "the build tree {} (a worktree of {owner}) could not be compared with {} ({}): {e}",
+                "the tree {} (a worktree of {owner}) could not be compared with {} ({}): {e}",
                 src.display(),
                 repo.dir.display(),
                 repo.from.word()
@@ -221,7 +305,7 @@ pub(crate) fn ensure_tree(repo: &Repo, layout: &Layout, out: &mut Out) -> Result
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     out.say(&format!(
-        "update: making the build tree {} from {} ({})",
+        "{verb}: making the tree {} from {} ({})",
         src.display(),
         repo.dir.display(),
         repo.from.word()
@@ -253,8 +337,7 @@ pub(crate) fn ensure_tree(repo: &Repo, layout: &Layout, out: &mut Out) -> Result
         ],
         GIT_NETWORK,
     )?;
-    // The scheduled copy is given no working directory to find it from.
-    repo::record(layout, &repo.dir)
+    Ok(true)
 }
 
 /// PowerShell 7 where it is on `PATH`, else Windows PowerShell.
@@ -515,6 +598,15 @@ fn stage(
     .map_err(failed)?;
     let shell = powershell(env);
     let script_path = src.join("apps").join("aterm-win").join("build.ps1");
+    // A tool an earlier build left must not judge this one.
+    let tool_dir = layout.tree_tool_dir();
+    remove_dir_if_there(&tool_dir).map_err(failed)?;
+    let tree_tool = tool_dir.join("aterm-winship.exe");
+    // A tree from before `-Tool` would read the word as a prefix of
+    // `-Toolchain` and refuse the build: that tree is smoked by this tool.
+    let with_tool = std::fs::read_to_string(&script_path)
+        .map_err(|e| failed(format!("{}: {e}", script_path.display())))
+        .map(|text| takes_tool(&text))?;
     stage_built(
         layout,
         head,
@@ -527,39 +619,189 @@ fn stage(
                 script_path.display(),
                 to.display()
             ));
-            script(
-                &shell,
-                &script_path,
-                &["-Out".as_ref(), to.as_os_str()],
-                &src,
-                out,
-            )
+            let mut args: Vec<&std::ffi::OsStr> = vec!["-Out".as_ref(), to.as_os_str()];
+            if with_tool {
+                args.extend(["-Tool".as_ref(), tool_dir.as_os_str()]);
+            }
+            script(&shell, &script_path, &args, &src, out)
         },
         |dist, out| {
-            let opts = smoke::Options {
-                dist: dist.to_path_buf(),
-                scratch: None,
-                keep: false,
-                frame: None,
-            };
-            let mut report = String::new();
-            let outcome = smoke::smoke(&opts, env, &mut |line| {
-                out.say(line);
-                report.push_str(line);
-                report.push('\n');
-            });
-            let verdict = match &outcome {
-                Outcome::Ran(_) if outcome.code() == PASS => Smoke::Pass,
-                Outcome::Ran(_) => Smoke::Fail,
-                Outcome::NotRun(why) => {
-                    out.say(&format!("NOT RUN smoke: {why}"));
-                    report.push_str(&format!("NOT RUN smoke: {why}\n"));
-                    Smoke::NotRun
+            if !with_tool {
+                out.say("update: the build tree's build.ps1 takes no -Tool; this tool smokes it");
+                return own_smoke(dist, env, out);
+            }
+            let judged = tree_smoke(&tree_tool, dist, &tool_dir.join("smoke.txt"), out);
+            // Only a tool that reached its own verdict is kept: one that could
+            // not start, panicked or hung would leave the task nothing to run.
+            if judged.reached {
+                match adopt_tool(&tree_tool, &layout.tool()) {
+                    Ok(true) => out.say(&format!(
+                        "update: {} is now the build tree's aterm-winship",
+                        layout.tool().display()
+                    )),
+                    Ok(false) => {}
+                    Err(e) => out.say(&format!("update: the scheduled tool: {e}")),
                 }
-            };
-            (verdict, report)
+            }
+            (judged.verdict, judged.report)
         },
     )
+}
+
+/// Whether a `build.ps1`'s text declares the `-Tool` parameter.
+#[must_use]
+pub fn takes_tool(script: &str) -> bool {
+    script.lines().any(|line| {
+        line.trim()
+            .trim_end_matches(',')
+            .eq_ignore_ascii_case("[string]$Tool")
+    })
+}
+
+/// Smokes `dist` in this process, with this tool's own rows.
+fn own_smoke(dist: &Path, env: &[(String, String)], out: &mut Out) -> (Smoke, String) {
+    let opts = smoke::Options {
+        dist: dist.to_path_buf(),
+        scratch: None,
+        keep: false,
+        frame: None,
+    };
+    let mut report = String::new();
+    let outcome = smoke::smoke(&opts, env, &mut |line| {
+        out.say(line);
+        report.push_str(line);
+        report.push('\n');
+    });
+    let verdict = match &outcome {
+        Outcome::Ran(_) if outcome.code() == PASS => Smoke::Pass,
+        Outcome::Ran(_) => Smoke::Fail,
+        Outcome::NotRun(why) => {
+            out.say(&format!("NOT RUN smoke: {why}"));
+            report.push_str(&format!("NOT RUN smoke: {why}\n"));
+            Smoke::NotRun
+        }
+    };
+    (verdict, report)
+}
+
+/// The longest a whole smoke may run before it is taken for hung: above the
+/// sum of the smoke's own per-step bounds, under the scheduled task's four hours.
+pub const SMOKE_HANG: Duration = Duration::from_secs(3600);
+
+/// The verdict a `smoke` run's exit code gives.
+#[must_use]
+pub fn smoke_verdict(code: Option<i32>) -> Smoke {
+    match code {
+        Some(PASS) => Smoke::Pass,
+        Some(NOT_RUN) => Smoke::NotRun,
+        _ => Smoke::Fail,
+    }
+}
+
+/// Whether a `smoke` run that exited `code` reached a verdict of its own: it
+/// passed or failed a row, rather than not starting, panicking or not running.
+#[must_use]
+pub fn reached_verdict(code: Option<i32>) -> bool {
+    matches!(code, Some(PASS | FAILED))
+}
+
+/// What the build tree's tool said of a dist.
+struct Judged {
+    verdict: Smoke,
+    report: String,
+    /// It reached its own verdict ([`reached_verdict`]).
+    reached: bool,
+}
+
+/// Smokes `dist` with `tool`, the `aterm-winship.exe` its own tree built
+/// (`build.ps1 -Tool`): a build is held to its tree's rows, never to those of
+/// the copy that is running, which the daily task may have run unchanged since
+/// it was scheduled (an image the build newly lays out would fail it). Its
+/// rows go to `rows` as they are written, so a smoke ended at [`SMOKE_HANG`]
+/// keeps them; one ended there fails, so its commit is not rebuilt every day.
+fn tree_smoke(tool: &Path, dist: &Path, rows: &Path, out: &mut Out) -> Judged {
+    let ran = proc::run_to_file(
+        tool,
+        &[OsStr::new("smoke"), dist.as_os_str()],
+        rows,
+        SMOKE_HANG,
+    );
+    let mut report = std::fs::read_to_string(rows).unwrap_or_default();
+    let (verdict, reached, last) = match ran {
+        Ok(Some(code)) => (smoke_verdict(Some(code)), reached_verdict(Some(code)), None),
+        Ok(None) => (
+            Smoke::Fail,
+            false,
+            Some(format!(
+                "FAIL smoke: the build tree's tool ran past {} s and was ended with what it started",
+                SMOKE_HANG.as_secs()
+            )),
+        ),
+        Err(e) => (
+            Smoke::NotRun,
+            false,
+            Some(format!("NOT RUN smoke: the build tree's tool: {e}")),
+        ),
+    };
+    if let Some(last) = last {
+        report.push_str(&last);
+        report.push('\n');
+    }
+    for line in report.lines() {
+        out.say(line);
+    }
+    Judged {
+        verdict,
+        report,
+        reached,
+    }
+}
+
+/// Makes `fresh` the copy at `kept` that the scheduled task runs, where there
+/// is one (`schedule` made it) and it differs. `kept` may be the running
+/// image, which Windows lets no one write but lets be renamed: it is moved to
+/// `<kept>.old` first (the next run deletes it) and moved back when `fresh`
+/// cannot take its place. `Ok(true)`: `kept` is now `fresh`'s bytes.
+///
+/// # Errors
+/// A copy could not be read (`kept` is as it was), or the swap failed: the
+/// message says whether the previous copy is back at `kept` or still aside.
+pub fn adopt_tool(fresh: &Path, kept: &Path) -> Result<bool, String> {
+    if !kept.is_file() {
+        return Ok(false);
+    }
+    let new = std::fs::read(fresh).map_err(|e| format!("{}: {e}", fresh.display()))?;
+    let old = std::fs::read(kept).map_err(|e| format!("{}: {e}", kept.display()))?;
+    if new == old {
+        return Ok(false);
+    }
+    let aside = old_tool(kept);
+    match std::fs::remove_file(&aside) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}; kept as it was", aside.display())),
+    }
+    std::fs::rename(kept, &aside)
+        .map_err(|e| format!("{}: {e}; kept as it was", kept.display()))?;
+    if let Err(e) = aterm_uds::atomic_file::write(kept, &new, 0o755) {
+        return Err(match std::fs::rename(&aside, kept) {
+            Ok(()) => format!("{}: {e}; kept as it was", kept.display()),
+            Err(back) => format!(
+                "{}: {e}; the previous copy is at {} and could not be put back ({back}): the task has no tool until `aterm-winship schedule` is run",
+                kept.display(),
+                aside.display()
+            ),
+        });
+    }
+    Ok(true)
+}
+
+/// Where [`adopt_tool`] moves the copy it replaces.
+#[must_use]
+pub fn old_tool(kept: &Path) -> PathBuf {
+    let mut name = kept.as_os_str().to_os_string();
+    name.push(".old");
+    PathBuf::from(name)
 }
 
 /// What the dist's installer is started with: `-Staged` (it never stops a
@@ -628,9 +870,9 @@ pub fn update(opts: &Options, layout: &Layout, env: &[(String, String)], out: &m
     }
     // One update at a time: a scheduled run and a hand-started one share the build tree.
     let _lock = match aterm_uds::file_lock::LockFile::take(
-        &root.join("update.lock"),
+        &layout.update_lock(),
         Instant::now() + Duration::from_secs(2),
-        "another aterm-winship update is running",
+        "another aterm-winship update, or release-serve's release build, is running",
     ) {
         Ok(lock) => lock,
         Err(e) => {
@@ -638,6 +880,8 @@ pub fn update(opts: &Options, layout: &Layout, env: &[(String, String)], out: &m
             return NOT_RUN;
         }
     };
+    // The copy a previous run's `adopt_tool` moved aside; that run has ended.
+    let _ = std::fs::remove_file(old_tool(&layout.tool()));
     let src = layout.src();
     let fetched = std::env::current_dir()
         .map_err(|e| format!("the working directory: {e}"))

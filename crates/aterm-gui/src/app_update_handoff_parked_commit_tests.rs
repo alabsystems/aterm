@@ -479,9 +479,10 @@ mod queued_setup_custody {
             let wid = crate::WindowId(0);
             let mut view = None;
             let (mut parked, attempt) = Parked::with_app(b"", None, |app| {
-                let window = app.windows.get_mut(&wid).expect("the private window");
+                let mut window = app.windows.get_mut(&wid).expect("the private window");
                 window.rows = 90;
                 window.cols = 160;
+                drop(window);
                 assert!(app.open_system_state_tab());
                 view = Some(app.active_native_view(wid).expect("System State"));
                 app.set_system_state_handlers_for_test(handlers());

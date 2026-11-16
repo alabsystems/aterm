@@ -283,7 +283,7 @@ pub fn prepare<R>(
             context,
             answer,
         };
-        let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &[read], remaining());
+        let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &[read], None, remaining());
     };
     let budget = || {
         let left = remaining().saturating_sub(RECORD_WITHIN);
@@ -506,7 +506,7 @@ fn select(
             context,
             answer: FreshAnswer::Usage(usage.usage.clone()),
         });
-        if codex_rotation::usable(&usage, seat.now)
+        if codex_rotation::usable(&usage, None, seat.now)
             && usage.identity.account != expected_source.account
         {
             selected = Some((row.clone(), usage.identity, new_auth));
@@ -515,7 +515,7 @@ fn select(
     }
     // The report and later writers judge these rows by what was just read. A selection stands
     // whether or not this records: its writer judges the row again.
-    let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &reads, remaining());
+    let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &reads, None, remaining());
     let Some((destination, destination_identity, new_auth)) = selected else {
         return Ok(NotNeeded(LostLoginEnd::NoTarget));
     };

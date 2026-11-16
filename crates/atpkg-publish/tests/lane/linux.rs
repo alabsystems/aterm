@@ -254,6 +254,7 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
             build: 12,
             exposes: vec!["git".into()],
             shim_env: Vec::new(),
+            harness: None,
         };
         let path = dir.join("pkg-git-12.toml");
         std::fs::write(dir.join(&row.asset), &archive).unwrap();
@@ -338,6 +339,7 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
             build: 12,
             exposes: vec!["git".into()],
             shim_env: Vec::new(),
+            harness: None,
         },
         &BottleRow {
             triple: ARM,

@@ -3279,7 +3279,7 @@ fn the_kept_glyphs_keep_within_their_byte_bound() {
 fn a_scale_change_drops_the_kept_glyphs() {
     let mut app = crate::App::headless_for_test();
     let window = crate::WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&window) {
+    if let Some(mut ws) = app.windows.get_mut(&window) {
         ws.scale = 2.0;
     }
     memo_raster(DARK_INK, DARK_GROUND, LIGHT_GROUND, 2.0);

@@ -18,7 +18,7 @@ use alab_policy::go_ahead::RULE_GO_AHEAD;
 use alab_policy::{
     land_check::RULE_LAND_CHECK,
     words::{
-        RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
+        RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LEFT,
         RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
     },
 };
@@ -172,50 +172,61 @@ fn is_dialog_key(rule: &str) -> bool {
     is_question_rule(rule) || rule == RULE_LAND_ANSWER
 }
 
-fn is_prose_answer(rule: &str) -> bool {
-    rule == RULE_LAND_ANSWER
-        || rule == RULE_GO_AHEAD
-        || rule == RULE_CREDENTIAL
-        || PriorityWord::ALL
-            .into_iter()
-            .any(|p| p.prose_rule_id() == rule)
+/// EVERY RULE AN ACT ATERM TYPES IS LEDGERED UNDER, with the act it lights and the counter it adds
+/// to: the one list [`typed_act`] reads, so whatever reads every typed act (a test that each has
+/// a duty, [`act_scope`]) walks exactly what it lights. The continuations; the prose answers (a
+/// prose question's under each [`PriorityWord`], go-ahead, the credential line, the land answer);
+/// Land's instruction, nudge and check; and every carry past a wall (the usage resume, the API
+/// retry, back and cutoff, the outage resume, the login's return, compaction, the goal restore).
+fn typed_rules() -> impl Iterator<Item = (&'static str, Act, Counter)> {
+    let continued = [
+        RULE_CONTINUE,
+        RULE_POLICY_CONTINUE,
+        RULE_SUGGESTION,
+        RULE_DONE_CHECK,
+        RULE_OPEN_ITEMS,
+        RULE_UNCOMMITTED,
+        alab_policy::cruise_carry::RULE_BACKGROUND,
+    ]
+    .map(|rule| (rule, Act::Continued, Counter::Continued));
+    let answered = [RULE_LAND_ANSWER, RULE_GO_AHEAD, RULE_CREDENTIAL]
+        .into_iter()
+        .chain(PriorityWord::ALL.map(PriorityWord::prose_rule_id))
+        .map(|rule| (rule, Act::Answered, Counter::Answered));
+    let landing = [
+        (RULE_LAND, Act::Landing),
+        (RULE_LAND_NUDGE, Act::Nudged),
+        (RULE_LAND_CHECK, Act::LandCheck),
+    ]
+    .map(|(rule, act)| (rule, act, Counter::LandPrompts));
+    let resumed = [
+        RULE_LIMIT_RESUME,
+        RULE_API_RETRY,
+        RULE_API_BACK,
+        RULE_API_CUTOFF,
+        RULE_OUTAGE_RESUME,
+        RULE_LOGIN_BACK,
+        RULE_COMPACT,
+        crate::supervise::policy::goal_restore::RULE_GOAL_RESTORE,
+    ]
+    .map(|rule| (rule, Act::Resumed, Counter::Resumed));
+    continued
+        .into_iter()
+        .chain(answered)
+        .chain(landing)
+        .chain(resumed)
 }
 
+/// The act and counter of a row aterm typed under `rule`, its command `command`
+/// ([`typed_rules`]): none for a rule no typed act is ledgered under, nor for a compaction row
+/// whose command is a slash command.
 fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
-    if matches!(
-        rule,
-        RULE_CONTINUE
-            | RULE_POLICY_CONTINUE
-            | RULE_SUGGESTION
-            | RULE_DONE_CHECK
-            | RULE_OPEN_ITEMS
-            | RULE_UNCOMMITTED
-            | alab_policy::cruise_carry::RULE_BACKGROUND
-    ) {
-        Some((Act::Continued, Counter::Continued))
-    } else if is_prose_answer(rule) {
-        Some((Act::Answered, Counter::Answered))
-    } else if rule == RULE_LAND {
-        Some((Act::Landing, Counter::LandPrompts))
-    } else if rule == RULE_LAND_NUDGE {
-        Some((Act::Nudged, Counter::LandPrompts))
-    } else if rule == RULE_LAND_CHECK {
-        Some((Act::LandCheck, Counter::LandPrompts))
-    } else if matches!(
-        rule,
-        RULE_LIMIT_RESUME
-            | RULE_API_RETRY
-            | RULE_API_BACK
-            | RULE_API_CUTOFF
-            | RULE_OUTAGE_RESUME
-            | RULE_LOGIN_BACK
-            | crate::supervise::policy::goal_restore::RULE_GOAL_RESTORE
-    ) || (rule == RULE_COMPACT && !command.starts_with('/'))
-    {
-        Some((Act::Resumed, Counter::Resumed))
-    } else {
-        None
+    if rule == RULE_COMPACT && command.starts_with('/') {
+        return None;
     }
+    typed_rules()
+        .find(|&(typed, ..)| typed == rule)
+        .map(|(_, act, counter)| (act, counter))
 }
 
 /// The session log's `act` mark for a ledger row.
@@ -272,6 +283,66 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         _ => return None,
     };
     Some((word, log_rule(act)))
+}
+
+/// THE DUTY AN ACT REPORTS ON (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2, HX-06's
+/// decisions): a scoped claim's `meta set harness_act <act>` is admitted only where its scope
+/// holds this duty. `None` for an act no duty names, which only codex-alab's contract 2
+/// self-claim (every duty) may record.
+///
+/// - approvals: `approve-all@v1` and the plan box's yes;
+/// - questions: every question and prose answer, go-ahead and the land answer;
+/// - walls: the credential answer and every wall retry the built-in engine files under `walls`
+///   (`turn_end::is_wall_retry`: the API retry, back and cutoff, the outage resume, compaction,
+///   the login's return);
+/// - turn-end: the usage resume, every continuation [`typed_act`] lights as one (`continue@v1`,
+///   `policy-continue@v1`, the done check, the suggestion, the open items, the uncommitted work,
+///   the background carry), its reset, the goal restore (`goal-restore@v1`, typed in a
+///   continuation's place), the dispatch of a turn or Land (`land@v1`, its nudge and check), its
+///   landing (`landed@v1`) and a point left to a person (`left-to-person@v1`);
+/// - upgrade: the re-exec onto a newer build (`upgrade@v1`).
+///
+/// The walls and the usage resume are read from the built-in engine's own rule
+/// (`supervise::duty::known_action_scope`), and every other act aterm types ([`typed_rules`])
+/// from its sort: a prose answer is `questions`, the rest `turn-end`, where the engine files a
+/// typed act no rule of its own names at a point with no wall drawn and no prose question
+/// (`supervise::duty::action_scope`). So one act has one duty whoever performs it, and an act
+/// aterm comes to type has its duty with it.
+#[must_use]
+pub fn act_scope(act: &str) -> Option<super::contract::Scope> {
+    use super::contract::Scope;
+    Some(match act {
+        RULE_APPROVE_ALL | RULE_PLAN => Scope::Approvals,
+        RULE_ANSWER_RECOMMENDED
+        | RULE_ANSWER_LONG_TERM
+        | RULE_ANSWER_SHORT_TERM
+        | RULE_ANSWER_LAND
+        | RULE_LAND_ANSWER
+        | RULE_GO_AHEAD
+        | RULE_ANSWER
+        | RULE_PROSE_LONG_TERM
+        | RULE_PROSE_SHORT_TERM => Scope::Questions,
+        act if is_question_rule(act) => Scope::Questions,
+        RULE_UPGRADE => Scope::Upgrade,
+        // The engine files the usage resume under turn-end ahead of its wall retries.
+        RULE_LIMIT_RESUME => Scope::TurnEnd,
+        RULE_CREDENTIAL => Scope::Walls,
+        act if crate::supervise::policy::turn_end::is_wall_retry(act) => Scope::Walls,
+        RULE_HOST_TURN
+        | RULE_LANDED
+        | RULE_LEFT
+        | alab_policy::cruise_carry::RULE_BACKGROUND_RESET => Scope::TurnEnd,
+        // Every other act aterm types: a prose answer is a question's; a continuation, Land's
+        // instruction, nudge and check, and a carry past a wall no wall rule names (the goal
+        // restore) are turn-end's.
+        act => {
+            if typed_act(act, "")?.0 == Act::Answered {
+                Scope::Questions
+            } else {
+                Scope::TurnEnd
+            }
+        }
+    })
 }
 
 /// Whether a self-claim's act types a turn (Autopilot Land).

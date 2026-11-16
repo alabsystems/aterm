@@ -328,7 +328,8 @@ impl App {
         let windows = self.windows.keys().copied().collect::<Vec<_>>();
         for wid in windows {
             self.invalidate_native_ui_cache(wid);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.native_motion_fired_ms = None;
                 ws.next_native_motion_tick = None;
             }
@@ -435,9 +436,10 @@ impl App {
             return false;
         }
         let t_ms = self.native_motion_ms();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         if ws.tab_set.active().is_none() {
             return false;
         }

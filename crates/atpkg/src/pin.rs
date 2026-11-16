@@ -1,20 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local pin state for programs frozen against `update` and `sync`.
+//! Local pin state for programs frozen against `update` and `sync`, and, apart from it, which
+//! of those pins a named harness install made ([`set_held`]): a hold that a named update
+//! releases, where a pin the person set stays until they unpin it.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
 
 use crate::store::Layout;
 
 const MAX_PIN_FILE_BYTES: usize = 256 * 1024;
 const MAX_PINNED_PROGRAMS: usize = 2048;
 
-fn pins_path(layout: &Layout) -> PathBuf {
-    layout.prefix.join("pins")
+/// The person's pins.
+const PINS: &str = "pins";
+/// The pins `aterm pkg install <id>-alab --build <n>` made ([`set_held`]).
+const HOLDS: &str = "harness-holds";
+
+#[cfg(test)]
+fn pins_path(layout: &Layout) -> std::path::PathBuf {
+    layout.prefix.join(PINS)
 }
 
 /// Read the local pins. Only a confirmed missing file means an empty set.
@@ -22,7 +29,12 @@ fn pins_path(layout: &Layout) -> PathBuf {
 /// # Errors
 /// Refuses unreadable, nonregular, oversized, malformed or over-count pin state.
 pub fn pinned_set(layout: &Layout) -> io::Result<BTreeSet<String>> {
-    let path = pins_path(layout);
+    set_of(layout, PINS)
+}
+
+/// The names in the pin-format file `file` under the prefix ([`pinned_set`]).
+fn set_of(layout: &Layout, file: &str) -> io::Result<BTreeSet<String>> {
+    let path = layout.prefix.join(file);
     let body = match crate::metadata_io::read_bounded_regular_utf8(&path, MAX_PIN_FILE_BYTES) {
         Ok(body) => body,
         Err(error)
@@ -84,6 +96,28 @@ fn valid_name(program: &str) -> bool {
 /// # Errors
 /// Refuses invalid names, lock failures, unreadable prior state, bounds violations and publication failures.
 pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bool> {
+    set_in(layout, PINS, program, pinned)
+}
+
+/// Whether `program`'s pin is a hold a named harness install made ([`set_held`]).
+///
+/// # Errors
+/// As [`pinned_set`], for the holds file.
+pub fn is_held(layout: &Layout, program: &str) -> io::Result<bool> {
+    set_of(layout, HOLDS).map(|holds| holds.contains(program))
+}
+
+/// Records or forgets that `program`'s pin is a named harness install's hold, returning
+/// `Ok(changed)`. It pins nothing by itself: the pin is [`set_pinned`]'s.
+///
+/// # Errors
+/// As [`set_pinned`].
+pub fn set_held(layout: &Layout, program: &str, held: bool) -> io::Result<bool> {
+    set_in(layout, HOLDS, program, held)
+}
+
+/// Add `program` to, or take it from, the pin-format file `file` ([`set_pinned`]).
+fn set_in(layout: &Layout, file: &str, program: &str, pinned: bool) -> io::Result<bool> {
     if !valid_name(program) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -93,7 +127,7 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
     }
     layout.ensure_dir(&layout.prefix)?;
     let _writer = crate::lock::lock_metadata(&layout.prefix.join("pins.lock"))?;
-    let mut set = pinned_set(layout)?;
+    let mut set = set_of(layout, file)?;
     let changed = if pinned {
         set.insert(program.to_string())
     } else {
@@ -114,7 +148,7 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
     }
     #[cfg(test)]
     tests::before_publish();
-    aterm_uds::atomic_file::write(&pins_path(layout), body.as_bytes(), 0o600)?;
+    aterm_uds::atomic_file::write(&layout.prefix.join(file), body.as_bytes(), 0o600)?;
     Ok(changed)
 }
 

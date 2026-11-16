@@ -1910,3 +1910,101 @@ fn an_anchor_is_another_if_absent_entry_its_receivers_all_get() {
     let e = parse_plain(b"a<<END if-absent=b\nx\nEND\n").expect_err("dangling");
     assert_eq!(e.line, 1, "{e}");
 }
+
+/// The size door of [`Document::set_entry_with`]: a fleet configuration name is not given a new
+/// value over 64 KiB, by any author, in words that hold the name and the sizes and never the
+/// value. A value the section already holds is no change, so a 300 KiB one an older build wrote
+/// survives an unrelated edit and a set of itself, can be made small and can be deleted; a
+/// credential's name is held to no such door.
+///
+/// CONTROL, in the test: a value of exactly 64 KiB lands.
+#[test]
+fn vault_fill_door_refuses_a_changed_fleet_configuration_value_over_64_kib() {
+    const NAME: &str = crate::entry_class::GITHUB_REPOSITORIES;
+    let everyone = Audience::Everyone;
+    let mut doc = Document::new_vault("m22", &recipient(1));
+    assert_eq!(MAX_CONFIGURATION_VALUE, 64 * 1024);
+    doc.set_entry(&everyone, NAME, &vec![b'a'; MAX_CONFIGURATION_VALUE])
+        .expect("CONTROL: a 64 KiB value lands");
+    let error = doc
+        .set_entry(&everyone, NAME, &vec![b'Z'; MAX_CONFIGURATION_VALUE + 1])
+        .expect_err("one byte more is refused");
+    assert_eq!(
+        error.to_string(),
+        "`github-repositories.json` was not set: the value it would take is 64 KiB, and a fleet \
+         configuration value over 64 KiB is not set or changed, since the vault's log keeps \
+         every version of it whole; the value the vault holds stays as it is"
+    );
+    assert!(!error.to_string().contains("ZZ"), "and no value: {error}");
+    assert_eq!(
+        doc.entry(&everyone, NAME)
+            .map(|held| held.value.as_slice().len()),
+        Some(MAX_CONFIGURATION_VALUE),
+        "the value it held stays"
+    );
+    for (name, refused) in [
+        ("ai-accounts-codex.toml", true),
+        ("sheet.csv", true),
+        // A credential, release material and git's configuration are held to no such door.
+        ("gh_access_token", false),
+        (crate::entry_class::NOTARY, false),
+    ] {
+        assert_eq!(
+            doc.set_entry(&everyone, name, &vec![b'b'; 300 * 1024])
+                .is_err(),
+            refused,
+            "{name}"
+        );
+    }
+
+    // A 300 KiB value the vault already holds, as the log or a text an older build wrote hands
+    // it to a document.
+    let large = vec![b'L'; 300 * 1024];
+    let mut held = Document::new_vault("m22", &recipient(1));
+    held.hold_entry_with(&everyone, NAME, &large, false, None)
+        .expect("what the vault holds is shown at any size");
+    let mut doc = Document::parse(std::str::from_utf8(held.render().as_slice()).unwrap())
+        .expect("a text that holds it parses");
+    doc.set_entry(&everyone, "shared", b"an unrelated edit")
+        .expect("an unrelated edit");
+    doc.set_entry(&everyone, NAME, &large)
+        .expect("a set of the value it holds is no change");
+    doc.set_entry_with(&everyone, NAME, &large, true, None)
+        .expect("nor is the same value under another flag");
+    assert_eq!(
+        doc.entry(&everyone, NAME).map(|held| held.value.as_slice()),
+        Some(large.as_slice()),
+        "the unchanged 300 KiB value survives"
+    );
+    assert!(
+        doc.set_entry(&everyone, NAME, &vec![b'M'; 300 * 1024])
+            .is_err(),
+        "another 300 KiB value is a change"
+    );
+    assert!(
+        doc.set_entry(&Audience::Hosts(vec!["m22".to_owned()]), NAME, &large)
+            .is_err(),
+        "and so is the same value in an audience that does not hold it"
+    );
+    assert!(doc.added_refusal(&held).is_none(), "nothing large changed");
+    // A text edited whole is held to the same door against the text it started from.
+    let mut edited = held.clone();
+    edited
+        .hold_entry_with(&everyone, NAME, &vec![b'M'; 300 * 1024], false, None)
+        .unwrap();
+    assert!(
+        edited
+            .added_refusal(&held)
+            .is_some_and(|why| why.starts_with("`github-repositories.json` was not set: ")),
+        "{:?}",
+        edited.added_refusal(&held)
+    );
+    assert!(
+        doc.unset_entry(&everyone, NAME).expect("a delete"),
+        "a delete of it is not refused"
+    );
+    let mut small = held;
+    small
+        .set_entry(&everyone, NAME, b"{}")
+        .expect("and it can be made small");
+}

@@ -1010,7 +1010,9 @@ pub type Built = (
 #[derive(Debug, Default)]
 pub struct Noted {
     /// The units of the directory each call's artifacts and build script runs are outputs of,
-    /// fresh or built, and the packages the calls built tests of.
+    /// fresh or built, and the workspace's own packages the calls built: those they built tests
+    /// of, and, where a call's caller named the workspace's members (a cell's,
+    /// [`crate::disk::note_call_owning`]), every member they built anything of.
     pub used: atpkg::build_cache::stale::Used,
     /// A call into the directory did not pass, or what it reported could not be read (its
     /// output, or the directory it built into): the units are not all the run uses, so nothing
@@ -1018,8 +1020,9 @@ pub struct Noted {
     pub failed: bool,
     /// The call that completes what the run builds there passed ([`crate::disk::close`]): for
     /// the main lane's, the test compile's whole or closing call; for the lint lane's, the last
-    /// of a dev run's lint passes, all of which passed. A run that made no such call keeps
-    /// nothing of the directory.
+    /// of a dev run's lint passes, all of which passed; for a cell's, its row passed, every call
+    /// it owed made and passed (`crate::cells`). A run that made no such call keeps nothing of
+    /// the directory.
     pub closed: bool,
 }
 

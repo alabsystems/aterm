@@ -2598,3 +2598,28 @@ fn counters_of_reads_a_process_and_grows_by_the_child_it_reaped() {
     assert_eq!(counters_of(99_999_999), None, "a pid no process holds");
     assert_eq!(counters_of(0), None, "no pid 0");
 }
+
+/// THE CENSUS'S READ OF A PROCESS SAYS WHEN ITS THREAD LIST WAS CUT (`macos::census_of`): a list
+/// past [`MAX_THREADS`] is read to the cap and says `cut`, so a count of its uninterruptible
+/// threads is at least, never exact. CONTROL: a list of exactly the cap is whole.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_census_read_says_when_a_thread_list_was_cut() {
+    use crate::dstate::Read;
+    let pid = std::ffi::c_int::try_from(std::process::id()).expect("a pid");
+    let own = macos::thread_handles(pid, 8).expect("this process's threads");
+    assert!(!own.is_empty());
+    let listed = |n: usize| -> Vec<u64> { own.iter().copied().cycle().take(n).collect() };
+    let Read::Threads { threads, cut, .. } = macos::census_of(pid, &listed(MAX_THREADS + 1)) else {
+        panic!("threads were listed")
+    };
+    assert!(cut, "one past the cap is cut");
+    assert!(threads as usize <= MAX_THREADS, "{threads}");
+    assert!(
+        matches!(
+            macos::census_of(pid, &listed(MAX_THREADS)),
+            Read::Threads { cut: false, .. }
+        ),
+        "the cap itself is whole"
+    );
+}

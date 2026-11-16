@@ -354,14 +354,25 @@ THE OVERVIEW'S LINES
 FIGURES
   ≥ and ≤ (JSON {"v","bound":"at_least|at_most","cause"}) mark a bound: unread counters or
   unresolved ownership leave the true figure at least or at most the one printed.
+  Network link rx_bytes/tx_bytes are raw counters: byte_counter names their source, effective
+  bit width and byte quantum. Darwin's non-platform NET_RT_IFLIST2 source is modulo 2^32,
+  rounded down to 1024 bytes, not a lifetime total. Rates cross a wrap only where a bounded
+  window, unchanged link capacity and monotonic full-width packets establish one delta.
+  Missing capacity on a moving modulo stream or a window allowing multiple wraps reads
+  unavailable(counter_wrap_ambiguous), even when the raw counter increased. A reset or
+  inconsistent movement reads counter_discontinuity; changed sources, unknown provenance and
+  invalid intervals read counter_source_changed, counter_provenance_unknown and
+  counter_interval_invalid respectively. Unchanged bytes and packets can still read zero.
   CPU includes finished work where the source proves it. cpu_charge_mc retains attributed
   counter charge, which may repeat or miss inherited work; cpu_floor_mc is independently
   observed own CPU. Ambiguous inherited charge leaves actual CPU at its proved floor.
   unavailable(<why>) (JSON {"why"}) is not measured here, and never zero. unsupported: no
   reader on this OS; not_sampled: this build does not read it; refused: the OS refused the
-  read; warming: one reading has no interval yet; stalled: the reader that feeds it is held in
+  read; not_read: the measurement was unavailable, with other independent measurements retained;
+  warming: one reading has no interval yet; stalled: the reader that feeds it is held in
   the kernel (state=partial); no_counter_delta: the counters did not move;
-  walking: a folder walk is under way; lane_off:<lane>, not_enabled:<setting> and
+  walking: a folder walk is under way; unread: no walk has read that store of aterm's yet
+  (`sys disk`); lane_off:<lane>, not_enabled:<setting> and
   needs_privilege:<what>: a reader that is off, or needs what aterm never asks for. Every word:
 "#;
 
@@ -650,6 +661,7 @@ LINES
 
 const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|request|aterm|global] [depth=<1-8>]
       [top=<n>] [--json]
+  aterm ctl @self sys disk held [--json]
   Folder sizes come from a background walk, so a large tree can read state=walking for a
   while; nothing waits on a walk (`await sys` has no walk term), so read again until
   state=complete. A folder no walk measures (protected, another user's, remote, removable, too
@@ -680,6 +692,32 @@ LINES
            purgeable_bytes=; free_bytes= is what this user may write, reserved_bytes= the free
            blocks kept from it (0 on APFS); level= is `status disk=`'s word; slope_bps= and
            purgeable_bytes= (and JSON's eta_full_s) read unavailable(not_sampled) in this build
+  store    name=<word> [n=] under= [path=] alloc_bytes= logical_bytes= files= [bound_bytes=
+           at_bound= used_pct=] growth_bytes_per_h= [full_in_s=] walked_s=: one store aterm
+           itself keeps on this machine, in every scope. name= is a fixed word and never an
+           entry, an account or an address: vault-records (the vault's records log),
+           vault-served (what this machine serves of it), commons-table (one Commons table;
+           n= is the number the walker gave it when it first read it, which it keeps while the
+           table is there, so a table that comes or goes renumbers no other; path= is the
+           folder that holds them all), journal-heard and journal-outbox (the lab journal's
+           archive and its unsent notes), harness-accounts (n= one pooled agent's logins),
+           packages, logs, images and telemetry. A store this machine does not keep has no
+           line. bound_bytes= is the bound the store's own code holds it to, printed only where
+           it enforces one, and at_bound= what that code does there: refuses (vault-records,
+           journal-outbox, commons-table: a write past the bound is refused) or discards
+           (journal-heard, telemetry: the oldest is dropped, so at its bound is where such a
+           store stands once it has filled). used_pct= is logical_bytes= as a share of the
+           bound, rounded down. A Commons table's bound is on the operations it holds (128 MiB
+           of them, and 8,192 in count), which no file size reads: its used_pct= and
+           full_in_s= are unavailable(unread), never a share of its files. growth_bytes_per_h=
+           is the move of alloc_bytes= over the last day of walks (at least ten minutes of
+           them), negative where it shrank, and after a store drained it is the rate since the
+           drain; full_in_s= is how long until a store that refuses at its bound meets it, at
+           the rate its logical bytes grow: 0 at the bound, absent while it does not grow, and
+           never printed for a store that discards. The sizes are read from the walk
+           of aterm's own folders this view asks for, walked_s= ago, never by a walk of their
+           own; where no such walk is kept they are the last sizes a walk recorded, at most
+           seven days old. Until one is, every figure reads unavailable(unread), never 0
   budget   cap_bytes= cap_from=aterm.toml|share kept_bytes= target_bytes= rebuildable_bytes=
            over_bytes=|under_bytes= walk=complete|partial sized_s=: the home volume's
            rebuildable budget. cap_bytes= is `[disk] cap_used_gib` in aterm.toml, or 80% of the
@@ -696,10 +734,49 @@ LINES
            unavailable(not_enabled:disk.cap_used_gib) where cap_used_gib is 0, is not a whole
            number, or aterm.toml cannot be read
   summary  folders past 100,000 entries, the roots no walk measures, and whether a walk is
-           still under way (sizes are then lower bounds)
+           still under way (sizes are then lower bounds); and store-near-bound (<name> <n>%
+           [full in <time>]; <n> more) where a store that refuses writes at its bound holds
+           75% of it or more, or meets it within 48 hours at its growth: the fullest such
+           store, and how many more. A store that discards its oldest at its bound never
+           sets it
+  --json lists the stores as "stores" (at_bound among each one's keys) and those that warn
+  as "store_warnings" (name, n, used_pct, full_in_s) under "disk".
   withheld=<n> counts the writer and program rows outside this tab, which are the owner's.
   --json names growth_bytes_per_s, walked_age_s, sized_age_s and write_bytes_per_s in full.
   To wait for space, `aterm help sys wait` (VOLUME).
+
+HELD
+  `sys disk held` says who holds home's volume and what aterm's own passes do with each
+  holding by themselves: one row per holding, largest first, read from the walker's last
+  board and the build-start records. Its header says form=held. It starts no walk and waits
+  on none: its sizes are those of the walks the Deck in view or a plain `sys disk` asks for.
+  It takes no scope=, depth= or top=. A record to read, not a request.
+  space and budget as above, then:
+  held     used_bytes= total_bytes= rows= filling_bytes_per_h= walk= oldest_walk_s=: the
+           volume, how fast its used bytes grew over the last hour, where the walks are, and
+           the age of the oldest walk the sizes stand on. walk=complete: every root has one;
+           walking: one is under way, so sizes are lower bounds; idle: no walk is asked for, so
+           a root no walk measured reads unavailable(not_sampled); stopped: no walker runs
+  holding  n= project= worktree=checkout|linked|folder|build|cache|tooling|aterm|opt-in|
+           unclassified session=at-work|gone|none [tab=] [exe=] bytes=<n>|≥<n>|unavailable(<why>)
+           class=rebuildable|costly|kept|unclassified clamped=yes|no path= (under= outside
+           the caller's tab) pass=none|tier|daily-cache|run-end|unknown next: <what the pass
+           does with it, in words>
+           session=at-work: a session aterm holds claims it (tab= and exe= are those of the
+           one whose folder lies nearest); gone: the sessions that claimed it have closed;
+           none: no session claims it. ≥<n> is a floor: a walk lists only its largest folders.
+           worktree=cache is aterm's build cache or the root it moved from, tooling the pinned
+           tools its checks fetch (costly to fetch again), aterm the rest of aterm's folders
+           (its state, its disk reserve, virtual machines: kept).
+           pass= is the pass that reaches it first: tier (the low-disk pass, oldest-idle
+           first), daily-cache (aterm's caches: parts unwritten for days, or entries unused
+           for a time), run-end (a verify run that ends in a build folder where a run kept its
+           record of the units it used), none (nothing aterm runs removes it, or its disk
+           cleanup is off), unknown (no walk measured it)
+  summary  measured_bytes= other_bytes=, and where the walks are when not complete
+  The rows add up to used_bytes=: each is cut to what the rows above it leave (clamped=yes;
+  a cloned file counts once per copy), and the last, project=other worktree=unclassified,
+  holds the used bytes no row names.
 "#;
 
 const LEFT_BODY: &str = r#"  aterm ctl @self sys left [scope=pane|tab|aterm] [top=<n>] [--json]
@@ -862,8 +939,10 @@ fn machine_body() -> String {
                 s,
                 "  memory {} · swap {} used of {} · pressure {}",
                 words::mem(m.total),
-                words::mem(m.swap_used),
-                words::mem(m.swap_total),
+                m.swap_used
+                    .map_or_else(|| "unavailable(not_read)".to_owned(), words::mem),
+                m.swap_total
+                    .map_or_else(|| "unavailable(not_read)".to_owned(), words::mem),
                 m.pressure
                     .map_or("unavailable(unsupported)", |p| p.as_str())
             );
@@ -1056,6 +1135,7 @@ OWNER-ONLY
     scope=aterm), and disk beyond its window (scope=aterm|global)
   - a sys left with no @ target, which reads scope=aterm
   - await sys … scope=aterm
+  - sys disk held, which reads every holding on home's volume
   Such a caller reads why's coalitions only where they lie wholly in its target's tab; the
   rest sum on withheld=. Other tabs' writer, program and process rows sum on withheld= too.
 

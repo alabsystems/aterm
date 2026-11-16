@@ -44,8 +44,17 @@ pub struct CutOptions {
     pub windows_artifacts: Option<PathBuf>,
     /// `--windows-sha256 HEX`: the Windows zip's SHA-256 as `release-build` printed it on the
     /// Windows host, lowercase; no carried pair is admitted without it
-    /// ([`buildplan::windows::Handoff::sha256`]).
+    /// ([`buildplan::windows::Handoff::sha256`]) or `windows_attested`.
     pub windows_sha256: Option<String>,
+    /// `--windows-attested`: the pair in `windows_artifacts` came through the pull lane, and is
+    /// bound by the attestation beside its receipt, by a builder the release commit pins, in
+    /// place of `windows_sha256` ([`buildplan::windows::Handoff::attested`]).
+    pub windows_attested: bool,
+    /// The UTC day the pull lane admitted that attestation (the release journal's
+    /// `windows_pull.admitted_on`), which its expiry is judged on
+    /// ([`buildplan::windows::Handoff::attested_on`]). No flag sets it: `cut --sign` reads it
+    /// from the release journal for the pair the lane brought.
+    pub windows_attested_on: Option<String>,
     /// `--sign`: sign, notarize and package a byte copy of the release's verified bundle under
     /// its reserved number, privately, and keep the record the claim adopts ([`run_cut_sign`]).
     pub sign: bool,
@@ -6330,7 +6339,14 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let windows = opts
         .windows_artifacts
         .as_deref()
-        .map(|dir| buildplan::windows::Handoff::new(dir, opts.windows_sha256.as_deref()))
+        .map(|dir| {
+            buildplan::windows::Handoff::declared(
+                dir,
+                opts.windows_sha256.as_deref(),
+                opts.windows_attested,
+            )?
+            .attested_on(opts.windows_attested_on.as_deref())
+        })
         .transpose()?;
     let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
@@ -6798,8 +6814,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
 }
 
 /// A real cut that will admit a Windows zip itself (no private draft signed one first) is bound
-/// to the digest the person named before it claims: the admission comes after the claim, and
-/// `cut --resume` takes no flag, so a cut that claimed without one could never name it.
+/// to an anchor before it claims, the digest the person named or the pull lane's attestation:
+/// the admission comes after the claim, and `cut --resume` takes no flag, so a cut that claimed
+/// without one could never name it.
 fn windows_bound_before_claim(
     windows: Option<&buildplan::windows::Handoff>,
     dist: &Path,
@@ -6807,7 +6824,7 @@ fn windows_bound_before_claim(
     let Some(handoff) = windows else {
         return Ok(());
     };
-    if handoff.sha256.is_some() || dist.join(draft::JOURNAL).exists() {
+    if handoff.sha256.is_some() || handoff.attested || dist.join(draft::JOURNAL).exists() {
         return Ok(());
     }
     Err(Error::new(format!(
@@ -7020,16 +7037,36 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
     }
     if !opts.sign_prepare {
         let mut declaration = opts.clone();
+        let pulled = release.pulled_windows();
+        // The day the lane admitted the pair it brought, which that pair is judged on.
+        let pulled_on = release
+            .reserved_pull()
+            .and_then(|pull| pull.admitted_on.clone());
         if !declaration.mac_only && declaration.linux_artifacts.is_none() {
             declaration.mac_only = release.linux.mac_only;
             declaration.linux_artifacts = release.linux.artifacts;
             declaration.linux_targets = release.linux.targets;
             declaration.linux_workers = release.linux.workers;
         }
-        if declaration.windows_artifacts.is_none() {
-            declaration.windows_artifacts = release.windows;
+        if declaration.windows_attested
+            && pulled.is_some()
+            && declaration.windows_artifacts == pulled
+        {
+            declaration.windows_attested_on.clone_from(&pulled_on);
         }
-        if declaration.windows_sha256.is_none() {
+        if declaration.windows_artifacts.is_none() {
+            // A pair carried by hand, else the pair the pull lane admitted for this reservation.
+            match (release.windows, pulled) {
+                (Some(carried), _) => declaration.windows_artifacts = Some(carried),
+                (None, Some(pulled)) if declaration.windows_sha256.is_none() => {
+                    declaration.windows_artifacts = Some(pulled);
+                    declaration.windows_attested = true;
+                    declaration.windows_attested_on = pulled_on;
+                }
+                (None, _) => {}
+            }
+        }
+        if declaration.windows_sha256.is_none() && !declaration.windows_attested {
             declaration.windows_sha256 = release.windows_sha256;
         }
         draft::prepare(&mut ctx, &declaration)?;

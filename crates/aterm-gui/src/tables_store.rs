@@ -19,8 +19,8 @@ use aterm_db::typed::{Collection, Ty, Writer};
 
 #[cfg(unix)]
 use crate::native_tables::{
-    AsOf, Author, AuthorKind, Group, Sheet, SheetColumn, SheetRow, Shown, Since, Written,
-    WrittenCell,
+    AsOf, Author, AuthorKind, ColumnKind, Group, Sheet, SheetColumn, SheetRow, Shown, Since,
+    Written, WrittenCell,
 };
 use crate::native_tables::{Snapshot, Staged, Wrote};
 
@@ -45,16 +45,21 @@ pub(crate) fn label_of(name: &str) -> String {
 }
 
 #[cfg(unix)]
-fn group_of(column: &Collection, name: &str) -> (Group, bool) {
+fn group_of(column: &Collection, name: &str) -> (Group, ColumnKind) {
     let Some(schema) = column.column(name) else {
-        return (Group::Stored, false);
+        return (Group::Stored, ColumnKind::Text);
     };
     let group = match schema.writer {
         Writer::Owner => Group::Stored,
         Writer::Birth | Writer::Mine | Writer::Seed => Group::SetByAterm,
     };
-    let numeric = matches!(schema.ty, Ty::Int { .. } | Ty::Uint);
-    (group, numeric)
+    // A time and a day show as their numbers (`grid::show`), so they are ordered as numbers.
+    let kind = match schema.ty {
+        Ty::Int { .. } | Ty::Uint => ColumnKind::Number,
+        Ty::Time | Ty::Day => ColumnKind::Time,
+        _ => ColumnKind::Text,
+    };
+    (group, kind)
 }
 
 #[cfg(unix)]
@@ -335,13 +340,13 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                 if HIDDEN.contains(&name) {
                     return None;
                 }
-                let (group, numeric) = group_of(collection, name);
+                let (group, kind) = group_of(collection, name);
                 Some(SheetColumn {
                     name: name.to_owned(),
                     label: label_of(name),
                     group,
                     editable: !read_only && group == Group::Stored,
-                    numeric,
+                    kind,
                     links: collection
                         .column(name)
                         .and_then(|c| target(&c.ty))
@@ -388,7 +393,7 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                     label,
                     group: Group::Linked,
                     editable: false,
-                    numeric: true,
+                    kind: ColumnKind::Number,
                     links: Some(other.to_owned()),
                 });
             }

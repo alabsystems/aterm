@@ -437,6 +437,8 @@ pub fn restore_commons_control(
                 records.push(put);
                 Ok(records)
             })?;
+        // A recovery gives members back the control they read Commons by: critical, as an
+        // admission's `Wrap`s are, so it runs to the log's bound, which `insert` held it to.
         let epoch = *records[0].id();
         log_entries::commit_authored_records(
             paths,

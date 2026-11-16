@@ -1106,3 +1106,74 @@ fn any_leaf_agrees_with_leaves_any_and_stops_at_the_first_match() {
         None
     );
 }
+
+#[test]
+fn title_membership_custody_follows_real_mutation_and_clones_start_unbound() {
+    let (mut tabs, _, ids) = parked_set(2, 1);
+    let mut authority = TitleAuthority::default();
+    let custody = tabs.bind_title_owner(11, &authority);
+    assert_eq!(
+        authority.take_pending().into_iter().collect::<Vec<_>>(),
+        [11]
+    );
+    let token = authority.revision();
+    tabs.presentation_at_mut(0).unwrap().title = "presentation".into();
+    tabs.switch_to(ids[1]);
+    tabs.reorder(ids[0], 1);
+    assert!(token.is_current(&authority));
+    let mut clone = tabs.clone();
+    let _ = clone.active_mut();
+    assert!(
+        token.is_current(&authority),
+        "cloning does not subscribe a second payload"
+    );
+    let _ = tabs.active_mut();
+    assert!(!token.is_current(&authority));
+    assert_eq!(
+        authority.take_pending().into_iter().collect::<Vec<_>>(),
+        [11]
+    );
+    drop(custody);
+    let token = authority.revision();
+    let _ = tabs.tab_at_mut(0);
+    assert!(
+        token.is_current(&authority),
+        "retired payload cannot wake its former owner"
+    );
+}
+
+#[test]
+fn title_owner_late_release_cannot_remove_a_cross_owner_binding() {
+    let (mut tabs, _, _) = parked_set(1, 0);
+    let mut authority = TitleAuthority::default();
+    let old = tabs.bind_title_owner(11, &authority);
+    let new = tabs.bind_title_owner(22, &authority);
+    drop(old);
+    let _ = authority.take_pending();
+    let _ = tabs.active_mut();
+    assert_eq!(
+        authority.take_pending().into_iter().collect::<Vec<_>>(),
+        [22]
+    );
+    let mut other = TitleAuthority::default();
+    let _other = tabs.bind_title_owner(22, &other);
+    drop(new);
+    let _ = other.take_pending();
+    let _ = tabs.active_mut();
+    assert_eq!(other.take_pending().into_iter().collect::<Vec<_>>(), [22]);
+}
+
+#[test]
+fn title_owner_old_incarnation_cannot_revoke_the_same_owner_after_rebinding() {
+    let (mut tabs, _, _) = parked_set(1, 0);
+    let mut authority = TitleAuthority::default();
+    let old = tabs.bind_title_owner(7, &authority);
+    let _new = tabs.bind_title_owner(7, &authority);
+    drop(old);
+    let _ = authority.take_pending();
+    let _ = tabs.active_mut();
+    assert_eq!(
+        authority.take_pending().into_iter().collect::<Vec<_>>(),
+        [7]
+    );
+}

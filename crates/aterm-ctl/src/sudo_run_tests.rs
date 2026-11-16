@@ -36,6 +36,8 @@ fn only_a_sudo_request_is_a_command_and_its_words_are_untouched() {
     assert!(command_words(&parts(&["status", "sudo"])).is_none());
 }
 
+/// Unix's: the paths are a Mac's, `PATH` is colon-separated, and `/bin/ls` is there.
+#[cfg(unix)]
 #[test]
 fn a_program_resolves_to_what_the_shell_would_run() {
     let cwd = Path::new("/tmp/here");

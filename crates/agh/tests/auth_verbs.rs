@@ -130,6 +130,20 @@ fn holds_no_token(dirs: &Dirs) {
     );
 }
 
+/// The verified store keeps the fixture's exact bytes; agh makes no legacy plaintext copy.
+fn vault_holds(dirs: &Dirs, name: &str, token: &str) {
+    let value = identity::vault_value(&dirs.home, name)
+        .expect("the verified store is readable")
+        .expect("the vault entry remains present");
+    assert_eq!(value.expose(), format!("{token}\n").as_bytes());
+    let legacy = dirs.home.join(".secrets").join(name);
+    assert!(
+        matches!(std::fs::symlink_metadata(&legacy), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "no legacy plaintext copy at {}",
+        legacy.display()
+    );
+}
+
 /// An agent routes a vault file with no terminal on stderr or stdin, and a file elsewhere in
 /// place alike.
 #[test]
@@ -174,29 +188,30 @@ fn auth_add_without_a_terminal_provisions() {
 }
 
 #[test]
-fn auth_add_of_a_vault_file_writes_a_private_agh_toml_that_validates() {
+fn auth_add_of_a_vault_entry_writes_private_config_without_materializing_the_token() {
     let root = common::scratch("auth-vault-file");
     let fake = FakeGithub::start();
     let token = agh_fake::token("vault-file");
     fake.add_token(&token, "fixture-dev-bot");
     let file = vault_file(root.path(), "dev", &token);
+    let dirs = dirs(root.path());
+    vault_holds(&dirs, "dev", &token);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let path = word(&file);
     let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
-    let dirs = dirs(root.path());
     assert_eq!(mode(&dirs.config), 0o700);
     assert_eq!(mode(&dirs.config_file()), 0o600);
     holds_no_token(&dirs);
-    assert_eq!(
-        std::fs::read_to_string(&file).expect("the vault file"),
-        format!("{token}\n"),
-        "the vault's file is read in place"
-    );
+    vault_holds(&dirs, "dev", &token);
     let router = validated(&dirs);
     let profile = router.profile("dev").expect("the dev profile");
     assert_eq!(profile.login.as_deref(), Some("fixture-dev-bot"));
+    assert_eq!(
+        profile.source,
+        identity::Source::Entry(identity::VaultEntry::new("dev", &dirs.home))
+    );
     let doc = parsed(&dirs);
     let row = owner(&doc, "fixture-dev");
     assert_eq!(
@@ -609,7 +624,7 @@ fn auth_add_checks_its_arguments() {
 }
 
 #[test]
-fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
+fn auth_remove_drops_every_reference_and_preserves_tokens_in_files_and_the_store() {
     let root = common::scratch("auth-remove");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
@@ -653,6 +668,7 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
     let token = agh_fake::token("own");
     fake.add_token(&token, "fixture-ext-bot");
     let ext = vault_file(root.path(), "ext", &token);
+    vault_holds(&dirs, "ext", &token);
     let path = word(&ext);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
@@ -677,11 +693,7 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
         "{}",
         captured.stderr_text()
     );
-    assert_eq!(
-        std::fs::read_to_string(&ext).expect("the vault's file"),
-        format!("{token}\n"),
-        "removing a profile leaves the vault's file to the vault"
-    );
+    vault_holds(&dirs, "ext", &token);
 
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
@@ -1264,10 +1276,12 @@ fn auth_remove_refuses_a_file_that_is_already_invalid_and_changes_nothing() {
     let root = common::scratch("auth-remove-invalid");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    let token = vault_file(root.path(), "b", &agh_fake::token("shared"));
+    let token = agh_fake::token("shared");
+    let file = vault_file(root.path(), "b", &token);
+    vault_holds(&dirs, "b", &token);
     let text = format!(
         "[profiles.a]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n\n[profiles.b]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n",
-        shared = token.display()
+        shared = file.display()
     );
     common::write_config(&dirs, &text);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
@@ -1286,7 +1300,7 @@ fn auth_remove_refuses_a_file_that_is_already_invalid_and_changes_nothing() {
         "{error}"
     );
     assert_eq!(config_text(&dirs), text);
-    assert!(token.exists(), "the token another profile names is kept");
+    vault_holds(&dirs, "b", &token);
 }
 
 #[test]
@@ -1298,10 +1312,12 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
         config: root.path().join("elsewhere").join("agh"),
         ..dirs.clone()
     };
-    let token = vault_file(root.path(), "dev", &agh_fake::token("linked"));
+    let token = agh_fake::token("linked");
+    let file = vault_file(root.path(), "dev", &token);
+    vault_holds(&dirs, "dev", &token);
     let text = format!(
         "[profiles.dev]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
-        token.display()
+        file.display()
     );
     common::write_config(&real, &text);
     std::fs::create_dir_all(dirs.config.parent().expect("a parent")).expect("the parent");
@@ -1328,7 +1344,7 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
     assert_eq!(removed["next"], loaded["next"]);
     assert_eq!(removed["why"], loaded["why"]);
     assert_eq!(config_text(&real), text, "nothing was edited");
-    assert!(token.exists());
+    vault_holds(&dirs, "dev", &token);
 }
 
 #[test]

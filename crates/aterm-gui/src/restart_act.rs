@@ -70,6 +70,43 @@ impl Drop for DeadlineForTest {
     }
 }
 
+#[cfg(unix)]
+/// HOW LONG A SCOPED HARNESS HAS TO OBEY `restart` before its process group gets `SIGTERM`
+/// ([`watch_scoped`]): the policy's `stall_term_after_s` ([`crate::harness_host::stall_term_after`],
+/// 600 s by default), the bound after which aterm ends any frozen worker, unless a unit test set
+/// its own ([`stall_bound_for_test`]); `None` where the policy says never (`0`).
+fn stall_bound() -> Option<Duration> {
+    #[cfg(test)]
+    if let Some(bound) = STALL_BOUND_FOR_TEST.with(std::cell::Cell::get) {
+        return Some(bound);
+    }
+    crate::harness_host::stall_term_after()
+}
+
+#[cfg(test)]
+thread_local! {
+    static STALL_BOUND_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This test thread's [`stall_bound`] until the guard drops.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct StallBoundForTest(Option<Duration>);
+
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn stall_bound_for_test(bound: Duration) -> StallBoundForTest {
+    StallBoundForTest(STALL_BOUND_FOR_TEST.with(|slot| slot.replace(Some(bound))))
+}
+
+#[cfg(test)]
+impl Drop for StallBoundForTest {
+    fn drop(&mut self) {
+        STALL_BOUND_FOR_TEST.with(|slot| slot.set(self.0));
+    }
+}
+
 /// The verb's arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Ask {
@@ -206,42 +243,83 @@ fn record_restart(ctx: &SessionCtx, cause: Cause) {
         .record_row(RESTART_EVENT, format!("cause={}", cause.word()));
 }
 
-/// Publish an account-pool selection to a proven relaunch claimant. No credential value crosses
-/// this boundary: only the row label and the home its sessions already share with the default.
-pub(crate) fn record_scoped_account(
+/// The pid of the live scoped claim on `ctx` that hears a restart's model
+/// ([`crate::harness_claim::Scoped::hears_restart`]) and, where the restart moves its child's
+/// `account`, an account move ([`crate::harness_claim::Scoped::hears_account_move`]: a claim
+/// granted `accounts`), read in one look at the claim.
+fn scoped_restart_pid(ctx: &SessionCtx, now_us: u64, account: bool) -> Option<u32> {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_scoped(now_us)
+        .filter(|scoped| scoped.hears_restart() && (!account || scoped.hears_account_move()))
+        .map(|scoped| scoped.proven.pid)
+}
+
+/// Whether `model` may ride a restart event as `model=<word>`: what aterm's model identifier
+/// check accepts (1 to 256 bytes of ASCII alphanumerics and `._-:@/[]`), except a word starting
+/// with `-`, which a vendor would read as an option.
+fn model_word(model: &str) -> bool {
+    (1..=256).contains(&model.len())
+        && !model.starts_with('-')
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-:@/[]".contains(&b))
+}
+
+/// TELL A SCOPED HARNESS TO RESTART ITS CHILD ON ANOTHER ACCOUNT OR MODEL: the `restart` event
+/// `cause=<cause>[ to=<label> home=<pct|->][ model=<word>]` on `ctx`'s timeline, for a live
+/// proven claim that hears it ([`scoped_restart_pid`]), whichever harness made it: a model move
+/// for a claim holding `relaunch`, or `accounts` under contract 4; an account move only for a
+/// claim granted `accounts`, since it names the account's home, which aterm hands only to a
+/// verified installed or seed build (`contract::grant`). No credential value crosses this
+/// boundary: an account move names only its row's label and the home its sessions already share
+/// (`cause=account|account-ahead`); a model move names the model in `model=`, never in `to=`.
+/// Whether the event was recorded: never with neither an account nor a model, an account under
+/// another cause, an inadmissible label or a relative home, an account for a claim not granted
+/// `accounts` (a claim holding `relaunch` alone hears no account move, a model riding it
+/// included), or a model word a vendor's command line could misread.
+pub(crate) fn record_scoped_restart(
     ctx: &SessionCtx,
     cause: &str,
-    env: &aterm_agent::harness::accounts_pool::LoginEnv,
+    account: Option<&aterm_agent::harness::accounts_pool::LoginEnv>,
+    model: Option<&str>,
 ) -> bool {
-    if !matches!(cause, "account" | "account-ahead")
-        || env.var != "KIMI_CODE_HOME"
-        || !aterm_agent::harness::accounts::admissible_label(&env.label)
-        || env
-            .value
-            .as_deref()
-            .is_some_and(|home| !std::path::Path::new(home).is_absolute())
+    if account.is_none() && model.is_none()
+        || cause.is_empty()
+        || !cause.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        || model.is_some_and(|model| !model_word(model))
     {
         return false;
     }
-    let Some(pid) =
-        scoped_relaunch_pid(ctx, crate::metrics::now_us()).and_then(|pid| i32::try_from(pid).ok())
-    else {
-        return false;
-    };
-    if !scoped_relaunch(ctx, pid) {
+    if let Some(env) = account
+        && (!matches!(cause, "account" | "account-ahead")
+            || !aterm_agent::harness::accounts::admissible_label(&env.label)
+            || env
+                .value
+                .as_deref()
+                .is_some_and(|home| !std::path::Path::new(home).is_absolute()))
+    {
         return false;
     }
-    let home = env
-        .value
-        .as_deref()
-        .map_or_else(|| "-".to_string(), crate::control::pct_encode);
+    if scoped_restart_pid(ctx, crate::metrics::now_us(), account.is_some()).is_none() {
+        return false;
+    }
+    let mut payload = format!("cause={cause}");
+    if let Some(env) = account {
+        let home = env
+            .value
+            .as_deref()
+            .map_or_else(|| "-".to_string(), crate::control::pct_encode);
+        payload.push_str(&format!(" to={} home={home}", env.label));
+    }
+    if let Some(model) = model {
+        payload.push_str(&format!(" model={model}"));
+    }
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .record_row(
-            RESTART_EVENT,
-            format!("cause={cause} to={} home={home}", env.label),
-        );
+        .record_row(RESTART_EVENT, payload);
     true
 }
 
@@ -986,11 +1064,15 @@ impl Stamped<'_> {
             );
         }
         if scoped_relaunch(ctx, pgrp) {
+            // The claim as it stands before the event: a harness that answers at once is
+            // measured against this, never against its own answer.
+            let asked = asked_of(ctx);
             record_restart(ctx, cause);
             aterm_log::info!(
                 "restart @{sid}: pid {pgrp} is a scoped harness; sent restart event (cause={})",
                 cause.word()
             );
+            watch_scoped(ctx, state, pgrp, stamp, by, asked);
             return format!("OK restarting pid {pgrp} cause={}\n", cause.word());
         }
         // A move that its own stamp would end is refused, the stamp taken back, where input waits
@@ -1044,6 +1126,224 @@ impl Stamped<'_> {
                     cause.word()
                 )
             }
+        }
+    }
+}
+
+/// What a scoped harness's `restart` is watched by ([`watch_scoped`]): the claim as it stood just
+/// before the event was sent ([`asked_of`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Asked {
+    /// How many claim lines the session had placed then
+    /// ([`crate::session_timeline::SessionMeta::claim_placements`]), a renewal in place included.
+    placements: u64,
+    /// The child the claim kept then.
+    child: Option<crate::harness_claim::KeptChild>,
+}
+
+/// [`Asked`] as `ctx`'s claim stands now: read before the event is recorded.
+#[cfg(unix)]
+fn asked_of(ctx: &SessionCtx) -> Asked {
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    Asked {
+        placements: meta.claim_placements,
+        child: meta
+            .live_scoped(crate::metrics::now_us())
+            .and_then(|scoped| scoped.child),
+    }
+}
+
+/// Why a scoped watch lets its harness go, having sent nothing ([`scoped_let_go`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Obeyed {
+    /// The claimant no longer leads its tab at its start: it ended or left.
+    Left,
+    /// The claim was released or replaced.
+    Released,
+    /// The claim names another child, or its kept child ended: the restart was obeyed.
+    Child,
+    /// The claimant sent a claim line after the event (a harness announces its claim again
+    /// after every child start, the same words or not): the restart was obeyed.
+    Reclaimed,
+}
+
+#[cfg(unix)]
+impl Obeyed {
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Left => "it no longer leads its tab",
+            Self::Released => "its claim was released",
+            Self::Child => "it started another child",
+            Self::Reclaimed => "it claimed again",
+        }
+    }
+}
+
+/// Whether the scoped harness `pgrp` started at `start` obeyed or left the restart `asked`
+/// watches: the claimant no longer leads `ctx`'s tab with the same start, the claim was released
+/// (or another process holds it), the kept child changed or no longer reads at its birth, or
+/// the claimant placed a claim line since the event. That last is what obedience produces under
+/// every contract: a harness announces its claim again after each child start, and the same
+/// words renew in place, keeping the revision, so a moved revision would miss it.
+#[cfg(unix)]
+fn scoped_let_go(ctx: &SessionCtx, pgrp: i32, start: &str, asked: Asked) -> Option<Obeyed> {
+    if !leads(ctx.sink.master(), pgrp, start) {
+        return Some(Obeyed::Left);
+    }
+    let (claim, placements) = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            meta.live_scoped(crate::metrics::now_us()).cloned(),
+            meta.claim_placements,
+        )
+    };
+    let Some(claim) = claim.filter(|claim| {
+        i64::from(claim.proven.pid) == i64::from(pgrp) && claim.proven.start == start
+    }) else {
+        return Some(Obeyed::Released);
+    };
+    if let Some(kept) = asked.child {
+        let ended = i32::try_from(kept.pid)
+            .ok()
+            .and_then(aterm_uds::process::read_birth)
+            != Some(kept.birth);
+        if claim.child != Some(kept) || ended {
+            return Some(Obeyed::Child);
+        }
+    }
+    // Only the standing claimant places a line while its proven claim stands: another holder's
+    // claim is refused, and a release or replacement was read above.
+    (placements != asked.placements).then_some(Obeyed::Reclaimed)
+}
+
+/// A SCOPED HARNESS THAT DOES NOT OBEY `restart` IS ENDED (`docs/DESIGN-harness-interface-2026-11-12.md`
+/// §2.2): after the event, a watch waits [`stall_bound`] for the harness `pgrp` to obey
+/// ([`scoped_let_go`]). Past the bound it waits while another hand holds the session
+/// ([`another_hand`]: a person's hold, another driver's turn or lease), as every restart waits
+/// for them, then renews the act's stamp (a stamp older than `relaunch::STALE_S` stands for
+/// nothing, and the bound outlasts it), sends `SIGTERM` to the claimant's process group,
+/// re-reading its lead first ([`term`]), and escalates to `SIGKILL` as any restart does
+/// ([`escalate`], [`kill`], which waits for no host read of a scoped harness). Restarting the tab
+/// after that is the watchdog's (HX-15). `asked` is the claim as it stood before the event
+/// ([`asked_of`]).
+#[cfg(unix)]
+fn watch_scoped(
+    ctx: &Arc<SessionCtx>,
+    state: &std::path::Path,
+    pgrp: i32,
+    stamp: Stamp,
+    by: aterm_slog::Actor,
+    asked: Asked,
+) {
+    let Some(bound) = stall_bound() else {
+        aterm_log::info!(
+            "restart: scoped harness pid {pgrp}: the policy's stall_term_after_s is 0; not watched"
+        );
+        return;
+    };
+    let (grace, deadline) = (grace(), deadline());
+    let weak = Arc::downgrade(ctx);
+    let state = state.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name(format!("aterm-restart-scoped-{pgrp}"))
+        .spawn(move || {
+            let said = watch_scoped_until(
+                &weak,
+                &state,
+                pgrp,
+                stamp,
+                by,
+                asked,
+                bound,
+                (grace, deadline),
+            );
+            aterm_log::info!("restart: scoped harness pid {pgrp}: {said}");
+        });
+    if let Err(e) = spawned {
+        aterm_log::warn!("restart: scoped harness pid {pgrp}'s watch could not start: {e}");
+    }
+}
+
+/// [`watch_scoped`]'s thread: what it came to, in words.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn watch_scoped_until(
+    ctx: &Weak<SessionCtx>,
+    state: &std::path::Path,
+    pgrp: i32,
+    stamp: Stamp,
+    by: aterm_slog::Actor,
+    asked: Asked,
+    bound: Duration,
+    (grace, deadline): (Duration, Duration),
+) -> String {
+    let until = Instant::now() + bound;
+    let pid = u32::try_from(pgrp).unwrap_or(0);
+    loop {
+        let Some(live) = ctx.upgrade() else {
+            return "its session is gone; nothing sent".to_string();
+        };
+        if let Some(obeyed) = scoped_let_go(&live, pgrp, &stamp.start, asked) {
+            return format!("let go: {}; nothing sent", obeyed.words());
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        drop(live);
+        // A claimant that ends is read at the next look.
+        let _ = aterm_agent::harness::upgrade_wake::wait_exit(pid, left.min(look_again()));
+    }
+    // Past the bound, a person's hold or another driver's hand still comes first: the SIGTERM
+    // waits for it to lift, the harness still let go if it obeys meanwhile.
+    let mut waited = false;
+    let live = loop {
+        let Some(live) = ctx.upgrade() else {
+            return "its session is gone; nothing sent".to_string();
+        };
+        if let Some(obeyed) = scoped_let_go(&live, pgrp, &stamp.start, asked) {
+            return format!("let go: {}; nothing sent", obeyed.words());
+        }
+        if !another_hand(&live, crate::metrics::now_us()) {
+            break live;
+        }
+        if !waited {
+            aterm_log::info!(
+                "restart: scoped harness pid {pgrp}: past {}s, another hand holds its tab; its \
+                 SIGTERM waits",
+                bound.as_secs()
+            );
+            waited = true;
+        }
+        drop(live);
+        let _ = aterm_agent::harness::upgrade_wake::wait_exit(pid, look_again());
+    };
+    let sid = live.self_id.as_str().to_string();
+    let stamp = renew(state, &sid, stamp);
+    let asker = crate::session_log::EndAsker {
+        timeline: &live.timeline,
+        by,
+        from: None,
+    };
+    match term(live.sink.master(), &live.sink, pgrp, &stamp.start, asker) {
+        Signalled::Gone => "it left its tab before the SIGTERM; nothing sent".to_string(),
+        Signalled::Failed => "killpg refused its SIGTERM".to_string(),
+        Signalled::Sent(_) => {
+            let Some(mut watch) = watch(state, pgrp, &stamp) else {
+                return format!(
+                    "ignored restart past {}s: sent SIGTERM; another watch ends it",
+                    bound.as_secs()
+                );
+            };
+            watch.scoped = true;
+            drop(live);
+            format!(
+                "ignored restart past {}s: sent SIGTERM; {}",
+                bound.as_secs(),
+                escalate(ctx, &watch, grace, deadline)
+            )
         }
     }
 }
@@ -1215,6 +1515,9 @@ pub(crate) struct Watch {
     start: String,
     /// Harness state directory holding the tab's stamp, re-read on every look ([`Watch::named`]).
     state: std::path::PathBuf,
+    /// A scoped harness that ignored `restart` ([`watch_scoped`]): the host keeps no snapshot of
+    /// it, so its `SIGKILL` waits for no host read ([`read_by_host`]).
+    scoped: bool,
 }
 
 /// Registers a watch for `pgrp` at `stamp`, or raises the `stands_until` time of an existing watch
@@ -1302,6 +1605,7 @@ impl Watch {
             pid: stamp.pid,
             start: stamp.start.clone(),
             state: state.to_path_buf(),
+            scoped: false,
         }
     }
 
@@ -1405,7 +1709,7 @@ pub(crate) fn another_hand(ctx: &SessionCtx, now_us: u64) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .live_claim(now_us)
         .is_some_and(|claim| {
-            claim.proven.is_none()
+            !claim.is_proven()
                 && !aterm_agent::harness::upgrade_drive::is_host_holder(&claim.holder)
         });
     if claimed || ctx.fabric.hold().is_some() {
@@ -1571,7 +1875,7 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
                 Some(Withheld::Hand)
             } else if watch.lapsed() || !watch.named(&tab) {
                 Some(Withheld::Lapsed)
-            } else if !read_by_host(&tab, pid, start) {
+            } else if !watch.scoped && !read_by_host(&tab, pid, start) {
                 Some(Withheld::Unread)
             } else {
                 None

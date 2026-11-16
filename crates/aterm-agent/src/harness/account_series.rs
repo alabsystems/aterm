@@ -1455,7 +1455,9 @@ pub fn outlook_view(rows: Vec<SeriesRow>, now: i64) -> Vec<SeriesRow> {
 pub enum Began {
     /// A window's first run: empty at `reset − W`.
     Window,
-    /// After a limit reset used inside the window: empty at the epoch.
+    /// After a limit reset used inside the window, or a refill or raised allowance read on the
+    /// run's first row: empty at the epoch when the epoch precedes that row, else at that row
+    /// (the epoch then says only that the change came before it).
     Epoch(i64),
     /// After a refill: at its first row.
     Refill,
@@ -1889,7 +1891,8 @@ pub enum Moved {
     /// The window its figure is of began at this instant (`reset − length`), after the
     /// baseline.
     NewWindow(i64),
-    /// A limit reset was used at this instant, after the baseline: the figure counts from there.
+    /// A limit reset was used, or the window refilled or raised with no session seeing it, at this
+    /// instant, after the baseline: the figure counts from there.
     ResetUsed(i64),
 }
 

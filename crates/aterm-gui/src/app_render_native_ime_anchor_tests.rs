@@ -89,7 +89,7 @@ fn a_presented_native_field_replaces_the_terminal_ime_anchor_at_its_painted_care
         (-1, true),
         (-(f64::from(caret.height) * scale).ceil() as i32 - 2, false),
     ] {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         let card = window.settings_card.as_mut().unwrap();
         let caret_x = frame_x + (f64::from(caret.x) * scale).floor() as i64;
         card.dx = u32::try_from(caret_x.max(20) - caret_x).unwrap();
@@ -97,6 +97,7 @@ fn a_presented_native_field_replaces_the_terminal_ime_anchor_at_its_painted_care
             u32::try_from(i64::from(top) - frame_y - (f64::from(caret.y) * scale).floor() as i64)
                 .unwrap();
         window.last_ime_rect = Some(stale);
+        drop(window);
         assert!(
             app.retained_native_leaf_artifact_from_plan(wid, view, true, &plan)
                 .is_some(),

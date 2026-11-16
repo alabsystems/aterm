@@ -58,42 +58,27 @@ pub fn store_of(exe: &Path) -> Option<(PathBuf, String, u64)> {
 /// store; a clone, copy or lay failed; the twin does not name the clone or the stub is not laid;
 /// `hold` could not be made; the clone could not be run or never printed a version.
 pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, String> {
-    let source = std::fs::canonicalize(source)
-        .map_err(|e| format!("cannot resolve {}: {e}", source.display()))?;
-    let (owner, program, build) = store_of(&source).ok_or_else(|| {
-        format!(
-            "{} is no store build's executable (<prefix>/store/<program>/<build>/bin/<name>)",
-            source.display()
-        )
-    })?;
-    let home = std::fs::canonicalize(home)
-        .map_err(|e| format!("cannot resolve the home {}: {e}", home.display()))?;
-    let layout = atpkg::Layout {
-        prefix: atpkg::store::default_prefix(&home),
-    };
-    if layout.prefix.starts_with(&owner) || owner.starts_with(&layout.prefix) {
-        return Err(format!(
-            "the scratch prefix {} overlaps the owner's {}: never re-laid",
-            layout.prefix.display(),
-            owner.display()
-        ));
-    }
-    if layout.prefix.join("store").exists() {
+    let scratch = Scratch::of(home, source)?;
+    if scratch.layout.prefix.join("store").exists() {
         return Err(format!(
             "{} already holds a store: lay into a new home",
-            layout.prefix.display()
+            scratch.layout.prefix.display()
         ));
     }
-    let from = source
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("the source has no build directory")?;
-    let build_dir = layout.build_dir(&program, build);
+    let Scratch {
+        source,
+        home,
+        layout,
+        program,
+        build,
+        from,
+        build_dir,
+    } = scratch;
     if let Some(hold) = hold {
         std::fs::create_dir_all(hold)
             .map_err(|e| format!("cannot hold {}: {e}", hold.display()))?;
     }
-    clone_tree(from, &build_dir).map_err(|e| {
+    clone_tree(&from, &build_dir).map_err(|e| {
         format!(
             "cannot clone {} into {}: {e}",
             from.display(),
@@ -102,13 +87,13 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
     })?;
     for sidecar in ["ready", "shim-env", "vendor"] {
         let name = |dir: &Path| dir.with_file_name(format!("{build}.{sidecar}"));
-        let (src, dest) = (name(from), name(&build_dir));
+        let (src, dest) = (name(&from), name(&build_dir));
         if src.is_file() {
             crate::util::copy_regular_file(&src, &dest)
                 .map_err(|e| format!("cannot copy {}: {e}", src.display()))?;
         }
     }
-    let exe = build_dir.join(source.strip_prefix(from).map_err(|e| e.to_string())?);
+    let exe = build_dir.join(source.strip_prefix(&from).map_err(|e| e.to_string())?);
     atpkg::activate_build(&layout, &build_dir)
         .map_err(|e| format!("cannot activate {}: {e}", build_dir.display()))?;
     let env = atpkg::shim_env::ShimEnv::from_lines(
@@ -142,15 +127,134 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
     if atpkg::reroute::stub_state(&layout, &program) != atpkg::reroute::StubState::Laid {
         return Err(format!("no reroute stub for {program} was laid"));
     }
+    let version = first_exec(&exe, &home, hold)?;
+    Ok(Laid {
+        twin: layout.agents_dir().join(&program),
+        stub: atpkg::reroute::stub_path(&layout, &program),
+        prefix: layout.prefix,
+        program,
+        build_dir,
+        exe,
+        version,
+    })
+}
+
+/// The scratch HOME `home`'s default prefix and the owner's store build holding `source` that a
+/// clone there copies, as [`lay`] and [`clone_build`] read them.
+struct Scratch {
+    /// `source`, resolved.
+    source: PathBuf,
+    /// `home`, resolved.
+    home: PathBuf,
+    /// The scratch prefix.
+    layout: atpkg::Layout,
+    program: String,
+    build: u64,
+    /// The owner's `store/<program>/<build>`.
+    from: PathBuf,
+    /// The scratch prefix's `store/<program>/<build>`.
+    build_dir: PathBuf,
+}
+
+impl Scratch {
+    /// # Errors
+    /// `source` or `home` does not resolve; `source` is no store build's executable; the scratch
+    /// prefix overlaps the owner's.
+    fn of(home: &Path, source: &Path) -> Result<Scratch, String> {
+        let source = std::fs::canonicalize(source)
+            .map_err(|e| format!("cannot resolve {}: {e}", source.display()))?;
+        let (owner, program, build) = store_of(&source).ok_or_else(|| {
+            format!(
+                "{} is no store build's executable (<prefix>/store/<program>/<build>/bin/<name>)",
+                source.display()
+            )
+        })?;
+        let home = std::fs::canonicalize(home)
+            .map_err(|e| format!("cannot resolve the home {}: {e}", home.display()))?;
+        let layout = atpkg::Layout {
+            prefix: atpkg::store::default_prefix(&home),
+        };
+        if layout.prefix.starts_with(&owner) || owner.starts_with(&layout.prefix) {
+            return Err(format!(
+                "the scratch prefix {} overlaps the owner's {}: never re-laid",
+                layout.prefix.display(),
+                owner.display()
+            ));
+        }
+        let from = source
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("the source has no build directory")?
+            .to_path_buf();
+        let build_dir = layout.build_dir(&program, build);
+        Ok(Scratch {
+            source,
+            home,
+            layout,
+            program,
+            build,
+            from,
+            build_dir,
+        })
+    }
+}
+
+/// Clone the owner's store build holding `source` ([`store_of`]) into the scratch HOME `home`'s
+/// default prefix at the same `store/<program>/<build>` path, beside whatever that store already
+/// holds and not activated, then run the clone once as [`lay`] does (`--version`, with `hold`): a
+/// build of atpkg's store under `home`, which the token wrapper's store-build check
+/// (`token_route::store_build_in`) admits where the owner's own build is outside that store. The
+/// clone's executable.
+/// # Errors
+/// `source` is no store build's executable; the scratch prefix overlaps the owner's or already
+/// holds that build; the clone failed; `hold` could not be made; the clone could not be run or
+/// never printed a version.
+pub fn clone_build(home: &Path, source: &Path, hold: Option<&Path>) -> Result<PathBuf, String> {
+    let scratch = Scratch::of(home, source)?;
+    if scratch.build_dir.exists() {
+        return Err(format!(
+            "{} is already there: clone into a new home",
+            scratch.build_dir.display()
+        ));
+    }
+    if let Some(hold) = hold {
+        std::fs::create_dir_all(hold)
+            .map_err(|e| format!("cannot hold {}: {e}", hold.display()))?;
+    }
+    clone_tree(&scratch.from, &scratch.build_dir).map_err(|e| {
+        format!(
+            "cannot clone {} into {}: {e}",
+            scratch.from.display(),
+            scratch.build_dir.display()
+        )
+    })?;
+    let exe = scratch.build_dir.join(
+        scratch
+            .source
+            .strip_prefix(&scratch.from)
+            .map_err(|e| e.to_string())?,
+    );
+    first_exec(&exe, &scratch.home, hold)?;
+    Ok(exe)
+}
+
+/// Run the clone `exe` once (`--version`, under `home` with a bare environment) so the first
+/// measured launch does not pay macOS's first-exec assessment: `hold`, made before the clone was,
+/// is stamped ([`aterm_uds::deadline::stamp_exec`]) just before the exec and removed once the
+/// clone printed anything; when it printed nothing, or the run could not be started or read,
+/// `hold` stays, as macOS may still be assessing the clone. The first line it printed.
+/// # Errors
+/// `hold` could not be made; the clone could not be run or never printed a version.
+fn first_exec(exe: &Path, home: &Path, hold: Option<&Path>) -> Result<String, String> {
     if let Some(hold) = hold {
         std::fs::create_dir_all(hold)
             .map_err(|e| format!("cannot hold {}: {e}", hold.display()))?;
         aterm_uds::deadline::stamp_exec(hold);
     }
-    let mut cmd = aterm_uds::spawnfd::command(&exe);
+    let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.arg("--version")
         .env_clear()
-        .env("HOME", &home)
+        .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
         .env("DISABLE_AUTOUPDATER", "1")
         .stdin(Stdio::null());
@@ -174,15 +278,7 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(Laid {
-        twin: layout.agents_dir().join(&program),
-        stub: atpkg::reroute::stub_path(&layout, &program),
-        prefix: layout.prefix,
-        program,
-        build_dir,
-        exe,
-        version,
-    })
+    Ok(version)
 }
 
 /// Clone the tree `from` into the new `to`: directories made, regular files

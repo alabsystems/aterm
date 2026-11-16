@@ -12,6 +12,7 @@ fn a_held_descendant_shared_slice_budget_opens_the_tree_gate() {
         accounting: aterm_capacity::Accounting::Holder,
         pid,
         start_ms: 1,
+        laid_at: None,
         seq: 1,
         checkout: String::new(),
         need: aterm_capacity::Need::new(what)
@@ -385,6 +386,7 @@ fn only_an_exact_held_descendant_tippy_claim_opens_the_compiler_barrier() {
         accounting: aterm_capacity::Accounting::Holder,
         pid,
         start_ms: 1,
+        laid_at: None,
         seq: 1,
         checkout: String::new(),
         need: aterm_capacity::Need::new(what)
@@ -601,6 +603,7 @@ fn queued_tree_record() -> aterm_capacity::Record {
         accounting: aterm_capacity::Accounting::Holder,
         pid: 20,
         start_ms: 10,
+        laid_at: None,
         seq: 1,
         checkout: "queued-tree-test".into(),
         need: aterm_capacity::Need::new(shapes[0].label.clone())
@@ -2172,6 +2175,7 @@ fn automatic_prefreeze_follows_between_cuts_and_yields_to_stages_and_windows() {
         accounting: aterm_capacity::Accounting::default(),
         pid,
         start_ms: 1,
+        laid_at: None,
         seq: 1,
         checkout: String::new(),
         need,
@@ -2353,6 +2357,7 @@ fn prefreeze_supervisor_starts_once_per_main_and_states_a_yield() {
         accounting: aterm_capacity::Accounting::default(),
         pid,
         start_ms: 1,
+        laid_at: None,
         seq: 1,
         checkout: String::new(),
         need,

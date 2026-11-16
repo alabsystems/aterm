@@ -47,6 +47,7 @@ use crate::{
     Error, Result,
     alab::{
         registry::{self, ACCOUNT, ADDRESS, MACHINE, PHONE},
+        sighted::{self, Heard},
         view::LabView,
     },
     att::{self, Handle},
@@ -492,10 +493,6 @@ fn shown_row(
     Value::Object(out)
 }
 
-/// How long a sighting keeps an account on a Mac: two of a running tab's hourly `seen`
-/// refreshes (`docs/DESIGN-account-discovery-2026-11-09.md`, "In use on <mac>").
-const SEEN_LIVE_MS: u64 = 2 * 3_600_000;
-
 /// Where and when one account was observed running (`account-obs` and heard `seen` events,
 /// `docs/DESIGN-account-discovery-2026-11-09.md`): each Mac it runs on now by name with its tabs,
 /// and the newest sighting anywhere.
@@ -507,113 +504,39 @@ struct SeenOn {
     last_ms: u64,
 }
 
-/// One journal event a view folds: a tab's `seen`, or the `session-end` that closes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Heard {
-    /// The writer's Commons uuid, 32 hex.
-    uuid: String,
-    account: String,
-    tab: String,
-    /// When, Unix milliseconds.
-    t_ms: u64,
-    /// A `session-end` of that tab, rather than a sighting.
-    ended: bool,
-}
-
 /// The `seen` and tabbed `session-end` events of the journal window this Mac holds at `now_ms`;
 /// none where it holds no Commons or the window cannot be read (the view still shows the rows).
 fn heard(paths: &Paths, now_ms: u64) -> Vec<Heard> {
-    use crate::alab::journal::{Kind, seen};
-    let Ok(Some(window)) = seen::read(paths, None, now_ms / 1_000) else {
-        return Vec::new();
-    };
-    window
-        .events
-        .iter()
-        .filter_map(|logged| {
-            let event = &logged.event;
-            let ended = match event.kind {
-                Kind::Seen => false,
-                Kind::SessionEnd => true,
-                _ => return None,
-            };
-            Some(Heard {
-                uuid: logged.uuid.clone(),
-                account: event.account.as_ref()?.as_str().to_owned(),
-                tab: event.tab.as_ref()?.as_str().to_owned(),
-                t_ms: event.t.saturating_mul(1_000),
-                ended,
-            })
-        })
-        .collect()
+    match crate::alab::journal::seen::read(paths, None, now_ms / 1_000) {
+        Ok(Some(window)) => sighted::heard(&window),
+        _ => Vec::new(),
+    }
 }
 
 /// Every account's [`SeenOn`] at `now_ms` from the `account-obs` rows `obs` and the heard events
-/// `heard`, each Mac named by `name` (from its Commons uuid). A Mac runs an account now where its
-/// row says `running` with a tab and was written within [`SEEN_LIVE_MS`], or where one of its tabs
-/// was seen on it within that span and has not ended since; its tabs are the more of the row's
-/// count and the distinct tabs heard. A row whose key does not end in a uuid, or whose prefix is
-/// not the account it names, is no Mac's word and is skipped, as the collection's writers rule
-/// admits only its signer's own suffix. Every row and sighting dates `last_ms`, however old.
+/// `heard`, both read then, each Mac named by `name` (from its Commons uuid): the one fold of
+/// sightings ([`sighted::fold`], which the fleet tables' accounts relation reads too), with the
+/// Macs a tab runs the account on now by name, two uuids of one name counted once at the more
+/// tabs. Every row and sighting dates `last_ms`, however old; an account no Mac sighted (one a
+/// row only says `signed-out` of) has no entry.
 fn seen_on(
     obs: &crate::typed::owned::OwnedRead,
     heard: &[Heard],
     name: &dyn Fn(&str) -> String,
     now_ms: u64,
 ) -> BTreeMap<String, SeenOn> {
-    let live = |at: u64| now_ms.saturating_sub(at) <= SEEN_LIVE_MS;
-    let mut out: BTreeMap<String, SeenOn> = BTreeMap::new();
-    for (key, row) in &obs.rows {
-        let row = &row.value;
-        let Some(account) = row.get("account").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some((prefix, uuid)) = key.rsplit_once('.') else {
-            continue;
-        };
-        if prefix != account || crate::typed::keys::parse_uuid32(uuid).is_none() {
-            continue;
-        }
-        let at = row.get("at").and_then(Value::as_u64).unwrap_or(0);
-        let running = row.get("state").and_then(Value::as_str) == Some("running");
-        let tabs = row.get("tabs").and_then(Value::as_u64).unwrap_or(0);
-        let seen = out.entry(account.to_owned()).or_default();
-        seen.last_ms = seen.last_ms.max(at);
-        if running && tabs > 0 && live(at) {
-            let mac = seen.macs.entry(name(uuid)).or_default();
-            *mac = (*mac).max(tabs);
-        }
-    }
-    // Each (account, Mac, tab)'s newest word: a sighting, or its session's end.
-    let mut tabs: BTreeMap<(&str, &str, &str), (u64, bool)> = BTreeMap::new();
-    for event in heard {
-        let newest = tabs
-            .entry((&event.account, &event.uuid, &event.tab))
-            .or_insert((event.t_ms, event.ended));
-        if event.t_ms >= newest.0 {
-            *newest = (event.t_ms, event.ended);
-        }
-        if !event.ended {
-            let seen = out.entry(event.account.clone()).or_default();
-            seen.last_ms = seen.last_ms.max(event.t_ms);
-        }
-    }
-    let mut running: BTreeMap<(&str, &str), u64> = BTreeMap::new();
-    for ((account, uuid, _), (at, ended)) in tabs {
-        if !ended && live(at) {
-            *running.entry((account, uuid)).or_default() += 1;
-        }
-    }
-    for ((account, uuid), n) in running {
-        let mac = out
-            .entry(account.to_owned())
-            .or_default()
-            .macs
-            .entry(name(uuid))
-            .or_default();
-        *mac = (*mac).max(n);
-    }
-    out
+    sighted::fold(&sighted::obs_rows(obs), heard, now_ms, now_ms)
+        .into_iter()
+        .filter_map(|(account, sighted)| {
+            let (last_ms, _) = sighted.last()?;
+            let mut macs: BTreeMap<String, u64> = BTreeMap::new();
+            for (uuid, on) in sighted.macs.iter().filter(|(_, on)| on.tabs > 0) {
+                let mac = macs.entry(name(uuid)).or_default();
+                *mac = (*mac).max(on.tabs);
+            }
+            Some((account, SeenOn { macs, last_ms }))
+        })
+        .collect()
 }
 
 /// An age as the view says it: `12 s`, `4 min`, `3 h`, `2 d`.
@@ -1035,6 +958,44 @@ fn set(
         let one_value = held
             .and_then(|r| r.fields.get(column))
             .is_some_and(|f| f.candidates().len() == 1);
+        // A set is written member by member: each one the text names that the set lacks is
+        // added, and each one it holds that the text leaves out is removed, so another
+        // writer's concurrent member stands.
+        if matches!(schema.ty, Ty::Set(_)) {
+            let after = grid::read_set(&text).ok_or_else(|| {
+                Error::new(&format!(
+                    "{}.{column}: a set is `a, b` or a JSON list of texts",
+                    collection.name
+                ))
+            })?;
+            let before: BTreeSet<String> =
+                cell::members(schema, held.and_then(|r| r.fields.get(column)))
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+            let mut changes = Vec::new();
+            for (members, present) in [
+                (after.difference(&before), true),
+                (before.difference(&after), false),
+            ] {
+                for member in members {
+                    changes.push(cell::member_change(
+                        collection,
+                        &pk,
+                        column,
+                        member,
+                        present,
+                        |x| CellValue::owner(collection.version, x),
+                    )?);
+                }
+            }
+            let records = if changes.is_empty() {
+                Vec::new()
+            } else {
+                vec![changes]
+            };
+            return Ok(((pk, BTreeSet::new()), records));
+        }
         // A number's last four digits, which its row keeps beside it.
         let mut last4 = None;
         // The value to write; `None` where the cell already holds the number given.

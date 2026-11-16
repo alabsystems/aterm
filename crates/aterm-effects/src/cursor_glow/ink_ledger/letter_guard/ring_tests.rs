@@ -599,3 +599,66 @@ fn a_stroke_reads_against_its_ring_s_channel_medians() {
         "fixture: the ring's medians read brighter than either light ({read} against {alone})"
     );
 }
+
+/// A BAR CARET'S LINE IS NO GROUND OF THE LETTER BESIDE IT ([`RingCell::read_lined`]): a dark
+/// stem on paper standing right of a bar caret's two columns, a grey light over the pixels right
+/// of it, reads against that light alone, as the judge reads it by the clean frame that draws the
+/// bar, and as [`judged`] reads it with the bar's columns no ground. NEGATIVE CONTROL (no line,
+/// as [`RingCell::read`]): the bar's columns, unlit in the guard's frame, read as the page's
+/// ground, and each stem pixel's ring median takes the page's channels over the light's, which
+/// reads the stem at the page (the meteor's red in the `e` under glass dark jump's bar was left
+/// at 3.72).
+#[test]
+fn a_bar_caret_s_line_is_no_ground_of_the_letter_beside_it() {
+    let (cw, ch, r) = (6usize, 10usize, 2usize);
+    let (w, h) = (cw + 2 * r, ch + 2 * r);
+    let mut stem = vec![0u8; cw * ch];
+    for y in 2..8 {
+        stem[y * cw + 2] = 255;
+    }
+    let table: RasterTable = vec![GlyphRaster::placed(&stem, cw, (0, 0))].into();
+    let (paper, ink, grey) = (0x00F6_F7F9, 0x002B_2D33, 0x0050_5060);
+    let mut cells = [Neighbour::Known {
+        ground: paper,
+        base: paper,
+        glyph: None,
+    }; 9];
+    cells[4] = Neighbour::Known {
+        ground: paper,
+        base: paper,
+        glyph: Some((0, ink)),
+    };
+    // The bar: the cell's two left columns, every row; the light: the three columns right of
+    // the stem.
+    let line = [r as u16, r as u16, r as u16 + 2, (r + ch) as u16];
+    let mut frame = vec![paper; w * h];
+    let mut ground = vec![true; w * h];
+    for y in r..r + ch {
+        for x in r..r + 2 {
+            ground[y * w + x] = false;
+        }
+        for x in r + 3..r + 6 {
+            frame[y * w + x] = grey;
+        }
+    }
+    let solid: Vec<usize> = (2..8).map(|y| (r + y) * w + r + 2).collect();
+    for &k in &solid {
+        frame[k] = ink;
+        ground[k] = false;
+    }
+    let read = |line: Option<[u16; 4]>| {
+        let mut cell = RingCell::EMPTY;
+        cell.read_lined((w, h), (cw, ch), r, (&cells, line), (&table, false));
+        cell.reading(&Px(&frame))
+    };
+    let (lined, whole) = (read(Some(line)), read(None));
+    assert_eq!(
+        lined.to_bits(),
+        judged(&frame, w, &solid, &ground).to_bits(),
+        "the stem reads against the light beside it, as the judge reads it"
+    );
+    assert!(
+        whole > lined,
+        "control: the bar's columns read as ground lift the stem's reading: {whole} against {lined}"
+    );
+}

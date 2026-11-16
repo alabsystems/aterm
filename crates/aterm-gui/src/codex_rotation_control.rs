@@ -91,7 +91,8 @@ fn index(job: &Preparation) -> Option<renewal::IndexKey> {
     renewal::IndexKey::moved(&job.intent, job.process.pid, job.process.birth, &job.start).ok()
 }
 
-/// The live reader against the isolated HTTPS usage server a Rust fixture pins the roots of.
+/// The live reader against the isolated loopback provider a Rust fixture pins the roots of: its
+/// HTTPS usage server, and the token endpoint of a login whose issuer it serves too.
 #[cfg(debug_assertions)]
 pub(super) struct FixtureUsage<'a> {
     live: pool::LiveUsage<'a>,
@@ -198,7 +199,7 @@ fn observe(
         return pool::prepare(
             &seat,
             &session,
-            &job.intent.identity,
+            &job.intent,
             &FixtureUsage { live, roots },
             Duration::from_millis(OBSERVATION_MS),
         );
@@ -208,7 +209,7 @@ fn observe(
     pool::prepare(
         &seat,
         &session,
-        &job.intent.identity,
+        &job.intent,
         &live,
         Duration::from_millis(OBSERVATION_MS),
     )
@@ -504,6 +505,85 @@ pub(super) fn commit_pool(
     selected.proposal.commit(receipt, env.now)
 }
 
+/// `codex-rotation complete id=<id> turn=<turn>`: the report, from the bound successor of the
+/// consumed usage-wall receipt `id`, that its resumed turn `turn` (the walled turn's own id, which
+/// the resumed turn reuses) was served on the destination. The host proves that destination for
+/// the pool ([`renewal::record_completed_rotation`]), so each session walled behind its canary
+/// moves onto it at its next ask, where it would otherwise wait out the canary's hold
+/// (`accounts::CANARY_HOLD_S`), which stays the ceiling for a canary that never reports.
+///
+/// The report states a fact of the pool and grants this process nothing: no fabric hold, newer
+/// input of a person or other host epoch refuses it, as none refuses a consumed receipt's terminal
+/// observation (`status`). The shared lane has already judged it as it judges each of its verbs
+/// (`serve_claimed`): a proven claim whose record and resume line read, and a receipt on record
+/// under `id` of a pool move's purpose, not a lost login's (`wrong recovery purpose`, before any
+/// check here). It is then taken only as consume's lane left it, checked in this order: quota
+/// rotation on here (`denied`); a receipt on record (`unknown receipt`) that this
+/// interactive lane issued, not an exec handoff's ([`interactive`], `wrong recovery purpose`);
+/// this session's (`wrong session`); consumed by this very turn, the walled one (`receipt
+/// changed`); and the claimed process its bound successor, by pid and birth, with the
+/// destination's login file as its `CODEX_AUTH_PATH` and the receipt's thread as the conversation
+/// it resumed (`wrong process`). The source process never ran on the destination and cannot
+/// report it. A busy receipt writer, sign-in turn or auth lock answers `state=waiting`; any other
+/// refusal of the pool's records (the selection, policy or pin changed, the destination no longer
+/// runs, or a login, the source's included, names another identity or is held since the wall)
+/// answers `selection changed`. A refused report records nothing.
+pub(super) fn complete(
+    ctx: &crate::SessionCtx,
+    env: &Env,
+    proof: &crate::self_claim::Proven,
+    copy: &self_claimed::Copy,
+    id: &str,
+    turn: &str,
+) -> String {
+    if !ctx.native_policy.quota_rotation_enabled() {
+        return "ERR codex-rotation denied\n".into();
+    }
+    let Some(receipt) = renewal::read_receipt(env, id) else {
+        return "ERR codex-rotation unknown receipt\n".into();
+    };
+    if !interactive(&receipt) {
+        return "ERR codex-rotation wrong recovery purpose\n".into();
+    }
+    if receipt.sid != ctx.self_id.as_str() {
+        return "ERR codex-rotation wrong session\n".into();
+    }
+    if receipt.phase != Phase::Consumed
+        || receipt.accepted_turn.as_deref() != Some(turn)
+        || turn != receipt.intent.wall
+    {
+        return "ERR codex-rotation receipt changed\n".into();
+    }
+    let Ok(resume) = &copy.resume else {
+        return WAITING.into();
+    };
+    let successor = Process::observe(proof.pid).is_some_and(|process| {
+        Some(process.pid) == receipt.successor_pid && Some(process.birth) == receipt.successor_birth
+    });
+    if !successor
+        || resume.codex_auth_path.as_deref().map(Path::new) != Some(receipt.new_auth.as_path())
+        || resume.session != receipt.intent.thread
+    {
+        return "ERR codex-rotation wrong process\n".into();
+    }
+    match renewal::record_completed_rotation(env, &receipt) {
+        Ok(()) => receipt.completed_reply(),
+        Err(renewal::Unrecorded::Busy) => WAITING.into(),
+        Err(renewal::Unrecorded::Refused(_)) => "ERR codex-rotation selection changed\n".into(),
+    }
+}
+
+/// Whether `receipt` is this interactive lane's: its sealed recipe is the native restart its
+/// commit runs. An exec handoff's receipt shares the store and the purpose, but binds an exec
+/// operation's data, and that operation reports its own completion (`codex-exec-handoff
+/// complete`) under its own gates.
+fn interactive(receipt: &Receipt) -> bool {
+    matches!(
+        aterm_agent::harness::native_act::Request::parse(&receipt.native_prepare),
+        Some(aterm_agent::harness::native_act::Request::Prepare(_))
+    )
+}
+
 pub(super) fn retire_stale_ready(
     ctx: &crate::SessionCtx,
     env: &Env,
@@ -591,7 +671,7 @@ pub(in crate::native_act) fn observe_exec(
         return source.prepare(
             &seat,
             sid,
-            &intent.identity,
+            intent,
             &FixtureUsage { live, roots },
             Duration::from_millis(OBSERVATION_MS),
         );
@@ -601,7 +681,7 @@ pub(in crate::native_act) fn observe_exec(
     source.prepare(
         &seat,
         sid,
-        &intent.identity,
+        intent,
         &live,
         Duration::from_millis(OBSERVATION_MS),
     )

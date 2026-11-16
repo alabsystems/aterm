@@ -407,9 +407,10 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
         .collect()
 }
 
-/// The replay pool, where the library builds it (a release bench that mounts
-/// this module builds none).
-#[cfg(debug_assertions)]
+/// The replay pool: the library's unit-test pool, mounted here by path because the library
+/// builds it only for its own unit tests (`#[cfg(test)]`).
+#[allow(dead_code)]
+#[path = "../../src/test_pool.rs"]
+mod test_pool;
 #[allow(unused_imports)]
-#[cfg(debug_assertions)]
-pub use aterm_effects::test_pool::par_map;
+pub use test_pool::par_map;

@@ -670,11 +670,9 @@ impl History {
             no_authority: self.no_authority,
             ..Self::new(self.root)
         };
-        for prior in self
-            .index
-            .inventory()
-            .filter(|prior| *prior != id && self.index.observes(id, prior))
-        {
+        // One walk of `id`'s past, not one per retained record: the ancestors are exactly the
+        // records `observes(id, _)` holds for, other than `id` itself.
+        for prior in &self.index.ancestors(id) {
             if let Some((opened, command)) = self.records.get(prior) {
                 past.index.insert(opened.header.clone()).map_err(|_| {
                     Error::new("causal header refused or history capacity exhausted")
@@ -912,7 +910,7 @@ impl History {
                                         cut.is_some_and(|tip| {
                                             self.index.get(&tip).is_some_and(|head| {
                                                 head.actor == opened.header.actor
-                                            }) && self.index.observes(&tip, id)
+                                            }) && evidence.observes(&self.index, &tip, id)
                                         })
                                     })
                                 }));
@@ -1002,7 +1000,7 @@ impl History {
                     let reverting = matches!(command, Command::Revert { .. });
                     if let Command::Revert { operation, .. } = command
                         && (id == operation
-                            || !self.index.observes(id, operation)
+                            || !evidence.observes(&self.index, id, operation)
                             || !eligible.contains(operation)
                             || view.invalid.contains(operation)
                             || !self.command(operation).is_some_and(|(_, c)| match c {
@@ -1033,7 +1031,13 @@ impl History {
                             }
                         }
                     }
-                    crate::documents::apply(&self.index, &mut view.cells, *id, changes, reverting);
+                    crate::documents::apply(
+                        &|later, earlier| evidence.observes(&self.index, later, earlier),
+                        &mut view.cells,
+                        *id,
+                        changes,
+                        reverting,
+                    );
                 }
                 Command::Merge { .. } | Command::Budget { .. } => {}
                 Command::Spend {
@@ -1048,7 +1052,7 @@ impl History {
                     }
                     let limit = match self.records.get(grant) {
                         Some((_, Command::Budget { name, shares, .. }))
-                            if self.index.observes(id, grant)
+                            if evidence.observes(&self.index, id, grant)
                                 && evidence_ordered.contains(grant)
                                 && view.budgets.get(name).is_some_and(|g| g.len() == 1) =>
                         {

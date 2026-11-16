@@ -66,6 +66,14 @@ pub fn snapshot_until(paths: &Paths, until: std::time::Instant) -> Value {
     let mut value = metadata(paths);
     if let Some(object) = value.as_object_mut() {
         object.insert("services".into(), services_until(paths, until));
+        // How full the membership log this Mac holds is (`client::LogFill::json`): `null`
+        // where it holds none. Read here, not in `metadata`, whose callers ask for no log.
+        object.insert(
+            "log".into(),
+            observed(client::log_fill(paths), |fill| {
+                fill.map_or(Value::Null, |fill| fill.json())
+            }),
+        );
     }
     value
 }

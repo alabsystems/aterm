@@ -10,6 +10,8 @@ use super::accounts_pool::{self, Seat, Session, SessionPlan};
 use super::cli::Env;
 use super::codex_app_login::{self, IdentifiedRead, IdentifiedUsage};
 use super::codex_renewal::{self as renewal, Identity, Receipt, ReceiptWriter, Successor};
+use super::codex_rotation_pace::OwnRead;
+pub use super::codex_rotation_pace::ReadPace;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -196,6 +198,7 @@ pub fn with_selected_writer<T>(
         receipt,
         SelectionScope::Pool,
         SelectionPhase::Forward,
+        Takes::Waiting,
         use_selected,
     )
 }
@@ -213,6 +216,7 @@ pub fn with_session_selected_writer<T>(
         receipt,
         SelectionScope::Session,
         SelectionPhase::Forward,
+        Takes::Waiting,
         use_selected,
     )
 }
@@ -285,9 +289,37 @@ pub(super) fn publish_selected_committing_using(
 
 /// Validate data for a Ready receipt before the pool move has been committed.
 /// This is not execution authority; native admission uses `with_selected_writer`.
+///
+/// The machine's sign-in turn and `accounts.lock` are each taken on the store's ladder;
+/// [`with_prepared_writer_now`] tries each once instead.
 pub fn with_prepared_writer<T>(
     env: &Env,
     receipt: &Receipt,
+    use_prepared: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    prepared_writer(env, receipt, Takes::Waiting, use_prepared)
+}
+
+/// [`with_prepared_writer`] with the machine's sign-in turn and `accounts.lock` each tried once,
+/// never waited for: a turn another sign-in holds answers `signin-busy` at once, and a lock another
+/// writer holds `Ok(None)`. Its callers are an exec handoff's `arm` and `reserve`: they ask it
+/// while they hold their session's own locks, which the window's thread takes too, and their
+/// session asks again shortly. Every other caller of a prepared selection's writer (a TUI
+/// session's quota handoff, as it publishes and as it commits, and its lost-login move, as it
+/// publishes) waits ([`with_prepared_writer`]).
+pub fn with_prepared_writer_now<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_prepared: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    prepared_writer(env, receipt, Takes::Once, use_prepared)
+}
+
+/// The writer of a Ready receipt's selection, taking its two locks as `takes` says.
+fn prepared_writer<T>(
+    env: &Env,
+    receipt: &Receipt,
+    takes: Takes,
     use_prepared: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
 ) -> Result<Option<T>, &'static str> {
     if receipt.phase != renewal::Phase::Ready
@@ -297,12 +329,20 @@ pub fn with_prepared_writer<T>(
         return Err("not-ready");
     }
     let scope = SelectionScope::of(receipt.intent.purpose)?;
-    with_selection_writer(env, receipt, scope, SelectionPhase::Prepared, use_prepared)
+    with_selection_writer(
+        env,
+        receipt,
+        scope,
+        SelectionPhase::Prepared,
+        takes,
+        use_prepared,
+    )
 }
 
 /// Validate a consumed receipt after its pool deduplication record was retired.
 /// This validates metadata only. The native caller must separately prove that
-/// the same admitted process completed its original turn successfully.
+/// the same admitted process completed its original turn successfully. The
+/// destination must still run, a row read low since included ([`target_stands`]).
 pub fn with_completed_writer<T>(
     env: &Env,
     receipt: &Receipt,
@@ -319,6 +359,7 @@ pub fn with_completed_writer<T>(
         receipt,
         SelectionScope::Pool,
         SelectionPhase::Completed,
+        Takes::Waiting,
         use_completed,
     )
 }
@@ -342,6 +383,7 @@ pub fn with_consumed_member_writer<T>(
         receipt,
         SelectionScope::Pool,
         SelectionPhase::Member,
+        Takes::Waiting,
         use_member,
     )
 }
@@ -367,8 +409,21 @@ pub fn with_rollback_writer<T>(
         receipt,
         scope,
         SelectionPhase::Rollback,
+        Takes::Waiting,
         |_, writer| restore_source(writer),
     )
+}
+
+/// How a selection's writer takes the machine's sign-in turn and `accounts.lock`, the two locks
+/// it judges under.
+#[derive(Clone, Copy)]
+enum Takes {
+    /// Each on its store's ladder ([`accounts::Store::signin_within`],
+    /// [`accounts::Store::acquire_bounded`]).
+    Waiting,
+    /// Each tried once, never waited for: a caller that holds locks of its own while it asks, and
+    /// asks again shortly, waits for neither under them.
+    Once,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -413,6 +468,7 @@ fn with_selection_writer<T>(
     receipt: &Receipt,
     scope: SelectionScope,
     phase: SelectionPhase,
+    takes: Takes,
     use_selected: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
 ) -> Result<Option<T>, &'static str> {
     if SelectionScope::of(receipt.intent.purpose)? != scope {
@@ -429,11 +485,15 @@ fn with_selection_writer<T>(
     let store = env
         .accounts_store_for(Cli::Codex)
         .ok_or("store-unavailable")?;
+    let store = match takes {
+        Takes::Waiting => store,
+        Takes::Once => store.bounded_by(&[]),
+    };
     let _signin = store
         .signin_within()
-        .map_err(|_| "signin-lock")?
-        .ok_or("signin-busy")?;
-    renewal::with_receipt_writer(env, |writer| {
+        .map_err(|_| renewal::SIGNIN_LOCK)?
+        .ok_or(renewal::SIGNIN_BUSY)?;
+    renewal::with_receipt_writer_of(env, &store, |writer| {
         if phase == SelectionPhase::Rollback
             && renewal::read_receipt(env, &receipt.id).as_ref() != Some(receipt)
         {
@@ -505,8 +565,13 @@ fn with_selection_writer<T>(
             && !matches!(phase, SelectionPhase::Prepared | SelectionPhase::Member)
             && state.active.as_deref() != Some(target.label.as_str()))
             || state.pinned
-            || (phase != SelectionPhase::Rollback
-                && !super::accounts_pool::native_target_admitted(target, &state, env.now))
+            || !target_stands(
+                phase,
+                target,
+                &state,
+                receipt.intent.limit.as_deref(),
+                env.now,
+            )
         {
             return Err("target-unavailable");
         }
@@ -559,6 +624,39 @@ fn with_selection_writer<T>(
     })
 }
 
+/// Whether a move's destination `target` is still one its writer takes in `phase`. A phase that
+/// selects or launches onto it (Prepared, Forward) or admits another member of a tree already on
+/// it (Member) takes only a fresh row, usable or unseen ([`accounts::Condition::fresh`]).
+/// A completion proves a row its successor was served on: one that still runs, a row read low
+/// since included ([`accounts::Condition::runs`]), never one walled or signed out since. A proven
+/// low row is then routed by the low rule, as any proven active row is: walled sessions leave it
+/// for a fresh row, or wait where there is none. A rollback restores the source and asks nothing
+/// of the destination. A move asked about another limit (`limit`) takes, in those first phases,
+/// no row that limit holds on the records ([`super::accounts_pool::limit_holds`]).
+fn target_stands(
+    phase: SelectionPhase,
+    target: &Row,
+    state: &accounts::State,
+    limit: Option<&str>,
+    now: i64,
+) -> bool {
+    match phase {
+        SelectionPhase::Prepared | SelectionPhase::Forward | SelectionPhase::Member => {
+            super::accounts_pool::native_target_admitted(target, state, now)
+                && limit.is_none_or(|id| {
+                    !super::accounts_pool::limit_holds(
+                        &target.label,
+                        state,
+                        &accounts::limit_wall(id),
+                        now,
+                    )
+                })
+        }
+        SelectionPhase::Completed => accounts::condition(target, state, true, now).runs(),
+        SelectionPhase::Rollback => true,
+    }
+}
+
 pub(super) fn row_auth(seat: &Seat<'_>, row: &Row) -> PathBuf {
     row.dir
         .as_ref()
@@ -579,42 +677,148 @@ pub fn wall_asked(at: i64) -> Point {
 }
 
 /// The limit a fresh read of the session's login shows it walled at, where a handoff moves it off
-/// that login: the week's ([`accounts::WEEK_LIMIT`]) where the week is spent and the read names
-/// its wall; else the five-hour window's ([`accounts::SESSION_LIMIT`]) where that is spent, the
-/// read names its wall and a reset more than [`accounts::RESET_SOON_S`] away. Nearer than that,
-/// waiting out the reset costs less than a relaunch on another login, so the session stays, as it
-/// does where neither limit is reached (`None`). It stays too where the read names no reset: a
-/// wall with none stands by rungs up to six hours ([`accounts::NO_RESET_WALL_S`]), longer than
-/// the window itself, so a session with no row to move to would be held past the reset it could
-/// have waited out. The week is judged first,
-/// as it was when only the week's wall moved a session: where both limits stand, the handoff
-/// leaves and records the week's.
-fn walled_window(usage: &IdentifiedUsage, now: i64) -> Option<&'static str> {
-    let sample = &usage.usage.sample;
-    let wall = |window: &str| {
-        usage
-            .usage
-            .walls
-            .iter()
-            .find(|(name, _)| *name == window)
-            .map(|(_, reset)| *reset)
+/// that login, and the window the plan records that wall under. A window is spent where the read's
+/// sample shows it at 100% (its share taken up to the next whole percent, as
+/// [`accounts::Sample::reached_reset`] reads it). In order:
+///
+/// 1. a spent week leaves as the week's wall ([`accounts::WEEK_LIMIT`]), as it did when only the
+///    week's wall moved a session, so where both limits stand the handoff records the week's;
+/// 2. a spend control or a workspace's refusal ([`codex_app_login::Refusal::outlasts_windows`])
+///    leaves under the fallback window ([`codex_app_login::Usage::fallback_window`]), even beside
+///    a five-hour window about to reset: no window's reset ends it;
+/// 3. a spent five-hour window leaves as its own wall ([`accounts::SESSION_LIMIT`]) only where the
+///    sample names its reset more than [`accounts::RESET_SOON_S`] away. Nearer than that, waiting
+///    out the reset costs less than a relaunch on another login, so the session stays (`None`),
+///    and an ordinary refusal that window explains stays with it. It stays too where the read names
+///    no reset: a wall with none stands by rungs up to six hours ([`accounts::NO_RESET_WALL_S`]),
+///    longer than the window itself, so a session with no row to move to would be held past the
+///    reset it could have waited out;
+/// 4. an ordinary refusal no spent window explains (a credit-only plan out of credits, or one the
+///    windows do not show) leaves under the fallback window.
+///
+/// Where nothing is spent or refused, the session stays. A wall under the fallback window is
+/// recorded with that window's reset only where the window is spent, so one below 100% stands by
+/// rungs, not to that window's turnover.
+///
+/// A handoff asked about a limit other than the codex bucket (`limit`, a model's own) judges that
+/// limit's entry in the read alone ([`codex_app_login::Usage::limits`]), by the same four rules
+/// over its windows of every length: a spent week-long window is rule 1's, and a spent window of
+/// any other length (five hours, a day, any other or none named) rule 3's, leaving only where the
+/// latest reset such a window names is more than [`accounts::RESET_SOON_S`] away. Each rule's wall
+/// is recorded under that limit's own name ([`accounts::limit_wall`]). A read that lists no entry
+/// for it answers so ([`Walled::Absent`]), distinctly from an entry that shows no wall
+/// ([`Walled::No`]): the session stays either way, and its log says which.
+pub(super) fn walled_window(usage: &IdentifiedUsage, limit: Option<&str>, now: i64) -> Walled {
+    use crate::ai::codex_limits::Bucket;
+    let usage = &usage.usage;
+    let Some(id) = limit else {
+        let sample = &usage.sample;
+        let spent = |used: Option<u32>| used.is_some_and(|used| used >= 100);
+        let standing = Standing {
+            week: spent(sample.week_pct),
+            refusal: usage.refusal,
+            shorter: spent(sample.session_pct).then_some(sample.session_reset),
+        };
+        return match standing.leaves(now) {
+            Some(Leaves::Week) => Walled::At(accounts::WEEK_LIMIT.to_owned()),
+            Some(Leaves::Refusal) => Walled::At(usage.fallback_window().to_owned()),
+            Some(Leaves::Shorter) => Walled::At(accounts::SESSION_LIMIT.to_owned()),
+            None => Walled::No,
+        };
     };
-    if sample.week_pct.is_some_and(|used| used >= 100) && wall(accounts::WEEK_LIMIT).is_some() {
-        return Some(accounts::WEEK_LIMIT);
+    let Some(entry) = usage.limits.get(id) else {
+        return Walled::Absent;
+    };
+    let shorter: Vec<_> = entry
+        .walls()
+        .filter(|(bucket, _)| *bucket != Bucket::Week)
+        .map(|(_, reset)| reset)
+        .collect();
+    let standing = Standing {
+        week: entry.walls().any(|(bucket, _)| bucket == Bucket::Week),
+        refusal: entry.refusal,
+        shorter: (!shorter.is_empty()).then(|| shorter.into_iter().flatten().max()),
+    };
+    match standing.leaves(now) {
+        Some(_) => Walled::At(accounts::limit_wall(id)),
+        None => Walled::No,
     }
-    let reset = wall(accounts::SESSION_LIMIT)?;
-    (sample.session_pct.is_some_and(|used| used >= 100)
-        && reset.is_some_and(|reset| reset.saturating_sub(now) > accounts::RESET_SOON_S))
-    .then_some(accounts::SESSION_LIMIT)
+}
+
+/// What a fresh read of the session's login says of the wall a handoff was asked to leave
+/// ([`walled_window`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Walled {
+    /// It stands, and a handoff leaves it: the window the plan records it under.
+    At(String),
+    /// No wall a handoff leaves: the session stays (`not-walled`).
+    No,
+    /// The read lists no entry for the limit asked about, so nothing shows that limit standing:
+    /// the session stays, and says why (`limit-absent`, [`NoHandoff::LimitAbsent`]).
+    Absent,
+}
+
+/// One bucket's read as [`walled_window`]'s four rules take it: the codex bucket's, or another
+/// limit's entry.
+struct Standing {
+    /// A week-long window of it is spent.
+    week: bool,
+    /// What refuses its use, where something does.
+    refusal: Option<codex_app_login::Refusal>,
+    /// Where a window of it of another length is spent: the latest reset such a window names, or
+    /// `None` where none names one.
+    shorter: Option<Option<i64>>,
+}
+
+/// Which of [`walled_window`]'s rules leaves a wall ([`Standing::leaves`]).
+enum Leaves {
+    /// Rule 1: a spent week.
+    Week,
+    /// Rule 2 or 4: a refusal no reset ends, or one no spent window explains.
+    Refusal,
+    /// Rule 3: a spent window of another length, whose reset is not near.
+    Shorter,
+}
+
+impl Standing {
+    fn leaves(&self, now: i64) -> Option<Leaves> {
+        if self.week {
+            return Some(Leaves::Week);
+        }
+        if self
+            .refusal
+            .is_some_and(codex_app_login::Refusal::outlasts_windows)
+        {
+            return Some(Leaves::Refusal);
+        }
+        if let Some(reset) = self.shorter {
+            return reset
+                .is_some_and(|reset| reset.saturating_sub(now) > accounts::RESET_SOON_S)
+                .then_some(Leaves::Shorter);
+        }
+        self.refusal.map(|_| Leaves::Refusal)
+    }
 }
 
 /// Whether a fresh read lets a session move to its row, by the rule its writer holds a sample on
 /// record to ([`accounts::Sample::low`]), so a read it just made selects no row it would refuse.
-pub(super) fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
+/// A read that refuses ordinary use, by any [`codex_app_login::Refusal`], has a wall
+/// ([`codex_app_login::Usage::walls`]), so its row is passed over. A handoff asked about another
+/// limit (`limit`) takes, besides, only a read that lists that limit with room
+/// ([`codex_app_login::LimitUsage::room`]): a figure for at least one of its windows, none of them
+/// spent or low, whatever its length, and nothing refusing it.
+pub(super) fn usable(usage: &IdentifiedUsage, limit: Option<&str>, now: i64) -> bool {
     usage.usage.sample.week_pct.is_some_and(|used| used < 100)
         && usage.usage.sample.session_pct.is_none_or(|used| used < 100)
         && usage.usage.walls.is_empty()
         && !usage.usage.sample.low(now)
+        && limit.is_none_or(|id| {
+            usage
+                .usage
+                .limits
+                .get(id)
+                .is_some_and(|entry| entry.room(now))
+        })
 }
 
 /// Whether `why`, what [`prepare`] refused a session for, ends its asking, and as which kind
@@ -631,6 +835,7 @@ pub(super) fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
 pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
     match why {
         "not-walled" => Some(NoHandoff::NoWallToLeave),
+        LIMIT_ABSENT => Some(NoHandoff::LimitAbsent),
         "source-unbound" | "source-missing" | "source-unmanaged" => Some(NoHandoff::NoRowOfThePool),
         SOURCE_NAMES_ANOTHER => Some(NoHandoff::LoginNamesAnother),
         _ => None,
@@ -640,17 +845,28 @@ pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
 /// [`prepare`]'s refusal of a session whose row's login names another account than the row's.
 const SOURCE_NAMES_ANOTHER: &str = "source-names-another";
 
+/// [`prepare`]'s refusal of a session asked about a limit its login's fresh read lists no entry
+/// for ([`Walled::Absent`]).
+const LIMIT_ABSENT: &str = "limit-absent";
+
 /// Why no handoff is coming to a session that asked for one: what ends its asking, for its
 /// control's job or, for [`Self::NoWallToLeave`], until its control reads the login again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoHandoff {
     /// A fresh read of the session's login shows no limit a handoff leaves: its week is not
-    /// spent, and its five-hour window is not spent, resets within [`accounts::RESET_SOON_S`] or
-    /// names no reset. It is a reading at one time, of one wall: a session that asks again under
+    /// spent, its five-hour window is not spent, resets within [`accounts::RESET_SOON_S`] or
+    /// names no reset, and the read refuses no ordinary use but by that window (no spend control,
+    /// no workspace's refusal, and no ordinary refusal with no spent window). It is a reading at
+    /// one time, of one wall: a session that asks again under
     /// the same request at a later wall (a headless exec run, one root turn) is read again once
     /// that reset and its grace ([`accounts::RESET_GRACE_S`]) have passed, and by longer rungs
-    /// while it keeps reading so ([`accounts::NO_RESET_WALL_S`]).
+    /// while it keeps reading so ([`accounts::NO_RESET_WALL_S`]). Asked about another limit, the
+    /// same of that limit's entry ([`walled_window`]).
     NoWallToLeave,
+    /// The session asked about a limit other than the codex bucket (`limit=`), and a fresh read of
+    /// its login lists no entry for it: nothing shows that limit standing, so no handoff is made
+    /// off it. A reading at one time, as [`Self::NoWallToLeave`] is, and read again as it is.
+    LimitAbsent,
     /// The session's login is no row the pool hands off.
     NoRowOfThePool,
     /// The session's row's login names another account, which only a sign-in or a sync ends.
@@ -664,7 +880,11 @@ impl NoHandoff {
         match self {
             Self::NoWallToLeave => {
                 "its login stands at no weekly limit, and at no five-hour limit more than 15 \
-                 minutes from its reset"
+                 minutes from its reset, and its read refuses no other ordinary use"
+            }
+            Self::LimitAbsent => {
+                "its login's read lists no entry for the limit it asked about, so nothing shows \
+                 that limit standing"
             }
             Self::NoRowOfThePool => "its login is no row the pool hands off",
             Self::LoginNamesAnother => "its row's login names another account",
@@ -672,24 +892,103 @@ impl NoHandoff {
     }
 }
 
+/// Whether a handoff selected now could be published at all: `aterm.toml` beside the rosters
+/// lets one run ([`policy_allows_handoff`]) and the machine's sign-in turn is free, the two its
+/// writer refuses on before it looks at the selection (`with_selection_writer`). Read before a
+/// pass, so that none presents a login's token for a selection nothing could publish; the first
+/// ask after both hold reads. The turn is tried once, never waited for, and is released before
+/// this returns: no read runs under it.
+fn publication_open(seat: &Seat<'_>) -> bool {
+    let (policy, warnings) =
+        crate::supervise::SupervisorConfig::from_path(Some(&seat.config_dir.join("aterm.toml")));
+    if !policy_allows_handoff(&policy, &warnings) {
+        return false;
+    }
+    let turn = seat.store(Cli::Codex).signin_now();
+    let free = matches!(turn, Ok(Some(_)));
+    drop(turn);
+    free
+}
+
+/// What a session asks a usage-limit handoff to leave: the wall its login `source` (the account
+/// of the failed request) stands at, of the codex bucket, or of the limit `limit` names where it
+/// names one (a model's own, the intent's `limit=`, [`codex_app_login::is_limit_id`]). A caller
+/// outside this module makes one only of the whole intent it was asked under
+/// (`From<&Intent>`), so none can drop the limit that intent names: an identity alone makes one
+/// only in tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ask<'a> {
+    /// The identity the session's login must still read as.
+    source: &'a Identity,
+    /// The limit other than the codex bucket asked about, where one is.
+    limit: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl<'a> Ask<'a> {
+    /// The wall of `source` of the limit `limit` names, or of the codex bucket.
+    pub(crate) const fn of(source: &'a Identity, limit: Option<&'a str>) -> Self {
+        Self { source, limit }
+    }
+}
+
+#[cfg(test)]
+impl<'a> From<&'a Identity> for Ask<'a> {
+    /// The codex bucket's wall of `source`.
+    fn from(source: &'a Identity) -> Self {
+        Self {
+            source,
+            limit: None,
+        }
+    }
+}
+
+impl<'a> From<&'a super::codex_renewal::Intent> for Ask<'a> {
+    /// What `intent` asks: its source's wall, of the limit it names.
+    fn from(intent: &'a super::codex_renewal::Intent) -> Self {
+        Self {
+            source: &intent.identity,
+            limit: intent.limit.as_deref(),
+        }
+    }
+}
+
 /// Resolve only host-observed session paths. The source must still identify
 /// the account of the failed request and freshly report a limit a handoff
-/// leaves ([`walled_window`]): the week's, or a five-hour one not about to reset.
-/// Every destination is freshly read using its own immutable credential
-/// snapshot. One total deadline bounds all candidate reads.
-pub fn prepare(
+/// leaves ([`walled_window`]): the week's, a spend control's or a workspace's refusal, a
+/// five-hour one not about to reset, or an ordinary refusal no spent window explains; asked
+/// about another limit ([`Ask::limit`]), that limit's, and every destination must list that
+/// limit with room ([`usable`]). Every destination is freshly read using its own immutable
+/// credential snapshot. One total deadline bounds all candidate reads. Nothing is read while a
+/// selection could not be published ([`publication_open`]). Each call is paced as an asker that
+/// has read nothing ([`ReadPace`]), so no earlier call's reads hold this one's.
+pub fn prepare<'a>(
     seat: &Seat<'_>,
     session: &Session<'_>,
-    expected_source: &Identity,
+    ask: impl Into<Ask<'a>>,
     reader: &dyn UsageReader,
     wait: Duration,
+) -> Result<Option<Proposal>, &'static str> {
+    prepare_paced(seat, session, ask, reader, wait, &mut ReadPace::new())
+}
+
+/// [`prepare`] for an asking process whose reads so far are `pace`: what it leaves unread is
+/// neither read nor a target, and what this call reads is added to it.
+pub(super) fn prepare_paced<'a>(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    ask: impl Into<Ask<'a>>,
+    reader: &dyn UsageReader,
+    wait: Duration,
+    pace: &mut ReadPace,
 ) -> Result<Option<Proposal>, &'static str> {
     prepare_quota_wall(
         seat,
         session,
-        expected_source,
+        ask.into(),
         reader,
         wait,
+        pace,
         |seat, session, admit| {
             accounts_pool::native_quota_plan_admitting(seat, session, |note| note.record(), admit)
         },
@@ -697,23 +996,53 @@ pub fn prepare(
 }
 
 /// Read and verify the source and candidate accounts through the same provider
-/// and roster path, while preparing a typed cooperative exec handoff.
+/// and roster path, while preparing a typed cooperative exec handoff. Gated and paced as
+/// [`prepare`] is.
 #[cfg(unix)]
-pub fn prepare_exec<R: Clone>(
+pub fn prepare_exec<'a, R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
     program: &std::path::Path,
-    expected_source: &Identity,
+    ask: impl Into<Ask<'a>>,
     reader: &dyn UsageReader,
     wait: Duration,
+    command: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
+) -> Result<Option<Proposal<super::codex_exec_handoff::ExecCommand>>, &'static str> {
+    prepare_exec_paced(
+        seat,
+        session,
+        program,
+        ask,
+        reader,
+        wait,
+        &mut ReadPace::new(),
+        command,
+    )
+}
+
+/// [`prepare_exec`] for an asking process whose reads so far are `pace`, as [`prepare_paced`].
+#[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "prepare_exec's seven, and the asking process's pace"
+)]
+pub(super) fn prepare_exec_paced<'a, R: Clone>(
+    seat: &Seat<'_>,
+    session: &Session<'_, R>,
+    program: &std::path::Path,
+    ask: impl Into<Ask<'a>>,
+    reader: &dyn UsageReader,
+    wait: Duration,
+    pace: &mut ReadPace,
     mut command: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
 ) -> Result<Option<Proposal<super::codex_exec_handoff::ExecCommand>>, &'static str> {
     prepare_quota_wall(
         seat,
         session,
-        expected_source,
+        ask.into(),
         reader,
         wait,
+        pace,
         |seat, session, admit| {
             accounts_pool::native_exec_quota_plan(
                 seat,
@@ -729,11 +1058,13 @@ pub fn prepare_exec<R: Clone>(
 fn prepare_quota_wall<T, R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
-    expected_source: &Identity,
+    ask: Ask<'_>,
     reader: &dyn UsageReader,
     wait: Duration,
+    pace: &mut ReadPace,
     select: impl FnOnce(&Seat<'_>, &Session<'_, R>, &mut dyn FnMut(&Row) -> bool) -> SessionPlan<T>,
 ) -> Result<Option<Proposal<T>>, &'static str> {
+    pace.asks(seat.now);
     if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
         return Err("not-native-codex");
     }
@@ -759,13 +1090,18 @@ fn prepare_quota_wall<T, R: Clone>(
         return Err("source-unmanaged");
     }
     // Another row's pin keeps every session where it is, and the writer takes no target under one:
-    // nothing is read of the provider while it stands. The session's own row's wall ends its pin.
-    let state = seat
+    // nothing is read of the provider while it stands. A wall of the codex bucket on the session's
+    // own row ends its pin; a wall of another limit ends none ([`accounts::note_wall`]), since the
+    // row still serves every other limit's sessions, so a pin holds a session asked about one as
+    // a pin on another row does, its own row's included.
+    let mut state = seat
         .store(Cli::Codex)
         .load(seat.now)
         .map_err(|_| "state")?
         .0;
-    if state.pinned && state.active.as_deref() != Some(source.label.as_str()) {
+    if state.pinned
+        && (ask.limit.is_some() || state.active.as_deref() != Some(source.label.as_str()))
+    {
         return Ok(None);
     }
     // The source login contradicts its row before any provider request; repeating that request
@@ -773,6 +1109,16 @@ fn prepare_quota_wall<T, R: Clone>(
     if accounts_pool::check_login_identity(Cli::Codex, &source, seat.home).is_err() {
         return Err(SOURCE_NAMES_ANOTHER);
     }
+    let old_auth = who
+        .login
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| seat.home.join(Cli::Codex.accounts().default_home))
+        .join("auth.json");
+    // What this asking process read lately it leaves unread for now ([`ReadPace`]): laid over
+    // this ask's copy of the records, after the pin was judged on them as they are, and never
+    // written, so the run on record stays the row's and every session's.
+    pace.lay(seat, &roster, &source, &old_auth, &mut state);
     // Nor while this wall is on record and the handoff, as recorded, has no target
     // ([`accounts_pool::native_quota_target_at`]: what the plan below selects where each read admits
     // its candidate, low rows and held, pinned or moved-off defaults refused): no read here could
@@ -790,47 +1136,75 @@ fn prepare_quota_wall<T, R: Clone>(
     // target before its wait ends ([`accounts_pool::handoff_reads`]). The run is the row's, not
     // this session's: every session here reads a row's one login file, under its row's identity,
     // through one provider endpoint, so another session's failed read of this login also holds
-    // this one's for a rung, as its own would.
-    let wall_recorded = [accounts::WEEK_LIMIT, accounts::SESSION_LIMIT]
-        .into_iter()
-        .find(|window| {
-            state
-                .accounts
-                .get(&source.label)
-                .and_then(|account| account.walls.get(*window))
-                .and_then(accounts::Wall::stands_until)
-                .is_some_and(|until| until > seat.now)
-        });
-    let no_target = wall_recorded.is_some_and(|window| {
-        accounts_pool::native_quota_target_at(
-            (Cli::Codex, mode),
-            (
-                &roster,
-                &state,
-                &accounts::enrolled_in(Cli::Codex, &roster, seat.home),
-            ),
-            (&source, window),
-            (
-                accounts::default_login_address(Cli::Codex, seat.home).as_deref(),
-                seat.home,
-            ),
-            seat.now,
-        )
-        .is_none()
+    // this one's for a rung, as its own would. Nor, last, while this process's own reads hold the
+    // ask ([`ReadPace::holds`]): the ladder of its own login stands, and the forecast, made at
+    // every ask on the records as laid, names a row it has read usable or unanswered, or none. A
+    // row that is news to it is read past a ladder its login's limit climbed, not past one a read
+    // that showed no limit or ended the pass left. Asked about another limit, the wall on record
+    // is that limit's alone ([`accounts::Account::limit_walls`]), and the forecast passes over
+    // every row that limit holds ([`accounts_pool::limit_holds`]).
+    let account = state.accounts.get(&source.label);
+    let wall_recorded = match ask.limit {
+        Some(id) => account
+            .and_then(|account| account.limit_wall_until(id, seat.now))
+            .map(|_| accounts::limit_wall(id)),
+        None => [accounts::WEEK_LIMIT, accounts::SESSION_LIMIT]
+            .into_iter()
+            .find(|window| {
+                account
+                    .and_then(|account| account.walls.get(*window))
+                    .and_then(accounts::Wall::stands_until)
+                    .is_some_and(|until| until > seat.now)
+            })
+            .map(str::to_owned),
+    };
+    let forecast = wall_recorded.clone().unwrap_or_else(|| {
+        ask.limit
+            .map_or_else(|| accounts::WEEK_LIMIT.to_owned(), accounts::limit_wall)
     });
-    if no_target || !accounts_pool::handoff_reads(&source, &state, seat.now) {
+    let named = accounts_pool::native_quota_target_at(
+        (Cli::Codex, mode),
+        (
+            &roster,
+            &state,
+            &accounts::enrolled_in(Cli::Codex, &roster, seat.home),
+        ),
+        (&source, &forecast),
+        (
+            accounts::default_login_address(Cli::Codex, seat.home).as_deref(),
+            seat.home,
+        ),
+        seat.now,
+    );
+    let repeat = named.as_deref().is_none_or(|label| pace.asked(label));
+    if !accounts_pool::handoff_reads(&source, &state, seat.now)
+        || (named.is_none() && wall_recorded.is_some())
+        || pace.holds(&old_auth, repeat, seat.now)
+    {
+        // The holds that refused the ask are said nowhere yet: no pace outlives its ask.
+        let _ = pace.waits(seat.now);
         return Ok(None);
     }
-    let old_auth = who
-        .login
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| seat.home.join(Cli::Codex.accounts().default_home))
-        .join("auth.json");
     let left = remaining().saturating_sub(RECORD_WITHIN);
     if left.is_zero() {
         return Ok(None);
     }
+    // No pass for a selection nothing could publish ([`publication_open`]), and no rung spent on
+    // the asks it refuses.
+    if !publication_open(seat) {
+        return Ok(None);
+    }
+    // From here every way out, an unwinding read included, counts as a pass of this process.
+    let mut pass = pace.begin(
+        &old_auth,
+        named.map(|label| {
+            let context = roster
+                .row(&label)
+                .and_then(|row| seat.store(Cli::Codex).capture_auth_context(row));
+            (label, context)
+        }),
+        seat.now,
+    );
     let use_token =
         super::provider_read::Use::wall_read_use(WallUse(super::provider_read::Account::in_home(
             super::provider_read::Read::CodexEndpoint,
@@ -847,10 +1221,10 @@ fn prepare_quota_wall<T, R: Clone>(
         if reads_row {
             let read = accounts_pool::FreshRead {
                 label: source.label.clone(),
-                context: source_context,
+                context: source_context.clone(),
                 answer,
             };
-            let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &[read], remaining());
+            let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &[read], None, remaining());
         }
     };
     let observed = match reader.read_on(
@@ -861,7 +1235,7 @@ fn prepare_quota_wall<T, R: Clone>(
         left,
         use_token,
     ) {
-        IdentifiedRead::Usage(observed) => observed,
+        IdentifiedRead::Usage(observed) => *observed,
         // No handoff is proposed off a login that reads signed out, and the row says so.
         IdentifiedRead::SignedOut => {
             note_own(accounts_pool::FreshAnswer::SignedOut);
@@ -873,27 +1247,47 @@ fn prepare_quota_wall<T, R: Clone>(
             return Ok(None);
         }
     };
-    if observed.identity != *expected_source {
+    if observed.identity != *ask.source {
         return Err("source-identity-changed");
     }
-    let Some(window) = walled_window(&observed, seat.now) else {
-        return Err("not-walled");
+    let window = match walled_window(&observed, ask.limit, seat.now) {
+        Walled::At(window) => window,
+        Walled::No => {
+            pass.own_answered(OwnRead::NoWall);
+            return Err("not-walled");
+        }
+        Walled::Absent => {
+            pass.own_answered(OwnRead::NoWall);
+            return Err(LIMIT_ABSENT);
+        }
     };
+    pass.own_answered(OwnRead::Walled);
     if remaining().is_zero() {
         return Ok(None);
     }
     // The plan records the wall under the window this read named, with that window's own reset
     // from the same read ([`accounts::Sample::reached_reset`]): a five-hour wall holds its row to
-    // the five-hour reset, never to the week's.
+    // the five-hour reset, never to the week's, and a refusal recorded under a window it did not
+    // spend (the fallback window) names no reset, so it stands by rungs.
     let mut session = session.clone();
-    session.sample = Some(observed.usage.sample);
+    session.sample = Some(observed.usage.sample.clone());
     session.point = Point::Wall {
-        window: window.into(),
+        window,
         at: Some(seat.now),
     };
     let mut selected = None;
     let mut launch = super::provider_read::Launch::launch_use(LaunchUse(()));
     let mut reads = Vec::new();
+    // A limit's wall names no reset the sample shows, so the plan records it with none; the
+    // session's own read, recorded after the plan, gives it that limit's own
+    // ([`accounts::note_limits`]).
+    if ask.limit.is_some() && reads_row {
+        reads.push(accounts_pool::FreshRead {
+            label: source.label.clone(),
+            context: source_context.clone(),
+            answer: accounts_pool::FreshAnswer::Usage(observed.usage.clone()),
+        });
+    }
     let mut admit = |row: &Row| {
         if accounts_pool::check_login_identity(Cli::Codex, row, seat.home).is_err() {
             return false;
@@ -914,15 +1308,28 @@ fn prepare_quota_wall<T, R: Clone>(
         ) else {
             return false;
         };
-        let usage = match reader.read_on(
+        pass.minted(&row.label, context.clone());
+        let answered = reader.read_on(
             seat,
             &new_auth,
             row.expected_identity_email(),
             seat.now,
             left,
             use_token,
-        ) {
-            IdentifiedRead::Usage(usage) => usage,
+        );
+        // What the record of this read compares is the login as it stood before the read; what
+        // the pace keeps is the one the read left.
+        pass.answered(
+            &row.label,
+            seat.store(Cli::Codex).capture_auth_context(row),
+            match &answered {
+                IdentifiedRead::Usage(usage) => usable(usage, ask.limit, seat.now),
+                IdentifiedRead::SignedOut => false,
+                IdentifiedRead::Unread => true,
+            },
+        );
+        let usage = match answered {
+            IdentifiedRead::Usage(usage) => *usage,
             // A candidate whose login reads signed out is passed over on the record, not
             // silently: the next pick does not offer it again.
             IdentifiedRead::SignedOut => {
@@ -947,7 +1354,7 @@ fn prepare_quota_wall<T, R: Clone>(
             context,
             answer: accounts_pool::FreshAnswer::Usage(usage.usage.clone()),
         });
-        if !usable(&usage, seat.now) || usage.identity.account == expected_source.account {
+        if !usable(&usage, ask.limit, seat.now) || usage.identity.account == ask.source.account {
             return false;
         }
         selected = Some((row.clone(), usage.identity, new_auth));
@@ -956,7 +1363,27 @@ fn prepare_quota_wall<T, R: Clone>(
     let plan = select(seat, &session, &mut admit);
     // The report and later writers judge these rows by what was just read. A selection stands
     // whether or not this records: its writer judges the row again.
-    let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &reads, remaining());
+    let _ = accounts_pool::note_fresh_reads(seat, Cli::Codex, &reads, ask.limit, remaining());
+    // A row read walled, low or signed out that the records now refuse as a target is the
+    // record's to gate: the forecast names it again only once the record lets it go, and this
+    // process reads it then. One the records do not hold (its read went unrecorded) stays on its
+    // rungs here.
+    // Asked about another limit, the records hold a row that cannot take its session there too:
+    // one read walled, low or with no figure on it, or not listing it ([`accounts::note_limits`]).
+    let asked = ask.limit.map(accounts::limit_wall);
+    let mut recorded = None;
+    pass.held_on_record(|label| {
+        recorded
+            .get_or_insert_with(|| seat.store(Cli::Codex).load(seat.now).ok())
+            .as_ref()
+            .zip(roster.row(label))
+            .is_some_and(|((after, _), row)| {
+                !accounts_pool::native_target_admitted(row, after, seat.now)
+                    || asked.as_deref().is_some_and(|window| {
+                        accounts_pool::limit_holds(label, after, window, seat.now)
+                    })
+            })
+    });
     let Some((destination, destination_identity, new_auth)) = selected else {
         return Ok(None);
     };
@@ -973,7 +1400,7 @@ fn prepare_quota_wall<T, R: Clone>(
         plan,
         source,
         destination,
-        source_identity: expected_source.clone(),
+        source_identity: ask.source.clone(),
         destination_identity,
         old_auth,
         new_auth,

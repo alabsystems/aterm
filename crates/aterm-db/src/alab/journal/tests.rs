@@ -54,6 +54,9 @@ fn ev(t: u64, kind: Kind, account: Pk) -> Event {
         to: None,
         tab: None,
         harness: None,
+        op: None,
+        via: None,
+        program: None,
     }
 }
 
@@ -98,11 +101,23 @@ impl Gen {
 /// path or free text. Over 20,000 generated strings, every one a `Word`, `Pk` or the decoder
 /// admits is `[a-z0-9-]` alone, and every encoded event is made of those bytes and JSON's
 /// punctuation; an event with an unknown key (an `email` field a modified peer adds) or a
-/// word holding `@` is refused whole.
+/// word holding `@` is refused whole. A `decided` names its operation by 16 hex digits and its
+/// verb and author by words, so it carries no more than any other event.
 /// NEGATIVE CONTROL: with `Word::new` also admitting `@` (`|| *b == b'@'`), a generated
 /// address-like word is admitted: `` admitted "c@" `` (the first property's message).
 #[test]
 fn no_event_word_can_carry_an_address_url_or_free_text() {
+    let decided = Event {
+        kind: Kind::Decided,
+        account: None,
+        cli: Word::new("aterm").unwrap(),
+        src: Source::File,
+        op: Word::new("0123456789abcdef"),
+        via: Word::new("set"),
+        program: Word::new("claude"),
+        ..ev(1, Kind::Auth, pk("ann@example.test"))
+    };
+    assert_eq!(Event::from_value(&decided.to_value()), Some(decided));
     let mut generator = Gen(0x5eed_1234_abcd_0001);
     let plain = |s: &str| {
         s.bytes()
@@ -121,7 +136,44 @@ fn no_event_word_can_carry_an_address_url_or_free_text() {
         if let Some(event) = Event::from_value(&value) {
             assert!(plain(event.why.unwrap().as_str()), "decoded {text:?}");
         }
+        for key in ["op", "via", "pg"] {
+            let mut value = decided.to_value();
+            set(&mut value, key, Value::from(text.as_str()));
+            if let Some(event) = Event::from_value(&value) {
+                let word = match key {
+                    "op" => event.op,
+                    "via" => event.via,
+                    _ => event.program,
+                };
+                let word = word.unwrap();
+                assert!(plain(word.as_str()), "decoded {key} {text:?}");
+                if key == "op" {
+                    assert!(
+                        word.as_str().len() == 16
+                            && word.as_str().bytes().all(|b| b.is_ascii_hexdigit()),
+                        "an operation is 16 hex digits: {text:?}"
+                    );
+                }
+            }
+        }
     }
+    // A `decided` names its operation, verb and author, and nothing else names them.
+    let mut partial = decided.to_value();
+    if let Value::Object(object) = &mut partial {
+        object.remove("pg");
+    }
+    assert_eq!(
+        Event::from_value(&partial),
+        None,
+        "a decided without its author"
+    );
+    let mut stray = ev(1, Kind::Auth, pk("ann@example.test")).to_value();
+    set(&mut stray, "op", json!("0123456789abcdef"));
+    assert_eq!(
+        Event::from_value(&stray),
+        None,
+        "an operation on another kind"
+    );
     assert!(admitted > 0, "the generator also makes plain words");
     // The widest event a producer makes: a sub-account's reading, ten-digit times.
     let event = Event {
@@ -2381,4 +2433,21 @@ fn a_nudge_is_taken_once() {
     upd::nudge();
     assert!(upd::nudged());
     assert!(!upd::nudged());
+}
+
+/// Every word a `usage` row's `src` may hold is a word an event's `src` reads, so a reading's
+/// source is said the same way in `ai/usage` and in `ai/events`.
+/// NEGATIVE CONTROL, observed: with `"screen"` added to `READING_SOURCES`, the word is no event
+/// source: `` "screen" left: None right: Some("screen") ``.
+#[test]
+fn a_usage_rows_sources_are_event_sources() {
+    for word in READING_SOURCES {
+        assert_eq!(
+            Source::parse(word).map(Source::word),
+            Some(*word),
+            "{word:?}"
+        );
+    }
+    let src = USAGE.column("src").unwrap();
+    assert!(matches!(src.ty, crate::typed::Ty::Enum(words) if words == READING_SOURCES));
 }

@@ -151,9 +151,10 @@ impl Finalizing {
                 self.pending.push_front(window);
                 return Step::Wait(deadline);
             }
-            let state = app.windows.get_mut(&wid).expect("live re-grid window");
+            let mut state = app.windows.get_mut(&wid).expect("live re-grid window");
             state.restore_regrid_owed = None;
             state.restore_maximize_asked = false;
+            drop(state);
             window.geometry = Geometry::read(app, wid);
         }
         if let Some(target) = window.targets.pop_front() {

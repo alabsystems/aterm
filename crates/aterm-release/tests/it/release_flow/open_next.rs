@@ -255,7 +255,7 @@ fn open_next_blocked_by_the_preflight_names_itself_again() {
     assert!(w.journal().is_none());
 }
 
-/// ONE RED OF THE OPENING OPENS ONE WORKER, HOWEVER MAIN MOVES. The bump's commit gates are red
+/// A PUMP'S RED OF THE OPENING OPENS ONE WORKER, HOWEVER MAIN MOVES. The bump's commit gates are red
 /// on main; each try judges whatever commit the tip then is. The failure names the version it
 /// opens after, so the second red, at another tip, names the worker already on it.
 /// NEGATIVE CONTROL: keyed as a cut's inputs (the version and the tip), the red at the moved
@@ -268,6 +268,7 @@ fn a_red_open_next_opens_one_worker_however_main_moves() {
         ]
     };
     let mut w = World::new();
+    w.repairs.pump = true;
     w.blocks = blocked();
     let (code, last) = w.run(open_next());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);

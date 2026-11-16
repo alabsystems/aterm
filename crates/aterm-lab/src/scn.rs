@@ -242,7 +242,7 @@ impl Ctx {
             let ls = self.ctl(&["ls"]).stdout;
             if let Some(sid) = ls
                 .split_whitespace()
-                .find(|w| aterm_types::tab_id::is_tab_id(w))
+                .find(|w| aterm_types::control_verbs::is_minted_sid(w))
             {
                 self.sid = sid.to_string();
                 break;

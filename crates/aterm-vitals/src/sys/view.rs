@@ -4,13 +4,20 @@
 //! Each `sys` view as text lines and as JSON.
 
 use super::disk::{self, RootSize};
+use super::held;
 use super::jobs_view;
 use super::json::Jv;
-use super::query::{ScopeArg, SysQuery, View};
+use super::query::{DiskForm, ScopeArg, SysQuery, View};
+use super::stores;
 use super::why;
 use super::{BudgetFacts, BudgetRead, Ctx, Freshness, clock_ms, exe_word, pct};
+use crate::blockage::{DScope, DState, Zombies};
 use crate::events::{EventKind, LoadScope, millicores};
+use crate::heat::{Cut, NoHeat};
+use crate::jobs::ZombieParent;
 use crate::model::{ProcScope, ProcView, ProgramGroup, RowScope, ScopeView, Snapshot};
+use crate::runq::Runnable;
+use crate::situation::Reading;
 use crate::words;
 use crate::writes::ProgramHour;
 
@@ -30,6 +37,8 @@ pub struct Line {
 pub struct Reply {
     /// The view.
     pub view: View,
+    /// The disk view's form (`disk held`), or `None`: its lines differ from the plain view's.
+    pub form: Option<DiskForm>,
     /// The scope read, for the views that take one.
     pub scope: Option<ScopeArg>,
     /// Subject of a `why` reply, or `None` for every other view.
@@ -49,13 +58,22 @@ impl Reply {
         } else {
             self.lines.len()
         };
-        header_line(self.view, self.scope, self.subject, n, ctx, delta)
+        header_line(
+            self.view,
+            self.form,
+            self.scope,
+            self.subject,
+            n,
+            ctx,
+            delta,
+        )
     }
 }
 
 /// [`Reply::header`] of a reply of `n` lines.
 pub(super) fn header_line(
     view: View,
+    form: Option<DiskForm>,
     scope: Option<ScopeArg>,
     subject: Option<&str>,
     n: usize,
@@ -63,6 +81,9 @@ pub(super) fn header_line(
     delta: bool,
 ) -> String {
     let mut h = format!("OK {n} sys v=1 view={}", view.word());
+    if let Some(f) = form {
+        h.push_str(&format!(" form={}", f.word()));
+    }
     if let Some(s) = scope {
         h.push_str(&format!(" scope={}", s.word()));
     }
@@ -604,11 +625,7 @@ pub(super) fn mem_clauses(m: &crate::model::MemView) -> [String; 2] {
     if m.sample.pressure != crate::model::Pressure::Unknown {
         w.push_str(&format!(", pressure {}", m.sample.pressure.word()));
     }
-    let mut sw = if m.sample.swap_used == 0 {
-        "swap 0".to_owned()
-    } else {
-        format!("swap {}", words::mem(m.sample.swap_used))
-    };
+    let mut sw = words::swap_used(m.sample.swap_used);
     if let Some(r) = m
         .rates
         .filter(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS)
@@ -683,7 +700,7 @@ fn sentence(key: &str, label: &str, clauses: &[String]) -> Line {
     }
 }
 
-fn line(key: impl Into<String>, text: impl Into<String>) -> Line {
+pub(super) fn line(key: impl Into<String>, text: impl Into<String>) -> Line {
     Line {
         key: key.into(),
         text: text.into(),
@@ -691,7 +708,7 @@ fn line(key: impl Into<String>, text: impl Into<String>) -> Line {
     }
 }
 
-fn note(key: &str, text: impl Into<String>) -> Line {
+pub(super) fn note(key: &str, text: impl Into<String>) -> Line {
     Line {
         key: key.into(),
         text: text.into(),
@@ -1084,6 +1101,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     lines.extend(events);
     Reply {
         view: q.view,
+        form: q.form,
         scope: q.view.default_scope().and(scope),
         subject: why::subject_word(q, ctx.snap),
         lines,
@@ -1915,10 +1933,15 @@ fn gpu_words(s: &Snapshot) -> String {
 /// where the remainder is what the VM never manages), or leave memory no
 /// class names (Linux, Windows; design §9.6).
 pub(super) fn exact_partition(ctx: &Ctx<'_>) -> bool {
-    ctx.machine.family == "macOS"
-        && ctx.snap.and_then(|s| s.mem.as_ref()).is_some_and(|m| {
-            m.sample.exact && m.sample.compressed.is_some() && m.sample.in_vm() <= m.sample.total
-        })
+    let platform = match ctx.machine.family {
+        "macOS" => Some(words::Platform::MacOs),
+        "Linux" => Some(words::Platform::Linux),
+        "Windows" => Some(words::Platform::Windows),
+        _ => None,
+    };
+    ctx.snap.and_then(|s| s.mem.as_ref()).is_some_and(|m| {
+        m.sample.physical_classes(platform).partition == crate::model::MemoryPartition::Exact
+    })
 }
 
 /// A memory charge remains a lower bound whenever any member could not be read.
@@ -2065,24 +2088,20 @@ pub(super) fn mem_classes(
     m: &crate::model::MemView,
     exact: bool,
 ) -> [(&'static str, Option<u64>); 6] {
-    let x = &m.sample;
-    let counted = x
-        .app
-        .saturating_add(x.wired)
-        .saturating_add(x.compressed.unwrap_or(0))
-        .saturating_add(x.cached)
-        .saturating_add(x.free);
-    [
-        ("app", Some(x.app)),
-        ("wired", Some(x.wired)),
-        ("compressed", x.compressed),
-        ("cache", Some(x.cached)),
-        ("free", Some(x.free)),
-        (
-            if exact { "not_in_vm" } else { "unnamed" },
-            Some(x.total.saturating_sub(counted)),
-        ),
-    ]
+    use crate::model::MemoryClassKind;
+    // `exact_partition` supplies the naming proof; the physical counts do not depend on it.
+    m.sample.physical_classes(None).classes.map(|class| {
+        let name = match class.kind {
+            MemoryClassKind::App => "app",
+            MemoryClassKind::Wired => "wired",
+            MemoryClassKind::Compressed => "compressed",
+            MemoryClassKind::Cache => "cache",
+            MemoryClassKind::Free => "free",
+            MemoryClassKind::Residual if exact => "not_in_vm",
+            MemoryClassKind::Residual => "unnamed",
+        };
+        (name, class.bytes)
+    })
 }
 
 fn g2(b: u64) -> String {
@@ -2186,8 +2205,12 @@ fn thrashing_why(m: &crate::model::MemView) -> &'static str {
 fn paging_words(m: &crate::model::MemView) -> String {
     let mut t = format!(
         "swap {} used of {}",
-        words::mem(m.sample.swap_used),
-        words::mem(m.sample.swap_total)
+        m.sample
+            .swap_used
+            .map_or_else(|| unavailable("not_read"), words::mem),
+        m.sample
+            .swap_total
+            .map_or_else(|| unavailable("not_read"), words::mem)
     );
     match m.rates {
         Some(r) => t.push_str(&format!(
@@ -2728,6 +2751,10 @@ fn covered_whole_s(covered_s: f64) -> u64 {
 }
 
 fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
+    if q.form == Some(DiskForm::Held) {
+        held::text(ctx, s, lines);
+        return;
+    }
     let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
     let keys = scope_keys(ctx, scope);
     let f = tabs_fig(s, &keys, ctx.target.key);
@@ -2947,6 +2974,9 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             format!("volume {}", unavailable("not_sampled")),
         )),
     }
+    for store in ctx.stores {
+        lines.push(line(store.key(), store.text()));
+    }
     lines.push(line(
         "budget",
         format!("budget {}", budget_words(ctx.volume.map(|v| v.budget))),
@@ -2988,7 +3018,7 @@ fn budget_why(read: Option<BudgetRead>) -> &'static str {
 
 /// A disk view's `budget` record after its key: the figures of a sized budget, or why there
 /// are none (`read` is `None` where the view has no volume).
-fn budget_words(read: Option<BudgetRead>) -> String {
+pub(super) fn budget_words(read: Option<BudgetRead>) -> String {
     match read {
         Some(BudgetRead::Sized(b)) => {
             let (gap, by) = budget_gap(&b);
@@ -3009,7 +3039,7 @@ fn budget_words(read: Option<BudgetRead>) -> String {
 
 /// [`budget_words`] as the JSON `budget` value: the same figures (`sized_age_s` for the age),
 /// or `{"why": <word>}`.
-fn budget_json(read: Option<BudgetRead>) -> Jv {
+pub(super) fn budget_json(read: Option<BudgetRead>) -> Jv {
     match read {
         Some(BudgetRead::Sized(b)) => {
             let (gap, by) = budget_gap(&b);
@@ -3047,7 +3077,10 @@ fn net_summary_words(s: &Snapshot, net: &crate::model::NetView) -> String {
             parts.push(rate);
         }
         None if !net.links.is_empty() => {
-            parts.push(format!("rates {}", unavailable("warming")));
+            parts.push(format!(
+                "rates {}",
+                unavailable(net.rates_why.map_or("warming", |why| why.word()))
+            ));
         }
         None => {}
     }
@@ -3132,29 +3165,33 @@ fn net_text(q: &SysQuery, s: &Snapshot, lines: &mut Vec<Line>) {
     for l in net.links.iter().take(q.top) {
         let x = &l.sample;
         let primary = u8::from(s.facts.link.as_ref().is_some_and(|p| p.name == x.name));
+        let rate_why = l.rates_why.map_or("warming", |why| why.word());
         let tx_drop_ps = match l.rates {
             Some(r) => rec(r.tx_drop_ps.map(|v| v.round() as u64), "unsupported"),
             None if x.tx_drops.is_none() => unavailable("unsupported"),
-            None => unavailable("warming"),
+            None => unavailable(rate_why),
         };
         lines.push(line(
             format!("link {}", x.name),
             format!(
-                "link name={} kind={} up={} loopback={} counted={} primary={primary} rx_bps={} tx_bps={} rx_pps={} tx_pps={} rx_err_ps={} tx_err_ps={} rx_drop_ps={} tx_drop_ps={tx_drop_ps} rx_bytes={} tx_bytes={} rx_packets={} tx_packets={} rx_errors={} tx_errors={} rx_drops={} tx_drops={} link_bps={}",
+                "link name={} kind={} up={} loopback={} counted={} primary={primary} rx_bps={} tx_bps={} rx_pps={} tx_pps={} rx_err_ps={} tx_err_ps={} rx_drop_ps={} tx_drop_ps={tx_drop_ps} rx_bytes={} tx_bytes={} byte_counter={} byte_counter_bits={} byte_counter_quantum_bytes={} rx_packets={} tx_packets={} rx_errors={} tx_errors={} rx_drops={} tx_drops={} link_bps={}",
                 pct(&x.name),
                 x.kind.word(),
                 u8::from(x.up),
                 u8::from(x.loopback),
                 u8::from(x.counts),
-                rec(l.rates.map(|r| r.rx_bps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.tx_bps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.rx_pps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.tx_pps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.rx_err_ps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.tx_err_ps.round() as u64), "warming"),
-                rec(l.rates.map(|r| r.rx_drop_ps.round() as u64), "warming"),
+                rec(l.rates.map(|r| r.rx_bps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.tx_bps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.rx_pps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.tx_pps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.rx_err_ps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.tx_err_ps.round() as u64), rate_why),
+                rec(l.rates.map(|r| r.rx_drop_ps.round() as u64), rate_why),
                 x.rx,
                 x.tx,
+                x.byte_counter.word(),
+                rec(x.byte_counter.bits(), "not_sampled"),
+                rec(x.byte_counter.quantum(), "not_sampled"),
                 x.rx_packets,
                 x.tx_packets,
                 x.rx_errors,
@@ -3202,18 +3239,26 @@ fn disk_unmeasured(windows: bool) -> String {
 }
 
 fn disk_summary(ctx: &Ctx<'_>) -> String {
+    let store = stores::summary_clause(ctx.stores);
     let Some(t) = ctx.disk else {
-        return disk_unmeasured(ctx.machine.family == "Windows");
+        let mut out = disk_unmeasured(ctx.machine.family == "Windows");
+        if let Some(store) = store {
+            out.push_str(&format!(" · warnings {store}"));
+        }
+        return out;
     };
-    let warnings = if t.warnings.is_empty() {
-        "none".to_owned()
-    } else {
+    let folders = (!t.warnings.is_empty()).then(|| {
         let n = t.warnings.len();
         let worst = t.warnings.iter().map(|w| w.entries).max().unwrap_or(0);
         format!(
             "{n} folder{} past 100,000 entries (largest {worst})",
             if n == 1 { "" } else { "s" }
         )
+    });
+    let warnings = match (folders, store) {
+        (None, None) => "none".to_owned(),
+        (Some(one), None) | (None, Some(one)) => one,
+        (Some(folders), Some(store)) => format!("{folders}, {store}"),
     };
     let not_measured: Vec<&str> = ctx
         .roots
@@ -3438,7 +3483,379 @@ fn machine_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     if let Some(os) = ctx.machine.os.as_ref() {
         o.set("os", Jv::s(os.clone()));
     }
+    let kind = &s.situation.machine;
+    for (key, field) in [
+        ("type", kind.map(|m| m.name.clone())),
+        ("model", kind.map(|m| m.model.clone())),
+        ("model_id", kind.map(|m| m.model_id.clone())),
+    ] {
+        o.set(
+            key,
+            match field {
+                Reading::Read(Some(text)) => Jv::s(text),
+                Reading::Read(None) => Jv::why(TYPE_NOT_GIVEN),
+                unread => reading_why(&unread),
+            },
+        );
+    }
     o
+}
+
+/// Why a field of the computer's type holds no text although the type was read: the firmware
+/// gave none for it, or none that passed the name ladder (`crate::situation::MachineType`).
+const TYPE_NOT_GIVEN: &str = "not_sampled:firmware_gave_none";
+
+/// Why a heat value read no number although its chain read: the window held under
+/// [`crate::heat::MIN_CLOCK_NS`] of the core time it divides by, or no energy.
+const HEAT_TOO_LITTLE: &str = "not_sampled:too_little_core_time";
+
+/// A situational reading that is not one, as its unavailable word ([`Reading::why`]):
+/// `not_sampled` or `unsupported`.
+fn reading_why<T>(r: &Reading<T>) -> Jv {
+    Jv::why(r.why().unwrap_or("not_sampled"))
+}
+
+/// A heat value's absence as an unavailable word: `unsupported:<reason>` where this system has no
+/// reader of it, `not_sampled:<reason>` where its reader gave nothing this reading. A reason the
+/// word rule does not take (`super::is_unavailable_word`) is left off, so the reply keeps its
+/// contract whatever a reader names.
+fn heat_why(why: NoHeat) -> Jv {
+    let (head, reason) = match why {
+        NoHeat::NotSupported(reason) => ("unsupported", reason),
+        NoHeat::Unread(reason) => ("not_sampled", reason),
+    };
+    let word = format!("{head}:{reason}");
+    Jv::why(if super::is_unavailable_word(&word) {
+        &word
+    } else {
+        head
+    })
+}
+
+/// `v × scale` as a whole figure; `unread_format` for a value that is no count (not finite, or
+/// under zero), never a 0 in its place.
+fn scaled(v: f64, scale: f64) -> Jv {
+    let x = v * scale;
+    if x.is_finite() && x >= 0.0 {
+        Jv::u(x.round() as u64)
+    } else {
+        Jv::why("unread_format")
+    }
+}
+
+/// The overview's `heat` object (A4 §12.1), from [`Snapshot::heat`] and the thermal state's word
+/// as `global.thermal` prints it (the OS's where exact, the counter heuristic's where not):
+/// `{pressure, thermal_state, clock {p_mhz, e_mhz, e_verdict, basis, p_usual_mhz, cut}, watts
+/// {cpu_mw, gpu_mw, ane_mw}, ipj, p_share {time_pm, instructions_pm}}`. Each value that is not a
+/// reading is its [`NoHeat`]'s word ([`heat_why`]); with no chain, `clock`, `ipj` and `p_share`
+/// are each that one word.
+fn heat_json(s: &Snapshot) -> Jv {
+    let h = &s.heat;
+    let watt = |w: Result<f64, NoHeat>| w.map_or_else(heat_why, |w| scaled(w, 1000.0));
+    let (clock, ipj, p_share) = match h.chain {
+        Err(why) => (heat_why(why), heat_why(why), heat_why(why)),
+        Ok(c) => {
+            // A clock the chain did not give: no table to judge it against, else too little time.
+            let no_clock = || {
+                c.range
+                    .err()
+                    .map_or_else(|| Jv::why(HEAT_TOO_LITTLE), heat_why)
+            };
+            let mhz = |v: Option<f64>| v.map_or_else(no_clock, |v| scaled(v, 1.0));
+            // A share is at most the whole: the Super time and the QoS time are two accounts, so
+            // their quotient may pass 1 by a tick's rounding.
+            let share = |v: Option<f64>| match v {
+                None => Jv::why(HEAT_TOO_LITTLE),
+                Some(v) if v.is_nan() => Jv::why("unread_format"),
+                Some(v) => scaled(v.min(1.0), 1000.0),
+            };
+            let clock = Jv::obj([
+                ("p_mhz", mhz(c.judged.p_mhz)),
+                (
+                    "e_mhz",
+                    if c.judged.e_refused {
+                        Jv::why("not_sampled:past_table")
+                    } else {
+                        mhz(c.judged.e_mhz)
+                    },
+                ),
+                ("e_verdict", Jv::s(c.e_verdict.word())),
+                ("basis", Jv::s("coalition_counters")),
+                (
+                    "p_usual_mhz",
+                    c.usual_mhz.map_or_else(
+                        || {
+                            Jv::why(if c.decile.is_some() {
+                                "not_sampled:unlearned"
+                            } else {
+                                "not_sampled:no_busy_decile"
+                            })
+                        },
+                        |v| scaled(v, 1.0),
+                    ),
+                ),
+                ("cut", cut_json(c.cut)),
+            ]);
+            let ipj = c
+                .judged
+                .ipj
+                .map_or_else(|| Jv::why(HEAT_TOO_LITTLE), |v| scaled(v, 1.0));
+            let p_share = Jv::obj([
+                ("time_pm", share(c.judged.p_time_share)),
+                ("instructions_pm", share(c.judged.p_instruction_share)),
+            ]);
+            (clock, ipj, p_share)
+        }
+    };
+    Jv::obj([
+        (
+            "pressure",
+            h.pressure.map_or_else(heat_why, |p| Jv::s(p.word())),
+        ),
+        (
+            "thermal_state",
+            s.thermal
+                .map_or_else(|| Jv::why("unsupported"), |t| Jv::s(t.word())),
+        ),
+        ("clock", clock),
+        (
+            "watts",
+            Jv::obj([
+                ("cpu_mw", watt(h.watts.cpu)),
+                ("gpu_mw", watt(h.watts.gpu)),
+                ("ane_mw", watt(h.watts.ane)),
+            ]),
+        ),
+        ("ipj", ipj),
+        ("p_share", p_share),
+    ])
+}
+
+/// The Super clock's cut as `{state, …}`: `not_judged` (pressure under Moderate, or unread),
+/// `gated` with the decile's M-PCLK `verdict` (which claims nothing), `unlearned`, and `within`
+/// or `cut` with `usual_over_clock_m` (the usual clock ÷ the clock, in thousandths: over 1000
+/// where the clock runs under its usual); `not_sampled` with no Super clock or decile this reading.
+fn cut_json(cut: Cut) -> Jv {
+    let state = |word: &str| Jv::obj([("state", Jv::s(word))]);
+    let judged = |word: &str, ratio: f64| {
+        Jv::obj([
+            ("state", Jv::s(word)),
+            ("usual_over_clock_m", scaled(ratio, 1000.0)),
+        ])
+    };
+    match cut {
+        Cut::NotJudged => state("not_judged"),
+        Cut::Unread => Jv::why("not_sampled"),
+        Cut::Gated(verdict) => Jv::obj([
+            ("state", Jv::s("gated")),
+            ("verdict", Jv::s(verdict.word())),
+        ]),
+        Cut::Unlearned => state("unlearned"),
+        Cut::Within(ratio) => judged("within", ratio),
+        Cut::Cut(ratio) => judged("cut", ratio),
+    }
+}
+
+/// `global.queue` (A4 §12.1): the queue the over rule reads ([`crate::model::RowFacts::queue`]),
+/// `{threads_m, basis}`: P10, the machine's runnable threads over 10 s (`runnable_10s`), or the
+/// 1-minute load average only where P10 is unread (`load1`), in thousandths as `load_m` is. With
+/// neither, why P10 is unread.
+fn queue_json(s: &Snapshot) -> Jv {
+    match s.facts.queue {
+        Some(q) => Jv::obj([
+            ("threads_m", scaled(q.threads, 1000.0)),
+            ("basis", Jv::s(q.basis.word())),
+        ]),
+        None => Jv::why(match s.facts.runnable {
+            Runnable::Unread(why) => why.word(),
+            Runnable::Read(_) => "unread_format",
+        }),
+    }
+}
+
+/// The overview's `procs` object (A4 §12.1): blockage, from [`crate::model::RowFacts::zombies`]
+/// and [`crate::model::RowFacts::dstate`]. `zombies` is each parent's pile `{parent, exe, count,
+/// per_min_deci}` (with `local` and `tab` for a parent in a tab), largest first, and
+/// `zombie_count` the machine's, a lower bound where the sweep stopped at its cap; `dstate` is
+/// each process found in an uninterruptible wait `{pid, exe, threads, held}`, the held first,
+/// with `dstate_count`, `dstate_held` and whose processes they cover (`dstate_scope`: `own` or
+/// `machine`). A census pass that did not read every listed process (its cover takes more than
+/// one pass) counts at least what it found, so both counts are then lower bounds
+/// (`partial_census`); so are they where a read was cut at a cap (`truncated`: the sweep stopped
+/// at its process cap, or the census cut a process's thread list and found none uninterruptible
+/// in what it read), and a row's `threads` where its own list was cut.
+///
+/// A row names a process: a zombie pile outside the target's tab, and every `dstate` row, prints
+/// only for the owner class and is counted in `zombies_withheld` or `dstate_withheld` otherwise.
+/// Each list prints at most `top` rows, the rest counted in `zombies_more` or `dstate_more`. The
+/// counts are narrowed by neither: `zombie_count` is the machine's, and `dstate_count` and
+/// `dstate_held` cover the processes `dstate_scope` names. A reader that gave nothing is its
+/// word, never an empty list.
+fn blockage_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
+    let mut o = Jv::obj([] as [(&str, Jv); 0]);
+    // The rows of `key` a caller may read, cut at `top`, with what the gate and the cut left out.
+    let list = |o: &mut Jv, key: &str, rows: Vec<Jv>, of: usize| {
+        let (withheld, more) = (of - rows.len(), rows.len().saturating_sub(q.top));
+        o.set(key, Jv::Arr(rows.into_iter().take(q.top).collect()));
+        for (suffix, n) in [("withheld", withheld), ("more", more)] {
+            if n > 0 {
+                o.set(&format!("{key}_{suffix}"), Jv::u(n as u64));
+            }
+        }
+    };
+    match &s.facts.zombies {
+        Zombies::Unread(why) => {
+            o.set("zombies", Jv::why(why.word()));
+            o.set("zombie_count", Jv::why(why.word()));
+        }
+        Zombies::Read(v) => {
+            let shown = |z: &&ZombieParent| {
+                ctx.owner_class || z.tab.is_some_and(|t| ctx.target.panes.contains(&t))
+            };
+            let piles: Vec<Jv> = v
+                .piles
+                .iter()
+                .filter(shown)
+                .map(|z| {
+                    let mut p = Jv::obj([
+                        ("parent", Jv::u(u64::from(z.ppid))),
+                        ("exe", Jv::s(exe_word(&z.name))),
+                        ("count", Jv::u(u64::from(z.count))),
+                        ("per_min_deci", Jv::u(z.per_min_deci)),
+                    ]);
+                    if let Some(k) = z.tab {
+                        p.set("local", Jv::u(k));
+                        if let Some(n) = ctx.tab_number(k) {
+                            p.set("tab", Jv::u(n as u64));
+                        }
+                    }
+                    p
+                })
+                .collect();
+            list(&mut o, "zombies", piles, v.piles.len());
+            let count = u64::from(v.count);
+            o.set(
+                "zombie_count",
+                if v.whole {
+                    Jv::u(count)
+                } else {
+                    Jv::at_least(count, "truncated")
+                },
+            );
+            o.set("zombies_age_ms", Jv::u(v.age_ms));
+        }
+    }
+    match &s.facts.dstate {
+        DState::Unread(why) => {
+            for key in ["dstate", "dstate_count", "dstate_held", "dstate_scope"] {
+                o.set(key, Jv::why(why.word()));
+            }
+        }
+        DState::Read(v) => {
+            let mut procs: Vec<&crate::blockage::DStuck> = v.procs.iter().collect();
+            procs.sort_by_key(|d| (!d.held, d.pid));
+            let rows: Vec<Jv> = procs
+                .into_iter()
+                .filter(|_| ctx.owner_class)
+                .map(|d| {
+                    Jv::obj([
+                        ("pid", Jv::u(u64::from(d.pid))),
+                        ("exe", Jv::s(exe_word(&d.name))),
+                        (
+                            "threads",
+                            match d.threads.map(u64::from) {
+                                Some(n) if d.threads_cut => Jv::at_least(n, "truncated"),
+                                n => Jv::known_or(n, "unsupported"),
+                            },
+                        ),
+                        ("held", Jv::Bool(d.held)),
+                    ])
+                })
+                .collect();
+            list(&mut o, "dstate", rows, v.procs.len());
+            // The census reads this user's processes a budget's worth a pass: only a pass that
+            // was its whole cover read every process it listed. Any other leaves out a mark its
+            // budget did not re-read and whatever waits in the part of the list it did not reach.
+            // A read cut at a cap (`!v.whole`) leaves out what lay past the cut. Either way the
+            // counts are at least; the open cover is named first, as the wider gap.
+            let partial = v
+                .pass
+                .as_ref()
+                .is_some_and(|p| !(p.cover_done && p.passes_in_cover == 1));
+            let count = |n: usize| match (partial, v.whole) {
+                (true, _) => Jv::at_least(n as u64, "partial_census"),
+                (false, false) => Jv::at_least(n as u64, "truncated"),
+                (false, true) => Jv::u(n as u64),
+            };
+            o.set("dstate_count", count(v.procs.len()));
+            o.set("dstate_held", count(v.held()));
+            if v.scope == DScope::Machine {
+                o.set("dstate_blocked", Jv::known_or(v.blocked, "not_sampled"));
+            }
+            o.set("dstate_age_ms", Jv::u(v.age_ms));
+            o.set("dstate_scope", Jv::s(v.scope.word()));
+        }
+    }
+    o
+}
+
+/// The overview's `situation` object (A4 §8, §12.1), from [`Snapshot::situation`]: `{lid, power
+/// {source, battery_pct, charging}, docked, awake_since_ms, last_sleep {from_ms, to_ms, cause,
+/// wake}}`. What the machine lacks is the reading `none` (a desktop's lid, battery and docked; a
+/// machine that has not slept since it booted), and a value that is not a reading is its word
+/// ([`Reading::why`]). The network place is not here: the reply's `place` prints it
+/// ([`place_json`]), and Low Power Mode stays the global view's `thermal.low_power`.
+fn situation_json(s: &Snapshot) -> Jv {
+    let sit = &s.situation;
+    let none = || Jv::s("none");
+    let text = |t: &Option<String>| {
+        t.as_ref()
+            .map_or_else(|| Jv::why("not_sampled"), |t| Jv::s(t.clone()))
+    };
+    let lid = match &sit.lid {
+        Reading::Read(l) => Jv::s(l.lid.word()),
+        unread => reading_why(unread),
+    };
+    let power = match &sit.power {
+        Reading::Read(p) => Jv::obj([
+            ("source", Jv::s(p.source.word())),
+            (
+                "battery_pct",
+                p.battery.map_or_else(none, |b| Jv::u(u64::from(b.pct))),
+            ),
+            (
+                "charging",
+                p.battery.map_or_else(none, |b| Jv::Bool(b.charging)),
+            ),
+        ]),
+        unread => reading_why(unread),
+    };
+    let docked = match sit.docked() {
+        Reading::Read(Some(docked)) => Jv::Bool(docked),
+        Reading::Read(None) => none(),
+        unread => reading_why(&unread),
+    };
+    let (awake_since, last_sleep) = match &sit.awake {
+        Reading::Read(a) => (
+            Jv::Int(a.since_ms()),
+            a.last_sleep.as_ref().map_or_else(none, |sleep| {
+                Jv::obj([
+                    ("from_ms", Jv::Int(sleep.from_ms)),
+                    ("to_ms", Jv::Int(sleep.to_ms)),
+                    ("cause", text(&sleep.cause)),
+                    ("wake", text(&sleep.wake)),
+                ])
+            }),
+        ),
+        unread => (reading_why(unread), reading_why(unread)),
+    };
+    Jv::obj([
+        ("lid", lid),
+        ("power", power),
+        ("docked", docked),
+        ("awake_since_ms", awake_since),
+        ("last_sleep", last_sleep),
+    ])
 }
 
 fn global_json(s: &Snapshot) -> Jv {
@@ -3484,6 +3901,7 @@ fn global_json(s: &Snapshot) -> Jv {
             },
         ),
     );
+    o.set("queue", queue_json(s));
     o.set(
         "thermal",
         s.thermal
@@ -3495,7 +3913,10 @@ fn global_json(s: &Snapshot) -> Jv {
         o.set("mem_used_bytes", Jv::u(m.sample.used()));
         o.set("mem_available_bytes", Jv::u(m.sample.available));
         o.set("mem_total_bytes", Jv::u(m.sample.total));
-        o.set("swap_used_bytes", Jv::u(m.sample.swap_used));
+        o.set(
+            "swap_used_bytes",
+            Jv::known_or(m.sample.swap_used, "not_read"),
+        );
     } else {
         o.set("mem_pressure", Jv::why("unsupported"));
         o.set("mem_available_bytes", Jv::why("unsupported"));
@@ -3527,11 +3948,16 @@ fn global_json(s: &Snapshot) -> Jv {
             o.set("net_tx_bytes_per_s", Jv::u(r.tx_bps.round() as u64));
         }
         None => {
-            let why = if s.net.as_ref().is_some_and(|n| !n.links.is_empty()) {
-                "warming"
-            } else {
-                "not_sampled"
-            };
+            let why = s.net.as_ref().and_then(|n| n.rates_why).map_or_else(
+                || {
+                    if s.net.as_ref().is_some_and(|n| !n.links.is_empty()) {
+                        "warming"
+                    } else {
+                        "not_sampled"
+                    }
+                },
+                |why| why.word(),
+            );
             o.set("net_rx_bytes_per_s", Jv::why(why));
             o.set("net_tx_bytes_per_s", Jv::why(why));
         }
@@ -3720,6 +4146,9 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
         ("schema", Jv::Int(if q.view == View::Disk { 2 } else { 1 })),
         ("kind", Jv::s(format!("sys.{}", q.view.word()))),
     ]);
+    if let Some(f) = q.form {
+        o.set("form", Jv::s(f.word()));
+    }
     if let Some(sc) = q.view.default_scope().and(scope) {
         o.set("scope", Jv::s(sc.word()));
         if sc == ScopeArg::Request
@@ -3764,6 +4193,10 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("tab", tab_obj(ctx, s, &keys, &tab));
             o.set("split_mc", split_json(ctx, s, &tab));
             o.set("split_exact", Jv::s(split_exact(s)));
+            o.set("heat", heat_json(s));
+            o.set("procs", blockage_json(q, ctx, s));
+            o.set("situation", situation_json(s));
+            o.set("place", place_json(s));
         }
         View::Tab => {
             let keys = scope_keys(ctx, ScopeArg::Tab);
@@ -3889,7 +4322,6 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set(
                 "threads",
                 Jv::obj([
-                    ("runnable", Jv::why("not_sampled")),
                     (
                         "wait_mc",
                         s.global.wait.map_or_else(
@@ -4524,8 +4956,8 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         (
             "swap",
             Jv::obj([
-                ("used_bytes", Jv::u(m.sample.swap_used)),
-                ("total_bytes", Jv::u(m.sample.swap_total)),
+                ("used_bytes", Jv::known_or(m.sample.swap_used, "not_read")),
+                ("total_bytes", Jv::known_or(m.sample.swap_total, "not_read")),
             ]),
         ),
         (
@@ -4621,7 +5053,10 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     );
     o.set(
         "class_overflow_bytes",
-        Jv::u(m.sample.in_vm().saturating_sub(m.sample.total)),
+        match i64::try_from(m.sample.physical_classes(None).excess) {
+            Ok(bytes) => Jv::Int(bytes),
+            Err(_) => Jv::at_least(i64::MAX.unsigned_abs(), "integer_range"),
+        },
     );
     let mut rows: Vec<&ProcView> = s.procs.iter().filter(|r| r.footprint.is_some()).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.footprint));
@@ -4957,6 +5392,9 @@ fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv 
 }
 
 fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
+    if q.form == Some(DiskForm::Held) {
+        return Jv::obj([("held", held::json(ctx, s))]);
+    }
     let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
     let keys = scope_keys(ctx, scope);
     let f = tabs_fig(s, &keys, ctx.target.key);
@@ -5140,6 +5578,11 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         o.set("programs_withheld", Jv::u(withheld as u64));
     }
     o.set("volume", volume);
+    o.set(
+        "stores",
+        Jv::Arr(ctx.stores.iter().map(stores::StoreFact::json).collect()),
+    );
+    o.set("store_warnings", stores::warnings_json(ctx.stores));
     o.set("budget", budget_json(ctx.volume.map(|v| v.budget)));
     o
 }
@@ -5216,8 +5659,8 @@ fn place_value_json(value: &crate::model::PlaceValue) -> Jv {
     }
 }
 
-/// The `place` object of `sys --json`'s net view: the host's [`crate::model::PlaceView`] as it
-/// came, or `{"why":"not_sampled"}` with none.
+/// The `place` object of `sys --json`'s overview, global and net views: the host's
+/// [`crate::model::PlaceView`] as it came, or `{"why":"not_sampled"}` with none.
 fn place_json(s: &Snapshot) -> Jv {
     s.place.as_ref().map_or_else(
         || Jv::why("not_sampled"),
@@ -5236,11 +5679,16 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
     let Some(net) = s.net.as_ref() else {
         return Jv::why("not_sampled");
     };
-    let rates_why = if net.links.is_empty() {
-        "not_sampled"
-    } else {
-        "warming"
-    };
+    let rates_why = net.rates_why.map_or_else(
+        || {
+            if net.links.is_empty() {
+                "not_sampled"
+            } else {
+                "warming"
+            }
+        },
+        |why| why.word(),
+    );
     let primary = s
         .facts
         .link
@@ -5264,6 +5712,15 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
                 ),
                 ("rx_bytes", Jv::u(x.rx)),
                 ("tx_bytes", Jv::u(x.tx)),
+                ("byte_counter", Jv::s(x.byte_counter.word())),
+                (
+                    "byte_counter_bits",
+                    Jv::known_or(x.byte_counter.bits().map(u64::from), "not_sampled"),
+                ),
+                (
+                    "byte_counter_quantum_bytes",
+                    Jv::known_or(x.byte_counter.quantum(), "not_sampled"),
+                ),
                 ("rx_packets", Jv::u(x.rx_packets)),
                 ("tx_packets", Jv::u(x.tx_packets)),
                 ("rx_errors", Jv::u(x.rx_errors)),
@@ -5273,7 +5730,10 @@ fn net_json(q: &SysQuery, s: &Snapshot) -> Jv {
                 ("link_bps", Jv::known_or(x.rate_bps, "unsupported")),
                 (
                     "per_s",
-                    l.rates.map_or_else(|| Jv::why("warming"), link_rates_json),
+                    l.rates.map_or_else(
+                        || Jv::why(l.rates_why.map_or("warming", |why| why.word())),
+                        link_rates_json,
+                    ),
                 ),
             ])
         })

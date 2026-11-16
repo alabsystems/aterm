@@ -1494,7 +1494,11 @@ fn misread(s: &Sample) -> bool {
         .iter()
         .filter_map(|r| r.footprint)
         .fold(0, u64::saturating_add);
-    let room = mem.total.saturating_add(mem.swap_total);
+    let Some(swap_total) = mem.swap_total else {
+        // Without the swap bound a large footprint does not prove a layout misread.
+        return false;
+    };
+    let room = mem.total.saturating_add(swap_total);
     mem.total > 0 && held > room.saturating_mul(MISREAD_X)
 }
 

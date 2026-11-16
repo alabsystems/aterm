@@ -434,3 +434,17 @@ fn spawn_with_bad_theme_spawns_nothing() {
         }))
     );
 }
+
+/// A host config install rings the keeper's META pump once: it may move what a META carries (the
+/// host's mode policy, keyboard enables) with no output for the PTY reader to see.
+#[cfg(unix)]
+#[test]
+fn a_config_install_rings_the_keepers_meta_pump() {
+    let session = crate::stub_session(1);
+    let before = crate::keeper_link::rings();
+    super::install_session_config(
+        &session,
+        &Arc::new(aterm_core::config::TerminalConfig::default()),
+    );
+    assert_eq!(crate::keeper_link::rings(), before + 1);
+}

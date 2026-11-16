@@ -160,6 +160,77 @@ fn the_free_history_round_trips_through_its_rows() {
     );
 }
 
+const HOUR: i64 = WEEK_BUCKET_S * 1000;
+
+/// DC-09c: the three-week series is the 24-hour one's rule at hour buckets. Fed 22 days of
+/// ten-minute readings on the half-slot (each slot inside one hour), it keeps the last 504 hours,
+/// each holding its six readings and the whole hour; its rows are stamped on the hour, and a
+/// relaunch restores the same 504 buckets. Negative controls: the 24-hour series fed the same
+/// readings keeps 144 buckets of one reading each (the bucket width and count are the type's,
+/// not shared); a restore three weeks and more after the last write is empty, and two days
+/// after keeps 456 rows (the restore holds the series' own span); a restored series read on
+/// another mount starts afresh.
+#[test]
+fn the_three_week_free_history_keeps_hour_buckets_across_a_relaunch() {
+    const READINGS: i64 = 22 * 24 * 6;
+    let at = |m: i64| T0 + 300_000 + m * TEN;
+    let free = |m: i64| 900_000_000_000 - m as u64 * 1_000;
+    let mut weeks = FreeWeeks::new();
+    let mut day = FreeHistory::new();
+    for m in 0..READINGS {
+        weeks.note_on(DATA, SIZE, Taken::at(at(m), 600_000), free(m));
+        day.note_on(DATA, SIZE, Taken::at(at(m), 600_000), free(m));
+    }
+    let now = at(READINGS - 1);
+    assert_eq!(weeks.len(), WEEK_BUCKETS, "trimmed to 21 days");
+    let b = weeks.buckets(now);
+    assert_eq!(b.len(), WEEK_BUCKETS);
+    assert!(
+        b.iter()
+            .all(|a| a.is_some_and(|a| a.n == 6 && a.tau_ms == 3_600_000)),
+        "each hour holds its six readings and the whole hour"
+    );
+    let saved = weeks.saved().expect("three weeks read");
+    assert_eq!(saved.rows.len(), WEEK_BUCKETS);
+    assert!(
+        saved.rows.iter().all(|&(start, _)| start % HOUR == 0),
+        "on the hour"
+    );
+    assert_eq!(saved.rows[0].0, (now.div_euclid(HOUR) - 503) * HOUR);
+    let back = FreeWeeks::restored(&saved, now);
+    assert_eq!(back.buckets(now), b, "the same three weeks");
+    assert_eq!(back.saved(), Some(saved.clone()));
+
+    let mut on = weeks.clone();
+    on.note_on(DATA, SIZE, Taken::at(now + HOUR, 600_000), 5);
+    assert_eq!(on.len(), WEEK_BUCKETS, "an hour on: still 21 days");
+    let rows = on.saved_rows();
+    assert_eq!(rows[0].0, saved.rows[1].0, "the oldest hour dropped");
+    assert_eq!(rows.last().map(|r| r.1.min), Some(5.0));
+
+    assert_eq!(day.len(), FREE_BUCKETS, "control: the day keeps 144");
+    assert!(
+        day.buckets(now)
+            .iter()
+            .all(|a| a.is_some_and(|a| a.n == 1 && a.tau_ms == 600_000)),
+        "control: ten-minute buckets of one reading"
+    );
+    assert!(
+        FreeWeeks::restored(&saved, now + 22 * 24 * HOUR).is_empty(),
+        "control: a restore past three weeks is empty"
+    );
+    assert_eq!(
+        FreeWeeks::restored(&saved, now + 48 * HOUR)
+            .saved_rows()
+            .len(),
+        WEEK_BUCKETS - 48,
+        "control: two days on, 456 hours kept"
+    );
+    let mut moved = back.clone();
+    moved.note_on("/Volumes/Backup", SIZE, Taken::at(now + HOUR, 600_000), 7);
+    assert_eq!(moved.len(), 1, "control: another mount starts afresh");
+}
+
 #[test]
 fn a_restored_history_keeps_only_the_last_24_hours() {
     let saved = SavedFree {

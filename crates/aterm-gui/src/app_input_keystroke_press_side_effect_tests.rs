@@ -210,7 +210,7 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
         let mut glow_out = Vec::new();
         let mut trail_out = Vec::new();
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.fx
                 .cursor_mut()
                 .glow
@@ -224,7 +224,7 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
         }
         let _ = app.input(wid, ctrl_k.clone(), Source::Human);
         let moved = Instant::now();
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let glow_fp =
             ws.fx
                 .cursor_mut()
@@ -355,7 +355,7 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
         let mut glow_out = Vec::new();
         let mut trail_out = Vec::new();
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.fx
                 .cursor_mut()
                 .glow
@@ -370,7 +370,7 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
             crate::input::InputOutcome::WriteFailed,
             "the synthetic headless sink proves no bytes landed"
         );
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let moved = now + Duration::from_millis(4);
         assert_eq!(
             ws.fx
@@ -503,7 +503,7 @@ fn failed_queued_key_write_revokes_its_press_credit() {
                     "the prelude read the failed receipt"
                 );
             }
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             let moved = dispatched + Duration::from_millis(4);
             let mut glow_out = Vec::new();
             let mut trail_out = Vec::new();

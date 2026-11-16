@@ -13,7 +13,7 @@ fn scratch() -> aterm_tempfile::TempDir {
 #[test]
 fn prune_never_removes_an_entry_rewritten_after_it_was_read() {
     let s = scratch();
-    let entry = s.path().join("s-0bad");
+    let entry = s.path().join("t0badxxxxxx");
     let dead = "sock /tmp/x/a.sock\nnonce 00\npid 1234567\n";
     let live = format!("sock /tmp/x/a.sock\nnonce 11\npid {}\n", std::process::id());
     std::fs::write(&entry, &live).unwrap();

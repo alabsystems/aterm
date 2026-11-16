@@ -869,9 +869,10 @@ impl App {
 
     /// Replaces the previous frame's pane overlay quads on window `wid` with this frame's.
     pub(crate) fn splice_pane_overlay(&mut self, wid: WindowId) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let overlay = &mut ws.pane_overlay;
         if overlay.painted.is_empty()
             && overlay.pending.is_empty()
@@ -909,7 +910,8 @@ impl App {
     ) {
         let multi = plan.leaves.len() > 1;
         let Some(inputs) = self.pane_overlay_inputs_from_plan(wid, multi, Some(plan)) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.pane_overlay.clear();
             }
             return;
@@ -931,9 +933,10 @@ impl App {
             });
             read.push((session, facts));
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let overlay = &mut ws.pane_overlay;
         overlay.begin();
         for (session, facts) in read {
@@ -1023,10 +1026,15 @@ impl App {
             return true;
         }
         let hover = self.scrollbar_at(wid, x, y).map(|(f, ..)| f.session);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.pane_overlay.hover != hover
-        {
+        let changed = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+            let ws = &mut **ws;
+            if ws.pane_overlay.hover == hover {
+                return false;
+            }
             ws.pane_overlay.hover = hover;
+            true
+        });
+        if changed {
             self.redraw_overlay(wid);
         }
         hover.is_some()
@@ -1034,10 +1042,10 @@ impl App {
 
     /// The pointer left window `wid`: no bar is hovered.
     pub(crate) fn scrollbar_pointer_left(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.pane_overlay.drag.is_none()
-            && ws.pane_overlay.hover.take().is_some()
-        {
+        let changed = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+            ws.pane_overlay.drag.is_none() && ws.pane_overlay.hover.take().is_some()
+        });
+        if changed {
             self.redraw_overlay(wid);
         }
     }
@@ -1056,7 +1064,8 @@ impl App {
         }
         match hit {
             scrollbar::Hit::Thumb { grab } => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.pane_overlay.drag = Some(Drag {
                         session: facts.session,
                         grab,
@@ -1084,12 +1093,14 @@ impl App {
         let ended = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.pane_overlay.drag.take())
             .is_some();
         if ended {
             if let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) {
                 let hover = self.scrollbar_at(wid, x, y).map(|(f, ..)| f.session);
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.pane_overlay.hover = hover;
                 }
             }
@@ -1151,9 +1162,10 @@ impl App {
         let Some(term) = self.pool.get(session).map(|s| s.live_term().clone()) else {
             return;
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws
             .scroll_glide
             .as_ref()
@@ -1183,6 +1195,7 @@ impl App {
             f.offset = u32::try_from(offset).unwrap_or(u32::MAX);
         }
         ws.scroll_pill.touch(Instant::now());
+        drop(route_guard_ws);
         self.redraw_overlay(wid);
     }
 }

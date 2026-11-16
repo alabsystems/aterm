@@ -201,7 +201,7 @@ struct FailedPolicy {
     retries: bool,
     peer_ends_wait: bool,
     parked: bool,
-    bot_checked: bool,
+    check_held: bool,
 }
 
 fn failed_policy(fixture: &Fixture) -> FailedPolicy {
@@ -224,7 +224,7 @@ fn failed_policy(fixture: &Fixture) -> FailedPolicy {
         retries,
         peer_ends_wait: guard.ladder.retry_at("shared", clock).is_none(),
         parked: guard.parked.contains_key("shared"),
-        bot_checked: guard.bot_checked.contains_key("shared"),
+        check_held: guard.unrecorded_checks.contains_key("shared"),
     }
 }
 
@@ -421,7 +421,7 @@ fn shared_failure_diagnostics_do_not_change_custody_or_retry_policy() {
             let policy = failed_policy(&fixture);
             assert_eq!(policy.outcome, accounts::shared::Outcome::Unknown);
             assert!(policy.staging_retained && policy.retries && policy.peer_ends_wait);
-            assert!(!policy.parked && !policy.bot_checked && !policy.ordinary_attempt);
+            assert!(!policy.parked && !policy.check_held && !policy.ordinary_attempt);
             if let Some(baseline) = &baseline {
                 assert_eq!(&policy, baseline);
             } else {

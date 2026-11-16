@@ -55,8 +55,9 @@ struct Verified {
     /// A successful check under the fixed signature domain, never a historical writer grant.
     signer: OnceLock<[u8; 32]>,
     /// The current payload key's comparison token after successful authentication of a payload
-    /// that is not a cutoff. This is neither a key nor a permission to obtain one.
-    non_cut_key: OnceLock<crypto::PayloadKeyIdentity>,
+    /// that is neither a cutoff nor a checkpoint. This is neither a key nor a permission to obtain
+    /// one.
+    non_control_key: OnceLock<crypto::PayloadKeyIdentity>,
 }
 
 /// Content-bound cryptographic facts, independently retainable without wire bodies.
@@ -103,7 +104,7 @@ impl Identified {
             Arc::new(Verified {
                 id,
                 signer: OnceLock::new(),
-                non_cut_key: OnceLock::new(),
+                non_control_key: OnceLock::new(),
             })
         });
         Self(Arc::new(Wire { wire, facts }))
@@ -117,16 +118,16 @@ impl Identified {
         &self.0.wire
     }
 
-    pub(super) fn verified_non_cut(&self, key_identity: &crypto::PayloadKeyIdentity) -> bool {
+    pub(super) fn verified_non_control(&self, key_identity: &crypto::PayloadKeyIdentity) -> bool {
         self.0
             .facts
-            .non_cut_key
+            .non_control_key
             .get()
             .is_some_and(|known| known.matches(key_identity))
     }
 
-    pub(super) fn remember_non_cut(&self, key_identity: crypto::PayloadKeyIdentity) {
-        let _ = self.0.facts.non_cut_key.set(key_identity);
+    pub(super) fn remember_non_control(&self, key_identity: crypto::PayloadKeyIdentity) {
+        let _ = self.0.facts.non_control_key.set(key_identity);
     }
 
     /// A retained wire's allocations: its byte capacity and both shared objects, including

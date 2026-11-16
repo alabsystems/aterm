@@ -112,7 +112,7 @@ fn render(palettes: &[Palette]) -> String {
     };
     let mut out = format!(
         "// SPDX-License-Identifier: Apache-2.0\n// Copyright 2026 Andrew Yates\n{}\n\n",
-        aterm_census::seal::line(
+        aterm_seal::line(
             "//",
             "aterm-effects' `the_shipped_tables_are_the_generators_output` test under \
              ATERM_BLESS_GOLDEN=1"
@@ -156,7 +156,7 @@ fn render(palettes: &[Palette]) -> String {
         ));
     }
     out.push_str("];\n");
-    aterm_census::seal::stamp(&out).expect("the head carries a seal line")
+    aterm_seal::stamp(&out).expect("the head carries a seal line")
 }
 
 /// **THE SHIPPED TABLES ARE THE SOLVER'S OUTPUT**, byte for byte: every shipped page solved

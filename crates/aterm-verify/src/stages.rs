@@ -3,6 +3,7 @@
 
 //! The stages themselves.
 
+use crate::artifact::Profile;
 use crate::exec::{self, Cmd};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{Lane, StageId, StageSpec, lane_dir};
@@ -206,16 +207,25 @@ pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 /// The measuring executables selected by the runner and its content receipts.
 pub const MEASURING_TARGETS: [&str; 5] = ["paint", "spin", "aos", "rewind", "size"];
 
-/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos --bench rewind --bench size`: the measuring stage's one child, the paint, spin, aos, rewind and size matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes, repair main-thread time and Rewind step latency on a live instance, and its executable's slice for this Mac against its ceiling.
+/// The matrices applicable to the admitted assertion profile. Shipping size has no debug
+/// ceiling; the runtime matrices still judge a debug artifact's native behavior.
+fn measuring_targets(profile: Profile) -> impl Iterator<Item = &'static str> {
+    MEASURING_TARGETS
+        .into_iter()
+        .filter(move |target| profile == Profile::Release || *target != "size")
+}
+
+/// The measuring stage's one child: the paint, spin, aos and rewind matrices, and the shipping
+/// executable size matrix for a release assertion profile. Every selected matrix must report.
 #[must_use]
-pub fn measuring_args() -> Vec<String> {
-    measuring_targets_args()
+pub fn measuring_args(profile: Profile) -> Vec<String> {
+    measuring_targets_args(profile)
 }
 
 /// [`measuring_args`]'s compile alone (`--no-run`): the measuring rows' prebuild, the main lane's last row before the first barrier, so the exclusive stage that runs them compiles nothing. Planned only where no workspace test compile builds them ([`crate::plan::folds_measuring`]).
 #[must_use]
 pub fn measure_prebuild_args() -> Vec<String> {
-    let mut a = measuring_targets_args();
+    let mut a = measuring_targets_args(Profile::Release);
     a.push("--no-run".to_string());
     a
 }
@@ -231,7 +241,7 @@ pub fn measuring_bench_args() -> Vec<String> {
         .collect()
 }
 
-fn measuring_targets_args() -> Vec<String> {
+fn measuring_targets_args(profile: Profile) -> Vec<String> {
     let mut a: Vec<String> = [
         "--unverified",
         "bench",
@@ -243,7 +253,7 @@ fn measuring_targets_args() -> Vec<String> {
     ]
     .map(String::from)
     .into();
-    a.extend(measuring_bench_args());
+    a.extend(measuring_targets(profile).flat_map(|t| ["--bench".to_string(), t.to_string()]));
     a
 }
 
@@ -1523,9 +1533,9 @@ fn doctest_cmd(ctx: &Ctx, bind: bool) -> Cmd {
 }
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
-pub const NO_APP: &str = "(no release bundle to judge — fix: pass --app <path to aterm.app>; \
-                          `targo --unverified ship dev-app --no-install` assembles this checkout's \
-                          as dist/aterm (dev).app)";
+pub const NO_APP: &str = "(no bundle to judge — fix: pass --app <path to aterm.app>; \
+                          for native debug validation use --app-profile debug with the bundle \
+                          `targo --unverified ship dev-app --profile test --no-install` builds)";
 
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
@@ -1544,7 +1554,11 @@ fn measuring_targo(ctx: &Ctx, args: Vec<String>) -> (String, Cmd) {
     (label, main_targo(ctx, args))
 }
 
-fn measuring_cmd(ctx: &Ctx, artifact: &crate::MeasureArtifact, args: Vec<String>) -> (String, Cmd) {
+fn measuring_cmd(
+    ctx: &Ctx,
+    artifact: &crate::AdmittedArtifact<'_>,
+    args: Vec<String>,
+) -> (String, Cmd) {
     let (label, cmd) = measuring_targo(ctx, args);
     let bin = artifact.bin("aterm");
     let mut cmd = cmd
@@ -1576,7 +1590,6 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
         r.skip(format!("measuring matrices {NO_APP}"));
         return;
     };
-    let (label, cmd) = measuring_cmd(ctx, artifact, measuring_args());
     if crate::plan::folds_measuring(ctx)
         && ctx
             .test_compile_failed
@@ -1584,9 +1597,26 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
     {
         // Its benches were the test compile's to build: compiling them here would hold the
         // quiet machine for a build no memory claim covers.
+        let (label, _) = measuring_targo(ctx, measuring_args(artifact.profile));
         not_run_behind(r, &label, "the test compile that builds its benches failed");
         return;
     }
+    if let Err(why) = artifact.with_admission(ctx, |admitted| {
+        let (label, cmd) = measuring_cmd(ctx, admitted, measuring_args(admitted.profile()));
+        measuring_tests_admitted(ctx, r, admitted, &label, &cmd)
+    }) {
+        r.cannot_run(format!("measuring matrices: {why}"));
+    }
+}
+
+fn measuring_tests_admitted(
+    ctx: &Ctx,
+    r: &mut Report,
+    artifact: &crate::AdmittedArtifact<'_>,
+    label: &str,
+    cmd: &Cmd,
+) {
+    r.raw(format!("measurement subject: {}", artifact.describe()));
     let subject = Subject::of(ctx, artifact);
     if ctx.no_windows {
         r.skip(MEASURE_WINDOW_ROWS_SKIP);
@@ -1595,14 +1625,16 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
     // quiet claim (aterm-conformance's `benches/support/quiet.rs`), at once where this run's own
     // claim covers it. Any wait for it is behind other runs, not on a scratch lock of its own, so
     // the ceiling leaves it out, as it does a lab's.
-    run_child(ctx, r, &label, &cmd, |r, run, label| {
+    run_child(ctx, r, label, cmd, |r, run, label| {
         decide_measuring_child(r, run, label, &subject);
     });
 }
 
 /// The bundle `measure` asked, as its rows' decisions need it.
 pub(crate) struct Subject {
-    /// [`crate::MeasureArtifact::describe`].
+    /// The assertion contract proved by the artifact that the child actually executes.
+    profile: Profile,
+    /// [`crate::AdmittedArtifact::describe`].
     name: String,
     /// This checkout's HEAD, in full, when git names it.
     head: Option<String>,
@@ -1612,9 +1644,10 @@ pub(crate) struct Subject {
 }
 
 impl Subject {
-    pub(crate) fn of(ctx: &Ctx, artifact: &crate::MeasureArtifact) -> Self {
+    pub(crate) fn of(ctx: &Ctx, artifact: &crate::AdmittedArtifact<'_>) -> Self {
         let head = crate::head_commit(&ctx.root, &ctx.path_env);
         Self {
+            profile: artifact.profile(),
             name: artifact.describe(),
             own: head.as_deref().is_some_and(|h| artifact.built_from(h)),
             head,
@@ -1818,6 +1851,9 @@ fn strip_ansi_if_any(s: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject: &Subject) {
+    if subject.profile == Profile::Debug {
+        r.skip("shipping executable size requires a release artifact; debug validation cannot qualify a release");
+    }
     let unanswered = unanswered_rows(&run.output);
     if subject.own && !unanswered.is_empty() {
         subject.unanswered(r, Some(run), label, &unanswered);
@@ -1829,7 +1865,7 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     let mut any_failed = false;
     let mut any_undecided = false;
     let mut all_reported = true;
-    for target in MEASURING_TARGETS {
+    for target in measuring_targets(subject.profile) {
         let prefix = format!("measure result: {target} ");
         let mut summaries = run.output.lines().filter_map(|l| l.strip_prefix(&prefix));
         let counts = summaries.next().and_then(MeasuringCounts::parse);
@@ -3176,6 +3212,7 @@ fn appkit_runtime_parent(ctx: &Ctx) -> std::path::PathBuf {
     ))
 }
 
+#[cfg(unix)]
 fn finalized_appkit_command(
     ctx: &Ctx,
     path: &std::path::Path,

@@ -25,6 +25,7 @@ fn layout_keeps_everything_under_one_local_app_data() {
         l.log(),
         l.smoke_report("1a37de31a340"),
         l.installed(),
+        l.tree_tool_dir(),
     ] {
         assert!(path.starts_with(scratch.path()), "{}", path.display());
     }
@@ -345,4 +346,85 @@ fn a_dist_that_cannot_be_replaced_is_put_back() {
     swap_in(&building, &dist, &replaced).expect("swapped");
     assert_eq!(image(&dist), "new");
     assert!(!building.exists() && !replaced.exists());
+}
+
+#[test]
+fn a_smoke_s_exit_code_is_its_verdict() {
+    assert_eq!(smoke_verdict(Some(PASS)), Smoke::Pass);
+    assert_eq!(smoke_verdict(Some(FAILED)), Smoke::Fail);
+    assert_eq!(smoke_verdict(Some(NOT_RUN)), Smoke::NotRun);
+    // A usage error, a crash or a kill judged nothing good: the build is not passed.
+    assert_eq!(smoke_verdict(Some(crate::USAGE)), Smoke::Fail);
+    assert_eq!(smoke_verdict(Some(-1073741819)), Smoke::Fail);
+    assert_eq!(smoke_verdict(None), Smoke::Fail);
+}
+
+#[test]
+fn the_tree_s_tool_replaces_the_scheduled_copy_and_keeps_the_old_one_aside() {
+    let scratch = aterm_tempfile::tempdir().expect("tempdir");
+    let fresh = scratch.path().join("tool").join("aterm-winship.exe");
+    std::fs::create_dir_all(fresh.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&fresh, b"new tool").expect("write");
+    let kept = scratch.path().join("aterm-winship.exe");
+
+    // No scheduled copy: nothing is made (only `schedule` makes one).
+    assert_eq!(adopt_tool(&fresh, &kept), Ok(false));
+    assert!(!kept.exists());
+
+    // The same bytes: nothing is touched.
+    std::fs::write(&kept, b"new tool").expect("write");
+    assert_eq!(adopt_tool(&fresh, &kept), Ok(false));
+    assert!(!old_tool(&kept).exists());
+
+    // Other bytes: the old copy goes aside, the new one takes its name.
+    std::fs::write(&kept, b"old tool").expect("write");
+    std::fs::write(old_tool(&kept), b"older still").expect("write");
+    assert_eq!(adopt_tool(&fresh, &kept), Ok(true));
+    assert_eq!(std::fs::read(&kept).expect("read"), b"new tool");
+    assert_eq!(std::fs::read(old_tool(&kept)).expect("read"), b"old tool");
+    assert_eq!(
+        old_tool(&kept).file_name().and_then(|n| n.to_str()),
+        Some("aterm-winship.exe.old")
+    );
+
+    // A fresh tool that is not there: an error, and the scheduled copy is as it was.
+    let gone = scratch.path().join("gone.exe");
+    assert!(adopt_tool(&gone, &kept).is_err());
+    assert_eq!(std::fs::read(&kept).expect("read"), b"new tool");
+}
+
+#[test]
+fn only_a_tool_that_reached_its_own_verdict_is_kept() {
+    assert!(reached_verdict(Some(PASS)));
+    assert!(reached_verdict(Some(FAILED)));
+    // Not run, a usage error, a panic, a missing DLL, a kill: the tool proved nothing.
+    for code in [
+        Some(NOT_RUN),
+        Some(crate::USAGE),
+        Some(101),
+        Some(-1073741515),
+        None,
+    ] {
+        assert!(!reached_verdict(code), "{code:?}");
+    }
+}
+
+#[test]
+fn the_tool_flag_is_passed_only_to_a_build_ps1_that_declares_it() {
+    let now = std::fs::read_to_string(
+        aterm_tempfile::manifest_dir()
+            .join("..")
+            .join("..")
+            .join("apps")
+            .join("aterm-win")
+            .join("build.ps1"),
+    )
+    .expect("build.ps1");
+    assert!(takes_tool(&now));
+    // A tree from before -Tool: `-Toolchain` alone, which PowerShell would match `-Tool` to.
+    let before = "param(\n    [string]$Out,\n    [ValidateSet(\"auto\", \"trust\", \"stock\")]\n    [string]$Toolchain = \"auto\",\n    [string]$Builder,\n    [switch]$AllowDirty\n)\n";
+    assert!(!takes_tool(before));
+    assert!(takes_tool(
+        &before.replace("$AllowDirty\n", "$AllowDirty,\n    [string]$Tool\n")
+    ));
 }

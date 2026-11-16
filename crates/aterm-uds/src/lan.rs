@@ -90,6 +90,15 @@ pub enum Unavailable {
     /// No broker answers its socket: setup's one elevation has not installed it (a standard user,
     /// or a Mac password nobody typed).
     NotInstalled,
+    /// No broker answers its socket, though its LaunchDaemon plist is installed and launchd does
+    /// not list its job switched off: launchd does not run it (it stopped, or never started).
+    /// Setup's one elevation starts it ([`absent`]).
+    NotRunning,
+    /// No broker answers its socket because launchd lists its installed job switched off: aterm's
+    /// background item turned off in System Settings' Login Items, or `launchctl disable`. That
+    /// choice is the person's, and setup leaves it so; switching the job back on lets setup start
+    /// it ([`absent`]).
+    SwitchedOff,
     /// The broker speaks another protocol version (`ours`, `theirs`): it adopts a signed update by
     /// itself; an ad-hoc build's broker is renewed by that build's elevation.
     Outdated {
@@ -114,6 +123,17 @@ impl std::fmt::Display for Unavailable {
             Self::NotInstalled => f.write_str(
                 "the LAN broker is not installed: setup's Mac password installs it \
                  (`sudo aterm machines here apply --plain`)",
+            ),
+            Self::NotRunning => f.write_str(
+                "the LAN broker is installed and not running: setup's Mac password starts it \
+                 (`sudo aterm machines here apply --plain`)",
+            ),
+            Self::SwitchedOff => write!(
+                f,
+                "the LAN broker's job {LABEL} is switched off in launchd (aterm's background item \
+                 in System Settings' Login Items, or `launchctl disable`), which setup leaves as \
+                 the person's choice; switching it back on there, or `sudo launchctl enable \
+                 system/{LABEL}`, lets setup start it"
             ),
             Self::Outdated { ours, theirs } => write!(
                 f,
@@ -420,6 +440,10 @@ pub struct Seam {
     pub protocol: Option<u32>,
     /// The broker socket this thread's client dials instead of [`socket_path`].
     pub socket: Option<PathBuf>,
+    /// Where no broker answers ([`absent`]): `Some(switched_off)` reads the broker's plist
+    /// installed and launchd's switch of its job as `switched_off` (`None`: launchd could not
+    /// say); `None` reads nothing, so the broker reads not installed, as in a test binary.
+    pub installed_job: Option<Option<bool>>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -449,6 +473,66 @@ pub fn seam_here<R>(seam: Seam, f: impl FnOnce() -> R) -> R {
 #[must_use]
 pub fn seam() -> Seam {
     SEAM.with(|here| here.borrow().clone())
+}
+
+/// Why no broker answers the dialled socket and no direct path serves this process: its plist
+/// is not installed ([`Unavailable::NotInstalled`]), launchd lists its installed job switched
+/// off ([`Unavailable::SwitchedOff`]), or launchd does not run it ([`Unavailable::NotRunning`]).
+/// Only an installed plist asks launchd, and one reading serves this process for ten seconds, so
+/// dials that keep failing run `launchctl` that seldom. A test binary reads neither: its thread's
+/// [`Seam::installed_job`] answers.
+pub(crate) fn absent() -> Unavailable {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(switched_off) = SEAM.with(|here| here.borrow().installed_job) {
+        return absent_given(|| true, || switched_off);
+    }
+    absent_given(
+        || {
+            cfg!(target_os = "macos")
+                && crate::test_binary::scratch_root().is_none()
+                && std::fs::symlink_metadata(PLIST_PATH).is_ok()
+        },
+        kept_switch_off,
+    )
+}
+
+/// [`absent`]'s rule: a broker not `installed` is [`Unavailable::NotInstalled`], and launchd's
+/// switch is read only for an installed one: [`Unavailable::SwitchedOff`] where launchd lists it
+/// `switched_off`, else [`Unavailable::NotRunning`], whose elevation starts it (a switch launchd
+/// cannot say included, as setup's reading of what it owes takes it).
+fn absent_given(
+    installed: impl FnOnce() -> bool,
+    switched_off: impl FnOnce() -> Option<bool>,
+) -> Unavailable {
+    if !installed() {
+        Unavailable::NotInstalled
+    } else if switched_off() == Some(true) {
+        Unavailable::SwitchedOff
+    } else {
+        Unavailable::NotRunning
+    }
+}
+
+/// How long one launchd reading of the broker's switch serves [`absent`].
+const SWITCH_KEPT: Duration = Duration::from_secs(10);
+
+/// launchd's switch of the broker's job ([`crate::launchd::system_job_switched_off`]), read again
+/// once the last reading is [`SWITCH_KEPT`] old.
+fn kept_switch_off() -> Option<bool> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static KEPT: Mutex<Option<(Instant, Option<bool>)>> = Mutex::new(None);
+    let mut kept = KEPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, off)) = *kept
+        && at.elapsed() < SWITCH_KEPT
+    {
+        return off;
+    }
+    let off = crate::launchd::system_job_switched_off(LABEL);
+    *kept = Some((Instant::now(), off));
+    off
 }
 
 /// The protocol this thread names: [`PROTOCOL`], or a test's [`Seam::protocol`].

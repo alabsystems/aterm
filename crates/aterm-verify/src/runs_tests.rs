@@ -8,9 +8,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+#[cfg(unix)]
+use aterm_uds::process::process_presence;
 use aterm_uds::process::{
     Birth, EndControl, GroupMembers, HeldNow, Lineage, Markers, ProcessPresence, end_proven,
-    process_presence,
 };
 
 const SIGTERM: i32 = 15;
@@ -2765,6 +2766,7 @@ fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
 
 /// Selects the dead run's launcher stand-in: set, this test binary is a verify run's launcher,
 /// and its value is the scratch directory whose `records` it writes its run's record into.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const LAUNCHER_ENV: &str = "ATERM_VERIFY_LAUNCHER_CHILD";
 
 /// A verify run's launcher, as far as a later run's start pass reads one: it writes its run's

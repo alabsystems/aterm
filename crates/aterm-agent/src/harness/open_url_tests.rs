@@ -1178,38 +1178,7 @@ fn flat_webmail_password_aliases_keep_the_requested_account() {
     use super::super::headless_oauth::MailboxConfig;
 
     let home = aterm_tempfile::tempdir().expect("private password alias home");
-    crate::vault_entry::put(home.path(), "webmail-password", "file-secret\r\n");
-
-    for (suffix, value, expected) in [
-        (
-            "_webmail_password_file",
-            "~/.secrets/webmail-password",
-            "file-secret",
-        ),
-        (
-            "-webmail-password-file",
-            "~/.secrets/webmail-password",
-            "file-secret",
-        ),
-        (
-            "_password_file",
-            "~/.secrets/webmail-password",
-            "file-secret",
-        ),
-        (
-            "-password-file",
-            "~/.secrets/webmail-password",
-            "file-secret",
-        ),
-        ("_pass_file", "~/.secrets/webmail-password", "file-secret"),
-        ("-pass-file", "~/.secrets/webmail-password", "file-secret"),
-        ("_webmail_password", "direct-secret", "direct-secret"),
-        ("-webmail-password", "direct-secret", "direct-secret"),
-        ("_password", "direct-secret", "direct-secret"),
-        ("-password", "direct-secret", "direct-secret"),
-        ("_pass", "direct-secret", "direct-secret"),
-        ("-pass", "direct-secret", "direct-secret"),
-    ] {
+    let check_alias = |suffix: &str, value: &str, expected: &str| {
         let mut cfg =
             MailboxConfig::from_toml_str(&format!("m27{suffix} = '{value}'\n"), Some(home.path()))
                 .expect("parse flat per-account alias");
@@ -1226,6 +1195,60 @@ fn flat_webmail_password_aliases_keep_the_requested_account() {
             cfg.password_for(Some("opaque@example.test")).as_deref(),
             Some(expected)
         );
+    };
+
+    let local = home.path().join("webmail-password");
+    aterm_uds::atomic_file::write(&local, b"file-secret\r\n", 0o600).unwrap();
+    for suffix in [
+        "_webmail_password_file",
+        "-webmail-password-file",
+        "_password_file",
+        "-password-file",
+        "_pass_file",
+        "-pass-file",
+    ] {
+        check_alias(suffix, "~/webmail-password", "file-secret");
+    }
+
+    #[cfg(unix)]
+    {
+        crate::vault_entry::put(home.path(), "webmail-password", "file-secret\r\n");
+        for (suffix, value, expected) in [
+            (
+                "_webmail_password_file",
+                "~/.secrets/webmail-password",
+                "file-secret",
+            ),
+            (
+                "-webmail-password-file",
+                "~/.secrets/webmail-password",
+                "file-secret",
+            ),
+            (
+                "_password_file",
+                "~/.secrets/webmail-password",
+                "file-secret",
+            ),
+            (
+                "-password-file",
+                "~/.secrets/webmail-password",
+                "file-secret",
+            ),
+            ("_pass_file", "~/.secrets/webmail-password", "file-secret"),
+            ("-pass-file", "~/.secrets/webmail-password", "file-secret"),
+        ] {
+            check_alias(suffix, value, expected);
+        }
+    }
+    for (suffix, value, expected) in [
+        ("_webmail_password", "direct-secret", "direct-secret"),
+        ("-webmail-password", "direct-secret", "direct-secret"),
+        ("_password", "direct-secret", "direct-secret"),
+        ("-password", "direct-secret", "direct-secret"),
+        ("_pass", "direct-secret", "direct-secret"),
+        ("-pass", "direct-secret", "direct-secret"),
+    ] {
+        check_alias(suffix, value, expected);
     }
 }
 
@@ -2366,6 +2389,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 
         let split_home = tmp.path().join("split_home");
         std::fs::create_dir_all(split_home.join(".config/aterm")).expect("config dir");
+        #[cfg(unix)]
         crate::vault_entry::put(&split_home, "m27.pass", "file-pass-m27\n");
         std::fs::write(
             split_home.join(".config/aterm/mailbox.toml"),
@@ -2377,6 +2401,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 "#,
         )
         .expect("write config mailbox.toml");
+        #[cfg(unix)]
         crate::vault_entry::put(
             &split_home,
             "ai-mailbox.toml",
@@ -2399,29 +2424,32 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                 .as_deref(),
             Some("direct-pw")
         );
-        assert_eq!(
-            merged.password_for(Some("sol-m27@proton.me")).as_deref(),
-            Some("file-pass-m27")
-        );
-        assert_eq!(
-            merged
-                .mailbox_password_for(Some("sol-m27@proton.me"))
-                .as_deref(),
-            Some("second-pw-m27")
-        );
-        let resolved_totp = merged
-            .totp_secret_for(Some("sol-m27@proton.me"))
-            .expect("totp derived from otpauth label email");
-        assert_eq!(
-            generate_totp_at(&resolved_totp, 59).as_deref(),
-            Some("287082")
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                merged.password_for(Some("sol-m27@proton.me")).as_deref(),
+                Some("file-pass-m27")
+            );
+            assert_eq!(
+                merged
+                    .mailbox_password_for(Some("sol-m27@proton.me"))
+                    .as_deref(),
+                Some("second-pw-m27")
+            );
+            let resolved_totp = merged
+                .totp_secret_for(Some("sol-m27@proton.me"))
+                .expect("totp derived from otpauth label email");
+            assert_eq!(
+                generate_totp_at(&resolved_totp, 59).as_deref(),
+                Some("287082")
+            );
+        }
 
         let step_js = super::super::headless_oauth::oauth_step_js(
             Some("sol-m27@proton.me"),
             None,
-            false,
-            false,
+            (false, false),
+            None,
         );
         assert!(step_js.contains("switched_account"));
         assert!(step_js.contains("wrong_account"));
@@ -2511,28 +2539,31 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
             Some("raw-secret-pass")
         );
 
-        let label_home = tmp.path().join("label_secrets_home");
-        crate::vault_entry::put(&label_home, "m27_password", "m27-file-pw\n");
-        crate::vault_entry::put(&label_home, "m27-2_password", "m27-2-file-pw\n");
-        crate::vault_entry::put(&label_home, "m27_totp", format!("{otpauth_uri}\n"));
-        let label_cfg = discover_mailbox_config_files(Some(&label_home), None, None)
-            .expect("discover from single-line secret files");
-        assert_eq!(
-            label_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
-            Some("m27-file-pw")
-        );
-        assert_eq!(
-            label_cfg
-                .password_for(Some("sun.m27.2@proton.me"))
-                .as_deref(),
-            Some("m27-2-file-pw")
-        );
-        assert_eq!(
-            label_cfg
-                .totp_secret_for(Some("sol-m27@proton.me"))
-                .as_deref(),
-            Some(otpauth_uri)
-        );
+        #[cfg(unix)]
+        {
+            let label_home = tmp.path().join("label_secrets_home");
+            crate::vault_entry::put(&label_home, "m27_password", "m27-file-pw\n");
+            crate::vault_entry::put(&label_home, "m27-2_password", "m27-2-file-pw\n");
+            crate::vault_entry::put(&label_home, "m27_totp", format!("{otpauth_uri}\n"));
+            let label_cfg = discover_mailbox_config_files(Some(&label_home), None, None)
+                .expect("discover from single-line secret files");
+            assert_eq!(
+                label_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+                Some("m27-file-pw")
+            );
+            assert_eq!(
+                label_cfg
+                    .password_for(Some("sun.m27.2@proton.me"))
+                    .as_deref(),
+                Some("m27-2-file-pw")
+            );
+            assert_eq!(
+                label_cfg
+                    .totp_secret_for(Some("sol-m27@proton.me"))
+                    .as_deref(),
+                Some(otpauth_uri)
+            );
+        }
 
         let thread_dir = tmp.path().join("multi_otp_thread_mb");
         std::fs::create_dir_all(&thread_dir).expect("mkdir multi_otp_thread_mb");
@@ -2718,28 +2749,31 @@ imap_url = "imap://bridge:secret@127.0.0.1:1143/INBOX" # gitleaks:allow
             "split-box div/span digits and spaced 3-digit OTP groups are extracted in order"
         );
 
-        let us_home = tmp.path().join("underscore_secrets_home");
-        crate::vault_entry::put(&us_home, "m27_2_pass", "us-m27-2-pw\n");
-        crate::vault_entry::put(&us_home, "m27_2_otpauth", format!("{otpauth_uri}\n"));
-        let mut us_cfg = discover_mailbox_config_files(Some(&us_home), None, None)
-            .expect("discover underscore secret files");
-        assert_eq!(
-            us_cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
-            Some("us-m27-2-pw")
-        );
-        assert_eq!(
-            us_cfg
-                .totp_secret_for(Some("sun.m27.2@proton.me"))
-                .as_deref(),
-            Some(otpauth_uri)
-        );
-        us_cfg.alias_label_to_email(Some("m27-2"), Some("alias-m27-2@example.test"));
-        assert_eq!(
-            us_cfg
-                .password_for(Some("alias-m27-2@example.test"))
-                .as_deref(),
-            Some("us-m27-2-pw")
-        );
+        #[cfg(unix)]
+        {
+            let us_home = tmp.path().join("underscore_secrets_home");
+            crate::vault_entry::put(&us_home, "m27_2_pass", "us-m27-2-pw\n");
+            crate::vault_entry::put(&us_home, "m27_2_otpauth", format!("{otpauth_uri}\n"));
+            let mut us_cfg = discover_mailbox_config_files(Some(&us_home), None, None)
+                .expect("discover underscore secret files");
+            assert_eq!(
+                us_cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
+                Some("us-m27-2-pw")
+            );
+            assert_eq!(
+                us_cfg
+                    .totp_secret_for(Some("sun.m27.2@proton.me"))
+                    .as_deref(),
+                Some(otpauth_uri)
+            );
+            us_cfg.alias_label_to_email(Some("m27-2"), Some("alias-m27-2@example.test"));
+            assert_eq!(
+                us_cfg
+                    .password_for(Some("alias-m27-2@example.test"))
+                    .as_deref(),
+                Some("us-m27-2-pw")
+            );
+        }
 
         let flat_toml = format!(
             r#"
@@ -2796,20 +2830,23 @@ m27_2_pass = "flat-m27-2-pw"
             Some("https://mail.proton.me/u/0/inbox")
         );
 
-        let bare_home = tmp.path().join("bare_label_secrets_home");
-        crate::vault_entry::put(&bare_home, "m27", format!("bare-m27-pw\n{otpauth_uri}\n"));
-        let bare_cfg = discover_mailbox_config_files(Some(&bare_home), None, None)
-            .expect("discover bare label secret file");
-        assert_eq!(
-            bare_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
-            Some("bare-m27-pw")
-        );
-        assert_eq!(
-            bare_cfg
-                .totp_secret_for(Some("sol-m27@proton.me"))
-                .as_deref(),
-            Some(otpauth_uri)
-        );
+        #[cfg(unix)]
+        {
+            let bare_home = tmp.path().join("bare_label_secrets_home");
+            crate::vault_entry::put(&bare_home, "m27", format!("bare-m27-pw\n{otpauth_uri}\n"));
+            let bare_cfg = discover_mailbox_config_files(Some(&bare_home), None, None)
+                .expect("discover bare label secret file");
+            assert_eq!(
+                bare_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+                Some("bare-m27-pw")
+            );
+            assert_eq!(
+                bare_cfg
+                    .totp_secret_for(Some("sol-m27@proton.me"))
+                    .as_deref(),
+                Some(otpauth_uri)
+            );
+        }
 
         let mailhog_msg = r#"{
             "ID": "998877",
@@ -3102,8 +3139,8 @@ m27_2_pass = "flat-m27-2-pw"
         let oauth_js = super::super::headless_oauth::oauth_step_js(
             Some("sol-m27@proton.me"),
             Some("908172"),
-            false,
-            false,
+            (false, false),
+            None,
         );
         assert!(oauth_js.contains(".find(visibleControl)"));
         assert!(oauth_js.contains("el.focus()"));
@@ -3123,59 +3160,62 @@ m27_2_pass = "flat-m27-2-pw"
         assert!(wm_js.contains("input[name='loginfmt']"));
         assert!(wm_js.contains("input[name='otc']"));
 
-        let home_dir = tmp.path().join("home-fleet");
-        crate::vault_entry::put(&home_dir, "m27_pw_file", "file-pw-m27\n");
-        crate::vault_entry::put(&home_dir, "m27_mpw_file", "file-mpw-m27\n");
-        crate::vault_entry::put(&home_dir, "m27_totp_file", "JBSWY3DPEHPK3PXP\n");
-        crate::vault_entry::put(
-            &home_dir,
-            "ai-mailbox.toml",
-            "m27_password_file = \"~/.secrets/m27_pw_file\"\n\
+        #[cfg(unix)]
+        {
+            let home_dir = tmp.path().join("home-fleet");
+            crate::vault_entry::put(&home_dir, "m27_pw_file", "file-pw-m27\n");
+            crate::vault_entry::put(&home_dir, "m27_mpw_file", "file-mpw-m27\n");
+            crate::vault_entry::put(&home_dir, "m27_totp_file", "JBSWY3DPEHPK3PXP\n");
+            crate::vault_entry::put(
+                &home_dir,
+                "ai-mailbox.toml",
+                "m27_password_file = \"~/.secrets/m27_pw_file\"\n\
              m27_mailbox_password_file = \"~/.secrets/m27_mpw_file\"\n\
              m27_totp_secret_file = \"~/.secrets/m27_totp_file\"\n\n\
              [work]\n\
              email = \"custom-team@fastmail.com\"\n\
              password = \"work-secret\"\n",
-        );
-        crate::vault_entry::put(
-            &home_dir,
-            "fleet-accounts.toml",
-            "[[account]]\n\
+            );
+            crate::vault_entry::put(
+                &home_dir,
+                "fleet-accounts.toml",
+                "[[account]]\n\
              label = \"m27\"\n\
              machines = [\"m27\"]\n\
              class = \"dedicated\"\n\
              email = \"opaque-alias@proton.me\"\n",
-        );
-        let discovered_fleet = super::super::headless_oauth::discover_mailbox_config_files(
-            Some(&home_dir),
-            None,
-            None,
-        )
-        .expect("discover fleet mailbox config");
-        assert_eq!(
-            discovered_fleet
-                .password_for(Some("opaque-alias@proton.me"))
-                .as_deref(),
-            Some("file-pw-m27")
-        );
-        assert_eq!(
-            discovered_fleet
-                .mailbox_password_for(Some("opaque-alias@proton.me"))
-                .as_deref(),
-            Some("file-mpw-m27")
-        );
-        assert_eq!(
-            discovered_fleet
-                .totp_secret_for(Some("opaque-alias@proton.me"))
-                .as_deref(),
-            Some("JBSWY3DPEHPK3PXP")
-        );
-        assert_eq!(
-            discovered_fleet
-                .password_for(Some("custom-team@fastmail.com"))
-                .as_deref(),
-            Some("work-secret")
-        );
+            );
+            let discovered_fleet = super::super::headless_oauth::discover_mailbox_config_files(
+                Some(&home_dir),
+                None,
+                None,
+            )
+            .expect("discover fleet mailbox config");
+            assert_eq!(
+                discovered_fleet
+                    .password_for(Some("opaque-alias@proton.me"))
+                    .as_deref(),
+                Some("file-pw-m27")
+            );
+            assert_eq!(
+                discovered_fleet
+                    .mailbox_password_for(Some("opaque-alias@proton.me"))
+                    .as_deref(),
+                Some("file-mpw-m27")
+            );
+            assert_eq!(
+                discovered_fleet
+                    .totp_secret_for(Some("opaque-alias@proton.me"))
+                    .as_deref(),
+                Some("JBSWY3DPEHPK3PXP")
+            );
+            assert_eq!(
+                discovered_fleet
+                    .password_for(Some("custom-team@fastmail.com"))
+                    .as_deref(),
+                Some("work-secret")
+            );
+        }
     }
 }
 
@@ -3388,7 +3428,7 @@ Verification code: 390174\r\n";
 fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly() {
     use super::super::headless_oauth::{
         MailboxConfig, MailboxCredential, derive_account_label_from_email,
-        discover_mailbox_config_files, poll_mailbox_config_for_credential,
+        poll_mailbox_config_for_credential,
     };
 
     assert_eq!(
@@ -3401,32 +3441,37 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
         Some("m27-m28-2")
     );
 
-    let tmp = aterm_tempfile::Builder::new()
-        .prefix("aterm-secret-stems-")
-        .tempdir()
-        .expect("tempdir");
-    crate::vault_entry::put(
-        tmp.path(),
-        "m27-2.toml",
-        "password = \"pw-m27-2-toml\"\nmailbox_password = \"mpw-m27-2\"\n",
-    );
-    crate::vault_entry::put(tmp.path(), "sun.m27.3.txt", "pw-m27-3-txt\n");
+    #[cfg(unix)]
+    {
+        use super::super::headless_oauth::discover_mailbox_config_files;
 
-    let cfg = discover_mailbox_config_files(Some(tmp.path()), None, None)
-        .expect("discover mailbox config from .toml/.txt secret files");
-    assert_eq!(
-        cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
-        Some("pw-m27-2-toml")
-    );
-    assert_eq!(
-        cfg.mailbox_password_for(Some("sun.m27.2@proton.me"))
-            .as_deref(),
-        Some("mpw-m27-2")
-    );
-    assert_eq!(
-        cfg.password_for(Some("star.m27.3@proton.me")).as_deref(),
-        Some("pw-m27-3-txt")
-    );
+        let tmp = aterm_tempfile::Builder::new()
+            .prefix("aterm-secret-stems-")
+            .tempdir()
+            .expect("tempdir");
+        crate::vault_entry::put(
+            tmp.path(),
+            "m27-2.toml",
+            "password = \"pw-m27-2-toml\"\nmailbox_password = \"mpw-m27-2\"\n",
+        );
+        crate::vault_entry::put(tmp.path(), "sun.m27.3.txt", "pw-m27-3-txt\n");
+
+        let cfg = discover_mailbox_config_files(Some(tmp.path()), None, None)
+            .expect("discover mailbox config from .toml/.txt secret files");
+        assert_eq!(
+            cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
+            Some("pw-m27-2-toml")
+        );
+        assert_eq!(
+            cfg.mailbox_password_for(Some("sun.m27.2@proton.me"))
+                .as_deref(),
+            Some("mpw-m27-2")
+        );
+        assert_eq!(
+            cfg.password_for(Some("star.m27.3@proton.me")).as_deref(),
+            Some("pw-m27-3-txt")
+        );
+    }
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock mailpit");
     let port = listener.local_addr().expect("addr").port();
@@ -4098,7 +4143,12 @@ fn webmail_user_for_and_all_webmail_ui_urls_route_cleanly() {
         assert!(cfg.http_url.is_none());
     }
 
-    let step_js = oauth_step_js(Some("sol_m27_2+claude@proton.me"), None, false, false);
+    let step_js = oauth_step_js(
+        Some("sol_m27_2+claude@proton.me"),
+        None,
+        (false, false),
+        None,
+    );
     assert!(step_js.contains("const canonEmail ="));
     assert!(step_js.contains("canonEmail(e) === targetCanon"));
 }
@@ -4863,8 +4913,8 @@ fn tracked_magic_urls_chunked_http_and_email_input_detection() {
     let js = super::super::headless_oauth::oauth_step_js(
         Some("sol-m27@proton.me"),
         Some("123456"),
-        false,
-        false,
+        (false, false),
+        None,
     );
     let otp_pos = js.find("otpInputs.length > 0").expect("otpInputs check");
     let email_pos = js
@@ -6709,5 +6759,54 @@ fn a_relay_only_mailbox_drives_the_page_first() {
     assert!(
         !drives_page_first(&MailboxConfig::default(), Some("work@example.test")),
         "CONTROL: no mailbox"
+    );
+}
+
+/// EVERY BOT PROTECTION IS A STOP, AND THE WORDS ARE JUDGED ONE BY ONE: a sign-in that met any
+/// word [`MetWord::is_bot_protection`] names is recorded `blocked` ([`Met::stopped`]), never as
+/// a failure retried on a clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3).
+/// CONTROL: the stops no bot protection made, and the words that stop nothing, are exactly
+/// those named here, so a word added to [`MetWord`] changes this list.
+#[test]
+fn every_bot_protection_stops_a_sign_in() {
+    let mut stops = Vec::new();
+    let mut for_a_person = Vec::new();
+    for word in MetWord::ALL {
+        let met = Met::new(word, None);
+        assert_eq!(met.stopped(), word.stops(), "{word:?}");
+        assert_eq!(met.takes_a_person(), word.takes_a_person(), "{word:?}");
+        if word.is_bot_protection() {
+            assert!(met.stopped(), "{word:?} is a bot protection, so a stop");
+        } else if met.stopped() {
+            stops.push(word);
+        }
+        if met.takes_a_person() {
+            assert!(
+                met.stopped(),
+                "{word:?}: what a person clears stops a sign-in"
+            );
+            for_a_person.push(word);
+        }
+    }
+    assert_eq!(
+        stops,
+        [
+            MetWord::WindowNoDesktop,
+            MetWord::WindowClosed,
+            MetWord::WindowWrongAccount,
+            MetWord::ConsentUnproven,
+            MetWord::ConsentWrongAccount
+        ],
+        "CONTROL: the stops no bot protection made"
+    );
+    assert_eq!(
+        for_a_person,
+        [
+            MetWord::WindowNoDesktop,
+            MetWord::WindowBotCheck,
+            MetWord::WindowHumanCheck,
+            MetWord::BotCheck,
+            MetWord::HumanCheck
+        ]
     );
 }

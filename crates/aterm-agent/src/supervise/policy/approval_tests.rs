@@ -1070,6 +1070,57 @@ fn a_trust_dialog_for_the_folder_its_starter_trusted_is_answered_under_no_root()
     }
 }
 
+/// THE FOLDER JUDGMENT IS ONE: over the policy table (`approve`, the trust roots, the folder the
+/// session's starter trusted), the rule [`trust_folder_rule`] names for the session's folder is
+/// the rule [`decide`] approves the measured folder-trust dialog under, and it names none
+/// exactly where the dialog is escalated. The step that settles the folder before a launch
+/// (`harness::launch_trust`) books its row under this id, so the two never disagree.
+#[test]
+fn the_folder_judgment_names_the_rule_the_dialog_is_answered_under() {
+    const FOLDER: &str = "/private/tmp/claude-502/scratch/work1";
+    let rows = lines(CAP_TRUST);
+    let mut seen = std::collections::BTreeSet::new();
+    for approve in [Approve::None, Approve::Safe, Approve::All] {
+        for roots in [
+            &[][..],
+            &["/private/tmp/claude-502/scratch/work*"][..],
+            &["~/aterm*"][..],
+            &["/private/tmp/claude-*"][..],
+        ] {
+            for trusted in [
+                None,
+                Some(FOLDER),
+                Some("/private/tmp/claude-502/scratch"),
+                Some("/private/tmp/claude-502/scratch/work2"),
+            ] {
+                let roots: Vec<String> = roots.iter().map(|r| (*r).to_string()).collect();
+                let mut c = ApprovalCtx { approve, ..full() };
+                c.set_trust_roots(&roots, 502);
+                c.trusted_cwd = trusted.map(PathBuf::from);
+                let dialog = approved(&on_screen(&rows, &c));
+                let rule = trust_folder_rule(
+                    approve,
+                    &trust_roots_of(&roots, c.home.as_deref(), 502),
+                    c.trusted_cwd.as_deref(),
+                    Path::new(FOLDER),
+                );
+                assert_eq!(rule, dialog, "{approve:?} {roots:?} {trusted:?}");
+                seen.insert(rule);
+            }
+        }
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        [None, Some(RULE_TRUST_ANY), Some(RULE_TRUST_DIALOG)],
+        "the table reaches every answer"
+    );
+    assert_eq!(
+        trust_folder_rule(Approve::All, &[], None, Path::new("work1")),
+        None,
+        "a folder that is not absolute is no folder"
+    );
+}
+
 #[test]
 fn another_harnesss_trust_dialog_is_answered_only_in_its_workers_trusted_folder() {
     use aterm_phase::{agy::fixtures as agy, muse::fixtures as muse};

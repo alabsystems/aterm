@@ -117,7 +117,7 @@ fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
     let before = w.inbox(&a).len();
 
     let mut god = w.god();
-    let forged_tail = format!("/f/{FLEET}/in/{}/{a}/s-1/h-andrew/answer", w.node);
+    let forged_tail = format!("/f/{FLEET}/in/{}/{a}/t0000003vsh/h-andrew/answer", w.node);
     let unhosted = format!(
         "/f/{FLEET}/in/{}/s-00000000000000000000/h-andrew/task",
         w.node
@@ -281,7 +281,8 @@ fn a_dead_broker_keeps_the_hold_and_queues_the_posts_until_it_returns() {
 /// would, leave the terminal untouched.
 #[test]
 fn no_bus_record_ever_reaches_a_pty() {
-    let w = World::boot("pty", &["h-andrew", "s-1"]);
+    const SESSION_PRINCIPAL: &str = "t0000000001";
+    let w = World::boot("pty", &["h-andrew", SESSION_PRINCIPAL]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
     until("the shell's first prompt", || {
@@ -296,12 +297,7 @@ fn no_bus_record_ever_reaches_a_pty() {
     let body = "v=1 t=1 re=1 gen=1:0000000000000000 \
                 epoch=00000000000000000000000000000000 text=echo%20PWNED%0A";
     let mut records: Vec<harness::Record> = Vec::new();
-    for src in [
-        "h-andrew",
-        "s-00000000000000000001",
-        "n-deadbeefdeadbeef",
-        "a-svc",
-    ] {
+    for src in ["h-andrew", SESSION_PRINCIPAL, "n-deadbeefdeadbeef", "a-svc"] {
         for kind in ["answer", "task", "control", "note", "ack"] {
             let subject = format!("/f/{FLEET}/in/{}/{a}/{src}/{kind}", w.node);
             let seq = records.len() as u64 + 1;

@@ -107,6 +107,13 @@ impl Fixture {
         }
     }
 
+    /// An obsolete home file authored by the test, never an authenticated policy source.
+    fn write_untrusted_home_entry(&self, name: &str, bytes: &[u8]) {
+        let directory = self.lab.paths[0].home.join(".secrets");
+        aterm_secrets::fsx::ensure_private_dir(&directory).unwrap();
+        aterm_secrets::fsx::write_atomic(&directory.join(name), bytes, 0o600).unwrap();
+    }
+
     fn issue(
         &self,
         account: u8,
@@ -416,8 +423,7 @@ fn local_files_change_nothing_and_changed_credentials_and_root_stops_never_prepa
     let decision = f.issue(31, 0, reference, vec![]);
     let source = f.source(31, 0);
     source.prepare_until(deadline()).unwrap();
-    let file = f.lab.paths[0].home.join(".secrets").join(ENTRY);
-    std::fs::write(&file, f.policy("example-v2").text()).unwrap();
+    f.write_untrusted_home_entry(ENTRY, f.policy("example-v2").text().as_bytes());
     let prepared = source.prepare_until(deadline()).unwrap();
     assert_eq!(prepared.binding().policy, reference.policy);
     f.publish(|doc| {
@@ -551,11 +557,7 @@ fn transition_with(
             source.prepare_until(deadline()).is_ok()
         }
         "LocalEdit" => {
-            std::fs::write(
-                f.lab.paths[0].home.join(".secrets").join(ENTRY),
-                f.policy("example-v2").text(),
-            )
-            .unwrap();
+            f.write_untrusted_home_entry(ENTRY, f.policy("example-v2").text().as_bytes());
             let prepared = source.prepare_until(deadline());
             // Bound to the vault's policy bytes, never the edited file's.
             file = prepared.as_ref().is_ok_and(|prepared| {
@@ -693,6 +695,7 @@ fn fleet_intent_billing_follows_current_children_and_parent_stop() {
 fn billing_uses_selected_successor_custody_without_inheriting_spent_share() {
     let f = Fixture::new(2);
     let reference = f.policy("example-v1").reference([41; 32]).unwrap();
+    let untrusted_policy = f.policy("example-v2").text();
     let old = f.issue(31, 0, reference, vec![]);
     let source = f.source(31, 0);
     let prepared = source.prepare_until(deadline()).unwrap();
@@ -718,10 +721,12 @@ fn billing_uses_selected_successor_custody_without_inheriting_spent_share() {
         .configuration(&admin, [31; 32], "account-31", actor, vec![old])
         .unwrap();
     let new = db.issue(&admin, f.id(), request).unwrap().0;
-    std::fs::remove_file(f.lab.paths[0].home.join(".secrets").join(ENTRY)).unwrap();
+    // A different policy at the logical home's obsolete path cannot supply the successor's pin.
+    f.write_untrusted_home_entry(ENTRY, untrusted_policy.as_bytes());
     let next = source.prepare_until(deadline()).unwrap();
     assert_eq!(next.active_paths, selected);
     assert_eq!(next.binding().credential, new.id());
+    assert_eq!(next.binding().policy, reference.policy);
     let resources = next.resources();
     resources.initialize().unwrap();
     assert_eq!(resources.snapshot().unwrap().used.values().sum::<u64>(), 2);

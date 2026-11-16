@@ -138,6 +138,29 @@ impl Drop for Document {
 
 /// The largest value, and the largest file.
 pub const MAX_VALUE: usize = 1 << 20;
+
+/// The most bytes of a fleet configuration value ([`crate::entry_class::fleet_configuration`])
+/// an edit sets or changes ([`Document::set_entry_with`], [`Document::added_refusal`]). The
+/// vault's log keeps every version of an entry whole, for good, and configuration is rewritten
+/// far more often than a secret: one 299 KB inventory, signed again at every look, filled a
+/// lab's log. A larger value the vault already holds stays readable, is sealed again as it is
+/// and can be deleted.
+pub const MAX_CONFIGURATION_VALUE: usize = 64 * 1024;
+
+/// Why an edit does not set the entry `name` to a new value of `len` bytes: fleet configuration
+/// over [`MAX_CONFIGURATION_VALUE`]. The words hold the name and the sizes, never the value.
+fn configuration_refusal(name: &str, len: usize) -> Option<String> {
+    use crate::membership_log::budgets::size_words;
+    (len > MAX_CONFIGURATION_VALUE && crate::entry_class::fleet_configuration(name)).then(|| {
+        format!(
+            "`{name}` was not set: the value it would take is {}, and a fleet configuration value \
+             over {} is not set or changed, since the vault's log keeps every version of it \
+             whole; the value the vault holds stays as it is",
+            size_words(len),
+            size_words(MAX_CONFIGURATION_VALUE),
+        )
+    })
+}
 /// The largest text file.
 pub const MAX_TEXT: usize = 8 << 20;
 /// The most distinct sets of hosts a vault's sections name: each is sealed in a locker of its own, beside the admins' and `[everyone]`'s, within [`crate::envelope::MAX_LOCKERS`].
@@ -530,9 +553,10 @@ impl Document {
 
     /// Why this text cannot be published over `base`: an entry it adds or changes is one no
     /// vault text writes ([`crate::entry_class::text_refusal`]: an AI CLI's login file, another
-    /// name set apart, a Claude Code token), or shares its fold with another entry's name, which
-    /// a Mac's disk makes one file ([`crate::entry_class::folded_pairs`]). One `base` holds as it
-    /// is stays, so a vault an older build wrote still opens; no machine writes its file.
+    /// name set apart, a Claude Code token), is fleet configuration whose new value is over
+    /// [`MAX_CONFIGURATION_VALUE`], or shares its fold with another entry's name, which a Mac's
+    /// disk makes one file ([`crate::entry_class::folded_pairs`]). One `base` holds as it is
+    /// stays, so a vault an older build wrote still opens; no machine writes its file.
     pub fn added_refusal(&self, base: &Document) -> Option<String> {
         let entries: Vec<&Entry> = self
             .model
@@ -545,6 +569,19 @@ impl Document {
             .iter()
             .filter(changed)
             .find_map(|entry| crate::entry_class::text_refusal(&entry.name))
+        {
+            return Some(why);
+        }
+        // The door of `set_entry_with`, for a text edited whole: a value `base` holds at that
+        // name and audience is no change, whatever else of the entry differs.
+        let revalued = |entry: &&&Entry| {
+            base.entry(&entry.audience, &entry.name)
+                .is_none_or(|held| held.value != entry.value)
+        };
+        if let Some(why) = entries
+            .iter()
+            .filter(revalued)
+            .find_map(|entry| configuration_refusal(&entry.name, entry.value.as_slice().len()))
         {
             return Some(why);
         }
@@ -798,7 +835,40 @@ impl Document {
     }
 
     /// [`Document::set_entry`], marking the entry ` if-absent` when `if_absent` (always a heredoc then: a base64 one for a value a text heredoc cannot hold exactly), and anchoring it to the ` if-absent` entry `anchor` names (` if-absent=<anchor>`).
+    ///
+    /// This is the door every author's change of an entry goes through, a person's and an
+    /// automatic writer's alike: a fleet configuration name
+    /// ([`crate::entry_class::fleet_configuration`]) is not given a new value over
+    /// [`MAX_CONFIGURATION_VALUE`]. A value the section already holds at that name is no
+    /// change, so a larger one an older build wrote survives every other edit, and
+    /// [`Document::unset_entry`] removes it.
+    ///
+    /// # Errors
+    /// The audience, the name, the anchor or the value's size is one no vault text holds, or the
+    /// value is fleet configuration's new value over [`MAX_CONFIGURATION_VALUE`]: the words name
+    /// the entry and the sizes.
     pub fn set_entry_with(
+        &mut self,
+        audience: &Audience,
+        name: &str,
+        value: &[u8],
+        if_absent: bool,
+        anchor: Option<&str>,
+    ) -> Result<(), TextError> {
+        let held = self
+            .entry(audience, name)
+            .is_some_and(|held| held.value.as_slice() == value);
+        if !held && let Some(why) = configuration_refusal(name, value.len()) {
+            return Err(whole(why));
+        }
+        self.hold_entry_with(audience, name, value, if_absent, anchor)
+    }
+
+    /// [`Document::set_entry_with`] with no size door, for what is no author's change: an entry
+    /// the log, a waiting write or a published head already holds, written into a text that
+    /// reads it (a store that could not show a value it holds would lose it), and a removal's
+    /// own rewrite of the entries that name the removed Mac, which is the removal's.
+    pub(crate) fn hold_entry_with(
         &mut self,
         audience: &Audience,
         name: &str,
@@ -856,7 +926,7 @@ impl Document {
                 lines.remove(header).zeroize();
             }
             next.commit(lines)?;
-            next.set_entry_with(&audience, name, value, if_absent, anchor)?;
+            next.hold_entry_with(&audience, name, value, if_absent, anchor)?;
             *self = next;
             return Ok(());
         }

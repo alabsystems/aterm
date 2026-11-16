@@ -125,8 +125,9 @@ fn fold_mail_params(s: &str) -> Vec<String> {
     out
 }
 
-/// A `from=` sender: a class word, a tab ID in its `t` form (`tqn5r6e0148`, or
-/// `tqn5r6e0148@n-lab` for one on another node), or an `h-`/`s-`/`a-` principal.
+/// A `from=` sender: a class word, a tab ID (`tqn5r6e0148`, or `tqn5r6e0148@n-lab` for one on
+/// another node), a legacy tab's exact `s-` ID on this Mac ([`aterm_session::is_minted_sid`]),
+/// or an `h-`/`a-` principal.
 fn is_sender_selector(v: &str) -> bool {
     if matches!(v, "human" | "agent" | "service" | "other") {
         return true;
@@ -616,7 +617,7 @@ pub(crate) fn drain_timeline_events(
     Some(hi)
 }
 
-/// A PROGRAM'S CLAIM IS PUSHED AS THE CLAIM AND ITS ROW, NEVER AS AN AGENT'S WORD: a `program-state` row (`state=<w> kind=<k|->`) is pushed as `program state=<w>[ kind=<k>] rev=<id>` (`kind=` only on a blocked state that names one) and a self-claim's `harness-act` row (`act=<act> holder=<h>`) as `act <act> rev=<id>`, `<id>` the row's own id (`timeline`'s `event <id>`), so a codex's or Grok Build's moves and a self-claim's acts reach an `events` watcher while `agent` stays the screen verdict's alone. Every other row's payload is its own, verbatim.
+/// A PROGRAM'S CLAIM IS PUSHED AS THE CLAIM AND ITS ROW, NEVER AS AN AGENT'S WORD: a `program-state` row (`state=<w> kind=<k|->`) is pushed as `program state=<w>[ kind=<k>] rev=<id>` (`kind=` only on a blocked state that names one) and a self-claim's `harness-act` row (`act=<act> holder=<h>`) as `act <act> rev=<id>`, `<id>` the row's own id (`timeline`'s `event <id>`), so a codex's, Grok Build's or Claude Code's moves and a self-claim's acts reach an `events` watcher while `agent` stays the screen verdict's alone. Every other row's payload is its own, verbatim.
 fn timeline_wire_payload(e: &crate::session_timeline::TimelineEvent) -> std::borrow::Cow<'_, str> {
     match e.kind {
         crate::session_timeline::PROGRAM_STATE => {
@@ -1216,7 +1217,7 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
 pub(crate) struct WatchSource {
     byte_fanout: Arc<ByteFanout>,
     turns: Arc<Mutex<TurnLedger>>,
-    meta: Arc<Mutex<crate::session_timeline::SessionMeta>>,
+    meta: Arc<crate::session_timeline::MetaLock>,
     timeline: Arc<Mutex<crate::session_timeline::SessionTimeline>>,
     fabric: Arc<crate::fabric::SessionFabric>,
     frame: Arc<FrameSlot>,

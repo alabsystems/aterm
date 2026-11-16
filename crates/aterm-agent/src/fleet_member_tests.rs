@@ -2922,40 +2922,97 @@ fn fleet_access_prints_the_level_in_force_and_states_the_one_named() {
 }
 
 /// A WORKER ANOTHER FLEET MAC STARTED HERE NEVER RAISES THIS MAC'S LEVEL: a raise asked from a
-/// session with a `drive-workers` record is refused and writes nothing. CONTROL: the same
-/// session lowers it; a session with no record, and no session at all, raise it.
+/// session with a `drive-workers` record is refused and writes nothing, for either exact ID
+/// form. The command names the hosted parent even when a recursive child has its own ID.
+/// CONTROL: the same session lowers it; a session with no matching record, and no session at
+/// all, raise it.
 #[test]
 fn a_fleet_started_worker_lowers_the_level_and_never_raises_it() {
     use aterm_types::fleet_access::{DRIVE_WORKERS, FleetAccess};
-    let world = World::new("access-worker");
-    let state = &world.places.state;
-    const DRIVEN: &str = "t00000000aa";
-    const LOCAL: &str = "t00000000bb";
-    let run =
-        |words: &[&str], session: Option<&str>| access_from(&world.places, &args(words), session);
-    let level = || crate::fleet_access::read(state).level;
-    run(&["write"], None).unwrap();
-    std::fs::create_dir_all(state.join(DRIVE_WORKERS)).unwrap();
-    std::fs::write(state.join(DRIVE_WORKERS).join(DRIVEN), "0b".repeat(16)).unwrap();
+    for (driven, local, unrelated) in [
+        ("t00000000aa", "t00000000bb", "t00000000dd"),
+        (
+            "s-0123456789abcdef00aa",
+            "s-0123456789abcdef00bb",
+            "s-0123456789abcdef00dd",
+        ),
+    ] {
+        let world = World::new("access-worker");
+        let state = &world.places.state;
+        let run = |words: &[&str], session: Option<&str>| {
+            access_from(&world.places, &args(words), session)
+        };
+        let command = |words: &[&str], parent: &str, child: &str| {
+            access_with_env(&world.places, &args(words), &|name| match name {
+                "ATERM_PARENT_SESSION_ID" => Some(parent.to_owned()),
+                "ATERM_SESSION_ID" => Some(child.to_owned()),
+                _ => None,
+            })
+        };
+        let level = || crate::fleet_access::read(state).level;
+        let stored = || {
+            (
+                std::fs::read(state.join(crate::fleet_access::FILE)).expect("the access file"),
+                crate::fleet_access::basis(state),
+            )
+        };
+        let workers = state.join(DRIVE_WORKERS);
+        aterm_uds::private_file::create_private_dir(state).unwrap();
+        std::fs::create_dir_all(&workers).unwrap();
+        std::fs::write(workers.join(unrelated), "0b".repeat(16)).unwrap();
+        run(&["write"], Some(driven))
+            .expect("CONTROL: another worker's record does not name this session");
+        assert_eq!(level(), FleetAccess::ReadWrite);
+        std::fs::write(workers.join(driven), "0b".repeat(16)).unwrap();
 
-    let refused = run(&["full"], Some(DRIVEN)).expect_err("a raise");
-    assert!(
-        matches!(&refused, Failure::Failed(why) if why.contains(DRIVEN)),
-        "{refused:?}"
-    );
-    assert_eq!(level(), FleetAccess::ReadWrite, "nothing was written");
-    let (same, changed) = run(&["write"], Some(DRIVEN)).unwrap();
-    assert!(!changed, "the level it is at is no raise: {same}");
-    let (_, changed) = run(&["read"], Some(DRIVEN)).unwrap();
-    assert!(changed, "CONTROL: lowering is always allowed");
-    assert_eq!(level(), FleetAccess::ReadOnly);
-    assert!(run(&["write"], Some(DRIVEN)).is_err(), "and no way back up");
-    assert_eq!(level(), FleetAccess::ReadOnly);
+        let before = stored();
+        let refused = run(&["full"], Some(driven))
+            .expect_err(&format!("a raise from recorded worker {driven}"));
+        assert!(
+            matches!(&refused, Failure::Failed(why) if why.contains(driven)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            stored(),
+            before,
+            "a refused raise changes no access bytes or basis"
+        );
+        assert_eq!(level(), FleetAccess::ReadWrite);
 
-    run(&["write"], Some(LOCAL)).expect("CONTROL: a session this Mac started");
-    assert_eq!(level(), FleetAccess::ReadWrite);
-    run(&["full"], None).expect("CONTROL: no session");
-    assert_eq!(level(), FleetAccess::Full);
+        let child = "t00000000cc";
+        let before = stored();
+        let refused = command(&["full"], driven, child)
+            .expect_err("the hosted parent's record refuses a raise from its recursive child");
+        assert!(
+            matches!(&refused, Failure::Failed(why) if why.contains(driven)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            stored(),
+            before,
+            "the command preserves the refused access state"
+        );
+        let (same, changed) = run(&["write"], Some(driven)).unwrap();
+        assert!(!changed, "the level it is at is no raise: {same}");
+        let (_, changed) = run(&["read"], Some(driven)).unwrap();
+        assert!(changed, "CONTROL: lowering is always allowed");
+        assert_eq!(level(), FleetAccess::ReadOnly);
+        let before = stored();
+        assert!(run(&["write"], Some(driven)).is_err(), "and no way back up");
+        assert_eq!(
+            stored(),
+            before,
+            "a second refused raise leaves the file and basis alone"
+        );
+        assert_eq!(level(), FleetAccess::ReadOnly);
+
+        std::fs::write(workers.join(child), "0b".repeat(16)).unwrap();
+        command(&["write"], local, child)
+            .expect("CONTROL: an unrelated recursive child's record cannot name the hosted parent");
+        assert_eq!(level(), FleetAccess::ReadWrite);
+        access_with_env(&world.places, &args(&["full"]), &|_| None).expect("CONTROL: no session");
+        assert_eq!(level(), FleetAccess::Full);
+    }
 }
 
 /// A LEVEL NEVER OUTLIVES THE MEMBERSHIP IT WAS CHOSEN FOR: `leave` removes the stored level,
@@ -5268,6 +5325,9 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
     let listener = serving.take();
     let node = member::node_id(&member.places.state).unwrap();
     let sid = "tabcdef0123";
+    let legacy = "s-0123456789abcdef0123";
+    let short = "s-fffffffffffffffffff";
+    let long = "s-eeeeeeeeeeeeeeeeeeeee";
     let _holding = Listener::with_rows(
         listener,
         &issuer.places.state,
@@ -5276,19 +5336,24 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
             "session sid=t0000000002 held_from=-".to_owned(),
             format!("session sid=\u{1b}]52;c;aGk=\u{7} held_from={node}"),
             format!("session sid=t00000123zu held_from={node}"),
+            format!("session sid={legacy} held_from={node}"),
+            format!("session sid={short} held_from={node}"),
+            format!("session sid={long} held_from={node}"),
         ],
     );
 
     let left = ok(with_peers_answering(|| leave(&member.places, &[])));
-    assert!(
-        !left.contains('\u{1b}') && !left.contains("t00000123zu"),
-        "{left:?}"
-    );
-    assert!(
-        left.contains(&format!("  hold       {sid} on node-")),
-        "{left}"
-    );
-    assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
+    assert!(!left.contains('\u{1b}'), "{left:?}");
+    for malformed in ["t00000123zu", short, long] {
+        assert!(!left.contains(malformed), "{left:?}");
+    }
+    for held in [sid, legacy] {
+        assert!(
+            left.contains(&format!("  hold       {held} on node-")),
+            "{left}"
+        );
+    }
+    assert_eq!(left.matches("  hold  ").count(), 2, "{left}");
     match drive_fleet_in(&member.places, &format!("127.0.0.1:{port}"), HANG) {
         Err(refused) => assert_eq!(
             refused.left,
@@ -5321,20 +5386,26 @@ fn a_leave_reports_a_tab_it_holds_on_another_member() {
     };
     ok(join(&holder.places, &opts, &code));
     let node = member::node_id(&holder.places.state).unwrap();
-    let sid = "s-0123456789abcdef0abc";
+    let sid = "t0000000abc";
+    let legacy = "s-0123456789abcdef00aa";
     let _holding = Listener::with_rows(
         TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap(),
         &held.places.state,
-        vec![format!("session sid={sid} held_from={node}")],
+        vec![
+            format!("session sid={sid} held_from={node}"),
+            format!("session sid={legacy} held_from={node}"),
+        ],
     );
 
     // Every peer it reads serves in process: the read waits the hang detector, not its 3 s.
     let left = ok(with_peers_answering(|| leave(&holder.places, &[])));
-    assert!(
-        left.contains(&format!("  hold       {sid} on node-")),
-        "{left}"
-    );
-    assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
+    for held in [sid, legacy] {
+        assert!(
+            left.contains(&format!("  hold       {held} on node-")),
+            "{left}"
+        );
+    }
+    assert_eq!(left.matches("  hold  ").count(), 2, "{left}");
 }
 
 #[test]
@@ -5382,7 +5453,7 @@ fn a_join_of_another_fleet_names_each_tab_this_machine_holds_in_the_old_one() {
     ok(join(&member.places, &opts, &code));
     drop(serving);
     let node = member::node_id(&member.places.state).unwrap();
-    let sid = "s-0123456789abcdef0789";
+    let sid = "t0000000789";
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let _holding = Listener::with_rows(
         listener,
@@ -5464,7 +5535,7 @@ fn an_issuers_leave_names_no_join_again_for_a_tab_it_holds() {
     };
     ok(join(&member.places, &opts, &code));
     let node = member::node_id(&issuer.places.state).unwrap();
-    let sid = "s-0123456789abcdef0456";
+    let sid = "t0000000456";
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let _holding = Listener::with_rows(
         listener,

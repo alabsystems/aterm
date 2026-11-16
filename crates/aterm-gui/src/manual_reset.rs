@@ -85,13 +85,17 @@ pub(crate) fn apply(t: &mut Terminal, clock: ClockReading) -> (ResetReport, Vec<
     (report, h.bytes)
 }
 
-/// Record the reset on the session's timeline and in the log.
+/// Record the reset on the session's timeline and in the log, once the engine's lock is dropped
+/// (by the reader's parse stage or [`run_direct`]), and ring the keeper's META pump: the reset
+/// restored modes and keyboard state a META carries, with no output for the reader to see.
 pub(crate) fn record(
     sid: u64,
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
     source: ResetSource,
     report: &ResetReport,
 ) {
+    #[cfg(unix)]
+    crate::keeper_link::ring_meta();
     let payload = manual_payload(source, report);
     {
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());

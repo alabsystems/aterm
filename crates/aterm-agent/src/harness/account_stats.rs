@@ -542,13 +542,13 @@ pub fn view(look: &Look<'_>) -> View {
             SESSION_LIMIT,
             Bucket::FiveHour,
             SESSION_WINDOW_S,
-            account.and_then(|a| a.warned_session.as_ref()),
+            account.and_then(Account::session_warning),
         ),
         (
             WEEK_LIMIT,
             Bucket::SevenDay,
             WEEK_WINDOW_S,
-            account.and_then(|a| a.warned_week.as_ref()),
+            account.and_then(Account::week_warning),
         ),
     ] {
         let sources = held(id)

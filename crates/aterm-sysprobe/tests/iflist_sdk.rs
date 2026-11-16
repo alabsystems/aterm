@@ -22,6 +22,7 @@ const HEADERS: &str = "#include <stddef.h>\n\
                        #include <sys/sockio.h>\n\
                        #include <sys/sysctl.h>\n\
                        #include <net/if.h>\n\
+                       #include <net/if_media.h>\n\
                        #include <net/if_var.h>\n\
                        #include <net/if_dl.h>\n\
                        #include <net/route.h>\n\

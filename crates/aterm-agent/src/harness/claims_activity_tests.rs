@@ -60,6 +60,7 @@ impl Lab {
 }
 
 #[test]
+#[cfg(unix)]
 fn shared_claim_entrypoint_publishes_codex_and_refuses_a_second_machine() {
     for cli in super::super::CLAIMED_CLIS {
         let first = Lab::new();

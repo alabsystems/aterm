@@ -20,9 +20,10 @@ fn two_tabs() -> (App, (u64, i32), (u64, i32)) {
     const FRONT_SHELL: i32 = 4_100_001;
     const BEHIND_SHELL: i32 = 4_100_002;
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WID).expect("its window");
+    let mut ws = app.windows.get_mut(&WID).expect("its window");
     ws.focused = true;
     ws.os_window_for_test = true;
+    drop(ws);
     let behind = tab(&mut app, BEHIND_SHELL);
     let front = tab(&mut app, FRONT_SHELL);
     assert!(app.active_tab_shows_session(WID, front), "PRECONDITION");

@@ -14,7 +14,7 @@
 //! read-only.
 
 use super::{
-    Collection, Column, Kind, MAX_KEY, OnConflict, Ty, column_name, guard, keys, pk_grammar,
+    Collection, Column, Kind, MAX_KEY, OnConflict, Ty, column_name, guard, keys, pk_grammar, values,
 };
 use crate::{
     Error, Result,
@@ -233,6 +233,14 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             .map(drop)
             .ok_or("this column holds a whole number"),
         Ty::Text(max) => guard::text(text()?, *max).map_err(guard::Refusal::rule),
+        Ty::Prose(max) => guard::prose(text()?, *max).map_err(guard::Refusal::rule),
+        Ty::Command(max) => guard::command(text()?, *max).map_err(guard::Refusal::rule),
+        Ty::Commit => values::commit(text()?),
+        Ty::Digest => values::digest(text()?),
+        Ty::Path => values::path(text()?),
+        Ty::Decimal => values::decimal(text()?),
+        Ty::Principal => values::principal(x),
+        Ty::Evidence => values::evidence(x),
         Ty::AccountLabel(max) => guard::account_label(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Enum(words) => {
             let word = text()?;
@@ -426,9 +434,10 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
     }
 }
 
-/// Check a text set member's text: in its normal form, not empty, within the column's size and
-/// past the guards. A comma is a member's own (a grid shows such a set as a JSON list).
-fn check_member_text(max: usize, text: &str) -> std::result::Result<(), &'static str> {
+/// Check a text set member's text: in its normal form, not empty, and a value of the set's
+/// member type `member` (within its size and past its guard). A comma is a member's own (a grid
+/// shows such a set as a JSON list).
+fn check_member_text(member: &Ty, text: &str) -> std::result::Result<(), &'static str> {
     if text.is_empty() || keys::normal_text(text) != text {
         return Err("a set member is trimmed with single spaces");
     }
@@ -436,7 +445,7 @@ fn check_member_text(max: usize, text: &str) -> std::result::Result<(), &'static
     if text.contains('‖') {
         return Err("a set member never holds ‖");
     }
-    guard::text(text, max).map_err(guard::Refusal::rule)
+    check(member, &Value::String(text.to_owned()), false)
 }
 
 /// Check one stored value of the element `elem` of the set column `column`: `true` or `false`
@@ -450,8 +459,8 @@ fn check_elem_value(
 ) -> std::result::Result<(), &'static str> {
     match (column.ty.text_set(), x) {
         (Some(_), Value::Null | Value::Bool(false)) | (None, Value::Bool(_)) => Ok(()),
-        (Some(max), Value::String(text)) => {
-            check_member_text(max, text)?;
+        (Some(member), Value::String(text)) => {
+            check_member_text(member, text)?;
             (keys::text_elem(text) == elem)
                 .then_some(())
                 .ok_or("a text set's element key is the digest of its text")
@@ -512,14 +521,14 @@ pub fn element_holds(
     values.iter().any(|x| adds(column, elem, x)) == adds(column, elem, x)
 }
 
-/// `raw` as a member of a text set of `max`-byte texts: its normal form ([`keys::normal_text`]),
-/// checked as an element cell's text is.
+/// `raw` as a member of a text set whose members are `member`s: its normal form
+/// ([`keys::normal_text`]), checked as an element cell's text is.
 ///
 /// # Errors
 /// The text set refuses it; the rule names no part of it.
-pub fn text_member(max: usize, raw: &str) -> std::result::Result<String, &'static str> {
+pub fn text_member(member: &Ty, raw: &str) -> std::result::Result<String, &'static str> {
     let text = keys::normal_text(raw);
-    check_member_text(max, &text)?;
+    check_member_text(member, &text)?;
     Ok(text)
 }
 
@@ -534,8 +543,8 @@ pub fn element(
     column: &Column,
     member: &str,
 ) -> std::result::Result<(String, Value), &'static str> {
-    if let Some(max) = column.ty.text_set() {
-        let text = text_member(max, member)?;
+    if let Some(member_ty) = column.ty.text_set() {
+        let text = text_member(member_ty, member)?;
         return Ok((keys::text_elem(&text), Value::String(text)));
     }
     check_elem(column, member)?;
@@ -671,6 +680,112 @@ pub fn member_change(
         },
         &value(x),
     )
+}
+
+/// The texts a free-text column (a list of texts, or a text set) holds in `field`, as a reader
+/// takes them, whichever form the generation its projection read holds it in (LT-15B): a list's
+/// shown value (a conflict's provisional one), in its order, or a text set's present members
+/// (add-wins, [`members`]), in their elements' order. A projection holds a text set's element
+/// only where each candidate is one its column takes ([`project`]), so a member is a candidate's
+/// text. Meant for the columns that change form; a set of words or keys holds no texts.
+pub fn texts(field: Option<&Field>) -> Vec<String> {
+    match field {
+        Some(Field::Set(elements)) => elements
+            .values()
+            .filter_map(|field| {
+                field
+                    .candidates()
+                    .iter()
+                    .find_map(|c| c.value.x.as_str().map(str::to_owned))
+            })
+            .collect(),
+        field => list_texts(field.and_then(Field::value)),
+    }
+}
+
+/// [`texts`], settled only, for a reader that acts on a member (a mail route): a conflicted list
+/// holds none, and of a text set only each member whose element holds one value, which adds it.
+/// A member some write removed while another added it is no settled member.
+pub fn settled_texts(field: Option<&Field>) -> Vec<String> {
+    match field {
+        Some(Field::Set(elements)) => elements
+            .values()
+            .filter_map(|field| match field {
+                Field::Value(candidate) => candidate.value.x.as_str().map(str::to_owned),
+                _ => None,
+            })
+            .collect(),
+        Some(Field::Value(candidate)) => list_texts(Some(&candidate.value.x)),
+        _ => Vec::new(),
+    }
+}
+
+fn list_texts(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The changes that move the free-text column `col` of row `pk` from holding `before` to
+/// holding `after`, in the form `collection` holds it, each stored value made by `value` from
+/// the typed value: for a list, one change writing `after` whole, or none where it is `before`;
+/// for a text set ([`Ty::text_set`]), one element change for each member `after` adds and one
+/// for each `before` member it drops, members compared in their normal form, so a member both
+/// hold writes nothing and a concurrent writer's other members are left alone.
+///
+/// # Errors
+/// As [`change`] and [`member_change`]; `col` is no list or text set column of `collection`.
+pub fn texts_change(
+    collection: &Collection,
+    pk: &str,
+    col: &str,
+    before: &[String],
+    after: &[String],
+    value: impl Fn(Value) -> CellValue,
+) -> Result<Vec<Change>> {
+    let column = collection
+        .column(col)
+        .ok_or_else(|| refuse(collection, col, "no such live column"))?;
+    match (column.ty.text_set(), column.ty) {
+        (Some(_), _) => {
+            let normal = |texts: &[String]| -> BTreeSet<String> {
+                texts.iter().map(|text| keys::normal_text(text)).collect()
+            };
+            let (had, has) = (normal(before), normal(after));
+            let mut out = Vec::new();
+            for member in has.difference(&had) {
+                out.push(member_change(collection, pk, col, member, true, &value)?);
+            }
+            for member in had.difference(&has) {
+                out.push(member_change(collection, pk, col, member, false, &value)?);
+            }
+            Ok(out)
+        }
+        (None, Ty::List(..)) if before == after => Ok(Vec::new()),
+        (None, Ty::List(..)) => Ok(vec![change(
+            collection,
+            CellKey {
+                pk,
+                col,
+                elem: None,
+            },
+            &value(Value::Array(
+                after.iter().cloned().map(Value::String).collect(),
+            )),
+        )?]),
+        _ => Err(refuse(
+            collection,
+            col,
+            "this column holds no free-text members",
+        )),
+    }
 }
 
 /// One concurrent value of a cell.

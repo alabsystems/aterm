@@ -6,9 +6,13 @@ use super::*;
 /// A tab ID in the t form, as aterm mints one for every new tab.
 const TAB: &str = "t0qje5bafqr";
 
-/// A session id in the earlier form, from a number.
+/// The ID of a tab opened before the t form, which its shell's environment names until aterm
+/// restores or closes the tab ([`aterm_types::tab_id::is_legacy`]).
+const LEGACY: &str = "s-0123456789abcdef0123";
+
+/// A tab's session from a number: the tab ID of those bits, so two numbers name two tabs.
 fn sid(n: u64) -> String {
-    format!("s-{n:020x}")
+    aterm_types::tab_id::TabId::from_bits(n).as_str().to_owned()
 }
 
 fn start(session: u64, workspace: &Path, at_ms: u64) -> Start {
@@ -52,7 +56,7 @@ fn starts_of(record: &Path) -> Vec<Start> {
 fn a_start_reads_back_from_its_line_and_a_line_naming_no_tab_or_no_absolute_path_is_refused() {
     let (_directory, base, _) = scratch();
     let plain = Start {
-        session: sid(0x0123_4567_89ab_cdef),
+        session: TAB.to_owned(),
         workspace: base.join("work tree"),
         build: Some(base.join("cache").join("it's \"here\"\nnow")),
         pid: 4242,
@@ -73,12 +77,16 @@ fn a_start_reads_back_from_its_line_and_a_line_naming_no_tab_or_no_absolute_path
     let line = unknown.line().unwrap();
     assert!(!line.contains("\"build\""), "{line}");
     assert_eq!(Start::parse(&line), Some(unknown.clone()));
-    // A tab minted since the t form: its session reads back too.
-    let tab = Start {
-        session: TAB.to_owned(),
+    // Another tab's session reads back as its own.
+    let other = Start {
+        session: sid(1),
         ..plain.clone()
     };
-    assert_eq!(Start::parse(&tab.line().expect("a t ID's line")), Some(tab));
+    assert_ne!(other.session, plain.session);
+    assert_eq!(
+        Start::parse(&other.line().expect("a t ID's line")),
+        Some(other)
+    );
 
     // What a writer refuses to spell.
     for session in [
@@ -167,11 +175,32 @@ fn a_start_reads_back_from_its_line_and_a_line_naming_no_tab_or_no_absolute_path
     ] {
         assert_eq!(Start::parse(&skipped), None, "{skipped}");
     }
+
+    // A tab opened before the t form: its shell's builds name its `s-` ID. Last, so that
+    // everything above is judged before it. First the reader alone, on a line an earlier build
+    // already wrote to the record (a rewrite keeps only the lines it reads); then the writer
+    // and the reader together.
+    let stored = format!(
+        "{{\"v\":1,\"session\":\"{LEGACY}\",\"workspace\":{workspace},\"pid\":3,\"at_ms\":9}}"
+    );
+    assert_eq!(
+        Start::parse(&stored).map(|start| start.session).as_deref(),
+        Some(LEGACY),
+        "a line an earlier build wrote for a legacy tab: {stored}"
+    );
+    let legacy = Start {
+        session: LEGACY.to_owned(),
+        ..plain.clone()
+    };
+    assert_eq!(
+        legacy.line().as_deref().and_then(Start::parse),
+        Some(legacy),
+        "a legacy tab's session"
+    );
 }
 
 #[test]
 fn the_session_is_the_tabs_parent_variable_and_nothing_else() {
-    let tab = sid(0xabc);
     let env = |parent: Option<&str>| {
         let parent = parent.map(str::to_owned);
         move |name: &str| match name {
@@ -182,10 +211,6 @@ fn the_session_is_the_tabs_parent_variable_and_nothing_else() {
         }
     };
     assert_eq!(
-        session_of(&env(Some(tab.as_str()))).as_deref(),
-        Some(tab.as_str())
-    );
-    assert_eq!(
         session_of(&env(Some(TAB))).as_deref(),
         Some(TAB),
         "a tab minted in the t form"
@@ -193,6 +218,12 @@ fn the_session_is_the_tabs_parent_variable_and_nothing_else() {
     assert_eq!(session_of(&env(None)), None, "outside a tab");
     assert_eq!(session_of(&env(Some("x"))), None);
     assert_eq!(session_of(&env(Some(""))), None);
+    // Last, so that everything above is judged before it.
+    assert_eq!(
+        session_of(&env(Some(LEGACY))).as_deref(),
+        Some(LEGACY),
+        "a tab opened before the t form, which keeps its `s-` ID until it is restored or closed"
+    );
 }
 
 #[test]
@@ -652,8 +683,8 @@ fn started(out: &std::process::Output, words: &[&str]) -> bool {
 /// becomes the build, however it reached the workspace (its folder, `--manifest-path`, `-m`,
 /// `-C`) and whether or not it claims (`run`, and a user alias over it). NEGATIVE CONTROLS: a
 /// call that builds nothing, a build outside a tab, one whose tab variable is no session id,
-/// and one that names no manifest and finds none (`install x` from a folder with none) each
-/// run and leave no line.
+/// one that names no manifest and finds none (`install x` from a folder with none) and a `-C`
+/// without the gate Targo's `-C` needs, which Targo refuses, each run and leave no line.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_front_writes_one_start_line_for_a_build_in_a_tab() {
@@ -696,10 +727,18 @@ fn the_front_writes_one_start_line_for_a_build_in_a_tab() {
     leaves_its_line(&elsewhere, &by_path, Some(&cache));
     let by_short = ["--unverified", "build", "-m", manifest, "--jobs=1"];
     leaves_its_line(&elsewhere, &by_short, Some(&cache));
-    // The shim's block leaves a `-C` call as typed: its output goes where Targo puts it, inside
-    // the workspace, which the window reads from the workspace itself.
-    let moved = ["-C", source, "--unverified", "build", "--jobs=1"];
-    leaves_its_line(&elsewhere, &moved, None);
+    // A `-C` call, with the gate Targo's `-C` needs before the verb, is judged as the same call
+    // typed in the directory it names, and the shim's block places it there too.
+    let moved = [
+        "-C",
+        source,
+        "-Z",
+        "unstable-options",
+        "--unverified",
+        "build",
+        "--jobs=1",
+    ];
+    leaves_its_line(&elsewhere, &moved, Some(&cache));
 
     // Calls that compile and never claim: `run`, and an alias over it.
     let run = ["--unverified", "run", "-q"];
@@ -743,6 +782,12 @@ fn the_front_writes_one_start_line_for_a_build_in_a_tab() {
             &["--unverified", "build", "--jobs=1"][..],
             Some(tab.as_str()),
         ),
+        // Without the gate Targo refuses the `-C` before it reads anything: it builds nothing.
+        (
+            &elsewhere,
+            &["-C", source, "--unverified", "build", "--jobs=1"][..],
+            Some(tab.as_str()),
+        ),
     ] {
         let out = front.run(cwd, words, session);
         assert!(started(&out, words), "{words:?} {session:?}: {out:?}");
@@ -757,9 +802,9 @@ fn the_front_writes_one_start_line_for_a_build_in_a_tab() {
 /// THE LINE'S BUILD FOLDER IS WHERE THE PLACEMENT PUT THE OUTPUT: a `--target-dir` build names
 /// that target directory, not the quiet folder placed under it; the trust lane (`env`: the
 /// shim exported the directory) names its target directory the same way; and a call the block
-/// left as typed (`-`) names the build directory its own environment gave it. (A `-` call with
-/// no such variable names none: the `-C` case of
-/// `the_front_writes_one_start_line_for_a_build_in_a_tab`.)
+/// left as typed (`-`) names the build directory its own environment gave it, and one with no
+/// such variable names none: a `-C` call under a channel override, which the block's `-C` arm
+/// refuses to place while Targo honours the `-C`, so its output goes where Targo puts it.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_line_names_the_build_folder_its_placement_chose() {
@@ -794,7 +839,22 @@ fn a_start_line_names_the_build_folder_its_placement_chose() {
         Some(own.clone()),
         "-"
     );
-    assert_eq!(front.starts().len(), 3);
+    let source = front.source.to_str().unwrap();
+    let moved = [
+        "-C",
+        source,
+        "-Z",
+        "unstable-options",
+        "--unverified",
+        "build",
+        "--jobs=1",
+    ];
+    let nightly = [(
+        "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS",
+        Path::new("nightly"),
+    )];
+    assert_eq!(last(&moved, &nightly), None, "- with no variable");
+    assert_eq!(front.starts().len(), 4);
 }
 
 /// A START LINE THAT CANNOT BE WRITTEN NEVER STOPS THE BUILD: with no state folder, with a

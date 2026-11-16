@@ -52,6 +52,7 @@ fn claim(pid: u32, start_ms: u64, disk: u64, on: &str, held: bool) -> Record {
         timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/Users//me/aterm".to_owned(),
         need: Need::new(format!("verify {pid}")).disk(disk, on),

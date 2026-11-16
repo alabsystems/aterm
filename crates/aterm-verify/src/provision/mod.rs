@@ -19,7 +19,7 @@ use aterm_uds::host::When;
 
 pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
-pub use stock::{CELL_TARGETS, LINUX_LANE_TARGETS};
+pub use stock::LINUX_LANE_TARGETS;
 
 /// The stamp's file name in a placed row's directory ([`aterm_uds::host::PIN_STAMP`]).
 pub const STAMP: &str = aterm_uds::host::PIN_STAMP;

@@ -362,6 +362,7 @@ fn a_panicking_timed_stage_lets_the_runs_quiet_claim_go() {
         app: dir.path().join("fixture.app"),
         version: None,
         commit: None,
+        ..crate::MeasureArtifact::unnamed(dir.path().join("fixture.app"))
     }));
     let window = Ledger::at(dir.path().join("window-ledger"));
     let listed = || window.list().unwrap().len();

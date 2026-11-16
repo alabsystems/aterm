@@ -139,6 +139,13 @@ impl NativeUsageDeferred {
                         .is_some_and(|work| self.0.source.as_ref() == Some(&work.source_identity()))
             })
     }
+    /// Whether no [`Self::resume`] can settle this ticket in this App: its source
+    /// namespace was replaced or went, so a resume hands it back unchanged, and
+    /// only a fresh discovery ticket for the same journal ([`Self::same_journal`])
+    /// takes its place. Ordering metadata only, never admission.
+    pub fn parked(&self) -> bool {
+        self.0.parked_namespace
+    }
     /// Admit a genuinely new operation only after the original has retired and
     /// the same App accepts ordinary work. Reconciliation cannot send HTTP or
     /// materialize a consumer source. A pause leaves this metadata unchanged.

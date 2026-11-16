@@ -126,17 +126,14 @@ fn after_sync_failure() -> (aterm_tempfile::TempDir, Plan, Fake, Ctx) {
     let source = root.path().join("team.secrets");
     let home = root.path().join("home");
     let paths = joined(&home, &source);
-    // Readiness was true. The subscriber now writes a newer token while another
-    // entry fails, before the repository stage captures its local inputs.
-    let other = home.join(".secrets/tool-other");
-    std::fs::remove_file(&other).unwrap();
-    std::fs::create_dir(&other).unwrap();
+    // Readiness was true. The source now holds a newer token, and an apply of it began and
+    // did not finish before the repository stage captures its local inputs.
     std::fs::write(
         &source,
         "gh_access_token=fixture_new_repository_token\ntool-other=after\n",
     )
     .unwrap();
-    client::sync(&paths, None).unwrap();
+    client::test_interrupt_apply(&paths).unwrap();
     assert!(!client::materialization_ready(&paths).unwrap());
     let mut selection = Selection::none();
     selection.set(Setting::Secrets, true);

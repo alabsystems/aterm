@@ -20,6 +20,7 @@ fn entry(name: &str, value: &[u8]) -> MemberEntry {
         anchor: Anchor::Keep,
         fleet_reads_anchors: false,
         read_as: None,
+        settles: None,
     }
 }
 
@@ -53,7 +54,7 @@ fn a_seated_mac_without_the_admin_key_sets_a_shared_name_another_mac_reads() {
     assert_eq!(written, MemberWritten::Posted);
     sync(m22, None).expect("m22 syncs");
     assert_eq!(
-        crate::client::stored(&m22, "gh_access_token").unwrap(),
+        crate::client::stored(m22, "gh_access_token").unwrap(),
         b"token-v2",
         "m22 writes m7's value"
     );
@@ -440,6 +441,7 @@ fn a_busy_vault_refuses_a_person_and_keeps_a_waiting_write() {
 fn over(name: &str, read: &[u8], value: &[u8]) -> MemberEntry {
     MemberEntry {
         read_as: Some(SecretBytes::from(read.to_vec())),
+        settles: None,
         ..entry(name, value)
     }
 }
@@ -872,7 +874,7 @@ fn unset_then_admit(old_epoch: bool) -> Admitted {
     let signed = convergence::signed_since(m7, &before);
     sync(m22, None).expect("m22 syncs");
     assert!(
-        crate::client::stored(&m22, "secret").is_none(),
+        crate::client::stored(m22, "secret").is_none(),
         "m22 takes it back"
     );
     let (m40, _, _) = let_in_by(&macs, m7, "m40", "m40");

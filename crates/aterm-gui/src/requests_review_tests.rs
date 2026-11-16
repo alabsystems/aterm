@@ -13,7 +13,8 @@ const AT: u64 = 1_794_233_460_000;
 const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
 const OTHER: &str = "c0ffee00c0ffee00c0ffee00c0ffee00";
 const ASKER: &str = "s-0123456789abcdef0123";
-const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+const REMOTE: &str = "tqn5r6e0148";
+const BY: &str = "fleet:87be5228:tqn5r6e0148";
 /// A hang detector for the requests' writer thread.
 const MUST: Duration = Duration::from_secs(60);
 
@@ -285,7 +286,7 @@ fn requests_lists_newest_first_and_filters_state_and_from() {
         ids(&fake.run(&no_client, "requests", "state=running", &sessions)),
         [running.as_str()]
     );
-    for from in ["87be5228", NODE, BY, ASKER] {
+    for from in ["87be5228", NODE, BY, REMOTE] {
         assert_eq!(
             ids(&fake.run(
                 &no_client,
@@ -780,126 +781,201 @@ fn review_refuses_a_running_request_and_keep_keeps_its_open_tabs() {
 
 #[test]
 fn reply_mails_the_requester_there_and_here_through_report_post() {
+    for malformed in [
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
+        "s-0123456789abcdef0123:extra",
+    ] {
+        assert!(
+            reply_to(&format!("fleet:87be5228:{malformed}"), NODE).is_err(),
+            "{malformed}"
+        );
+    }
+    for remote in [REMOTE, ASKER] {
+        let by = format!("fleet:87be5228:{remote}");
+        let here = Here::new();
+        let sessions = new_store();
+        let mut store = here.store();
+        let (fleet_tab, local_tab, silent_tab) = (test_handle(1), test_handle(2), test_handle(3));
+        for tab in [&fleet_tab, &local_tab, &silent_tab] {
+            sessions.write().unwrap().register(tab.clone());
+        }
+        let there = request(
+            &mut store,
+            AT,
+            fleet_shell(NODE, &by, "there"),
+            fleet_tab.sid.as_str(),
+            None,
+        );
+        let local = request(
+            &mut store,
+            AT + 1,
+            local_spawn("here"),
+            local_tab.sid.as_str(),
+            None,
+        );
+        let silent = request(
+            &mut store,
+            AT + 2,
+            fleet_shell(NODE, "fleet:87be5228:-", "named no session"),
+            silent_tab.sid.as_str(),
+            None,
+        );
+        let fake = Fake::default();
+        let answer = fake.run(
+            &no_client,
+            "request",
+            &format!("reply {there} -- thanks, cleaning it up"),
+            &sessions,
+        );
+        assert_eq!(
+            answer,
+            format!("OK replied req={there} to=@{remote}@{NODE} OK f1\n")
+        );
+        let answer = fake.run(
+            &no_client,
+            "request",
+            &format!("reply {local} done here"),
+            &sessions,
+        );
+        assert_eq!(
+            answer,
+            format!("OK replied req={local} to=@{ASKER} OK f1\n")
+        );
+        {
+            let posts = fake.posts.lock().unwrap();
+            assert_eq!(posts.len(), 2);
+            let (from, to, key, line) = &posts[0];
+            assert_eq!(
+                from,
+                fleet_tab.sid.as_str(),
+                "sent from a tab of the request"
+            );
+            assert_eq!(to, &format!("@{remote}@{NODE}"));
+            assert!(
+                key.starts_with(&format!("rq.{there}.")) && key.len() <= 64,
+                "{key}"
+            );
+            assert!(
+                line.starts_with(&format!(
+                    "reply to request {there} from this-mac: thanks, cleaning it up | req={there} \
+                 stage=running"
+                )),
+                "{line}"
+            );
+        }
+        let mut cold = here.store();
+        let request = cold.get(&there).cloned().unwrap();
+        assert_eq!(request.replies.len(), 1);
+        assert!(request.replies[0].sent);
+        assert_eq!(
+            cold.said(&there).unwrap().replies[0].1,
+            "thanks, cleaning it up"
+        );
+        // NEGATIVE: a requester that named no session is refused, and nothing is posted.
+        let refused = fake.run(
+            &no_client,
+            "request",
+            &format!("reply {silent} hi"),
+            &sessions,
+        );
+        assert_eq!(
+            refused,
+            "ERR request reply: its requester named no session, so no mail reaches it\n"
+        );
+        assert_eq!(fake.posts.lock().unwrap().len(), 2);
+        // A mail nothing took answers why and is recorded unsent.
+        let unsent = Fake {
+            unsent: Some(Unsent::NoBridge("absent".to_owned())),
+            ..Fake::default()
+        };
+        let answer = unsent.run(
+            &no_client,
+            "request",
+            &format!("reply {local} again"),
+            &sessions,
+        );
+        assert!(
+            answer.starts_with("ERR request reply: no fabric bridge runs here"),
+            "{answer}"
+        );
+        let cold = here.store();
+        let replies = cold.get(&local).cloned().unwrap().replies;
+        assert_eq!(
+            replies.iter().map(|reply| reply.sent).collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+}
+
+/// A DRIVE FROM A TAB OPENED BEFORE THE `t` FORM IS ANSWERED IN THAT TAB: the actor a drive
+/// records for a requester line naming such a tab's `s-` ID (`Actor::fleet_drive`) keeps the ID,
+/// so a reply to each of two such tabs' requests is mailed to its own tab on the asking Mac.
+/// NEGATIVE CONTROL: a drive whose requester line named no session is refused a reply.
+#[test]
+fn a_legacy_tabs_drive_is_replied_to_in_that_tab() {
     let here = Here::new();
     let sessions = new_store();
     let mut store = here.store();
-    let (fleet_tab, local_tab, silent_tab) = (test_handle(1), test_handle(2), test_handle(3));
-    for tab in [&fleet_tab, &local_tab, &silent_tab] {
-        sessions.write().unwrap().register(tab.clone());
-    }
-    let there = request(
-        &mut store,
-        AT,
-        fleet_shell(NODE, BY, "there"),
-        fleet_tab.sid.as_str(),
-        None,
-    );
-    let local = request(
-        &mut store,
-        AT + 1,
-        local_spawn("here"),
-        local_tab.sid.as_str(),
-        None,
-    );
+    let tab = test_handle(1);
+    sessions.write().unwrap().register(tab.clone());
+    let asked: Vec<(String, &str)> = [
+        (AT, "s-0123456789abcdef0123"),
+        (AT + 10, "s-fedcba9876543210fedc"),
+    ]
+    .into_iter()
+    .map(|(at, legacy)| {
+        let by = aterm_slog::Actor::fleet_drive(NODE, Some(legacy));
+        let id = request(
+            &mut store,
+            at,
+            fleet_shell(NODE, by.word(), "legacy"),
+            tab.sid.as_str(),
+            None,
+        );
+        (id, legacy)
+    })
+    .collect();
     let silent = request(
         &mut store,
-        AT + 2,
-        fleet_shell(NODE, "fleet:87be5228:-", "named no session"),
-        silent_tab.sid.as_str(),
+        AT + 20,
+        fleet_shell(
+            NODE,
+            aterm_slog::Actor::fleet_drive(NODE, None).word(),
+            "none",
+        ),
+        tab.sid.as_str(),
         None,
     );
     let fake = Fake::default();
-    let answer = fake.run(
-        &no_client,
-        "request",
-        &format!("reply {there} -- thanks, cleaning it up"),
-        &sessions,
-    );
-    assert_eq!(
-        answer,
-        format!("OK replied req={there} to=@{ASKER}@{NODE} OK f1\n")
-    );
-    let answer = fake.run(
-        &no_client,
-        "request",
-        &format!("reply {local} done here"),
-        &sessions,
-    );
-    assert_eq!(
-        answer,
-        format!("OK replied req={local} to=@{ASKER} OK f1\n")
-    );
-    {
-        let posts = fake.posts.lock().unwrap();
-        assert_eq!(posts.len(), 2);
-        let (from, to, key, line) = &posts[0];
+    for (id, legacy) in &asked {
         assert_eq!(
-            from,
-            fleet_tab.sid.as_str(),
-            "sent from a tab of the request"
-        );
-        assert_eq!(to, &format!("@{ASKER}@{NODE}"));
-        assert!(
-            key.starts_with(&format!("rq.{there}.")) && key.len() <= 64,
-            "{key}"
-        );
-        assert!(
-            line.starts_with(&format!(
-                "reply to request {there} from this-mac: thanks, cleaning it up | req={there} \
-                 stage=running"
-            )),
-            "{line}"
+            fake.run(
+                &no_client,
+                "request",
+                &format!("reply {id} on it"),
+                &sessions
+            ),
+            format!("OK replied req={id} to=@{legacy}@{NODE} OK f1\n")
         );
     }
-    let mut cold = here.store();
-    let request = cold.get(&there).cloned().unwrap();
-    assert_eq!(request.replies.len(), 1);
-    assert!(request.replies[0].sent);
     assert_eq!(
-        cold.said(&there).unwrap().replies[0].1,
-        "thanks, cleaning it up"
-    );
-    // NEGATIVE: a requester that named no session is refused, and nothing is posted.
-    let refused = fake.run(
-        &no_client,
-        "request",
-        &format!("reply {silent} hi"),
-        &sessions,
-    );
-    assert_eq!(
-        refused,
-        "ERR request reply: its requester named no session, so no mail reaches it\n"
+        fake.run(
+            &no_client,
+            "request",
+            &format!("reply {silent} on it"),
+            &sessions
+        ),
+        "ERR request reply: its requester named no session, so no mail reaches it\n",
+        "CONTROL"
     );
     assert_eq!(fake.posts.lock().unwrap().len(), 2);
-    // A mail nothing took answers why and is recorded unsent.
-    let unsent = Fake {
-        unsent: Some(Unsent::NoBridge("absent".to_owned())),
-        ..Fake::default()
-    };
-    let answer = unsent.run(
-        &no_client,
-        "request",
-        &format!("reply {local} again"),
-        &sessions,
-    );
-    assert!(
-        answer.starts_with("ERR request reply: no fabric bridge runs here"),
-        "{answer}"
-    );
-    let cold = here.store();
-    let replies = cold.get(&local).cloned().unwrap().replies;
-    assert_eq!(
-        replies.iter().map(|reply| reply.sent).collect::<Vec<_>>(),
-        [true, false]
-    );
 }
 
-/// Session ids `s-…` for tab `n` of a test.
+/// The tab ID whose number is `n`, for tab `n` of a test.
 fn sid(n: u8) -> String {
-    format!(
-        "s-{}",
-        format!("{n:x}").repeat(20).get(..20).unwrap_or_default()
-    )
+    aterm_types::tab_id::TabId::from_bits(u64::from(n)).to_string()
 }
 
 #[test]

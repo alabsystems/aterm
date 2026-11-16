@@ -152,7 +152,7 @@ impl Deleted {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum WriteOp {
-    /// POST a public repository for the authenticated owner. One-shot.
+    /// POST a repository with explicit visibility for the authenticated owner. One-shot.
     RepoCreate,
     /// POST a draft release. One-shot.
     ReleaseCreate,

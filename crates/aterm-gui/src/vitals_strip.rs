@@ -4,7 +4,8 @@
 //! The stats deck's strip checkpoint, append-only (`docs/DESIGN-stats-deck-flow-2026-11-02.md`
 //! §9): a folder in the state home's quiet `.ubd` folder, so its churn feeds neither fseventsd
 //! nor Spotlight, holding `base.json`, the whole strip, and `tail.jsonl`, one line per closed
-//! ten-second epoch of every ring. The base is rewritten at a start's first reading, hourly, where
+//! ten-second epoch of every ring, with the gaps, events, situation spans and usual clocks that
+//! moved since the line before. The base is rewritten at a start's first reading, hourly, where
 //! the model's held buckets changed other than by an epoch closing
 //! ([`aterm_vitals::Vitals::strip_rewrites`]) and at the probe thread's stop; between bases, and
 //! while an hourly one cannot be written, each reading past an epoch's end appends that epoch's
@@ -16,8 +17,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aterm_vitals::model::{STRIP_RINGS, SavedStrip, StripEvent, StripEventKind, StripLine};
+use aterm_vitals::heat::{UsualClocks, UsualRow};
+use aterm_vitals::model::{
+    PlaceKind, STRIP_RINGS, SavedStrip, StripEvent, StripEventKind, StripLine,
+};
 use aterm_vitals::ring::{Agg, GapKind, SavedBucket, SavedRing, TimeGap};
+use aterm_vitals::situation::{Lid, PowerSource, Span, Stay};
 
 use super::{StripLock, read_bounded};
 
@@ -30,14 +35,22 @@ pub(super) const TAIL_FILE: &str = "tail.jsonl";
 /// Where a build before the append-only checkpoint kept the strip, whole, at schema 1: it restores
 /// nothing (record §9) and goes at the first base written.
 pub(super) const LEGACY_FILE: &str = "vitals-strip.json";
-/// Schema 3: preserves scope coverage and raw CPU charge alongside the primary CPU figures.
-pub(super) const STRIP_SCHEMA: u32 = 3;
+/// Schema 4 (stats deck A4, step N3): the instruments' rings (compute watts, the thermal
+/// pressure level, process exits, blockage) after schema 3's, the situation spans and the usual
+/// Super clocks. Schema 3 held 20 rings: scope coverage and raw CPU charge alongside the primary
+/// CPU figures. Schema 2 held 17. [`base_of`] reads all three.
+pub(super) const STRIP_SCHEMA: u32 = 4;
 /// The bound a base is read under; a full one is held under 85 % of it by a test.
 pub(super) const STRIP_MAX_BYTES: u64 = STRIP_RINGS as u64 * 64 * 1024;
-/// The bound a tail is read under: four hours of lines at their fullest. A base is written
-/// hourly, so only an hourly base that cannot be written lets a tail grow past an hour's, and an
+/// The bound a tail is read under: four hours of lines at their fullest (every ring's bucket at
+/// its widest, the stay's span moved and every usual clock taught; a test holds it). A base is
+/// written hourly, so only an hourly base that cannot be written lets a tail grow past an hour's, and an
 /// append never takes it past this bound ([`StripStore::keep`]).
 pub(super) const TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// The rings a schema 2 base held: slots 0 to 16.
+const SCHEMA_2_RINGS: usize = 17;
+/// The rings a schema 3 base held: schema 2's, then scope coverage and raw CPU charge.
+const SCHEMA_3_RINGS: usize = 20;
 /// How often a base is rewritten while nothing else asks for one.
 pub(super) const BASE_EVERY: Duration = Duration::from_secs(3_600);
 /// How soon a base that could not be written is tried again.
@@ -71,6 +84,10 @@ pub(super) struct StripStore {
     gaps: Vec<TimeGap>,
     /// The events the files hold.
     events: Vec<StripEvent>,
+    /// The situation spans the files hold: a line carries those not among them.
+    spans: Vec<Span>,
+    /// The usual clocks the files hold: a line carries the deciles that differ.
+    usual: UsualClocks,
     /// The tail's length in whole lines of this generation.
     tail_ok: u64,
     /// Whether the tail may hold more than [`Self::tail_ok`] (a short or failed append, a
@@ -96,6 +113,8 @@ impl StripStore {
             rewrites: 0,
             gaps: kept.time_gaps.clone(),
             events: kept.strip_events.clone(),
+            spans: kept.situation.clone(),
+            usual: kept.usual,
             tail_ok: 0,
             tail_dirty: true,
             #[cfg(test)]
@@ -218,6 +237,8 @@ impl StripStore {
         self.rewrites = rewrites;
         self.gaps.clone_from(&saved.time_gaps);
         self.events.clone_from(&saved.strip_events);
+        self.spans.clone_from(&saved.situation);
+        self.usual = saved.usual;
         self.tail_ok = 0;
         self.tail_dirty = !truncate(&dir.join(TAIL_FILE), 0);
         if let Some(legacy) = self.legacy.take()
@@ -233,7 +254,8 @@ impl StripStore {
     }
 
     /// Appends the lines of the epochs `model` closed past [`Self::through_k`], before `open`,
-    /// the last carrying the gaps and events the files do not hold yet.
+    /// the last carrying the gaps, events, situation spans and usual clocks the files do not
+    /// hold yet.
     fn append(&mut self, model: &aterm_vitals::Vitals, open: i64) {
         let Some(dir) = self.dir.as_deref() else {
             return;
@@ -258,6 +280,14 @@ impl StripStore {
             .filter(|e| !self.events.contains(e))
             .cloned()
             .collect();
+        let spans = model.strip_spans();
+        last.spans = spans
+            .iter()
+            .filter(|s| !self.spans.contains(s))
+            .copied()
+            .collect();
+        let usual = *model.usual_clocks();
+        last.usual = usual.rows_unlike(&self.usual);
         let text: String = lines
             .iter()
             .filter_map(|line| line_json(line, self.generation))
@@ -282,6 +312,8 @@ impl StripStore {
                 self.through_k = open - 1;
                 self.gaps = gaps;
                 self.events = events;
+                self.spans = spans.to_vec();
+                self.usual = usual;
             }
             Err(error) => {
                 self.tail_dirty = true;
@@ -455,16 +487,24 @@ struct BaseDoc {
     gaps: Vec<GapDoc>,
     #[serde(default)]
     events: Vec<EventDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    spans: Vec<SpanDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usual: Vec<UsualRow>,
 }
 
 /// A gap: `(start ms, end ms, kind)`.
 type GapDoc = (i64, i64, String);
 /// An event: `(at ms, kind, label)`.
 type EventDoc = (i64, String, String);
+/// A situation span: `(start ms, end ms, place, power, lid)`, each of the three its word, or
+/// empty where its reader gave none.
+type SpanDoc = (i64, i64, String, String, String);
 
 /// One line of `tail.jsonl`: generation `g`'s epoch `k`, its newest wall clock `w`, the
 /// capacities `c`, each ring's bucket by slot `r`, what the Processes rings hold `p`, and the
-/// gaps and events opened since the line before.
+/// gaps and events opened, the situation spans moved `s` and the usual clocks taught `u` since
+/// the line before.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct LineDoc {
     g: u64,
@@ -478,6 +518,10 @@ struct LineDoc {
     gaps: Vec<GapDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     events: Vec<EventDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    s: Vec<SpanDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    u: Vec<UsualRow>,
 }
 
 fn caps_of(read: Vec<Option<f64>>) -> [Option<f64>; 7] {
@@ -516,6 +560,38 @@ fn event_of((at_unix_ms, kind, label): EventDoc) -> Option<StripEvent> {
     })
 }
 
+fn span_doc(s: &Span) -> SpanDoc {
+    (
+        s.start_ms,
+        s.end_ms,
+        s.stay.place.map_or("", PlaceKind::word).to_owned(),
+        s.stay.power.map_or("", PowerSource::word).to_owned(),
+        s.stay.lid.map_or("", Lid::word).to_owned(),
+    )
+}
+
+/// The span a doc holds; `None` for one that ends before it starts, holds a word that names
+/// nothing, or holds no value at all (an empty word is a value no reader gave).
+fn span_of((start_ms, end_ms, place, power, lid): SpanDoc) -> Option<Span> {
+    fn named<T>(word: &str, of: impl FnOnce(&str) -> Option<T>) -> Option<Option<T>> {
+        if word.is_empty() {
+            Some(None)
+        } else {
+            of(word).map(Some)
+        }
+    }
+    let stay = Stay {
+        place: named(&place, place_kind_of)?,
+        power: named(&power, power_source_of)?,
+        lid: named(&lid, lid_of)?,
+    };
+    (end_ms >= start_ms && !stay.is_unread()).then_some(Span {
+        start_ms,
+        end_ms,
+        stay,
+    })
+}
+
 /// `strip` as a base of `generation`; `None` for one that has read nothing.
 pub(super) fn base_json(strip: &SavedStrip, generation: u64) -> Option<String> {
     if strip.last_wall_ms <= 0 {
@@ -534,18 +610,27 @@ pub(super) fn base_json(strip: &SavedStrip, generation: u64) -> Option<String> {
         proc_starts: strip.proc_starts,
         gaps: strip.time_gaps.iter().map(gap_doc).collect(),
         events: strip.strip_events.iter().map(event_doc).collect(),
+        spans: strip.situation.iter().map(span_doc).collect(),
+        usual: strip.usual.saved(),
     };
     aterm_json::to_string(&doc).ok()
 }
 
-/// The base in `text` and its generation. Schema 2 retains its measured history with explicitly
-/// unknown scope coverage; schema 3 reads that coverage directly.
+/// The base in `text` and its generation; `None` unless it parses with a reading at a schema
+/// this reads, holding that schema's rings. Schema 4 is read as written. A schema 3 base holds
+/// every ring but the instruments', and neither spans nor usual clocks: those start empty, and
+/// no value is made up for them. Schema 2 retains its measured history with explicitly unknown
+/// scope coverage.
 pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
     let doc: BaseDoc = aterm_json::from_str(text).ok()?;
-    let old_coverage = doc.schema == 2 && doc.rings.len() == 17;
-    if !(old_coverage || doc.schema == STRIP_SCHEMA && doc.rings.len() == STRIP_RINGS)
-        || doc.last_wall_ms <= 0
-    {
+    let old_coverage = doc.schema == 2;
+    let rings = match doc.schema {
+        2 => SCHEMA_2_RINGS,
+        3 => SCHEMA_3_RINGS,
+        STRIP_SCHEMA => STRIP_RINGS,
+        _ => return None,
+    };
+    if doc.rings.len() != rings || doc.last_wall_ms <= 0 {
         return None;
     }
     let mut strip = SavedStrip {
@@ -556,6 +641,8 @@ pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
         proc_starts: doc.proc_starts,
         time_gaps: doc.gaps.into_iter().filter_map(gap_of).collect(),
         strip_events: doc.events.into_iter().filter_map(event_of).collect(),
+        situation: doc.spans.into_iter().filter_map(span_of).collect(),
+        usual: UsualClocks::restored(&doc.usual),
         ..SavedStrip::default()
     };
     for (slot, ring) in doc.rings.into_iter().enumerate() {
@@ -584,6 +671,8 @@ pub(super) fn line_json(line: &StripLine, generation: u64) -> Option<String> {
         p: line.proc_starts,
         gaps: line.time_gaps.iter().map(gap_doc).collect(),
         events: line.strip_events.iter().map(event_doc).collect(),
+        s: line.spans.iter().map(span_doc).collect(),
+        u: line.usual.clone(),
     };
     aterm_json::to_string(&doc).ok()
 }
@@ -615,6 +704,8 @@ pub(super) fn line_of(text: &str) -> Option<(u64, StripLine)> {
         proc_starts: doc.p,
         time_gaps: doc.gaps.into_iter().filter_map(gap_of).collect(),
         strip_events: doc.events.into_iter().filter_map(event_of).collect(),
+        spans: doc.s.into_iter().filter_map(span_of).collect(),
+        usual: doc.u,
     };
     Some((doc.g, line))
 }
@@ -653,6 +744,30 @@ fn strip_event_kind_of(word: &str) -> Option<StripEventKind> {
         "crash" => Some(StripEventKind::Crash),
         _ => None,
     }
+}
+
+fn place_kind_of(word: &str) -> Option<PlaceKind> {
+    [
+        PlaceKind::Lan,
+        PlaceKind::Hotspot,
+        PlaceKind::Cellular,
+        PlaceKind::Vpn,
+        PlaceKind::Offline,
+    ]
+    .into_iter()
+    .find(|k| k.word() == word)
+}
+
+fn power_source_of(word: &str) -> Option<PowerSource> {
+    [PowerSource::Ac, PowerSource::Battery, PowerSource::Ups]
+        .into_iter()
+        .find(|p| p.word() == word)
+}
+
+fn lid_of(word: &str) -> Option<Lid> {
+    [Lid::Open, Lid::Closed, Lid::None]
+        .into_iter()
+        .find(|l| l.word() == word)
 }
 
 #[cfg(test)]

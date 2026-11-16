@@ -232,7 +232,9 @@ impl App {
             .accept_overwrite(document, observed.observed)
             .map_err(|error| format!("could not keep your edits: {error:?}"))?;
         for (_, _, view) in self.document_native_views(document) {
-            if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
+            if let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
+            {
                 state.status = Some(KEPT_STATUS.to_string());
             }
         }

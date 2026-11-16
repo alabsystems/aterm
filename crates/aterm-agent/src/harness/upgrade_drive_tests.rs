@@ -579,33 +579,38 @@ fn another_harness_processs_hand_is_no_outside_hand() {
 
 #[test]
 fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
-    let body = "0 t000000000a driving=- watchers=0 turns=0 alive nonce=0123456789abcdef0123456789abcdef fgpgid=101\n\
-                1 t000000000b driving=- watchers=1 turns=3 alive nonce=abcdef0123456789abcdef0123456789 fgpgid=-\n";
-    let tabs = parse_host_roster("OK 2", body).expect("who roster");
-    assert_eq!(tabs[0].fgpgid, Some(101));
-    assert_eq!(tabs[1].fgpgid, None);
-    assert_eq!(unique_tab_for_group(&tabs, 101), Some("t000000000a"));
-    assert_eq!(parse_host_roster("OK 0", ""), Some(Vec::new()));
-    assert_eq!(parse_host_roster("OK 1", body), None);
-    assert_eq!(parse_host_roster("OK 3", body), None);
-    assert_eq!(parse_host_roster("OK", ""), None);
-    assert_eq!(parse_host_roster("OK bogus", ""), None);
-    assert_eq!(parse_host_roster("OK 2 extra", body), None);
-    assert_eq!(parse_host_roster("ERR busy", body), None);
-    assert_eq!(parse_host_roster("OKAY", body), None);
-    assert_eq!(
-        parse_host_roster("OK 2", &body.replace("t000000000b", "t000000000a")),
-        None,
-        "duplicate tab ids are not an ownership roster"
-    );
-    let ambiguous = [
-        tabs[0].clone(),
-        LiveTab {
-            sid: "t000000000c".to_string(),
-            fgpgid: Some(101),
-        },
-    ];
-    assert_eq!(unique_tab_for_group(&ambiguous, 101), None);
+    for (foreground, other) in [
+        ("t000000000a", "t000000000b"),
+        ("s-b999e4758c0f9813bf7f", "t000000000b"),
+        ("t000000000a", "s-b999e4758c0f9813bf7f"),
+    ] {
+        let body = format!(
+            "0 {foreground} driving=- watchers=0 turns=0 alive nonce=0123456789abcdef0123456789abcdef fgpgid=101\n\
+             1 {other} driving=- watchers=1 turns=3 alive nonce=abcdef0123456789abcdef0123456789 fgpgid=-\n"
+        );
+        let tabs = parse_host_roster("OK 2", &body).expect("who roster");
+        assert_eq!(tabs[0].sid, foreground);
+        assert_eq!(tabs[1].sid, other);
+        assert_eq!(tabs[0].fgpgid, Some(101));
+        assert_eq!(tabs[1].fgpgid, None);
+        assert_eq!(unique_tab_for_group(&tabs, 101), Some(foreground));
+        assert_eq!(parse_host_roster("OK 0", ""), Some(Vec::new()));
+        assert_eq!(parse_host_roster("OK 1", &body), None);
+        assert_eq!(parse_host_roster("OK 3", &body), None);
+        assert_eq!(parse_host_roster("OK", ""), None);
+        assert_eq!(parse_host_roster("OK bogus", ""), None);
+        assert_eq!(parse_host_roster("OK 2 extra", &body), None);
+        assert_eq!(parse_host_roster("ERR busy", &body), None);
+        assert_eq!(parse_host_roster("OKAY", &body), None);
+        assert_eq!(
+            parse_host_roster("OK 2", &body.replace(other, foreground)),
+            None,
+            "duplicate session ids are not an ownership roster"
+        );
+        let ambiguous = parse_host_roster("OK 2", &body.replace("fgpgid=-", "fgpgid=101"))
+            .expect("two distinct sessions can report the same group");
+        assert_eq!(unique_tab_for_group(&ambiguous, 101), None);
+    }
 }
 
 /// The lanes past Claude Code's, as [`due_after_lanes`] asks them: Codex's answers `codex`,
@@ -1781,8 +1786,8 @@ fn the_last_look_reads_the_held_shells_from_the_agent_s_children_not_the_whole_t
         fn parent(&self, _: u32) -> Option<u32> {
             None
         }
-        fn terminal(&self, _: u32) -> Option<(u32, String)> {
-            None
+        fn terminal(&self, _: u32) -> Fact<(u32, String)> {
+            Ok(None)
         }
         fn process_start(&self, _: u32) -> Option<String> {
             None
@@ -4006,6 +4011,7 @@ fn a_measured_empty_composer_asks_the_gate_no_cell() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let (mut c, server) = fake_tab(vec![
@@ -4032,6 +4038,7 @@ fn a_displaced_grid_never_makes_a_placeholder_a_draft() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let screen = |cursor: Option<(usize, usize)>| typed(text, cursor);
@@ -4082,16 +4089,23 @@ fn tty_rows(rows: &[(u32, u32, &str, &str)]) -> Vec<(u32, u32, String, String)> 
         .collect()
 }
 
-/// The terminal proof over process tables.
+/// The terminal proof over process tables: who opened a terminal is an answer only where every
+/// row the walk needs was read. A process with no controlling terminal is read and has no opener;
+/// a table that lacks a row of the walk is not read, never a terminal nobody opened (LS-15).
 #[test]
 fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
+    let ours = |pid: u32, t: &[(u32, u32, String, String)]| {
+        terminal_owner(pid, t)
+            .expect("every row of the walk is in the table")
+            .is_some_and(owned_by_aterm)
+    };
     let live = tty_rows(&[
         (4205, 1916, "ttys000", "2.1.281"),
         (1916, 1, "ttys000", "zsh"),
         (1, 0, "??", "launchd"),
     ]);
-    assert_eq!(terminal_owner(4205, &live), Some((1, "launchd")));
-    assert!(terminal_owner(4205, &live).is_some_and(owned_by_aterm));
+    assert_eq!(terminal_owner(4205, &live), Ok(Some((1, "launchd"))));
+    assert!(ours(4205, &live));
     for name in ["aterm", "aterm-gui"] {
         let fresh = tty_rows(&[
             (700, 600, "ttys004", "claude"),
@@ -4099,18 +4113,15 @@ fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
             (500, 1, "??", name),
             (1, 0, "??", "launchd"),
         ]);
-        assert!(
-            terminal_owner(700, &fresh).is_some_and(owned_by_aterm),
-            "{name}"
-        );
+        assert!(ours(700, &fresh), "{name}");
     }
     let script = tty_rows(&[
         (99234, 99225, "ttys002", "sleep"),
         (99225, 1, "??", "script"),
         (1, 0, "??", "launchd"),
     ]);
-    assert_eq!(terminal_owner(99234, &script), Some((99225, "script")));
-    assert!(!terminal_owner(99234, &script).is_some_and(owned_by_aterm));
+    assert_eq!(terminal_owner(99234, &script), Ok(Some((99225, "script"))));
+    assert!(!ours(99234, &script));
     let screen = tty_rows(&[
         (29687, 28893, "ttys005", "2.1.0"),
         (28893, 28890, "ttys005", "zsh"),
@@ -4119,22 +4130,104 @@ fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
         (22415, 1, "ttys006", "zsh"),
         (1, 0, "??", "launchd"),
     ]);
-    assert!(!terminal_owner(29687, &screen).is_some_and(owned_by_aterm));
-    assert!(terminal_owner(22415, &screen).is_some_and(owned_by_aterm));
+    assert!(!ours(29687, &screen));
+    assert!(ours(22415, &screen));
     let tmux = tty_rows(&[
         (800, 801, "pts/7", "claude"),
         (801, 802, "pts/7", "bash"),
         (802, 1, "?", "tmux"),
         (1, 0, "?", "systemd"),
     ]);
-    assert!(!terminal_owner(800, &tmux).is_some_and(owned_by_aterm));
-    assert_eq!(owner_word(terminal_owner(800, &tmux)), "tmux");
+    assert!(!ours(800, &tmux));
+    assert_eq!(
+        owner_word(terminal_owner(800, &tmux).expect("read")),
+        "tmux"
+    );
     let bare = tty_rows(&[(900, 1, "??", "claude"), (1, 0, "??", "launchd")]);
-    assert_eq!(terminal_owner(900, &bare), None);
+    assert_eq!(
+        terminal_owner(900, &bare),
+        Ok(None),
+        "read: no controlling terminal, so nobody opened one"
+    );
     let cut = tty_rows(&[(901, 555, "ttys001", "claude")]);
-    assert_eq!(terminal_owner(901, &cut), None);
+    assert_eq!(
+        terminal_owner(901, &cut),
+        Err(NotRead),
+        "its parent's row is not in the table: not read, never a terminal nobody opened"
+    );
+    assert_eq!(
+        terminal_owner(902, &cut),
+        Err(NotRead),
+        "its own row is not in the table"
+    );
+    assert_eq!(
+        terminal_owner(900, &[]),
+        Err(NotRead),
+        "an empty table (a `ps` that did not answer) reads nothing"
+    );
     assert_eq!(owner_word(None), "none");
     assert_eq!(owner_word(Some((5, "a b/c"))), "abc");
+}
+
+/// LS-15: AN OPENER WHOSE NAME WAS NOT READ IS NOT ANOTHER PROGRAM. On macOS the terminal's owner
+/// is named by its `argv[0]`; where that read fails (`KERN_PROCARGS2` on a loaded host), `ps`
+/// prints the placeholder `(aterm)`, which [`owned_by_aterm`] rightly does not take for aterm. So
+/// an owner whose name was not read is [`NotRead`] (the snapshot's `terminal-unread`), never a
+/// terminal another program opened (`terminal`, the answer that no agent is in the tab).
+/// NEGATIVE CONTROL: that placeholder taken for its name is not aterm's. CONTROL: the same owner
+/// named `aterm` is aterm's, and a process of this user whose arguments the kernel did not answer
+/// (a pid no process holds) is named by none ([`comm_fact`]).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_terminal_owner_whose_name_was_not_read_is_not_read() {
+    use aterm_sysprobe::kproc::Record;
+    // SAFETY: `geteuid` reads this process's effective uid.
+    let me = unsafe { libc::geteuid() };
+    let row = |pid: u32, ppid: u32, tty: Option<i32>, comm: &str| Record {
+        pid,
+        ppid,
+        pgid: i32::try_from(pid).expect("a small pid"),
+        tpgid: 0,
+        tty,
+        uid: me,
+        comm: comm.into(),
+        start_s: 0,
+        start_us: 0,
+        zombie: false,
+    };
+    let rows = [
+        row(700, 600, Some(5), "claude"),
+        row(600, 500, Some(5), "zsh"),
+        row(500, 1, None, "aterm"),
+        row(1, 0, None, "launchd"),
+    ];
+    assert_eq!(
+        terminal_of_records(700, &rows, |_| Err(NotRead)),
+        Err(NotRead),
+        "the owner found and its name not read: not read"
+    );
+    assert_eq!(
+        terminal_of_records(700, &rows, |_| Ok(None)),
+        Err(NotRead),
+        "a name none answered is no name"
+    );
+    assert!(
+        !owned_by_aterm((500, "(aterm)")),
+        "the placeholder is no program's name, so it never reads as aterm's"
+    );
+    let named = terminal_of_records(700, &rows, |r| Ok(Some(r.comm.clone())));
+    assert_eq!(named, Ok(Some((500, "aterm".to_string()))));
+    assert!(
+        named
+            .expect("read")
+            .is_some_and(|(pid, name)| owned_by_aterm((pid, &name)))
+    );
+    let gone = row(dead_pid(), 1, None, "aterm");
+    assert_eq!(
+        comm_fact(&gone),
+        Err(NotRead),
+        "this user's process whose arguments the kernel did not answer is named by none"
+    );
 }
 
 /// End to end: an agent on a pty the tab does not own ([`PtyHost`]'s here, the shape of
@@ -4520,8 +4613,8 @@ fn only_its_shells_foreground_job_is_ever_announced_to_or_ended() {
     let (a, b) = (job_of(&Live, plain.id()), job_of(&Live, own.id()));
     let opened = (
         job_of(&Live, execd.id()),
-        Live.terminal(execd.id()),
-        Live.opener(execd.id(), me),
+        Live.terminal(execd.id()).expect("its terminal read"),
+        Live.opener(execd.id(), me).expect("its opener read"),
     );
     let not_opened = Live.opener(plain.id(), me);
     for c in [&mut plain, &mut own] {
@@ -4536,7 +4629,7 @@ fn only_its_shells_foreground_job_is_ever_announced_to_or_ended() {
     assert_eq!(opened.2.as_deref(), Some(name.as_str()), "the same opener");
     assert!(!owned_by_aterm((owner, name.as_str())), "{name}");
     assert_eq!(opened.0, Some((Job::Foreground, me)));
-    assert_eq!(not_opened, None);
+    assert_eq!(not_opened, Ok(None), "read, and not opened by this process");
 }
 
 /// End to end: an agent no job-control shell started (a launcher script that runs `claude` without
@@ -4724,8 +4817,8 @@ impl Kernel for Script {
         self.parent
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        Some((1, "launchd".to_string()))
+    fn terminal(&self, _: u32) -> Fact<(u32, String)> {
+        Ok(Some((1, "launchd".to_string())))
     }
 
     fn process_start(&self, _: u32) -> Option<String> {
@@ -4791,11 +4884,11 @@ impl<K: Kernel> Kernel for ParkedProcess<'_, K> {
         self.script.parent(pid)
     }
 
-    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+    fn terminal(&self, pid: u32) -> Fact<(u32, String)> {
         self.script.terminal(pid)
     }
 
-    fn opener(&self, agent: u32, parent: u32) -> Option<String> {
+    fn opener(&self, agent: u32, parent: u32) -> Fact<String> {
         self.script.opener(agent, parent)
     }
 
@@ -5986,6 +6079,9 @@ struct PaneProgram {
     agent: u32,
     shell: Option<u32>,
     opener: &'static str,
+    /// Whether the table the terminal's owner is read from answered ([`Kernel::terminal`]); its
+    /// opener is read apart from it, by the agent's and its parent's own records.
+    terminal_read: bool,
 }
 
 #[cfg(unix)]
@@ -5996,6 +6092,7 @@ impl PaneProgram {
             agent,
             shell: None,
             opener: "aterm",
+            terminal_read: true,
         }
     }
 
@@ -6028,8 +6125,15 @@ impl Kernel for PaneProgram {
         self.ids(pid).map(|(ppid, _, _)| ppid)
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        Some((PTY_OWNER, self.opener.to_string()))
+    fn terminal(&self, _: u32) -> Fact<(u32, String)> {
+        if !self.terminal_read {
+            return Err(NotRead);
+        }
+        Ok(Some((PTY_OWNER, self.opener.to_string())))
+    }
+
+    fn opener(&self, _: u32, parent: u32) -> Fact<String> {
+        Ok((parent == PTY_OWNER).then(|| self.opener.to_string()))
     }
 
     fn process_start(&self, _: u32) -> Option<String> {
@@ -6137,6 +6241,16 @@ fn an_agent_its_pane_runs_as_its_own_program_is_refused_before_the_announce_and_
     };
     let tmux_verdict = tmux.job(pid);
     let tmux_pane = run(&opts, Phase::Pending, &tmux);
+    // LS-15: the same pane with its terminal's owner not read (the table held past its bound) is
+    // waited on, never held back as another program's pane.
+    let unread_pane = run(
+        &opts,
+        Phase::Pending,
+        &PaneProgram {
+            terminal_read: false,
+            ..tmux
+        },
+    );
     let still_running_after = alive(pid);
     let _ = agent.kill();
     let _ = agent.wait();
@@ -6167,6 +6281,7 @@ fn an_agent_its_pane_runs_as_its_own_program_is_refused_before_the_announce_and_
     assert_eq!(signalled_control, 1, "the one signal asked for");
     assert_eq!(tmux_verdict, Some((Job::Foreground, PTY_OWNER)));
     assert_eq!(tmux_pane, "held-back:terminal:tmux");
+    assert_eq!(unread_pane, "wait:terminal-unread");
     assert!(still_running_after, "the server sent nothing");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -6185,8 +6300,8 @@ fn a_shells_hold_on_its_tab_is_read_through_the_kernels_ids() {
         fn parent(&self, _: u32) -> Option<u32> {
             None
         }
-        fn terminal(&self, _: u32) -> Option<(u32, String)> {
-            None
+        fn terminal(&self, _: u32) -> Fact<(u32, String)> {
+            Ok(None)
         }
         fn process_start(&self, _: u32) -> Option<String> {
             unstated("process start")
@@ -9195,6 +9310,7 @@ fn a_reply_drawn_under_a_status_line_holds_the_gate_while_its_title_runs() {
             generation: None,
             human: HumanInput::Never,
             title: title.map(str::to_owned),
+            program_report: None,
             human_seq: None,
         }
     };
@@ -15174,6 +15290,50 @@ fn the_relaunch_snapshot_reads_a_relative_or_empty_home_where_its_agent_runs() {
     case("snapshot-users-home", Home::Users);
 }
 
+/// LS-72: A RECORD NOT READ DOES NOT CHOOSE THE FOLDER WITH NO RECORD. A relative
+/// `CLAUDE_CONFIG_DIR` resolves under the directory the process runs in now or the one it started
+/// in, whichever holds its own session record ([`Records::of_process`]). A record there and not
+/// read (here cut short, as one in the middle of its write is) may be its own: its folder is
+/// kept, so the read that follows says the record was not read. NEGATIVE CONTROL: the choice read
+/// that record as none and fell back to the folder the process runs in now, whose read then
+/// answered that no record registers the process (`Ok(None)`), which the relaunch snapshot takes
+/// for `not-claude`. CONTROL: with no record under either folder, that read is `Ok(None)`.
+#[cfg(unix)]
+#[test]
+fn a_relative_homes_record_not_read_keeps_its_folder_and_stays_unread() {
+    let dir = scratch("relative-home-record-unread");
+    let (now, started) = (dir.join("now"), dir.join("started"));
+    for base in [&now, &started] {
+        std::fs::create_dir_all(base).expect("a working directory");
+    }
+    // No process need run as it: the record is never parsed, so its start is never asked for.
+    let pid = 4_100_001;
+    let read = || {
+        Records::of_process(
+            &dir.join("user"),
+            HomeVars::config(Some("home/.claude")),
+            pid,
+            || Some(now.clone()),
+            started.to_str(),
+        )
+        .session_file_read(pid)
+    };
+    let none = read();
+    let sessions = started.join("home/.claude/sessions");
+    std::fs::create_dir_all(&sessions).expect("its sessions folder");
+    std::fs::write(sessions.join(format!("{pid}.json")), "{\"pid\":").expect("a cut record");
+    let cut = read();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        matches!(none, Ok(None)),
+        "control: no record under either folder"
+    );
+    assert!(
+        matches!(cut, Err(NotRead)),
+        "a record there and not read is never no record"
+    );
+}
+
 /// An unset `CLAUDE_CONFIG_DIR` is the agent's own `HOME`'s `.claude`, not the window's
 /// (`homedir()` is the agent's `HOME`).
 #[cfg(unix)]
@@ -15302,6 +15462,53 @@ fn an_unreaped_zombie_neither_lives_nor_holds_its_conversation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Whether a live snapshot read refused only for what a loaded Mac can leave unread under a
+/// fixture that is right: the process table ([`super::TERMINAL_UNREAD`]) or
+/// the one process's record its opener's ids rest on (`ids`). These alone are waited out; every
+/// other refusal, unread or answered, is the read's result and fails the test at once with its
+/// own code.
+fn table_unread<T>(read: &Result<T, &'static str>) -> bool {
+    matches!(read, Err(why) if [super::TERMINAL_UNREAD, "ids"].contains(why))
+}
+
+/// THE LIVE READS WAIT OUT ONLY A TABLE NOT READ ([`table_unread`]): `terminal-unread` and `ids`
+/// are asked again; every other unread code (a roster, a record, a layout, an image not read)
+/// is no load's doing in a right fixture, so a regression that refuses it ends the wait at once
+/// and fails with its own code. NEGATIVE CONTROL (by hand, run): with `table_unread` true for
+/// every code `SnapshotRefusal::of` puts in Unread, the rows below from `roster` on say `true`.
+#[test]
+fn only_a_table_not_read_is_asked_again() {
+    use super::TERMINAL_UNREAD;
+    use crate::harness::relaunch::SnapshotRefusal;
+    assert!(table_unread::<()>(&Err(TERMINAL_UNREAD)));
+    assert!(table_unread::<()>(&Err("ids")));
+    for why in [
+        "roster",
+        "no-tab",
+        "no-socket",
+        "argv-unreadable",
+        "start",
+        "exe-unreadable",
+        "records-unread",
+        "layout-unread",
+        "shell-unread",
+    ] {
+        assert_eq!(
+            SnapshotRefusal::of(why),
+            SnapshotRefusal::Unread(why),
+            "CONTROL: {why} is an unread code"
+        );
+        assert!(!table_unread::<()>(&Err(why)), "{why} is not waited out");
+    }
+    for why in ["terminal", "not-claude", "no-foreground"] {
+        assert!(
+            !table_unread::<()>(&Err(why)),
+            "the answer {why} ends the wait"
+        );
+    }
+    assert!(!table_unread(&Ok(())), "a snapshot ends the wait");
+}
+
 /// The relaunch keeps a snapshot of a tab's own program, and relaunches nothing from it.
 #[cfg(unix)]
 #[test]
@@ -15339,14 +15546,15 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         crate::harness::relaunch::ProcessLifetime::capture(pid).is_some(),
         "negative control: this owned fixture PID really does name a live process"
     );
-    // A loaded Mac's process table can stay unread past its wait, and that read refuses as
-    // unread. The read under test is the one that answers, so it is asked until the table is read.
+    // A loaded Mac's process table, or one process's record in it, can stay unread past its wait,
+    // and that read refuses as unread (`terminal-unread`; `ids` for the opener the job rests on).
+    // The read under test is the one that answers, so it is asked until the read answers.
     let live = aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
-        "a read of the process table",
+        "a read of the process table that answers",
         || {
             let read = snapshot_with(&opts, &Live).map(|s| s.session);
-            (read != Err(crate::harness::relaunch::TERMINAL_UNREAD)).then_some(read)
+            (!table_unread(&read)).then_some(read)
         },
     );
     let execd = PaneProgram::execd(pid);
@@ -16895,8 +17103,8 @@ impl Kernel for ShellHolds {
         None
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        None
+    fn terminal(&self, _: u32) -> Fact<(u32, String)> {
+        Ok(None)
     }
 
     fn process_start(&self, _: u32) -> Option<String> {
@@ -18019,7 +18227,7 @@ impl Kernel for EachLineEnds {
         self.script.parent(pid)
     }
 
-    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+    fn terminal(&self, pid: u32) -> Fact<(u32, String)> {
         self.script.terminal(pid)
     }
 
@@ -19954,6 +20162,7 @@ fn a_labelled_top_rule_is_the_input_box_the_notice_fences_on() {
             generation: Some("4.77".to_string()),
             human: HumanInput::Unknown,
             title: None,
+            program_report: None,
             human_seq: None,
         };
         let fence = composer_rows(&scr).unwrap_or_else(|| panic!("{name}: the box"));
@@ -21508,6 +21717,7 @@ fn typing_that_wraps_at_the_bottom_of_the_screen_is_still_typing() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let mark = PromptMark::of(&at(&["out", "~/p % "], 1, 6)).expect("mark");
@@ -21797,6 +22007,7 @@ fn a_caret_moved_home_over_a_half_typed_command_is_typing() {
         generation: None,
         human: HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let clock = PromptMark::of(&at("~/proj %            12:34:56", 9)).expect("mark");
@@ -26130,7 +26341,7 @@ impl Kernel for Racing<'_> {
         self.script.parent(pid)
     }
 
-    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+    fn terminal(&self, pid: u32) -> Fact<(u32, String)> {
         self.script.terminal(pid)
     }
 
@@ -35267,4 +35478,37 @@ fn a_conversations_goal_is_read_from_its_record_as_it_grows() {
         ..snap
     };
     assert_eq!(GoalOf::default().of_snapshot(&dir, &agy), GoalRead::Unread);
+}
+
+/// LS-72: THE KERNEL'S LASTING REFUSAL OF ANOTHER USER'S ARGUMENTS IS READ AS SUCH, LIVE. The
+/// first process (launchd, init) is root's: to a reader that is not root the kernel withholds its
+/// arguments for as long as it runs, and [`args_of`] says so (`Ok(None)`), where the bare
+/// argument read (`process_args`) gives only a failure it cannot tell from one a busy kernel gives
+/// once. CONTROL: this process's own arguments are read.
+#[cfg(unix)]
+#[test]
+fn another_users_arguments_are_withheld_for_good_and_ones_own_are_read() {
+    let own = args_of(std::process::id()).expect("its own arguments read");
+    assert!(own.is_some_and(|args| !args.argv.is_empty()));
+    // SAFETY: `geteuid` reads this process's effective uid.
+    let me = unsafe { libc::geteuid() };
+    if me == 0 {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(first) = std::fs::metadata("/proc/1") else {
+            return;
+        };
+        if first.uid() == me {
+            return;
+        }
+    }
+    assert!(atpkg::caller_shell::process_args(1).is_none());
+    assert_eq!(
+        args_of(1).map(|args| args.is_some()),
+        Ok(false),
+        "pid 1 is root's: withheld"
+    );
 }

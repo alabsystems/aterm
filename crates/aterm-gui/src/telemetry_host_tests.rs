@@ -301,14 +301,27 @@ fn an_agent_call_row_is_sampled_from_its_job() {
 
 #[test]
 fn a_spawn_row_is_ok_or_refused_by_its_answer() {
-    let ok = spawn_row("claude", Some("/w"), 900, "OK s-12 tab=3", "m14", facts());
+    let ok = spawn_row(
+        "claude",
+        Some("/w"),
+        900,
+        "OK t0000000012 tab=3",
+        "m14",
+        facts(),
+    );
     assert_eq!((ok.kind.clone(), ok.outcome), (Kind::Spawn, Outcome::Ok));
     assert_eq!((ok.cpu_ms.clone(), ok.cache.clone()), (Fig::Na, Fig::Na));
     assert_eq!(ok.wait_ms, Fig::Na);
     assert_eq!(
         (ok.sid.as_deref(), ok.on.as_deref()),
-        (Some("s-12"), None),
+        (Some("t0000000012"), None),
         "the worker it started, here"
+    );
+    let loose = spawn_row("claude", Some("/w"), 900, "OK s-12 tab=3", "m14", facts());
+    assert_eq!(
+        (loose.outcome, loose.sid),
+        (Outcome::Ok, None),
+        "a loose `s-` word names no worker"
     );
     let refused = spawn_row("claude", None, 3, "ERR spawn: no room", "m14", facts());
     assert_eq!((refused.outcome, refused.sid), (Outcome::Refused, None));

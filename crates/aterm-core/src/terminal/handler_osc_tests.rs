@@ -798,3 +798,87 @@ fn osc_52_set_pre_decode_bound_passes_exact_cap_payload() {
         "exactly-cap OSC 52 set must still reach the clipboard"
     );
 }
+
+/// Where `needle` first stands in `haystack`, or `None`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Where the first DA1 reply (`CSI ? <params> c`) stands in `response`, or `None`.
+fn first_da1_reply(response: &[u8]) -> Option<usize> {
+    (0..response.len()).find(|&at| {
+        let Some(rest) = response[at..].strip_prefix(b"\x1b[?") else {
+            return false;
+        };
+        let params = rest
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b';')
+            .count();
+        params > 0 && rest.get(params) == Some(&b'c')
+    })
+}
+
+/// CLAUDE CODE'S PROGRAM-STATUS QUERY IS ANSWERED BEFORE ITS SENTINEL: the startup probe Claude
+/// Code 2.1.323 writes (MEASURED 2026-11-12 in the real-Claude lab: `CSI > 0 q`, `CSI ? u`,
+/// `OSC 7501 ; ? BEL`, then a DA1 as the round's sentinel). The engine answers `OSC 7501 ; ? BEL`
+/// ahead of the DA1's reply, which Claude Code needs: a DA1 reply first settles the protocol
+/// unspoken and nothing later moves it. The reports that then come are read
+/// (`program_state_tests`). NEGATIVE CONTROL: the same probe with no 7501 query is answered with no
+/// 7501 reply, and a report is answered with nothing.
+#[test]
+fn claude_codes_program_status_query_is_answered_before_its_sentinel() {
+    let mut term = Terminal::new(24, 80);
+    term.process(b"\x1b[>0q\x1b[?u\x1b]7501;?\x07\x1b[c");
+    let response = term.take_response().expect("the probe is answered");
+    let answer = find(&response, b"\x1b]7501;?\x07").expect("the query is answered, BEL for BEL");
+    let sentinel = first_da1_reply(&response).expect("the DA1 is answered");
+    assert!(
+        answer < sentinel,
+        "the answer must come before the sentinel's reply: {}",
+        String::from_utf8_lossy(&response).escape_debug()
+    );
+
+    let mut control = Terminal::new(24, 80);
+    control.process(b"\x1b[>0q\x1b[?u\x1b[c");
+    let response = control.take_response().expect("the probe is answered");
+    assert_eq!(
+        find(&response, b"\x1b]7501"),
+        None,
+        "no query, no 7501 reply"
+    );
+    control.process(b"\x1b]7501;state=idle:app=claude-code\x07");
+    assert_eq!(control.take_response(), None, "a report is not a query");
+}
+
+/// THE ANSWER ENDS AS THE QUERY DID: Muse Code, Grok Build and Kimi Code end theirs with ST
+/// (MEASURED 2026-11-12), Claude Code and agy with BEL. Only the bare query `?` is one: a body that
+/// merely starts with it, or a query split over a second parameter, is answered with nothing.
+#[test]
+fn the_program_status_answer_ends_with_the_querys_terminator() {
+    let mut term = Terminal::new(24, 80);
+    term.process(b"\x1b]7501;?\x1b\\");
+    assert_eq!(
+        term.take_response().as_deref(),
+        Some(&b"\x1b]7501;?\x1b\\"[..])
+    );
+    term.process(b"\x1b]7501;?\x07");
+    assert_eq!(
+        term.take_response().as_deref(),
+        Some(&b"\x1b]7501;?\x07"[..])
+    );
+    for not_a_query in [
+        &b"\x1b]7501;?x\x07"[..],
+        b"\x1b]7501;??\x07",
+        b"\x1b]7501;?;?\x07",
+        b"\x1b]7501;\x07",
+        b"\x1b]7501;state=?\x07",
+    ] {
+        term.process(not_a_query);
+        assert_eq!(
+            term.take_response(),
+            None,
+            "{}",
+            String::from_utf8_lossy(not_a_query).escape_debug()
+        );
+    }
+}

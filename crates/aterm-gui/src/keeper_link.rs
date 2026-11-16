@@ -34,25 +34,147 @@ pub(crate) fn set_predecessor(pid: u32) {
     PREDECESSOR.store(pid, Ordering::Relaxed);
 }
 
-/// How often the meta pump looks at the registered terminals.
+/// The META pump's shortest pause between one pass's end and the next pass ([`spacing`]), the
+/// pause its old fixed cadence slept: a program that churns its modes sends at most one META per
+/// session each `META_POLL`, and a stream of rings (a busy topic's rows) costs at most one pass
+/// over every tab each `META_POLL`. Also how soon it tries again a pass it left pending
+/// ([`Pass::pending`]): an engine another thread held, a META the link's full queue refused, an
+/// op still owed. A pass with nothing pending waits for a ring alone ([`ring_meta`]).
 #[cfg(unix)]
 pub(crate) const META_POLL: Duration = Duration::from_millis(250);
 
-/// Development seam: milliseconds the keeper link's worker waits idle (for
-/// [`aterm_keeper::client::LINK_POLL`]) and the META pump waits between its passes (for
-/// [`META_POLL`]). An hour leaves only a queued op or the keeper's own frame to wake the worker:
-/// the live lane's check that a recovered window reads its keeper's SYNC answer as it arrives.
+/// A doorbell one thread parks on ([`pump`]): a ring sets it and unparks that thread on the
+/// unrung-to-rung edge; the thread clears it before each pass, so a ring during a pass leaves it
+/// set (and a park token) and is never lost.
 #[cfg(unix)]
-const QUIET_SEAM: &str = "ATERM_DEBUG_KEEPER_QUIET_MS";
+struct Bell {
+    rung: AtomicBool,
+    /// The thread that parks on it, once it has started.
+    parked: std::sync::OnceLock<std::thread::Thread>,
+    /// Each wait the pump chose ([`PumpWait`]), for a test to read.
+    #[cfg(test)]
+    waits: (Mutex<Vec<PumpWait>>, std::sync::Condvar),
+}
 
-/// [`QUIET_SEAM`]'s wait, when it is set to a number of milliseconds.
 #[cfg(unix)]
-fn quiet() -> Option<Duration> {
-    aterm_types::dev_seam!(QUIET_SEAM)?
-        .to_str()?
-        .parse()
-        .ok()
-        .map(Duration::from_millis)
+impl Bell {
+    const fn new() -> Self {
+        Self {
+            rung: AtomicBool::new(false),
+            parked: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            waits: (Mutex::new(Vec::new()), std::sync::Condvar::new()),
+        }
+    }
+
+    fn ring(&self) {
+        if !self.rung.swap(true, Ordering::AcqRel)
+            && let Some(thread) = self.parked.get()
+        {
+            thread.unpark();
+        }
+    }
+}
+
+/// The META pump's doorbell.
+#[cfg(unix)]
+static META_BELL: Bell = Bell::new();
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// How often this thread rang the META pump ([`ring_meta`]), the link on or off.
+    static RINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How often this thread rang the META pump.
+#[cfg(all(test, unix))]
+pub(crate) fn rings() -> u64 {
+    RINGS.with(std::cell::Cell::get)
+}
+
+/// Something a META reads may have moved: a terminal's modes or keyboard state (the PTY reader,
+/// [`MetaWatch`]; a host config install; a manual reset; a control verb's engine change), a
+/// session's fabric (its condvar's ring, [`aterm_gui_fabric::on_carry_moved`]), a registration,
+/// the link going live, an op owed. The pump makes a pass at once, or [`META_POLL`] after its
+/// last pass ended if that is later ([`spacing`]); one with nothing new sends nothing.
+#[cfg(unix)]
+pub(crate) fn ring_meta() {
+    #[cfg(test)]
+    RINGS.with(|rings| rings.set(rings.get() + 1));
+    if on() {
+        META_BELL.ring();
+    }
+}
+
+/// How a PTY reader's [`MetaWatch`] asks whether the link is on and rings the META pump: every
+/// session's reader takes [`Self::KEEPER`] from its factory; a test hands a reader its own pair
+/// to hear that reader's rings on the reader's thread.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+pub(crate) struct MetaRing {
+    pub(crate) on: fn() -> bool,
+    pub(crate) ring: fn(),
+}
+
+#[cfg(unix)]
+impl MetaRing {
+    /// This process's keeper link: [`on`] and [`ring_meta`].
+    pub(crate) const KEEPER: Self = Self {
+        on,
+        ring: ring_meta,
+    };
+}
+
+/// The PTY reader's watch on what a META's [`Fingerprint`] reads. Under each slice's one hold it
+/// notes the fingerprint as the hold begins ([`Self::hold`]) and as it ends ([`Self::saw`]), and
+/// once the hold is dropped rings the META pump ([`Self::ring`]) for a slice whose end differs
+/// from its start (the slice moved it) or from the end of the reader's last slice (something
+/// moved it between slices: a host-side change, which rings by itself, or a path that does
+/// not), so the pass finds the engine free. A slice that puts back what the pump last sent
+/// after a host-side change (a reset, then the program's next write re-asserting its modes)
+/// moved it, so it rings, though it ends where the reader's last slice did. Nothing while the
+/// link is off.
+#[cfg(unix)]
+pub(crate) struct MetaWatch {
+    link: MetaRing,
+    /// The fingerprint as this slice's hold began.
+    began: Option<Fingerprint>,
+    /// The fingerprint as the reader's last slice's hold ended.
+    seen: Option<Fingerprint>,
+    moved: bool,
+}
+
+#[cfg(unix)]
+impl MetaWatch {
+    pub(crate) const fn new(link: MetaRing) -> Self {
+        Self {
+            link,
+            began: None,
+            seen: None,
+            moved: false,
+        }
+    }
+
+    /// As the slice's hold of `term` begins.
+    pub(crate) fn hold(&mut self, term: &Terminal) {
+        self.began = (self.link.on)().then(|| Fingerprint::of(term));
+    }
+
+    /// As that hold of `term` ends.
+    pub(crate) fn saw(&mut self, term: &Terminal) {
+        if (self.link.on)() {
+            let now = Fingerprint::of(term);
+            self.moved |= self.began.take() != Some(now) || self.seen != Some(now);
+            self.seen = Some(now);
+        }
+    }
+
+    /// With the slice's hold dropped.
+    pub(crate) fn ring(&mut self) {
+        if std::mem::take(&mut self.moved) {
+            (self.link.ring)();
+        }
+    }
 }
 
 /// How long the update worker waits for its PENDING to be written before it
@@ -204,6 +326,8 @@ fn send_in(st: &mut State, session_id: Option<u64>, op: LinkOp) {
                          could not take is owed and offered again"
                     );
                     st.owed.push_back((session_id, op));
+                    // The pump offers what is owed again until the queue takes it all.
+                    ring_meta();
                 }
                 Err(aterm_keeper::client::Refused::Gone(_)) => {}
             }
@@ -948,8 +1072,7 @@ fn boot_unix(candidate: bool, cfg: Option<&aterm_core::config::TerminalConfig>) 
             recovery.restores.counts.meta
         );
     }
-    let idle = quiet().unwrap_or(aterm_keeper::client::LINK_POLL);
-    match KeeperLink::start_idling(socket, identity, build(), marker(), booted, JOURNAL, idle) {
+    match KeeperLink::start_marked(socket, identity, build(), marker(), booted, JOURNAL) {
         Ok(link) => {
             keeper_state().phase = Phase::Live(Arc::new(link));
             start_meta_pump();
@@ -1067,8 +1190,7 @@ pub(crate) fn activate() {
     let Some((socket, identity)) = place() else {
         return;
     };
-    let idle = quiet().unwrap_or(aterm_keeper::client::LINK_POLL);
-    match KeeperLink::start_idling(socket, identity, build(), marker(), None, JOURNAL, idle) {
+    match KeeperLink::start_marked(socket, identity, build(), marker(), None, JOURNAL) {
         Ok(link) => {
             st.phase = Phase::Live(Arc::new(link));
             for (id, op) in std::mem::take(&mut st.buffered) {
@@ -1076,6 +1198,8 @@ pub(crate) fn activate() {
             }
             drop(st);
             start_meta_pump();
+            // The sessions registered while armed have their first META now.
+            ring_meta();
             aterm_log::info!("keeper: this successor's sessions are registered at its Commit");
         }
         Err(e) => aterm_log::warn!("keeper: the link worker did not start: {e}"),
@@ -1497,6 +1621,8 @@ fn register_in(
     st.tracked.insert(session_id, tracked);
     send_in(st, Some(session_id), register);
     send_in(st, Some(session_id), journal);
+    // Its first META, right behind them.
+    ring_meta();
 }
 
 /// COMPANION_RELEASE (`crash_restore::SessionJournal::stop`).
@@ -1952,6 +2078,8 @@ pub(crate) fn bye(carried: &[u64]) {
     if on() {
         bye_over(&KEEPER_STATE, carried, BYE_WAIT);
         ON.store(false, Ordering::Relaxed);
+        // The pump, parked for a ring, ends.
+        META_BELL.ring();
     }
     #[cfg(not(unix))]
     let _ = carried;
@@ -2012,11 +2140,23 @@ fn bye_over(state: &Mutex<State>, carried: &[u64], wait: Duration) {
     }
 }
 
-/// The META pump: one thread, started with the live link, that looks at every
-/// registered terminal every [`META_POLL`] and attempts its META when the
-/// fingerprint or the session's fabric moved.
+/// Development seam: set, the META pump never starts, so once a registration's own ops are
+/// written nothing but the keeper's frame wakes the link's worker. The live lane's check that a
+/// recovered window reads its keeper's SYNC answer as it arrives sets it: the META a registration
+/// rings for is an op, and its wake would drain that answer too.
+#[cfg(unix)]
+const NO_META_SEAM: &str = "ATERM_DEBUG_KEEPER_NO_META";
+
+/// The META pump: one thread, started with the live link, that looks at every registered
+/// terminal when rung ([`ring_meta`]) and attempts its META when the fingerprint or the
+/// session's fabric moved ([`pump`]). With nothing moving and nothing pending it stays parked:
+/// an idle window's pump never wakes.
 #[cfg(unix)]
 fn start_meta_pump() {
+    if aterm_types::dev_seam!(NO_META_SEAM).is_some() {
+        aterm_log::info!("keeper: the META pump is not started ({NO_META_SEAM})");
+        return;
+    }
     {
         let mut st = keeper_state();
         if st.pump {
@@ -2024,19 +2164,11 @@ fn start_meta_pump() {
         }
         st.pump = true;
     }
+    aterm_gui_fabric::on_carry_moved(ring_meta);
     let spawned = crate::qos::spawn_lane_thread(
         "aterm-keeper-meta".to_string(),
         crate::qos::Role::Housekeeping,
-        || {
-            let period = quiet().unwrap_or(META_POLL);
-            loop {
-                std::thread::sleep(period);
-                if !on() {
-                    return;
-                }
-                meta_pass();
-            }
-        },
+        || pump(&META_BELL, on, meta_pass),
     );
     if let Err(e) = spawned {
         aterm_log::warn!("keeper: the META pump did not start: {e}");
@@ -2044,9 +2176,94 @@ fn start_meta_pump() {
     }
 }
 
-/// One pass of the pump (and, for tests, one step of it).
+/// How the META pump waits after a pass ([`Self::after`]), before the next pass waits out
+/// [`spacing`].
 #[cfg(unix)]
-pub(crate) fn meta_pass() -> usize {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpWait {
+    /// The pass left something pending that no ring tells of: the next pass [`META_POLL`] after
+    /// it ended, rung or not.
+    Retry,
+    /// Nothing pending: the next pass at a ring (one during the pass included), with no
+    /// deadline.
+    Ring,
+}
+
+#[cfg(unix)]
+impl PumpWait {
+    /// After `pass`. A ring during the pass needs no reading here: it left the bell rung, so
+    /// [`Self::Ring`]'s wait is over before it begins.
+    const fn after(pass: Pass) -> Self {
+        if pass.pending {
+            Self::Retry
+        } else {
+            Self::Ring
+        }
+    }
+}
+
+/// How long the pump waits, at `now`, before its next pass: until [`META_POLL`] after the last
+/// pass `ended`, the pause the pump's old fixed cadence slept between passes, so passes, rung or
+/// retried, sending or not, come at most once each `META_POLL`.
+#[cfg(unix)]
+fn spacing(ended: std::time::Instant, now: std::time::Instant) -> Duration {
+    (ended + META_POLL).saturating_duration_since(now)
+}
+
+/// The META pump's loop on `bell`, making a `pass` at its start and then whenever rung, until
+/// `on` says the link is off: a pass with nothing pending waits for a ring with no deadline, one
+/// left pending tries again without one ([`PumpWait`]), and either way the next pass waits out
+/// [`spacing`] first. The bell is cleared before each pass, which so sees every change a ring
+/// before the clear told of; a ring during the pass (or during the spacing) sets it again, so a
+/// pass follows. A wake that finds the bell unrung (a spurious one, or the token a ring during a
+/// pass left) parks again: only a ring, a pending pass or the start makes a pass.
+#[cfg(unix)]
+fn pump(bell: &Bell, on: impl Fn() -> bool, mut pass: impl FnMut() -> Pass) {
+    let _ = bell.parked.set(std::thread::current());
+    loop {
+        // Acquire: what a ring before the clear told of is visible to the pass.
+        bell.rung.swap(false, Ordering::AcqRel);
+        if !on() {
+            return;
+        }
+        let wait = PumpWait::after(pass());
+        let ended = std::time::Instant::now();
+        #[cfg(test)]
+        {
+            let (waits, noted) = &bell.waits;
+            waits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(wait);
+            noted.notify_all();
+        }
+        if wait == PumpWait::Ring {
+            while !bell.rung.load(Ordering::Acquire) {
+                std::thread::park();
+            }
+        }
+        let gap = spacing(ended, std::time::Instant::now());
+        if !gap.is_zero() {
+            std::thread::sleep(gap);
+        }
+    }
+}
+
+/// What one pass of the META pump did.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Pass {
+    /// The METAs it queued.
+    pub(crate) sent: usize,
+    /// It left something to try again that no ring will tell of: an engine another thread held,
+    /// a META the link's full queue refused or that waits behind an owed op, an op still owed.
+    /// Each means output being parsed or a keeper slow to read, never an idle window.
+    pub(crate) pending: bool,
+}
+
+/// One pass of the pump.
+#[cfg(unix)]
+fn meta_pass() -> Pass {
     meta_pass_over(&KEEPER_STATE, |meta, fabric| {
         crate::seamless::keeper_meta_of(meta, Some(fabric))
     })
@@ -2055,19 +2272,23 @@ pub(crate) fn meta_pass() -> usize {
 /// [`meta_pass`] over `state`, building each META with `build` from the
 /// terminal's meta carry and the session's fabric.
 #[cfg(unix)]
-fn meta_pass_over<B>(state: &Mutex<State>, build: B) -> usize
+fn meta_pass_over<B>(state: &Mutex<State>, build: B) -> Pass
 where
     B: Fn(aterm_core::terminal::CheckpointMeta, &crate::fabric::KeeperCarry) -> Option<Vec<u8>>,
 {
-    let targets: Vec<(u64, Tracked)> = {
+    let (targets, mut pending): (Vec<(u64, Tracked)>, bool) = {
         let mut st = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Phase::Live(link) = &st.phase {
-            let link = Arc::clone(link);
-            let _ = flush_owed(&link, &mut st.owed);
-        }
-        st.tracked.iter().map(|(id, t)| (*id, t.clone())).collect()
+        let owing = match &st.phase {
+            Phase::Live(link) => {
+                let link = Arc::clone(link);
+                !flush_owed(&link, &mut st.owed)
+            }
+            Phase::Armed | Phase::Off => false,
+        };
+        let targets = st.tracked.iter().map(|(id, t)| (*id, t.clone())).collect();
+        (targets, owing)
     };
     let mut sent = 0;
     for (
@@ -2090,6 +2311,7 @@ where
             .unwrap_or_default();
         let (fingerprint, meta) = {
             let Ok(engine) = term.try_lock() else {
+                pending = true;
                 continue;
             };
             let fingerprint = Fingerprint::of(&engine);
@@ -2114,15 +2336,34 @@ where
         let Some(tracked) = tracked.get_mut(&id) else {
             continue;
         };
-        if let (Some(meta), Phase::Live(link)) = (meta, &*phase)
-            && owed.is_empty()
-            && link.enqueue(LinkOp::Meta { rdev, meta })
-        {
+        let Some(meta) = meta else {
+            // Over the wire's bound at its tersest: the same inputs build the same refusal, so it
+            // is tried again once they move, not on every pass.
+            aterm_log::warn!(
+                "keeper: session {id}'s META is over the wire's bound even at its tersest; it is \
+                 built again once its modes or fabric move"
+            );
             tracked.last = Some((fingerprint, carry));
-            sent += 1;
+            continue;
+        };
+        let Phase::Live(link) = &*phase else {
+            // No link to take it: the link's start rings the pump again ([`activate`]).
+            continue;
+        };
+        if !owed.is_empty() {
+            pending = true;
+            continue;
+        }
+        match link.offer(LinkOp::Meta { rdev, meta }) {
+            Ok(()) => {
+                tracked.last = Some((fingerprint, carry));
+                sent += 1;
+            }
+            Err(aterm_keeper::client::Refused::Full(_)) => pending = true,
+            Err(aterm_keeper::client::Refused::Gone(_)) => {}
         }
     }
-    sent
+    Pass { sent, pending }
 }
 
 impl crate::App {

@@ -184,6 +184,7 @@ fn pass(at_mono_ms: u64, marked: &[(u32, bool)]) -> DStateRead {
                 pid,
                 name: format!("p{pid}"),
                 uninterruptible: 1,
+                cut: false,
                 held,
             })
             .collect(),
@@ -290,4 +291,493 @@ fn linux_holds_a_d_state_seen_ten_seconds_and_counts_procs_blocked() {
     let _ = v.absorb(&swept(14, false));
     let s = v.absorb(&swept(15, true));
     assert!(matches!(&s.facts.dstate, DState::Read(d) if d.held() == 0));
+}
+
+fn pile(count: u32, growing: bool, age_ms: u64) -> Zombies {
+    Zombies::Read(ZombiesView {
+        count,
+        growing,
+        whole: true,
+        age_ms,
+        ..ZombiesView::default()
+    })
+}
+
+fn waits(held: &[bool], age_ms: u64) -> DState {
+    DState::Read(DStateView {
+        scope: DScope::Own,
+        procs: held
+            .iter()
+            .zip(70u32..)
+            .map(|(&held, pid)| DStuck {
+                pid,
+                name: format!("p{pid}"),
+                threads: Some(1),
+                threads_cut: false,
+                held,
+            })
+            .collect(),
+        blocked: None,
+        age_ms,
+        whole: true,
+        pass: None,
+    })
+}
+
+const fn stuck(jobs: u32, busy_orphans: u32, age_ms: u64) -> StuckWork {
+    StuckWork {
+        jobs,
+        busy_orphans,
+        age_ms,
+    }
+}
+
+/// The one per-reading rule (A4 §6.2, §6.5): the worst of a growing pile, stuck work, a steady
+/// pile and a held uninterruptible wait, each from a reader that answered within
+/// [`BLOCKAGE_STALE_MS`]; clear where at least one answered and none of them blocks.
+/// CONTROL: with no reader answering, or each answer too old, the reading is unread, never
+/// clear; a wait not yet held, an empty pile and a pass that found nothing stuck block nothing.
+#[test]
+fn the_blockage_rule_takes_the_worst_kind_a_fresh_reader_found() {
+    let none_z = Zombies::default();
+    let none_d = DState::default();
+    let by = |z: &Zombies, d: &DState, s: Option<StuckWork>| Blocked::judge(z, d, s.as_ref());
+
+    // Each kind alone.
+    assert_eq!(
+        by(&none_z, &waits(&[false, true], 0), None),
+        Blocked::By(Blockage::Uninterruptible)
+    );
+    assert_eq!(
+        by(&pile(3, false, 0), &none_d, None),
+        Blocked::By(Blockage::SteadyPile)
+    );
+    assert_eq!(
+        by(&none_z, &none_d, Some(stuck(1, 0, 0))),
+        Blocked::By(Blockage::Stuck)
+    );
+    assert_eq!(
+        by(&none_z, &none_d, Some(stuck(0, 2, 0))),
+        Blocked::By(Blockage::Stuck)
+    );
+    assert_eq!(
+        by(&pile(3, true, 0), &none_d, None),
+        Blocked::By(Blockage::GrowingPile)
+    );
+    // The worst of those that hold, in the kinds' order.
+    assert_eq!(
+        by(&pile(3, false, 0), &waits(&[true], 0), None),
+        Blocked::By(Blockage::SteadyPile)
+    );
+    assert_eq!(
+        by(&pile(3, false, 0), &waits(&[true], 0), Some(stuck(1, 0, 0))),
+        Blocked::By(Blockage::Stuck)
+    );
+    assert_eq!(
+        by(&pile(3, true, 0), &waits(&[true], 0), Some(stuck(1, 1, 0))),
+        Blocked::By(Blockage::GrowingPile)
+    );
+    assert!(Blockage::ALL.is_sorted());
+    assert_eq!(
+        Blockage::ALL.map(Blockage::critical),
+        [false, false, false, true]
+    );
+    for kind in Blockage::ALL {
+        assert_eq!(Blockage::of_rank(kind.rank()), Some(kind));
+    }
+    assert_eq!((Blockage::of_rank(0), Blockage::of_rank(5)), (None, None));
+    assert_eq!(
+        Blockage::ALL.map(Blockage::word),
+        ["d_state", "steady_pile", "stuck", "growing_pile"]
+    );
+
+    // CONTROL: answered, and nothing blocks.
+    assert_eq!(by(&pile(0, false, 0), &none_d, None), Blocked::Clear);
+    assert_eq!(by(&none_z, &waits(&[false], 0), None), Blocked::Clear);
+    assert_eq!(by(&none_z, &none_d, Some(stuck(0, 0, 0))), Blocked::Clear);
+    // CONTROL: nobody answered.
+    assert_eq!(by(&none_z, &none_d, None), Blocked::Unread);
+    assert_eq!(Blocked::default(), Blocked::Unread);
+    // An answer stands at exactly the bound and says nothing past it, either way.
+    let (at, past) = (BLOCKAGE_STALE_MS, BLOCKAGE_STALE_MS + 1);
+    assert_eq!(
+        by(&pile(3, true, at), &none_d, None),
+        Blocked::By(Blockage::GrowingPile)
+    );
+    assert_eq!(
+        by(
+            &pile(3, true, past),
+            &waits(&[true], past),
+            Some(stuck(4, 0, past))
+        ),
+        Blocked::Unread
+    );
+    assert_eq!(
+        by(
+            &pile(3, true, past),
+            &waits(&[false], at),
+            Some(stuck(4, 0, past))
+        ),
+        Blocked::Clear,
+        "the fresh reader alone is heard"
+    );
+    assert_eq!(
+        by(
+            &pile(0, false, at),
+            &waits(&[true], past),
+            Some(stuck(1, 0, at))
+        ),
+        Blocked::By(Blockage::Stuck)
+    );
+
+    // What the ring takes of each.
+    assert_eq!(Blocked::Unread.reading(), None);
+    assert_eq!(Blocked::Clear.reading(), Some((0.0, false)));
+    assert_eq!(
+        Blocked::By(Blockage::GrowingPile).reading(),
+        Some((4.0, true))
+    );
+}
+
+/// What the jobs pass found stuck: its jobs judged stuck and its busy orphans, dated.
+/// CONTROL: a slow job and a job judged fine are no stuck work.
+#[test]
+fn stuck_work_counts_the_stuck_jobs_and_the_busy_orphans() {
+    use crate::jobs::{Class, JobsView, Named, Verdict};
+    let row = |verdict| crate::sys::jobs_view::fixtures::row("j1", 41, Class::Running, verdict);
+    let mut view = JobsView {
+        rows: vec![row(Verdict::Stuck), row(Verdict::Slow), row(Verdict::Stuck)],
+        ..JobsView::default()
+    };
+    assert_eq!(StuckWork::of(&view, 7_000), stuck(2, 0, 7_000));
+    assert_eq!(StuckWork::of(&view, 0).count(), 2);
+    view.rows.truncate(2);
+    view.rows.remove(0);
+    assert_eq!(
+        StuckWork::of(&view, 0).count(),
+        0,
+        "control: slow is not stuck"
+    );
+    view.findings.busy_orphans = vec![Named {
+        pid: 812,
+        exec_version: None,
+        name: "node".into(),
+        tab: Some(41),
+        job: None,
+        for_ms: 240_000,
+    }];
+    assert_eq!(StuckWork::of(&view, 3_000), stuck(0, 1, 3_000));
+    assert_eq!(StuckWork::of(&JobsView::default(), 0).count(), 0);
+}
+
+/// A pile grows while it has stood a minute and gained a zombie within the last (each counted
+/// once seen [`ZOMBIE_AGE_MS`]), and stands steady once a minute passes with none new.
+/// CONTROL: a pile found whole and never added to is steady whatever its size, and a zombie too
+/// young to count makes no pile grow.
+#[test]
+fn a_pile_grows_while_zombies_keep_coming_and_is_steady_once_they_stop() {
+    let mut b = ZombieBook::default();
+    b.note(0, [(10, 1)]);
+    b.note(40_000, [(10, 1), (11, 1)]);
+    let stood = ZOMBIE_AGE_MS + PILE_GROWS_MS;
+    assert!(!b.grows(1, stood - 1), "the pile has not stood its minute");
+    assert!(
+        b.grows(1, stood),
+        "stood a minute, and 11 came to count 20 s ago"
+    );
+    assert!(b.grows(1, 40_000 + stood - 1));
+    assert!(
+        !b.grows(1, 40_000 + stood),
+        "a minute with none new: steady"
+    );
+    assert!(!b.grows(2, stood), "no pile under 2");
+
+    // CONTROL: found whole.
+    let mut whole = ZombieBook::default();
+    whole.note(0, (20..60).map(|pid| (pid, 2)));
+    for at in [stood - 1, stood, stood + 1, 10 * stood] {
+        assert!(!whole.grows(2, at), "{at}");
+    }
+    // CONTROL: one seen 5 s ago does not count yet, so the pile does not grow by it.
+    whole.note(stood, (20..61).map(|pid| (pid, 2)));
+    assert!(!whole.grows(2, stood + 5_000));
+    assert!(whole.grows(2, stood + ZOMBIE_AGE_MS));
+
+    // A parent that reaped its pile starts again.
+    b.note(200_000, []);
+    b.note(201_000, [(12, 1)]);
+    assert!(!b.grows(1, 201_000 + ZOMBIE_AGE_MS));
+}
+
+/// A pile its parent reaps as fast as it fills does not grow, however long it stands: a child
+/// exits every 20 s and is reaped 30 s later, so one or two zombies stand at every sweep and the
+/// pile never counts more than it counted a minute before. Nor does a pile that shrinks while
+/// one new zombie joins it.
+/// CONTROL: the same arrivals with nothing reaped grow from the pile's first minute on.
+#[test]
+fn a_pile_reaped_as_fast_as_it_fills_does_not_grow() {
+    let (mut turning, mut kept) = (ZombieBook::default(), ZombieBook::default());
+    for t in (0..=600_000_u64).step_by(1_000) {
+        // Zombie n is first seen at 20 n s; the turning pile's parent reaps it 30 s later.
+        let born =
+            (0..=u32::try_from(t / 20_000).expect("small")).map(|n| (n, u64::from(n) * 20_000));
+        turning.note(
+            t,
+            born.clone()
+                .filter(|&(_, first)| t < first + 30_000)
+                .map(|(n, _)| (100 + n, 7)),
+        );
+        kept.note(t, born.map(|(n, _)| (100 + n, 7)));
+        assert!(!turning.grows(7, t), "turning over at {t}");
+        assert_eq!(
+            kept.grows(7, t),
+            t >= ZOMBIE_AGE_MS + PILE_GROWS_MS,
+            "CONTROL: nothing reaped, at {t}"
+        );
+    }
+    assert_eq!(turning.pile_since(7), Some(0), "one pile throughout");
+
+    // Twenty found whole; five minutes on the parent reaps nineteen as one new child exits.
+    let mut shrinking = ZombieBook::default();
+    shrinking.note(0, (0..20).map(|pid| (pid, 9)));
+    shrinking.note(300_000, [(0, 9), (20, 9)]);
+    // The nineteen that went weigh against it for as long as the one that came is new.
+    for at in (300_000..=400_000_u64)
+        .step_by(1_000)
+        .chain([359_999, 369_999])
+    {
+        assert!(!shrinking.grows(9, at), "{at}");
+    }
+    // One more a minute later, with none gone since: it grows again.
+    shrinking.note(400_000, [(0, 9), (20, 9), (21, 9)]);
+    assert!(shrinking.grows(9, 400_000 + ZOMBIE_AGE_MS));
+}
+
+/// The strip's blockage ring through the model (N3): a box keeps the share of its read time a
+/// blockage held and the worst kind read in it. The tab's build piles three zombies at 1 s, so
+/// they count from 11 s and the pile stands steady; a fourth seen at 55 s counts from 65 s, and
+/// at 71 s the pile has stood its minute with that one new in it: it grows from then.
+/// CONTROL: the first box, its zombies too young to count, reads clear with no kind; a model
+/// that swept nothing and read no census keeps no blockage box at all, never a clear one.
+#[test]
+fn a_blockage_box_keeps_the_blocked_share_and_the_worst_kind() {
+    let box_at = |v: &Vitals, t_s: i64| {
+        let k = (T0 + t_s * 1000).div_euclid(crate::ring::BUCKET_MS);
+        v.saved_strip(false)
+            .blockage
+            .buckets
+            .iter()
+            .find(|(bk, _)| *bk == k)
+            .and_then(|(_, agg)| BlockageBox::of(agg))
+    };
+    let mut v = Vitals::new();
+    for t in 1..=100u64 {
+        let zombies = if t >= 55 { 4 } else { 3 };
+        let s = v.absorb(&reading(
+            t,
+            Some(sweep(zombies, 0)),
+            DStateRead::Unsupported,
+        ));
+        let want = match t {
+            1..=10 => Blocked::Clear,
+            11..=70 => Blocked::By(Blockage::SteadyPile),
+            _ => Blocked::By(Blockage::GrowingPile),
+        };
+        assert_eq!(s.facts.blocked, want, "reading {t}");
+        assert_eq!(
+            zombies_growing(&s),
+            t >= 71,
+            "the pile column's critical ink, reading {t}"
+        );
+    }
+    // CONTROL: the box of readings 1 to 9 read clear.
+    assert_eq!(
+        box_at(&v, 0),
+        Some(BlockageBox {
+            share: 0.0,
+            worst: None
+        })
+    );
+    // Readings 10 to 19: clear for the half second reading 10 stands for, blocked the 9 s after.
+    let second = box_at(&v, 10).expect("read");
+    assert!((second.share - 9.0 / 9.5).abs() < 1e-9, "{second:?}");
+    assert_eq!(second.worst, Some(Blockage::SteadyPile));
+    // Readings 70 to 79: blocked throughout, the growing pile its worst (reading 70 itself
+    // still read it steady); the box before read the steady pile alone.
+    assert_eq!(
+        box_at(&v, 70),
+        Some(BlockageBox {
+            share: 1.0,
+            worst: Some(Blockage::GrowingPile)
+        })
+    );
+    assert_eq!(
+        box_at(&v, 60),
+        Some(BlockageBox {
+            share: 1.0,
+            worst: Some(Blockage::SteadyPile)
+        })
+    );
+    // Stuck work the host handed in outranks the steady pile, and a stale pass is not heard.
+    let mut with_jobs = Vitals::new();
+    for t in 1..=12u64 {
+        let _ = with_jobs.absorb(&reading(t, Some(sweep(3, 0)), DStateRead::Unsupported));
+    }
+    let fresh = with_jobs.absorb(&Sample {
+        stuck_work: Some(stuck(1, 0, 4_000)),
+        ..reading(13, Some(sweep(3, 0)), DStateRead::Unsupported)
+    });
+    assert_eq!(fresh.facts.blocked, Blocked::By(Blockage::Stuck));
+    let stale = with_jobs.absorb(&Sample {
+        stuck_work: Some(stuck(1, 0, BLOCKAGE_STALE_MS + 1)),
+        ..reading(14, Some(sweep(3, 0)), DStateRead::Unsupported)
+    });
+    assert_eq!(stale.facts.blocked, Blocked::By(Blockage::SteadyPile));
+
+    // CONTROL: nothing read, no box.
+    let mut blind = Vitals::new();
+    for t in 1..=30u64 {
+        let s = blind.absorb(&reading(t, None, DStateRead::Unsupported));
+        assert_eq!(s.facts.blocked, Blocked::Unread);
+    }
+    assert_eq!(blind.saved_strip(false).blockage.buckets, Vec::new());
+    assert_eq!(BlockageBox::of(&crate::ring::Agg::default()), None);
+}
+
+fn zombies_growing(s: &Snapshot) -> bool {
+    zombies(s).growing
+}
+
+/// A parent that reaps one child as the next exits keeps one zombie standing and never a
+/// growing pile: the one that came counts ten seconds after the one that went left, so the pile
+/// dips to none and back, which is no growth a minute on.
+/// CONTROL: the same child joining a pile whose first zombie stays is growth, for the minute it
+/// is new.
+#[test]
+fn a_zombie_replaced_one_for_one_is_no_growth() {
+    let (mut replaced, mut joined) = (ZombieBook::default(), ZombieBook::default());
+    for t in (0..=300_000_u64).step_by(1_000) {
+        if t < 100_000 {
+            replaced.note(t, [(10, 1)]);
+            joined.note(t, [(10, 1)]);
+        } else {
+            replaced.note(t, [(11, 1)]);
+            joined.note(t, [(10, 1), (11, 1)]);
+        }
+        assert!(!replaced.grows(1, t), "replaced at {t}");
+        assert_eq!(
+            joined.grows(1, t),
+            (100_000 + ZOMBIE_AGE_MS..100_000 + ZOMBIE_AGE_MS + PILE_GROWS_MS).contains(&t),
+            "CONTROL: joined at {t}"
+        );
+    }
+    assert_eq!(replaced.pile_since(1), Some(0), "one pile throughout");
+}
+
+/// A sweep stopped at its cap tells no growth: the book forgets a zombie the cut sweep did not
+/// reach and dates it anew when the next sweep sees it, so the model judges no pile growing at
+/// a cut sweep, nor until a whole one after it has stood the time a new zombie counts as new.
+/// CONTROL: the book alone, noted the same sweeps, reads the unchanged pile as growing.
+#[test]
+fn a_cut_sweep_tells_no_growth() {
+    let cut = |t: u64| {
+        let mut procs = sweep(3, 0);
+        procs.retain(|p| p.pid != 2000);
+        Sample {
+            procs_truncated: true,
+            ..reading(t, Some(procs), DStateRead::Unsupported)
+        }
+    };
+    let mut v = Vitals::new();
+    let mut book = ZombieBook::default();
+    let mut book_grew = Vec::new();
+    for t in 1..=260u64 {
+        let s = if t == 80 {
+            cut(t)
+        } else {
+            reading(t, Some(sweep(3, 0)), DStateRead::Unsupported)
+        };
+        let seen = v.absorb(&s);
+        let z = zombies(&seen);
+        assert!(!z.growing, "reading {t}");
+        assert_eq!(z.whole, t != 80);
+        book.note(
+            t * 1000,
+            s.procs
+                .iter()
+                .flatten()
+                .filter(|p| p.state == ProcState::Zombie)
+                .map(|p| (p.pid, p.ppid)),
+        );
+        if book.grows(601, t * 1000) {
+            book_grew.push(t);
+        }
+    }
+    assert_eq!(
+        book_grew,
+        [150],
+        "CONTROL: the re-dated zombie outlasts the forgotten one"
+    );
+    // The same pile gaining a zombie once the cut sweep is that far behind does read growing.
+    for t in 261..=300u64 {
+        let s = v.absorb(&reading(t, Some(sweep(4, 0)), DStateRead::Unsupported));
+        assert_eq!(zombies(&s).growing, t >= 271, "reading {t}");
+    }
+}
+
+/// A READ CUT AT A CAP SAYS SO, NEVER AN EXACT COUNT: Linux's sweep that stopped at its process
+/// cap leaves its `D` processes a lower bound, on that reading and on each later one that reuses
+/// it, until a whole sweep runs; a census pass that cut a thread list and found none
+/// uninterruptible in what it read does the same, and a mark whose own list was cut counts at
+/// least its threads. CONTROL: a whole sweep and a pass with no cut read are whole.
+#[test]
+fn a_d_state_read_cut_at_a_cap_is_not_whole() {
+    let mut v = Vitals::new();
+    let swept = |t: u64, truncated: bool| {
+        let mut p = sweep(0, 0);
+        p.push(proc(700, 1, "rsync", ProcState::Uninterruptible));
+        Sample {
+            procs_truncated: truncated,
+            ..reading(t, Some(p), DStateRead::Sweep { blocked: None })
+        }
+    };
+    let whole = |s: &Snapshot| match &s.facts.dstate {
+        DState::Read(d) => (d.whole, d.age_ms, d.procs.len()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(whole(&v.absorb(&swept(1, false))), (true, 0, 1));
+    assert_eq!(whole(&v.absorb(&swept(2, true))), (false, 0, 1));
+    // A reading that took no sweep reuses the cut one, and says it still.
+    let later = v.absorb(&reading(3, None, DStateRead::Sweep { blocked: None }));
+    assert_eq!(whole(&later), (false, 1_000, 1));
+    assert_eq!(whole(&v.absorb(&swept(4, false))), (true, 0, 1));
+
+    let census = |cut_unmarked: u32, cut: bool| {
+        DStateRead::Census(Some(Arc::new(CensusPass {
+            at_mono_ms: 30_500,
+            marked: vec![CensusMark {
+                pid: 77,
+                name: "java".into(),
+                uninterruptible: 256,
+                cut,
+                held: true,
+            }],
+            cut_unmarked,
+            cover_done: true,
+            passes_in_cover: 1,
+            ..CensusPass::default()
+        })))
+    };
+    for (cut_unmarked, cut) in [(0, false), (0, true), (2, false)] {
+        let mut v = Vitals::new();
+        let s = v.absorb(&reading(31, None, census(cut_unmarked, cut)));
+        let DState::Read(d) = &s.facts.dstate else {
+            panic!("{:?}", s.facts.dstate)
+        };
+        assert_eq!(d.whole, cut_unmarked == 0, "{cut_unmarked}");
+        assert_eq!(
+            (d.procs[0].threads, d.procs[0].threads_cut),
+            (Some(256), cut)
+        );
+    }
 }

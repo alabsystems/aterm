@@ -755,6 +755,7 @@ impl Packer for FakePacker {
             build: input.build_number,
             exposes: input.exposes.clone(),
             shim_env: input.shim_env.clone(),
+            harness: None,
         };
         let row = BottleRow {
             triple: req.triple,

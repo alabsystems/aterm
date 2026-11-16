@@ -35,11 +35,11 @@ pub enum ExceptionKind {
     /// `/model`, a rephrased message), so the host files it per tab.
     Refused,
     /// A screen no reader names, busy on background work alone for hours while
-    /// Claude's title says idle ([`super::exception::Exception::stalled`]);
+    /// Claude's run sign says idle ([`super::exception::Exception::stalled`]);
     /// and agy's or Muse Code's own background work, run for hours under
     /// words that stood still ([`super::exception::Exception::stalled_on_work`]).
     Stalled,
-    /// A dialog no reader names, unchanged for an hour while Claude's title
+    /// A dialog no reader names, unchanged for an hour while Claude's run sign
     /// says idle ([`super::exception::Exception::dialog`]); and Claude Code's
     /// own Settings panel, which a reader names, left open as long by a hand
     /// other than the harness's ([`super::exception::Exception::settings_panel`]).

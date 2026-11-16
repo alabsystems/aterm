@@ -1234,10 +1234,11 @@ fn a_run_takes_one_lane_and_only_the_options_that_lane_reads() {
 }
 
 /// THE RUN'S END (review F2, F4): the capacity lane runs alone and as the full proof's last
-/// leg once its legs held, each of its checks counted among the run's (a failed one named,
-/// the run then exit 1); never after a leg failed or was interrupted, nor in another lane;
+/// leg once its legs returned `Ok`, each of its checks counted among the run's (a failed one named,
+/// the run then exit 1); never after a leg returned `Err`, nor in another lane;
 /// an interrupt during it ends the run as one (128 + the signal), never PASS. A leg's other
-/// `Err` ends the run unless checks failed, which are then its verdict.
+/// `Err` ends the run unless checks failed, which are then its verdict. Checks that failed
+/// before an early `Ok` remain failed through passing capacity checks or an interrupt.
 #[test]
 fn the_runs_end_runs_the_capacity_lane_last_and_counts_its_checks() {
     /// End a run in `lane` whose legs came back `legs` with `fails` failed and 5 held, the
@@ -1276,6 +1277,33 @@ fn the_runs_end_runs_the_capacity_lane_last_and_counts_its_checks() {
     assert!(ran);
     assert_eq!((res.ok(), oks), (Some(1), 6));
     assert_eq!(fails, ["capacity 1"], "a failed check is named");
+    let (res, ran, oks, fails) = end(
+        Lane::Full,
+        Ok(()),
+        &["first: the claim is proven"],
+        checks(&[true, true]),
+    );
+    assert!(ran, "capacity is independent of the first-claim assertion");
+    assert_eq!((res.ok(), oks), (Some(1), 7));
+    assert_eq!(
+        fails,
+        ["first: the claim is proven"],
+        "passing capacity checks cannot erase the failed prerequisite"
+    );
+    let (res, ran, oks, fails) = end(
+        Lane::Full,
+        Ok(()),
+        &["first: the claim is proven"],
+        Err(Stopped(libc::SIGINT)),
+    );
+    assert!(ran);
+    assert_eq!(
+        res.err().map(|f| (f.code, f.stopped)),
+        Some((128 + libc::SIGINT, Some(libc::SIGINT))),
+        "an interrupt takes precedence over a recorded prerequisite failure"
+    );
+    assert_eq!(oks, 5);
+    assert_eq!(fails, ["first: the claim is proven"]);
     let (res, ran, _, fails) = end(Lane::Capacity, Ok(()), &[], checks(&[false]));
     assert!(ran);
     assert_eq!((res.ok(), fails.len()), (Some(1), 1), "alone");

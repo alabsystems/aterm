@@ -40,13 +40,16 @@ const THEMES: [(&str, Look); 6] = [
     ("paper-grey", PAPER_GREY),
 ];
 
-/// The caret shapes, each with the DECSCUSR that sets it; `block-pinned` is the block with its
-/// colour pinned by the program (OSC 12), which the effects wear and never recolour.
-const CARETS: [(&str, &[u8]); 4] = [
+/// The caret shapes, each with the DECSCUSR that sets it; `block-pinned`, `bar-pinned` and
+/// `underline-pinned` are the shape with its colour pinned by the program (OSC 12), which the
+/// effects wear and move only where the light round it would read it under its own reading.
+const CARETS: [(&str, &[u8]); 6] = [
     ("block", b""),
     ("bar", b"\x1b[6 q"),
     ("underline", b"\x1b[4 q"),
     ("block-pinned", b"\x1b]12;#cf222e\x07"),
+    ("bar-pinned", b"\x1b[6 q\x1b]12;#cf222e\x07"),
+    ("underline-pinned", b"\x1b[4 q\x1b]12;#cf222e\x07"),
 ];
 
 /// Where a film is shot.
@@ -766,7 +769,9 @@ const LINE_TYPED_MS: u64 = 2_528;
 /// half the page behind the line lies under deep glass. Negative control: the same window with
 /// its latch dropped ([`Lane::Unlatched`]) reads light 0, no glass arm, and lays deep colour on
 /// under a quarter of that page (main's paper band), so [`glass_behind`] refuses it on both
-/// counts.
+/// counts. The window's cell is SF Mono's 15 x 28 px on macOS, the one platform whose
+/// [`Renderer::from_system`] loads that face; elsewhere the lane lays the same window round
+/// the face that platform loads.
 #[test]
 fn a_retina_window_s_light_page_draws_the_glass_behind_the_typed_word() {
     use aterm_effects::cursor_glow::Live;
@@ -779,10 +784,10 @@ fn a_retina_window_s_light_page_draws_the_glass_behind_the_typed_word() {
         "latched on frame 1"
     );
     let k = &lit[1];
-    assert_eq!(
-        (k.cell, k.left, k.top),
-        ((15, 28), RETINA_PAD, RETINA_PAD_TOP)
-    );
+    assert_eq!((k.left, k.top), (RETINA_PAD, RETINA_PAD_TOP));
+    if cfg!(target_os = "macos") {
+        assert_eq!(k.cell, (15, 28), "SF Mono's cell at {RETINA_PX} px");
+    }
     assert!(
         k.glass.thin_ink.is_some_and(|t| t <= 0.007),
         "{:?}",
@@ -918,23 +923,27 @@ fn vivid_rows(k: &Kept, page: u32) -> Vec<i64> {
 /// typed (dims: cell 15 x 28, font_px 24, pad 24, pad_top 4, frame 1128 x 420): the body from
 /// the cell's 5th pixel row to its last (dy 5 to 27), two page rows under the cell (28, 29), the
 /// rail under them (30 to 35), and the deep glass from 69 px across, the typed row's 4th cell.
+/// The rows are counted from the cell's foot (of a `ch` px cell, the page's `ch` and `ch + 1`,
+/// the rail's `ch + 3` to `ch + 6`, the body's 8 to `ch - 1`), so the window laid round another
+/// face's cell, the one [`Renderer::from_system`] loads off macOS, is read by the same rule.
 /// `Err` names what of `k` is not where the window lays it.
 fn laid_as_the_window_lays_it(k: &Kept, page: u32) -> Result<(), String> {
     let rows = vivid_rows(k, page);
     let has = |dy: i64| rows.contains(&dy);
+    let (cw, ch) = k.cell;
+    let foot = ch as i64;
     let mut off = Vec::new();
-    if let Some(dy) = [28, 29].into_iter().find(|&dy| has(dy)) {
+    if let Some(dy) = [foot, foot + 1].into_iter().find(|&dy| has(dy)) {
         off.push(format!(
             "dy {dy} is vivid, where the window leaves the page"
         ));
     }
-    if let Some(dy) = (31..=34).find(|&dy| !has(dy)) {
+    if let Some(dy) = (foot + 3..=foot + 6).find(|&dy| !has(dy)) {
         off.push(format!("dy {dy} is not, where the window lays its rail"));
     }
-    if let Some(dy) = (8..=27).find(|&dy| !has(dy)) {
+    if let Some(dy) = (8..foot).find(|&dy| !has(dy)) {
         off.push(format!("dy {dy} is not, where the window lays the glass"));
     }
-    let (cw, ch) = k.cell;
     let y = k.top + k.caret.0 * ch + 15;
     let first = (0..k.w).find(|&x| {
         let f = k.px[y * k.w + x];
@@ -963,7 +972,8 @@ fn laid_as_the_window_lays_it(k: &Kept, page: u32) -> Result<(), String> {
 /// A glass film lays its light where the window lays it: its effects from the grid's corner in
 /// the window's padding (`EffectsPipeline::set_chrome`, `set_chrome_pad_top`), so the glass and
 /// its rail sit on the typed row's pixel rows as a real Retina window's do
-/// ([`laid_as_the_window_lays_it`]), and its frame is the window's, 1128 x 420. Negative control:
+/// ([`laid_as_the_window_lays_it`]), and its frame is the window's: its grid with a pad each side
+/// across and its pads over and under it down, 1128 x 420 on SF Mono's cell. Negative control:
 /// the same window whose effects are not told its padding lays them from the frame's corner, 24
 /// px left of and 4 over the letters (the rail inside the cell, over its letters' feet), and
 /// fails the reading.
@@ -975,14 +985,25 @@ fn a_glass_film_lays_its_light_where_the_window_does() {
         laid_as_the_window_lays_it(k, GITHUB_LIGHT.bg).unwrap_or_else(|e| panic!("{e}"));
     }
     let mut k = lit.into_iter().next_back().expect("the line typed");
-    window_frame(&mut k, Take::Gallery(Scene::Typing).grid().0);
-    assert_eq!((k.w, k.px.len() / k.w), (1128, 420), "the window's frame");
+    let (rows, cols) = Take::Gallery(Scene::Typing).grid();
+    window_frame(&mut k, rows);
+    let (cw, ch) = k.cell;
+    let frame = (
+        usize::from(cols) * cw + 2 * RETINA_PAD,
+        usize::from(rows) * ch + RETINA_PAD_TOP + RETINA_PAD,
+    );
+    assert_eq!((k.w, k.px.len() / k.w), frame, "the window's frame");
+    if cfg!(target_os = "macos") {
+        assert_eq!(frame, (1128, 420), "the window's frame on SF Mono's cell");
+    }
     let unregistered = window_typing(GITHUB_LIGHT, RETINA_PX, true, false, &at);
     for k in &unregistered {
         let e = laid_as_the_window_lays_it(k, GITHUB_LIGHT.bg)
             .expect_err("control: laid from the frame's corner");
+        let ch = k.cell.1;
         assert!(
-            e.contains("dy 28 is vivid") || e.contains("dy 29 is vivid"),
+            e.contains(&format!("dy {ch} is vivid"))
+                || e.contains(&format!("dy {} is vivid", ch + 1)),
             "{e}"
         );
         assert!(e.contains("the deep glass starts at"), "{e}");
@@ -1021,6 +1042,9 @@ fn a_burst_under_the_glass_yields_it_to_the_words() {
 /// (`THIN_INK_SHARE`), so a light page latched over that face goes sheer and draws main's paper
 /// band, no glass, on every frame. Negative control: the same window at the films' 24 px draws
 /// the glass ([`a_retina_window_s_light_page_draws_the_glass_behind_the_typed_word`] reads it).
+/// Held on macOS, the one platform whose [`Renderer::from_system`] loads SF Mono: the faces the
+/// others load (JetBrains Mono on Linux, Iosevka Term NL on Windows) read thin ink 0 at 26 px.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_face_whose_thin_ink_is_over_the_glass_s_bound_draws_no_glass() {
     use aterm_effects::rainbow_kitty::prism_glass::colour::THIN_INK_SHARE;

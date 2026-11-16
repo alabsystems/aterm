@@ -215,7 +215,7 @@ fn explicit_holds_and_package_choices_start_no_prerequisite_child() {
 
 #[test]
 fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass() {
-    for change in ["source", "file", "writer", "stop"] {
+    for change in ["source", "entry", "writer", "stop"] {
         use client::{JoinOptions, JoinPassword};
         let root = aterm_tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -241,6 +241,14 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
             },
         )
         .unwrap();
+        assert_eq!(
+            client::read_in_place(&paths, "gh_access_token")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"fixture-one",
+            "the admitted credential is read from the plaintext source"
+        );
         let (_, choices, mut item) = fixture_at(home.to_str().unwrap());
         let original = item.capture;
         let scoped = paths.clone();
@@ -249,13 +257,20 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
                 let policy: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
                     Arc::from(ready.current);
                 let intent = Arc::clone(&policy);
-                admit(
+                let captured = admit(
                     sys,
                     ready.ctx,
                     scoped.clone(),
                     Box::new(move || intent()),
                     Box::new(move || policy()),
-                )
+                )?;
+                if let Scope::Admitted(ready) = &captured {
+                    assert!(
+                        ready.credential.is_none(),
+                        "the fixture admits package work, not credential delivery"
+                    );
+                }
+                Ok(captured)
             }
             other => Ok(other),
         });
@@ -276,11 +291,41 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
                     )
                     .unwrap();
                         client::sync(&paths, None).unwrap();
+                        assert_eq!(
+                            client::read_in_place(&paths, "gh_access_token")
+                                .unwrap()
+                                .unwrap()
+                                .as_slice(),
+                            b"fixture-two",
+                            "the synced source holds the changed credential"
+                        );
                         assert!(stopped(), "changed recorded inputs cancel the child");
                     }
-                    "file" => {
-                        std::fs::write(paths.home.join(".secrets/gh_access_token"), b"changed")
-                            .unwrap();
+                    "entry" => {
+                        // Edit the source read in place without updating its recorded digests.
+                        // Continuation permits this; the full boundary must refuse it.
+                        let edited = before.replacen(
+                            "gh_access_token=fixture-one\n",
+                            "gh_access_token=fixture-edited\n",
+                            1,
+                        );
+                        aterm_uds::atomic_file::write(&source, edited.as_bytes(), 0o600).unwrap();
+                        assert_eq!(
+                            client::read_in_place(&paths, "gh_access_token")
+                                .unwrap()
+                                .unwrap()
+                                .as_slice(),
+                            b"fixture-edited",
+                            "the source changed without a sync"
+                        );
+                        assert_eq!(
+                            client::read_in_place(&paths, "github-repositories.json")
+                                .unwrap()
+                                .unwrap()
+                                .as_slice(),
+                            inventory_bytes(Some(&[])),
+                            "the original repository inventory is preserved"
+                        );
                         assert!(!stopped(), "continuation does not grant file integrity");
                     }
                     "writer" => {

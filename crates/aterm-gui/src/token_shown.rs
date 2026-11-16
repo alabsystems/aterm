@@ -78,8 +78,11 @@ pub(crate) struct TokenFact {
     pub(crate) ends_at: Option<u64>,
     /// The Mac that made it, as its meta names it.
     pub(crate) made_on: Option<String>,
-    /// When the Mac that made it verified it, where this Mac's row holds that.
+    /// When it was verified, as the vault's meta says (this Mac's row where the vault was not
+    /// read).
     pub(crate) verified_at: Option<u64>,
+    /// The Mac that compared it and wrote that verification, as the vault's meta names it.
+    pub(crate) verified_on: Option<String>,
     /// A token made here is not in the vault yet: its write waits, or no server took it.
     pub(crate) not_yet: bool,
     /// The account's stored login on this Mac, the offer pair's other half.
@@ -117,6 +120,7 @@ impl TokenFact {
             ends_at: None,
             made_on: None,
             verified_at: None,
+            verified_on: None,
             not_yet: false,
             login: LoginHere::Half(LoginHalf::Ok),
             logged_in: false,
@@ -380,12 +384,14 @@ pub(crate) fn facts_of_view(
                     words.push_str("; not yet in vault");
                 }
                 let used = account.row.as_ref().map(|row| &row.used_on);
+                let verified = account.verified();
                 TokenFact {
                     kind: account.state.clone(),
                     made_at: account.minted_at(),
                     ends_at: account.expires_at(),
                     made_on: account.minted_on(),
-                    verified_at: account.row.as_ref().and_then(|row| row.verified),
+                    verified_at: verified.as_ref().map(|(at, _)| *at),
+                    verified_on: verified.and_then(|(_, on)| on),
                     not_yet: account.not_yet(),
                     login: account.login,
                     logged_in: account.logged_in,

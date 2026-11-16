@@ -26,9 +26,10 @@ const HOLD_S: u32 = 5;
 const UNTIL_MAX_TENTHS: u32 = 200;
 const HANG: Duration = Duration::from_secs(60);
 
-struct Instance {
+pub(crate) struct Instance {
     live: headless_boot::Instance,
-    sid: String,
+    /// The boot session's sid: the tab the stand-in agent runs in.
+    pub(crate) sid: String,
 }
 
 impl std::ops::Deref for Instance {
@@ -2006,17 +2007,13 @@ fn launch_the_fake(inst: &Instance) -> u32 {
 
 /// What process `pid` read, focus reports aside, once `done` says it holds what it should.
 fn read_by(inst: &Instance, pid: u32, what: &str, done: impl Fn(&str) -> bool) -> String {
-    until(
-        HANG,
-        what,
-        || {
-            std::fs::read_to_string(inst.tmp.join(format!("typed-{pid}.log")))
-                .unwrap_or_default()
-                .replace("\x1b[I", "")
-                .replace("\x1b[O", "")
-        },
-        done,
-    )
+    aterm_spec::wait::until_while_working(inst.child.id(), what, || {
+        let read = std::fs::read_to_string(inst.tmp.join(format!("typed-{pid}.log")))
+            .unwrap_or_default()
+            .replace("\x1b[I", "")
+            .replace("\x1b[O", "");
+        done(&read).then_some(read)
+    })
 }
 
 /// The process relaunched after `old` ended, once launch `nth` (from zero) stands, `old` the one
@@ -2067,6 +2064,29 @@ fn restart_stands_ready(inst: &Instance, pid: u32) {
         || crate::native_claude::observed(&inst.tmp, &inst.sid, pid).to_string(),
         |ready| ready == "true",
     );
+}
+
+/// An instance under `harness` whose boot session runs the restartable stand-in agent, ready for
+/// `restart`, every tab's shell `shell` (a worker's tab needs zsh, bash or fish): the instance
+/// and the agent's pid.
+pub(crate) fn agent_ready_to_restart(tag: &str, harness: &str, shell: &str) -> (Instance, u32) {
+    let inst = boot_on(tag, harness, 40, None, true, |_| {
+        vec![("SHELL", shell.to_owned())]
+    });
+    write_restarting_fake(&inst, "");
+    let pid = start_the_fake(&inst);
+    restart_stands_ready(&inst, pid);
+    (inst, pid)
+}
+
+/// `restart` of the agent `old` in the boot session, accepted, and its relaunch's pid.
+pub(crate) fn restart_agent(inst: &Instance, old: u32) -> u32 {
+    let said = ctl_ok(inst, &[&format!("@{}", inst.sid), "restart"]);
+    assert!(
+        said.starts_with(&format!("OK restarting pid {old} cause=asked")),
+        "{said}"
+    );
+    relaunched_after(inst, old)
 }
 
 /// A RESTART THROUGH `restart` CONTINUES THE WORK (owner report 2026-11-01), under Cruise and under

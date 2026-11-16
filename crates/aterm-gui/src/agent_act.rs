@@ -4,7 +4,10 @@
 //! THE HOST'S WORD ON A SESSION'S AGENT (H6; the law is [`aterm_agent::harness::agent_image`]'s:
 //! a name steers, the kernel confirms, an agent nothing confirms is observed).
 //!
-//! The foreground group's leader is read where the kernel keeps it: the image's path and the
+//! The session's agent is read where the kernel keeps it: the foreground group's leader, or, in
+//! a tab a harness leads under a contract 4 claim, the child that claim kept
+//! ([`crate::harness_claim::agent_pid`]), so the engine types in a harness-led tab only when
+//! that child passes the image proof. Of that process aterm reads the image's path and the
 //! file it was mapped from, the process's start, the team of a Developer ID signature the kernel
 //! validated ([`live_team`]), its pid version (Apple's, which every exec moves) and, for a script
 //! shell, its script. The verdict ([`Verdict`]) is kept per session under that key ([`Key`]):
@@ -48,6 +51,13 @@ pub(crate) struct Kernel {
     /// not (Apple's `p_idversion`, [`aterm_uds::process::Identity::idversion`]); `None` where the
     /// kernel keeps none (Linux, whose `/proc/<pid>/exe` keeps an unlinked image's inode).
     pub(crate) version: fn(i32) -> Option<i32>,
+    /// A process's birth ([`aterm_uds::process::read_birth`]): whether a scoped claim's kept
+    /// child still reads at the birth aterm kept ([`crate::harness_claim::agent_pid_with`]).
+    pub(crate) birth: fn(i32) -> Option<aterm_uds::process::Birth>,
+    /// Whether the image is an install of the agent by its vendor's layout
+    /// ([`agent_image::in_vendor_layout`]): read once a verdict, as it decides both the team's
+    /// read and the proof.
+    pub(crate) layout: fn(Program, &Image<'_>, &Places<'_>) -> bool,
 }
 
 impl Kernel {
@@ -59,6 +69,8 @@ impl Kernel {
         team: live_team,
         script: live_script,
         version: live_version,
+        birth: aterm_uds::process::read_birth,
+        layout: agent_image::in_vendor_layout,
     };
 }
 
@@ -122,12 +134,15 @@ impl Where {
     }
 }
 
-/// What a kept verdict stands on: the same leader of the same group, started at the same time,
-/// running the same script, and not exec'd since: the same pid version where the kernel keeps
-/// one, else mapped from the same file.
+/// What a kept verdict stands on: the same agent process (the group's leader, or the child a
+/// scoped claim kept) of the same group, started at the same time, running the same script, and
+/// not exec'd since: the same pid version where the kernel keeps one, else mapped from the same
+/// file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
     group: i32,
+    /// The process read: `group` itself, or a scoped claim's kept child.
+    pid: i32,
     start_us: Option<u64>,
     file: Option<FileId>,
     script: Option<FileId>,
@@ -144,7 +159,8 @@ impl Key {
     /// A key with neither is read afresh each time.
     fn stands_for(&self, kept: &Self) -> bool {
         self.start_us.is_some()
-            && (self.group, self.start_us, self.script) == (kept.group, kept.start_us, kept.script)
+            && (self.group, self.pid, self.start_us, self.script)
+                == (kept.group, kept.pid, kept.start_us, kept.script)
             && match (self.version, kept.version) {
                 (Some(now), Some(then)) => now == then,
                 _ => self.file.is_some() && self.file == kept.file,
@@ -185,8 +201,10 @@ static TOLD: Mutex<BTreeMap<String, Act>> = Mutex::new(BTreeMap::new());
 /// Past this many sessions kept, the host's roster pass forgets the ones gone ([`forget_gone`]).
 const KEPT_MAX: usize = 256;
 
-fn key_of(group: i32, kernel: &Kernel) -> (Key, Option<PathBuf>) {
-    let pid = u32::try_from(group).ok().filter(|pid| *pid > 1);
+/// The key of `agent`, the process read in group `group` (the leader, or a scoped claim's kept
+/// child): its image, start, script and pid version are `agent`'s; the verdict is kept by group.
+fn key_of(group: i32, agent: i32, kernel: &Kernel) -> (Key, Option<PathBuf>) {
+    let pid = u32::try_from(agent).ok().filter(|pid| *pid > 1);
     let exe = pid.and_then(kernel.exe);
     let file = pid
         .zip(exe.as_deref())
@@ -194,14 +212,15 @@ fn key_of(group: i32, kernel: &Kernel) -> (Key, Option<PathBuf>) {
     let script = exe
         .as_deref()
         .filter(|exe| crate::holder_image::is_script_shell(atpkg::image::strip_deleted(exe)))
-        .and_then(|_| (kernel.script)(group))
+        .and_then(|_| (kernel.script)(agent))
         .filter(|script| script.is_absolute())
         .and_then(|script| FileId::of(&script));
-    let start_us = pid.and_then(|_| (kernel.start_us)(group));
-    let version = pid.and_then(|_| (kernel.version)(group));
+    let start_us = pid.and_then(|_| (kernel.start_us)(agent));
+    let version = pid.and_then(|_| (kernel.version)(agent));
     (
         Key {
             group,
+            pid: agent,
             start_us,
             file,
             script,
@@ -214,7 +233,9 @@ fn key_of(group: i32, kernel: &Kernel) -> (Key, Option<PathBuf>) {
 /// The verdict on `sid`'s `agent`, its foreground group `group`, through `kernel`: kept while the
 /// kernel's key stands ([`Key::stands_for`]), read afresh otherwise, the places read by `places` only when a verdict
 /// is. Nothing readable of the leader is [`Act::Observe`]. A key that moved while the verdict
-/// was read is not kept: the next read reads again.
+/// was read is not kept: the next read reads again. Tests read the leader through it; the
+/// engine reads the claim's agent process through [`read_process`].
+#[cfg(all(test, unix))]
 pub(crate) fn read_with(
     sid: &str,
     agent: Program,
@@ -222,7 +243,22 @@ pub(crate) fn read_with(
     kernel: &Kernel,
     places: &dyn Fn() -> Where,
 ) -> Verdict {
-    let (key, exe) = key_of(group, kernel);
+    read_process(sid, agent, group, group, kernel, places)
+}
+
+/// The verdict on `sid`'s `agent` read at `pid`, the agent process of group `group`: the
+/// leader, or the child a scoped claim kept ([`crate::harness_claim::agent_pid_with`]). The
+/// verdict is still the image proof of `agent` ([`agent_image::proof_among`]), kept by group
+/// under `pid`'s key.
+fn read_process(
+    sid: &str,
+    agent: Program,
+    group: i32,
+    pid: i32,
+    kernel: &Kernel,
+    places: &dyn Fn() -> Where,
+) -> Verdict {
+    let (key, exe) = key_of(group, pid, kernel);
     if let Some(kept) = KEPT
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -235,7 +271,7 @@ pub(crate) fn read_with(
     {
         return kept.verdict;
     }
-    let verdict = match (exe.as_deref(), u32::try_from(group)) {
+    let verdict = match (exe.as_deref(), u32::try_from(pid)) {
         (Some(exe), Ok(pid)) => {
             let at = places();
             let places = Places {
@@ -249,16 +285,14 @@ pub(crate) fn read_with(
                 script: key.script,
             };
             // The team's read runs `codesign` on the process: only where no layout confirms it.
-            let team = if agent_image::in_vendor_layout(agent, &unsigned, &places) {
-                None
-            } else {
-                (kernel.team)(pid)
-            };
+            // The layout is read once: the read that skipped the team's is the proof's.
+            let laid = (kernel.layout)(agent, &unsigned, &places);
+            let team = if laid { None } else { (kernel.team)(pid) };
             let image = Image {
                 team: team.as_deref(),
                 ..unsigned
             };
-            let proof = agent_image::proof_among(agent, &image, &places, &at.standins);
+            let proof = agent_image::proof_laid(laid, agent, &image, &at.standins);
             Verdict {
                 act: Act::of(proof),
                 proof,
@@ -266,7 +300,7 @@ pub(crate) fn read_with(
         }
         _ => OBSERVED,
     };
-    if key_of(group, kernel).0 == key {
+    if key_of(group, pid, kernel).0 == key {
         KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(
             sid.to_string(),
             Kept {
@@ -289,7 +323,11 @@ pub(crate) fn read_with(
 #[cfg(any(unix, test))]
 pub(crate) fn carry_row(sid: &str) -> Option<String> {
     let kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
-    let kept = kept.get(sid)?;
+    // A kept child's confirmation is not carried: the successor keeps the claim's child afresh
+    // and reads it again.
+    let kept = kept
+        .get(sid)
+        .filter(|kept| kept.key.pid == kept.key.group)?;
     let (Act::On, Some(proof), Some(start), Some(version)) = (
         kept.verdict.act,
         kept.verdict.proof,
@@ -368,9 +406,11 @@ fn carried_of(row: &str) -> Option<(Key, Program, Proof)> {
             return None;
         }
     }
+    let group = group?;
     Some((
         Key {
-            group: group?,
+            group,
+            pid: group,
             start_us: Some(start?),
             file: None,
             script,
@@ -406,6 +446,7 @@ pub(crate) fn keep_for_test(sid: &str, agent: Program, group: i32, act: Act) {
         Kept {
             key: Key {
                 group,
+                pid: group,
                 start_us: None,
                 file: None,
                 script: None,
@@ -421,10 +462,13 @@ pub(crate) fn keep_for_test(sid: &str, agent: Program, group: i32, act: Act) {
 /// Keep `act` as the host's read of `sid`'s `agent` leading `group`, a live group the kernel
 /// reads (the test's own process), under the key the kernel gives it now, so that the gate's own
 /// read of it ([`read_with`] through [`Kernel::LIVE`]) stands on it; and forget what the gate
-/// said of `sid`.
-#[cfg(test)]
+/// said of `sid`. Only where the kernel reads a leader's start ([`Key::stands_for`] needs it).
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 pub(crate) fn keep_live_for_test(sid: &str, agent: Program, group: i32, act: Act) {
-    let (key, _) = key_of(group, &Kernel::LIVE);
+    let (key, _) = key_of(group, group, &Kernel::LIVE);
     assert!(
         key.stands_for(&key),
         "the kernel reads group {group}: {key:?}"
@@ -467,6 +511,7 @@ pub(crate) fn fixture_row(group: i32, start_us: u64, version: i32) -> String {
         Kept {
             key: Key {
                 group,
+                pid: group,
                 start_us: Some(start_us),
                 file: None,
                 script: None,
@@ -486,7 +531,10 @@ pub(crate) fn fixture_row(group: i32, start_us: u64, version: i32) -> String {
 }
 
 /// How many withheld lines the gate logged of `sid` ([`withheld`]).
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
 pub(crate) fn withheld_said(sid: &str) -> usize {
     SAID.lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -590,7 +638,8 @@ pub(crate) fn hosted_with(
     let Some(agent) = crate::harness_host::admitted_as(&ctx, agent, group) else {
         return Act::Observe;
     };
-    let verdict = read_with(sid, agent, group, kernel, places);
+    let pid = crate::harness_claim::agent_pid_with(&ctx, group, &kernel.birth);
+    let verdict = read_process(sid, agent, group, pid, kernel, places);
     tell(&ctx, sid, verdict);
     verdict.act
 }
@@ -622,7 +671,8 @@ pub(crate) fn roster_read_with(
     kernel: &Kernel,
     places: &dyn Fn() -> Where,
 ) {
-    let verdict = read_with(sid, agent, group, kernel, places);
+    let pid = crate::harness_claim::agent_pid_with(ctx, group, &kernel.birth);
+    let verdict = read_process(sid, agent, group, pid, kernel, places);
     let held = ctx
         .meta
         .lock()
@@ -669,7 +719,10 @@ pub(crate) fn withheld_with(
     };
     let sid = ctx.self_id.as_str();
     let act = match crate::harness_host::admitted_as(ctx, agent, group) {
-        Some(agent) => Some(read_with(sid, agent, group, kernel, places).act),
+        Some(agent) => {
+            let pid = crate::harness_claim::agent_pid_with(ctx, group, &kernel.birth);
+            Some(read_process(sid, agent, group, pid, kernel, places).act)
+        }
         None => named.map(|_| Act::Observe),
     };
     if !agent_image::withholds(act, lane) {

@@ -787,10 +787,8 @@ fn setup_mints_the_master_into_the_vault_and_shows_it_nowhere() {
     let kept = dir
         .join(".secrets")
         .join(aterm_secrets::paper_master::ENTRY);
-    let saved = std::fs::read(&kept).unwrap();
-    std::fs::remove_file(&kept).unwrap();
+    assert!(!kept.exists(), "the vault must not materialize the master");
     let checked = assert_nothing_on_disk_holds(&dir, &phrase);
-    std::fs::write(&kept, saved).unwrap();
     assert!(
         checked >= 5,
         "the run must have written five files; saw {checked}"

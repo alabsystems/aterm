@@ -420,6 +420,8 @@ pub(crate) fn usage_transition(
                         .then_some(("five_hour", Some(NOW + HOUR)))
                         .into_iter()
                         .collect(),
+                    refusal: None,
+                    limits: Default::default(),
                 })
             };
             let result = super::super::launch_env(&world.seat(), Cli::Codex, &read);
@@ -547,6 +549,8 @@ pub(super) fn plain_usage() -> Reading {
             ..Sample::default()
         },
         walls: Vec::new(),
+        refusal: None,
+        limits: Default::default(),
     })
 }
 
@@ -558,6 +562,8 @@ pub(super) fn spent_usage() -> Reading {
             ..Sample::default()
         },
         walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+        refusal: None,
+        limits: Default::default(),
     })
 }
 
@@ -851,6 +857,8 @@ fn one_launch_reads_a_row_once_where_the_answer_leaves_it_due() {
                 ..Sample::default()
             },
             walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let beside_another: fn(&World) = |world| {
@@ -1039,6 +1047,8 @@ fn a_read_that_shows_no_room_leaves_a_lone_rows_wall() {
                 ..Sample::default()
             },
             walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let names: [(&str, &str, &(dyn Fn() -> Reading + Sync)); 3] = [

@@ -12,6 +12,7 @@ struct Prepared<'a> {
     header: Header,
     receipt: Receipt,
     cut: Option<cutoff::Cut>,
+    checkpoint: Option<crate::checkpoint::Body>,
 }
 
 impl Store {
@@ -26,7 +27,10 @@ impl Store {
     /// # Errors
     /// Authority, authentication, policy, identity collisions, and aggregate capacity
     /// failures refuse before persistent mutation. Any uncertain permission, append,
-    /// or custody write fences the handle; reopen and retry the exact wires.
+    /// or custody write fences the handle; reopen and retry the exact wires. The
+    /// writing open adopts the exact group where it reached the log and retires its
+    /// permission where none of it did. A custody check refused after the commit
+    /// leaves the group witnessed and announced; a retry returns its receipts.
     pub fn ingest_batch(&mut self, session: &Session<'_>, wires: &[&[u8]]) -> Result<Vec<Receipt>> {
         self.ingest_batch_via(session, wires, Via::Local)
     }
@@ -123,11 +127,13 @@ impl Store {
                 offset: self.witness.count + position as u64,
             };
             replies.push(receipt);
+            let control = super::Control::of(record.payload());
             staged.push(Prepared {
                 wire,
                 header: record.header().clone(),
                 receipt,
-                cut: cutoff::decode(record.payload()),
+                cut: control.cut,
+                checkpoint: control.checkpoint,
             });
         }
         if staged.is_empty() {
@@ -190,10 +196,6 @@ impl Store {
             return Err(Error::new("table log and custody witness diverged"));
         }
         self.poisoned = true;
-        #[cfg(test)]
-        if APPEND_FAILS.with(std::cell::Cell::get) {
-            return Err(Error::new("injected append failure"));
-        }
         group::prepare(
             &self.claim_dir,
             &self.claim_name,
@@ -201,6 +203,11 @@ impl Store {
             self.witness,
             witness,
         )?;
+        // A writer stopped with its group's permit durable and none of its records in the log.
+        #[cfg(test)]
+        if APPEND_FAILS.with(std::cell::Cell::get) {
+            return Err(Error::new("injected append failure"));
+        }
         let mut claim = self.claim.clone();
         claim[WITNESS_AT..].copy_from_slice(&witness.bytes());
         let expected = self.witness.count;
@@ -242,13 +249,16 @@ impl Store {
                 receipt,
                 payload: PayloadState::Ready,
                 cut: prepared.cut,
+                checkpoint: prepared.checkpoint,
             };
             if !self.hold(receipt.id, stored) {
                 return Err(Error::new("duplicate witnessed batch record"));
             }
         }
         self.poisoned = false;
-        self.check(session)?;
+        // Announce the witnessed group before the check that guards its receipts: a refusal
+        // there still leaves these records committed, and a retry answers each as a retained
+        // duplicate, which never notifies.
         for (position, receipt) in replies.iter().enumerate() {
             // Each new physical record notifies once, including when inputs repeat it.
             if !notify[position] {
@@ -268,6 +278,7 @@ impl Store {
                 wire: stored.wire.as_slice(),
             });
         }
+        self.check(session)?;
         #[cfg(test)]
         super::batch_conformance_tests::acknowledged(self.witness);
         Ok(replies)

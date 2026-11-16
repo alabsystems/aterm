@@ -181,6 +181,8 @@ mod lab;
 #[cfg(target_os = "macos")]
 mod lab_build;
 #[cfg(target_os = "macos")]
+mod launch_trust;
+#[cfg(target_os = "macos")]
 mod link;
 #[cfg(target_os = "macos")]
 mod link_notice;
@@ -652,6 +654,12 @@ usage: targo --unverified lab <command> [tag] [args]
                                  the launch that ran there (the stub's route, or Claude Code's default route)
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
+  launch-trust [--answer FILE]
+                                 on a fresh rerouting lab with no trust seeded: `aterm harness tap --launch` typed as the twin's
+                                 block spells it, then real Claude Code by name, in a folder inside a repository, a linked
+                                 worktree and a plain folder (its profile's key, the ledger's row, no dialog), with the home,
+                                 `--no-harness` and a launch with no terminal as controls; the verb's stdout; and the headless
+                                 start timed, its answer kept in FILE
   trail-keys [--vim] [--keep]
                                  on a fresh lab, real Claude Code fullscreen with its caret drawn, Rainbow Kitty on: whether
                                  the composer's keys light the trail after a drag over a path, Escape, Ctrl-L, Ctrl-C, Escape or
@@ -887,7 +895,7 @@ Outside any lab (no jail, no stub):
                                  agy logins signed in, out and expired; judge that survey, report, upkeep and fleet
                                  survey read each state from local files alone, contact no provider, open nothing,
                                  sign nothing in, and carry only their own Mac's rows (debug lab image)
-  setup-token-lab [a|b|c|all] [tag] [--keep]
+  setup-token-lab [a|b|c|d|all] [tag] [--keep]
                                  DESIGN-claude-setup-token S9's gate (debug lab image, no real sign-in): (a) the real
                                  `claude setup-token` on the capture's terminal in the jail reaches an authorize URL the
                                  capture admits and its paste prompt, stopped there; (b) `accounts token` on a stand-in
@@ -895,7 +903,10 @@ Outside any lab (no jail, no stub):
                                  casts, the lab's files, $TMPDIR or any process's argv and environment (each scanner
                                  with a planted control); (c) the real Claude Code on the wrapper's descriptor: its
                                  SessionStart hook, MCP server and statusLine command find no token (control: the
-                                 wrapper's spare socket, which they find); exit 1 on FAIL, 3 when a lane could not run
+                                 wrapper's spare socket, which they find); (d) the real Claude Code on the token of a
+                                 row whose login was never made here reaches its composer on the default home's
+                                 first-run state and leaves no login (control: no first-run state, its first-run
+                                 screens); exit 1 on FAIL, 3 when a lane could not run
   fleet-sim [--n N] [--runs R] [--keep]
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (each run's
@@ -1032,6 +1043,7 @@ Outside any lab (no jail, no stub):
   title-drift-memory <same frozen builds/workload> --calibration-memory-mib N --bound-growth-mib N --bound-reason TEXT --out DIR
                                  OPENS PRIVATE WINDOWS: functional memory sizing only; no timing qualification (`--help` for required bounds)
   title-drift --a PATH --a-source SHA --a-sha256 SHA --b PATH --b-source SHA --b-sha256 SHA --out DIR
+      --cases windows1,windows2,windows8 selects actual OS-window scaling (30 idle tabs per extra window)
   restore-native --a PATH --a-source SHA --a-sha256 SHA --a-build-record JSONL --b PATH --b-source SHA --b-sha256 SHA --b-build-record JSONL --out DIR
                                  OPENS PRIVATE WINDOWS: unchanged-title output and native typing, in ABBA order, with strict timing evidence (`--help` for profiles and quick validation)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
@@ -1390,6 +1402,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "work-overlap" => work_overlap::cmd_work_overlap(args),
         "git-starts" => git_starts::cmd_git_starts(args),
         "footers" => footers::cmd_footers(args),
+        "launch-trust" => launch_trust::cmd_launch_trust(args),
         "halfdraw" => halfdraw::cmd_halfdraw(args),
         "idle-points" => idlepoints::cmd_idle_points(args),
         "restart-jobs" => restart_jobs::cmd_restart_jobs(args),

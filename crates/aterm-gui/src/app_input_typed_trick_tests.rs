@@ -68,7 +68,7 @@ fn flash(app: &App, wid: WindowId, t0: Instant) -> TrickFlashPhase {
 
 fn grieves_at(app: &mut App, wid: WindowId, typed: Instant) -> bool {
     crate::app_render::pet_fails_a_command_for_test(
-        app.windows.get_mut(&wid).expect("window"),
+        &mut app.windows.get_mut(&wid).expect("window"),
         typed,
         Some(12),
     )
@@ -206,8 +206,9 @@ fn a_name_glued_to_its_command_by_ime_commit_waits_for_a_name_or_enter() {
     let (mut app, wid, _) = pet_app();
     app.input(wid, InputEvent::Text("坐下猫咪".into()), Source::Human);
     app.input(wid, named(NamedKey::Enter), Source::Human);
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.fx.companion_mut().revoke_trick();
+    drop(ws);
     assert_eq!(pending(&app, wid), Some(Trick::Sit), "sent: final");
 
     for prose in ["猫咪坐下 很可爱", "猫咪玩具", "喂猫咪"] {
@@ -409,7 +410,7 @@ fn the_master_the_tricks_bit_serious_mode_and_ignore_words_are_each_inert() {
             "{label}: the line is over"
         );
         let grieving = crate::app_render::pet_fails_a_command_for_test(
-            app.windows.get_mut(&wid).expect("window"),
+            &mut app.windows.get_mut(&wid).expect("window"),
             Instant::now(),
             Some(12),
         );
@@ -671,7 +672,7 @@ fn naming_the_pet_makes_the_command_final() {
         },
         "the name confirmed the tentative fire"
     );
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.fx.companion_mut().revoke_trick();
     assert_eq!(
         ws.fx.companion_mut().brain().pending_trick(),
@@ -680,7 +681,7 @@ fn naming_the_pet_makes_the_command_final() {
     );
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sit ");
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.fx.companion_mut().revoke_trick();
     assert_eq!(
         ws.fx.companion_mut().brain().pending_trick(),
@@ -706,7 +707,7 @@ fn the_verb_after_a_greeting_is_the_request() {
             },
             "{line:?}"
         );
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.fx.companion_mut().revoke_trick();
         assert_eq!(
             ws.fx.companion_mut().brain().pending_trick(),
@@ -763,8 +764,8 @@ fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     type_word(&mut app, wid, "kitty sit ");
     assert_eq!(flash(&app, wid, t0), TrickFlashPhase::Pending);
     let now = Instant::now();
-    let ws = app.windows.get_mut(&wid).expect("window");
-    super::revoke_trick_line(ws, now);
+    let mut ws = app.windows.get_mut(&wid).expect("window");
+    super::revoke_trick_line(&mut ws, now);
     assert_eq!(
         ws.fx.decos().trick_flash_phase(t0),
         TrickFlashPhase::Pending,
@@ -780,8 +781,8 @@ fn a_revoke_spares_the_flash_of_an_addressed_fire() {
     let (mut app, wid, _) = pet_app();
     type_word(&mut app, wid, "sit ");
     let now = Instant::now();
-    let ws = app.windows.get_mut(&wid).expect("window");
-    super::revoke_trick_line(ws, now);
+    let mut ws = app.windows.get_mut(&wid).expect("window");
+    super::revoke_trick_line(&mut ws, now);
     assert_eq!(
         ws.fx.decos().trick_flash_phase(t0),
         TrickFlashPhase::Idle,

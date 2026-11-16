@@ -83,7 +83,7 @@ fn an_unsupported_pattern_is_refused() {
 }
 
 /// The listing walks `public/`, prunes an ignored directory, skips ignored files, refuses a
-/// symbolic link, and lays a dry run's planned content over what is on disk.
+/// symbolic link, and lays a dry run's planned content and removals over what is on disk.
 /// NEGATIVE CONTROL: with no ignore list every file is listed, the dot file included.
 #[cfg(unix)]
 #[test]
@@ -111,14 +111,22 @@ fn the_listing_leaves_what_ignore_names_and_refuses_a_link() {
     ])
     .unwrap();
     let mut overlay = BTreeMap::new();
-    overlay.insert("index.html".to_string(), b"planned".to_vec());
-    overlay.insert("releases.html".to_string(), b"new".to_vec());
+    overlay.insert("index.html".to_string(), Some(b"planned".to_vec()));
+    overlay.insert("releases.html".to_string(), Some(b"new".to_vec()));
     let listed = list(&public, &ignore, &overlay).unwrap();
     assert_eq!(
         listed.keys().collect::<Vec<_>>(),
         ["assets/a.css", "index.html", "releases.html"]
     );
     assert_eq!(listed["index.html"], b"planned");
+    // A planned removal leaves the file out; one of a file not there adds nothing.
+    overlay.insert("assets/a.css".to_string(), None);
+    overlay.insert("gone.ps1".to_string(), None);
+    let removed = list(&public, &ignore, &overlay).unwrap();
+    assert_eq!(
+        removed.keys().collect::<Vec<_>>(),
+        ["index.html", "releases.html"]
+    );
     let all = list(&public, &[], &BTreeMap::new()).unwrap();
     assert_eq!(all.len(), 5, "{:?}", all.keys().collect::<Vec<_>>());
     std::os::unix::fs::symlink("/etc/hosts", public.join("hosts")).unwrap();
@@ -182,7 +190,7 @@ fn a_key_under_public_is_never_published() {
 
     std::fs::remove_file(public.join("assets/deployer.txt")).unwrap();
     let mut overlay = BTreeMap::new();
-    overlay.insert("assets/new-key.json".to_string(), key.into_bytes());
+    overlay.insert("assets/new-key.json".to_string(), Some(key.into_bytes()));
     let why_overlay = list(&public, &[], &overlay).unwrap_err();
     assert!(
         why_overlay.contains("new-key.json") && why_overlay.contains("private key"),
@@ -205,7 +213,7 @@ fn a_key_under_public_is_never_published() {
         ),
     ] {
         let mut extra = BTreeMap::new();
-        extra.insert(name.to_string(), secret);
+        extra.insert(name.to_string(), Some(secret));
         let why_extra = list(&public, &[], &extra).unwrap_err();
         assert!(
             why_extra.contains(name) && why_extra.contains("private key"),

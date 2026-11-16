@@ -10,7 +10,7 @@ const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
 /// Another Mac whose node id begins as [`NODE`]'s does, so its drive's actor token is the same.
 const TWIN: &str = "87be5228ffffffffffffffffffffffff";
 const ASKER: &str = "s-0123456789abcdef0123";
-const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+const BY: &str = "fleet:87be5228:tqn5r6e0148";
 const TAB_A: &str = "s-aaaaaaaaaaaaaaaaaaaa";
 const TAB_B: &str = "s-bbbbbbbbbbbbbbbbbbbb";
 const TAB_C: &str = "s-cccccccccccccccccccc";
@@ -156,11 +156,11 @@ fn a_tab_attaches_only_its_requesters_verbs() {
     let before = journal(dir.path());
     for (node, stranger) in [
         // Another node, the same session id.
-        (NODE, "fleet:c0ffee00:s-0123456789abcdef0123"),
+        (NODE, "fleet:c0ffee00:tqn5r6e0148"),
         // Another node whose head is the requester's: the same token, a different Mac.
         (TWIN, BY),
         // The same node, another session.
-        (NODE, "fleet:87be5228:s-9999999999999999999a"),
+        (NODE, "fleet:87be5228:tqn5r6e0149"),
         // The same node, a drive that names no session.
         (NODE, "fleet:87be5228:-"),
         // A local tab, a ctl client in no tab, the harness.

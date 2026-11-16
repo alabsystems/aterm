@@ -22,7 +22,13 @@ pub enum BuiltinAuthority {
     /// A foreign legacy or v2 holder owns the whole session.
     Exclusive,
     /// The built-in keeps the complement of these externally owned duties at this revision.
+    /// An empty set is a coordinated session no claim holds: the built-in may claim it again.
     Complement { revision: u64, taken: u8 },
+    /// A proven scoped claim stands that was granted no duty (a contract 4 claim whose words a
+    /// seed or a link may not take, or a claim a cap narrowed to nothing): the built-in keeps
+    /// every duty at this revision, under typed, revision-bound input, and does not claim the
+    /// session itself, which the standing claim holds (HX-06).
+    Ceded { revision: u64 },
 }
 
 fn bit(scope: Scope) -> u8 {
@@ -33,6 +39,8 @@ fn bit(scope: Scope) -> u8 {
         Scope::Approvals => 8,
         Scope::Questions => 16,
         Scope::Walls => 32,
+        Scope::State => 64,
+        Scope::Accounts => 128,
     }
 }
 
@@ -86,8 +94,22 @@ impl BuiltinAuthority {
                 Self::Unknown
             };
         }
-        if !matches!(contract, "-" | "2" | "3") || scopes == "-" {
+        if !matches!(contract, "-" | "2" | "3" | "4") {
             return Self::Unknown;
+        }
+        let scoped = matches!(contract, "3" | "4");
+        if scopes == "-" {
+            // A scoped claim granted no duty (contract 4, or a contract 3 claim a cap narrowed to
+            // nothing) leaves every duty to the built-in, never to nobody; it still holds the
+            // session, so this is not the empty complement of no claim. Any other holder's `-`
+            // is inconsistent.
+            return if scoped {
+                Self::Ceded {
+                    revision: revision_number,
+                }
+            } else {
+                Self::Unknown
+            };
         }
         let mut taken = Vec::new();
         for word in scopes.split(',') {
@@ -99,12 +121,12 @@ impl BuiltinAuthority {
             }
             taken.push(scope);
         }
-        if contract != "3" && taken.len() != Scope::ALL.len() {
+        if !scoped && taken.len() != Scope::ALL.len() {
             return Self::Unknown;
         }
         if holder == aterm_codec::pct::encode(builtin_holder) {
             Self::complement(revision_number, [])
-        } else if contract == "3" {
+        } else if scoped {
             Self::complement(revision_number, taken)
         } else {
             Self::Exclusive
@@ -124,14 +146,18 @@ impl BuiltinAuthority {
     /// nothing; an ordinary adapter continues through its legacy claim protocol separately.
     #[must_use]
     pub fn keeps(self, scope: Scope) -> bool {
-        matches!(self, Self::Complement { taken, .. } if taken & bit(scope) == 0)
+        match self {
+            Self::Complement { taken, .. } => taken & bit(scope) == 0,
+            Self::Ceded { .. } => true,
+            Self::Unsupported | Self::Unknown | Self::Legacy | Self::Exclusive => false,
+        }
     }
 
     /// The input revision, only for a complete scoped-complement observation.
     #[must_use]
     pub const fn revision(self) -> Option<u64> {
         match self {
-            Self::Complement { revision, .. } => Some(revision),
+            Self::Complement { revision, .. } | Self::Ceded { revision } => Some(revision),
             _ => None,
         }
     }
@@ -157,6 +183,11 @@ impl TapeValue for BuiltinAuthority {
                 bytes.push(taken);
                 bytes
             }
+            Self::Ceded { revision } => {
+                let mut bytes = vec![5];
+                bytes.extend_from_slice(&revision.to_le_bytes());
+                bytes
+            }
         }
     }
 
@@ -166,9 +197,12 @@ impl TapeValue for BuiltinAuthority {
             [1] => Ok(Self::Unknown),
             [2] => Ok(Self::Legacy),
             [3] => Ok(Self::Exclusive),
-            [4, a, b, c, d, e, f, g, h, taken] if taken & !63 == 0 => Ok(Self::Complement {
+            [4, a, b, c, d, e, f, g, h, taken] => Ok(Self::Complement {
                 revision: u64::from_le_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
                 taken: *taken,
+            }),
+            [5, a, b, c, d, e, f, g, h] => Ok(Self::Ceded {
+                revision: u64::from_le_bytes([*a, *b, *c, *d, *e, *f, *g, *h]),
             }),
             _ => Err(CodecError {
                 at: 0,
@@ -324,6 +358,13 @@ impl<C: Ctl> Session<'_, C> {
                 self.claim_managed = true;
                 taken != 0
             }
+            // The standing claim holds the session: the built-in keeps every duty and holds no
+            // claim of its own, so it neither claims again nor watches as one behind.
+            BuiltinAuthority::Ceded { .. } => {
+                self.claim = Claim::Complement;
+                self.claim_managed = true;
+                false
+            }
             BuiltinAuthority::Unknown => {
                 self.claim = Claim::Pending {
                     tried: self.fx.mono(),
@@ -383,7 +424,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.setup.builtin_duties {
             self.refresh_builtin_authority();
             match self.builtin_authority {
-                BuiltinAuthority::Complement { .. } => return self.builtin_authority.foreign(),
+                BuiltinAuthority::Complement { .. } | BuiltinAuthority::Ceded { .. } => {
+                    return self.builtin_authority.foreign();
+                }
                 BuiltinAuthority::Unknown | BuiltinAuthority::Exclusive => return true,
                 _ => {}
             }

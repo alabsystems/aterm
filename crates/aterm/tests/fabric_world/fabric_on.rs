@@ -2143,7 +2143,7 @@ fn every_verb_that_takes_a_cap_path_refuses_a_wide_one_a_link_and_a_fifo_at_once
                     "post",
                     "--cap-file",
                     bad,
-                    "to=@s-0000000000000000a1ce@n-00000000000000aa",
+                    "to=@t9000000000@n-00000000000000aa",
                     "kind=answer",
                     "re=1",
                     "x",

@@ -6403,8 +6403,7 @@ mod vault {
         .unwrap();
         client::admin_publish(&paths, &opened, &doc).unwrap();
         client::sync(&paths, None).unwrap();
-        let tracked = paths.home.join(".secrets/gh_access_token");
-        std::fs::remove_file(&tracked).unwrap();
+        client::test_interrupt_apply(&paths).unwrap();
         assert!(!client::materialization_ready(&paths).unwrap());
         let status = without_heartbeat(client::status(&paths).unwrap());
         assert!(matches!(status.membership, Membership::In { .. }));

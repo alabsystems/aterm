@@ -772,6 +772,17 @@ fn always_on_desktop_installs_vault_server_launchdaemon_before_login_and_retires
     sys.on(&bootstrap_cmd, ok(""));
     sys.on(&kickstart_cmd, ok(""));
     daemon.apply(&sys, &ctx).unwrap();
+    // The baseline turns the vault server on, so its job is enabled before it is bootstrapped and
+    // kicked. MUTANT: a VaultServer that skips `enable_system_job` never enables it.
+    let calls = sys.calls();
+    let at = |cmd: &str| calls.iter().position(|call| call == cmd);
+    assert!(
+        matches!(
+            (at(&enable_cmd), at(&bootstrap_cmd), at(&kickstart_cmd)),
+            (Some(enable), Some(bootstrap), Some(kickstart)) if enable < bootstrap && bootstrap < kickstart
+        ),
+        "{calls:?}"
+    );
 
     assert!(
         sys.read_file(Path::new(user_agent_plist)).is_err(),

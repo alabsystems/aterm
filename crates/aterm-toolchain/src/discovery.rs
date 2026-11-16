@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Trust toolchain discovery (std-only) shared by `aterm-verify`, `atpkg`, and `aterm-release`.
+//! Trust toolchain discovery shared by `aterm-verify`, `atpkg`, and `aterm-release`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -569,9 +569,29 @@ impl Probe<'_> {
 }
 
 pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut command = aterm_uds::spawnfd::command(program);
+        command.args(args).stderr(aterm_uds::spawnfd::Stdio::null());
+        let output =
+            aterm_uds::deadline::output_while_process_progressing_complete_stdout_with_limit(
+                &mut command,
+                bound,
+                format!("compiler identity {}", program.display()),
+                64 << 10,
+            )
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).ok())
+            .flatten()
+    }
+    #[cfg(not(unix))]
     bounded_stdout_at(program, args, bound, std::time::Instant::now())
 }
 
+#[cfg(not(unix))]
 fn bounded_stdout_at(
     program: &Path,
     args: &[&str],

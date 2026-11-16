@@ -9,7 +9,9 @@ use aterm_agent::harness::{
 };
 use aterm_uds::spawnfd::{BirthAttempt, SpawnFailure, Spawned};
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -18,11 +20,44 @@ use std::time::{Duration, Instant};
 mod settings;
 pub(crate) use settings::Settings;
 
+#[path = "codex_retained_delivery.rs"]
+mod frontend_delivery;
+
+/// An original start intent on an actual native-issued controller. The opaque
+/// identity holds no request scope and grants no constructor or attachment.
+pub(crate) struct StartOwner {
+    controller: registry::ServiceIdentity,
+    operation: String,
+}
+impl StartOwner {
+    pub(crate) fn new(
+        frontend: &registry::ServiceFrontend,
+        operation: &str,
+    ) -> Result<Self, registry::Error> {
+        frontend.current()?;
+        if operation.len() != 32
+            || !operation
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(registry::Error::Denied);
+        }
+        Ok(Self {
+            controller: frontend.identity(),
+            operation: operation.into(),
+        })
+    }
+    fn same(&self, other: &Self) -> bool {
+        self.controller.same(&other.controller) && self.operation == other.operation
+    }
+}
+
 pub(crate) struct Controller {
     namespace: Weak<registry::Registry>,
     id: String,
+    owner: StartOwner,
     image: aterm_agent::harness::native_act::Image,
-    arguments: Vec<String>,
+    arguments: Vec<OsString>,
     cwd: PathBuf,
     environment: registry::OwnedLaunchEnvironment,
     state: Arc<Mutex<&'static str>>,
@@ -40,6 +75,7 @@ struct Delivered {
     frontend: registry::ServiceFrontend,
     operation: String,
     receipt: registry::PreparedServiceAttachment,
+    transport: Option<frontend_delivery::FrontendDelivery>,
     result: Result<(), registry::Error>,
 }
 struct Running {
@@ -130,17 +166,17 @@ struct Start {
 
 pub(crate) struct Selection {
     process: Process,
-    arguments: Vec<String>,
+    arguments: Vec<OsString>,
     cwd: PathBuf,
     environment: registry::OwnedLaunchEnvironment,
 }
 impl Selection {
     pub(crate) fn capture(
         peer: &registry::Peer,
-        arguments: &[String],
+        arguments: &[OsString],
         environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     ) -> Result<Self, registry::Error> {
-        if !peer.current() || arguments.iter().any(|arg| arg.contains('\0')) {
+        if !peer.current() || arguments.iter().any(|arg| arg.as_bytes().contains(&0)) {
             return Err(registry::Error::Stale);
         }
         let process = Process::observe(peer.caller().pid).ok_or(registry::Error::Unavailable)?;
@@ -161,6 +197,10 @@ impl Selection {
 }
 
 impl Controller {
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_resource_qualification(&self) -> bool {
+        self.arguments == [OsString::from("--alab-app-resources")]
+    }
     #[cfg(debug_assertions)]
     pub(crate) fn observe_owned_backend(&self) -> Result<Process, registry::Error> {
         let mut running = self
@@ -220,6 +260,9 @@ impl Controller {
             && self.cwd == selection.cwd
             && self.environment.same_settings(&selection.environment)
     }
+    pub(crate) fn same_start(&self, owner: &StartOwner, sources: &Arc<registry::Registry>) -> bool {
+        self.in_namespace(sources) && self.owner.same(owner)
+    }
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -235,6 +278,7 @@ impl Controller {
         sources: &Arc<registry::Registry>,
         lifetime: &account_work::Lifetime,
         selection: Selection,
+        owner: StartOwner,
     ) -> Result<Self, registry::Error> {
         if ctx.fabric.endpoint_closed() {
             return Err(registry::Error::Stale);
@@ -260,6 +304,7 @@ impl Controller {
         let result = Self {
             namespace: Arc::downgrade(sources),
             id,
+            owner,
             image: selection.process.image.clone(),
             arguments: selection.arguments,
             cwd: selection.cwd,
@@ -291,34 +336,26 @@ fn prepare(
     use std::os::unix::ffi::OsStringExt;
     let cli =
         worker::worker_cli(aterm_phase::Program::Codex).ok_or(registry::Error::Unavailable)?;
-    let args = atpkg::caller_shell::process_args(selection.process.pid)
-        .ok_or(registry::Error::Unavailable)?;
-    let home = args
-        .env_var("HOME")
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .ok_or(registry::Error::Unsupported)?;
     let cwd = selection.cwd.clone();
-    let worker::StarterRead::Read(mut starter) = worker::starter(
-        cli,
-        selection.process.pid,
-        &home,
-        || None,
-        || Some(cwd.clone()),
-    ) else {
-        return Err(registry::Error::Denied);
+    // This is the already observed caller image and explicit startup snapshot.
+    // Shell worker posture/pool transformations must not select another argv.
+    let starter = worker::Starter {
+        exe: std::ffi::OsString::from_vec(selection.process.image.path.clone()).into(),
+        env: Vec::new(),
+        args: Ok(Vec::new()),
+        unset: Vec::new(),
     };
-    // Use this admitted caller's actual mapped image, never a moving current shim.
-    starter.exe = std::ffi::OsString::from_vec(selection.process.image.path.clone()).into();
-    // Worker posture/pool transformations select a different invocation. This
-    // service keeps the caller's complete explicit environment and startup
-    // startup data; admission below checks that exact view again.
-    starter.env.clear();
-    starter.unset.clear();
-    starter.args = Ok(std::iter::once("--alab-retained-service".to_owned())
+    let arguments = std::iter::once(OsString::from("--alab-retained-service"))
         .chain(selection.arguments.iter().cloned())
-        .collect());
+        .collect();
     let starter = selection.environment.prepare(starter)?;
+    if !starter
+        .env
+        .iter()
+        .any(|(key, value)| key == "HOME" && std::path::Path::new(value).is_absolute())
+    {
+        return Err(registry::Error::Unsupported);
+    }
     let expected = selection.process.image.clone();
     let executable = starter.exe.clone();
     let admitted = worker::admit(
@@ -335,8 +372,13 @@ fn prepare(
         eprintln!("Retained native startup: context=Unavailable");
         registry::Error::Unavailable
     })?;
-    let reservation =
-        sources.reserve_owned_worker(&env, ctx.self_id.as_str(), &admitted, scope, environment)?;
+    let reservation = sources.reserve_owned_worker_with_arguments(
+        &env,
+        ctx.self_id.as_str(),
+        &admitted,
+        scope,
+        (environment, arguments),
+    )?;
     let admitted = reservation.arm(admitted)?;
     Ok(Start {
         reservation,
@@ -485,6 +527,7 @@ fn attach(
         frontend: request.frontend,
         operation: request.operation,
         receipt,
+        transport: None,
         result: Err(registry::Error::Stale),
     });
     let entry = delivered.last_mut().ok_or(registry::Error::Unavailable)?;
@@ -511,6 +554,7 @@ fn attach(
         deliver(
             service,
             &mut entry.receipt,
+            &mut entry.transport,
             callback,
             foreground,
             delivery,
@@ -523,12 +567,12 @@ fn attach(
 fn deliver(
     service: &mut registry::OwnedService,
     attachment: &mut registry::PreparedServiceAttachment,
+    transport: &mut Option<frontend_delivery::FrontendDelivery>,
     callback: aterm_uds::CtlStream,
     foreground: &registry::FrontendMember<'_>,
     delivery: &Delivery,
     deadline: Instant,
 ) -> Result<(), registry::Error> {
-    use std::os::fd::AsFd;
     // The accepted native actor owns this exact receipt throughout synchronous
     // commit and callback IO. No await or response cancellation can replay it.
     let result = (|| {
@@ -546,45 +590,17 @@ fn deliver(
             #[cfg(debug_assertions)]
             eprintln!("Retained native delivery: endpoint={_error:?}");
         })?;
-        callback
-            .set_nonblocking(true)
-            .map_err(|_| registry::Error::Unavailable)?;
-        loop {
-            if !delivery.live() {
-                return Err(registry::Error::Stale);
-            }
-            aterm_uds::ready::until(
-                callback.as_fd(),
-                aterm_uds::ready::Interest::Write,
-                deadline,
-            )
-            .map_err(|_| registry::Error::Unavailable)?;
-            match foreground.check_current() {
-                Err(registry::Error::Busy) => {
-                    // Registry metadata uses a try-lock and exposes no wake.
-                    // Bound contention backoff by this same delivery deadline;
-                    // a writable callback itself is not a metadata wake.
-                    let left = deadline
-                        .checked_duration_since(Instant::now())
-                        .ok_or(registry::Error::Unavailable)?;
-                    std::thread::sleep(left.min(Duration::from_millis(1)));
-                    continue;
-                }
-                result => result?,
-            }
-            match aterm_uds::fdpass::send_with_fds(&callback, b"F", &[endpoint.as_fd()]) {
-                Ok(1) => break Ok(()),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
-                _ => break Err(registry::Error::Unavailable),
-            }
-        }
+        *transport = Some(frontend_delivery::FrontendDelivery::new(
+            callback, endpoint,
+        )?);
+        transport
+            .as_mut()
+            .ok_or(registry::Error::Unavailable)?
+            .exchange(deadline, || {
+                retry_delivery_metadata(deadline, delivery, || {
+                    service.commit_attachment(attachment, foreground)
+                })
+            })
     })();
     if result.is_err() {
         service.detach_frontend()?;

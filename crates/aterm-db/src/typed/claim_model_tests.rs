@@ -295,6 +295,47 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         operations = vec![carried];
         index = target;
     }
+    if mode == 7 {
+        // Each row born with its own label and a live lifecycle, then a roll that carries every
+        // register with no claim context (0.199.0's), and the same claims written after it.
+        use super::tests::carried_operation;
+        let mut source = Index::new(16);
+        let mut born = Vec::new();
+        for (row, (pk, label)) in ROWS.iter().zip(["m1", "m2", "m3"]).enumerate() {
+            let id = 60 + u8::try_from(row).unwrap();
+            born.push(operation(id, pk, "label", label, &[], &mut source));
+            born.push(operation(id + 10, pk, "row", "live", &[id], &mut source));
+        }
+        let mut target = Index::new(16);
+        let carry = carried_operation(
+            100,
+            &cells(&born.iter().collect::<Vec<_>>()),
+            None,
+            &mut target,
+        );
+        // Each claim observes the roll: a claim the graph gives no parent gets the roll's.
+        let mut claims = Vec::new();
+        for (row, parents) in [Vec::new(), parents_b, parents_c].into_iter().enumerate() {
+            let parents = if parents.is_empty() {
+                vec![100]
+            } else {
+                parents
+            };
+            claims.push(operation(
+                ranks[row],
+                ROWS[row],
+                "label",
+                "m7",
+                &parents,
+                &mut target,
+            ));
+        }
+        raw = cells(&[&carry]);
+        raw.extend(cells(&claims.iter().collect::<Vec<_>>()));
+        origin_a = claims[0].id;
+        operations = std::iter::once(carry).chain(claims).collect();
+        index = target;
+    }
     if mode == 6 {
         let mut parents: Vec<_> = operations.iter().map(|operation| operation.id[0]).collect();
         parents.sort_unstable();
@@ -305,12 +346,22 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         operations.push(unreadable);
     }
     let view = View {
+        table: None,
         causal: index.clone(),
         ops: operations.clone(),
         quota: Default::default(),
         cells: raw.clone(),
         owned: Default::default(),
         complete: mode != 5,
+        awaiting: if mode == 5 {
+            crate::typed::Awaiting {
+                records: 1,
+                rows: None,
+                restated: true,
+            }
+        } else {
+            crate::typed::Awaiting::NONE
+        },
         refused: Vec::new(),
     };
     let accepted = view
@@ -381,7 +432,7 @@ fn identity_claims_conform_for_every_dependency_digest_and_generation_case() {
         .into_iter()
         .find(|models| models[0].name == default.name)
         .expect("registered identity model");
-    assert_eq!(configurations.len(), 2usize.pow(3) * 6 * 7);
+    assert_eq!(configurations.len(), 2usize.pow(3) * 6 * 8);
     let mut judged = 0;
     for model in &configurations {
         let init = model.init_state();

@@ -44,7 +44,7 @@ use crate::{
     Result,
     database::Change,
     typed::{
-        LIFECYCLE,
+        Collection, LIFECYCLE,
         cell::{self, CellKey, CellValue, Field, Projection, Row},
         keys,
     },
@@ -382,12 +382,14 @@ fn carried(field: &CellValue, version: u32) -> CellValue {
 }
 
 /// Plan the merges of `machines`, moving `preferences`. `facts` holds what each Mac's own facts row
-/// names, which only that Mac rebinds; `roster` what the roster says of each label.
+/// names, which only that Mac rebinds; `roster` what the roster says of each label. `machine` is
+/// the `machine` collection as the generation `machines` was read from declares it, so a carried
+/// host or nickname alias goes in the form that generation holds it.
 ///
 /// # Errors
 /// A value carried breaks its column's type, which is a bug: nothing is written then.
 pub fn plan(
-    machines: &Projection,
+    (machine, machines): (&Collection, &Projection),
     preferences: &Projection,
     facts: &Facts,
     roster: &Roster,
@@ -420,12 +422,21 @@ pub fn plan(
                     continue;
                 }
                 let waits = unbound(keep, &machines.rows[keep], facts);
-                merge_group(&mut plan, &rows, keep, label, &names, preferences, waits)?;
+                merge_group(
+                    machine,
+                    &mut plan,
+                    &rows,
+                    keep,
+                    label,
+                    &names,
+                    preferences,
+                    waits,
+                )?;
             }
         }
     }
     move_strays(&mut plan, machines, preferences, facts)?;
-    wait_for_macs(&mut plan, machines, facts, roster)?;
+    wait_for_macs(&mut plan, (machine, machines), facts, roster)?;
     Ok(plan)
 }
 
@@ -544,7 +555,7 @@ fn move_strays(
 /// roster gives another Mac, or two names of the roster, is held: either Mac would adopt it.
 fn wait_for_macs(
     plan: &mut Plan,
-    machines: &Projection,
+    (machine, machines): (&Collection, &Projection),
     facts: &Facts,
     roster: &Roster,
 ) -> Result<()> {
@@ -573,10 +584,7 @@ fn wait_for_macs(
             || !unbound(pk, row, facts)
             || conflicted(row)
             || WAIT_COLUMNS.iter().any(|column| row.raw.contains(*column))
-            || row
-                .get("hosts")
-                .and_then(Value::as_array)
-                .is_some_and(|hosts| !hosts.is_empty())
+            || !cell::texts(row.fields.get("hosts")).is_empty()
         {
             continue;
         }
@@ -607,14 +615,14 @@ fn wait_for_macs(
             label: label.to_owned(),
         });
         plan.rows.push(vec![cell::change(
-            &MACHINE,
+            machine,
             CellKey {
                 pk,
                 col: "status",
                 elem: None,
             },
             &CellValue {
-                r: MACHINE.version,
+                r: machine.version,
                 x: json!("planned"),
                 s: word.value.s.clone(),
                 a: false,
@@ -827,15 +835,26 @@ fn choose<'a>(
     Ok((keep, label))
 }
 
-fn owner_cell(pk: &str, col: &str, elem: Option<&str>, x: Value) -> Result<Change> {
+fn owner_cell(
+    machine: &Collection,
+    pk: &str,
+    col: &str,
+    elem: Option<&str>,
+    x: Value,
+) -> Result<Change> {
     cell::change(
-        &MACHINE,
+        machine,
         CellKey { pk, col, elem },
-        &CellValue::owner(MACHINE.version, x),
+        &CellValue::owner(machine.version, x),
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one merge's inputs, each read once"
+)]
 fn merge_group(
+    machine: &Collection,
     plan: &mut Plan,
     rows: &[(&str, &Row)],
     keep: &str,
@@ -870,9 +889,16 @@ fn merge_group(
     }
     let mut carries = Vec::new();
     for (pk, row) in &gone {
-        carry_cells(&mut merge, &mut carries, pk, row, keep, keeper, waits)?;
+        carry_cells(
+            machine,
+            &mut merge,
+            &mut carries,
+            (pk, row),
+            (keep, keeper),
+            waits,
+        )?;
     }
-    carry_hosts(&mut merge, &mut carries, &gone, keep, keeper)?;
+    carry_hosts(machine, &mut merge, &mut carries, &gone, (keep, keeper))?;
     plan.rows
         .extend(carries.chunks(RECORD).map(<[Change]>::to_vec));
     // The names and the duplicates' ends go in one record, so no reader sees a name on two rows or
@@ -889,14 +915,14 @@ fn merge_group(
                 _ => None,
             });
         last.push(cell::change(
-            &MACHINE,
+            machine,
             CellKey {
                 pk: keep,
                 col: "label",
                 elem: None,
             },
             &CellValue {
-                r: MACHINE.version,
+                r: machine.version,
                 x: json!(label),
                 s: source,
                 a: false,
@@ -916,7 +942,13 @@ fn merge_group(
         .flat_map(Field::members)
         .filter(|name| !names.contains(*name))
     {
-        last.push(owner_cell(keep, "aliases", Some(name), json!(false))?);
+        last.push(owner_cell(
+            machine,
+            keep,
+            "aliases",
+            Some(name),
+            json!(false),
+        )?);
         merge.aliases_removed.push(name.to_owned());
     }
     for name in names {
@@ -925,14 +957,14 @@ fn merge_group(
             if member {
                 let source = element(name).and_then(|cell| cell.s.clone());
                 last.push(cell::change(
-                    &MACHINE,
+                    machine,
                     CellKey {
                         pk: keep,
                         col: "aliases",
                         elem: Some(name),
                     },
                     &CellValue {
-                        r: MACHINE.version,
+                        r: machine.version,
                         x: json!(false),
                         s: source,
                         a: false,
@@ -950,45 +982,52 @@ fn merge_group(
                 .kept
                 .push((from.to_owned(), format!("aliases.{name}")));
         } else if !member {
-            last.push(owner_cell(keep, "aliases", Some(name), json!(true))?);
+            last.push(owner_cell(
+                machine,
+                keep,
+                "aliases",
+                Some(name),
+                json!(true),
+            )?);
             merge.aliases_added.push(name.clone());
         }
     }
     for (pk, _) in &gone {
-        last.push(owner_cell(pk, "merged_into", None, json!(keep))?);
-        last.push(owner_cell(pk, LIFECYCLE, None, json!("merged"))?);
+        last.push(owner_cell(machine, pk, "merged_into", None, json!(keep))?);
+        last.push(owner_cell(machine, pk, LIFECYCLE, None, json!("merged"))?);
     }
     plan.rows.push(last);
     plan.merges.push(merge);
     Ok(())
 }
 
-/// The hosts of the row that stays and of its duplicates together, its own first, as many as a row
-/// holds; what does not fit is listed.
+/// The hosts of the row that stays and of its duplicates together, its own first. Where the
+/// generation holds them as one list, as many as it holds, what does not fit listed, the list
+/// keeping the provenance of the first that gave it a host. Where it holds them as a text set, each
+/// host of a duplicate the row that stays lacks (by [`same_host`]) goes in as its element with that
+/// element's own source, and an element the row that stays holds removed stays removed (a group
+/// with an element in dispute is held before it merges).
 fn carry_hosts(
+    machine: &Collection,
     merge: &mut Merge,
     out: &mut Vec<Change>,
     gone: &[(&str, &Row)],
-    keep: &str,
-    keeper: &Row,
+    (keep, keeper): (&str, &Row),
 ) -> Result<()> {
-    let list = |row: &Row| -> Vec<String> {
-        row.get("hosts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    };
-    let mut hosts = list(keeper);
+    if machine
+        .column("hosts")
+        .is_some_and(|column| column.ty.text_set().is_some())
+    {
+        return carry_host_members(machine, merge, out, gone, (keep, keeper));
+    }
+    let mut hosts = cell::texts(keeper.fields.get("hosts"));
     let mut source = match keeper.fields.get("hosts") {
         Some(Field::Value(candidate)) if !candidate.value.x.is_null() => candidate.value.s.clone(),
         _ => None,
     };
     let mut grew = false;
     for (pk, row) in gone {
-        for host in list(row) {
+        for host in cell::texts(row.fields.get("hosts")) {
             if hosts.iter().any(|held| same_host(held, &host)) {
                 continue;
             }
@@ -1010,20 +1049,64 @@ fn carry_hosts(
         }
     }
     if grew {
-        out.push(cell::change(
-            &MACHINE,
-            CellKey {
-                pk: keep,
-                col: "hosts",
-                elem: None,
-            },
-            &CellValue {
-                r: MACHINE.version,
-                x: json!(hosts),
-                s: source,
+        out.extend(cell::texts_change(
+            machine,
+            keep,
+            "hosts",
+            &[],
+            &hosts,
+            |x| CellValue {
+                r: machine.version,
+                x,
+                s: source.clone(),
                 a: false,
             },
         )?);
+    }
+    Ok(())
+}
+
+/// [`carry_hosts`] where the generation holds hosts as a text set.
+fn carry_host_members(
+    machine: &Collection,
+    merge: &mut Merge,
+    out: &mut Vec<Change>,
+    gone: &[(&str, &Row)],
+    (keep, keeper): (&str, &Row),
+) -> Result<()> {
+    let held = keeper.fields.get("hosts");
+    let mut hosts = cell::texts(held);
+    for (pk, row) in gone {
+        let Some(Field::Set(elements)) = row.fields.get("hosts") else {
+            continue;
+        };
+        // A group with a disputed member is held before it merges ([`conflicted`]): each
+        // element here holds one value, a member's text or its removal.
+        for (elem, element) in elements {
+            let Field::Value(candidate) = element else {
+                continue;
+            };
+            let Some(host) = candidate.value.x.as_str() else {
+                continue;
+            };
+            let known = matches!(held, Some(Field::Set(have)) if have.contains_key(elem));
+            if known || hosts.iter().any(|have| same_host(have, host)) {
+                continue;
+            }
+            out.push(cell::change(
+                machine,
+                CellKey {
+                    pk: keep,
+                    col: "hosts",
+                    elem: Some(elem),
+                },
+                &carried(&candidate.value, machine.version),
+            )?);
+            hosts.push(host.to_owned());
+            if !merge.carried.iter().any(|(_, column)| column == "hosts") {
+                merge.carried.push(((*pk).to_owned(), "hosts".to_owned()));
+            }
+        }
     }
     Ok(())
 }
@@ -1044,12 +1127,11 @@ fn status_moves(word: &CellValue, there: Option<&Field>, waits: bool) -> bool {
 /// build cannot read stays. Its `status` is [`status_moves`]'s, and a `planned` it takes over an
 /// import's word keeps that import's provenance, so a later import can still correct it.
 fn carry_cells(
+    machine: &Collection,
     merge: &mut Merge,
     out: &mut Vec<Change>,
-    pk: &str,
-    row: &Row,
-    keep: &str,
-    keeper: &Row,
+    (pk, row): (&str, &Row),
+    (keep, keeper): (&str, &Row),
     waits: bool,
 ) -> Result<()> {
     for (column, field) in &row.fields {
@@ -1070,15 +1152,19 @@ fn carry_cells(
                     let shown = format!("{column}.{elem}");
                     let known = matches!(held, Some(Field::Set(have)) if have.contains_key(elem));
                     let taken = merge.carried.iter().any(|(_, column)| *column == shown);
-                    if candidate.value.x == json!(true) && !known && !taken {
+                    // A member: `true` in a set of words or keys, its text in a text set.
+                    let adds = machine
+                        .column(column)
+                        .is_some_and(|set| cell::adds(set, elem, &candidate.value.x));
+                    if adds && !known && !taken {
                         out.push(cell::change(
-                            &MACHINE,
+                            machine,
                             CellKey {
                                 pk: keep,
                                 col: column,
                                 elem: Some(elem),
                             },
-                            &carried(&candidate.value, MACHINE.version),
+                            &carried(&candidate.value, machine.version),
                         )?);
                         merge.carried.push((pk.to_owned(), shown));
                     }
@@ -1098,7 +1184,7 @@ fn carry_cells(
                     continue;
                 }
                 if needed && !taken {
-                    let mut moved = carried(&candidate.value, MACHINE.version);
+                    let mut moved = carried(&candidate.value, machine.version);
                     // An import's `active` says nothing of a row that waits for its Mac by name.
                     if status && waits && moved.x == json!("active") && moved.s.is_some() {
                         moved.x = json!("planned");
@@ -1110,7 +1196,7 @@ fn carry_cells(
                         moved.s.clone_from(&word.value.s);
                     }
                     out.push(cell::change(
-                        &MACHINE,
+                        machine,
                         CellKey {
                             pk: keep,
                             col: column,

@@ -53,14 +53,9 @@ fn signed(seed: &[u8; 32], seq: u64, handoff: Vec<Link>, parents: Vec<[u8; 32]>)
 /// What a server holds once it took `bytes`, beside a vault already `parented` or not.
 fn held(bytes: &[u8], parented: bool) -> Held {
     let envelope = envelope::parse(bytes).expect("parsed");
-    Held {
-        seq: envelope.seq,
-        signer: envelope.signer,
-        head: envelope.digest(),
-        parented: parented || !envelope.parents.is_empty(),
-        handoff: envelope.handoff.clone(),
-        bytes: Arc::new(bytes.to_vec()),
-    }
+    let mut held = Held::taken(&envelope, bytes.to_vec());
+    held.parented |= parented;
+    held
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {

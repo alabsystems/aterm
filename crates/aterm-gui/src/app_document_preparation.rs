@@ -915,8 +915,10 @@ impl App {
                                 front.request_effect = OriginalRequestEffect::DirectoryRefreshed;
                                 for (view, prepared) in directory.views.into_iter().zip(coordinates)
                                 {
+                                    let mut route_native_guard =
+                                        self.native_runtime.view_state_mut(view);
                                     let Some(crate::native_app::AppViewState::Editor(state)) =
-                                        self.native_runtime.view_state_mut(view)
+                                        route_native_guard.as_deref_mut()
                                     else {
                                         unreachable!("validated directory view");
                                     };

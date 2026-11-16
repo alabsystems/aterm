@@ -1259,6 +1259,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
     let split = app
         .windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.tab_set.active_mut())
         .is_some_and(|tab| tab.split_focused(crate::tab_model::SplitAxis::Vertical, native));
     assert!(split, "mixed terminal + native tab");
@@ -1276,6 +1277,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
 
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.tab_set.active_mut())
         .expect("active tab")
         .presentation
@@ -1304,6 +1306,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
 
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.tab_set.active_mut())
         .expect("active tab")
         .presentation
@@ -1953,18 +1956,31 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
             .unwrap_or_else(|| panic!("{key} in {line}"))
             .to_string()
     };
+    let opened = app
+        .pool
+        .get(0)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .opened_ms()
+        .expect("session 0's log opened");
     let record = status(&app);
     assert!(
-        record.contains(
+        record.contains(&format!(
             " flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- \
              end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 log_seq=1 log_ep=1 log_base=1 run=- \
-             turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
-        ),
+             turn=- step=- need=- need_since_ms=- opened_ms={opened} rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+        )),
         "{record}"
     );
     assert_stamp_rides_last(&record);
     assert!(
-        roster(&app).ends_with(" upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"),
+        roster(&app).ends_with(&format!(
+            " upgrade=- land_at=- task=- pause=- task_state=- task_rev=0 opened_ms={opened}"
+        )),
         "{}",
         roster(&app)
     );
@@ -2073,6 +2089,17 @@ fn the_status_record_and_the_roster_carry_land_at_and_task() {
 fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     const AT: i64 = 1_792_249_260;
     let mut app = crate::App::headless_for_test();
+    let opened = app
+        .pool
+        .get(0)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .opened_ms()
+        .expect("session 0's log opened");
     let status = |app: &crate::App| app.session_status_record(0).expect("live session");
     let roster = |app: &crate::App| {
         crate::control::cmd_sessions_store(&app.store, None)
@@ -2118,7 +2145,9 @@ fn the_status_record_and_the_roster_carry_the_pause_after_task() {
     );
     assert_stamp_rides_last(&record);
     assert!(
-        roster(&app).ends_with(&format!(" task=- pause={AT} task_state=- task_rev=0")),
+        roster(&app).ends_with(&format!(
+            " task=- pause={AT} task_state=- task_rev=0 opened_ms={opened}"
+        )),
         "{}",
         roster(&app)
     );
@@ -2194,6 +2223,7 @@ fn the_status_record_carries_a_scoped_claims_versions() {
                     start: "stand-in".to_string(),
                 },
                 claim,
+                child: None,
             }),
         });
         let record = app.session_status_record(0).expect("live session");
@@ -2579,9 +2609,23 @@ fn fabric_batch_rows_carry_each_sessions_meaning_fields_as_meta_prints_them() {
         "{set}"
     );
 
-    let held = ctx.meta.lock().unwrap();
+    // Another thread holds the metadata, as a holder the row's try_lock meets does.
+    let (held, holding) = std::sync::mpsc::sync_channel(0);
+    let (release, released) = std::sync::mpsc::sync_channel::<()>(0);
+    let holder = {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _meta = ctx.meta.lock().unwrap();
+            held.send(()).unwrap();
+            let _ = released.recv();
+        })
+    };
+    holding
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("another thread holds the metadata");
     let busy = app.fabric_status_fields(0).expect("live session");
-    drop(held);
+    release.send(()).unwrap();
+    holder.join().unwrap();
     for key in fields {
         assert_eq!(said(&busy, key), None, "{key}= left out while held: {busy}");
     }
@@ -2705,8 +2749,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              resizes flaps land_at task pause land_held land_nudges land_since held waiting \
              land_asked landed_head landed_on landed_leg landed_repo end \
              end_seen end_cheered done_unseen goal task_state task_rev \
-             log_seq log_ep log_base run turn step need need_since_ms rollout rollout_asks \
-             log_journal log_journal_why exec_watch exec_watch_why editing editor \
+             log_seq log_ep log_base run turn step need need_since_ms opened_ms rollout \
+             rollout_asks log_journal log_journal_why exec_watch exec_watch_why editing editor \
              bells bells_sounded last_bell gen seq hash"
         ),
         "{observed}"
@@ -6554,4 +6598,188 @@ fn help_status_names_every_field_the_record_writes_in_its_order() {
         }
     }
     assert!(seen > 100, "{record}");
+}
+
+/// Exercise the real App sweep, including the failed first sample and edge inbox. The
+/// production probe and pool-yield counters catch enumeration before the due predicate.
+#[test]
+fn a_status_sweep_visits_only_due_edged_and_unclassified_sessions() {
+    const COUNT: u64 = 200;
+    const PROMPT: &[u8] = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+    let mut app = crate::App::headless_for_test();
+    assert!(app.config.tab_status_or_default());
+    let interval = Duration::from_secs(1);
+    app.session_status = StatusObserver::new(policy(), interval);
+    for id in 1..COUNT {
+        app.pool.insert(crate::stub_session(id));
+    }
+    for session in app.pool.iter() {
+        session.term.lock().unwrap().process(PROMPT);
+    }
+    let events = |app: &crate::App, id: u64| {
+        app.pool
+            .get(id)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|event| event.kind == STATUS_CHANGE)
+            .map(|event| event.payload.to_string())
+            .collect::<Vec<_>>()
+    };
+    let t0 = Instant::now();
+    let blocked = app.pool.get(COUNT - 1).unwrap().term.clone();
+    let held = blocked.lock().unwrap();
+    let _ = crate::work_counts::take_status_probes();
+    let _ = app.observe_session_statuses(t0);
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        usize::try_from(COUNT).unwrap()
+    );
+    assert!(!app.session_status.knows(COUNT - 1));
+    assert_eq!(app.session_status.unclassified, vec![COUNT - 1]);
+    drop(held);
+    let visits = crate::wake_census::pool_visits();
+    let _ = app.observe_session_statuses(t0);
+    assert_eq!(crate::work_counts::take_status_probes(), 1);
+    assert_eq!(crate::wake_census::pool_visits(), visits);
+    assert!(!app.session_status.has_unclassified());
+
+    let settled = t0 + Duration::from_secs(2);
+    let _ = app.observe_session_statuses(settled);
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        usize::try_from(COUNT).unwrap()
+    );
+    for id in 0..COUNT {
+        assert_eq!(
+            app.session_status.status(id).map(|s| s.phase),
+            Some(Phase::Idle)
+        );
+        assert_eq!(
+            app.session_status.status(id).map(|s| s.last_outcome),
+            Some(Outcome::None)
+        );
+    }
+    let idle = "phase=idle outcome=none exit_code=- signal=- confidence=strong".to_string();
+    assert_eq!(events(&app, 0), vec![idle.clone()]);
+    assert_eq!(events(&app, 1), vec![idle.clone()]);
+    // The public contention gate staggers deadlines without bypassing their owner. Move
+    // time forward, leaving one older deadline due while the other 199 remain in the future.
+    let staggered = settled + interval / 2;
+    for id in 1..COUNT {
+        app.session_status.note_skipped(id, staggered);
+    }
+    app.session_status
+        .note_swept(app.pool.insert_epoch(), Vec::new());
+    let at = staggered + interval / 2;
+    let fail = |app: &crate::App, id: u64, code: u8| {
+        let bytes =
+            format!("\x1b]133;C\x1b\\\x1b]133;D;{code}\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+        app.pool
+            .get(id)
+            .unwrap()
+            .term
+            .lock()
+            .unwrap()
+            .process(bytes.as_bytes());
+    };
+    fail(&app, 0, 7);
+    let visits = crate::wake_census::pool_visits();
+    assert_eq!(app.observe_session_statuses(at), vec![0]);
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        1,
+        "199 future slots are not probed"
+    );
+    assert_eq!(
+        crate::wake_census::pool_visits(),
+        visits,
+        "no hidden topology census"
+    );
+    assert_eq!(
+        app.session_status
+            .status(0)
+            .map(|s| (s.phase, s.last_outcome)),
+        Some((Phase::Idle, Outcome::Failure { exit_code: 7 }))
+    );
+    assert!(app.observe_session_statuses(at).is_empty());
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        0,
+        "no-due fast path"
+    );
+
+    fail(&app, 1, 9);
+    app.session_factory.edge_inbox.push(1);
+    assert_eq!(app.observe_session_statuses(at), vec![1]);
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        1,
+        "edge bypasses a future deadline"
+    );
+    assert_eq!(
+        app.session_status
+            .status(1)
+            .map(|s| (s.phase, s.last_outcome)),
+        Some((Phase::Idle, Outcome::Failure { exit_code: 9 }))
+    );
+
+    let term = app.pool.get(0).unwrap().term.clone();
+    let held = term.lock().unwrap();
+    let retry_at = at + interval;
+    assert!(app.observe_session_statuses(retry_at).is_empty());
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        usize::try_from(COUNT).unwrap(),
+        "the other cohort has now reached its deadline too"
+    );
+    drop(held);
+    assert!(!app.session_status.due(0, retry_at));
+    assert!(app.observe_session_statuses(retry_at).is_empty());
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        0,
+        "contention charges its interval"
+    );
+    // An edge refused by the lock must stay pending and retry even inside that interval.
+    let held = term.lock().unwrap();
+    app.session_factory.edge_inbox.push(0);
+    assert!(app.observe_session_statuses(retry_at).is_empty());
+    assert_eq!(crate::work_counts::take_status_probes(), 1);
+    drop(held);
+    assert!(app.observe_session_statuses(retry_at).is_empty());
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        1,
+        "refused edge was retained"
+    );
+    assert!(app.observe_session_statuses(retry_at + interval).is_empty());
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        usize::try_from(COUNT).unwrap(),
+        "scheduled retries remain live for both deadline cohorts"
+    );
+    assert_eq!(crate::wake_census::pool_visits(), visits);
+
+    for (id, code) in [(0, 7), (1, 9)] {
+        assert_eq!(
+            events(&app, id),
+            vec![
+                idle.clone(),
+                format!("phase=idle outcome=failure exit_code={code} signal=- confidence=strong")
+            ],
+            "one publication per transition, including after lock retries"
+        );
+    }
+    app.pool.insert(crate::stub_session(COUNT));
+    let _ = app.observe_session_statuses(retry_at + interval);
+    assert_eq!(
+        crate::work_counts::take_status_probes(),
+        usize::try_from(COUNT + 1).unwrap(),
+        "a real topology change still admits a census"
+    );
+    assert!(app.session_status.knows(COUNT));
 }

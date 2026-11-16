@@ -842,6 +842,7 @@ fn the_first_adds_main_is_the_default_login_under_the_lab() {
 /// gate removed, the sheet is a source (`no fleet source`); with `cli_sync_inputs` reading the
 /// sheet ungated, the pending digest moves (`while the lab is not read yet`).
 #[test]
+#[cfg(unix)]
 fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let home = root.path().join("home");

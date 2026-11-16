@@ -88,6 +88,89 @@ fn bar_rod_hugs_the_bar_and_stays_text_safe() {
     }
 }
 
+/// THE ROD'S NARROW LAYERS LIE ON THE BAR'S LINE (CT-51 Rule R): on the dark page the white-hot
+/// axis and the inner sleeve, on paper the narrow band, are laid exactly on the renderer's bar's
+/// columns (`bar_width` px from the cell's left), at rest and at full blaze, at every cell width
+/// the films and windows draw, so no pixel of them lies in the column left of the bar or right of
+/// it; on paper the band is the cell's height, and on the dark page the rod's overshoot caps reach
+/// the same way above the cell and below it, straight over the bar. Only the wide layers (the
+/// haze, the wash, the wide band) reach past its columns. Negative control: laid round the rod's
+/// anchor a tenth of a cell in, as before, the sleeve's and the narrow band's edges round down onto
+/// the column left of the bar (the dark page's `#432a43` and paper's `#ebacd7` at rest) at every
+/// one of those widths.
+#[test]
+fn the_rod_s_narrow_layers_lie_on_the_bar_s_line() {
+    for cw in [10u16, 14, 15, 16] {
+        for dark in [true, false] {
+            for blaze in [0.0, 1.0] {
+                let mut g = geom();
+                g.cw = usize::from(cw);
+                g.win_w = 40 * cw;
+                let mut c = cfg(true);
+                c.dark_theme = dark;
+                if !dark {
+                    c.theme_fg = 0x001F_2328;
+                    c.theme_bg = 0x00FF_FFFF;
+                }
+                let mut rod = CursorBeamRod::default();
+                let (mut out, mut under) = (Vec::new(), Vec::new());
+                let _ = rod.tick(
+                    Some((2, 3)),
+                    Instant::now(),
+                    blaze,
+                    g,
+                    &c,
+                    &mut out,
+                    &mut under,
+                );
+                let laid = if dark { &out } else { &under };
+                assert!(
+                    !laid.is_empty(),
+                    "cw {cw} dark {dark} blaze {blaze}: no rod"
+                );
+                let x0 = 3 * i32::from(cw);
+                let t = crate::cursor_glow::bar_width(i32::from(cw));
+                let wide = ((f32::from(cw) * 0.30 * 2.0) as i32).max(1);
+                let narrow: Vec<_> = laid.iter().filter(|q| i32::from(q.w) < wide).collect();
+                assert!(
+                    !narrow.is_empty(),
+                    "cw {cw} dark {dark} blaze {blaze}: no narrow layer"
+                );
+                let (top, ch) = (2 * g.ch as i32, g.ch as i32);
+                for q in narrow {
+                    let (x, w) = (i32::from(q.x), i32::from(q.w));
+                    assert_eq!(
+                        (x, w),
+                        (x0, t),
+                        "cw {cw} dark {dark} blaze {blaze}: a narrow layer at {x}..{} off the bar's line {x0}..{}",
+                        x + w,
+                        x0 + t
+                    );
+                    let (y, h) = (i32::from(q.y), i32::from(q.h));
+                    if dark {
+                        // Laid row by row of the grid: each piece within the caps' reach.
+                        let most = (0.22 * ch as f32).ceil() as i32 + 1;
+                        assert!(
+                            y >= top - most && y + h <= top + ch + most,
+                            "cw {cw} blaze {blaze}: a rod piece at {y}..{} past its caps round the cell {top}..{}",
+                            y + h,
+                            top + ch
+                        );
+                    } else {
+                        assert_eq!((y, h), (top, ch), "cw {cw} blaze {blaze}: the band's rows");
+                    }
+                }
+                // The control: the layers' old edges, round the anchor.
+                for hw in [0.13f32, 0.11] {
+                    let anchor = x0 as f32 + f32::from(cw) * 0.10;
+                    let old = (anchor - f32::from(cw) * hw) as i32;
+                    assert_eq!(old, x0 - 1, "control: cw {cw} hw {hw} laid at {old}");
+                }
+            }
+        }
+    }
+}
+
 /// The rod lands inside the padded window's effects box (origin and head band applied).
 #[test]
 fn rod_lands_at_the_window_origin() {

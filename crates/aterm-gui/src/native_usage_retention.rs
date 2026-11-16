@@ -6,9 +6,24 @@
 
 use aterm_agent::harness::{account_work, accounts, accounts_pool as pool, cli, provider_read};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const CAPACITY: usize = 32;
+
+/// How often the driver retries what it holds while a retry may settle it, as
+/// it retried everything before it rested: no event tells that storage became
+/// available, that an original operation retired, or that admissions reopened,
+/// and a resume in a new admission epoch drops a deferred ticket's backoff, so
+/// resting until that backoff ends would let a reopened App wait it out.
+const PACE: Duration = Duration::from_secs(1);
+
+/// How often the driver rediscovers durable responses another App or process
+/// left unsettled, as it did before it rested: their writer's exit and its
+/// lock's release are that process's, and nothing here hears them, and one pass
+/// looks at a few of the account store's candidates, its cursor moving on to
+/// the next few at the pass after.
+const DISCOVER_EVERY: Duration = Duration::from_secs(60);
 
 enum Entry {
     Reserved,
@@ -17,12 +32,54 @@ enum Entry {
     Running,
 }
 
+impl Entry {
+    /// Whether the driver retries this entry on its [`PACE`]: a retained
+    /// response, or a deferred ticket a resume may still settle in this App.
+    /// A reservation ends with its read (a retained response wakes the driver),
+    /// and a parked ticket waits for discovery to replace it.
+    fn paces(&self) -> bool {
+        match self {
+            Self::Retained(_) => true,
+            Self::Deferred(deferred) => !deferred.parked(),
+            Self::Reserved | Self::Running => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NativeUsageSink {
     entries: Arc<Mutex<Vec<Option<Entry>>>>,
+    /// Declared after `entries`, so a handle that goes releases its share of
+    /// them before its drop wakes the driver to count what is left.
+    driver: Driver,
+}
+
+/// The recovery driver's thread, once started: woken when a handle goes. The
+/// App's last one going ends it, and a reservation holds one, which goes as the
+/// read it was made for ends, so a retained response that read committed is
+/// retried on its arrival.
+#[derive(Clone, Default)]
+struct Driver(Arc<OnceLock<std::thread::Thread>>);
+
+impl Driver {
+    /// Wake the recovery driver: something it holds may settle now, or a
+    /// handle went.
+    fn wake(&self) {
+        if let Some(driver) = self.0.get() {
+            driver.unpark();
+        }
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.wake();
+    }
 }
 
 struct Reservation {
+    /// A handle on the App's sink: its drop, after the reservation's own, wakes
+    /// the driver ([`Driver`]).
     sink: NativeUsageSink,
     index: usize,
     committed: bool,
@@ -41,41 +98,70 @@ impl NativeUsageSink {
     pub(crate) fn start(app: &account_work::Lifetime) -> std::io::Result<Self> {
         let sink = Self {
             entries: Arc::new(Mutex::new(Vec::new())),
+            driver: Driver::default(),
         };
         let worker = sink.clone();
         let admission = app.admission_owner();
-        let _driver = std::thread::Builder::new()
+        let driver = std::thread::Builder::new()
             .name("native-usage-storage".into())
             .spawn(move || {
                 let mut cursor = pool::NativeUsageDiscoveryCursor::default();
-                let mut next_discovery = std::time::Instant::now();
-                loop {
-                    worker.retry_retained();
-                    if std::time::Instant::now() >= next_discovery {
-                        cursor = worker.discover_retained(&admission, cursor);
-                        next_discovery =
-                            std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    }
-                    // Retainers keep the real counted operation alive after
-                    // App drop. Deferred entries own metadata only: abandoning
-                    // that locator closes no canonical operation and leaves the
-                    // encrypted response/family fence intact. Cold restart
-                    // discovery is a separate maintenance doorway.
-                    let metadata_only = worker
-                        .entries
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .all(|entry| matches!(entry, None | Some(Entry::Deferred(_))));
-                    if metadata_only && Arc::strong_count(&worker.entries) == 1 {
-                        break;
-                    }
-                    // Pacing only, never evidence of retirement or a new
-                    // admission. Recovery still runs through app cancellation.
-                    std::thread::park_timeout(std::time::Duration::from_secs(1));
-                }
+                worker.drive(
+                    &mut |worker| {
+                        cursor = worker.discover_retained(&admission, std::mem::take(&mut cursor));
+                    },
+                    &mut std::thread::park_timeout,
+                    DISCOVER_EVERY,
+                );
             })?;
+        let _ = sink.driver.0.set(driver.thread().clone());
         Ok(sink)
+    }
+
+    /// The recovery driver: retry what it holds, `discover` every
+    /// `discover_every` from its start, and `park` until the next of those is
+    /// owed, or until a [`Driver::wake`]. It retries on its [`PACE`] only while it
+    /// holds an entry a retry may settle ([`Entry::paces`]); holding none, it
+    /// rests until the next discovery. It ends once it holds only deferred
+    /// metadata and the App's handles are gone.
+    fn drive(
+        self,
+        discover: &mut dyn FnMut(&Self),
+        park: &mut dyn FnMut(Duration),
+        discover_every: Duration,
+    ) {
+        let mut next_discovery = Instant::now();
+        loop {
+            self.retry_retained();
+            if Instant::now() >= next_discovery {
+                discover(&self);
+                next_discovery = Instant::now() + discover_every;
+            }
+            // Retainers keep the real counted operation alive after
+            // App drop. Deferred entries own metadata only: abandoning
+            // that locator closes no canonical operation and leaves the
+            // encrypted response/family fence intact. Cold restart
+            // discovery is a separate maintenance doorway.
+            let (metadata_only, paces) = {
+                let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    entries
+                        .iter()
+                        .all(|entry| matches!(entry, None | Some(Entry::Deferred(_)))),
+                    entries.iter().flatten().any(Entry::paces),
+                )
+            };
+            if metadata_only && Arc::strong_count(&self.entries) == 1 {
+                break;
+            }
+            // Pacing only, never evidence of retirement or a new
+            // admission. Recovery still runs through app cancellation.
+            park(if paces {
+                PACE
+            } else {
+                next_discovery.saturating_duration_since(Instant::now())
+            });
+        }
     }
 
     fn discover_retained(
@@ -192,6 +278,11 @@ impl Reservation {
 }
 
 impl Drop for Reservation {
+    /// A reservation nothing was committed to gives its capacity back. Either
+    /// way its handle ([`Reservation::sink`]) goes after this, and a handle's
+    /// drop wakes the driver: what was committed to it (a retained response,
+    /// [`Reservation::retain`]) is retried at once, where the driver's rest
+    /// could last until the next discovery.
     fn drop(&mut self) {
         if !self.committed {
             let mut entries = self.sink.entries.lock().unwrap_or_else(|e| e.into_inner());

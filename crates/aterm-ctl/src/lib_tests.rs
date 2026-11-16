@@ -177,7 +177,7 @@ fn help_after_a_verb_becomes_a_catalog_query_not_an_action() {
     for (req, asks) in [
         ("turn --help", Some("turn")),
         ("grants -h", Some("grants")),
-        ("@s-abc text --help", Some("text")),
+        ("@tabcxxxxxxx text --help", Some("text")),
         ("search needle --json --help", Some("search")),
         ("help -h", Some("help")),
         ("help text", None),
@@ -207,7 +207,7 @@ fn help_after_a_verb_becomes_a_catalog_query_not_an_action() {
             vec!["help", "turn", section],
         ),
         (
-            format!("@s-abc turn -h {section}"),
+            format!("@tabcxxxxxxx turn -h {section}"),
             vec!["help", "turn", section],
         ),
         ("turn --help nope".to_string(), vec!["help", "turn"]),
@@ -747,10 +747,10 @@ fn a_program_workers_spawn_line_sends_each_word_percent_encoded() {
         "-",
     ]);
     assert_eq!(
-        worker_spawn_head(None, &args, Some("s-ab12"), Some(here)).unwrap(),
+        worker_spawn_head(None, &args, Some("tab12xxxxxx"), Some(here)).unwrap(),
         format!(
             "spawn program=/opt/my%20tools/run arg=-c arg=echo%20%22it's%22%20100%25 arg= \
-             cwd=\"{}\" from=s-ab12",
+             cwd=\"{}\" from=tab12xxxxxx",
             native_abs("/w/proj/my dir")
         )
     );
@@ -769,8 +769,8 @@ fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
     let proj = native_abs("/w/proj");
     let here = Path::new(&proj);
     assert_eq!(
-        worker_spawn_head(Some("@s-cd34"), &args, Some("s-ab12"), Some(here)).unwrap(),
-        format!("@s-cd34 spawn agent=claude model=opus from=s-ab12 cwd={proj}")
+        worker_spawn_head(Some("@tcd34xxxxxx"), &args, Some("tab12xxxxxx"), Some(here)).unwrap(),
+        format!("@tcd34xxxxxx spawn agent=claude model=opus from=tab12xxxxxx cwd={proj}")
     );
     let spaced = native_abs("/a b/c");
     assert_eq!(
@@ -789,16 +789,16 @@ fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
             None,
             &argv(&[
                 x.as_str(),
-                "from=s-ef56",
+                "from=tef56xxxxxx",
                 "agent=claude",
                 "raise=false",
                 "-"
             ]),
-            Some("s-ab12"),
+            Some("tab12xxxxxx"),
             None
         )
         .unwrap(),
-        format!("spawn {x} from=s-ef56 agent=claude raise=false")
+        format!("spawn {x} from=tef56xxxxxx agent=claude raise=false")
     );
     let project = native_abs("/My Project/x");
     for given in [format!("cwd={project}"), format!("cwd=\"{project}\"")] {
@@ -890,8 +890,8 @@ fn a_worker_spawn_line_names_its_folder_and_leaves_the_length_to_the_frame() {
 fn a_spawn_line_keeps_a_spaced_folder_whole() {
     let line = |parts: &[&str]| spawn_wire_line(&argv(parts));
     assert_eq!(
-        line(&["@s-1", "spawn", "cwd=/My Project", "split=v"]).unwrap(),
-        "@s-1 spawn cwd=\"/My Project\" split=v"
+        line(&["@t1xxxxxxxxx", "spawn", "cwd=/My Project", "split=v"]).unwrap(),
+        "@t1xxxxxxxxx spawn cwd=\"/My Project\" split=v"
     );
     for given in [
         &["spawn", "cwd=/w/proj", "raise=false"][..],
@@ -931,19 +931,19 @@ fn a_plain_spawn_request_keeps_its_folder_whole_however_aimed() {
         "spawn cwd=\"/My Project\""
     );
     assert_eq!(
-        line(&["@s-1", "spawn", "cwd=/My Project", "split=v"]),
-        "@s-1 spawn cwd=\"/My Project\" split=v"
+        line(&["@t1xxxxxxxxx", "spawn", "cwd=/My Project", "split=v"]),
+        "@t1xxxxxxxxx spawn cwd=\"/My Project\" split=v"
     );
     assert_eq!(
-        request_line(&argv(&["@s-1", "spawn", "cwd=/a \"b"]))
+        request_line(&argv(&["@t1xxxxxxxxx", "spawn", "cwd=/a \"b"]))
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidInput,
         "refused before a byte is sent"
     );
     assert_eq!(
-        line(&["@s-1", "turn", "cwd=/My Project"]),
-        "@s-1 turn cwd=/My Project"
+        line(&["@t1xxxxxxxxx", "turn", "cwd=/My Project"]),
+        "@t1xxxxxxxxx turn cwd=/My Project"
     );
     assert_eq!(line(&["send", "cwd=/a \"b"]), "send cwd=/a \"b");
 }
@@ -951,17 +951,20 @@ fn a_plain_spawn_request_keeps_its_folder_whole_however_aimed() {
 #[test]
 fn a_workers_starter_is_its_own_session_and_its_aim_unless_told_or_pinned() {
     assert_eq!(
-        worker_starter(Some("s-ab12".to_string())).as_deref(),
-        Some("s-ab12")
+        worker_starter(Some("tab12xxxxxx".to_string())).as_deref(),
+        Some("tab12xxxxxx")
     );
     assert_eq!(worker_starter(None), None, "outside any session");
     assert_eq!(worker_starter(Some(String::new())), None);
-    assert_eq!(worker_starter(Some("s-a b".to_string())), None);
-    let me = Some("s-ab12");
-    assert_eq!(worker_selector(None, false, me).as_deref(), Some("@s-ab12"));
+    assert_eq!(worker_starter(Some("taxxxxxxxxx b".to_string())), None);
+    let me = Some("tab12xxxxxx");
     assert_eq!(
-        worker_selector(Some("@s-cd34"), false, me).as_deref(),
-        Some("@s-cd34")
+        worker_selector(None, false, me).as_deref(),
+        Some("@tab12xxxxxx")
+    );
+    assert_eq!(
+        worker_selector(Some("@tcd34xxxxxx"), false, me).as_deref(),
+        Some("@tcd34xxxxxx")
     );
     assert_eq!(
         worker_selector(None, true, me),
@@ -1014,7 +1017,7 @@ fn a_workers_task_follows_only_the_servers_go() {
                 let mut body = vec![0u8; task.len()];
                 r.read_exact(&mut body).expect("the task");
                 rest.extend_from_slice(&body);
-                std::io::Write::write_all(&mut w, b"OK s-0e1\n").expect("answer");
+                std::io::Write::write_all(&mut w, b"OK t0e1xxxxxxx\n").expect("answer");
             } else {
                 std::io::Write::write_all(&mut w, answers[0].as_bytes()).expect("answer");
             }
@@ -1031,7 +1034,7 @@ fn a_workers_task_follows_only_the_servers_go() {
     });
     assert_eq!(
         answered,
-        WorkerAnswer::Task("OK s-0e1".to_owned(), Some("s-0e1".to_owned())),
+        WorkerAnswer::Task("OK t0e1xxxxxxx".to_owned(), Some("t0e1xxxxxxx".to_owned())),
         "the answer, unprinted, and the sid the instance answered, for the board"
     );
     assert!(
@@ -1047,7 +1050,7 @@ fn a_workers_task_follows_only_the_servers_go() {
         worker_exchange(&path, TargetOrigin::Pinned, (&head, task), deadline).expect("run");
     assert_eq!(
         answered,
-        WorkerAnswer::Task("OK s-0e1".to_owned(), Some("s-0e1".to_owned())),
+        WorkerAnswer::Task("OK t0e1xxxxxxx".to_owned(), Some("t0e1xxxxxxx".to_owned())),
         "a second GO is read past"
     );
     let (listener, _, rest) = srv.join().expect("server");
@@ -1133,7 +1136,7 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
             std::io::Write::write_all(&mut w, go.as_bytes()).expect("GO");
             let mut body = vec![0u8; task.len()];
             r.read_exact(&mut body).expect("the task");
-            std::io::Write::write_all(&mut w, b"OK s-0e1 task_rev=1\n").expect("answer");
+            std::io::Write::write_all(&mut w, b"OK t0e1xxxxxxx task_rev=1\n").expect("answer");
             let _ = r.read_to_end(&mut Vec::new());
         }
     });
@@ -1149,7 +1152,7 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
             selector: None,
             args: &args,
             label: Some("dx".to_owned()),
-            starter: Some("s-5e1"),
+            starter: Some("t5e1xxxxxxx"),
             pwd: Some(Path::new("/Users//me/work")),
             task,
         };
@@ -1159,7 +1162,7 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
             move |line: &str| {
                 at_print.borrow_mut().push((
                     line.to_owned(),
-                    board::Board::at(&dir).row("s-0e1").is_some(),
+                    board::Board::at(&dir).row("t0e1xxxxxxx").is_some(),
                 ));
             }
         };
@@ -1173,7 +1176,7 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
         });
         assert_eq!(
             *at_print.borrow(),
-            [("OK s-0e1 task_rev=1".to_owned(), true)],
+            [("OK t0e1xxxxxxx task_rev=1".to_owned(), true)],
             "printed after the board's record (closed stdout: {closed})"
         );
         if closed {
@@ -1185,11 +1188,11 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
         }
         assert_eq!(
             printed,
-            ["OK s-0e1 task_rev=1"],
+            ["OK t0e1xxxxxxx task_rev=1"],
             "the answer, printed once (closed stdout: {closed})"
         );
         let row = board::Board::at(&dir)
-            .row("s-0e1")
+            .row("t0e1xxxxxxx")
             .unwrap_or_else(|| panic!("the board holds the worker (closed stdout: {closed})"));
         assert_eq!(
             (
@@ -1204,7 +1207,7 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
                 board::host_name(),
                 Some("dx"),
                 Some("/Users//me/work/w"),
-                Some("s-5e1")
+                Some("t5e1xxxxxxx")
             ),
             "closed stdout: {closed}"
         );
@@ -1327,7 +1330,7 @@ fn a_peer_selector_dials_its_host() {
     let own = dir.join(control_socket::instance_sock_name(4002));
     let other = dir.join(control_socket::instance_sock_name(4003));
     let alias = dir.join(control_socket::LATEST_SOCK_FILE);
-    let (peer, me) = ("s-c8a1", "s-c8b2");
+    let (peer, me) = ("tc8a1xxxxxx", "tc8b2xxxxxx");
     publish_entry(&dir, peer, &host);
     publish_entry(&dir, me, &own);
     aterm_uds::latest::publish(&alias, other.to_str().expect("utf8"));
@@ -1410,7 +1413,7 @@ fn a_host_that_took_the_request_ends_the_call() {
     std::fs::create_dir(dir.join("graph")).expect("graph dir");
     let host = dir.join(control_socket::instance_sock_name(4011));
     let own = dir.join(control_socket::instance_sock_name(4012));
-    let (peer, me) = ("s-c8d1", "s-c8d2");
+    let (peer, me) = ("tc8d1xxxxxx", "tc8d2xxxxxx");
     publish_entry(&dir, peer, &host);
     publish_entry(&dir, me, &own);
     let listener = aterm_uds::CtlListener::bind(&host).expect("bind host");
@@ -1534,7 +1537,7 @@ fn hosting_sock_holds_an_entry_to_the_rendezvous_dir() {
     for d in [&dir.join("graph"), &dir.join("sub"), &away] {
         std::fs::create_dir_all(d).expect("scratch dirs");
     }
-    let sid = aterm_types::control_request::Sid::parse("s-c8c3").expect("sid");
+    let sid = aterm_types::control_request::Sid::parse("tc8c3xxxxxx").expect("sid");
     let host = |entry: &str| {
         std::fs::write(dir.join("graph").join(sid.as_str()), entry).expect("entry");
         hosting_sock(&dir, sid)
@@ -1578,7 +1581,7 @@ fn hosting_sock_holds_an_entry_to_the_rendezvous_dir() {
 fn a_target_is_followed_to_where_its_successor_answers() {
     use redial::{Follow, Unfollowed};
     let at = PathBuf::from("/r");
-    let me = Some("s-ab".to_string());
+    let me = Some("tabxxxxxxxx".to_string());
     let only = |targets: Targets| {
         assert!(targets.hosting.is_empty(), "{targets:?}");
         let last = targets.last_target();
@@ -1639,8 +1642,8 @@ fn a_target_is_followed_to_where_its_successor_answers() {
     let dir = scratch.path().to_path_buf();
     std::fs::create_dir(dir.join("graph")).expect("graph dir");
     let (peer, own) = (dir.join("aterm-4006.sock"), dir.join("aterm-4007.sock"));
-    publish_entry(&dir, "s-cd", &peer);
-    publish_entry(&dir, "s-ab", &own);
+    publish_entry(&dir, "tcdxxxxxxxx", &peer);
+    publish_entry(&dir, "tabxxxxxxxx", &own);
     let hosted = |named: &str| {
         let named = aterm_types::control_request::Sid::parse(named);
         targets_in(Some(dir.clone()), None, None, me.clone(), named)
@@ -1661,13 +1664,13 @@ fn a_target_is_followed_to_where_its_successor_answers() {
         )
     };
     assert_eq!(
-        hosted("s-cd"),
-        [entry(&peer, "s-cd"), entry(&own, "s-ab")],
+        hosted("tcdxxxxxxxx"),
+        [entry(&peer, "tcdxxxxxxxx"), entry(&own, "tabxxxxxxxx")],
         "the peer's host, then the caller's own"
     );
     assert_eq!(
-        hosted("s-ab"),
-        [entry(&own, "s-ab")],
+        hosted("tabxxxxxxxx"),
+        [entry(&own, "tabxxxxxxxx")],
         "named twice, dialled once"
     );
     let targets = targets_in(Some(dir.clone()), None, None, me.clone(), None).unwrap();
@@ -2014,12 +2017,128 @@ fn stdin_send_takes_inline_sends_enter_and_stdin_paste_keeps_every_byte() {
     );
 }
 
+/// The one word stdin fills is the `value=-` of a `mark <node> desc` request, with or without
+/// a selector, wherever it stands among the options. CONTROLS: a `desc` with an inline value
+/// or none (a withdrawal), a `value=-` on another mark kind, on another verb, and a word that
+/// only starts like it each read no stdin.
+#[test]
+fn stdin_fills_only_the_value_dash_of_a_desc_mark() {
+    let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+    assert_eq!(
+        desc_stdin_word(&p("mark - desc field=title value=-")),
+        Some(4)
+    );
+    assert_eq!(
+        desc_stdin_word(&p("@s-ab12 mark r3 desc value=- field=description upto=41")),
+        Some(4)
+    );
+    for sent_as_typed in [
+        "mark - desc field=title value=Fold%20laws",
+        "mark - desc field=title",
+        "mark - note value=-",
+        "@s-ab12 mark - label text=-",
+        "meta set title value=-",
+        "mark - desc field=title value=-x",
+        "mark desc value=-",
+        "@s-ab12",
+        "",
+    ] {
+        assert_eq!(
+            desc_stdin_word(&p(sent_as_typed)),
+            None,
+            "{sent_as_typed:?}"
+        );
+    }
+}
+
+/// A description on stdin is its first line, whole and without its line ending, and what
+/// follows that line is left unread. CONTROLS: nothing, a bare newline and a blank line are
+/// refused (a request with no `value=` would withdraw the claim), and so are bytes that are
+/// not UTF-8 and a line no request line could carry; a line of exactly that length is taken.
+#[test]
+fn a_description_on_stdin_is_its_first_line_and_never_nothing() {
+    let read = |bytes: &[u8]| read_desc_line(bytes);
+    assert_eq!(
+        read(b"Review the fold laws\n").unwrap(),
+        "Review the fold laws"
+    );
+    assert_eq!(read(b"no line ending").unwrap(), "no line ending");
+    assert_eq!(read(b"from a CRLF pipe\r\n").unwrap(), "from a CRLF pipe");
+    let mut input: &[u8] = b"first\nsecond\n";
+    assert_eq!(read_desc_line(&mut input).unwrap(), "first");
+    assert_eq!(input, b"second\n", "the second line is left on stdin");
+
+    for nothing in [&b""[..], b"\n", b"  \t\n", b"\r\n", b"\nsecond\n"] {
+        let err = read(nothing).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{nothing:?}");
+        assert!(err.to_string().contains("leave value= out"), "{err}");
+    }
+    let err = read(b"caf\xe9\n").unwrap_err();
+    assert!(err.to_string().contains("not UTF-8"), "{err}");
+
+    let longest = vec![b'x'; MAX_REQUEST_LINE];
+    assert_eq!(read(&longest).unwrap().len(), MAX_REQUEST_LINE);
+    let mut over = longest;
+    over.push(b'x');
+    let err = read(&over).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains(&MAX_REQUEST_LINE.to_string()),
+        "{err}"
+    );
+}
+
+/// The line goes into `value=` as one space-free word the server's percent decoding reads
+/// back as the line, and a line that is only `-`, which the escape would leave as the word for
+/// an unset value, goes as `%2D`. CONTROL: a line that merely starts with `-` keeps its dash.
+#[test]
+fn a_stdin_description_is_one_percent_encoded_value_word() {
+    for line in [
+        "Review 100% of the fold laws",
+        "naïve café",
+        "-",
+        "a=b \"c\"",
+    ] {
+        let word = desc_value_word(line);
+        let value = word.strip_prefix("value=").expect("a value= word");
+        assert!(!value.contains(char::is_whitespace), "{word:?}");
+        assert_eq!(aterm_codec::pct::decode(value), line, "{word:?}");
+    }
+    assert_eq!(
+        desc_value_word("Review 100% of it"),
+        "value=Review%20100%25%20of%20it"
+    );
+    assert_eq!(desc_value_word("-"), "value=%2D");
+    assert_eq!(desc_value_word("-x"), "value=-x");
+}
+
+/// `described` answers `OK <n> described v=1 …`: the header says more than the count, so it
+/// goes to stderr and stdout carries the claim lines alone. CONTROLS: a verb whose header is
+/// the count alone keeps it off stderr, and `history` sends its header there only when it
+/// says `unheld_below=`.
+#[test]
+fn the_described_header_goes_to_stderr() {
+    assert!(header_to_stderr(
+        "described",
+        "2 described v=1 sid=s-ab12 as_of=41 ep=0 trust=screen"
+    ));
+    assert!(header_to_stderr("described", "1"));
+    assert!(header_to_stderr(
+        "log",
+        "3 v=2 as_of=41 ep=0 base=0 oldest=1"
+    ));
+    assert!(!header_to_stderr("timeline", "3"));
+    assert!(!header_to_stderr("blocks", "3"));
+    assert!(header_to_stderr("history", "3 unheld_below=9"));
+    assert!(!header_to_stderr("history", "3"));
+}
+
 #[test]
 fn split_selector_peels_leading_at() {
     let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
-    let parts = p("@s-abc feed-bin");
+    let parts = p("@tabcxxxxxxx feed-bin");
     let (sel, rest) = split_selector(&parts);
-    assert_eq!(sel, Some("@s-abc"));
+    assert_eq!(sel, Some("@tabcxxxxxxx"));
     assert_eq!(rest, &["feed-bin".to_string()]);
     let parts = p("send --stdin");
     let (sel, rest) = split_selector(&parts);
@@ -2032,14 +2151,18 @@ fn split_selector_peels_leading_at() {
 fn expand_self_selector_expands_env_and_errors_when_unset() {
     let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
     for (request, env, want) in [
-        ("@self text", Some("s-abc123"), Some("@s-abc123 text")),
-        ("@env send hi", Some("s-ff"), Some("@s-ff send hi")),
+        ("@self text", Some("tabc123xxxx"), Some("@tabc123xxxx text")),
+        (
+            "@env send hi",
+            Some("tffxxxxxxxx"),
+            Some("@tffxxxxxxxx send hi"),
+        ),
         ("@self text", None, None),
         ("@self text", Some(""), None),
         ("@self text", Some(" "), None),
         ("@self text", Some("\t"), None),
-        ("@s-xyz text", Some("s-abc"), Some("@s-xyz text")),
-        ("@. text", Some("s-abc"), Some("@. text")),
+        ("@s-xyz text", Some("tabcxxxxxxx"), Some("@s-xyz text")),
+        ("@. text", Some("tabcxxxxxxx"), Some("@. text")),
         ("text", None, Some("text")),
         ("", None, Some("")),
         (
@@ -2100,11 +2223,11 @@ fn an_empty_selector_is_refused_in_the_selector_position_only() {
         vec!["@ status".to_string()],
         vec!["@\t".to_string(), "close".into()],
         p("subscribe @ screen"),
-        p("subscribe @s-a,@ screen"),
+        p("subscribe @taxxxxxxxxx,@ screen"),
         p("subscribe @,@self events"),
         p("await task @"),
         p("await task @:5"),
-        p("await task @s-a,@:0"),
+        p("await task @taxxxxxxxxx,@:0"),
         p("@:5 await task"),
     ] {
         let e = refuse_empty_selectors(&refused).unwrap_err();
@@ -2118,11 +2241,11 @@ fn an_empty_selector_is_refused_in_the_selector_position_only() {
     for passed in [
         p("@. status"),
         p("@self turn hi"),
-        p("@s-ab12 send x"),
+        p("@tab12xxxxxx send x"),
         p("@3 close"),
-        p("subscribe @s-a,@self screen"),
+        p("subscribe @taxxxxxxxxx,@self screen"),
         p("subscribe screen"),
-        p("await task @s-a:5,@self:0"),
+        p("await task @taxxxxxxxxx:5,@self:0"),
         p("@self:5 await task"),
         p("send @"),
         p("status"),
@@ -2576,7 +2699,7 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
         vec!["help", "--json"],
         vec!["help", "nonesuch"],
         vec!["help", "ls", "extra"],
-        vec!["@s-abc", "help", "ls"],
+        vec!["@tabcxxxxxxx", "help", "ls"],
         vec!["ls"],
         vec!["text", "ls"],
     ] {
@@ -2624,7 +2747,7 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
         "upgrade=<-|<state>/<to>/<why>/<age>>",
         "land_at=<unix-s|-> task=<open|landed|theirs|->",
         "pause=<unix-s|-> task_state=<working|done|exited|stalled|failed|->",
-        "task_rev=<n>[ *]",
+        "task_rev=<n> opened_ms=<unix-ms|->[ *]",
     ];
     let at: Vec<Option<usize>> = order.iter().map(|field| ls.find(field)).collect();
     assert!(
@@ -2775,7 +2898,7 @@ fn discovery_report_names_the_cause_for_every_row_of_the_f8_table() {
     let answered = (
         10718,
         fleet_sock(10718),
-        Probe::Answered(vec!["r s-1".to_string()]),
+        Probe::Answered(vec!["r t1xxxxxxxxx".to_string()]),
     );
     assert_eq!(
         discovery_report(found(2), &[answered, stale(10274)]),
@@ -3175,7 +3298,7 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
         let body = format!("sock {}\nnonce 00\npid {pid}\n", sock.display());
         std::fs::write(rv.join("graph").join(sid), body).expect("graph entry");
     };
-    entry("s-dead", &root.join("gone").join("a.sock"), DEAD_PID);
+    entry("tdeadxxxxxx", &root.join("gone").join("a.sock"), DEAD_PID);
     let foreign_sock = private.join("a.sock");
     let foreign_listener =
         std::os::unix::net::UnixListener::bind(&foreign_sock).expect("bind foreign");
@@ -3204,7 +3327,7 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
         "the dead entry is skipped; the foreign one is still PUBLISHED"
     );
     assert!(
-        !rv.join("graph").join("s-dead").exists(),
+        !rv.join("graph").join("tdeadxxxxxx").exists(),
         "the dead entry is pruned, so the next call does not read it"
     );
     assert!(
@@ -3867,8 +3990,13 @@ fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
         ("@self send hi", sock, Some(42), true),
         ("@env send hi", sock, Some(42), true),
         ("subscribe @self,@1 screen", None, None, true),
-        ("await task @s-abc", None, None, false),
-        ("await task @s-abc:0,@s-def:2", None, None, false),
+        ("await task @tabcxxxxxxx", None, None, false),
+        (
+            "await task @tabcxxxxxxx:0,@tdefxxxxxxx:2",
+            None,
+            None,
+            false,
+        ),
         ("await task @self", sock, Some(42), true),
         ("await task @self:0", sock, Some(42), true),
         ("@self:5 await task", sock, Some(42), true),
@@ -3880,7 +4008,7 @@ fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
         ("board", None, None, false),
         ("@. text", None, None, true),
         ("@. text", None, Some(7), false),
-        ("@s-abc text", None, None, false),
+        ("@tabcxxxxxxx text", None, None, false),
         ("ls", None, None, false),
         ("mux", None, None, false),
         ("send", None, None, true),
@@ -3901,7 +4029,7 @@ fn implicit_self_targeting_is_exactly_the_flagless_at_self_and_at_dot_shapes() {
                 "{}",
                 spec.name
             );
-            for selector in ["@self", "@env", "@.", "@s-abc"] {
+            for selector in ["@self", "@env", "@.", "@tabcxxxxxxx"] {
                 let request = format!("{selector} {}", spec.name);
                 assert!(
                     !targets_own_session_implicitly(&p(request.as_str()), None, None),
@@ -3917,13 +4045,13 @@ fn mux_degradation_note_marks_the_block_reading_verbs_only() {
     let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
     let n = MuxNesting {
         kind: "screen",
-        outer_sid: Some("s-1a2b".to_string()),
+        outer_sid: Some("t1a2bxxxxxx".to_string()),
         detected_by: "environment",
     };
     for (request, noted) in [
         ("blocks", true),
         ("status", true),
-        ("@s-1a2b blocks", true),
+        ("@t1a2bxxxxxx blocks", true),
         ("@s-other blocks", false),
         ("text", false),
         ("send", false),
@@ -4033,15 +4161,15 @@ fn session_rows(rows: &[&str]) -> Vec<String> {
 #[test]
 fn fleet_sessions_carry_the_ls_row_verbatim_and_the_self_marker_as_data() {
     let rows = session_rows(&[
-        "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
-        "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
+        "0 taxxxxxxxxx - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude",
+        "1 tbxxxxxxxxx taxxxxxxxxx alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
     ]);
-    let listed = instance_sessions(4242, &rows, Some("s-b"));
+    let listed = instance_sessions(4242, &rows, Some("tbxxxxxxxxx"));
 
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].pid, 4242);
     assert_eq!(listed[0].row, rows[0], "the server's row, byte for byte");
-    assert_eq!(listed[0].sid(), Some("s-a"));
+    assert_eq!(listed[0].sid(), Some("taxxxxxxxxx"));
     assert!(!listed[0].is_self);
     assert!(listed[1].is_self, "the caller's own session is flagged");
 
@@ -4069,20 +4197,20 @@ fn a_sid_two_instances_both_serve_is_reported_as_ambiguous() {
         )
     };
 
-    let mut healthy = rows(10, &["s-a", "s-b"]);
-    healthy.extend(rows(11, &["s-c"]));
+    let mut healthy = rows(10, &["taxxxxxxxxx", "tbxxxxxxxxx"]);
+    healthy.extend(rows(11, &["tcxxxxxxxxx"]));
     assert!(duplicate_sids(&healthy).is_empty());
 
-    let mut clash = rows(10, &["s-a", "s-b"]);
-    clash.extend(rows(11, &["s-a"]));
+    let mut clash = rows(10, &["taxxxxxxxxx", "tbxxxxxxxxx"]);
+    clash.extend(rows(11, &["taxxxxxxxxx"]));
     assert_eq!(
         duplicate_sids(&clash),
-        vec![("s-a".to_string(), vec![10, 11])],
+        vec![("taxxxxxxxxx".to_string(), vec![10, 11])],
         "the duplicated id and BOTH pids claiming it"
     );
 
-    let mut repeated = rows(10, &["s-a"]);
-    repeated.extend(rows(10, &["s-a"]));
+    let mut repeated = rows(10, &["taxxxxxxxxx"]);
+    repeated.extend(rows(10, &["taxxxxxxxxx"]));
     assert!(
         duplicate_sids(&repeated).is_empty(),
         "one instance is one claimant, however many rows it sends"
@@ -4095,12 +4223,12 @@ fn a_sid_two_instances_both_serve_is_reported_as_ambiguous() {
 #[test]
 fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
     let lines: Vec<String> = [
-        "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude future=value",
-        "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
-        "2 s-c - alive sh meta=0 window=0 active=1 wfocus=0 detail=codex",
-        "3 s-d - alive sh meta=0 window=none active=0 wfocus=0 detail=-",
-        "4 s-e - alive sh meta=0 window=- active=- wfocus=- detail=-",
-        "5 s-f - alive sh meta=0",
+        "0 taxxxxxxxxx - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude future=value",
+        "1 tbxxxxxxxxx taxxxxxxxxx alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
+        "2 tcxxxxxxxxx - alive sh meta=0 window=0 active=1 wfocus=0 detail=codex",
+        "3 tdxxxxxxxxx - alive sh meta=0 window=none active=0 wfocus=0 detail=-",
+        "4 texxxxxxxxx - alive sh meta=0 window=- active=- wfocus=- detail=-",
+        "5 tfxxxxxxxxx - alive sh meta=0",
         "6 s-g - alive sh meta=0 window=1 active=1 wfocus=1 detail=-",
     ]
     .iter()
@@ -4109,13 +4237,14 @@ fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
     assert_eq!(
         window_rows_from_sessions(42, &lines),
         vec![
-            "42 window=0 focused=0 sessions=1 active=s-c".to_string(),
-            "42 window=1 focused=1 sessions=3 active=s-a,s-g".to_string(),
+            "42 window=0 focused=0 sessions=1 active=tcxxxxxxxxx".to_string(),
+            "42 window=1 focused=1 sessions=3 active=taxxxxxxxxx,s-g".to_string(),
             "42 window=none sessions=1".to_string(),
             "42 window=- sessions=2".to_string(),
         ]
     );
-    let lines = vec!["0 s-a - alive sh meta=0 window=2 active=0 wfocus=0 detail=-".to_string()];
+    let lines =
+        vec!["0 taxxxxxxxxx - alive sh meta=0 window=2 active=0 wfocus=0 detail=-".to_string()];
     assert_eq!(
         window_rows_from_sessions(7, &lines),
         vec!["7 window=2 focused=0 sessions=1 active=-".to_string()]
@@ -4126,12 +4255,12 @@ fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
 #[test]
 fn windows_rows_never_read_the_title_as_a_token() {
     let lines: Vec<String> = [
-        "0 s-a - alive window=none meta=0 window=3 active=0 wfocus=0 detail=-",
-        "1 s-b - alive active=1 meta=0 window=3 active=0 wfocus=0 detail=-",
-        "2 s-c - alive wfocus=1 meta=0 window=3 active=1 wfocus=0 detail=-",
-        "3 s-d - alive window=7 meta=0 window=none active=0 wfocus=0 detail=-",
-        "4 s-e - alive window=7 meta=1 window=5 active=1 wfocus=1 detail=-",
-        "5 s-f - alive meta=1 meta=0 window=5 active=0 wfocus=1 detail=-",
+        "0 taxxxxxxxxx - alive window=none meta=0 window=3 active=0 wfocus=0 detail=-",
+        "1 tbxxxxxxxxx - alive active=1 meta=0 window=3 active=0 wfocus=0 detail=-",
+        "2 tcxxxxxxxxx - alive wfocus=1 meta=0 window=3 active=1 wfocus=0 detail=-",
+        "3 tdxxxxxxxxx - alive window=7 meta=0 window=none active=0 wfocus=0 detail=-",
+        "4 texxxxxxxxx - alive window=7 meta=1 window=5 active=1 wfocus=1 detail=-",
+        "5 tfxxxxxxxxx - alive meta=1 meta=0 window=5 active=0 wfocus=1 detail=-",
         "6 s-p - alive  meta=0 window=2 active=1 wfocus=1 detail=-",
         "7 s-q - alive  meta=0",
         "8 s-r - alive sh meta=0 window=2 active=0 wfocus=1 detail=- extra=1 more=x",
@@ -4144,26 +4273,27 @@ fn windows_rows_never_read_the_title_as_a_token() {
         window_rows_from_sessions(9, &lines),
         vec![
             "9 window=2 focused=1 sessions=2 active=s-p".to_string(),
-            "9 window=3 focused=0 sessions=3 active=s-c".to_string(),
-            "9 window=5 focused=1 sessions=2 active=s-e".to_string(),
+            "9 window=3 focused=0 sessions=3 active=tcxxxxxxxxx".to_string(),
+            "9 window=5 focused=1 sessions=2 active=texxxxxxxxx".to_string(),
             "9 window=none sessions=2".to_string(),
             "9 window=- sessions=1".to_string(),
         ]
     );
     for title in ["window=1", "wfocus=1", "detail=x"] {
-        let lines = vec![format!("0 s-a - alive {title} meta=0")];
+        let lines = vec![format!("0 taxxxxxxxxx - alive {title} meta=0")];
         assert_eq!(
             window_rows_from_sessions(9, &lines),
             vec!["9 window=- sessions=1".to_string()],
             "{title}"
         );
     }
-    let lines = vec!["0 s-a - alive window=1".to_string()];
+    let lines = vec!["0 taxxxxxxxxx - alive window=1".to_string()];
     assert_eq!(
         window_rows_from_sessions(9, &lines),
         vec!["9 window=- sessions=1".to_string()]
     );
-    let lines = vec!["0 s-a - alive sh meta=0 window=+1 active=1 wfocus=1 detail=-".to_string()];
+    let lines =
+        vec!["0 taxxxxxxxxx - alive sh meta=0 window=+1 active=1 wfocus=1 detail=-".to_string()];
     assert_eq!(
         window_rows_from_sessions(9, &lines),
         vec!["9 window=- sessions=1".to_string()]
@@ -4275,7 +4405,7 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
         "OK 1\nfrom the successor\n".to_string(),
     );
     std::fs::write(
-        dir.join("graph").join("s-abc"),
+        dir.join("graph").join("tabcxxxxxxx"),
         format!("sock {}\n", successor_sock.display()),
     )
     .expect("the successor's graph entry");
@@ -4293,16 +4423,16 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
         )
     };
     assert_eq!(
-        ask("@s-abc text\n", "text").expect("asked of the host's successor"),
+        ask("@tabcxxxxxxx text\n", "text").expect("asked of the host's successor"),
         ExitCode::SUCCESS,
         "an anchorless read is asked once of the host's successor"
     );
     assert_eq!(
-        ask("@s-abc turn hi\n", "turn").expect("a reported outcome"),
+        ask("@tabcxxxxxxx turn hi\n", "turn").expect("a reported outcome"),
         ExitCode::from(redial::EXIT_REPLACED),
         "a `turn` is never asked again: 75"
     );
-    let err = ask("@s-abc key enter\n", "key").expect_err("a connection that closed");
+    let err = ask("@tabcxxxxxxx key enter\n", "key").expect_err("a connection that closed");
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
     assert!(
         err.to_string()
@@ -4772,24 +4902,28 @@ fn a_busy_answer_that_beat_the_timeouts_is_still_read() {
 fn a_sys_request_names_its_caller_once_and_only_a_valid_sid() {
     let p = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
     for (request, sid, want) in [
-        ("sys", Some("s-ab12"), "sys caller=s-ab12"),
+        ("sys", Some("tab12xxxxxx"), "sys caller=tab12xxxxxx"),
         (
             "sys cores --json",
-            Some("s-ab12"),
-            "sys cores --json caller=s-ab12",
+            Some("tab12xxxxxx"),
+            "sys cores --json caller=tab12xxxxxx",
         ),
         (
             "@s-x sys procs",
-            Some("s-ab12"),
-            "@s-x sys procs caller=s-ab12",
+            Some("tab12xxxxxx"),
+            "@s-x sys procs caller=tab12xxxxxx",
         ),
-        ("sys caller=s-mine", Some("s-ab12"), "sys caller=s-mine"),
+        (
+            "sys caller=s-mine",
+            Some("tab12xxxxxx"),
+            "sys caller=s-mine",
+        ),
         ("sys", None, "sys"),
         ("sys", Some(""), "sys"),
-        ("sys", Some("s-a b"), "sys"),
-        ("sys", Some("s-a;rm"), "sys"),
-        ("status", Some("s-ab12"), "status"),
-        ("await sys cpu<5%", Some("s-ab12"), "await sys cpu<5%"),
+        ("sys", Some("taxxxxxxxxx b"), "sys"),
+        ("sys", Some("taxxxxxxxxx;rm"), "sys"),
+        ("status", Some("tab12xxxxxx"), "status"),
+        ("await sys cpu<5%", Some("tab12xxxxxx"), "await sys cpu<5%"),
     ] {
         let mut parts = p(request);
         add_sys_caller(&mut parts, sid);
@@ -5112,7 +5246,7 @@ fn serve_workers(listener: &aterm_uds::CtlListener, sids: &[&str]) -> Vec<String
         let _ = (&conn).write_all(go.as_bytes());
         let mut task = vec![0; len];
         let _ = reader.read_exact(&mut task);
-        let sid = sids.next().copied().unwrap_or("s-0");
+        let sid = sids.next().copied().unwrap_or("t0xxxxxxxxx");
         let _ = (&conn).write_all(format!("OK {sid}\n").as_bytes());
         lines.push(line);
     }
@@ -5130,7 +5264,7 @@ struct SpawnWorld {
 }
 
 #[cfg(unix)]
-const SPAWN_CALLER: &str = "s-c9a1";
+const SPAWN_CALLER: &str = "tc9a1xxxxxx";
 
 #[cfg(unix)]
 const SPAWN_TASK: &[u8] = b"land the fix\n";
@@ -5221,11 +5355,11 @@ fn a_spawn_through_another_aterms_socket_names_no_caller_and_leaves_this_board_b
     let lab = away.join("lab.sock");
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1"],
+        &["tc9b1xxxxxx"],
     );
     let theirs = worker_instance(
         aterm_uds::CtlListener::bind(&lab).expect("bind the other aterm"),
-        &["s-c9c1"],
+        &["tc9c1xxxxxx"],
     );
 
     let code = world.spawn(Some(&lab), &["agent=claude", "cwd=/w", "label=pkg", "-"]);
@@ -5266,11 +5400,11 @@ fn a_spawn_on_the_callers_own_aterm_names_the_caller_and_books_the_worker_here()
     publish_entry(&world.dir, SPAWN_CALLER, &own);
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1", "s-c9b2"],
+        &["tc9b1xxxxxx", "tc9b2xxxxxx"],
     );
     let beside = worker_instance(
         aterm_uds::CtlListener::bind(&other).expect("bind the other instance"),
-        &["s-c9e1"],
+        &["tc9e1xxxxxx"],
     );
 
     let pinned = world.spawn(Some(&own), &["agent=claude", "cwd=/w", "label=pkg", "-"]);
@@ -5307,9 +5441,9 @@ fn a_spawn_on_the_callers_own_aterm_names_the_caller_and_books_the_worker_here()
     assert_eq!(
         booked,
         [
-            ("s-c9b1", Some(SPAWN_CALLER), Some("pkg"), None),
-            ("s-c9b2", Some(SPAWN_CALLER), None, None),
-            ("s-c9e1", Some(SPAWN_CALLER), None, None),
+            ("tc9b1xxxxxx", Some(SPAWN_CALLER), Some("pkg"), None),
+            ("tc9b2xxxxxx", Some(SPAWN_CALLER), None, None),
+            ("tc9e1xxxxxx", Some(SPAWN_CALLER), None, None),
         ],
         "each worker of this Mac's socket folder is on this Mac's board"
     );
@@ -5328,13 +5462,13 @@ fn an_explicit_from_goes_to_whichever_aterm_the_spawn_reaches() {
     let lab = away.join("lab.sock");
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1"],
+        &["tc9b1xxxxxx"],
     );
     let theirs = worker_instance(
         aterm_uds::CtlListener::bind(&lab).expect("bind the other aterm"),
-        &["s-c9c1"],
+        &["tc9c1xxxxxx"],
     );
-    let named = "s-c9d1";
+    let named = "tc9d1xxxxxx";
     let from = format!("from={named}");
 
     let there = world.spawn(Some(&lab), &["agent=claude", "cwd=/w", &from, "-"]);
@@ -5354,7 +5488,7 @@ fn an_explicit_from_goes_to_whichever_aterm_the_spawn_reaches() {
         .collect();
     assert_eq!(
         booked,
-        [("s-c9b1", Some(named))],
+        [("tc9b1xxxxxx", Some(named))],
         "the row of the caller's own aterm's worker, under the from= named"
     );
 }
@@ -5373,7 +5507,7 @@ fn a_spawn_pinned_to_an_aterm_not_holding_the_callers_session_names_no_caller() 
     abandon_socket(&gone);
     let theirs = worker_instance(
         aterm_uds::CtlListener::bind(&live).expect("bind the live instance"),
-        &["s-c9e1"],
+        &["tc9e1xxxxxx"],
     );
 
     let code = world.spawn_pid(4132, &["agent=claude", "cwd=/w", "-"]);
@@ -5389,7 +5523,11 @@ fn a_spawn_pinned_to_an_aterm_not_holding_the_callers_session_names_no_caller() 
     );
     assert_eq!(
         world.rows(),
-        [("s-c9e1".to_owned(), Some(SPAWN_CALLER.to_owned()), None)]
+        [(
+            "tc9e1xxxxxx".to_owned(),
+            Some(SPAWN_CALLER.to_owned()),
+            None
+        )]
     );
 }
 
@@ -5405,14 +5543,14 @@ fn a_worker_of_an_aterm_that_mirrors_its_sessions_here_is_booked_here() {
     let away = world.root.join("bound");
     std::fs::create_dir(&away).expect("the other aterm's folder");
     let bound = away.join("a.sock");
-    publish_entry(&world.dir, "s-c9f1", &bound);
+    publish_entry(&world.dir, "tc9f1xxxxxx", &bound);
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1"],
+        &["tc9b1xxxxxx"],
     );
     let theirs = worker_instance(
         aterm_uds::CtlListener::bind(&bound).expect("bind the other aterm"),
-        &["s-c9f2"],
+        &["tc9f2xxxxxx"],
     );
 
     let code = world.spawn(Some(&bound), &["agent=claude", "cwd=/w", "-"]);
@@ -5427,7 +5565,11 @@ fn a_worker_of_an_aterm_that_mirrors_its_sessions_here_is_booked_here() {
     );
     assert_eq!(
         world.rows(),
-        [("s-c9f2".to_owned(), Some(SPAWN_CALLER.to_owned()), None)],
+        [(
+            "tc9f2xxxxxx".to_owned(),
+            Some(SPAWN_CALLER.to_owned()),
+            None
+        )],
         "the worker of an aterm this Mac's folder records is on this Mac's board"
     );
     assert_eq!(stop_recording(&own, mine), Vec::<String>::new());
@@ -5444,7 +5586,7 @@ fn the_callers_own_aterm_is_known_by_any_path_to_its_socket() {
     publish_entry(&world.dir, SPAWN_CALLER, &own);
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1", "s-c9b2", "s-c9b3"],
+        &["tc9b1xxxxxx", "tc9b2xxxxxx", "tc9b3xxxxxx"],
     );
     let away = world.root.join("links");
     std::fs::create_dir(&away).expect("the links' folder");
@@ -5476,9 +5618,9 @@ fn the_callers_own_aterm_is_known_by_any_path_to_its_socket() {
     assert_eq!(
         world.rows(),
         [
-            ("s-c9b1".to_owned(), from.clone(), None),
-            ("s-c9b2".to_owned(), from.clone(), None),
-            ("s-c9b3".to_owned(), from, None),
+            ("tc9b1xxxxxx".to_owned(), from.clone(), None),
+            ("tc9b2xxxxxx".to_owned(), from.clone(), None),
+            ("tc9b3xxxxxx".to_owned(), from, None),
         ]
     );
 }
@@ -5499,12 +5641,12 @@ fn a_spawn_dialled_again_reaches_the_aterm_it_was_judged_for() {
     aterm_uds::latest::publish(&alias, other.to_str().expect("utf8"));
     let mine = worker_instance(
         aterm_uds::CtlListener::bind(&own).expect("bind own"),
-        &["s-c9b1"],
+        &["tc9b1xxxxxx"],
     );
     let repoint = alias.clone();
     let beside = hanging_up_first(
         aterm_uds::CtlListener::bind(&other).expect("bind the other instance"),
-        &["s-c9e1"],
+        &["tc9e1xxxxxx"],
         move || aterm_uds::latest::publish(&repoint, &own_s),
     );
 

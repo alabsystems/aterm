@@ -165,7 +165,8 @@ fn showcase_keep_with_no_theme_writes_the_plain_name() {
     let keep = |source: &str, id: &str| {
         let (mut service, mut runtime, instance, view) = themes_view(source);
         {
-            let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(shown)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             shown.theme_preview_side = Some(aterm_types::Appearance::Dark);
@@ -271,7 +272,8 @@ fn a_search_or_the_category_list_over_the_themes_page_ends_the_trial() {
     let (service, mut runtime, instance, view) = themes_view(source);
     let before = service.snapshot().text.to_string();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.showcase.filter = crate::native_text_input::TextInputState::new("o".to_string());
@@ -367,7 +369,8 @@ fn the_themes_page_keeps_its_heading_and_its_filter_stays_put() {
             let context = format!("{width}x{height} filter {filter:?}");
             let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.showcase.filter =
@@ -787,7 +790,8 @@ fn save_as_failure_preserves_exact_unsaved_colour_and_palette_drafts() {
         let (_, mut runtime, instance, view) =
             themes_view("theme = \"Nord\"\nforeground = \"#fafafa\"\n");
         let drafts = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             for (key, text) in [
@@ -899,10 +903,12 @@ fn save_as_catalog_before_completion_selects_after_its_own_success() {
 fn save_as_leaving_the_page_cancels_delayed_auto_selection() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
     let (id, scheme, operation) = start_save_as(&mut runtime, instance, view);
-    let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(view_state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     view_state.navigate(SettingsRoute::Appearance);
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -930,7 +936,8 @@ fn save_as_leaving_the_page_cancels_delayed_auto_selection() {
 fn save_as_success_retires_only_its_unchanged_submitted_drafts() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         for (key, text) in [
@@ -945,7 +952,8 @@ fn save_as_success_retires_only_its_unchanged_submitted_drafts() {
     }
     let (id, scheme, operation) = start_save_as(&mut runtime, instance, view);
     let newer = {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         let mut input = crate::native_text_input::TextInputState::new("#123456".into());
@@ -1063,7 +1071,8 @@ fn save_as_retires_only_the_exact_submitted_sparse_slot_input() {
             "the submitted file carries the draft"
         );
         let expected = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             let slot = state
@@ -1412,7 +1421,8 @@ fn finish_patch(
 fn save_as_keeps_drafts_and_name_until_the_theme_is_selected() {
     let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.field_inputs.insert(
@@ -2693,11 +2703,13 @@ fn typography_view(
     let mut service = VersionedConfigService::new(source.to_string()).expect("valid fixture");
     let snapshot = service.replace_theme_catalog(themes);
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     **state = SettingsViewState::from_snapshot(&snapshot).expect("snapshot");
     state.navigate(SettingsRoute::Themes);
+    drop(route_native_guard);
     (service, runtime, instance, view)
 }
 
@@ -2749,10 +2761,12 @@ fn a_reset_to_the_themes_type_is_named_by_its_words() {
         "theme = \"Studio\"\nline_height = 1.4\nfont_family = \"\"\n",
         studio_catalog(STUDIO_TYPE),
     );
-    let Some(AppViewState::Settings(page)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(page)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     page.navigate(SettingsRoute::TextFonts);
+    drop(route_native_guard);
     let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
     for (key, value) in [
         (prefs::EDIT_LINE_HEIGHT, "1.15"),
@@ -2788,11 +2802,13 @@ fn a_reset_to_the_themes_type_says_the_themes_value() {
     ] {
         let (mut service, mut runtime, instance, view) =
             typography_view(source, studio_catalog(PINNABLE_TYPE));
-        let Some(AppViewState::Settings(page)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(page)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         page.navigate(SettingsRoute::TextFonts);
         let reset = format!("settings/reset/{}", prefs::EDIT_LINE_HEIGHT);
+        drop(route_native_guard);
         let pressed = act(&mut runtime, instance, view, &reset, None);
         let (patch, operation) = config_patches(&pressed)[0].clone();
         land_patch(
@@ -3083,7 +3099,8 @@ fn list_arrows_walk_rows_and_the_list_follows() {
         "the control: the list scrolls at this size"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.common.last_focus = Some(UiKey::new(format!("settings/showcase/card/{}", order[0])));
@@ -3610,7 +3627,8 @@ const STAGE: &str = "settings/showcase/stage";
 const SHAPES: [f32; 3] = [556.0, 934.0, 1_284.0];
 
 fn focus_on(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, key: &str) {
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     state.common.last_focus = Some(UiKey::new(key));
@@ -3638,7 +3656,8 @@ fn strip_laid_height(
 }
 
 fn list_at_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     state.scroll_page_to(0);
@@ -3737,7 +3756,9 @@ fn the_keyboards_theme_row_is_whole_under_a_pinned_filter() {
                 let cx = view_cx_at(width, height);
                 let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.config_watch_status =
@@ -4246,10 +4267,12 @@ fn the_strip_says_a_failed_save_whole() {
         for (width, height) in [(584.0, 900.0), (744.0, 900.0), (1_095.0, 900.0)] {
             let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
             let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
-            let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             settings.showcase.error = Some(ERROR.to_string());
+            drop(route_native_guard);
             let compiled =
                 compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
             let mut lines: Vec<(usize, String, crate::native_ui::LogicalRect)> = compiled
@@ -4315,7 +4338,8 @@ fn the_strip_says_a_trials_facts_the_strip_wide() {
             cx.motion.system_dark = true;
             let (_service, mut runtime, instance, view) = themes_view(SOURCE);
             {
-                let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(shown)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 shown.presented_motion.set(cx.motion);
@@ -4434,10 +4458,12 @@ fn keep_files_a_theme_by_the_side_it_is_made_for() {
     let open = || {
         let (service, mut runtime, instance, view) =
             themes_view("theme = \"dark:Nord,light:Solarized Light\"\n");
-        let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(shown)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         shown.presented_motion.set(cx.motion);
+        drop(route_native_guard);
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         (service, runtime, instance, view)
     };
@@ -4735,7 +4761,8 @@ fn a_status_while_a_landing_waits_leaves_the_keyboards_control_whole() {
         shown + 0.5 >= tall,
         "the first screen shows the disclosure whole: {shown} of {tall}pt"
     );
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.feedback = Some(
@@ -4743,6 +4770,7 @@ fn a_status_while_a_landing_waits_leaves_the_keyboards_control_whole() {
          \u{b7} check its permissions"
             .to_string(),
     );
+    drop(route_native_guard);
     let screen = compile_settings_view(&runtime, instance, view, &cx);
     let (shown, tall) = shown_of(&screen, PACK);
     assert!(
@@ -5040,7 +5068,8 @@ fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
                 "{case:?}: the page lands on {key}"
             );
             if let_go {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.settle_page_scroll();
@@ -5393,7 +5422,8 @@ fn the_strip_says_each_fact_once_at_every_width() {
         for (size, cx) in &sizes {
             let (_service, mut runtime, instance, view) = setup();
             {
-                let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(shown)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 shown.presented_motion.set(cx.motion);
@@ -5484,7 +5514,9 @@ fn a_tried_themes_name_is_whole() {
                 let _ = act(&mut runtime, instance, view, &row, None);
                 list_at_top(&mut runtime, view);
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.common.last_focus = None;
@@ -5541,7 +5573,8 @@ fn the_first_screen_is_never_one_demo_row_over_a_blank() {
             let _ = act(&mut runtime, instance, view, &card, None);
             list_at_top(&mut runtime, view);
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.common.last_focus = None;
@@ -6225,11 +6258,13 @@ fn a_theme_file_published_again_repaints_its_rows_slab() {
             view,
             AppEvent::ConfigChanged(published),
         );
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.showcase.filter = crate::native_text_input::TextInputState::new("Mine".to_string());
         state.invalidate_result_page_limit();
+        drop(route_native_guard);
         let slab = format!("{}/slab", card_action(&runtime, view, "Mine"));
         let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(864.0, 500.0));
         compiled
@@ -6566,7 +6601,8 @@ fn colour_rows_are_one_line_with_one_field_column() {
         );
         let control = "settings/control/background";
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.common.last_focus = Some(UiKey::new(control));
@@ -6797,7 +6833,8 @@ fn a_closed_disclosure_opens_for_a_row_it_holds() {
     let cx = view_cx_at(1_284.0, 934.0);
     let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
     let _ = compile_settings_view(&runtime, instance, view, &cx);
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     assert!(!state.showcase.pack_open, "the disclosure starts closed");
@@ -6809,6 +6846,7 @@ fn a_closed_disclosure_opens_for_a_row_it_holds() {
     let pack_row = UiKey::new(format!("{ROW}tokyonight-storm"));
     assert!(state.open_disclosure_holding(&pack_row));
     assert!(state.showcase.pack_open, "the disclosure opens");
+    drop(route_native_guard);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     assert!(
         compiled.semantic(&pack_row).is_some(),
@@ -6889,7 +6927,8 @@ fn rows_added_over_the_keyboards_row_hold_its_place_and_list_each_row_once() {
         "each listed row is in the tree once"
     );
 
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     let (plan, shown) = state.scroll_shown().expect("the render recorded it");
@@ -7358,7 +7397,8 @@ fn a_chooser_rows_marks_are_whole_at_every_text_size() {
             let (_service, mut runtime, instance, view) =
                 typography_view("theme = \"Murky\"\n", themes);
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.showcase.pack_open = true;
@@ -7426,7 +7466,9 @@ fn the_strip_draws_its_title_and_every_button_whole() {
                 }
                 list_at_top(&mut runtime, view);
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.common.last_focus = None;
@@ -7465,7 +7507,8 @@ fn a_chooser_rows_name_comes_before_its_slab() {
         for width in [178.0, 206.0, 262.0, 318.0, 444.0, 584.0, 1_284.0] {
             let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.showcase.pack_open = true;
@@ -7542,7 +7585,8 @@ fn the_themes_page_opens_on_the_theme_in_use() {
                 continue;
             }
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!()
                 };
                 state.scroll_page_to(0);
@@ -8649,7 +8693,9 @@ fn the_choosers_end_sits_on_its_lists_bottom_edge() {
                 let dir = aterm_tempfile::tempdir().expect("a themes folder");
                 if yours {
                     std::fs::write(dir.path().join("paper.conf"), PAPER_THEME).unwrap();
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.showcase = ShowcaseState::new(
@@ -8668,7 +8714,9 @@ fn the_choosers_end_sits_on_its_lists_bottom_edge() {
                     continue;
                 }
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.scroll_page_to(limit);

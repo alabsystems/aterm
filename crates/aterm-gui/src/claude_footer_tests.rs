@@ -4956,7 +4956,7 @@ fn footer_uses_the_cell_frames_viewport_and_blank_after_terminal_moves() {
         for _ in 0..rows + 4 {
             term.process(b"history\r\n");
         }
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         term.cell_frame_into(&mut ws.input_scratch, rows, cols);
         vendor_frame(&mut ws.input_scratch);
     }
@@ -5008,7 +5008,7 @@ fn footer_uses_the_cell_frames_viewport_and_blank_after_terminal_moves() {
 
     {
         let mut term = crate::term_lock(&front.term);
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         term.cell_frame_into(&mut ws.input_scratch, rows, cols);
         vendor_frame(&mut ws.input_scratch);
         assert!(ws.input_scratch.display_offset > 0);
@@ -5035,7 +5035,7 @@ fn footer_source_uses_leaf_index_for_splits_and_view_for_mixed_tabs() {
     let leaf = plan.leaves.remove(0);
     let mut sibling = leaf.clone();
     sibling.focused = false;
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     ws.input_scratch.terminal_id = 11;
     ws.composed_focus_scratch.terminal_id = 22;
     ws.unfocused_pane_scratch.insert(1, RenderInput::empty());
@@ -5047,7 +5047,7 @@ fn footer_source_uses_leaf_index_for_splits_and_view_for_mixed_tabs() {
         .terminal_id = 44;
 
     let id = |route: VisibleContentRoute, index: usize, leaf: &crate::tab_model::VisibleLeaf| {
-        frame_source(ws, route, index, leaf).map(|s| s.terminal_id)
+        frame_source(&ws, route, index, leaf).map(|s| s.terminal_id)
     };
     assert_eq!(
         id(VisibleContentRoute::Terminal { composed: false }, 0, &leaf),

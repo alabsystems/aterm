@@ -5,8 +5,8 @@
 //! [`crate::seq_twins::TX_TWINS`] names runs there, against its `.seq` file; the rest are tests.
 
 use aterm_slog::{
-    ATTRIBUTION_MS, Actor, BoxWord, CARRY_MAX_LINE, Claimed, Conf, Key, Kind, Log, Lvl, Mark, Node,
-    Op, Rec, ShortId, Src, TX_TOOLS_MAX, TurnTracker, TxEvent, TxPos, TxState, Val, Verdict,
+    ATTRIBUTION_MS, Actor, BoxWord, CARRY_MAX_LINE, ClaimEdge, Conf, Key, Kind, Log, Lvl, Mark,
+    Node, Op, Rec, ShortId, Src, TX_TOOLS_MAX, TurnTracker, TxEvent, TxPos, TxState, Val, Verdict,
     WallJudge, WallKind,
 };
 
@@ -153,16 +153,16 @@ impl Rig {
         self.since(seq0)
     }
 
-    /// The program's own claim (`TurnTracker::claim`), which no `.seq` twin replays.
-    fn claim(&mut self, c: Claimed) -> Vec<Rec> {
-        let seq0 = self.log.last_seq();
-        self.tr.claim(&mut self.log, c, at(self.now));
-        self.since(seq0)
+    /// An engine edge of the program's claimed turn (`TurnTracker::claim_edge`) at the rig's now,
+    /// the run's bucket granting it, which no `.seq` twin replays.
+    fn claim(&mut self, c: ClaimEdge) -> Vec<Rec> {
+        let now = self.now;
+        self.edge(c, now, true)
     }
 
-    /// An engine edge no status sample showed (`TurnTracker::claim_edge`), at its own batch time
-    /// `at_ms`, with the run's bucket answering `may_open`; no `.seq` twin replays it either.
-    fn edge(&mut self, c: Claimed, at_ms: u64, may_open: bool) -> Vec<Rec> {
+    /// An engine edge (`TurnTracker::claim_edge`), at its own batch time `at_ms`, with the run's
+    /// bucket answering `may_open`; no `.seq` twin replays it either.
+    fn edge(&mut self, c: ClaimEdge, at_ms: u64, may_open: bool) -> Vec<Rec> {
         let seq0 = self.log.last_seq();
         self.tr
             .claim_edge(&mut self.log, c, at(at_ms), &mut || may_open);
@@ -1781,15 +1781,15 @@ pub(crate) fn a_closed_run_takes_no_transcript_row() {
 
 /// THE CLAIM'S TURNS: a run whose screen reads nothing and whose transcript steps no turn (none
 /// bound, or latched off) has a turn for each working-to-rest claim, opened and closed at
-/// `src=engine conf=claim` with its duration (`out=error` for a failed rest), a second working
-/// claim inside one keeping it (the host maps `blocked` to working: aterm-gui's
+/// `src=engine conf=claim` with its duration (`out=error` for a failed rest), a resumed working
+/// inside one keeping it (a `blocked` in a turn draws no edge at all: aterm-gui's
 /// `a_codex_alabs_blocked_claim_keeps_its_turn_and_an_error_closes_it`); a screen word that opens
 /// no turn (a codex-alab's `unknown`, or `idle`) leaves the claims their turns. NEGATIVE CONTROL:
 /// the same claims into a run whose screen opened a turn open and close nothing.
 #[test]
 pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_one() {
     let mut r = Rig::new();
-    let opened = r.claim(Claimed::Working);
+    let opened = r.claim(ClaimEdge::Began);
     let t1 = r.turn();
     let o = ops(&opened, Op::Open, Lvl::Turn);
     assert_eq!(o.len(), 1, "{opened:?}");
@@ -1800,11 +1800,11 @@ pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_
     assert_eq!(o[0].par, Some(r.run));
     r.now = 1_000;
     assert!(
-        r.claim(Claimed::Working).is_empty(),
-        "a turn runs: one turn"
+        r.claim(ClaimEdge::Resumed).is_empty(),
+        "a re-sent working in a turn running: one turn"
     );
     r.now = 4_000;
-    let closed = r.claim(Claimed::Rested);
+    let closed = r.claim(ClaimEdge::Rested);
     let c = ops(&closed, Op::Close, Lvl::Turn);
     assert_eq!(c.len(), 1, "{closed:?}");
     assert_eq!(
@@ -1813,16 +1813,16 @@ pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_
     );
     assert_eq!(r.tr.turn(), None);
     r.now = 4_500;
-    assert!(r.claim(Claimed::Rested).is_empty(), "no turn to close");
+    assert!(r.claim(ClaimEdge::Rested).is_empty(), "no turn to close");
     r.now = 6_000;
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t2 = r.turn();
     assert_ne!(t2, t1);
     r.now = 7_000;
-    let failed = ops(&r.claim(Claimed::Failed), Op::Close, Lvl::Turn);
+    let failed = ops(&r.claim(ClaimEdge::Failed), Op::Close, Lvl::Turn);
     assert_eq!((failed[0].node, failed[0].out()), (t2, Some("error")));
     let mut off = Rig::bound_at(TxState::Off);
-    off.claim(Claimed::Working);
+    off.claim(ClaimEdge::Began);
     assert!(
         off.tr.turn().is_some(),
         "a transcript latched off steps no turn"
@@ -1830,7 +1830,7 @@ pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_
     for word in [Verdict::Unknown, Verdict::Idle] {
         let mut resting = Rig::new();
         resting.see(word);
-        resting.claim(Claimed::Working);
+        resting.claim(ClaimEdge::Began);
         assert!(
             resting.tr.turn().is_some(),
             "a screen word that opens no turn ({word:?}) leaves the claim its turns"
@@ -1839,7 +1839,7 @@ pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_
     let mut screen = Rig::new();
     screen.see(Verdict::Busy);
     let own = screen.turn();
-    for c in [Claimed::Rested, Claimed::Failed, Claimed::Working] {
+    for c in [ClaimEdge::Rested, ClaimEdge::Failed, ClaimEdge::Began] {
         assert!(
             screen.claim(c).is_empty(),
             "NEGATIVE CONTROL: a screen that opened a turn keeps the turns ({c:?})"
@@ -1859,7 +1859,7 @@ pub(crate) fn a_claimed_turn_runs_from_working_to_rest_where_nothing_else_opens_
 #[test]
 pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_its_own() {
     let mut r = Rig::bound_at(TxState::Partial);
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t1 = r.turn();
     r.now = 100;
     let named = r.tx(prompt("v1"));
@@ -1884,7 +1884,7 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
     assert_eq!(end[0].f.get_u(Key::VdurMs), Some(4200));
     assert_eq!(end[0].f.get_u(Key::TokIn), Some(900));
     r.now = 1_000;
-    let rest = ops(&r.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let rest = ops(&r.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!((rest[0].node, rest[0].src), (t1, Src::Engine));
     assert_eq!(ops(&r.records(), Op::Open, Lvl::Turn).len(), 1, "one turn");
     r.ordered();
@@ -1900,7 +1900,7 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
     let t1 = first.turn();
     first.now = 150;
     assert!(
-        ops(&first.claim(Claimed::Working), Op::Open, Lvl::Turn).is_empty(),
+        ops(&first.claim(ClaimEdge::Began), Op::Open, Lvl::Turn).is_empty(),
         "the claim's working takes the turn running"
     );
     assert_eq!(first.tr.turn(), Some(t1));
@@ -1912,7 +1912,10 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
         "a partial end closes the turn it opened"
     );
     first.now = 1_000;
-    assert!(first.claim(Claimed::Rested).is_empty(), "no turn to close");
+    assert!(
+        first.claim(ClaimEdge::Rested).is_empty(),
+        "no turn to close"
+    );
     assert_eq!(
         ops(&first.records(), Op::Open, Lvl::Turn).len(),
         1,
@@ -1922,7 +1925,7 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
 
     let mut exact = Rig::bound();
     assert!(
-        exact.claim(Claimed::Working).is_empty(),
+        exact.claim(ClaimEdge::Began).is_empty(),
         "the transcript opens"
     );
     exact.now = 100;
@@ -1935,9 +1938,9 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
     let closed = ops(&exact.tx(END), Op::Close, Lvl::Turn);
     assert_eq!(closed[0].src, Src::Transcript);
     exact.now = 1_000;
-    assert!(exact.claim(Claimed::Rested).is_empty());
+    assert!(exact.claim(ClaimEdge::Rested).is_empty());
     exact.now = 2_000;
-    assert!(exact.claim(Claimed::Working).is_empty());
+    assert!(exact.claim(ClaimEdge::Began).is_empty());
     assert_eq!(
         ops(&exact.records(), Op::Open, Lvl::Turn).len(),
         1,
@@ -1946,7 +1949,7 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
     exact.ordered();
 
     let mut late = Rig::new();
-    late.claim(Claimed::Working);
+    late.claim(ClaimEdge::Began);
     let t1 = late.turn();
     late.state = TxState::On;
     late.bind(0);
@@ -1958,7 +1961,7 @@ pub(crate) fn a_partial_transcript_fills_the_claims_turn_and_an_exact_one_keeps_
     let closed = ops(&late.tx(END), Op::Close, Lvl::Turn);
     assert_eq!((closed[0].node, closed[0].src), (t1, Src::Transcript));
     late.now = 1_000;
-    assert!(late.claim(Claimed::Rested).is_empty());
+    assert!(late.claim(ClaimEdge::Rested).is_empty());
     assert_eq!(ops(&late.records(), Op::Open, Lvl::Turn).len(), 1);
     late.ordered();
 }
@@ -1975,10 +1978,10 @@ pub(crate) fn a_late_exact_transcript_names_the_claims_closed_turns_and_opens_no
     let mut claimed = Vec::new();
     for (from, to) in [(10_000, 20_000), (30_000, 40_000)] {
         r.now = from;
-        r.claim(Claimed::Working);
+        r.claim(ClaimEdge::Began);
         claimed.push(r.turn());
         r.now = to;
-        r.claim(Claimed::Rested);
+        r.claim(ClaimEdge::Rested);
     }
     r.now = 55_000;
     r.state = TxState::On;
@@ -2024,14 +2027,14 @@ pub(crate) fn a_late_exact_transcript_names_the_claims_closed_turns_and_opens_no
 #[test]
 pub(crate) fn a_claimed_turn_after_a_rest_continues_no_vendor_turn() {
     let mut r = Rig::bound_at(TxState::Partial);
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t1 = r.turn();
     r.now = 100;
     r.tx(prompt("v1"));
     r.now = 2_000;
-    r.claim(Claimed::Rested);
+    r.claim(ClaimEdge::Rested);
     r.now = 2_300;
-    let next = r.claim(Claimed::Working);
+    let next = r.claim(ClaimEdge::Began);
     let t2 = r.turn();
     assert_ne!(t2, t1);
     assert!(
@@ -2081,7 +2084,7 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
     r.now = 900;
     r.tx(END);
     r.now = 2_000;
-    for c in [Claimed::Working, Claimed::Rested] {
+    for c in [ClaimEdge::Began, ClaimEdge::Rested] {
         assert!(
             r.claim(c).is_empty(),
             "NEGATIVE CONTROL: the reader reads, and its turns are the run's ({c:?})"
@@ -2089,7 +2092,7 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
     }
     r.tr.tx_stopped();
     r.now = 3_000;
-    let opened = ops(&r.claim(Claimed::Working), Op::Open, Lvl::Turn);
+    let opened = ops(&r.claim(ClaimEdge::Began), Op::Open, Lvl::Turn);
     assert_eq!(
         (opened.len(), opened[0].src, opened[0].conf),
         (1, Src::Engine, Conf::Claim),
@@ -2097,7 +2100,7 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
     );
     let t2 = opened[0].node;
     r.now = 5_000;
-    let closed = ops(&r.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let closed = ops(&r.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!((closed[0].node, closed[0].src), (t2, Src::Engine));
     r.now = 8_000;
     let off = r.off;
@@ -2108,7 +2111,7 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
     r.tx_at(END, WALL0 + 4_900);
     r.now = 9_000;
     assert!(
-        r.claim(Claimed::Working).is_empty(),
+        r.claim(ClaimEdge::Began).is_empty(),
         "read again: the claims stand aside"
     );
     assert_eq!(ops(&r.records(), Op::Open, Lvl::Turn).len(), 2);
@@ -2119,7 +2122,7 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
 fn pending_next_interrupt(state: TxState) -> Rig {
     let mut r = Rig::new();
     r.now = 15;
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     r.state = state;
     r.now = 45;
     r.tx_at(
@@ -2149,7 +2152,7 @@ fn a_pending_vendor_interrupt_survives_the_previous_close_and_carry() {
                 r.adopt(&line);
                 assert_eq!(r.tr.turn(), Some(original), "carry retains the live owner");
             }
-            r.edge(Claimed::Rested, 20, true);
+            r.edge(ClaimEdge::Rested, 20, true);
             assert_eq!(
                 last_turn_out(&r),
                 Some("done"),
@@ -2159,12 +2162,12 @@ fn a_pending_vendor_interrupt_survives_the_previous_close_and_carry() {
                 let line = r.tr.carry_line(at(r.now));
                 r.adopt(&line);
             }
-            r.edge(Claimed::Working, 30, true);
-            // A held non-edge observation inside the same claim is not a missing boundary.
-            r.tr.claim(&mut r.log, Claimed::Working, at(35));
+            r.edge(ClaimEdge::Began, 30, true);
+            // A resumed beginning inside the same claim is not a missing boundary.
+            r.tr.claim_edge(&mut r.log, ClaimEdge::Resumed, at(35), &mut || true);
             let line = r.tr.carry_line(at(r.now));
             r.adopt(&line);
-            r.edge(Claimed::Rested, 40, true);
+            r.edge(ClaimEdge::Rested, 40, true);
             assert_eq!(
                 last_turn_out(&r),
                 Some("interrupted"),
@@ -2180,7 +2183,7 @@ fn damaged_interrupt_metadata_degrades_only_its_provenance() {
     for damage in ["legacy", "duplicate"] {
         let mut r = Rig::new();
         r.now = 15;
-        r.claim(Claimed::Working);
+        r.claim(ClaimEdge::Began);
         let owner = r.turn();
         r.tr.note_interrupted();
         let mut line = r.tr.carry_line(at(r.now));
@@ -2195,10 +2198,10 @@ fn damaged_interrupt_metadata_degrades_only_its_provenance() {
             Some(owner),
             "{damage}: core ownership must not be discarded"
         );
-        r.edge(Claimed::Rested, 20, true);
+        r.edge(ClaimEdge::Rested, 20, true);
         assert_eq!(last_turn_out(&r), Some("unknown"), "{damage}");
-        r.edge(Claimed::Working, 30, true);
-        r.edge(Claimed::Rested, 40, true);
+        r.edge(ClaimEdge::Began, 30, true);
+        r.edge(ClaimEdge::Rested, 40, true);
         assert_eq!(
             last_turn_out(&r),
             Some("done"),
@@ -2242,16 +2245,16 @@ fn damaged_interrupt_metadata_degrades_only_its_provenance() {
         }
         r.adopt(&line);
         assert_eq!(r.tr.turn(), Some(owner));
-        r.edge(Claimed::Rested, 20, true);
+        r.edge(ClaimEdge::Rested, 20, true);
         assert_eq!(
             last_turn_out(&r),
             Some("done"),
             "{damage}: damaged future metadata cannot taint the earlier claim"
         );
-        r.edge(Claimed::Working, 30, true);
+        r.edge(ClaimEdge::Began, 30, true);
         let line = r.tr.carry_line(at(r.now));
         r.adopt(&line);
-        r.edge(Claimed::Rested, 40, true);
+        r.edge(ClaimEdge::Rested, 40, true);
         assert_eq!(
             last_turn_out(&r),
             Some("unknown"),
@@ -2268,19 +2271,19 @@ fn overloaded_vendor_interrupts_keep_each_overlapping_interval_unknown() {
     r.tx_at(TxEvent::Interrupt, WALL0 + 60);
     let line = r.tr.carry_line(at(r.now));
     r.adopt(&line);
-    r.edge(Claimed::Rested, 20, true);
+    r.edge(ClaimEdge::Rested, 20, true);
     assert_eq!(last_turn_out(&r), Some("done"));
     for (begin, end) in [(30, 40), (50, 60)] {
-        r.edge(Claimed::Working, begin, true);
-        r.edge(Claimed::Rested, end, true);
+        r.edge(ClaimEdge::Began, begin, true);
+        r.edge(ClaimEdge::Rested, end, true);
         assert_eq!(
             last_turn_out(&r),
             Some("unknown"),
             "one slot cannot assign either overlapping vendor fact"
         );
     }
-    r.edge(Claimed::Working, 70, true);
-    r.edge(Claimed::Rested, 80, true);
+    r.edge(ClaimEdge::Began, 70, true);
+    r.edge(ClaimEdge::Rested, 80, true);
     assert_eq!(
         last_turn_out(&r),
         Some("done"),
@@ -2292,11 +2295,11 @@ fn overloaded_vendor_interrupts_keep_each_overlapping_interval_unknown() {
 fn a_refused_begin_cannot_supply_an_adjacent_interval_fence() {
     let mut r = Rig::new();
     r.now = 10;
-    r.claim(Claimed::Working);
-    r.edge(Claimed::Rested, 20, true);
-    r.edge(Claimed::Working, 25, false);
-    r.edge(Claimed::Rested, 30, true);
-    r.edge(Claimed::Working, 40, true);
+    r.claim(ClaimEdge::Began);
+    r.edge(ClaimEdge::Rested, 20, true);
+    r.edge(ClaimEdge::Began, 25, false);
+    r.edge(ClaimEdge::Rested, 30, true);
+    r.edge(ClaimEdge::Began, 40, true);
     r.state = TxState::Partial;
     r.now = 55;
     r.tx_at(
@@ -2308,7 +2311,7 @@ fn a_refused_begin_cannot_supply_an_adjacent_interval_fence() {
     );
     r.tx_at(prompt("next"), WALL0 + 40);
     r.tx_at(TxEvent::Interrupt, WALL0 + 50);
-    r.edge(Claimed::Rested, 50, true);
+    r.edge(ClaimEdge::Rested, 50, true);
     assert_eq!(
         last_turn_out(&r),
         Some("unknown"),
@@ -2373,7 +2376,7 @@ fn duplicated_source_quality_cannot_restore_measured_screen_authority() {
         Some(owner),
         "only proof quality degrades, never the live owner"
     );
-    r.claim(Claimed::Rested);
+    r.claim(ClaimEdge::Rested);
     assert_eq!(
         last_turn_out(&r),
         Some("unknown"),
@@ -2393,7 +2396,7 @@ fn ambiguous_carried_join_fields_cannot_authorize_a_new_interrupt() {
     ] {
         let mut r = Rig::new();
         r.now = 15;
-        r.claim(Claimed::Working);
+        r.claim(ClaimEdge::Began);
         r.state = TxState::Partial;
         r.now = 45;
         r.tx_at(
@@ -2414,9 +2417,9 @@ fn ambiguous_carried_join_fields_cannot_authorize_a_new_interrupt() {
         );
         r.now = 65;
         r.tx_at(TxEvent::Interrupt, WALL0 + 60);
-        r.edge(Claimed::Rested, 20, true);
-        r.edge(Claimed::Working, 30, true);
-        r.edge(Claimed::Rested, 60, true);
+        r.edge(ClaimEdge::Rested, 20, true);
+        r.edge(ClaimEdge::Began, 30, true);
+        r.edge(ClaimEdge::Rested, 60, true);
         assert_ne!(
             last_turn_out(&r),
             Some("interrupted"),
@@ -2434,11 +2437,11 @@ fn ambiguous_carried_join_fields_cannot_authorize_a_new_interrupt() {
         let line = format!("{} {key}={value}", r.tr.carry_line(at(r.now)));
         r.adopt(&line);
         assert_eq!(r.tr.turn(), Some(owner));
-        r.edge(Claimed::Rested, 20, true);
-        r.edge(Claimed::Working, 30, true);
+        r.edge(ClaimEdge::Rested, 20, true);
+        r.edge(ClaimEdge::Began, 30, true);
         let line = r.tr.carry_line(at(r.now));
         r.adopt(&line);
-        r.edge(Claimed::Rested, 40, true);
+        r.edge(ClaimEdge::Rested, 40, true);
         assert_eq!(
             last_turn_out(&r),
             Some("unknown"),
@@ -2499,7 +2502,7 @@ fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
     for (prompt_ms, interrupt_ms) in [(30, 30), (35, 30)] {
         let mut r = Rig::new();
         r.now = 15;
-        r.claim(Claimed::Working);
+        r.claim(ClaimEdge::Began);
         r.state = TxState::Partial;
         r.now = 45;
         r.tx_at(
@@ -2511,9 +2514,9 @@ fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
         );
         r.tx_at(prompt("next"), WALL0 + prompt_ms);
         r.tx_at(TxEvent::Interrupt, WALL0 + interrupt_ms);
-        r.edge(Claimed::Rested, 20, true);
-        r.edge(Claimed::Working, 30, true);
-        r.edge(Claimed::Rested, 40, true);
+        r.edge(ClaimEdge::Rested, 20, true);
+        r.edge(ClaimEdge::Began, 30, true);
+        r.edge(ClaimEdge::Rested, 40, true);
         assert_eq!(
             last_turn_out(&r),
             Some("unknown"),
@@ -2538,7 +2541,7 @@ fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
     r.tx_at(TxEvent::Interrupt, WALL0 + 40);
     let mut claimed = Rig::new();
     claimed.now = 15;
-    claimed.claim(Claimed::Working);
+    claimed.claim(ClaimEdge::Began);
     assert_eq!(
         claimed.turn(),
         owner,
@@ -2563,7 +2566,7 @@ fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
             .join(" ");
     r.adopt(&line);
     assert_eq!(r.tr.turn(), Some(owner));
-    r.edge(Claimed::Rested, 40, true);
+    r.edge(ClaimEdge::Rested, 40, true);
     assert_eq!(
         last_turn_out(&r),
         Some("unknown"),
@@ -2575,7 +2578,7 @@ fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
 fn a_new_transcript_epoch_preserves_independent_raw_claim_observations() {
     let mut r = Rig::new();
     r.now = 15;
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     r.state = TxState::Partial;
     r.now = 25;
     r.tx_at(
@@ -2600,7 +2603,7 @@ fn a_new_transcript_epoch_preserves_independent_raw_claim_observations() {
     );
     r.call(prompt("new-source"), pos(1, WALL0 + 18));
     r.call(TxEvent::Interrupt, pos(2, WALL0 + 19));
-    r.edge(Claimed::Rested, 20, true);
+    r.edge(ClaimEdge::Rested, 20, true);
     assert_eq!(
         last_turn_out(&r),
         Some("interrupted"),
@@ -2612,9 +2615,9 @@ fn a_new_transcript_epoch_preserves_independent_raw_claim_observations() {
 fn a_clamped_claim_opening_cannot_be_reconstructed_as_a_raw_begin() {
     let mut r = Rig::new();
     r.now = 10;
-    r.claim(Claimed::Working);
-    r.edge(Claimed::Rested, 50, true);
-    r.edge(Claimed::Working, 40, true);
+    r.claim(ClaimEdge::Began);
+    r.edge(ClaimEdge::Rested, 50, true);
+    r.edge(ClaimEdge::Began, 40, true);
     r.state = TxState::Partial;
     r.now = 75;
     r.tx_at(
@@ -2628,7 +2631,7 @@ fn a_clamped_claim_opening_cannot_be_reconstructed_as_a_raw_begin() {
     r.tx_at(TxEvent::Interrupt, WALL0 + 60);
     let line = r.tr.carry_line(at(r.now));
     r.adopt(&line);
-    r.edge(Claimed::Rested, 70, true);
+    r.edge(ClaimEdge::Rested, 70, true);
     assert_eq!(
         last_turn_out(&r),
         Some("unknown"),
@@ -2644,25 +2647,25 @@ fn a_clamped_claim_opening_cannot_be_reconstructed_as_a_raw_begin() {
 #[test]
 pub(crate) fn a_partial_interrupt_is_the_claims_turns_witness_of_an_esc() {
     let mut r = Rig::bound_at(TxState::Partial);
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t1 = r.turn();
     r.now = 100;
     r.tx(prompt("v1"));
     r.now = 600;
     r.tx(TxEvent::Interrupt);
     r.now = 700;
-    let c = ops(&r.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let c = ops(&r.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!(
         (c[0].node, c[0].out(), c[0].src),
         (t1, Some("interrupted"), Src::Engine)
     );
     r.now = 2_000;
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t2 = r.turn();
     r.now = 2_100;
     r.tx(prompt("v2"));
     r.now = 2_600;
-    let c = ops(&r.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let c = ops(&r.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!((c[0].node, c[0].out()), (t2, Some("done")));
     r.now = 3_000;
     let late = r.tx_at(TxEvent::Interrupt, WALL0 + 2_550);
@@ -2675,11 +2678,11 @@ pub(crate) fn a_partial_interrupt_is_the_claims_turns_witness_of_an_esc() {
     let opened = ops(&r.tx(prompt("v3")), Op::Open, Lvl::Turn);
     let t3 = opened[0].node;
     r.now = 4_100;
-    assert!(r.claim(Claimed::Working).is_empty());
+    assert!(r.claim(ClaimEdge::Began).is_empty());
     r.now = 4_200;
     r.tx(TxEvent::Interrupt);
     r.now = 4_300;
-    let c = ops(&r.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let c = ops(&r.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!(
         (c[0].node, c[0].out(), c[0].src),
         (t3, Some("interrupted"), Src::Engine),
@@ -2693,7 +2696,7 @@ pub(crate) fn a_partial_interrupt_is_the_claims_turns_witness_of_an_esc() {
     lost.now = 200;
     lost.tx(TxEvent::Interrupt);
     lost.now = 300;
-    let c = ops(&lost.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let c = ops(&lost.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!(
         c.iter()
             .map(|c| (c.node, c.out(), c.src))
@@ -2702,13 +2705,13 @@ pub(crate) fn a_partial_interrupt_is_the_claims_turns_witness_of_an_esc() {
         "a partial prompt no beginning took (its held working replaced) closes at its rest"
     );
     lost.now = 1_000;
-    let next = ops(&lost.edge(Claimed::Working, 400, true), Op::Open, Lvl::Turn);
+    let next = ops(&lost.edge(ClaimEdge::Began, 400, true), Op::Open, Lvl::Turn);
     assert_eq!(
         next.len(),
         1,
         "the next beginning takes no closed turn: {next:?}"
     );
-    lost.edge(Claimed::Rested, 450, true);
+    lost.edge(ClaimEdge::Rested, 450, true);
     lost.ordered();
 
     let mut exact = Rig::bound();
@@ -2718,7 +2721,7 @@ pub(crate) fn a_partial_interrupt_is_the_claims_turns_witness_of_an_esc() {
     exact.now = 200;
     exact.tx(TxEvent::Interrupt);
     exact.now = 300;
-    let c = ops(&exact.claim(Claimed::Rested), Op::Close, Lvl::Turn);
+    let c = ops(&exact.claim(ClaimEdge::Rested), Op::Close, Lvl::Turn);
     assert_eq!(
         (c[0].node, c[0].out(), c[0].src),
         (te, Some("interrupted"), Src::Engine),
@@ -2756,7 +2759,7 @@ fn turn_opens(r: &Rig) -> Vec<Rec> {
 pub(crate) fn an_edge_no_sample_showed_is_one_claimed_turn_at_its_own_times() {
     let mut r = Rig::new();
     r.now = 5_000;
-    let opened = ops(&r.edge(Claimed::Working, 1_000, true), Op::Open, Lvl::Turn);
+    let opened = ops(&r.edge(ClaimEdge::Began, 1_000, true), Op::Open, Lvl::Turn);
     assert_eq!(
         opened
             .iter()
@@ -2765,7 +2768,11 @@ pub(crate) fn an_edge_no_sample_showed_is_one_claimed_turn_at_its_own_times() {
         [(WALL0 + 1_000, Src::Engine, Conf::Claim, Some(r.run))],
     );
     let t1 = r.turn();
-    let closed = ops(&r.edge(Claimed::Rested, 1_017, true), Op::Close, Lvl::Turn);
+    let closed = ops(
+        &r.edge(ClaimEdge::Rested, 1_017, true),
+        Op::Close,
+        Lvl::Turn,
+    );
     assert_eq!(
         closed
             .iter()
@@ -2780,9 +2787,13 @@ pub(crate) fn an_edge_no_sample_showed_is_one_claimed_turn_at_its_own_times() {
             Conf::Claim
         )],
     );
-    r.edge(Claimed::Working, 2_000, true);
+    r.edge(ClaimEdge::Began, 2_000, true);
     let t2 = r.turn();
-    let failed = ops(&r.edge(Claimed::Failed, 2_030, true), Op::Close, Lvl::Turn);
+    let failed = ops(
+        &r.edge(ClaimEdge::Failed, 2_030, true),
+        Op::Close,
+        Lvl::Turn,
+    );
     assert_eq!(
         (failed[0].node, failed[0].t, failed[0].out()),
         (t2, WALL0 + 2_030, Some("error"))
@@ -2796,7 +2807,7 @@ pub(crate) fn an_edge_no_sample_showed_is_one_claimed_turn_at_its_own_times() {
     screen.now = 5_000;
     let mut exact = Rig::bound();
     exact.now = 5_000;
-    for (c, ms) in [(Claimed::Working, 1_000), (Claimed::Rested, 1_017)] {
+    for (c, ms) in [(ClaimEdge::Began, 1_000), (ClaimEdge::Rested, 1_017)] {
         assert!(
             screen.edge(c, ms, true).is_empty(),
             "NEGATIVE CONTROL: a screen that opened a turn keeps the turns ({c:?})"
@@ -2826,12 +2837,12 @@ pub(crate) fn a_stopped_exact_reader_keeps_the_turns_it_read() {
     r.tx(END);
     r.tr.tx_stopped();
     r.now = 1_000;
-    for (c, ms) in [(Claimed::Working, 105), (Claimed::Rested, 895)] {
+    for (c, ms) in [(ClaimEdge::Began, 105), (ClaimEdge::Rested, 895)] {
         let recs = r.edge(c, ms, true);
         assert!(recs.is_empty(), "{c:?}: {recs:?}");
     }
     assert_eq!(turn_opens(&r).len(), 1, "the transcript's turn alone");
-    let opened = ops(&r.edge(Claimed::Working, 950, true), Op::Open, Lvl::Turn);
+    let opened = ops(&r.edge(ClaimEdge::Began, 950, true), Op::Open, Lvl::Turn);
     assert_eq!(
         opened
             .iter()
@@ -2840,7 +2851,7 @@ pub(crate) fn a_stopped_exact_reader_keeps_the_turns_it_read() {
         [(WALL0 + 950, Src::Engine, Conf::Claim)],
         "NEGATIVE CONTROL: an edge after the newest row read is the claim's"
     );
-    r.edge(Claimed::Rested, 990, true);
+    r.edge(ClaimEdge::Rested, 990, true);
     r.ordered();
 
     let mut lost = Rig::bound();
@@ -2857,7 +2868,11 @@ pub(crate) fn a_stopped_exact_reader_keeps_the_turns_it_read() {
     );
     lost.tr.tx_stopped();
     lost.now = 1_000;
-    let closed = ops(&lost.edge(Claimed::Rested, 895, true), Op::Close, Lvl::Turn);
+    let closed = ops(
+        &lost.edge(ClaimEdge::Rested, 895, true),
+        Op::Close,
+        Lvl::Turn,
+    );
     assert_eq!(
         closed
             .iter()
@@ -2889,7 +2904,7 @@ pub(crate) fn a_turn_a_partial_rollout_opened_and_closed_holds_its_span() {
     };
     let mut r = rollout();
     r.now = 1_000;
-    for (c, ms) in [(Claimed::Working, 105), (Claimed::Rested, 118)] {
+    for (c, ms) in [(ClaimEdge::Began, 105), (ClaimEdge::Rested, 118)] {
         let recs = r.edge(c, ms, true);
         assert!(recs.is_empty(), "{c:?}: {recs:?}");
     }
@@ -2898,9 +2913,9 @@ pub(crate) fn a_turn_a_partial_rollout_opened_and_closed_holds_its_span() {
 
     let mut sampled = rollout();
     sampled.now = 130;
-    assert!(sampled.claim(Claimed::Working).is_empty());
+    assert!(sampled.claim(ClaimEdge::Began).is_empty());
     sampled.now = 140;
-    assert!(sampled.claim(Claimed::Rested).is_empty());
+    assert!(sampled.claim(ClaimEdge::Rested).is_empty());
     assert_eq!(turn_opens(&sampled).len(), 1, "the sampled twin too");
     sampled.ordered();
 
@@ -2908,7 +2923,7 @@ pub(crate) fn a_turn_a_partial_rollout_opened_and_closed_holds_its_span() {
     stale.now = 7_000;
     let begin = 100 + ATTRIBUTION_MS + 1_000;
     let opened = ops(
-        &stale.edge(Claimed::Working, begin, true),
+        &stale.edge(ClaimEdge::Began, begin, true),
         Op::Open,
         Lvl::Turn,
     );
@@ -2920,7 +2935,7 @@ pub(crate) fn a_turn_a_partial_rollout_opened_and_closed_holds_its_span() {
         [(WALL0 + begin, Src::Engine, Conf::Claim)],
         "NEGATIVE CONTROL: a stale rollout turn holds no later span"
     );
-    stale.edge(Claimed::Rested, begin + 17, true);
+    stale.edge(ClaimEdge::Rested, begin + 17, true);
     assert_eq!(turn_opens(&stale).len(), 2);
     stale.ordered();
 }
@@ -2946,7 +2961,7 @@ pub(crate) fn a_turn_begun_during_a_seamless_update_is_still_a_claimed_turn() {
         "the new turn's prompt is below the floor"
     );
     r.now = 210;
-    let opened = ops(&r.claim(Claimed::Working), Op::Open, Lvl::Turn);
+    let opened = ops(&r.claim(ClaimEdge::Began), Op::Open, Lvl::Turn);
     assert_eq!(
         opened
             .iter()
@@ -2956,7 +2971,7 @@ pub(crate) fn a_turn_begun_during_a_seamless_update_is_still_a_claimed_turn() {
         "the successor's first working opens the new turn"
     );
     r.now = 300;
-    r.claim(Claimed::Rested);
+    r.claim(ClaimEdge::Rested);
     assert_eq!(turn_opens(&r).len(), 2);
     r.ordered();
 }
@@ -2971,9 +2986,9 @@ pub(crate) fn an_open_partial_turn_is_the_spans_and_closes_at_the_engines_end() 
     r.tx(prompt("v1"));
     let t1 = r.turn();
     r.now = 1_000;
-    assert!(r.edge(Claimed::Working, 105, true).is_empty());
+    assert!(r.edge(ClaimEdge::Began, 105, true).is_empty());
     assert_eq!(r.tr.turn(), Some(t1));
-    let closed = ops(&r.edge(Claimed::Rested, 300, true), Op::Close, Lvl::Turn);
+    let closed = ops(&r.edge(ClaimEdge::Rested, 300, true), Op::Close, Lvl::Turn);
     assert_eq!(
         closed
             .iter()
@@ -3006,11 +3021,11 @@ pub(crate) fn turns_whose_edges_share_one_batch_clock_are_paired_in_order() {
     r.tx(prompt("v2"));
     let t2 = r.turn();
     r.now = 1_000;
-    for c in [Claimed::Working, Claimed::Rested, Claimed::Working] {
+    for c in [ClaimEdge::Began, ClaimEdge::Rested, ClaimEdge::Began] {
         let recs = r.edge(c, 130, true);
         assert!(recs.is_empty(), "{c:?}: {recs:?}");
     }
-    let closed = ops(&r.edge(Claimed::Rested, 150, true), Op::Close, Lvl::Turn);
+    let closed = ops(&r.edge(ClaimEdge::Rested, 150, true), Op::Close, Lvl::Turn);
     assert_eq!(
         closed
             .iter()
@@ -3025,10 +3040,10 @@ pub(crate) fn turns_whose_edges_share_one_batch_clock_are_paired_in_order() {
     let mut bare = Rig::new();
     bare.now = 1_000;
     for c in [
-        Claimed::Working,
-        Claimed::Rested,
-        Claimed::Working,
-        Claimed::Rested,
+        ClaimEdge::Began,
+        ClaimEdge::Rested,
+        ClaimEdge::Began,
+        ClaimEdge::Rested,
     ] {
         bare.edge(c, 130, true);
     }
@@ -3049,18 +3064,18 @@ pub(crate) fn turns_whose_edges_share_one_batch_clock_are_paired_in_order() {
     let mut late = Rig::bound_at(TxState::Partial);
     late.now = 100;
     late.tx(prompt("v1"));
-    late.edge(Claimed::Working, 105, true);
+    late.edge(ClaimEdge::Began, 105, true);
     late.now = 400;
     late.tx(END);
     late.now = 1_000;
-    assert!(late.edge(Claimed::Rested, 390, true).is_empty());
-    let next = ops(&late.edge(Claimed::Working, 390, true), Op::Open, Lvl::Turn);
+    assert!(late.edge(ClaimEdge::Rested, 390, true).is_empty());
+    let next = ops(&late.edge(ClaimEdge::Began, 390, true), Op::Open, Lvl::Turn);
     assert_eq!(
         next.iter().map(|o| (o.t, o.src)).collect::<Vec<_>>(),
         [(WALL0 + 400, Src::Engine)],
         "a sibling turn never opens before the one before it closed"
     );
-    late.edge(Claimed::Rested, 450, true);
+    late.edge(ClaimEdge::Rested, 450, true);
     late.ordered();
 }
 
@@ -3076,7 +3091,7 @@ fn an_earlier_engine_beginning_does_not_consume_a_future_vendor_turn() {
     let vendor_records = r.records();
     assert_eq!(r.tr.untaken().collect::<Vec<_>>(), [vendor]);
 
-    r.edge(Claimed::Working, 1_000, true);
+    r.edge(ClaimEdge::Began, 1_000, true);
     assert_eq!(
         r.tr.untaken().collect::<Vec<_>>(),
         [vendor],
@@ -3087,8 +3102,8 @@ fn an_earlier_engine_beginning_does_not_consume_a_future_vendor_turn() {
             .iter()
             .all(|record| r.records().contains(record))
     );
-    r.edge(Claimed::Rested, 1_100, true);
-    r.edge(Claimed::Working, 20_005, true);
+    r.edge(ClaimEdge::Rested, 1_100, true);
+    r.edge(ClaimEdge::Began, 20_005, true);
     assert!(
         r.tr.untaken().next().is_none(),
         "its own beginning takes the span"
@@ -3108,7 +3123,7 @@ pub(crate) fn a_rest_leaves_a_later_vendor_turn_open() {
         r.now = 100;
         r.tx(prompt("v1"));
         r.now = 1_000;
-        assert!(r.edge(Claimed::Working, 105, true).is_empty());
+        assert!(r.edge(ClaimEdge::Began, 105, true).is_empty());
         r.now = 1_100;
         r.tx_at(END, WALL0 + 120);
         r.tx_at(prompt("v2"), WALL0 + 130);
@@ -3116,11 +3131,11 @@ pub(crate) fn a_rest_leaves_a_later_vendor_turn_open() {
     };
     let mut r = rollout();
     let t2 = r.turn();
-    let rest = r.edge(Claimed::Rested, 125, true);
+    let rest = r.edge(ClaimEdge::Rested, 125, true);
     assert!(rest.is_empty(), "{rest:?}");
     assert_eq!(r.tr.turn(), Some(t2));
-    assert!(r.edge(Claimed::Working, 135, true).is_empty());
-    let closed = ops(&r.edge(Claimed::Rested, 300, true), Op::Close, Lvl::Turn);
+    assert!(r.edge(ClaimEdge::Began, 135, true).is_empty());
+    let closed = ops(&r.edge(ClaimEdge::Rested, 300, true), Op::Close, Lvl::Turn);
     assert_eq!(
         closed
             .iter()
@@ -3134,7 +3149,7 @@ pub(crate) fn a_rest_leaves_a_later_vendor_turn_open() {
     let mut sampled = rollout();
     let t2 = sampled.turn();
     sampled.now = 1_200;
-    let rest = sampled.claim(Claimed::Rested);
+    let rest = sampled.claim(ClaimEdge::Rested);
     assert!(rest.is_empty(), "{rest:?}");
     assert_eq!(
         sampled.tr.turn(),
@@ -3146,10 +3161,14 @@ pub(crate) fn a_rest_leaves_a_later_vendor_turn_open() {
     let mut esc = rollout();
     let t2 = esc.turn();
     esc.tx_at(TxEvent::Interrupt, WALL0 + 140);
-    let rest = esc.edge(Claimed::Rested, 125, true);
+    let rest = esc.edge(ClaimEdge::Rested, 125, true);
     assert!(rest.is_empty(), "the earlier turn's rest: {rest:?}");
-    assert!(esc.edge(Claimed::Working, 135, true).is_empty());
-    let closed = ops(&esc.edge(Claimed::Rested, 300, true), Op::Close, Lvl::Turn);
+    assert!(esc.edge(ClaimEdge::Began, 135, true).is_empty());
+    let closed = ops(
+        &esc.edge(ClaimEdge::Rested, 300, true),
+        Op::Close,
+        Lvl::Turn,
+    );
     assert_eq!(
         closed
             .iter()
@@ -3163,15 +3182,15 @@ pub(crate) fn a_rest_leaves_a_later_vendor_turn_open() {
 
 /// A CLAIMED TURN WHOSE END NEVER CAME CLOSES `out=unknown` AT THE NEXT BEGINNING: two engine
 /// beginnings with no end fed between them (the end fell out of the engine's record) close the
-/// first claimed turn there and open the second at that time. NEGATIVE CONTROL: a sampled second
-/// `working` is the turn running, so it keeps one turn.
+/// first claimed turn there and open the second at that time. NEGATIVE CONTROL: a resumed second
+/// `working` (a re-send the engine drew no turn for) is the turn running, so it keeps one turn.
 #[test]
 pub(crate) fn a_claimed_turn_whose_end_never_came_closes_unknown_at_the_next_begin() {
     let mut r = Rig::new();
     r.now = 1_000;
-    r.edge(Claimed::Working, 100, true);
+    r.edge(ClaimEdge::Began, 100, true);
     let t1 = r.turn();
-    let recs = r.edge(Claimed::Working, 500, true);
+    let recs = r.edge(ClaimEdge::Began, 500, true);
     let closed = ops(&recs, Op::Close, Lvl::Turn);
     let opened = ops(&recs, Op::Open, Lvl::Turn);
     assert_eq!(
@@ -3190,16 +3209,16 @@ pub(crate) fn a_claimed_turn_whose_end_never_came_closes_unknown_at_the_next_beg
         [(WALL0 + 500, Src::Engine, Conf::Claim)],
         "{recs:?}"
     );
-    r.edge(Claimed::Rested, 600, true);
+    r.edge(ClaimEdge::Rested, 600, true);
     r.ordered();
 
     let mut sampled = Rig::new();
     sampled.now = 100;
-    sampled.claim(Claimed::Working);
+    sampled.claim(ClaimEdge::Began);
     sampled.now = 500;
     assert!(
-        sampled.claim(Claimed::Working).is_empty(),
-        "NEGATIVE CONTROL: a sampled working is the turn running"
+        sampled.claim(ClaimEdge::Resumed).is_empty(),
+        "NEGATIVE CONTROL: a re-sent working is the turn running"
     );
     assert_eq!(turn_opens(&sampled).len(), 1);
     sampled.ordered();
@@ -3212,18 +3231,18 @@ pub(crate) fn a_claimed_turn_whose_end_never_came_closes_unknown_at_the_next_beg
 pub(crate) fn a_refused_begin_opens_nothing_and_its_end_closes_nothing() {
     let mut r = Rig::new();
     r.now = 1_000;
-    for (c, ms) in [(Claimed::Working, 100), (Claimed::Rested, 117)] {
+    for (c, ms) in [(ClaimEdge::Began, 100), (ClaimEdge::Rested, 117)] {
         let recs = r.edge(c, ms, false);
         assert!(recs.is_empty(), "{c:?}: {recs:?}");
     }
     assert_eq!(r.tr.turn(), None);
     let mut asked = 0;
-    r.tr.claim_edge(&mut r.log, Claimed::Working, at(200), &mut || {
+    r.tr.claim_edge(&mut r.log, ClaimEdge::Began, at(200), &mut || {
         asked += 1;
         true
     });
     assert!(r.tr.turn().is_some() && asked == 1, "asked {asked}");
-    r.edge(Claimed::Rested, 217, true);
+    r.edge(ClaimEdge::Rested, 217, true);
     r.ordered();
 
     let mut taken = Rig::bound_at(TxState::Partial);
@@ -3232,7 +3251,7 @@ pub(crate) fn a_refused_begin_opens_nothing_and_its_end_closes_nothing() {
     let mut asked = 0;
     taken
         .tr
-        .claim_edge(&mut taken.log, Claimed::Working, at(105), &mut || {
+        .claim_edge(&mut taken.log, ClaimEdge::Began, at(105), &mut || {
             asked += 1;
             true
         });
@@ -3253,9 +3272,9 @@ pub(crate) fn a_late_partial_prompt_names_each_edge_dated_turn() {
     r.now = 3_000;
     let mut claimed = Vec::new();
     for (from, to) in [(1_000, 1_017), (2_000, 2_030)] {
-        r.edge(Claimed::Working, from, true);
+        r.edge(ClaimEdge::Began, from, true);
         claimed.push(r.turn());
-        r.edge(Claimed::Rested, to, true);
+        r.edge(ClaimEdge::Rested, to, true);
     }
     r.now = 5_000;
     r.state = TxState::Partial;
@@ -3288,14 +3307,14 @@ pub(crate) fn a_late_partial_prompt_names_each_edge_dated_turn() {
 pub(crate) fn a_carried_claimed_turn_closes_at_an_end_only_edge() {
     let mut r = Rig::new();
     r.now = 100;
-    r.claim(Claimed::Working);
+    r.claim(ClaimEdge::Began);
     let t1 = r.turn();
     r.now = 200;
     let line = r.tr.carry_line(at(r.now));
     r.adopt(&line);
     assert_eq!(r.tr.turn(), Some(t1));
     r.now = 1_000;
-    let closed = ops(&r.edge(Claimed::Rested, 250, true), Op::Close, Lvl::Turn);
+    let closed = ops(&r.edge(ClaimEdge::Rested, 250, true), Op::Close, Lvl::Turn);
     assert_eq!(
         closed
             .iter()

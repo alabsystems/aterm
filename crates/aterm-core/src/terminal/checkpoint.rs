@@ -1787,7 +1787,7 @@ super::checkpoint_heap::no_heap!(PendingRestore);
     reason = "independent transient terminal flags carried across an in-process replay keyframe"
 )]
 struct CapturedCarry {
-    program_state: super::program_state::ProgramStateReport,
+    program_state: super::program_state::ProgramStateRecord,
     shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth,
     foreground_job: bool,
     probe_job_active: bool,

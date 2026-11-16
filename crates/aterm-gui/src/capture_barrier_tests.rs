@@ -516,7 +516,12 @@ fn windowed_image_is_the_presented_destination() {
         (fw, fh),
         "the image is the frame, not the surface"
     );
-    let x0 = usize::try_from(aterm_render::band_offset(fw + 3, fw)).expect("a band");
+    let x0 = usize::try_from(aterm_render::band_offset(
+        fw + 3,
+        fw,
+        aterm_render::SideInsetPx(0),
+    ))
+    .expect("a band");
     let y0 = usize::try_from(aterm_render::band_offset_y(fh + 2, fh)).expect("a band");
     assert!(
         rgba == glass_rgba(&mut app, (x0, y0, fw, fh)),

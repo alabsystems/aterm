@@ -250,9 +250,13 @@ fn recovered_login_preserves_claims_replaced_during_admission() {
                                     .as_deref(),
                                 staging.to_str(),
                             );
-                            for held in [&state.last_attempt, &state.parked, &state.bot_checked] {
+                            for held in [&state.last_attempt, &state.parked] {
                                 assert_eq!(held.contains_key("key"), activity_changed);
                             }
+                            assert_eq!(
+                                state.unrecorded_checks.contains_key("key"),
+                                activity_changed
+                            );
                             assert_eq!(state.activity_owners.contains_key("key"), activity_changed);
                             assert_eq!(state.ladder.has_backoff("key"), ladder_changed);
                             assert_eq!(state.ladder_owners.contains_key("key"), ladder_changed);

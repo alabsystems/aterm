@@ -854,7 +854,7 @@ fn approve(app: &mut App, revision: u64) {
 /// Give every window of `app` a stand-in OS surface with keyboard focus, or take
 /// it away (`App::any_os_window_focused`).
 fn focus(app: &mut App, focused: bool) {
-    for window in app.windows.values_mut() {
+    for mut window in app.windows.values_mut() {
         window.os_window_for_test = focused;
         window.focused = focused;
     }
@@ -1176,7 +1176,8 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
     assert!(app.open_settings_tab(SettingsRoute::Security));
     let wid = crate::WindowId(0);
     let (_, view) = app.active_native_view(wid).unwrap();
-    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.arm_consent_gestures(ConsentGestures::guarded_pane_for_test(|_| {
@@ -1184,6 +1185,7 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
         crate::menu::SettingsOpen::Anchored
     }));
     DIALOG_AVAILABLE.with(|read| read.borrow_mut().clear());
+    drop(route_native_guard);
     app.dispatch_native_view_event(
         wid,
         view,
@@ -1214,12 +1216,14 @@ fn a_security_pages_person_press_transfers_its_dialog_before_recording() {
     });
     assert!(app.open_settings_tab(SettingsRoute::Security));
     let (_, view) = app.active_native_view(wid).unwrap();
-    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.arm_consent_gestures(ConsentGestures::guarded_pane_for_test(|_| {
         crate::menu::SettingsOpen::Anchored
     }));
+    drop(route_native_guard);
     app.dispatch_native_view_event(
         wid,
         view,

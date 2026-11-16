@@ -61,6 +61,7 @@ impl KimiOauth {
             login_drive::Outcome::PageNotOpened(why) | login_drive::Outcome::Unverified(why) => {
                 Execution::Unknown(why)
             }
+            login_drive::Outcome::BotCheck(why) => Execution::BotCheck(why),
             _ => Execution::Unknown("device-local Kimi sign-in did not complete".into()),
         }
     }

@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance: what [`TurnTracker::claim_edge`] and a transcript read `state=partial`
-//! make of two codex-alab turns, against the derived `ClaimedTurnEdges` model
+//! make of two codex-alab turns under the run's turn bucket, against the derived
+//! `ClaimedTurnEdges` model
 //! (`aterm_models_session::claimed_turn_edges_model`, checked at Tier-0 in
 //! `aterm-models/tests/derived_ring_ty.rs`; ATERM-KI-1029-1).
 
@@ -10,7 +11,8 @@ use std::collections::BTreeSet;
 
 use aterm_models_session::claimed_turn_edges_model;
 use aterm_slog::{
-    Claimed, Key, Kind, Log, Node, Op, Rec, ShortId, Src, TurnTracker, TxEvent, TxPos, TxState,
+    ClaimEdge, EdgeOutcome, Key, Kind, Log, Node, Op, Rec, ShortId, Src, TurnTracker, TxEvent,
+    TxPos, TxState,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
@@ -22,11 +24,14 @@ const PROCESS_START: u64 = WALL0 - 60_000;
 const FP: u64 = 0xc0de_0000_0000_7501;
 
 /// The model's steps the walk drives: each is the real call [`World::step`] makes.
-const STEPS: [&str; 9] = [
+const STEPS: [&str; 12] = [
     "Parse",
     "FeedBegin1",
+    "RefuseBegin1",
+    "Resume1",
     "FeedEnd1",
     "FeedBegin2",
+    "RefuseBegin2",
     "FeedEnd2",
     "Prompt1",
     "RowEnd1",
@@ -45,7 +50,8 @@ enum Host {
 }
 
 /// The real tracker and its log, bound to a rollout read `state=partial`, and the driver's
-/// counts: edges parsed (`d`) and fed (`f`), rollout rows read (`p`).
+/// counts: edges parsed (`d`) and fed (`f`), rollout rows read (`p`), and the spans whose
+/// beginning the bucket refused, which the host says (`s`).
 struct World {
     log: Log,
     run: Node,
@@ -53,6 +59,7 @@ struct World {
     d: i64,
     f: i64,
     p: i64,
+    s: [i64; 2],
     off: u64,
 }
 
@@ -67,6 +74,7 @@ impl World {
             d: 0,
             f: 0,
             p: 0,
+            s: [0; 2],
             off: 0,
         };
         let bind = TxEvent::Bind {
@@ -87,10 +95,11 @@ impl World {
         }
     }
 
-    /// An engine edge at its batch time `ms`, the run's bucket granting every token it asks.
-    fn edge(&mut self, claimed: Claimed, ms: u64) {
+    /// An engine edge at its batch time `ms`, the run's bucket granting or refusing (`grant`)
+    /// every token it asks.
+    fn edge(&mut self, edge: ClaimEdge, ms: u64, grant: bool) -> EdgeOutcome {
         self.tr
-            .claim_edge(&mut self.log, claimed, at(ms), &mut || true);
+            .claim_edge(&mut self.log, edge, at(ms), &mut || grant)
     }
 
     /// A rollout row written at `ms` and read a moment later.
@@ -102,22 +111,31 @@ impl World {
     }
 
     /// The real call for the model's `step`, and the model action it is under `host`. Span `j`'s
-    /// beginning is at `j * 1000` ms, its prompt row 3 ms later, its end row at 15 and its end at
-    /// 17.
+    /// beginning is at `j * 1000` ms, its prompt row 3 ms later, its resumed beginning at 8, its
+    /// end row at 15 and its end at 17. A refusal is the bucket answering no, and the host says
+    /// the span's turn it refused.
     fn step(&mut self, step: &'static str, host: Host) -> &'static str {
         let ms = if step.ends_with('1') { 1_000 } else { 2_000 };
         match step {
             "Parse" => self.d += 1,
-            "FeedBegin1" | "FeedBegin2" => {
+            "FeedBegin1" | "FeedBegin2" | "RefuseBegin1" | "RefuseBegin2" => {
                 self.f += 1;
-                if host == Host::NoBeginnings {
+                if host == Host::NoBeginnings && step.starts_with("Feed") {
                     return "BeginUnfed";
                 }
-                self.edge(Claimed::Working, ms);
+                let grant = step.starts_with("Feed");
+                if self.edge(ClaimEdge::Began, ms, grant) == EdgeOutcome::Refused {
+                    self.s[usize::from(ms == 2_000)] = 1;
+                }
+            }
+            // The host that feeds no beginning feeds no resumed one either.
+            "Resume1" if host == Host::NoBeginnings => {}
+            "Resume1" => {
+                let _ = self.edge(ClaimEdge::Resumed, ms + 8, true);
             }
             "FeedEnd1" | "FeedEnd2" => {
                 self.f += 1;
-                self.edge(Claimed::Rested, ms + 17);
+                let _ = self.edge(ClaimEdge::Rested, ms + 17, true);
             }
             "Prompt1" | "Prompt2" => {
                 self.p += 1;
@@ -169,9 +187,27 @@ impl World {
         };
         let untaken: Vec<Node> = self.tr.untaken().collect();
         let mut s = State::new();
-        for (k, v) in [("d", self.d), ("f", self.f), ("p", self.p)] {
+        for (k, v) in [
+            ("d", self.d),
+            ("f", self.f),
+            ("p", self.p),
+            ("s1", self.s[0]),
+            ("s2", self.s[1]),
+        ] {
             s.insert(k, v);
         }
+        let k1 = self
+            .log
+            .window()
+            .filter(|r| {
+                r.op == Op::Open
+                    && r.k == Kind::Turn
+                    && r.par == Some(self.run)
+                    && r.src == Src::Engine
+                    && r.t < WALL0 + 2_000
+            })
+            .count();
+        s.insert("k1", i64::try_from(k1).expect("a count"));
         for (j, (c, x)) in [("c1", "x1"), ("c2", "x2")].into_iter().enumerate() {
             let (cv, cn) = one(&slots[0][j]);
             let (xv, xn) = one(&slots[1][j]);
@@ -246,6 +282,7 @@ fn claimed_turn_edges_conform_to_derived_model() {
     assert_eq!(World::new().project(), m.init_state(), "the walk's start");
     let mut ran = BTreeSet::new();
     let mut held_by = BTreeSet::new();
+    let mut said = false;
     for seed in 1..=400u64 {
         let walked = walk(&m, seed, Host::Feeds).unwrap_or_else(|e| panic!("{e}"));
         assert!(
@@ -256,10 +293,11 @@ fn claimed_turn_edges_conform_to_derived_model() {
         let (_, _, last) = walked.steps.last().expect("a walk takes steps");
         assert_eq!(
             (last["d"], last["f"], last["p"]),
-            (4, 4, 4),
-            "seed {seed}: every edge fed and every row read"
+            (4, 4, if last["s1"] == 1 { 0 } else { 4 }),
+            "seed {seed}: every edge fed and every row read (none of a refused first span's)"
         );
         held_by.insert((last["c1"] > 0, last["c2"] > 0, last["xc2"]));
+        said |= last["s1"] + last["s2"] > 0;
         ran.extend(walked.steps.iter().map(|(a, ..)| *a));
     }
     for a in STEPS {
@@ -269,14 +307,15 @@ fn claimed_turn_edges_conform_to_derived_model() {
         assert!(
             held_by.iter().any(|h| (h.0, h.1) == (c1, c2)),
             "no walk left span 1 to {} and span 2 to {}: {held_by:?}",
-            ["the rollout", "the claim"][usize::from(c1)],
-            ["the rollout", "the claim"][usize::from(c2)],
+            ["no claim", "the claim"][usize::from(c1)],
+            ["no claim", "the claim"][usize::from(c2)],
         );
     }
     assert!(
         held_by.iter().any(|h| h.2 == 1),
         "no walk had the claim close the rollout's second turn"
     );
+    assert!(said, "no walk had the bucket refuse a turn the host said");
 }
 
 #[test]
@@ -299,7 +338,10 @@ fn claimed_turn_edges_conformance_catches_a_host_that_feeds_no_beginning() {
             }
         }
         assert!(
-            walked.broken.iter().all(|law| *law == "EveryFedTurnLogged"),
+            walked
+                .broken
+                .iter()
+                .all(|law| *law == "EveryFedTurnLoggedOrSaid"),
             "seed {seed}: {:?}",
             walked.broken
         );
@@ -311,6 +353,6 @@ fn claimed_turn_edges_conformance_catches_a_host_that_feeds_no_beginning() {
     );
     assert!(
         caught > 0,
-        "NEGATIVE CONTROL: no walk of a host that feeds no beginning broke EveryFedTurnLogged"
+        "NEGATIVE CONTROL: no walk of a host that feeds no beginning broke EveryFedTurnLoggedOrSaid"
     );
 }

@@ -123,7 +123,9 @@ pub enum Owed {
     NameRule,
     /// The root LAN broker's image or plist is missing or not this build's, save an image of the
     /// source's own signing team, which the running broker adopts by itself
-    /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]).
+    /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]), or its job
+    /// is known stopped; never a job launchd lists switched off, which stays the person's
+    /// ([`aterm_uds::lan::install::Reading::owed_with_job`]).
     LanBroker,
     /// Spotlight still indexes a folder of this account's home that setup has never excluded
     /// nor failed to ([`crate::init_spotlight::scope_owed`]).
@@ -337,11 +339,14 @@ pub fn owed(sys: &dyn System) -> Vec<Owed> {
     }
     if crate::items::lan::reading(sys).is_some_and(|reading| {
         reading.is_ok_and(|r| {
-            r.owed_with_running(|| {
-                crate::items::aterm::system_job_pid(sys, aterm_uds::lan::LABEL)
-                    .ok()
-                    .map(|job| matches!(job, Some(Some(_))))
-            })
+            r.owed_with_job(
+                || {
+                    crate::items::aterm::system_job_pid(sys, aterm_uds::lan::LABEL)
+                        .ok()
+                        .map(|job| matches!(job, Some(Some(_))))
+                },
+                || crate::items::lan::switched_off(sys).ok(),
+            )
         })
     }) {
         owed.push(Owed::LanBroker);

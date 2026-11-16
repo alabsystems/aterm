@@ -696,25 +696,26 @@ impl App {
 
     fn invalidate_search_results(&mut self, wid: crate::WindowId, revision_stale: bool) {
         let term = self.front_shown(wid).map(|(term, _)| term);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && let Some(search) = ws.search.as_mut()
-        {
-            search.anchor_to_current();
-            if revision_stale {
-                match search.direction {
-                    SearchDirection::Forward => {
-                        search.anchor_absolute_row = i64::MIN;
-                        search.anchor_col = 0;
-                    }
-                    SearchDirection::Backward => {
-                        search.anchor_absolute_row = i64::MAX;
-                        search.anchor_col = u16::MAX;
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some(search) = ws.routing.search_mut() {
+                search.anchor_to_current();
+                if revision_stale {
+                    match search.direction {
+                        SearchDirection::Forward => {
+                            search.anchor_absolute_row = i64::MIN;
+                            search.anchor_col = 0;
+                        }
+                        SearchDirection::Backward => {
+                            search.anchor_absolute_row = i64::MAX;
+                            search.anchor_col = u16::MAX;
+                        }
                     }
                 }
-            }
-            search.results_dirty = true;
-            if let Some(window) = &ws.os_window {
-                window.request_redraw();
+                search.results_dirty = true;
+                if let Some(window) = &ws.os_window {
+                    window.request_redraw();
+                }
             }
         }
         if let Some(term) = term {
@@ -834,8 +835,9 @@ impl App {
         legacy_from_start: bool,
     ) {
         let Some((term, session)) = self.front_shown(wid) else {
-            if let Some(window) = self.windows.get_mut(&wid) {
-                window.search = None;
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
+                window.routing.set_search(None);
                 window.find_bar_hit = None;
             }
             return;
@@ -849,15 +851,16 @@ impl App {
                 .entry((session, wid))
                 .or_insert(find_origin);
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            if let Some(search) = ws.search.as_mut() {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some(search) = ws.routing.search_mut() {
                 search.direction = direction;
                 if legacy_from_start {
                     search.anchor_absolute_row = i64::MIN;
                     search.anchor_col = 0;
                 }
             } else {
-                ws.search = Some(SearchState {
+                ws.routing.set_search(Some(SearchState {
                     direction,
                     case_sensitive,
                     is_regex,
@@ -868,7 +871,7 @@ impl App {
                     },
                     anchor_col: if legacy_from_start { 0 } else { anchor_col },
                     ..SearchState::default()
-                });
+                }));
             }
         }
         self.search_recompute_in(wid);
@@ -888,7 +891,8 @@ impl App {
         let Some(now) = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.search.as_mut())
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
             .map(|s| {
                 s.case_sensitive = !s.case_sensitive;
                 s.case_sensitive
@@ -914,7 +918,8 @@ impl App {
         let Some(now) = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.search.as_mut())
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
             .map(|s| {
                 s.is_regex = !s.is_regex;
                 s.is_regex
@@ -951,17 +956,22 @@ impl App {
         let (origin, row, col) =
             find_start(&term_lock(&term), direction == SearchDirection::Forward);
         self.find_origins.insert((session, wid), origin);
-        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut())
+        if let Some(route_guard_search) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
             && !matches!(
                 (
-                    search.direction,
-                    search.anchor_absolute_row,
-                    search.anchor_col
+                    route_guard_search.direction,
+                    route_guard_search.anchor_absolute_row,
+                    route_guard_search.anchor_col
                 ),
                 (SearchDirection::Forward, i64::MIN, 0)
                     | (SearchDirection::Backward, i64::MAX, u16::MAX)
             )
         {
+            let search = &mut *route_guard_search;
             search.anchor_absolute_row = row;
             search.anchor_col = col;
         }
@@ -985,11 +995,12 @@ impl App {
         {
             self.note_history_wanted(session);
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let (query, case_sensitive, is_regex, direction, anchor, anchor_is_buffer_edge) =
-            match &ws.search {
+            match ws.search.as_ref() {
                 Some(s) => (
                     s.query.clone(),
                     s.case_sensitive,
@@ -1103,16 +1114,17 @@ impl App {
         #[cfg(test)]
         let consistent = consistent && !FORCE_TORN_SEARCH.with(std::cell::Cell::get);
         if !consistent {
-            if let Some(search) = ws.search.as_mut() {
+            if let Some(search) = ws.routing.search_mut() {
                 search.results_dirty = true;
                 let away = rewrapping && !query.is_empty();
                 search.history_away = away;
                 search.truncated |= away;
             }
+            drop(route_guard_ws);
             self.search_apply_current_in(wid);
             return;
         }
-        if let Some(s) = ws.search.as_mut() {
+        if let Some(s) = ws.routing.search_mut() {
             s.matches = matches;
             s.point_match = None;
             s.match_base_y = base_y;
@@ -1134,6 +1146,7 @@ impl App {
             s.note_match_rows(cols);
             s.anchor_to_current();
         }
+        drop(route_guard_ws);
         self.search_apply_current_in(wid);
     }
 
@@ -1186,7 +1199,7 @@ impl App {
         };
         let rows = ws.rows;
         let (mat, match_base_y, match_revision, match_epoch, match_seq, dirty, search_title) =
-            match &ws.search {
+            match ws.search.as_ref() {
                 Some(s) => (
                     s.current_match(),
                     s.match_base_y,
@@ -1314,7 +1327,13 @@ impl App {
             .point_match
             .as_ref()
             .and_then(|found| map_matches(std::slice::from_ref(found), point.base_y).pop());
-        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
+        if let Some(route_guard_search) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
+        {
+            let search = &mut *route_guard_search;
             search.match_base_y = point.base_y;
             search.match_absolute_row_revision = point.absolute_row_revision;
             search.match_history_renumber_epoch = point.history_renumber_epoch;
@@ -1344,7 +1363,13 @@ impl App {
     }
 
     pub(crate) fn search_step_in(&mut self, wid: crate::WindowId, forward: bool) {
-        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
+        if let Some(route_guard_search) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
+        {
+            let search = &mut *route_guard_search;
             search.direction = SearchDirection::from_forward(forward);
             search.anchor_to_current();
         }
@@ -1369,10 +1394,11 @@ impl App {
             self.search_step_truncated_in(wid, forward);
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && let Some(s) = ws.search.as_mut()
-        {
-            s.step(forward);
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some(s) = ws.routing.search_mut() {
+                s.step(forward);
+            }
         }
         self.search_apply_current_in(wid);
     }
@@ -1440,7 +1466,13 @@ impl App {
             })
             .map(|(_, _, _, row, start, end)| (row, start, end));
         self.search_enter_direction_in(wid, forward);
-        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
+        if let Some(route_guard_search) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
+        {
+            let search = &mut *route_guard_search;
             search.set_query(query);
             if let Some((row, start, _)) = anchor {
                 search.anchor_absolute_row = row;
@@ -1486,7 +1518,13 @@ impl App {
     }
 
     pub(crate) fn search_repeat_in(&mut self, wid: crate::WindowId, forward: bool) {
-        if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
+        if let Some(route_guard_s) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
+        {
+            let s = &mut *route_guard_s;
             s.direction = SearchDirection::from_forward(forward);
         }
         let query_empty = self
@@ -1496,7 +1534,13 @@ impl App {
             .is_some_and(|s| s.query.is_empty());
         let recalled = self.remembered_find().0.to_owned();
         if query_empty && !recalled.is_empty() {
-            if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
+            if let Some(route_guard_s) = self
+                .windows
+                .get_mut(&wid)
+                .as_deref_mut()
+                .and_then(|ws| ws.routing.search_mut())
+            {
+                let s = &mut *route_guard_s;
                 s.set_query(recalled);
                 if forward {
                     s.anchor_absolute_row = i64::MIN;
@@ -1517,7 +1561,8 @@ impl App {
         let Some(changed) = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.search.as_mut())
+            .as_deref_mut()
+            .and_then(|ws| ws.routing.search_mut())
             .map(|search| search.edit(edit))
         else {
             return;
@@ -1715,11 +1760,12 @@ impl App {
     /// Shared find-close core: drop the overlay state (+ its clickable-indicator geometry), optionally clear the selection highlight (accept keeps it on the match), and restore the newest title owned by the remaining authority.
     pub(crate) fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
         let term = self.front_shown(wid).map(|(term, _)| term);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let was_open = ws.search.is_some() || ws.find_bar_hit.is_some();
-        ws.search = None;
+        ws.routing.set_search(None);
         ws.find_bar_hit = None;
         if clear_selection && let Some(term) = term {
             term_lock(&term).text_selection_mut().clear();

@@ -37,9 +37,14 @@
 //!
 //! The successor's seat is the same Mac's, on the same disk, under an age identity of its own.
 //! The log ties the two ([`Lineages`]): the `Admit` carries the name the log gave its signer's
-//! own seat when it came in, no fleet node key and [`Evidence::Manual`]. A person's removal of
-//! the Mac takes every such seat out with it, down the lineage (`super::remove`), so no epoch
-//! minted after a removal is wrapped to a key on the removed Mac's disk.
+//! own seat when it came in, no fleet node key and [`Evidence::Manual`]. Every removal of the
+//! Mac that this build signs takes every such seat out with it, down the lineage
+//! (`super::remove::successors_of`), so no epoch that removal mints is wrapped to a key on the
+//! removed Mac's disk: a person's `aterm members remove`, the admin's `aterm secrets revoke`
+//! and `retire`, which name the Mac by its age recipient alone, and an admin's edit that puts
+//! the Mac's key on a `code-only` line. A `Remove` an earlier release signed took the Mac's
+//! seats alone, and its successors stay members until a later removal takes them out
+//! (ATERM-KI-1111-41).
 
 use super::admit::{
     HandedVault, LogAdmission, held_audiences, held_log, kept_out, labels_taken, log_bundle,

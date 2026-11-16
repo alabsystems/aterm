@@ -72,13 +72,13 @@ fn cancel_is_bound_to_attempt_and_session() {
     let bytes = Cancel { binding: minted }.encode().unwrap();
     assert!(Cancel::decode(&bytes, &b).is_err());
 }
-/// A binding's session is a tab ID in either form `TabId::parse` reads, exactly what the host's
+/// A binding's session is a local ID in either form `Sid::parse` reads, exactly what the host's
 /// journal can name its file by, so nothing the wire admits is refused later in the pipeline.
 /// NEGATIVE CONTROL: a malformed ID of each form is refused on encode and on decode, including
 /// an `s-` ID of other than 20 hex digits, which the earlier wire rule (`s-` and 1 to 62 hex)
 /// admitted and the journal then refused.
 #[test]
-fn a_binding_session_is_a_tab_id_in_either_form() {
+fn a_binding_session_is_an_exact_local_session_id() {
     for session in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
         let mut s = sample();
         s.binding.session = session.into();

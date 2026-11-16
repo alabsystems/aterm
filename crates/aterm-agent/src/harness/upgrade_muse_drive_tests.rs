@@ -244,8 +244,8 @@ impl Kernel for Script {
         }
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        Some((1, "launchd".to_string()))
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(Some((1, "launchd".to_string())))
     }
 
     fn process_start(&self, pid: u32) -> Option<String> {
@@ -1619,6 +1619,7 @@ fn the_gate_reads_the_composer_past_a_drawn_caret_as_the_loop_does() {
         generation: None,
         human: crate::supervise::screen::HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let caret_cell = "OK a 111318 d0d0d0 inverse";
@@ -1676,6 +1677,7 @@ fn the_gate_reads_the_cursor_as_the_loop_does() {
         generation: None,
         human: crate::supervise::screen::HumanInput::Never,
         title: None,
+        program_report: None,
         human_seq: None,
     };
     for (rows, cursor, empty) in [

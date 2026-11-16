@@ -1145,6 +1145,133 @@ fn an_unreadable_log_prevents_conclusion_and_ratchet_changes() {
 }
 
 #[test]
+fn floor_inputs_preserve_text_and_true_absence() {
+    let scratch = crate::test_scratch_dir("optional-floor-inputs");
+    let ratchet = scratch.path().join("floors.tsv");
+    let missing = FloorInputs::read(&ratchet).unwrap();
+    assert_eq!((missing.ratchet, missing.backstops), (None, None));
+    let floor = "\n# retained formatting\nalpha\t3\t9\told prover\t\n";
+    fs::write(&ratchet, floor).unwrap();
+    let inputs = FloorInputs::read(&ratchet).unwrap();
+    assert_eq!(inputs.ratchet.as_deref(), Some(floor));
+    assert_eq!(inputs.backstops, None);
+    let history = "# a legacy floor may have no head row\n";
+    fs::write(backstops_beside(&ratchet), history).unwrap();
+    let inputs = FloorInputs::read(&ratchet).unwrap();
+    assert_eq!(inputs.backstops.as_deref(), Some(history));
+    assert_eq!(floor_run(inputs.backstops.as_deref(), "alpha"), None);
+}
+
+#[test]
+fn unreadable_floor_inputs_prevent_measurement_and_publication() {
+    for update in [Update::NONE, Update::RAISE] {
+        for target in [RATCHET, BACKSTOPS] {
+            for directory in [false, true] {
+                let w = World::new("unreadable-floor-inputs");
+                w.commit(&[
+                    (RATCHET, &format!("alpha\t3\t21\t{DRV}\n")),
+                    (BACKSTOPS, "alpha\t-\tcancelled\t0\n"),
+                ]);
+                let logs = w.root.join("logs");
+                fs::create_dir(&logs).unwrap();
+                fs::write(logs.join("alpha@1.0.0.log"), DONE).unwrap();
+                fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
+                let broken = w.work().join(target);
+                if directory {
+                    fs::remove_file(&broken).unwrap();
+                    fs::create_dir(&broken).unwrap();
+                    fs::write(broken.join("unowned"), "retained").unwrap();
+                } else {
+                    fs::write(&broken, [0xff]).unwrap();
+                }
+                let other = w.work().join(if target == RATCHET {
+                    BACKSTOPS
+                } else {
+                    RATCHET
+                });
+                let other_before = fs::read(&other).unwrap();
+                let mut plan = Plan::parse(&format!(
+                    "{PLAN_MAGIC}\nlogdir {}\nratchet {}\nstore {}\nfile \ncrate alpha\talpha@1.0.0\tgate\n",
+                    logs.display(), w.work().join(RATCHET).display(), w.store().display(),
+                )).unwrap();
+                let before = plan.facts.clone();
+                let error = conclude(&w.cli(), &w.work(), &mut plan, update).unwrap_err();
+                assert!(error.0.contains(target), "{error}");
+                assert_eq!(
+                    plan.facts, before,
+                    "no measurement is committed before policy inputs read"
+                );
+                assert!(!w.store().exists(), "no facts were filed");
+                assert_eq!(fs::read(&other).unwrap(), other_before);
+                if directory {
+                    assert_eq!(
+                        fs::read_to_string(broken.join("unowned")).unwrap(),
+                        "retained"
+                    );
+                } else {
+                    assert_eq!(fs::read(&broken).unwrap(), [0xff]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_judge_rejects_present_unreadable_floor_inputs_before_writing() {
+    for update in [false, true] {
+        for target in [RATCHET, BACKSTOPS] {
+            for directory in [false, true] {
+                let w = World::new("judge-unreadable-floor-inputs");
+                let a = w.prover("a");
+                let head = w.commit(&[
+                    ("src/lib.rs", "v1"),
+                    (RATCHET, &floor(3)),
+                    (BACKSTOPS, "alpha\t-\tcancelled\t0\n"),
+                ]);
+                let facts = w.file(&head, &a, 5, 9);
+                let facts_before = fs::read(&facts).unwrap();
+                let broken = w.work().join(target);
+                if directory {
+                    fs::remove_file(&broken).unwrap();
+                    fs::create_dir(&broken).unwrap();
+                    fs::write(broken.join("unowned"), "retained").unwrap();
+                } else {
+                    fs::write(&broken, [0xff]).unwrap();
+                }
+                let other = w.work().join(if target == RATCHET {
+                    BACKSTOPS
+                } else {
+                    RATCHET
+                });
+                let other_before = fs::read(&other).unwrap();
+                assert_eq!(
+                    run_cmd(
+                        &w.work(),
+                        TrustCmd::Judge {
+                            commit: "HEAD".into(),
+                            prover: Some(a.bin.clone()),
+                            update,
+                            reason: None
+                        }
+                    ),
+                    2
+                );
+                assert_eq!(fs::read(&facts).unwrap(), facts_before);
+                assert_eq!(fs::read(&other).unwrap(), other_before);
+                if directory {
+                    assert_eq!(
+                        fs::read_to_string(broken.join("unowned")).unwrap(),
+                        "retained"
+                    );
+                } else {
+                    assert_eq!(fs::read(&broken).unwrap(), [0xff]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_trust_verbs_answer_three_ways() {
     let w = World::new("cli");
     let a = w.prover("a");
@@ -1181,7 +1308,7 @@ fn the_trust_verbs_answer_three_ways() {
     assert_eq!(working(), measured);
     let w = World::new("cli-first");
     let a = w.prover("a");
-    let head = w.commit(&[("src/lib.rs", "v1"), (RATCHET, "")]);
+    let head = w.commit(&[("src/lib.rs", "v1"), (MEMORY, "# no observations\n")]);
     w.file(&head, &a, 5, 9);
     let judge_cmd = |update| TrustCmd::Judge {
         commit: "HEAD".into(),
@@ -1189,6 +1316,8 @@ fn the_trust_verbs_answer_three_ways() {
         update,
         reason: None,
     };
+    assert!(!w.work().join(RATCHET).exists());
+    assert!(!w.work().join(BACKSTOPS).exists());
     assert_eq!(run_cmd(&w.work(), judge_cmd(false)), 1, "NO-FLOOR");
     assert_eq!(run_cmd(&w.work(), judge_cmd(true)), 0);
     assert_eq!(

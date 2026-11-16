@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use aterm_bootstrap_verify::pin::WindowsPin;
 use aterm_uds::spawnfd::{Child, Command};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -57,6 +58,32 @@ fn installer() -> PathBuf {
     aterm_tempfile::manifest_dir()
         .join("../..")
         .join(crate::site::INSTALLER_SOURCE)
+}
+
+fn windows_installer() -> PathBuf {
+    aterm_tempfile::manifest_dir()
+        .join("../..")
+        .join(crate::site::WINDOWS_INSTALLER_SOURCE)
+}
+
+/// A pin of [`SLUG`]'s release verifier.
+fn windows_pin() -> WindowsPin {
+    WindowsPin {
+        repo: SLUG.into(),
+        tag: "v0.63.0".into(),
+        x86_64: "cd".repeat(32),
+    }
+}
+
+/// The shipped get-aterm.ps1 with `pin` in place of its own, line ends as git checks it out.
+fn windows_installer_pinned(pin: &WindowsPin) -> String {
+    pin.rewrite(&read(&windows_installer()).replace("\r\n", "\n"))
+        .unwrap()
+}
+
+/// The public commit's get-aterm.ps1 made `text`.
+fn write_windows_installer(src: &Path, text: &str) {
+    std::fs::write(src.join(crate::site::WINDOWS_INSTALLER_SOURCE), text).unwrap();
 }
 
 fn read(path: &Path) -> String {
@@ -252,13 +279,32 @@ enum Call {
     Deploy(Deployed),
 }
 
-/// How the fixture world starts the sync's children: as they are, except that a signal
-/// (SIGTERM) can arrive while a chosen git subcommand runs — after which, as under the
-/// release, nothing more starts.
+/// Repository reads whose failure must not authorize a sync decision.
+#[derive(Clone, Copy)]
+enum UnreadGit {
+    SourceStatus,
+    StagedDiff { after_add: bool },
+    CurrentBranch,
+    Upstream,
+    UnpushedHistory,
+    LiveEngine,
+    StatusAfterPull,
+    StatusAfterPush,
+}
+
+/// Starts children normally, with injected interruptions or unavailable repository reads.
 #[derive(Default)]
 struct Signals {
     during: Option<&'static str>,
     caught: Cell<Option<i32>>,
+    pushed: Cell<bool>,
+    pulled: Cell<bool>,
+    added: Cell<bool>,
+    unread: Option<UnreadGit>,
+    engine_reads: Cell<usize>,
+    rewrite_before_pull: Option<PathBuf>,
+    block_owed_write: Option<PathBuf>,
+    block_in_flight_removal: Option<PathBuf>,
 }
 
 impl Launch for Signals {
@@ -273,7 +319,87 @@ impl Launch for Signals {
                 "not started: interrupted",
             ));
         }
+        let git = cmd.get_program() == aterm_uds::os_path!("git");
+        let engine_read = git
+            && cmd.get_args().any(|arg| arg == "show")
+            && cmd
+                .get_args()
+                .any(|arg| arg == "HEAD:./assets/term/ENGINE_SOURCE");
+        let unread = git
+            && match self.unread {
+                Some(UnreadGit::SourceStatus) => {
+                    cmd.get_args().any(|arg| arg == "status")
+                        && cmd
+                            .get_args()
+                            .nth(1)
+                            .is_some_and(|dir| Path::new(dir).ends_with("clone"))
+                }
+                Some(UnreadGit::CurrentBranch) => cmd.get_args().any(|arg| arg == "symbolic-ref"),
+                Some(UnreadGit::StagedDiff { after_add }) => {
+                    self.added.get() == after_add
+                        && cmd.get_args().any(|arg| arg == "diff")
+                        && cmd.get_args().any(|arg| arg == "--cached")
+                        && cmd.get_args().any(|arg| arg == "--quiet")
+                }
+                Some(UnreadGit::Upstream) => {
+                    cmd.get_args().any(|arg| arg == "rev-parse")
+                        && cmd
+                            .get_args()
+                            .any(|arg| arg == "refs/remotes/origin/main^{commit}")
+                }
+                Some(UnreadGit::UnpushedHistory) => {
+                    cmd.get_args().any(|arg| arg == "log")
+                        && cmd.get_args().any(|arg| arg == "--format=%h")
+                }
+                Some(UnreadGit::LiveEngine) => engine_read && self.engine_reads.get() > 0,
+                Some(UnreadGit::StatusAfterPull) => {
+                    self.pulled.get() && cmd.get_args().any(|arg| arg == "status")
+                }
+                Some(UnreadGit::StatusAfterPush) => {
+                    self.pushed.get() && cmd.get_args().any(|arg| arg == "status")
+                }
+                None => false,
+            };
+        if engine_read {
+            self.engine_reads.set(self.engine_reads.get() + 1);
+        }
+        if unread {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture: repository evidence is unread",
+            ));
+        }
+        if git
+            && cmd.get_args().any(|arg| arg == "pull")
+            && let Some(path) = &self.rewrite_before_pull
+        {
+            let mut page = std::fs::read(path)?;
+            page.extend_from_slice(b"\n<!-- changed after staging -->\n");
+            std::fs::write(path, page)?;
+        }
+        if git
+            && cmd.get_args().any(|arg| arg == "commit")
+            && let Some(path) = &self.block_owed_write
+        {
+            std::fs::create_dir(path)?;
+        }
+        if git
+            && cmd.get_args().any(|arg| arg == "commit")
+            && let Some(path) = &self.block_in_flight_removal
+        {
+            std::fs::remove_file(path)?;
+            std::fs::create_dir(path)?;
+        }
         let child = cmd.spawn()?;
+        if git && cmd.get_args().any(|arg| arg == "add") {
+            self.added.set(true);
+        }
+        if git && cmd.get_args().any(|arg| arg == "push") {
+            self.pushed.set(true);
+        }
+        if git && cmd.get_args().any(|arg| arg == "pull") {
+            self.pulled.set(true);
+        }
         let during = self.during.is_some_and(|sub| {
             cmd.get_program() == aterm_uds::os_path!("git") && cmd.get_args().any(|a| a == sub)
         });
@@ -295,6 +421,7 @@ struct Fake {
     engine: EngineFault,
     /// A concurrent configuration commit while the engine builds.
     hosting_update: Option<(PathBuf, String)>,
+    block_owed_removal: Option<PathBuf>,
     deploy: Deploy,
     git: Git,
     signals: Rc<Signals>,
@@ -496,6 +623,10 @@ impl World for Fake {
             )
             .unwrap();
         }
+        if let Some(path) = &self.block_owed_removal {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+        }
         Ok(Released {
             release: "sites/fixture-site/releases/r1".into(),
             version,
@@ -628,6 +759,7 @@ impl Lab {
         let src = self.root.join(format!("public-src-{}", self.generation));
         std::fs::create_dir_all(src.join("crates/aterm-wasm")).unwrap();
         std::fs::create_dir_all(src.join("tools")).unwrap();
+        std::fs::create_dir_all(src.join("apps/aterm-win")).unwrap();
         std::fs::write(
             src.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/aterm-wasm\"]\n\n[workspace.package]\nversion = \"0.64.0\"\n",
@@ -635,6 +767,9 @@ impl Lab {
         .unwrap();
         aterm_tempfile::copy_to_new_file(installer(), src.join(crate::site::INSTALLER_SOURCE))
             .unwrap();
+        // The shipped script with an empty pin, whatever pin it ships with: the site serves no
+        // /get-aterm.ps1 unless a test pins one.
+        write_windows_installer(&src, &windows_installer_pinned(&WindowsPin::default()));
         std::fs::write(
             src.join("crates/aterm-wasm/Cargo.toml"),
             format!(
@@ -747,6 +882,7 @@ impl Lab {
             home: self.root.join("home"),
             engine: EngineFault::None,
             hosting_update: None,
+            block_owed_removal: None,
             deploy: Deploy::Ok,
             git: self.git.clone(),
             signals: Rc::default(),
@@ -1565,6 +1701,362 @@ fn no_deploy_commits_and_pushes_only() {
 }
 
 #[test]
+fn a_page_changed_after_staging_never_reaches_the_remote() {
+    let lab = Lab::new();
+    let remote = lab.origin_main();
+    let page = lab.site.join("public/terminal.html");
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        rewrite_before_pull: Some(page.clone()),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    refused(ended, &out, Refusal::Uncaptured);
+    assert!(world.deploys().is_empty());
+    assert_eq!(
+        lab.origin_main(),
+        remote,
+        "uncaptured pages must stop the push"
+    );
+    assert_ne!(lab.head(), remote, "the local commit stays recoverable");
+    assert!(read(&page).contains("changed after staging"));
+    assert!(lab.owed_marker().is_file());
+
+    lab.git
+        .ok(&lab.site, &["restore", "--", "public/terminal.html"]);
+    let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+    deployed(&ended, &out);
+    assert_eq!(lab.head(), lab.origin_main());
+}
+
+#[test]
+fn a_deployed_site_reports_pending_marker_retirement_failure() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.block_owed_removal = Some(lab.owed_marker());
+    let (ended, out) = lab.run(&mut world);
+    refused(ended, &out, Refusal::Io);
+    assert_eq!(
+        world.deploys().len(),
+        1,
+        "hosting already accepted the release"
+    );
+    assert_eq!(lab.head(), lab.origin_main());
+    assert_eq!(
+        read(&lab.live.join("index.html")),
+        read(&lab.site.join("public/index.html"))
+    );
+    assert!(lab.owed_marker().is_dir());
+
+    std::fs::remove_dir(lab.owed_marker()).unwrap();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    assert!(synced(&ended, &out));
+    assert!(
+        world.deploys().is_empty(),
+        "the successful deployment needs no retry"
+    );
+}
+
+#[test]
+fn an_unretired_in_flight_marker_keeps_the_commit_local() {
+    let lab = Lab::new();
+    let remote = lab.origin_main();
+    let marker = lab.site_root.join(".git").join(crate::site::IN_FLIGHT_MARK);
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        block_in_flight_removal: Some(marker.clone()),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(world.deploys().is_empty(), "{out}");
+    refused(ended, &out, Refusal::Io);
+    assert_ne!(lab.head(), remote, "the committed pages stay recoverable");
+    assert_eq!(lab.origin_main(), remote);
+    assert!(
+        marker.is_dir(),
+        "failed cleanup must preserve the obstruction"
+    );
+
+    std::fs::remove_dir(&marker).unwrap();
+    let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+    deployed(&ended, &out);
+    assert_eq!(lab.head(), lab.origin_main());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn an_unwritten_deployment_marker_keeps_the_commit_local() {
+    let lab = Lab::new();
+    let remote = lab.origin_main();
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        block_owed_write: Some(lab.owed_marker()),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(world.deploys().is_empty(), "{out}");
+    refused(ended, &out, Refusal::Io);
+    assert_ne!(lab.head(), remote, "the commit is available for recovery");
+    assert_eq!(
+        lab.origin_main(),
+        remote,
+        "publishing requires recovery state"
+    );
+
+    std::fs::remove_dir(lab.owed_marker()).unwrap();
+    let opts = Options {
+        no_deploy: true,
+        ..Options::default()
+    };
+    let (ended, out) = lab.sync(&opts, &lab.env(), &mut lab.fake("releases-fat.json"));
+    assert_eq!(ended, Ok(Outcome::NoDeploy), "{out}");
+    assert_eq!(lab.head(), lab.origin_main());
+    assert!(
+        lab.owed_marker().is_file(),
+        "recovery must record the pending deployment"
+    );
+    let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+    deployed(&ended, &out);
+    assert_eq!(lab.head(), lab.origin_main());
+    assert!(!lab.owed_marker().exists());
+}
+
+#[test]
+fn a_tag_named_like_the_site_branch_does_not_change_the_publication_destination() {
+    at_once(["main", "site-preview"], |branch| {
+        let lab = Lab::new();
+        let before = lab.head();
+        let branch_ref = format!("refs/heads/{branch}");
+        let tag_ref = format!("refs/tags/{branch}");
+        if branch != "main" {
+            lab.git
+                .ok(&lab.site_root, &["checkout", "-b", branch, "--quiet"]);
+            lab.git.ok(
+                &lab.site_root,
+                &["push", "origin", &format!("HEAD:{branch_ref}")],
+            );
+        }
+        lab.git.ok(&lab.site_root, &["tag", branch]);
+        lab.git.ok(&lab.site_root, &["push", "origin", &tag_ref]);
+        let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+        deployed(&ended, &out);
+        let after = lab.head();
+        assert_ne!(after, before);
+        assert_eq!(lab.git.ok(&lab.origin, &["rev-parse", &branch_ref]), after);
+        assert_eq!(lab.git.ok(&lab.origin, &["rev-parse", &tag_ref]), before);
+        assert_eq!(lab.git.ok(&lab.site_root, &["rev-parse", &tag_ref]), before);
+        if branch != "main" {
+            assert_eq!(
+                lab.origin_main(),
+                before,
+                "publishing a preview leaves main alone"
+            );
+        }
+        assert!(lab.status().is_empty());
+    });
+}
+
+#[test]
+fn an_unknown_site_branch_never_defaults_to_publishing_main() {
+    at_once([false, true], |detached| {
+        let lab = Lab::new();
+        let before = lab.head();
+        let mut world = lab.fake("releases-fat.json");
+        if detached {
+            lab.git
+                .ok(&lab.site_root, &["checkout", "--detach", "--quiet"]);
+        } else {
+            lab.git.ok(
+                &lab.site_root,
+                &["checkout", "-b", "site-preview", "--quiet"],
+            );
+            world.signals = Rc::new(Signals {
+                unread: Some(UnreadGit::CurrentBranch),
+                ..Signals::default()
+            });
+        }
+        let (ended, out) = lab.run(&mut world);
+        assert!(
+            world.builds().is_empty() && world.deploys().is_empty(),
+            "{out}"
+        );
+        assert!(matches!(
+            failure(ended, &out),
+            Failure::Child {
+                child: "git symbolic-ref",
+                ..
+            }
+        ));
+        assert_eq!(lab.head(), before);
+        assert_eq!(lab.origin_main(), before);
+        assert!(lab.status().is_empty());
+        assert!(!lab.owed_marker().exists());
+    });
+}
+
+#[test]
+fn an_unread_staged_diff_never_authorizes_a_commit() {
+    at_once([false, true], |after_add| {
+        let lab = Lab::new();
+        let head = lab.head();
+        let mut world = lab.fake("releases-fat.json");
+        world.signals = Rc::new(Signals {
+            unread: Some(UnreadGit::StagedDiff { after_add }),
+            ..Signals::default()
+        });
+        let (ended, out) = lab.run(&mut world);
+        assert!(matches!(
+            failure(ended, &out),
+            Failure::Child {
+                child: "git diff",
+                ..
+            }
+        ));
+        assert_eq!(lab.head(), head);
+        assert_eq!(lab.origin_main(), head);
+        assert!(world.deploys().is_empty());
+        if after_add {
+            assert!(!lab.status().is_empty());
+            let mut world = lab.fake("releases-fat.json");
+            let (ended, out) = lab.run(&mut world);
+            deployed(&ended, &out);
+            assert_eq!(lab.status(), "");
+        } else {
+            assert!(world.builds().is_empty());
+            assert_eq!(lab.status(), "");
+        }
+    });
+}
+
+#[test]
+fn unread_source_status_never_builds_or_publishes() {
+    let lab = Lab::new();
+    let before = lab.head();
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        unread: Some(UnreadGit::SourceStatus),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(world.builds().is_empty(), "{out}");
+    assert!(world.deploys().is_empty(), "{out}");
+    assert!(matches!(
+        failure(ended, &out),
+        Failure::Child {
+            child: "git status",
+            ..
+        }
+    ));
+    assert_eq!(lab.head(), before);
+    assert_eq!(lab.origin_main(), before);
+    assert!(lab.status().is_empty());
+}
+
+#[test]
+fn unread_unpushed_history_never_deploys_a_local_only_commit() {
+    at_once(
+        [UnreadGit::Upstream, UnreadGit::UnpushedHistory],
+        |unread| {
+            let lab = Lab::new();
+            lab.refuse_pushes(true);
+            let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+            assert!(matches!(
+                failure(ended, &out),
+                Failure::Child {
+                    child: "git push",
+                    ..
+                }
+            ));
+            let local = lab.head();
+            let remote = lab.origin_main();
+            assert_ne!(local, remote);
+            lab.refuse_pushes(false);
+            let mut world = lab.fake("releases-fat.json");
+            world.signals = Rc::new(Signals {
+                unread: Some(unread),
+                ..Signals::default()
+            });
+            let (ended, out) = lab.run(&mut world);
+            assert!(world.deploys().is_empty(), "{out}");
+            let expected = match unread {
+                UnreadGit::Upstream => "git rev-parse",
+                UnreadGit::UnpushedHistory => "git log",
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(failure(ended, &out), Failure::Child { child, .. } if child == expected)
+            );
+            assert_eq!(lab.head(), local);
+            assert_eq!(lab.origin_main(), remote);
+            assert!(lab.owed_marker().exists());
+
+            let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
+            deployed(&ended, &out);
+            assert_eq!(lab.head(), lab.origin_main());
+        },
+    );
+}
+
+#[test]
+fn unread_live_engine_commit_never_reports_a_verified_deployment() {
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        unread: Some(UnreadGit::LiveEngine),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert_eq!(world.deploys().len(), 1, "the fault follows deployment");
+    assert!(matches!(
+        failure(ended, &out),
+        Failure::Child {
+            child: "git show",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn unread_publication_status_preserves_the_pending_commit_at_each_boundary() {
+    at_once(
+        [UnreadGit::StatusAfterPull, UnreadGit::StatusAfterPush],
+        |unread| {
+            let lab = Lab::new();
+            let remote = lab.origin_main();
+            let mut world = lab.fake("releases-fat.json");
+            world.signals = Rc::new(Signals {
+                unread: Some(unread),
+                ..Signals::default()
+            });
+            let (ended, out) = lab.run(&mut world);
+            assert!(world.deploys().is_empty(), "{out}");
+            assert!(matches!(
+                failure(ended, &out),
+                Failure::Child {
+                    child: "git status",
+                    ..
+                }
+            ));
+            assert_ne!(lab.head(), remote, "the new commit remains available");
+            match unread {
+                UnreadGit::StatusAfterPull => assert_eq!(lab.origin_main(), remote),
+                UnreadGit::StatusAfterPush => assert_eq!(lab.head(), lab.origin_main()),
+                _ => unreachable!(),
+            }
+            assert!(lab.owed_marker().is_file(), "deployment remains owed");
+
+            let mut world = lab.fake("releases-fat.json");
+            let (ended, out) = lab.run(&mut world);
+            deployed(&ended, &out);
+            assert_eq!(world.deploys().len(), 1);
+            assert_eq!(lab.head(), lab.origin_main());
+            assert!(!lab.owed_marker().exists());
+        },
+    );
+}
+
+#[test]
 fn an_interrupt_starts_nothing_further() {
     let lab = Lab::new();
     let mut world = lab.fake("releases-fat.json");
@@ -1620,6 +2112,94 @@ fn an_interrupt_starts_nothing_further() {
         0
     );
     assert_eq!((lab.head(), lab.status()), (before, String::new()));
+}
+
+#[test]
+fn an_invalid_recovery_marker_preserves_interrupted_work() {
+    let cases = [b"\xff".as_slice(), b"", b" \n\t"]
+        .into_iter()
+        .flat_map(|marker| [true, false].map(|pending| (marker, pending)));
+    at_once(cases, |(marker, pending)| {
+        let lab = Lab::new();
+        let before = lab.head();
+        let page = lab.site.join("public/index.html");
+        let dirty = read(&page) + "<!-- interrupted work -->\n";
+        std::fs::write(&page, &dirty).unwrap();
+        let in_flight = lab.site_root.join(".git").join(crate::site::IN_FLIGHT_MARK);
+        let invalid = if pending {
+            std::fs::write(&in_flight, &lab.public_sha).unwrap();
+            lab.owed_marker()
+        } else {
+            in_flight.clone()
+        };
+        std::fs::write(&invalid, marker).unwrap();
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        assert_eq!(
+            read(&page),
+            dirty,
+            "invalid recovery state cannot authorize a restore"
+        );
+        refused(ended, &out, Refusal::Io);
+        assert!(world.builds().is_empty() && world.deploys().is_empty());
+        assert_eq!(lab.head(), before);
+        assert_eq!(lab.origin_main(), before);
+        assert!(in_flight.is_file());
+        assert_eq!(std::fs::read(invalid).unwrap(), marker);
+    });
+}
+
+#[test]
+fn interrupted_recovery_restores_staged_changes_hidden_by_the_worktree() {
+    let lab = Lab::new();
+    let page = lab.site.join("public/index.html");
+    let original = read(&page);
+    std::fs::write(&page, original.clone() + "<!-- interrupted stage -->\n").unwrap();
+    lab.git.ok(&lab.site, &["add", "public/index.html"]);
+    std::fs::write(&page, original).unwrap();
+    let marker = lab.site_root.join(".git").join(crate::site::IN_FLIGHT_MARK);
+    std::fs::write(&marker, &lab.public_sha).unwrap();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert_eq!(lab.status(), "");
+    assert!(!read(&page).contains("interrupted stage"));
+    assert!(!marker.exists());
+}
+
+#[test]
+fn interrupted_recovery_restores_git_quoted_owned_paths() {
+    let lab = Lab::new();
+    let paths = ["aterm_wasm.café", "aterm_wasm.spaced [1]"];
+    for name in paths {
+        std::fs::write(lab.site.join("public/assets/term").join(name), "original\n").unwrap();
+    }
+    lab.git
+        .commit_all(&lab.site_root, "fixture: quoted engine paths");
+    lab.git.ok(
+        &lab.site_root,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    for name in paths {
+        std::fs::write(
+            lab.site.join("public/assets/term").join(name),
+            "interrupted\n",
+        )
+        .unwrap();
+    }
+    let marker = lab.site_root.join(".git").join(crate::site::IN_FLIGHT_MARK);
+    std::fs::write(&marker, &lab.public_sha).unwrap();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    for name in paths {
+        assert_eq!(
+            read(&lab.site.join("public/assets/term").join(name)),
+            "original\n"
+        );
+    }
+    assert_eq!(lab.status(), "");
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -1724,6 +2304,33 @@ fn a_live_site_that_cannot_be_fetched_is_unchecked_never_synced() {
         Ok(Outcome::LiveUnchecked { deployed: false }),
         "{out}"
     );
+}
+
+#[test]
+fn an_empty_live_engine_source_never_verifies_the_site() {
+    at_once(["", " \n\t"], |served| {
+        let lab = Lab::new();
+        let mut world = lab.fake("releases-fat.json");
+        let (ended, out) = lab.run(&mut world);
+        deployed(&ended, &out);
+        std::fs::write(lab.live.join("assets/term/ENGINE_SOURCE"), served).unwrap();
+        world.calls.clear();
+        let (ended, out) = lab.run(&mut world);
+        assert_eq!(
+            ended,
+            Ok(Outcome::LiveDisagrees {
+                deployed: false,
+                why: vec![Disagreement::EngineNotCommitted {
+                    served: String::new(),
+                    committed: lab.public_sha.clone(),
+                }],
+            }),
+            "{out}"
+        );
+        assert!(world.deploys().is_empty());
+        assert_eq!(crate::site::report(&ended), 4);
+        assert!(crate::release_steps::site_outcome(&ended, Vec::new()).is_err());
+    });
 }
 
 #[test]
@@ -2283,15 +2890,8 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
         .ok(&lab.site_root, &["remote", "set-url", "origin", &nowhere]);
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);
-    let (child, why) = failed_child(ended, &out);
+    let (child, _) = failed_child(ended, &out);
     assert_eq!(child, "git pull");
-    assert!(
-        why.contains(&format!(
-            "Resolve the pull by hand, and do not push: (cd {} && git pull --rebase origin main)",
-            lab.site_root.display()
-        )),
-        "{why}"
-    );
     assert!(world.deploys().is_empty());
     let git_dir = lab.site_root.join(".git");
     assert!(!git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists());
@@ -2299,7 +2899,7 @@ fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_on
         .ok(&lab.site_root, &["remote", "set-url", "origin", &origin]);
     lab.git.ok(
         &lab.site_root,
-        &["pull", "-q", "--rebase", "origin", "main"],
+        &["pull", "-q", "--rebase", "origin", "refs/heads/main"],
     );
     let mut env = lab.env();
     env.commit = None;
@@ -2536,6 +3136,48 @@ fn an_installer_the_site_cannot_serve_is_refused_before_anything_is_written() {
             },
             "does not declare OFFICIAL_REPO_SLUG=\"alabsystems/aterm\"",
         ),
+        (
+            "no windows installer",
+            |src: &Path| {
+                std::fs::remove_file(src.join(crate::site::WINDOWS_INSTALLER_SOURCE)).unwrap();
+            },
+            "the public commit has no readable apps/aterm-win/get-aterm.ps1 to serve as \
+             /get-aterm.ps1",
+        ),
+        (
+            "another windows channel",
+            |src: &Path| {
+                let text = windows_installer_pinned(&windows_pin()).replacen(
+                    "[string]$Repo = \"alabsystems/aterm\"",
+                    "[string]$Repo = \"someone-else/aterm\"",
+                    1,
+                );
+                write_windows_installer(src, &text);
+            },
+            "does not declare [string]$Repo = \"alabsystems/aterm\"",
+        ),
+        (
+            "another repository's verifier",
+            |src: &Path| {
+                let pin = WindowsPin {
+                    repo: "someone-else/aterm".into(),
+                    ..windows_pin()
+                };
+                write_windows_installer(src, &windows_installer_pinned(&pin));
+            },
+            "pins the release verifier of someone-else/aterm, not of alabsystems/aterm",
+        ),
+        (
+            "a malformed verifier pin",
+            |src: &Path| {
+                let text = windows_installer_pinned(&windows_pin()).replace(
+                    "$AtermVerifierTag = \"v0.63.0\"",
+                    "$AtermVerifierTag = \"v0.63\"",
+                );
+                write_windows_installer(src, &text);
+            },
+            "carries no readable release verifier pin",
+        ),
     ] {
         let mut lab = Lab::new();
         lab.publish_with(true, edit);
@@ -2553,7 +3195,9 @@ fn an_installer_the_site_cannot_serve_is_refused_before_anything_is_written() {
             (before, String::new()),
             "{label}"
         );
-        assert!(!lab.site.join("public/install.sh").exists(), "{label}");
+        for served in ["public/install.sh", "public/get-aterm.ps1"] {
+            assert!(!lab.site.join(served).exists(), "{label}: {served}");
+        }
     }
 }
 
@@ -2588,4 +3232,191 @@ fn a_live_installer_that_is_missing_or_stale_is_named() {
         );
         assert!(world.deploys().is_empty());
     }
+}
+
+/// The paths a dry run's hosting plan lists, as `/<path>`.
+fn planned_paths(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|l| l.contains("gzipped, sha256 "))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect()
+}
+
+/// A public commit whose get-aterm.ps1 pins this repository's verifier has it served at
+/// /get-aterm.ps1 byte for byte, planned, committed, deployed and live; the next one, whose
+/// script pins nothing, takes it down from the checkout, the site repo and the live site, a dry
+/// run first planning the removal and changing nothing.
+#[test]
+fn a_pinned_windows_installer_is_served_as_committed_and_an_unpinned_one_is_taken_down() {
+    let mut lab = Lab::new();
+    let pinned = windows_installer_pinned(&windows_pin());
+    lab.publish_with(true, |src| write_windows_installer(src, &pinned));
+    let dry = Options {
+        dry_run: true,
+        ..Options::default()
+    };
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.sync(&dry, &lab.env(), &mut world);
+    assert_eq!(
+        ended,
+        Ok(Outcome::Planned {
+            files: [
+                "public/index.html",
+                "public/aterm.html",
+                "public/terminal.html",
+                "public/releases.html",
+                "public/assets/releases.css",
+                "public/install.sh",
+                "public/get-aterm.ps1",
+                "public/sitemap.xml",
+            ]
+            .map(String::from)
+            .to_vec(),
+            engine: true,
+        }),
+        "{out}"
+    );
+    assert!(planned_paths(&out).contains(&"/get-aterm.ps1"), "{out}");
+    assert!(!lab.site.join("public/get-aterm.ps1").exists());
+
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert!(
+        out.contains(&format!(
+            "== windows installer: /get-aterm.ps1 = apps/aterm-win/get-aterm.ps1 @ {} ({} bytes; \
+             piped to iex, it installs from {SLUG})",
+            &lab.public_sha[..12],
+            pinned.len()
+        )),
+        "{out}"
+    );
+    assert_eq!(lab.page("get-aterm.ps1"), pinned);
+    assert_eq!(read(&lab.live.join("get-aterm.ps1")), pinned);
+    assert!(
+        world.deploys()[0]
+            .files
+            .contains(&"/get-aterm.ps1".to_string())
+    );
+    let committed = lab.git.ok(
+        &lab.site_root,
+        &["show", "--name-status", "--format=", "HEAD"],
+    );
+    assert!(
+        committed
+            .lines()
+            .any(|l| l == "A\tweb/site/public/get-aterm.ps1"),
+        "{committed}"
+    );
+    assert_eq!(lab.status(), "");
+
+    lab.publish(true);
+    let before = lab.head();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.sync(&dry, &lab.env(), &mut world);
+    match &ended {
+        Ok(Outcome::Planned { files, .. }) => {
+            assert!(files.contains(&"public/get-aterm.ps1".to_string()), "{out}");
+        }
+        other => panic!("{other:?}\n{out}"),
+    }
+    assert!(out.contains("  public/get-aterm.ps1: removed"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "== windows installer: apps/aterm-win/get-aterm.ps1 @ {} pins no release verifier \
+             yet, so it could only refuse — /get-aterm.ps1 is not served",
+            &lab.public_sha[..12]
+        )),
+        "{out}"
+    );
+    let paths = planned_paths(&out);
+    assert!(paths.contains(&"/install.sh"), "{out}");
+    assert!(!paths.contains(&"/get-aterm.ps1"), "{out}");
+    assert_eq!((lab.head(), lab.status()), (before, String::new()));
+    assert_eq!(
+        lab.page("get-aterm.ps1"),
+        pinned,
+        "a dry run removes nothing"
+    );
+
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert!(
+        out.contains(
+            "== removed public/get-aterm.ps1: the public commit gives it nothing to serve"
+        ),
+        "{out}"
+    );
+    assert!(!lab.site.join("public/get-aterm.ps1").exists());
+    assert!(!lab.live.join("get-aterm.ps1").exists());
+    assert!(
+        !world.deploys()[0]
+            .files
+            .contains(&"/get-aterm.ps1".to_string())
+    );
+    let committed = lab.git.ok(
+        &lab.site_root,
+        &["show", "--name-status", "--format=", "HEAD"],
+    );
+    assert!(
+        committed
+            .lines()
+            .any(|l| l == "D\tweb/site/public/get-aterm.ps1"),
+        "{committed}"
+    );
+    assert_eq!(lab.status(), "");
+}
+
+/// With a pinned script the live site must serve the checkout's /get-aterm.ps1; with an
+/// unpinned one it must serve none, which agrees.
+/// NEGATIVE CONTROLS: a live copy missing, one that differs and one the checkout no longer
+/// holds are each named, and none is redeployed by a run with nothing to change.
+#[test]
+fn a_live_windows_installer_that_is_missing_stale_or_unwanted_is_named() {
+    let mut lab = Lab::new();
+    let pinned = windows_installer_pinned(&windows_pin());
+    lab.publish_with(true, |src| write_windows_installer(src, &pinned));
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    for (stale, want) in [
+        (None, Difference::WindowsInstallerNotFetched),
+        (Some("param()\n"), Difference::WindowsInstallerDiffers),
+    ] {
+        let live = lab.live.join("get-aterm.ps1");
+        match stale {
+            None => std::fs::remove_file(&live).unwrap(),
+            Some(text) => std::fs::write(&live, text).unwrap(),
+        }
+        world.calls.clear();
+        let (ended, out) = lab.run(&mut world);
+        assert_eq!(
+            ended,
+            Ok(Outcome::LiveDisagrees {
+                deployed: false,
+                why: vec![Disagreement::Page(want.clone())],
+            }),
+            "{out}"
+        );
+        assert!(world.deploys().is_empty());
+    }
+
+    let lab = Lab::new();
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert!(!lab.live.join("get-aterm.ps1").exists());
+    std::fs::write(lab.live.join("get-aterm.ps1"), &pinned).unwrap();
+    world.calls.clear();
+    let (ended, out) = lab.run(&mut world);
+    assert_eq!(
+        ended,
+        Ok(Outcome::LiveDisagrees {
+            deployed: false,
+            why: vec![Disagreement::Page(Difference::WindowsInstallerStale)],
+        }),
+        "{out}"
+    );
+    assert!(world.deploys().is_empty());
 }

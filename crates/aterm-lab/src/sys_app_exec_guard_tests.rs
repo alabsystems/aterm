@@ -3,7 +3,66 @@
 
 use super::*;
 use aterm_toolchain::record_lock::RecordLock;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+
+#[test]
+fn app_exec_refuses_process_reads_and_reopens_after_failure() {
+    const CASE: &str =
+        "sys::app_exec_guard_tests::app_exec_refuses_process_reads_and_reopens_after_failure";
+    if !aterm_uds::test_binary::isolated_lifecycle(CASE) {
+        return;
+    }
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let program = shell.to_str().unwrap();
+    let argv = [
+        program.into(),
+        "-c".into(),
+        "printf 'unguarded-native-app-exec\\n'; exit 37".into(),
+    ];
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let flags = || {
+        // SAFETY: the owned file remains live across this read-only query.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        flags
+    };
+    let before = flags();
+    let read = aterm_sysprobe::exec_gate::reading().expect("the helper's gate starts open");
+    for guarded in [false, true] {
+        let error = if guarded {
+            exec_as_app_with_guards(program, &argv, &[], 1, &[file.as_fd()])
+        } else {
+            exec_as_app(program, &argv, &[], 1)
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        assert_eq!(flags(), before);
+        assert!(aterm_sysprobe::exec_gate::reading().is_some());
+    }
+    drop(read);
+
+    let world = aterm_tempfile::tempdir().unwrap();
+    let missing = world.path().join("missing-program");
+    let program = missing.to_str().unwrap();
+    for guarded in [false, true] {
+        let error = if guarded {
+            exec_as_app_with_guards(program, &[program.into()], &[], 1, &[file.as_fd()])
+        } else {
+            exec_as_app(program, &[program.into()], &[], 1)
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "{error}");
+        assert_eq!(flags(), before);
+        assert!(aterm_sysprobe::exec_gate::reading().is_some());
+    }
+    drop(world);
+    let program = shell.to_str().unwrap();
+    let script = format!(
+        "test -r /dev/fd/{} || exit 38; printf 'native-app-exec-reopened\\n'; exit 0",
+        file.as_raw_fd(),
+    );
+    let argv = [program.into(), "-c".into(), script];
+    let error = exec_as_app_with_guards(program, &argv, &[], 1, &[file.as_fd()]);
+    panic!("native app exec did not dispatch after reopening: {error}");
+}
 
 #[test]
 fn failed_app_exec_preserves_original_guard_flags_and_closes_temporary_sources() {

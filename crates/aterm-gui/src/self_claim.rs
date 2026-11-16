@@ -558,7 +558,7 @@ pub(crate) fn tapped(
 
 /// Guard holding `meta` and `copies` locks across a bounded timeline hold.
 pub(crate) struct RolloutGuard<'a> {
-    _meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
+    _meta: crate::session_timeline::MetaGuard<'a>,
     _copies: std::sync::MutexGuard<'static, Copies>,
 }
 

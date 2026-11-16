@@ -29,7 +29,7 @@ pub(super) struct ResetGroups<'a> {
     pub(super) notifications: &'a mut NotificationState,
     pub(super) marks_state: &'a mut MarksState,
     pub(super) taskbar_progress: &'a mut Option<TaskbarProgress>,
-    pub(super) program_state: &'a mut super::program_state::ProgramStateReport,
+    pub(super) program_state: &'a mut super::program_state::ProgramStateRecord,
 }
 
 impl ResetGroups<'_> {

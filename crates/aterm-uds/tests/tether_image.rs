@@ -5,7 +5,7 @@
 
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod native {
-    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    use aterm_spec::wait::{MUST_HAPPEN, until_while_descendants_work, until_within};
     use aterm_uds::process::{Identity, read_identity};
     use aterm_uds::spawnfd::{Child, command};
     use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ mod native {
     }
 
     fn read(world: &Path, name: &str) -> String {
-        until_within(MUST_HAPPEN, name, || {
+        until_while_descendants_work(name, || {
             let text = std::fs::read_to_string(world.join(name)).ok()?;
             text.ends_with('\n').then_some(text)
         })

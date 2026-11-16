@@ -21,7 +21,7 @@ pub(crate) const PAGE: Page = Page {
             "keyed attention: one entry per writer (`meta unset attention owner=<k>`)",
         ),
         row(
-            "meta set supervisor <holder> [ttl=<ms>] [contract=3 scope=<s,…> …]",
+            "meta set supervisor <holder> [ttl=<ms>] [contract=3|4 scope=<s,…> …]",
             "claim the session for a supervisor (owner; `meta unset supervisor [holder=<h>]`)",
         ),
         row(
@@ -32,7 +32,8 @@ pub(crate) const PAGE: Page = Page {
     options: &[
         row(
             "title",
-            "120 bytes; sets `user_title=`, which overrides the program's OSC title",
+            "120 bytes; a claim of the session's title (`help meta title`): `user_title=` is \
+             the title those claims settled, shown over the program's OSC title",
         ),
         row("description", "1024 bytes"),
         row("icon, role", "64 bytes each"),
@@ -91,12 +92,13 @@ pub(crate) const PAGE: Page = Page {
                     "`meta set <title|description|icon|role|attention|questions|autopilot> \
                      <text...>` / `meta unset <field>` set or clear user metadata (title 120 B, \
                      description 1024 B, icon 64 B, role 64 B, attention 256 B; `user_title=` \
-                     overrides the OSC `title=`).",
+                     overrides the OSC `title=`; a title is a claim, `help meta title`).",
                 ),
                 row(
                     "title=",
                     "the title the terminal holds (the program's OSC title), empty with none; \
-                     `user_title=` the one `meta set title` gave, which the tab shows instead",
+                     `user_title=` the stated title its claims settled (`help meta title`), \
+                     which the tab shows instead",
                 ),
                 row("cwd=", "the folder the shell last reported"),
                 row(
@@ -138,6 +140,57 @@ pub(crate) const PAGE: Page = Page {
             ],
         },
         Section {
+            name: "title",
+            about: "the title is a claim: whose stands, what unset withdraws, redaction",
+            rows: &[
+                para(
+                    "TITLE: `meta set title <text…>`, `meta unset title` and a person's rename \
+                     of the tab each write a claim of the session's `title` (`help described`): \
+                     one claim per author, each kept beside the others. `user_title=` is the \
+                     title as the last title write settled it: the claim then standing for the \
+                     session, time-limited claims aside, when its author is a person, the \
+                     session's own program, its creator, a writer aterm ran or a control \
+                     client, in that order. A title restored with the session has no claim \
+                     until someone writes one (below). With neither it is `-` and the tab shows \
+                     the program's OSC title.",
+                ),
+                para(
+                    "A person's claim stands over every other author's. A control client's \
+                     `meta set title` under a person's rename is recorded and listed by \
+                     `described`, answers `OK`, and does not change the title.",
+                ),
+                para(
+                    "`meta unset title` withdraws the caller's own claim and nobody else's: it \
+                     does not clear a title a person claimed, and where another author's claim \
+                     then stands, that one becomes the title.",
+                ),
+                para(
+                    "A title aterm put back has no author when it comes from a restart (aterm \
+                     quit and reopened, or a crash), from an update that did not carry the \
+                     session's log, or from before titles were claims; an update that carries \
+                     the log carries the title's standing claim with its author. `user_title=` \
+                     shows such a title and `described` lists no claim behind it. It is \
+                     nobody's, and the next title write settles it as any title: a `meta set \
+                     title` from an author whose claims can stand replaces it, and where no \
+                     claim then stands that author's `meta unset title` clears it and a write \
+                     from an author who is only listed leaves it. A person takes it by renaming \
+                     the tab to other text: a rename field committed as it opened writes \
+                     nothing.",
+                ),
+                para(
+                    "A title from another session, the bridge or another Mac's driver is \
+                     listed and never stands. Not on yet: a session's own sid and its \
+                     creator's rank as any other session's (`help described ranks`). A title \
+                     from anyone but a person is redacted before it is stored (what reads as a \
+                     credential becomes `[redacted]`), and one that is nothing but a credential \
+                     is refused. The cap is 120 bytes, and 256 once percent-encoded: a longer \
+                     title is refused, never cut. A title write spends its author's `mark` \
+                     tokens (`ERR busy retry_ms=<ms>`); a person's rename is never refused for \
+                     rate.",
+                ),
+            ],
+        },
+        Section {
             name: "attention",
             about: "keyed attention: owners, kind=ask and kind=wait, what each surface shows",
             rows: &[para(
@@ -157,7 +210,7 @@ pub(crate) const PAGE: Page = Page {
         },
         Section {
             name: "supervisor",
-            about: "the supervisor claim, proven claims and contract 3's scoped claims",
+            about: "the supervisor claim, proven claims and contract 3's and 4's scoped claims",
             rows: &[
                 para(
                     "SUPERVISOR: `meta set supervisor <holder> [ttl=<1..600000>]` / `meta unset \
@@ -165,6 +218,26 @@ pub(crate) const PAGE: Page = Page {
                      while another holds it) raises no need for a prompt while the supervisor \
                      handles prompts (`supervisor_proven=1`: a direct foreground \
                      `codex-alab@<pid>` connection, or a contract 3 claim).",
+                ),
+                para(
+                    "CONTRACT 4: `meta set supervisor <id>@<pid> contract=4 scope=<word>[,…] \
+                     version=<v> [vendor=<v>] [child=<pid>:<start_us>] [login=<label>]` claims a \
+                     session for any harness the registry lists, proven as contract 3's; a \
+                     well-formed word aterm does not know is dropped, and the known ones \
+                     (`relaunch upgrade turn-end approvals questions walls state accounts`) are \
+                     granted by where the row came from: a verified record all, a seed row \
+                     `relaunch,upgrade,state,accounts`, a dev link all but `accounts`. `OK \
+                     scope=<granted|-> revision=<n>` answers it, an empty grant included; `ERR \
+                     unproven` an id no row lists; `ERR usage` a missing `scope=` or `version=`, a \
+                     malformed word or `child=`. `child=` names the vendor process: kept on \
+                     aterm's own kernel reads (in the claimant's group, below it, started when \
+                     said), it is the agent the built-in engine's image gate reads (`who` prints \
+                     `agent=<pid>`). A claim holding `relaunch`, or `accounts`, hears `restart \
+                     cause=<c>[ to=<label> home=<path>][ model=<word>]`; one that obeys the \
+                     `restart` verb's event neither by a claim line, a new child nor by leaving \
+                     within the policy's `stall_term_after_s` gets TERM, then KILL, once no hold \
+                     stands (an account or model move starts no watch). A live claim is proven \
+                     again when the registry changes, and dropped where it no longer proves.",
                 ),
                 para(
                     "CONTRACT 3: `meta set supervisor <id>@<pid> contract=3 \

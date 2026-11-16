@@ -15,6 +15,7 @@ fn intent() -> Intent {
         thread: THREAD.into(),
         wall: WALL.into(),
         identity: Identity::from_native("workspace", "user"),
+        limit: None,
     }
 }
 
@@ -196,6 +197,219 @@ fn login_rotation_requests_take_exactly_the_rotations_four_keys() {
         Request::parse_login_rotation(&format!("status id={}", "ab".repeat(16))),
         Some(Request::Status("ab".repeat(16)))
     );
+}
+
+/// A USAGE-LIMIT PREPARE TAKES AN OPTIONAL FIFTH KEY, THE LIMIT IT ASKS ABOUT: the rotation's four
+/// keys parse as before, naming no limit; with ` limit=codex_other` beside them they parse with
+/// that limit. A limit of the codex bucket itself (`limit=codex`), one spelt outside
+/// `[a-z0-9_]{1,64}` (capitals, a `-`, a `.`, empty, 65 long), a sixth key, a repeated limit and
+/// a limit on any other verb are refused, and so is a limit under a renewal's grammar or a lost
+/// login's, which keep their four keys.
+#[test]
+fn a_usage_limit_prepare_takes_an_optional_fifth_key_naming_its_limit() {
+    let quota = Intent {
+        purpose: Purpose::WeeklyQuota,
+        ..intent()
+    };
+    let four = format!(
+        "prepare thread={THREAD} turn={WALL} source_account={} source_user={}",
+        quota.identity.account, quota.identity.user,
+    );
+    assert_eq!(
+        Request::parse_rotation(&four),
+        Some(Request::Prepare(quota.clone())),
+        "four keys, as before"
+    );
+    let limited = Intent {
+        limit: Some("codex_other".into()),
+        ..quota.clone()
+    };
+    let five = format!("{four} limit=codex_other");
+    assert_eq!(
+        Request::parse_rotation(&five),
+        Some(Request::Prepare(limited.clone()))
+    );
+    assert_eq!(
+        Request::parse_rotation(&format!(
+            "prepare limit=codex_other thread={THREAD} turn={WALL} source_account={} \
+             source_user={}",
+            quota.identity.account, quota.identity.user,
+        )),
+        Some(Request::Prepare(limited)),
+        "the fields in any order"
+    );
+    let longest = "a".repeat(64);
+    assert!(Request::parse_rotation(&format!("{four} limit={longest}")).is_some());
+    for refused in [
+        format!("{four} limit=codex"),
+        format!("{four} limit=Codex_Other"),
+        format!("{four} limit=codex-other"),
+        format!("{four} limit=codex.other"),
+        format!("{four} limit="),
+        format!("{four} limit={}", "a".repeat(65)),
+        format!("{five} extra=x"),
+        format!("{five} limit=codex_other"),
+        format!("{five} limit=another"),
+    ] {
+        assert!(Request::parse_rotation(&refused).is_none(), "{refused}");
+    }
+    for other_verb in [
+        format!("commit id={} limit=codex_other", "ab".repeat(16)),
+        format!("status id={} limit=codex_other", "ab".repeat(16)),
+        format!(
+            "consume id={} turn={WALL} limit=codex_other",
+            "ab".repeat(16)
+        ),
+        format!(
+            "complete id={} turn={WALL} limit=codex_other",
+            "ab".repeat(16)
+        ),
+    ] {
+        assert!(
+            Request::parse_rotation(&other_verb).is_none(),
+            "{other_verb}"
+        );
+    }
+    assert!(Request::parse_login_rotation(&four).is_some(), "CONTROL");
+    assert!(
+        Request::parse_login_rotation(&five).is_none(),
+        "a lost login's move keeps four keys"
+    );
+    let renewal = format!(
+        "prepare thread={THREAD} wall={WALL} account={} user={}",
+        quota.identity.account, quota.identity.user,
+    );
+    assert!(Request::parse(&renewal).is_some(), "CONTROL");
+    assert!(
+        Request::parse(&format!("{renewal} limit=codex_other")).is_none(),
+        "a renewal keeps four keys"
+    );
+}
+
+/// THE LIMIT ASKED ABOUT IS THE ONE THE SESSION'S OWN RECORD NAMES: a usage-limit move's record
+/// (`owed.rotation`) with no `limit`, or a null one, matches an intent naming none and no intent
+/// naming one; a record naming `codex_other` matches only an intent naming the same limit, never
+/// one naming none or another, and a limit that is no string matches nothing.
+#[test]
+fn a_records_limit_is_the_one_its_intent_names() {
+    let quota = Intent {
+        purpose: Purpose::WeeklyQuota,
+        ..intent()
+    };
+    let limited = |limit: &str| Intent {
+        limit: Some(limit.into()),
+        ..quota.clone()
+    };
+    let record = |limit: Option<aterm_json::Value>| {
+        let mut rotation = aterm_json::json!({"openaiScope": true,
+            "account": quota.identity.account, "user": quota.identity.user, "receipt": null});
+        if let Some(limit) = limit {
+            rotation
+                .as_object_mut()
+                .unwrap()
+                .insert("limit".into(), limit);
+        }
+        aterm_json::json!({
+            "sessionId": THREAD, "status": "waiting", "draftEmpty": true,
+            "autopilot": "active", "owed": {
+                "thread": THREAD, "mode": "cruise", "rule": "usage-rotate@v1",
+                "nativeOrigin": {"turnId": WALL, "phase": "complete"},
+                "rotation": rotation
+            }
+        })
+    };
+    for none in [None, Some(aterm_json::Value::Null)] {
+        let record = record(none.clone());
+        assert!(quota.matches_record(&record, None), "{none:?}");
+        assert!(
+            !limited("codex_other").matches_record(&record, None),
+            "{none:?}"
+        );
+    }
+    let named = record(Some(aterm_json::json!("codex_other")));
+    assert!(limited("codex_other").matches_record(&named, None));
+    assert!(!quota.matches_record(&named, None));
+    assert!(!limited("another").matches_record(&named, None));
+    for bad in [aterm_json::json!(7), aterm_json::json!(["codex_other"])] {
+        let record = record(Some(bad.clone()));
+        assert!(!quota.matches_record(&record, None), "{bad}");
+        assert!(
+            !limited("codex_other").matches_record(&record, None),
+            "{bad}"
+        );
+    }
+}
+
+/// AN INTENT THAT NAMES NO LIMIT IS WRITTEN AS BEFORE LIMITS WERE ASKED: its JSON, which every
+/// receipt and the renewal index carry, has exactly the keys it had (`limit` nowhere), and one
+/// written so reads back naming none. One naming a limit writes it and reads it back.
+#[test]
+fn an_intent_naming_no_limit_writes_the_same_bytes_as_before() {
+    let quota = Intent {
+        purpose: Purpose::WeeklyQuota,
+        ..intent()
+    };
+    let text = aterm_json::to_string(&quota).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "{{\"purpose\":\"weekly_quota\",\"thread\":\"{THREAD}\",\"wall\":\"{WALL}\",\
+             \"identity\":{{\"account\":\"{}\",\"user\":\"{}\"}}}}",
+            quota.identity.account, quota.identity.user
+        )
+    );
+    assert_eq!(aterm_json::from_str::<Intent>(&text).unwrap(), quota);
+    let limited = Intent {
+        limit: Some("codex_other".into()),
+        ..quota
+    };
+    let text = aterm_json::to_string(&limited).unwrap();
+    assert!(text.ends_with(",\"limit\":\"codex_other\"}"), "{text}");
+    assert_eq!(aterm_json::from_str::<Intent>(&text).unwrap(), limited);
+}
+
+/// A COMPLETION REPORT IS A POOL MOVE'S ALONE, OF EXACTLY ITS RECEIPT AND TURN: `complete id=
+/// turn=` parses under the usage-limit handoff's grammar with exactly those two fields, the id 32
+/// lowercase hex digits and the turn a lowercase uuid. A third field, a missing one, a repeated
+/// one, an id of another shape or a turn that is no uuid is refused, and so is the same line
+/// under a renewal's or a lost login's grammar, whose moves carry no pool canary to prove.
+#[test]
+fn a_completion_report_parses_only_as_a_pool_moves_with_exactly_its_id_and_turn() {
+    let id = "ab".repeat(16);
+    let line = format!("complete id={id} turn={WALL}");
+    assert_eq!(
+        Request::parse_rotation(&line),
+        Some(Request::Complete {
+            id: id.clone(),
+            turn: WALL.into()
+        })
+    );
+    assert_eq!(
+        Request::parse_rotation(&format!("complete turn={WALL} id={id}")),
+        Request::parse_rotation(&line),
+        "the fields in any order"
+    );
+    assert!(Request::parse(&line).is_none(), "a renewal's");
+    assert!(
+        Request::parse_login_rotation(&line).is_none(),
+        "a lost login's"
+    );
+    for refused in [
+        format!("{line} extra=1"),
+        format!("{line} id={id}"),
+        format!("{line} turn={WALL}"),
+        format!("complete id={id}"),
+        format!("complete turn={WALL}"),
+        "complete".to_owned(),
+        format!("complete id={} turn={WALL}", "AB".repeat(16)),
+        format!("complete id={} turn={WALL}", "ab".repeat(15)),
+        format!("complete id=../{} turn={WALL}", "ab".repeat(14)),
+        format!("complete id={id} turn={}", &WALL[1..]),
+        format!("complete id={id} turn=not-a-turn"),
+        format!("complete id={id} wall={WALL}"),
+    ] {
+        assert!(Request::parse_rotation(&refused).is_none(), "{refused}");
+    }
 }
 
 /// Each purpose's predicates say what its receipt is: only a usage-limit handoff's is the
@@ -644,6 +858,31 @@ fn a_login_rotation_receipt_names_another_account_under_its_own_verb() {
     quota.intent.purpose = Purpose::WeeklyQuota;
     assert!(quota.reply().starts_with("OK codex-rotation state=ready "));
     assert!(!quota.same_intent(&moved));
+}
+
+/// A RECORDED COMPLETION ANSWERS THE RECEIPT'S OWN EIGHT FIELDS UNDER `state=completed`: the
+/// consumed receipt's reply word for word but its state, and no login path. A receipt with no
+/// destination answers the identity refusal, as every reply of it does.
+#[test]
+fn a_recorded_completion_answers_the_receipts_fields_under_its_own_state() {
+    let mut quota = receipt();
+    quota.intent.purpose = Purpose::WeeklyQuota;
+    assert_eq!(
+        quota.completed_reply(),
+        "ERR account recovery invalid identity transition\n"
+    );
+    quota.destination = Some(Identity::from_native("next-workspace", "next-user"));
+    quota.phase = Phase::Consumed;
+    quota.accepted_turn = Some(WALL.into());
+    let consumed = quota.reply();
+    assert!(consumed.starts_with("OK codex-rotation state=consumed "));
+    assert_eq!(
+        quota.completed_reply(),
+        consumed.replace(" state=consumed ", " state=completed ")
+    );
+    assert!(
+        !quota.completed_reply().contains("/old/") && !quota.completed_reply().contains("/new/")
+    );
 }
 
 #[test]

@@ -27,6 +27,7 @@ pub(crate) fn scoped(duties: &[Scope]) -> crate::harness_claim::Scoped {
             start: "fixture-birth".to_string(),
         },
         claim,
+        child: None,
     }
 }
 

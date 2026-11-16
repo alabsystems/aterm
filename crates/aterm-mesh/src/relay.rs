@@ -255,6 +255,21 @@ pub enum Event {
         /// Records refused for good.
         refused: usize,
     },
+    /// This Mac woke from sleep or its network path changed ([`crate::overlay::Waker::woke`]):
+    /// every link was asked to re-prove within [`crate::overlay::WAKE_REPROVE_WITHIN`], presence
+    /// forgot every seat's advance, and the overlay was rung to kick its relays.
+    Woke {
+        /// What happened.
+        why: crate::overlay::Woke,
+        /// The links asked to re-prove.
+        links: usize,
+    },
+    /// The overlay kicked every relay it runs after a wake or a path change: each one waiting
+    /// out a back-off tries again at its first step.
+    Kicked {
+        /// The relays it runs now, each kicked or started at this step.
+        relays: usize,
+    },
     /// A rebuilt Mac's lease settled on its first neighbour's high water.
     Settled {
         /// The log.

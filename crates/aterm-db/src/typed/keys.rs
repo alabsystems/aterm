@@ -603,6 +603,27 @@ pub fn archived_pk(operation: &[u8; 32]) -> String {
     h8("ar", b"aterm/alab/archived/1\0", &[operation])
 }
 
+/// A carried history entry's row (`alab::history`), keyed by the Mac that carried it and the
+/// operation it restates: two Macs carrying one operation write two rows, so no row is a
+/// register of two candidates that a later restatement would have to carry together.
+pub fn history_pk(uuid32: &str, operation: &[u8; 32]) -> String {
+    h8(
+        "hy",
+        b"aterm/alab/history/2\0",
+        &[uuid32.as_bytes(), operation.as_slice()],
+    )
+}
+
+/// One roller's history horizon for generation `from` (`alab::history`): what its bound left out.
+/// The row names both, and a horizon is read only under the key they make.
+pub fn history_horizon_pk(from: u32, uuid32: &str) -> String {
+    h8(
+        "hy",
+        b"aterm/alab/history-horizon/1\0",
+        &[&from.to_le_bytes(), uuid32.as_bytes()],
+    )
+}
+
 /// A table roll's cover row (design §3.8): one per generation rolled from and Mac that restated
 /// it, so a Mac's later restatement of what it still held replaces its own earlier cover.
 pub fn roll_pk(from: u32, uuid32: &str) -> String {

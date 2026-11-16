@@ -12,6 +12,8 @@
 //! is anything else is no reading, so nothing a repository or a branch is named can reach the
 //! typed line.
 
+use aterm_types::control_request::Sid;
+
 use super::facts::EpisodeKey;
 
 /// How many sids the sentence names before it counts the rest.
@@ -33,12 +35,11 @@ pub const OVERLAP_FRESH_MS: i64 = 10 * 60_000;
 pub struct PeerSid(String);
 
 impl PeerSid {
-    /// `word` as a peer's sid where it is a session ID aterm minted
-    /// ([`aterm_types::control_verbs::is_minted_sid`]), else `None`: a path, a branch or any
-    /// other word is refused.
+    /// `word` as a peer's local session ID ([`Sid::parse`]), else `None`: a path, a branch
+    /// or any other word is refused.
     #[must_use]
     pub fn of(word: &str) -> Option<Self> {
-        aterm_types::control_verbs::is_minted_sid(word).then(|| Self(word.to_owned()))
+        Sid::parse(word).map(|id| Self(id.as_str().to_string()))
     }
 
     /// The sid.

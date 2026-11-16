@@ -4,8 +4,8 @@
 //! `lab tables-page`: the Tables page (docs/PLAN.md LT-08) on a private instance whose home holds
 //! a scratch registry with synthetic rows, two of its Macs' concurrent edits to one cell among
 //! them. It opens the page, takes a frame, stages an edit through `act`, takes a frame, writes
-//! it, takes a frame, selects the grid's last column, and takes a frame; the frames go to the
-//! folder named. No live vault, fleet or Commons is
+//! it, takes a frame, selects the grid's last column, takes a frame, sorts the rows by a header,
+//! and takes a frame; the frames go to the folder named. No live vault, fleet or Commons is
 //! reached, and every value is synthetic (`example.invalid`).
 
 use std::path::{Path, PathBuf};
@@ -283,5 +283,10 @@ fn drive(inst: &mut Instance, out: &Path) -> Result<Vec<PathBuf>, Fail> {
     // The grid's last column selected scrolls it across: the row's label stays at the left.
     act(inst, &view, "tables/cell/mc-000000000000000c/hosts", None)?;
     shots.push(frame(inst, out, "tables-5-across.png")?);
+    // A header pressed twice orders the rows by its column from the greatest value down, and
+    // wears the mark that says so.
+    act(inst, &view, "tables/head/label", None)?;
+    act(inst, &view, "tables/head/label", None)?;
+    shots.push(frame(inst, out, "tables-6-sorted.png")?);
     Ok(shots)
 }

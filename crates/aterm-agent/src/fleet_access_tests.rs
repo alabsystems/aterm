@@ -261,11 +261,13 @@ fn a_fleet_started_worker_is_one_with_a_record() {
     assert!(!fleet_started(&state, "t00000000ab"));
     assert!(!fleet_started(&state, "../fleet-access"), "no sid, no look");
     assert!(!fleet_started(&state, ""));
-    // A tab opened before the `t` form keeps its `s-` ID until it closes, and its record is read
-    // as one. NEGATIVE CONTROLS: a malformed ID of either form is no sid, though a record bears it.
-    let earlier = "s-0123456789abcdef00aa";
-    std::fs::write(dir.join(earlier), "node").unwrap();
-    assert!(fleet_started(&state, earlier));
+    // A live legacy worker keeps its exact local ID; a record for another worker grants none.
+    let legacy = "s-0123456789abcdef00aa";
+    assert!(!fleet_started(&state, legacy));
+    std::fs::write(dir.join(legacy), "node").unwrap();
+    assert!(fleet_started(&state, legacy));
+    assert!(!fleet_started(&state, "s-0123456789abcdef00ab"));
+    // A record cannot turn a malformed ID into a minted session identity.
     for bad in [
         "t00000000a",
         "T00000000AA",

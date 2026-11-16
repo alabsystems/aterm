@@ -107,6 +107,7 @@ impl Lost {
                 thread: THREAD.into(),
                 wall: TURN.into(),
                 identity: Identity::from_native("source", "user"),
+                limit: None,
             },
             sid: "s-one".into(),
             old_pid: 10,

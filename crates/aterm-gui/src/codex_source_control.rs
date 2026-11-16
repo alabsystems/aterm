@@ -936,13 +936,15 @@ fn execute(
                     #[cfg(debug_assertions)]
                     eprintln!("Retained native startup: settings={_error:?}");
                 })?;
-            frontend.current()?;
+            let owner =
+                crate::native_session_policy::StartOwner::new(&frontend, &request.operation)?;
             let (id, state) = host.ctx.native_policy.retained_start(
                 host.ctx,
                 registry,
                 host.lifetime,
                 &peer,
                 settings,
+                owner,
             )?;
             let object = value.as_object_mut().ok_or(registry::Error::Unavailable)?;
             object.insert("service".into(), aterm_json::json!(id));

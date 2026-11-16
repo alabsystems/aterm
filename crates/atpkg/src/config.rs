@@ -418,6 +418,97 @@ pub fn cached_abrew() -> &'static AbrewConfig {
     CFG.get_or_init(load_abrew)
 }
 
+/// What the harness registry reads of aterm.toml ([`crate::harness_record`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HarnessConfig {
+    /// `[harness] dev`: harness ids whose development link makes a row with no verified row.
+    pub dev: Vec<String>,
+    /// `[harness] lead.<word> = "<id>"`: the development link that leads `word` although an
+    /// installed row leads it too.
+    pub lead: std::collections::BTreeMap<String, String>,
+    /// `shell_env_strip`: the person's strip list, replacing the default; `None` when unset
+    /// ([`aterm_types::domain::EnvStrip::compose`]). An item that is not a string is kept as
+    /// [`unread_toml`] words, which no strip entry matches, so it is refused and reported as an
+    /// entry that breaks the pattern is, and the list's other entries stand.
+    pub env_strip: Option<Vec<String>>,
+    /// `shell_env_strip` when it is not a list, as [`unread_toml`] words: refused whole, and the
+    /// default list applies, as when it is unset.
+    pub env_strip_unread: Option<String>,
+}
+
+/// `value` as a refusal names a setting it cannot read: its TOML text on one line and its kind,
+/// as `1 (an integer)`. The words hold a space, so no strip entry ever matches them.
+#[must_use]
+pub fn unread_toml(value: &aterm_toml::Value) -> String {
+    let kind = match value {
+        aterm_toml::Value::String(_) => "a string",
+        aterm_toml::Value::Integer(_) => "an integer",
+        aterm_toml::Value::Float(_) => "a float",
+        aterm_toml::Value::Boolean(_) => "a boolean",
+        aterm_toml::Value::Datetime(_) => "a date",
+        aterm_toml::Value::Array(_) => "a list",
+        aterm_toml::Value::Table(_) => "a table",
+    };
+    let text = value.to_string();
+    format!(
+        "{} ({kind})",
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+/// [`HarnessConfig`] of full `aterm.toml` text. A file that does not parse reads as unset; in
+/// `[harness]`, an entry that is not a string is skipped; `shell_env_strip` is read as
+/// [`HarnessConfig::env_strip`] and [`HarnessConfig::env_strip_unread`] say.
+#[must_use]
+pub fn parse_harness(text: &str) -> HarnessConfig {
+    let Ok(root) = aterm_toml::from_str::<aterm_toml::Value>(text) else {
+        return HarnessConfig::default();
+    };
+    let strings = |v: Option<&aterm_toml::Value>| -> Option<Vec<String>> {
+        v.and_then(aterm_toml::Value::as_array).map(|list| {
+            list.iter()
+                .filter_map(aterm_toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    let harness = root.get("harness");
+    let (env_strip, env_strip_unread) = match root.get("shell_env_strip") {
+        None => (None, None),
+        Some(aterm_toml::Value::Array(list)) => (
+            Some(
+                list.iter()
+                    .map(|v| v.as_str().map_or_else(|| unread_toml(v), str::to_string))
+                    .collect(),
+            ),
+            None,
+        ),
+        Some(other) => (None, Some(unread_toml(other))),
+    };
+    HarnessConfig {
+        dev: strings(harness.and_then(|h| h.get("dev"))).unwrap_or_default(),
+        lead: harness
+            .and_then(|h| h.get("lead"))
+            .and_then(aterm_toml::Value::as_table)
+            .map(|t| {
+                t.iter()
+                    .filter_map(|(word, id)| Some((word.clone(), id.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        env_strip,
+        env_strip_unread,
+    }
+}
+
+/// [`parse_harness`] of the config file as it is now; no file is the default.
+#[must_use]
+pub fn load_harness() -> HarnessConfig {
+    config_path()
+        .and_then(|p| read_config_text(&p))
+        .map_or_else(HarnessConfig::default, |t| parse_harness(&t))
+}
+
 /// Deserialization wrapper for the top-level `agents_auto_prime` key alone.
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]

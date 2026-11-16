@@ -13,15 +13,15 @@
 //! (a build directory reclaimed since is written again) but no more than [`COLD_BYTES`]
 //! ([`FOOTPRINT`]), or where none was measured [`COLD_BYTES`] less what they hold already. A peak
 //! further above what they hold measured more than one run writes (stale builds, or the build
-//! root before the cache moved), so it claims the budget. A volume short of it is relieved first
-//! (the build cache's pass under pressure, and inside aterm the window's disk watch), then waited
-//! for with a line a minute naming the need, the free space and the largest holders, after one
-//! saying why it needs that (`atpkg::admit_disk`).
+//! root before the cache moved), so it claims the budget. A volume short of it is relieved once
+//! (the build cache's pass under pressure, and inside aterm one pass of the window's disk
+//! watch), after a line saying why it needs that (`atpkg::admit_disk`); then the run starts if
+//! the volume's room above its floor fits it, and waits for no disk.
 //! `--admit now` starts at once and says what it lacks. A need above what the volume holds over
 //! its floor is refused, and so is one still above what it has free over its floor once the
-//! relief ran (UNMET, `aterm_capacity::Error::Unmet`): no other run's end gives that space, so a
-//! wait could never end, and the run COULD NOT RUN, naming how much to free on which volume, what
-//! holds the most there, and that `--admit now` starts it.
+//! relief ran (UNMET, `aterm_capacity::Error::Unmet`): it ends at once rather than wait for disk,
+//! and the run COULD NOT RUN, naming what it was short of on which volume, what holds the most
+//! there, and that `--admit now` starts it.
 //!
 //! Those directories are each checkout's own (the shared cache keeps one build directory per
 //! workspace path), so a fresh worktree's hold no run of anything and its record beside them none:
@@ -38,10 +38,13 @@
 //! that claim from its own record of what its runs wrote) is handed that claim's name
 //! ([`aterm_capacity::DISK_COVER_ENV`], [`crate::EnvSnapshot::disk_cover`]) and covered by it
 //! ([`Disk::Covered`], [`aterm_capacity::covering_disk`]): it walks nothing (no measure before it
-//! builds, no meter while it does, no look at its end), claims nothing and keeps nothing, since
-//! one walk of a release clone's build directory reads every file of hundreds of GiB. Every run
+//! builds, no meter while it does, no measure at its end), claims nothing and keeps no record of
+//! what its scope wrote, since one walk of a release clone's build directory reads every file of
+//! hundreds of GiB. It keeps the units it used and trims what they replaced as any run does
+//! (below), which reads the record and the folders it names and walks nothing. Every run
 //! says at its end how its disk was held and how many walks it made ([`event`]). A run whose
-//! compile calls into a build directory completed keeps, at that directory's top, what they used
+//! compile calls into a build directory (the main lane's, the lint lane's, or a cell's own in the
+//! cells lane, `crate::cells::cell_dir`) completed keeps, at that directory's top, what they used
 //! of it and when the run began, as its scope's run ([`note_call`], [`close`], [`keep_used`];
 //! `atpkg::build_cache::stale::USED`): the record holds the newest run of each scope, and a unit
 //! they stopped using is what the cache takes (`atpkg::build_cache::stale::decide`). Where the
@@ -270,7 +273,8 @@ pub enum Disk {
     /// Its own claim, its writes measured ([`run_of`]).
     Held(Box<atpkg::admit_disk::Admitted>),
     /// The claim the work it is part of holds, named by [`crate::EnvSnapshot::disk_cover`]: its
-    /// holder's record. Nothing is walked, claimed or kept.
+    /// holder's record. Nothing is walked, claimed or measured, and no record of what its scope
+    /// wrote is kept; the units it used are kept as any run's are ([`keep_used`]).
     Covered(Box<aterm_capacity::Record>),
     /// None: no check it runs builds, or no ledger could take a claim (said).
     Unclaimed,
@@ -376,7 +380,7 @@ fn admit_run(
 #[must_use]
 pub fn covered_line(by: &aterm_capacity::Record) -> String {
     format!(
-        "disk: covered by {} (claim {}, pid {}); nothing walked or kept",
+        "disk: covered by {} (claim {}, pid {}); nothing walked, claimed or measured",
         by.need.what,
         by.cover_marker(),
         by.pid
@@ -469,14 +473,17 @@ pub enum Dir {
     /// run's own target ([`Ctx::target_dir`]).
     Main,
     /// A side lane's, by its path: the lane's target directory, which holds its intermediates
-    /// too (`crate::plan::lane_dir`).
+    /// too (`crate::plan::lane_dir`), or a cell's directory in the cells lane
+    /// (`crate::cells::cell_dir`).
     Side(PathBuf),
 }
 
 /// The build directory `cmd` builds into, by the last `CARGO_TARGET_DIR` among its own variables
 /// ([`crate::exec::Cmd::envs`]): the main lane's where it names none (every child is handed the
 /// run's target, [`Ctx::child_env_add`]) or names the run's target; the lint lane's where it
-/// names that lane's directory; `None` for any other (a directory no record is kept of).
+/// names that lane's directory; a cell's where it names the directory of one of forge's cells
+/// (`crate::cells::cell_dir`); `None` for any other (a directory no record is kept of: the cells
+/// lane itself, and its folders that are no cell's, the browser smoke's and the oracles').
 fn dir_of(ctx: &Ctx, cmd: &crate::exec::Cmd) -> Option<Dir> {
     let Some((_, target)) = cmd
         .envs
@@ -490,9 +497,14 @@ fn dir_of(ctx: &Ctx, cmd: &crate::exec::Cmd) -> Option<Dir> {
     if target == ctx.target_dir.as_path() {
         return Some(Dir::Main);
     }
-    crate::plan::lane_dir(ctx, crate::plan::Lane::TippyTarget)
-        .filter(|lane| lane.as_path() == target)
-        .map(Dir::Side)
+    let lint = crate::plan::lane_dir(ctx, crate::plan::Lane::TippyTarget)
+        .is_some_and(|lane| lane.as_path() == target);
+    let cell = || {
+        aterm_forge::resolve::default_cells()
+            .iter()
+            .any(|one| crate::cells::cell_dir(ctx, &one.name) == target)
+    };
+    (lint || cell()).then(|| Dir::Side(target.to_path_buf()))
 }
 
 /// Note what the compile call `cmd` used of the build directory it builds into ([`dir_of`],
@@ -500,12 +512,34 @@ fn dir_of(ctx: &Ctx, cmd: &crate::exec::Cmd) -> Option<Dir> {
 /// `None` where they could not be read), and whether it passed (`ok`). A call whose messages
 /// could not be read is noted as one that did not pass: what it used is not known.
 pub fn note_call(ctx: &Ctx, cmd: &crate::exec::Cmd, stdout: Option<&str>, ok: bool) {
+    note_call_owning(ctx, cmd, stdout, ok, &std::collections::BTreeSet::new());
+}
+
+/// [`note_call`] for a call whose caller knows the workspace's members (`members`, by package
+/// name): a package of theirs it built anything of is noted as the workspace's own, as one it
+/// built tests of is ([`note_used`]). A cell's calls are noted so ([`crate::cells`]): a lint
+/// builds no test, so without them its record would name no package whose units a trim may
+/// take.
+pub fn note_call_owning(
+    ctx: &Ctx,
+    cmd: &crate::exec::Cmd,
+    stdout: Option<&str>,
+    ok: bool,
+    members: &std::collections::BTreeSet<String>,
+) {
     let Some(dir) = dir_of(ctx, cmd) else {
         return;
     };
     let artifacts = stdout.map(crate::shape::artifacts).unwrap_or_default();
     let script_runs = stdout.map(crate::shape::script_runs).unwrap_or_default();
-    note_used(ctx, &dir, &artifacts, &script_runs, ok && stdout.is_some());
+    note_used_owning(
+        ctx,
+        &dir,
+        &artifacts,
+        &script_runs,
+        ok && stdout.is_some(),
+        members,
+    );
 }
 
 /// Note what a compile call used of the build directory `dir` ([`crate::shape::Run::used`]): the
@@ -522,6 +556,26 @@ pub fn note_used(
     artifacts: &[crate::shape::Artifact],
     script_runs: &[String],
     ok: bool,
+) {
+    note_used_owning(
+        ctx,
+        dir,
+        artifacts,
+        script_runs,
+        ok,
+        &std::collections::BTreeSet::new(),
+    );
+}
+
+/// [`note_used`], a package among `members` that an artifact is of noted as the workspace's own
+/// whether or not the artifact is a test build ([`note_call_owning`]).
+fn note_used_owning(
+    ctx: &Ctx,
+    dir: &Dir,
+    artifacts: &[crate::shape::Artifact],
+    script_runs: &[String],
+    ok: bool,
+    members: &std::collections::BTreeSet<String>,
 ) {
     // `main_leaf` takes the run's lock itself: resolve before taking it here.
     let leaf = match dir {
@@ -544,8 +598,8 @@ pub fn note_used(
     let leaf = leaf.as_path();
     let used = &mut noted.used;
     for artifact in artifacts {
-        if artifact.test
-            && let Some(package) = &artifact.package
+        if let Some(package) = &artifact.package
+            && (artifact.test || members.contains(package))
         {
             used.members.insert(package.clone());
         }
@@ -567,10 +621,11 @@ pub fn note_used(
 
 /// The call that completes what the run builds into `dir` passed ([`crate::shape::Noted::closed`]):
 /// for the main lane's, the test compile's whole or closing call; for the lint lane's, the last
-/// of a dev run's lint passes over its selection, all of which passed. Without it the run keeps
-/// nothing of `dir`: a run that never made that call (a check that builds no tests, a test
-/// compile that failed before or in it, a release's lint, which lints package by package)
-/// reported only some of what its scope uses.
+/// of a dev run's lint passes over its selection, all of which passed; for a cell's, its row
+/// passed, every call it owed made and passed (`crate::cells`). Without it the run keeps nothing
+/// of `dir`: a run that never made that call (a check that builds no tests, a test compile that
+/// failed before or in it, a release's lint, which lints package by package, a cell that failed
+/// or could not run) reported only some of what its scope uses.
 pub fn close(ctx: &Ctx, dir: &Dir) {
     ctx.shape_run
         .lock()
@@ -659,12 +714,19 @@ pub struct KeptDir {
     /// How many units the record says this run retired
     /// (`atpkg::build_cache::stale::Kept::end`); 0 where the record was not written.
     pub retired: usize,
-    /// The directory the record was written in, by its device and inode as they were read once
+    /// The directory the record was written in, by its identity ([`DirId`]) as it was read once
     /// it was (the path's own, never a link's target): what [`trim_used`] trims, and nothing
     /// else that later stands at the path. `None` where the record was not written, or the
     /// directory could not be read: nothing of it is trimmed.
-    pub bound: Option<(u64, u64)>,
+    pub bound: Option<DirId>,
 }
+
+/// A directory's identity as [`identity`] reads it: its device and inode.
+#[cfg(unix)]
+pub type DirId = (u64, u64);
+/// A directory's identity as [`identity`] reads it: its volume serial number and file id.
+#[cfg(windows)]
+pub type DirId = aterm_dirfd::FileId;
 
 /// Keep, for each build directory the run's compile calls completed in (its closing call
 /// passed, [`close`], and no call into it failed, [`note_used`]), what they used of it and when
@@ -748,12 +810,31 @@ pub fn keep_used(ctx: &Ctx) -> Vec<KeptDir> {
 
 /// The real directory at `dir`, by its device and inode; `None` where nothing stands there, it
 /// cannot be read, or it is no directory (a link is not followed).
-fn identity(dir: &Path) -> Option<(u64, u64)> {
+#[cfg(unix)]
+fn identity(dir: &Path) -> Option<DirId> {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::symlink_metadata(dir)
         .ok()
         .filter(std::fs::Metadata::is_dir)
         .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// The real directory at `dir`, by its volume serial number and file id, read through a handle
+/// opened on the path's own entry; `None` where nothing stands there, it cannot be read, or it
+/// is no directory (a junction or link is a reparse point, not followed and never a directory).
+#[cfg(windows)]
+fn identity(dir: &Path) -> Option<DirId> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let handle = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .ok()?;
+    let stat = aterm_dirfd::fstat(&handle).ok()?;
+    stat.file_type().is_dir().then(|| stat.id())
 }
 
 /// The most of a run's end its trim takes ([`trim_used`]), over all its build directories: the
@@ -791,7 +872,7 @@ pub fn trim_used(ctx: &Ctx, kept: &[KeptDir]) -> Vec<String> {
 }
 
 /// [`trim_used`], each directory trimmed by `trim`.
-fn trim_used_with(
+pub(crate) fn trim_used_with(
     ctx: &Ctx,
     kept: &[KeptDir],
     trim: &dyn Fn(&Path) -> atpkg::build_cache::Trimmed,
@@ -872,9 +953,10 @@ fn trim_used_with(
 /// # Errors
 /// Why the run COULD NOT RUN, no check started: the need is more than the target's volume holds
 /// above its floor, so the run can never fit there; it is more than the volume has free above
-/// its floor once the relief ran, which no wait admits (UNMET), named with what to free and
-/// `--admit now`; an interrupt ended the wait; or the wait gave up behind holders that made no
-/// progress for [`crate::STUCK_ENDS`], named, and left alone.
+/// its floor once its one relief ran, so it ends at once rather than wait for disk (UNMET),
+/// named with what it was short of and `--admit now`; an interrupt ended the wait; or the wait
+/// gave up behind holders that made no progress for [`crate::STUCK_ENDS`], named, and left
+/// alone.
 fn answer(
     admitted: Result<atpkg::admit_disk::Admitted, atpkg::admit_disk::Error>,
 ) -> Result<Disk, String> {
@@ -884,8 +966,8 @@ fn answer(
             "{why}; it can never be admitted there. Fix: point CARGO_TARGET_DIR at a larger volume"
         )),
         Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(format!(
-            "the run's disk claim was refused, no check started: {e}, or start it at once with \
-             `--admit now`"
+            "the run's disk claim was refused, no check started: {e}; `--admit now` starts it at \
+             once"
         )),
         Err(e @ atpkg::admit_disk::Error::Stopped { .. }) => Err(format!(
             "the run's disk claim was {e}; no check started, so nothing was decided"

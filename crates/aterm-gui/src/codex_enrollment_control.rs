@@ -116,7 +116,14 @@ fn still_native(ctx: &crate::SessionCtx, proof: &crate::self_claim::Proven, mast
     let holder = format!("codex-alab@{}", proof.pid);
     let qualified = ctx.native_policy.holder(&holder).map_or_else(
         || crate::self_claim::runs_alab_build(proof.pid),
-        |(row, pid)| pid == proof.pid && ctx.native_policy.actor_image(row, pid),
+        |(row, pid)| {
+            pid == proof.pid
+                && ctx.native_policy.actor_image(
+                    row,
+                    aterm_agent::harness::contract::UNIVERSAL,
+                    pid,
+                )
+        },
     );
     qualified && proof.alive()
 }

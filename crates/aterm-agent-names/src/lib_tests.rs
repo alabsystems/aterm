@@ -19,6 +19,14 @@ fn program_words_match_without_case_from_a_path_and_a_login_dash() {
             Some(Agent::Claude),
         ),
         ("Agy", Some(Agent::Agy)),
+        ("agy-alab", Some(Agent::Agy)),
+        (
+            "/opt/pkg/store/agy-alab/5/bin/agy-alab run -- --model x",
+            Some(Agent::Agy),
+        ),
+        ("Agy-Alab", Some(Agent::Agy)),
+        ("agy-alabs", None),
+        ("xagy-alab", None),
         ("MUSE x", Some(Agent::Muse)),
         (
             "/Users/_user0/.local/bin/muse-bin-1.4.10-R6427.1",

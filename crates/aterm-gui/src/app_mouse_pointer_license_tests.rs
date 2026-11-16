@@ -81,7 +81,7 @@ fn echo_at(app: &mut App, geom: Geom, now: Instant) -> (u64, &'static str, bool)
     term_lock(&term).process(b"a");
     let cursor = term_lock(&term).cursor();
     let cfg = app.glow_config();
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     let mut out = Vec::new();
     ws.fx
         .cursor_mut()

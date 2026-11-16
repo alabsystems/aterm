@@ -360,12 +360,15 @@ fn independent_stages_really_do_run_at_the_same_time() {
 
 #[test]
 fn windowed_stages_serialize_without_blocking_independent_headless_work() {
-    let wanted = crate::checks::stages_of(&[
-        crate::Check::Lint,
-        crate::Check::Census,
-        crate::Check::Browser,
-        crate::Check::Appkit,
-    ]);
+    let wanted = crate::checks::stages_of(
+        &[
+            crate::Check::Lint,
+            crate::Check::Census,
+            crate::Check::Browser,
+            crate::Check::Appkit,
+        ],
+        false,
+    );
     let specs: Vec<_> = crate::plan::declared(&crate::Scope::workspace())
         .into_iter()
         .filter(|s| wanted.contains(&s.id))
@@ -533,7 +536,7 @@ fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
     for id in [StageId::Test, StageId::SpecCheck] {
         assert!(span(StageId::TestCompile).1 <= span(id).0);
     }
-    let mut expected = crate::checks::stages_of(&crate::checks::RELEASE_TREE);
+    let mut expected = crate::checks::stages_of(&crate::checks::RELEASE_TREE, true);
     let mut actual: Vec<_> = specs.iter().map(|s| s.id).collect();
     expected.sort_by_key(|id| *id as u8);
     actual.sort_by_key(|id| *id as u8);

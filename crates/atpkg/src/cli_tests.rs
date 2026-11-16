@@ -3236,7 +3236,7 @@ fn a_refused_set_rewrites_every_member_row_and_spares_a_held_one() {
     let r = set_disk_refusal(&units, 0, 5 * GIB, prefix).expect("7 GiB on 5 GiB refuses");
     assert!(
         r.line
-            .ends_with("free 3.0 GiB, or install ay alone: aterm pkg install ay"),
+            .ends_with("3.0 GiB short, or install ay alone: aterm pkg install ay"),
         "{}",
         r.line
     );
@@ -15890,4 +15890,39 @@ fn an_alab_rollback_on_the_vendor_door_sweeps_the_revoked_build_and_refreshes_ho
     );
     assert_eq!(HOOKS.load(std::sync::atomic::Ordering::SeqCst), 1);
     let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// A NAMED UPDATE RELEASES A NAMED INSTALL'S HOLD WHATEVER ITS PLAN DECIDES: `install
+/// hx-alab --build <n>` held it, and `update hx-alab` names it, so the hold goes whether the
+/// held build is the one the index pins (up to date), an older one (install), or one the index
+/// no longer serves; a pin the person set with `aterm pkg pin` stays theirs. NEGATIVE CONTROL
+/// (2026-11-14): while only an `Install` decision released the hold, `update` of the held,
+/// pinned build kept it, and the next pass skipped hx-alab when the index moved on.
+#[test]
+fn a_named_update_releases_a_named_installs_hold_whatever_its_plan_decides() {
+    use crate::ApplyDecision as D;
+    for decision in [D::UpToDate, D::Install, D::Tombstone, D::NotPinned] {
+        let layout = temp_layout("named-update-hold");
+        crate::pin::set_pinned(&layout, "hx-alab", true).unwrap();
+        crate::pin::set_held(&layout, "hx-alab", true).unwrap();
+        assert_eq!(
+            super::named_update_pin(&layout, "hx-alab", decision).unwrap(),
+            (false, true),
+            "{decision:?}"
+        );
+        assert!(!crate::pin::is_pinned(&layout, "hx-alab").unwrap());
+        assert!(!crate::pin::is_held(&layout, "hx-alab").unwrap());
+    }
+    let layout = temp_layout("named-update-own-pin");
+    crate::pin::set_pinned(&layout, "hx-alab", true).unwrap();
+    assert_eq!(
+        super::named_update_pin(&layout, "hx-alab", D::UpToDate).unwrap(),
+        (false, false)
+    );
+    assert_eq!(
+        super::named_update_pin(&layout, "hx-alab", D::Install).unwrap(),
+        (true, false),
+        "the person's own pin holds an install back"
+    );
+    assert!(crate::pin::is_pinned(&layout, "hx-alab").unwrap());
 }

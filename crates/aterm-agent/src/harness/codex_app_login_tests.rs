@@ -483,6 +483,7 @@ pub(in crate::harness) fn native_enrollment_refresh_fixture(home: &Path, now: i6
         aterm_spec::wait::MUST_HAPPEN,
         now,
         Some("main@example.test"),
+        None,
     );
     let seen = provider_seen(port, server);
     assert_eq!(seen, ["POST /oauth/token"]);
@@ -509,6 +510,9 @@ mod row_identity_tests;
 
 #[path = "codex_app_login_refusal_tests.rs"]
 mod refusal_tests;
+
+#[path = "codex_app_login_fixture_roots_tests.rs"]
+mod fixture_roots_tests;
 
 #[cfg(unix)]
 #[path = "codex_grant_completion_tests.rs"]
@@ -597,6 +601,12 @@ struct RecordedHttp {
 
 fn read_http_request(stream: &mut TcpStream) -> Option<RecordedHttp> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    read_http_request_from(stream)
+}
+
+/// [`read_http_request`] from any stream, a TLS session's among them. Its socket's own read
+/// timeout is the hang detector.
+fn read_http_request_from(stream: &mut impl Read) -> Option<RecordedHttp> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let header_end = loop {
@@ -645,7 +655,7 @@ fn read_http_request(stream: &mut TcpStream) -> Option<RecordedHttp> {
     })
 }
 
-fn send_http_json(stream: &mut TcpStream, status: &str, body: &Value) {
+fn send_http_json(stream: &mut impl Write, status: &str, body: &Value) {
     let payload = aterm_json::to_string(body).expect("json response");
     let wire = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -2421,16 +2431,23 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
     assert_eq!(full.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
     let week = with("\"usedPercent\":31", "\"usedPercent\":100");
     assert_eq!(week.walls, [(WEEK_LIMIT, Some(1_790_259_200))]);
+    // A refusal no spent window explains names no reset: the most-used window (94.2%, taken as
+    // 95%) is not spent, so its turnover says nothing of when the refusal ends.
     let refused = with(
         "\"ordinaryUsageAllowed\":true",
         "\"ordinaryUsageAllowed\":false",
     );
-    assert_eq!(refused.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
+    assert_eq!(refused.walls, [(SESSION_LIMIT, None)]);
+    assert_eq!(refused.refusal, Some(Refusal::Ordinary));
     let reached = with(
         "\"rateLimitReachedType\":null",
         "\"rateLimitReachedType\":\"workspace_member_credits_depleted\"",
     );
     assert!(!reached.walls.is_empty());
+    assert_eq!(
+        reached.refusal,
+        Some(Refusal::Workspace(WorkspaceRefusal::MemberCreditsDepleted))
+    );
     assert_eq!(usage_of(&json!({"accountId": "x"}), now), None);
     assert_eq!(usage_from_backend(&json!({"unexpected": true}), now), None);
 
@@ -2450,7 +2467,8 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         now,
     )
     .expect("spend wall");
-    assert_eq!(spend_wall.walls, [(SESSION_LIMIT, Some(1_790_010_800))]);
+    assert_eq!(spend_wall.walls, [(SESSION_LIMIT, None)]);
+    assert_eq!(spend_wall.refusal, Some(Refusal::SpendControl));
 
     let week_only = usage_of(
         &json!({
@@ -2580,6 +2598,642 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         std::os::unix::fs::symlink(&real, &link).expect("symlink auth");
         assert!(read_account_in_home(&link).is_none());
         assert!(write_auth_doc(&link, &json!({"auth_mode": "chatgpt"})).is_err());
+    }
+}
+
+/// The instant codex-alab's provider goldens are read at: each names its resets both as `reset_at`
+/// and as `reset_after_seconds` from it.
+const GOLDEN_NOW: i64 = 1_800_000_000;
+
+/// One of codex-alab's usage goldens (`alab/smoke/fixtures/provider/<name>` in codex-alab, its S1
+/// fixtures for every wall kind), copied whole: the `/wham/usage` reply as upstream's
+/// `RateLimitStatusPayload` models it (`codex-rs/codex-backend-openapi-models/src/models/
+/// rate_limit_status_payload.rs`, with `spend_control_status_details.rs` and
+/// `additional_rate_limit_details.rs`), beside the `account/rateLimits/read` answer the app-server
+/// makes of the same reply (`codex-rs/app-server-protocol/src/protocol/v2/account.rs`:
+/// `GetAccountRateLimitsResponse`, whose `rateLimits` is the codex bucket's `RateLimitSnapshot`).
+struct UsageGolden {
+    name: &'static str,
+    backend: Value,
+    app_server: Value,
+    refusal: Option<Refusal>,
+    walls: Vec<(&'static str, Option<i64>)>,
+    /// The sample's five-hour and weekly whole percent.
+    used: (Option<u32>, Option<u32>),
+}
+
+fn usage_goldens() -> [UsageGolden; 5] {
+    use crate::harness::accounts::SESSION_LIMIT;
+    let windows = |session: u32, session_reset: i64| {
+        json!({
+            "primary": {"usedPercent": session, "windowDurationMins": 300,
+                "resetsAt": session_reset},
+            "secondary": {"usedPercent": 10, "windowDurationMins": 10_080,
+                "resetsAt": 1_800_086_400_i64},
+        })
+    };
+    let snapshot = |extra: Value, windows: Value| {
+        let mut snapshot = json!({
+            "limitId": "codex", "limitName": Value::Null, "normalModelSlug": Value::Null,
+            "primary": Value::Null, "secondary": Value::Null, "credits": Value::Null,
+            "individualLimit": Value::Null, "spendControlReached": Value::Null,
+            "planType": Value::Null, "rateLimitReachedType": Value::Null,
+        });
+        let object = snapshot.as_object_mut().expect("a snapshot");
+        for (key, value) in windows
+            .as_object()
+            .into_iter()
+            .chain(extra.as_object())
+            .flatten()
+        {
+            object.insert(key.clone(), value.clone());
+        }
+        snapshot
+    };
+    let answer = |allowed: bool, rate_limits: Value| {
+        json!({
+            "ordinaryUsageAllowed": allowed,
+            "rateLimits": rate_limits,
+            "rateLimitsByLimitId": Value::Null,
+            "rateLimitResetCredits": {"availableCount": 0},
+            "accountId": "source-account",
+            "rateLimitUpsell": Value::Null,
+        })
+    };
+    [
+        UsageGolden {
+            name: "usage-spend-control.json",
+            backend: json!({
+              "account_id": "source-account",
+              "plan_type": "team",
+              "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                  "limit_window_seconds": 18000,
+                  "reset_after_seconds": 3600,
+                  "reset_at": 1_800_003_600_i64,
+                  "used_percent": 20
+                },
+                "secondary_window": {
+                  "limit_window_seconds": 604_800,
+                  "reset_after_seconds": 86400,
+                  "reset_at": 1_800_086_400_i64,
+                  "used_percent": 10
+                }
+              },
+              "rate_limit_reset_credits": {
+                "available_count": 0
+              },
+              "spend_control": {
+                "individual_limit": {
+                  "limit": "25000",
+                  "remaining": "0",
+                  "remaining_percent": 0,
+                  "reset_after_seconds": 1_728_000,
+                  "reset_at": 1_801_728_000_i64,
+                  "source": "workspace_spend_controls",
+                  "used": "25000",
+                  "used_percent": 100
+                },
+                "reached": true
+              },
+              "user_id": "fixture-user"
+            }),
+            app_server: answer(
+                false,
+                snapshot(
+                    json!({
+                        "individualLimit": {"limit": "25000", "used": "25000",
+                            "remainingPercent": 0, "resetsAt": 1_801_728_000_i64},
+                        "spendControlReached": true,
+                        "planType": "team",
+                    }),
+                    windows(20, 1_800_003_600),
+                ),
+            ),
+            refusal: Some(Refusal::SpendControl),
+            walls: vec![(SESSION_LIMIT, None)],
+            used: (Some(20), Some(10)),
+        },
+        UsageGolden {
+            name: "usage-workspace-credits.json",
+            backend: json!({
+              "account_id": "source-account",
+              "plan_type": "team",
+              "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                  "limit_window_seconds": 18000,
+                  "reset_after_seconds": 3600,
+                  "reset_at": 1_800_003_600_i64,
+                  "used_percent": 20
+                },
+                "secondary_window": {
+                  "limit_window_seconds": 604_800,
+                  "reset_after_seconds": 86400,
+                  "reset_at": 1_800_086_400_i64,
+                  "used_percent": 10
+                }
+              },
+              "rate_limit_reached_type": {
+                "type": "workspace_member_credits_depleted"
+              },
+              "rate_limit_reset_credits": {
+                "available_count": 0
+              },
+              "user_id": "fixture-user"
+            }),
+            app_server: answer(
+                false,
+                snapshot(
+                    json!({
+                        "planType": "team",
+                        "rateLimitReachedType": "workspace_member_credits_depleted",
+                    }),
+                    windows(20, 1_800_003_600),
+                ),
+            ),
+            refusal: Some(Refusal::Workspace(WorkspaceRefusal::MemberCreditsDepleted)),
+            walls: vec![(SESSION_LIMIT, None)],
+            used: (Some(20), Some(10)),
+        },
+        UsageGolden {
+            name: "usage-credit-only.json",
+            backend: json!({
+              "account_id": "source-account",
+              "credits": {
+                "balance": "0",
+                "has_credits": false,
+                "unlimited": false
+              },
+              "plan_type": "self_serve_business_usage_based",
+              "rate_limit": {
+                "allowed": false,
+                "limit_reached": true
+              },
+              "rate_limit_reset_credits": {
+                "available_count": 0
+              },
+              "user_id": "fixture-user"
+            }),
+            app_server: answer(
+                false,
+                snapshot(
+                    json!({
+                        "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+                        "planType": "self_serve_business_usage_based",
+                    }),
+                    json!({}),
+                ),
+            ),
+            refusal: Some(Refusal::Ordinary),
+            walls: vec![(SESSION_LIMIT, None)],
+            used: (None, None),
+        },
+        UsageGolden {
+            name: "usage-model-limit.json",
+            backend: json!({
+              "account_id": "source-account",
+              "additional_rate_limits": [
+                {
+                  "limit_name": "codex_other",
+                  "metered_feature": "codex_other",
+                  "normal_model_slug": Value::Null,
+                  "rate_limit": {
+                    "allowed": false,
+                    "limit_reached": true,
+                    "primary_window": {
+                      "limit_window_seconds": 18000,
+                      "reset_after_seconds": 7200,
+                      "reset_at": 1_800_007_200_i64,
+                      "used_percent": 100
+                    },
+                    "secondary_window": {
+                      "limit_window_seconds": 604_800,
+                      "reset_after_seconds": 259_200,
+                      "reset_at": 1_800_259_200_i64,
+                      "used_percent": 40
+                    }
+                  }
+                }
+              ],
+              "plan_type": "pro",
+              "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                  "limit_window_seconds": 18000,
+                  "reset_after_seconds": 3600,
+                  "reset_at": 1_800_003_600_i64,
+                  "used_percent": 20
+                },
+                "secondary_window": {
+                  "limit_window_seconds": 604_800,
+                  "reset_after_seconds": 86400,
+                  "reset_at": 1_800_086_400_i64,
+                  "used_percent": 10
+                }
+              },
+              "rate_limit_reset_credits": {
+                "available_count": 0
+              },
+              "user_id": "fixture-user"
+            }),
+            app_server: {
+                let mut answer = answer(
+                    true,
+                    snapshot(json!({"planType": "pro"}), windows(20, 1_800_003_600)),
+                );
+                let by_limit = json!({
+                    "codex": answer["rateLimits"].clone(),
+                    "codex_other": snapshot(
+                        json!({"limitId": "codex_other", "limitName": "codex_other",
+                            "planType": "pro"}),
+                        json!({
+                            "primary": {"usedPercent": 100, "windowDurationMins": 300,
+                                "resetsAt": 1_800_007_200_i64},
+                            "secondary": {"usedPercent": 40, "windowDurationMins": 10_080,
+                                "resetsAt": 1_800_259_200_i64},
+                        }),
+                    ),
+                });
+                answer
+                    .as_object_mut()
+                    .expect("an answer")
+                    .insert("rateLimitsByLimitId".to_owned(), by_limit);
+                answer
+            },
+            refusal: None,
+            walls: Vec::new(),
+            used: (Some(20), Some(10)),
+        },
+        UsageGolden {
+            name: "usage-five-hour-reached.json",
+            backend: json!({
+              "account_id": "source-account",
+              "plan_type": "pro",
+              "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                  "limit_window_seconds": 18000,
+                  "reset_after_seconds": 300,
+                  "reset_at": 1_800_000_300_i64,
+                  "used_percent": 100
+                },
+                "secondary_window": {
+                  "limit_window_seconds": 604_800,
+                  "reset_after_seconds": 86400,
+                  "reset_at": 1_800_086_400_i64,
+                  "used_percent": 10
+                }
+              },
+              "rate_limit_reached_type": {
+                "type": "rate_limit_reached"
+              },
+              "rate_limit_reset_credits": {
+                "available_count": 0
+              },
+              "user_id": "fixture-user"
+            }),
+            app_server: answer(
+                false,
+                snapshot(
+                    json!({"planType": "pro", "rateLimitReachedType": "rate_limit_reached"}),
+                    windows(100, 1_800_000_300),
+                ),
+            ),
+            refusal: Some(Refusal::Ordinary),
+            walls: vec![(SESSION_LIMIT, Some(1_800_000_300))],
+            used: (Some(100), Some(10)),
+        },
+    ]
+}
+
+/// EVERY WALL KIND'S GOLDEN READS AS ITS REFUSAL, THROUGH BOTH PARSERS: each of codex-alab's usage
+/// goldens for the wall kinds outside the ordinary five-hour and weekly walls gives the same
+/// [`Usage`] read from the provider's reply (`usage_from_backend`) as from the app-server's answer
+/// of it (`usage_of`). A spend control is its own refusal, not folded into the ordinary
+/// allowance; a workspace's type is the workspace's; a credit-only plan out of credits, and
+/// `rate_limit_reached`, are the codex bucket's own. A refusal no spent window explains is one
+/// fallback wall under the most-used window with no reset, so it stands by rungs and not to that
+/// window's turnover; `rate_limit_reached` at a spent five-hour window keeps that window's wall and
+/// reset. Another model's own limit refuses nothing of the codex bucket.
+#[test]
+fn every_wall_kinds_golden_reads_as_its_refusal_through_both_parsers() {
+    for golden in usage_goldens() {
+        let name = golden.name;
+        let backend = usage_from_backend(&golden.backend, GOLDEN_NOW).expect(name);
+        let app_server = usage_of(&golden.app_server, GOLDEN_NOW).expect(name);
+        assert_eq!(
+            backend, app_server,
+            "{name}: one reading through both parsers"
+        );
+        assert_eq!(backend.refusal, golden.refusal, "{name}");
+        assert_eq!(backend.walls, golden.walls, "{name}");
+        assert_eq!(
+            (backend.sample.session_pct, backend.sample.week_pct),
+            golden.used,
+            "{name}"
+        );
+    }
+}
+
+/// ANOTHER MODEL'S LIMIT READS AS ONE ENTRY THROUGH BOTH PARSERS, AND ONLY THERE: codex-alab's
+/// `usage-model-limit.json` golden, its codex bucket with room and `codex_other` at its five-hour
+/// limit, gives through the provider's reply (`additional_rate_limits[]`, whose `allowed` false
+/// its spent window explains) and through the app-server's answer (`rateLimitsByLimitId`, which
+/// carries no allowance) the same one entry, `codex_other`: each of its windows with its share and
+/// its own reset, the spent five-hour one its wall, nothing else refusing it, and that reset as
+/// its wall's. The codex bucket's walls, refusal and sample are untouched by it, and no other id
+/// is listed.
+#[test]
+fn another_models_limit_reads_as_one_entry_through_both_parsers() {
+    use crate::ai::codex_limits::Bucket;
+    let golden = usage_goldens()
+        .into_iter()
+        .find(|golden| golden.name == "usage-model-limit.json")
+        .expect("the model-limit golden");
+    let backend = usage_from_backend(&golden.backend, GOLDEN_NOW).expect("a reply");
+    let app_server = usage_of(&golden.app_server, GOLDEN_NOW).expect("an answer");
+    let expected = LimitUsage {
+        windows: vec![
+            LimitWindow {
+                bucket: Bucket::FiveHour,
+                used: 100,
+                reset: Some(1_800_007_200),
+            },
+            LimitWindow {
+                bucket: Bucket::Week,
+                used: 40,
+                reset: Some(1_800_259_200),
+            },
+        ],
+        refusal: None,
+    };
+    for (parser, usage) in [("backend", &backend), ("app-server", &app_server)] {
+        assert_eq!(
+            usage.limits.keys().collect::<Vec<_>>(),
+            ["codex_other"],
+            "{parser}"
+        );
+        assert_eq!(usage.limits["codex_other"], expected, "{parser}");
+        assert_eq!(
+            usage.limits["codex_other"].walls().collect::<Vec<_>>(),
+            [(Bucket::FiveHour, Some(1_800_007_200))],
+            "{parser}"
+        );
+        assert!(usage.limits["codex_other"].walled(), "{parser}");
+        assert_eq!(
+            usage.limits["codex_other"].until(),
+            Some(1_800_007_200),
+            "{parser}"
+        );
+        assert!(
+            usage.walls.is_empty(),
+            "{parser}: the codex bucket has room"
+        );
+        assert_eq!(usage.refusal, None, "{parser}");
+        assert_eq!(
+            (usage.sample.session_pct, usage.sample.week_pct),
+            (Some(20), Some(10)),
+            "{parser}"
+        );
+    }
+}
+
+/// A LIMIT'S ID IS ITS METERED FEATURE AS UPSTREAM NORMALIZES IT: trimmed, lowercase, `-` as
+/// `_`, so `Codex-Other` in the provider's reply and in the app-server's keys is `codex_other`. A
+/// feature that normalizes to no id (`codex` itself, a `.`, empty, 65 long) is listed nowhere,
+/// and two entries of one id are listed as neither.
+#[test]
+fn a_limits_metered_feature_normalizes_to_its_id() {
+    assert_eq!(
+        limit_id(" GPT-5-Codex-Mini ").as_deref(),
+        Some("gpt_5_codex_mini")
+    );
+    for none in ["codex", "CODEX", "codex.other", "", " ", &"a".repeat(65)] {
+        assert_eq!(limit_id(none), None, "{none:?}");
+    }
+    assert!(is_limit_id(&"a".repeat(64)));
+    let window = |used: u32| {
+        json!({"used_percent": used, "limit_window_seconds": 18000,
+            "reset_at": GOLDEN_NOW + 7200})
+    };
+    let reply = |features: &[&str]| {
+        let limits: Vec<Value> = features
+            .iter()
+            .map(|feature| {
+                json!({"limit_name": feature, "metered_feature": feature,
+                    "rate_limit": {"allowed": true, "primary_window": window(30)}})
+            })
+            .collect();
+        json!({"plan_type": "pro",
+            "rate_limit": {"allowed": true, "primary_window": window(10)},
+            "additional_rate_limits": limits})
+    };
+    let read = |features: &[&str]| {
+        usage_from_backend(&reply(features), GOLDEN_NOW)
+            .expect("a reply")
+            .limits
+            .into_keys()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read(&["Codex-Other"]), ["codex_other"]);
+    assert_eq!(read(&["Codex-Other", "spark"]), ["codex_other", "spark"]);
+    assert!(read(&["codex", "codex.other"]).is_empty());
+    assert_eq!(
+        read(&["Codex-Other", "codex_other", "spark"]),
+        ["spark"],
+        "two entries of one id are listed as neither"
+    );
+    let answer = |keys: &[&str]| {
+        let by_limit: aterm_json::Map = keys
+            .iter()
+            .map(|key| {
+                (
+                    (*key).to_owned(),
+                    json!({"limitId": key, "primary": {"usedPercent": 30,
+                        "windowDurationMins": 300, "resetsAt": GOLDEN_NOW + 7200}}),
+                )
+            })
+            .collect();
+        usage_of(
+            &json!({"ordinaryUsageAllowed": true, "rateLimits": {}, "rateLimitsByLimitId": by_limit}),
+            GOLDEN_NOW,
+        )
+        .expect("an answer")
+        .limits
+        .into_keys()
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(answer(&["codex", "Codex-Other"]), ["codex_other"]);
+    assert!(answer(&["Codex-Other", "codex_other"]).is_empty());
+}
+
+/// ANOTHER LIMIT'S REFUSAL NEVER WALLS THE CODEX BUCKET: a reply whose codex bucket has room and
+/// whose `codex_other` the provider refuses (`allowed` false at 50%, which no spent window
+/// explains, or `limit_reached` alone) lists `codex_other` refused, its wall naming no reset, and
+/// adds nothing to the codex bucket's walls or refusal; so does one whose `codex_other` week and
+/// five-hour window are both spent. A Reserve (`gpt-reserve`), the fallback after the codex bucket
+/// is spent, is ordinary use and is listed nowhere, in either shape.
+#[test]
+fn another_limits_refusal_never_walls_the_codex_bucket() {
+    use crate::ai::codex_limits::Bucket;
+    let window = |used: u32, seconds: i64, after: i64| {
+        json!({"used_percent": used, "limit_window_seconds": seconds,
+            "reset_at": GOLDEN_NOW + after})
+    };
+    let reply = |name: &str, limit: Value| {
+        json!({"plan_type": "pro",
+            "rate_limit": {"allowed": true, "primary_window": window(10, 18000, 3600),
+                "secondary_window": window(5, 604_800, 86_400)},
+            "additional_rate_limits": [{"limit_name": name, "metered_feature": "codex_other",
+                "rate_limit": limit}]})
+    };
+    for refused in [
+        json!({"allowed": false, "primary_window": window(50, 18000, 3600)}),
+        json!({"limit_reached": true, "primary_window": window(50, 18000, 3600)}),
+    ] {
+        let usage = usage_from_backend(&reply("codex_other", refused.clone()), GOLDEN_NOW)
+            .expect("a reply");
+        let entry = &usage.limits["codex_other"];
+        assert_eq!(entry.refusal, Some(Refusal::Ordinary), "{refused}");
+        assert!(
+            entry.walls().next().is_none() && entry.walled(),
+            "{refused}"
+        );
+        assert_eq!(
+            entry.until(),
+            None,
+            "{refused}: no spent window names its end"
+        );
+        assert!(usage.walls.is_empty(), "{refused}");
+        assert_eq!(usage.refusal, None, "{refused}");
+    }
+    let spent = json!({"allowed": false, "primary_window": window(100, 18000, 7200),
+        "secondary_window": window(100, 604_800, 86_400)});
+    let usage = usage_from_backend(&reply("codex_other", spent), GOLDEN_NOW).expect("a reply");
+    assert_eq!(
+        usage.limits["codex_other"].walls().collect::<Vec<_>>(),
+        [
+            (Bucket::FiveHour, Some(GOLDEN_NOW + 7200)),
+            (Bucket::Week, Some(GOLDEN_NOW + 86_400))
+        ]
+    );
+    assert_eq!(
+        usage.limits["codex_other"].until(),
+        Some(GOLDEN_NOW + 86_400)
+    );
+    assert!(usage.walls.is_empty() && usage.refusal.is_none());
+    let reserve = json!({"allowed": false, "primary_window": window(100, 18000, 7200)});
+    for name in ["gpt-reserve", " GPT-Reserve "] {
+        let usage = usage_from_backend(&reply(name, reserve.clone()), GOLDEN_NOW).expect("a reply");
+        assert!(usage.limits.is_empty(), "{name}");
+        let answer = json!({"ordinaryUsageAllowed": true, "rateLimits": {},
+            "rateLimitsByLimitId": {"codex_other": {"limitId": "codex_other",
+                "limitName": name, "primary": {"usedPercent": 100,
+                    "windowDurationMins": 300, "resetsAt": GOLDEN_NOW + 7200}}}});
+        assert!(
+            usage_of(&answer, GOLDEN_NOW)
+                .expect("an answer")
+                .limits
+                .is_empty(),
+            "{name}"
+        );
+    }
+}
+
+/// The provider's four workspace words, written out as it spells them, each with the kind it names:
+/// upstream's `RateLimitReachedKind` serde names
+/// (`codex-rs/codex-backend-openapi-models/src/models/rate_limit_status_payload.rs`) and the
+/// app-server's snake_case `RateLimitReachedType`
+/// (`codex-rs/app-server-protocol/src/protocol/v2/account.rs`). Tests take each word from here,
+/// never from [`WorkspaceRefusal::as_str`], so a misspelt word fails them rather than agreeing
+/// with itself.
+pub(crate) const WORKSPACE_WORDS: [(&str, WorkspaceRefusal); 4] = [
+    (
+        "workspace_owner_credits_depleted",
+        WorkspaceRefusal::OwnerCreditsDepleted,
+    ),
+    (
+        "workspace_member_credits_depleted",
+        WorkspaceRefusal::MemberCreditsDepleted,
+    ),
+    (
+        "workspace_owner_usage_limit_reached",
+        WorkspaceRefusal::OwnerUsageLimitReached,
+    ),
+    (
+        "workspace_member_usage_limit_reached",
+        WorkspaceRefusal::MemberUsageLimitReached,
+    ),
+];
+
+/// ONLY THE FOUR WORKSPACE TYPES ARE A WORKSPACE'S REFUSAL: each of the provider's words
+/// ([`WORKSPACE_WORDS`]) names its own kind through both parsers, beside windows with room and an
+/// ordinary allowance that says yes, and the four are every kind. `rate_limit_reached` is the codex
+/// bucket's own refusal, and `unknown` names none; with the allowance refused too, it is the codex
+/// bucket's.
+#[test]
+fn only_the_four_workspace_types_are_a_workspaces_refusal() {
+    let read = |allowed: bool, kind: Option<&str>| {
+        let backend = usage_from_backend(
+            &json!({
+                "plan_type": "team",
+                "rate_limit": {
+                    "allowed": allowed,
+                    "primary_window": {"used_percent": 20, "limit_window_seconds": 18000,
+                        "reset_at": GOLDEN_NOW + 3600},
+                    "secondary_window": {"used_percent": 10, "limit_window_seconds": 604_800,
+                        "reset_at": GOLDEN_NOW + 86_400}
+                },
+                "rate_limit_reached_type": kind.map(|kind| json!({"type": kind})),
+            }),
+            GOLDEN_NOW,
+        )
+        .expect("usage");
+        let app_server = usage_of(
+            &json!({
+                "ordinaryUsageAllowed": allowed,
+                "rateLimits": {
+                    "rateLimitReachedType": kind.filter(|kind| *kind != "unknown"),
+                    "primary": {"usedPercent": 20, "windowDurationMins": 300,
+                        "resetsAt": GOLDEN_NOW + 3600},
+                    "secondary": {"usedPercent": 10, "windowDurationMins": 10_080,
+                        "resetsAt": GOLDEN_NOW + 86_400}
+                }
+            }),
+            GOLDEN_NOW,
+        )
+        .expect("usage");
+        assert_eq!(backend, app_server, "{kind:?}");
+        backend.refusal
+    };
+    for (word, kind) in WORKSPACE_WORDS {
+        assert_eq!(
+            read(true, Some(word)),
+            Some(Refusal::Workspace(kind)),
+            "{word}"
+        );
+        assert_eq!(WorkspaceRefusal::of(word), Some(kind), "{word}");
+        assert_eq!(kind.as_str(), word);
+    }
+    assert_eq!(WORKSPACE_WORDS.map(|(_, kind)| kind), WorkspaceRefusal::ALL);
+    assert_eq!(
+        read(true, Some("rate_limit_reached")),
+        Some(Refusal::Ordinary)
+    );
+    assert_eq!(read(true, Some("unknown")), None);
+    assert_eq!(read(false, Some("unknown")), Some(Refusal::Ordinary));
+    assert_eq!(read(true, None), None);
+    assert_eq!(read(false, None), Some(Refusal::Ordinary));
+    assert!(!Refusal::Ordinary.outlasts_windows());
+    assert!(Refusal::SpendControl.outlasts_windows());
+    for kind in WorkspaceRefusal::ALL {
+        assert!(Refusal::Workspace(kind).outlasts_windows());
     }
 }
 
@@ -2904,6 +3558,7 @@ fn refresh_case(case: i64, early: bool) -> [(&'static str, i64); 6] {
         Duration::from_secs(60),
         now,
         None,
+        None,
     );
     let _ = TcpStream::connect(("127.0.0.1", port));
     let kept = server.join().unwrap();
@@ -3049,6 +3704,7 @@ fn separately_bounded_responses_retain_large_tokens_across_fresh_file_reads() {
             Duration::from_secs(60),
             1_790_000_000 + round,
             None,
+            None,
         )
         .expect("refresh from the saved replacement");
         let reloaded = load_stored_auth(tmp.path()).expect("reload published auth");
@@ -3131,6 +3787,7 @@ fn result_case(case: i64) -> [(&'static str, i64); 6] {
         &format!("http://127.0.0.1:{port}/oauth/token"),
         Duration::from_secs(60),
         now,
+        None,
         |_| true,
         |home, doc| {
             if case == 9 {
@@ -3450,6 +4107,7 @@ fn identity_case(case: i64) -> [(&'static str, i64); 5] {
             Duration::from_secs(60),
             now,
             None,
+            None,
         );
         let _ = TcpStream::connect(("127.0.0.1", port));
         server.join().unwrap();
@@ -3643,6 +4301,7 @@ fn authority_case(case: i64) -> [(&'static str, i64); 6] {
         &fallback,
         Duration::from_secs(60),
         now,
+        None,
         None,
     );
     let _ = TcpStream::connect(("127.0.0.1", port));
@@ -5196,6 +5855,7 @@ fn a_refresh_with_too_little_time_left_sends_nothing() {
         MIN_REFRESH_BUDGET - Duration::from_millis(1),
         now,
         None,
+        None,
     );
     assert!(matches!(got, Refreshed::Failed), "{got:?}");
     assert_eq!(
@@ -5211,6 +5871,7 @@ fn a_refresh_with_too_little_time_left_sends_nothing() {
         &format!("http://127.0.0.1:{port}/oauth/token"),
         aterm_spec::wait::MUST_HAPPEN,
         now,
+        None,
         None,
     );
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
@@ -5235,6 +5896,7 @@ fn a_refresh_sends_nothing_while_another_holds_the_logins_lock() {
         &format!("http://127.0.0.1:{port}/oauth/token"),
         MIN_REFRESH_BUDGET + Duration::from_secs(1),
         now,
+        None,
         None,
     );
     drop(held);
@@ -5273,6 +5935,7 @@ fn an_uncertain_refresh_is_not_sent_again_after_reloading_the_login() {
             aterm_spec::wait::MUST_HAPPEN,
             now,
             None,
+            None,
         );
         assert!(matches!(got, Refreshed::Failed), "{got:?}");
     }
@@ -5305,6 +5968,7 @@ fn refresh_attempts_survive_metadata_changes_and_allow_a_new_token() {
                 &format!("http://127.0.0.1:{port}/oauth/token"),
                 aterm_spec::wait::MUST_HAPPEN,
                 now,
+                None,
                 None,
             );
             assert_eq!(matches!(result, Refreshed::Rejected), refused, "{result:?}");
@@ -5409,6 +6073,7 @@ fn an_unreadable_refresh_journal_never_starts_another_refresh() {
                 aterm_spec::wait::MUST_HAPPEN,
                 now,
                 None,
+                None,
             ),
             Refreshed::Failed
         ));
@@ -5436,6 +6101,7 @@ fn a_failed_refresh_directory_flush_sends_nothing_and_can_retry() {
             &format!("http://127.0.0.1:{port}/oauth/token"),
             aterm_spec::wait::MUST_HAPPEN,
             now,
+            None,
             None,
         )
     };
@@ -5476,6 +6142,7 @@ fn a_refresh_tls_failure_before_sending_can_retry() {
             aterm_spec::wait::MUST_HAPPEN,
             now,
             None,
+            None,
         ),
         Refreshed::Failed
     ));
@@ -5495,6 +6162,7 @@ fn a_refresh_tls_failure_before_sending_can_retry() {
             &format!("http://127.0.0.1:{port}/oauth/token"),
             aterm_spec::wait::MUST_HAPPEN,
             now,
+            None,
             None,
         ),
         Refreshed::Done(_)
@@ -5518,6 +6186,7 @@ fn an_applied_refresh_with_the_same_token_survives_a_failed_directory_flush() {
             &format!("http://127.0.0.1:{port}/oauth/token"),
             aterm_spec::wait::MUST_HAPPEN,
             now,
+            None,
             None,
         ),
         Refreshed::Failed
@@ -5552,6 +6221,7 @@ fn a_saved_refresh_reply_cannot_be_bypassed_by_editing_the_workspace() {
             &token_url,
             aterm_spec::wait::MUST_HAPPEN,
             now,
+            None,
             |_| true,
             |_, _| Err(std::io::Error::other("injected publication failure")),
         ),
@@ -5576,6 +6246,7 @@ fn a_saved_refresh_reply_cannot_be_bypassed_by_editing_the_workspace() {
             aterm_spec::wait::MUST_HAPPEN,
             now,
             None,
+            None,
         ),
         Refreshed::Failed
     ));
@@ -5596,6 +6267,7 @@ fn a_saved_refresh_reply_cannot_be_bypassed_by_editing_the_workspace() {
         &token_url,
         aterm_spec::wait::MUST_HAPPEN,
         now,
+        None,
         None,
     )
     .done()
@@ -5621,6 +6293,7 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
         &format!("http://127.0.0.1:{port}/oauth/token"),
         aterm_spec::wait::MUST_HAPPEN,
         now,
+        None,
         |_| true,
         |_, _| Err(std::io::Error::other("injected publication failure")),
     );
@@ -5701,6 +6374,7 @@ fn a_refresh_response_a_failed_publication_left_is_published_by_the_next_read() 
         aterm_spec::wait::MUST_HAPPEN,
         now,
         Some("owner@example.test"),
+        None,
     );
     assert_eq!(provider_seen(port, server), ["POST /oauth/token"]);
     assert!(matches!(got, Refreshed::Failed), "{got:?}");
@@ -5801,6 +6475,7 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
                 aterm_spec::wait::MUST_HAPPEN,
                 now,
                 Some("lock@example.com"),
+                None,
             )
         },
     )
@@ -5848,6 +6523,7 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
         aterm_spec::wait::MUST_HAPPEN,
         now,
         Some("lock@example.com"),
+        None,
     )
     .expect("refresh under lock");
     server.join().expect("server thread");
@@ -5876,6 +6552,7 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
             &token_url,
             Duration::from_secs(5),
             now,
+            None,
             None,
         )
         .is_none(),

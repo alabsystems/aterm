@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word, or, for a run whose screen reader reads nothing, by the program's own claim ([`TurnTracker::claim`]).
+//! The turn tracker (design §2.4): at most one open turn per agent run, driven by the screen verdict word, or, for a run whose screen reader reads nothing, by the program's own claim ([`TurnTracker::claim_edge`]).
 
 use crate::field::{BoundedText, BoundedToken, Fields, Key, Val};
 use crate::fold::NodeFields;
@@ -299,16 +299,41 @@ impl Verdict {
     }
 }
 
-/// What the program in front says of its own turn (OSC 7501's `state=`, the log's `mark program
-/// state=`), as [`TurnTracker::claim`] reads it.
+/// ONE EDGE OF A PROGRAM'S CLAIMED TURN, as the engine drew it from the program's OSC 7501
+/// reports (`aterm_core`'s `ProgramTurn`), which [`TurnTracker::claim_edge`] reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Claimed {
-    /// `working`, or `blocked` on a person in the middle of one: a turn runs.
-    Working,
+pub enum ClaimEdge {
+    /// A report began a turn: `working`, or `blocked` on a person, after a rest or none (one the
+    /// engine's turn count moved for).
+    Began,
+    /// A report resumed the turn running: an in-turn report taken while none stood (the program
+    /// cleared its report mid-turn and sent it again, as codex-alab does around a job-control stop
+    /// or an external program), or the one a restore installed. The same turn, so it opens one
+    /// only where none runs.
+    Resumed,
     /// `idle` or `done`: the turn came to rest.
     Rested,
     /// `error`: the turn ended on an error.
     Failed,
+}
+
+/// WHAT ONE CLAIMED EDGE DID ([`TurnTracker::claim_edge`]), which the host counts: a refusal is a
+/// turn the log does not hold, and the host says how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EdgeOutcome {
+    /// A beginning opened a claimed turn, paying the token `may_open` granted.
+    Opened,
+    /// A beginning took a partial transcript's turn no beginning took as its span's.
+    Took,
+    /// The run's turn bucket refused the turn a beginning would have opened: none is logged.
+    Refused,
+    /// A rest closed the turn running.
+    Closed,
+    /// The claim stands aside: the screen opens the run's turns, or a transcript read
+    /// `state=on` does.
+    Aside,
+    /// Nothing moved: the run is closed, a turn already runs, or a rest found none to close.
+    Nothing,
 }
 
 /// A step the screen holds open.
@@ -862,7 +887,7 @@ pub struct TurnTracker {
     opens: u64,
     closes: u64,
     /// The screen verdict opened a turn on this run in this process (a carry starts it unset): its
-    /// turns are the screen's, and the program's claim stands aside ([`TurnTracker::claim`]).
+    /// turns are the screen's, and the program's claim stands aside ([`TurnTracker::claim_edge`]).
     screen_turns: bool,
     /// The turns a partial transcript opened where none ran (fix E1) that no claim's beginning
     /// has taken and no claim's rest closed yet, oldest first, each with its open's wall time: at
@@ -871,9 +896,14 @@ pub struct TurnTracker {
     /// unless that reading shows its own span still `working`, and the later turn would open no
     /// turn of its own (ATERM-KI-1029-1 R5).
     untaken: Vec<(Node, u64)>,
+    /// A beginning this tracker read ([`ClaimEdge::Began`], or a resumed one it took as its span's)
+    /// stands with no rest read since: a resumed beginning is that span's turn and moves nothing,
+    /// whether the turn still runs or closed (a partial transcript's, closed at its own end). Never
+    /// carried: a successor's resumed beginning is its first reading of the turn.
+    claim_span: bool,
 }
 
-/// The most untaken partial-transcript turns a tracker keeps ([`TurnTracker::claim`]); a ninth
+/// The most untaken partial-transcript turns a tracker keeps ([`TurnTracker::claim_edge`]); a ninth
 /// drops the oldest.
 const UNTAKEN_MAX: usize = 8;
 
@@ -917,6 +947,7 @@ impl TurnTracker {
             closes: 0,
             screen_turns: false,
             untaken: Vec::new(),
+            claim_span: false,
         }
     }
 
@@ -1028,21 +1059,32 @@ impl TurnTracker {
         self.wake_at()
     }
 
-    /// THE PROGRAM'S OWN CLAIM of its turn (OSC 7501's working and resting edges), for a run whose
-    /// screen opens no turn (a codex-alab's, whose screen word is `unknown`): `working` opens a
-    /// turn at `conf=claim` (`src=engine`) and the next rest closes it there, and the host feeds
-    /// the edges no status sample showed through [`Self::claim_edge`], at the engine's own times,
-    /// so a turn that began and ended between two samples is in the log too, with its duration,
-    /// whatever its transcript gives, as far as the host feeds its edges and the run's bucket pays
-    /// for it (ATERM-KI-1029-1 names what it misses). A beginning opens its turn no earlier than
-    /// the run's open or the close of the log's newest closed turn, so sibling turns never run
-    /// backwards. Once the screen verdict has opened a turn on the run, its turns are the screen's
-    /// and the claim stands aside. A transcript read `state=on` opens and closes its own turns, so
-    /// the claim stands aside while one is read (until its reader stops, [`Self::tx_stopped`], or
-    /// an interrupt ended the vendor turn, which emits no `TurnEnd`; an engine edge dated no later
-    /// than the newest row a stopped reader applied stays aside, as that turn is the transcript's);
-    /// its prompt names the claim's turn it finds inside [`ATTRIBUTION_MS`], open or closed and
-    /// named by none, so a transcript read late never logs a second turn for a span a claim's turn
+    /// THE PROGRAM'S OWN CLAIM of its turn (OSC 7501's working and resting edges, as the engine
+    /// drew them), for a run whose screen opens no turn (a codex-alab's, whose screen word is
+    /// `unknown`): the host feeds every edge the engine kept past its cursor, oldest first, each at
+    /// the wall clock of the parse batch that carried it, so a turn that began and ended between
+    /// two status sweeps is in the log too, with its duration, whatever its transcript gives, as
+    /// far as the engine kept its edges and the run's turn bucket pays for it (ATERM-KI-1029-1
+    /// names what it misses). A beginning ([`ClaimEdge::Began`]) opens a turn at `conf=claim`
+    /// (`src=engine`) and the next rest closes it there; one that finds the claim's own turn still
+    /// open closes it `out=unknown` there first (the engine drew a new turn, so that one ended
+    /// unseen: its end fell out of the engine's ring before the host read it). A resumed beginning
+    /// ([`ClaimEdge::Resumed`]) is the same turn's: after a beginning this tracker read and no rest
+    /// since, it moves nothing (that span has its turn, running or closed, or its refusal); else it
+    /// does nothing while a turn runs and opens one as a beginning does, so a turn resumed in a new
+    /// run (a codex brought back with `fg`, or a successor's after a seamless update) is logged
+    /// there once. A beginning that
+    /// would open a turn asks `may_open` (the run's turn bucket) first and opens nothing on a
+    /// refusal ([`EdgeOutcome::Refused`]); one that takes a partial transcript's turn, or finds
+    /// another turn running, asks nothing. A beginning opens its turn no earlier than the run's
+    /// open or the close of the log's newest closed turn, so sibling turns never run backwards.
+    /// Once the screen verdict has opened a turn on the run, its turns are the screen's and the
+    /// claim stands aside. A transcript read `state=on` opens and closes its own turns, so the
+    /// claim stands aside while one is read (until its reader stops, [`Self::tx_stopped`], or an
+    /// interrupt ended the vendor turn, which emits no `TurnEnd`; an edge dated no later than the
+    /// newest row a stopped reader applied stays aside, as that turn is the transcript's); its
+    /// prompt names the claim's turn it finds inside [`ATTRIBUTION_MS`], open or closed and named
+    /// by none, so a transcript read late never logs a second turn for a span a claim's turn
     /// holds. One read `state=partial` adds to the claim's turns, as an unmeasured Claude Code's
     /// adds to its screen's, and opens a turn only where none runs (fix E1: its prompt read before
     /// the claim's `working`). A beginning takes the oldest turn a partial transcript opened that
@@ -1053,112 +1095,96 @@ impl TurnTracker {
     /// is dated no earlier than its opening: then its vendor turn is over and the rest closes it.
     /// Its interrupt, read while the claim's turn runs, is that turn's only witness of an Esc
     /// (`out=interrupted` at the rest).
-    pub fn claim(&mut self, log: &mut Log, claimed: Claimed, at: Stamp) -> Option<u64> {
-        self.claim_as(log, claimed, at, false, &mut || true)
-    }
-
-    /// AN ENGINE EDGE NO STATUS SAMPLE SHOWED: the host feeds each beginning and end the program's
-    /// report kept between two of its samples, oldest first, at the time of the parse batch that
-    /// carried it, under [`Self::claim`]'s rules; here [`Claimed::Working`] is always a turn's
-    /// beginning. A beginning that finds the claim's own turn (`src=engine conf=claim`) still open
-    /// closes it `out=unknown` there first: the engine drew a new turn, so that one ended unseen
-    /// (its end fell out of the report's record before a sample read it). A beginning that would
-    /// open a turn asks `may_open` (the run's program bucket) first and opens nothing on a
-    /// refusal; one that takes a partial transcript's turn, or finds another turn running, asks
-    /// nothing.
     pub fn claim_edge(
         &mut self,
         log: &mut Log,
-        claimed: Claimed,
+        edge: ClaimEdge,
         at: Stamp,
         may_open: &mut dyn FnMut() -> bool,
-    ) -> Option<u64> {
-        self.claim_as(log, claimed, at, true, may_open)
-    }
-
-    fn claim_as(
-        &mut self,
-        log: &mut Log,
-        claimed: Claimed,
-        at: Stamp,
-        engine_edge: bool,
-        may_open: &mut dyn FnMut() -> bool,
-    ) -> Option<u64> {
+    ) -> EdgeOutcome {
         self.resync(log);
         if !log.is_open(self.run) {
-            return self.wake_at();
+            return EdgeOutcome::Nothing;
         }
         self.settle_if_due(log, at);
+        let span = self.claim_span;
+        self.claim_span = matches!(edge, ClaimEdge::Began | ClaimEdge::Resumed);
         let pending_claim = self
             .tx
             .interrupt
             .is_some_and(|pending| pending.bound.is_none())
-            || claimed == Claimed::Rested && self.interrupted != Interruption::None;
+            || edge == ClaimEdge::Rested && self.interrupted != Interruption::None;
         if self.screen_turns
             || (self.tx.state == Some(TxState::On)
-                && (!self.tx.stopped || engine_edge && at.wall_ms <= self.tx.read_ms)
+                && (!self.tx.stopped || at.wall_ms <= self.tx.read_ms)
                 && !pending_claim)
         {
-            return self.wake_at();
+            return EdgeOutcome::Aside;
         }
-        if claimed == Claimed::Working {
-            self.begin(log, at, engine_edge, may_open);
-            return self.wake_at();
+        match edge {
+            ClaimEdge::Began => return self.begin(log, at, true, may_open),
+            // The span this tracker read the beginning of: its turn, running or closed.
+            ClaimEdge::Resumed if span => return EdgeOutcome::Nothing,
+            ClaimEdge::Resumed => return self.begin(log, at, false, may_open),
+            ClaimEdge::Rested | ClaimEdge::Failed => {}
         }
         let raw_interval = self.claim_interval.filter(|span| {
             Some(span.node) == self.turn && self.original_claim_interval(log, *span)
         });
-        if let Some(turn) = self.turn.filter(|t| {
+        let Some(turn) = self.turn.filter(|t| {
             !self.untaken_at(*t, at)
                 || self.interrupted != Interruption::None && !self.untaken_after(*t, at)
-        }) {
-            // An older rest that cannot close this owner must not consume the
-            // pending interruption that its own later rest still needs.
-            let vendor_out = (claimed == Claimed::Rested)
-                .then(|| self.vendor_claim_outcome(log, at))
-                .flatten();
-            let out = match claimed {
-                Claimed::Rested if self.interrupted.confirmed() => TurnOut::Interrupted,
-                Claimed::Rested if self.interrupted == Interruption::Unknown => TurnOut::Unknown,
-                Claimed::Rested => vendor_out.unwrap_or(TurnOut::Done),
-                Claimed::Failed => TurnOut::Error,
-                Claimed::Working => unreachable!("working was handled before close eligibility"),
-            };
-            self.untaken.retain(|&(n, _)| n != turn);
-            let raw_end = at.wall_ms;
-            let at = tx_close_at(log, turn, at);
-            let close = Close::new(Out::Turn(out), Src::Engine, Conf::Claim);
-            self.close_turn_with(log, close, out, (None, false, false), at);
-            self.claim_end = raw_interval
-                .filter(|span| span.continuous && span.begin < raw_end)
-                .map(|_| raw_end);
-            if claimed == Claimed::Failed
-                && raw_interval.is_some_and(|span| {
-                    self.tx.interrupt.is_some_and(|pending| {
-                        span.begin <= pending.prompt && pending.at <= raw_end
-                    })
-                })
-            {
-                self.tx.interrupt = None;
-            }
-        } else {
+        }) else {
             // A rest with no owned interval cannot stand in for a missing close.
             self.claim_end = None;
+            return EdgeOutcome::Nothing;
+        };
+        // An older rest that cannot close this owner must not consume the
+        // pending interruption that its own later rest still needs.
+        let vendor_out = (edge == ClaimEdge::Rested)
+            .then(|| self.vendor_claim_outcome(log, at))
+            .flatten();
+        let out = match edge {
+            ClaimEdge::Rested if self.interrupted.confirmed() => TurnOut::Interrupted,
+            ClaimEdge::Rested if self.interrupted == Interruption::Unknown => TurnOut::Unknown,
+            ClaimEdge::Rested => vendor_out.unwrap_or(TurnOut::Done),
+            ClaimEdge::Failed => TurnOut::Error,
+            ClaimEdge::Began | ClaimEdge::Resumed => {
+                unreachable!("a beginning was handled before close eligibility")
+            }
+        };
+        self.untaken.retain(|&(n, _)| n != turn);
+        let raw_end = at.wall_ms;
+        let at = tx_close_at(log, turn, at);
+        let close = Close::new(Out::Turn(out), Src::Engine, Conf::Claim);
+        self.close_turn_with(log, close, out, (None, false, false), at);
+        self.claim_end = raw_interval
+            .filter(|span| span.continuous && span.begin < raw_end)
+            .map(|_| raw_end);
+        if edge == ClaimEdge::Failed
+            && raw_interval.is_some_and(|span| {
+                self.tx
+                    .interrupt
+                    .is_some_and(|pending| span.begin <= pending.prompt && pending.at <= raw_end)
+            })
+        {
+            self.tx.interrupt = None;
         }
-        self.wake_at()
+        EdgeOutcome::Closed
     }
 
-    /// A CLAIM'S BEGINNING at `at` ([`Self::claim`], [`Self::claim_edge`]).
+    /// A CLAIM'S BEGINNING at `at` ([`Self::claim_edge`]): `began` a turn's first, which closes
+    /// the claim's own turn still open `out=unknown` first; else a resumed one.
     fn begin(
         &mut self,
         log: &mut Log,
         at: Stamp,
-        engine_edge: bool,
+        began: bool,
         may_open: &mut dyn FnMut() -> bool,
-    ) {
+    ) -> EdgeOutcome {
         let mut continuous = true;
         // The engine drew a new turn while the claim's own runs: that one's end was lost.
-        if engine_edge
+        if began
             && let Some(t) = self.turn
             && log
                 .state()
@@ -1175,16 +1201,17 @@ impl TurnTracker {
         if self.turn.is_none_or(|t| self.untaken_at(t, at)) && self.take_untaken(at).is_some() {
             self.claim_interval = None;
             self.claim_end = None;
-            return;
+            return EdgeOutcome::Took;
         }
         // A turn the claim did not open runs (a carried one, an exact transcript's after its
-        // reader stopped), or the run's bucket refuses.
+        // reader stopped, or the claim's own a resumed beginning finds), or the run's bucket
+        // refuses.
         if self.turn.is_some() {
-            return;
+            return EdgeOutcome::Nothing;
         }
         if !may_open() {
             self.claim_end = None;
-            return;
+            return EdgeOutcome::Refused;
         }
         let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
         let floor = run_t.max(log.state().last[1].as_ref().map_or(0, |c| c.t));
@@ -1203,6 +1230,11 @@ impl TurnTracker {
                     && continuous
                     && self.claim_end.is_none_or(|end| end < at.wall_ms),
             });
+        if self.turn.is_some() {
+            EdgeOutcome::Opened
+        } else {
+            EdgeOutcome::Nothing
+        }
     }
 
     /// Resolve only the vendor interval that this raw claim can actually name.
@@ -1365,7 +1397,7 @@ impl TurnTracker {
 
     /// THE TRANSCRIPT'S READER STOPPED (its tap dropped, or reading no file now): the join keeps
     /// its watermark and state, and the program's claim no longer stands aside for a source read
-    /// `state=on` ([`Self::claim`]) until the next transcript fact says it reads again, but for an
+    /// `state=on` ([`Self::claim_edge`]) until the next transcript fact says it reads again, but for an
     /// engine edge dated no later than the newest row it applied, whose turn the source logged.
     pub const fn tx_stopped(&mut self) {
         self.tx.stopped = true;
@@ -1928,6 +1960,7 @@ impl TurnTracker {
             closes: 0,
             screen_turns: false,
             untaken: Vec::new(),
+            claim_span: false,
         })
     }
 
@@ -3360,7 +3393,7 @@ impl TurnTracker {
                 if let Some(cause) = rest_cause(self.word) {
                     self.arm(cause, now);
                 }
-                // The span of a claim's beginning not fed yet ([`Self::claim`]); an exact source
+                // The span of a claim's beginning not fed yet ([`Self::claim_edge`]); an exact source
                 // keeps its own turns, and the claims stand aside for it.
                 if state != TxState::On {
                     if self.untaken.len() == UNTAKEN_MAX {

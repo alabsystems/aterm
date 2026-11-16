@@ -628,6 +628,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
 
 /// The limits hint promises no sign-in of another Mac's account (`ATERM-KI-1105-9`).
 /// `CONTROL`: it does of the same row while the sheet names this Mac.
+#[cfg(unix)]
 #[test]
 fn the_limits_hint_promises_no_sign_in_of_another_macs_account() {
     let f = Fixture::new(Cli::Claude, true);

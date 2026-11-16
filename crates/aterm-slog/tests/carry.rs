@@ -1641,11 +1641,11 @@ fn a_carry_sheds_a_cmd_detail_amend_with_its_open() {
 /// assertion pins the rest of the line, which other carry state writes.
 #[test]
 fn a_standing_claim_box_rides_the_carry() {
-    use aterm_slog::{Claimed, ClaimedBox, ClaimedReport};
+    use aterm_slog::{ClaimEdge, ClaimedBox, ClaimedReport};
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let mut tr = TurnTracker::new(run);
-    let _ = tr.claim(&mut log, Claimed::Working, at(100));
+    let _ = tr.claim_edge(&mut log, ClaimEdge::Began, at(100), &mut || true);
     let boxed = |began| ClaimedReport {
         boxed: Some(ClaimedBox::Approval),
         began,

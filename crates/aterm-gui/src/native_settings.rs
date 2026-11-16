@@ -8684,6 +8684,9 @@ const fn projection_reply(event: &AppEvent) -> bool {
         | AppEvent::EditorConfigDiagnosticNavigate { .. }
         | AppEvent::EditorViewportChanged { .. }
         | AppEvent::ScrollLines(_)
+        | AppEvent::ScrollAcross(_)
+        | AppEvent::StepAcross(_)
+        | AppEvent::ExtendFocus(_)
         | AppEvent::PressListPicture(_)
         | AppEvent::ScrollAt { .. }
         | AppEvent::StepFocus(_)
@@ -9638,7 +9641,11 @@ fn semantic_value_for_field(
         }
         Some(SemanticInput::Bool(value)) => Some(value.to_string()),
         Some(SemanticInput::Number(value)) => Some(value.to_string()),
-        Some(SemanticInput::TextPosition { .. } | SemanticInput::ColorPick { .. }) => None,
+        Some(
+            SemanticInput::TextPosition { .. }
+            | SemanticInput::ColorPick { .. }
+            | SemanticInput::Drag { .. },
+        ) => None,
         None if matches!(field.kind, EditKind::Bool) => {
             let current = SettingsState::display_value(field)
                 .parse::<bool>()
@@ -37733,7 +37740,9 @@ fn words_node_of_lines(
         UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))
             .layout(Layout::default().height(Length::Fixed(line_height)))
     };
-    if lines.len() <= 1 {
+    // Wrapping can normalize spaces even on one line. Paint that measured line;
+    // the group below keeps the original words as the accessible label.
+    if lines.len() <= 1 && lines.first().is_none_or(|line| line == text) {
         return (line_node(key.to_string(), text.to_string()), height);
     }
     (

@@ -3,7 +3,7 @@
 
 //! The `Inventory` exchange (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.6, "No anti-entropy
 //! timer", and §11 B7b): the digest exchange Commons repair runs
-//! (`aterm_db::replica::exchange_inventory`), with one neighbour, over an `Inventory` stream on its
+//! (`aterm_db::replica::reconcile_inventory`), with one neighbour, over an `Inventory` stream on its
 //! `atm/1` link. Each side lists the digests it holds of the membership log and of each table
 //! either holds, and the missing records move in batches of [`crate::ingest::BATCH`] into the
 //! stores' own checks, the membership log first so a writer's seat lands before its operations. A
@@ -62,13 +62,16 @@
 //! **`BOTH_HOLD_ONLY`** (`both-hold-only`) is the one-sided tables' (the rule before §11 B8): only
 //! the tables both hold move, so a table a Mac never held never reaches it here.
 //!
-//! **The wire.** Both sides first send `atm-inv 2` and their summary digest (over every digest
-//! they would list); equal summaries end the exchange. Then each table list, then per unit (the
+//! **The wire.** Both sides first send `atm-inv 3` and their summary digest (over every digest
+//! they would list); equal summaries end the exchange. Then the table lists, then per unit (the
 //! membership log, then each table both listed, then each table one listed, in order, a table's
-//! proofs before its operations) the key lists, then the initiator's batches (a `u32` count, that
-//! many length-prefixed records, a zero count to end), then the responder's. The unit list is a
-//! function of the two table lists alone, so both sides walk it in step; for a table it does not
-//! take, a side sends no key list (`exchange_inventory`'s unavailable), and is sent nothing.
+//! proofs before its operations) a range reconciliation of the two sides' ids
+//! (`aterm_db::replica::reconcile_inventory`, a conflict proof by SHA-256 of its key), whose bytes
+//! track the difference and whose sets no count bounds; then the initiator's batches (a `u32`
+//! count, that many length-prefixed records, a zero count to end), a table's operations parents
+//! first, then the responder's. The unit list is a function of the two table lists alone, so both
+//! sides walk it in step; for a table it does not take, a side offers no snapshot
+//! (`reconcile_inventory`'s unavailable), and is sent nothing.
 
 use crate::egress::Egress;
 use crate::logs::Mesh;
@@ -87,21 +90,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// The greeting's head. `atm-inv 1` walked only the tables both sides hold, a prefix of this
-/// unit list: a pair of the two would move those and then break off where the old side ended
-/// early, so each refuses the other's greeting instead.
-const HEAD: &[u8] = b"atm-inv 2";
+/// unit list, and `atm-inv 2` sent each unit's whole key list; a pair of different heads would
+/// break off mid-exchange, so each refuses the other's greeting instead.
+const HEAD: &[u8] = b"atm-inv 3";
 
-/// The most tables a list holds (`aterm_db::replica::MAX_TABLES`).
-const TABLES_MAX: usize = 64;
-
-/// The most digests one table's operation list holds.
-const DIGESTS_MAX: usize = aterm_db::replica::MAX_RECORDS;
-
-/// The most keys one table's proof list holds.
-const PROOFS_MAX: usize = aterm_db::replica::MAX_PROOFS;
-
-/// The most ids the membership log's list holds: every record it may hold.
-const MEMBERS_MAX: usize = aterm_secrets::membership_log::MAX_HELD_RECORDS;
+/// Domain separation for a conflict proof's reconciliation id: a proof key is 81 bytes, and range
+/// reconciliation agrees on 32-byte ids, so each side reconciles SHA-256 of its keys.
+const PROOF_DOMAIN: &[u8] = b"aterm/mesh/inventory-proof/1\0";
 
 /// The first wait before an exchange whose records found a store busy runs again.
 const BUSY_FIRST: Duration = Duration::from_millis(100);
@@ -940,22 +935,29 @@ fn read_frame(stream: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The key list exchange of one unit (or of the table lists), in Commons repair's encoding: `None`
-/// where this side sends no list (a table its stores do not take), and the neighbour's list, or
-/// `None` where it sent none.
-fn exchange_ids<const N: usize>(
+/// One unit's range reconciliation (or the table lists'), Commons repair's
+/// (`aterm_db::replica::reconcile_inventory`): `None` where this side sends no snapshot (a table
+/// its stores do not take), and the neighbour's set, `None` where either side sent none. The bytes
+/// track the difference, not the inventories, and no list is bounded by a count.
+fn reconcile(
     stream: &mut (impl Read + Write),
     initiator: bool,
-    local: Option<&BTreeSet<[u8; N]>>,
-    maximum: usize,
-) -> io::Result<Option<BTreeSet<[u8; N]>>> {
+    local: Option<aterm_db::replica::Snapshot>,
+) -> io::Result<Option<BTreeSet<Digest>>> {
     let side = if initiator {
         aterm_db::replica::Side::Initiator
     } else {
         aterm_db::replica::Side::Responder
     };
-    aterm_db::replica::exchange_inventory::<N>(stream, side, local, maximum, || Ok(()))
-        .map_err(|e| io_of(&e))
+    aterm_db::replica::reconcile_inventory(stream, side, local, || Ok(())).map_err(|e| io_of(&e))
+}
+
+/// A conflict proof key's reconciliation id ([`PROOF_DOMAIN`]).
+fn proof_id(key: &ProofKey) -> Digest {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(PROOF_DOMAIN);
+    hash.update(key);
+    hash.finalize()
 }
 
 /// Whether this side sends a key list for `table`: it holds the table (it listed it), or its
@@ -965,19 +967,11 @@ fn opens(stores: &dyn Stores, mine: &BTreeSet<Digest>, table: Digest) -> io::Res
     Ok(mine.contains(&table) || stores.takes(table)?)
 }
 
-/// What a side gives of a unit: the keys it holds that the neighbour's list lacks, by `lacks`;
-/// nothing where either side sent no list.
-fn lacking<const N: usize>(
-    local: Option<&BTreeSet<[u8; N]>>,
-    remote: Option<&BTreeSet<[u8; N]>>,
-    lacks: impl Fn(&BTreeSet<[u8; N]>, &[u8; N]) -> bool,
-) -> Vec<[u8; N]> {
+/// What a side gives of a unit: the ids it holds that the neighbour's set lacks; nothing where
+/// either side sent none.
+fn lacking(local: Option<&BTreeSet<Digest>>, remote: Option<&BTreeSet<Digest>>) -> Vec<Digest> {
     match (local, remote) {
-        (Some(local), Some(remote)) => local
-            .iter()
-            .filter(|key| lacks(remote, key))
-            .copied()
-            .collect(),
+        (Some(local), Some(remote)) => local.difference(remote).copied().collect(),
         _ => Vec::new(),
     }
 }
@@ -1022,8 +1016,12 @@ fn exchange_stream(
         return Ok(moved);
     }
     let mine = stores.tables()?;
-    let their_tables =
-        exchange_ids(stream, initiator, Some(&mine), TABLES_MAX)?.unwrap_or_default();
+    let their_tables = reconcile(
+        stream,
+        initiator,
+        Some(aterm_db::replica::Snapshot::new(mine.clone())),
+    )?
+    .unwrap_or_default();
     // One unit list, a function of the two lists alone, so both sides walk it in step: the
     // membership log, each table both listed, then each table one listed. The catalog, which
     // every vault holds, goes before the tables it declares to a vault that lacked them.
@@ -1040,37 +1038,70 @@ fn exchange_stream(
         let offer = match unit {
             Unit::Members => {
                 let local = stores.members_inventory()?;
-                let remote = exchange_ids(stream, initiator, Some(&local), MEMBERS_MAX)?;
-                let give = lacking(Some(&local), remote.as_ref(), |remote, id| {
-                    !remote.contains(id)
-                });
-                Offer::Members(give)
+                let remote = reconcile(
+                    stream,
+                    initiator,
+                    Some(aterm_db::replica::Snapshot::new(local.clone())),
+                )?;
+                Offer::Members(lacking(Some(&local), remote.as_ref()))
             }
             Unit::Proofs(table) => {
-                let local = if opens(stores, &mine, table)? {
-                    Some(stores.table_proofs(table)?.unwrap_or_default())
+                // A proof the neighbour holds the fork proof of is not sent (Commons repair's
+                // fork rule): its fork key's id in the neighbour's set says so.
+                let local: Option<BTreeMap<Digest, ProofKey>> = if opens(stores, &mine, table)? {
+                    Some(
+                        stores
+                            .table_proofs(table)?
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|key| (proof_id(&key), key))
+                            .collect(),
+                    )
                 } else {
                     None
                 };
-                let remote = exchange_ids(stream, initiator, local.as_ref(), PROOFS_MAX)?;
-                let give = lacking(local.as_ref(), remote.as_ref(), |remote, key| {
-                    let mut fork = [0u8; 81];
-                    fork[..48].copy_from_slice(&key[..48]);
-                    fork[48] = 1;
-                    !remote.contains(key) && !remote.contains(&fork)
-                });
+                let snapshot = local
+                    .as_ref()
+                    .map(|keys| aterm_db::replica::Snapshot::new(keys.keys().copied().collect()));
+                let remote = reconcile(stream, initiator, snapshot)?;
+                let mut give: Vec<ProofKey> = match (&local, &remote) {
+                    (Some(local), Some(remote)) => local
+                        .iter()
+                        .filter(|(id, key)| {
+                            let mut fork = [0u8; 81];
+                            fork[..48].copy_from_slice(&key[..48]);
+                            fork[48] = 1;
+                            !remote.contains(*id) && !remote.contains(&proof_id(&fork))
+                        })
+                        .map(|(_, key)| *key)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                give.sort_unstable();
                 Offer::Proofs(table, give)
             }
             Unit::Table(table) => {
                 let local = if opens(stores, &mine, table)? {
-                    Some(stores.table_inventory(table)?.unwrap_or_default())
+                    Some(
+                        stores
+                            .table_inventory(table)?
+                            .unwrap_or_else(|| aterm_db::replica::Snapshot::new(BTreeSet::new())),
+                    )
                 } else {
                     None
                 };
-                let remote = exchange_ids(stream, initiator, local.as_ref(), DIGESTS_MAX)?;
-                let give = lacking(local.as_ref(), remote.as_ref(), |remote, id| {
-                    !remote.contains(id)
-                });
+                let held: Option<BTreeSet<Digest>> = local
+                    .as_ref()
+                    .map(|snapshot| snapshot.ids().copied().collect());
+                let remote = reconcile(stream, initiator, local)?;
+                let give = lacking(held.as_ref(), remote.as_ref());
+                // Parents first: a neighbour never receives a child before a parent it is
+                // also being sent, so each batch's records are ready as they land.
+                let give = if give.is_empty() {
+                    give
+                } else {
+                    stores.table_order(table, &give)?
+                };
                 Offer::Table(table, give)
             }
         };

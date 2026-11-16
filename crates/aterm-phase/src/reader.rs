@@ -513,13 +513,24 @@ pub trait ScreenReader: Sync {
     fn end_drawn(&self, _rows: &[String]) -> bool {
         false
     }
-    /// What `title`, the program's window title read with the screen, says of its run
-    /// ([`Self::title_runs`]): `None` where there is no title (a host that sends none, or a tape
-    /// recorded from one) or it is empty (one the program never set), which say nothing.
-    fn runs(&self, title: Option<&str>) -> Option<bool> {
-        title
-            .filter(|t| !t.is_empty())
-            .and_then(|t| self.title_runs(t))
+    /// What the program's own OSC 7501 program-status report says of its run, `report` being the
+    /// report standing in the terminal as the body that says it (`state=<word>:app=<app>…`):
+    /// `Some(true)` running, `Some(false)` at rest, `None` where the reader takes no report of
+    /// this program (the default), or this one names another.
+    fn report_runs(&self, _report: &str) -> Option<bool> {
+        None
+    }
+    /// The program's run sign read with the screen: what `report`, the program-status report
+    /// standing in the terminal, says ([`Self::report_runs`]) where it says anything, else what
+    /// `title`, the window title, says ([`Self::title_runs`]). `None` where neither says: no
+    /// report or one of another program, and no title (a host that sends none, or a tape recorded
+    /// from one) or an empty one (one the program never set).
+    fn runs(&self, title: Option<&str>, report: Option<&str>) -> Option<bool> {
+        report.and_then(|r| self.report_runs(r)).or_else(|| {
+            title
+                .filter(|t| !t.is_empty())
+                .and_then(|t| self.title_runs(t))
+        })
     }
     /// Whether `rows` show work the agent handed off running, which runs its title with its turn
     /// over. The default shows none; Claude Code's is [`crate::phase::delegated_shown`].
@@ -823,9 +834,14 @@ impl ScreenReader for ClaudeReader {
     /// being drawn shows no busy sign on the screen: the footer has no `esc to interrupt`, and
     /// the spinner row is gone once the reply's first line is drawn. Every other title says it
     /// is not running; an empty one is a title never set, which the harness takes as saying
-    /// nothing.
+    /// nothing. Where its query was answered the title has no glyph and its report
+    /// ([`Self::report_runs`]) is the sign.
     fn title_runs(&self, title: &str) -> Option<bool> {
         Some(crate::phase::title_runs(title))
+    }
+    /// Its own program-status report ([`crate::phase::report_runs`], `app=claude-code`).
+    fn report_runs(&self, report: &str) -> Option<bool> {
+        crate::phase::report_runs(report)
     }
     /// Its done row under the reply ([`crate::phase::done_row_drawn`]).
     fn end_drawn(&self, rows: &[String]) -> bool {
@@ -1346,8 +1362,8 @@ pub fn read_at(
 }
 
 /// Identify the reader for `(program, rows)` and run [`ScreenReader::read_seen`] with what
-/// `title`, the program's window title read with `rows`, says of its run
-/// ([`ScreenReader::runs`]).
+/// `report`, the program-status report standing with `rows`, or else `title`, the program's
+/// window title read with them, says of its run ([`ScreenReader::runs`]).
 #[must_use]
 pub fn read_seen(
     program: Option<&str>,
@@ -1355,9 +1371,10 @@ pub fn read_seen(
     cursor_row: Option<usize>,
     cursor_col: Option<usize>,
     title: Option<&str>,
+    report: Option<&str>,
 ) -> Reading {
     let reader = identify(program, rows);
-    reader.read_seen(rows, cursor_row, cursor_col, reader.runs(title))
+    reader.read_seen(rows, cursor_row, cursor_col, reader.runs(title, report))
 }
 
 /// Where the live zone of `n` rows starts: `n` rows up from the last drawn row, a run of

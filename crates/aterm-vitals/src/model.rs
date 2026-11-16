@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::history::{self, Filling, FreeHistory, Rates};
+use crate::history::{self, Filling, FreeHistory, FreeWeeks, Rates};
+use crate::net_counter::{ByteCounter, ByteDelta, ByteSample, DeltaError, byte_delta};
 use crate::peaks::{DailyMax, NET_LEARN_S, PROC_LEARN_S, Peaks, TOKENS_LEARN_S};
 use crate::ring::{
     Agg, BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading,
@@ -410,7 +411,7 @@ pub struct MemSample {
     pub wired: u64,
     /// Physical memory holding compressed pages (macOS compressor or Linux zswap); `None` where
     /// the OS does not say (Linux with zswap off or absent, Windows' compression store, which this
-    /// build does not read), so a surface leaves the class out rather than show a false zero.
+    /// build does not read), so a surface keeps it unknown rather than show a false zero.
     pub compressed: Option<u64>,
     /// The uncompressed bytes the compressor or zswap holds in [`Self::compressed`], if reported.
     pub stored: Option<u64>,
@@ -424,10 +425,10 @@ pub struct MemSample {
     /// reader counts it (`aterm_sysprobe::MemoryDetail::available`). Not a VM class: it overlaps
     /// [`Self::free`], [`Self::cached`] and, on a Mac, what compressing idle anonymous pages frees.
     pub available: u64,
-    /// Swap in use.
-    pub swap_used: u64,
-    /// Swap allocated.
-    pub swap_total: u64,
+    /// Swap in use; `None` where the measurement was not read.
+    pub swap_used: Option<u64>,
+    /// Swap allocated; `None` where the measurement was not read.
+    pub swap_total: Option<u64>,
     /// The pressure level.
     pub pressure: Pressure,
     /// The VM's counters, where read.
@@ -440,6 +441,62 @@ pub struct MemSample {
     /// The classes partition the memory the VM manages (macOS), so [`Self::not_in_vm`] is the
     /// memory the OS keeps outside it rather than what the classes leave unnamed.
     pub exact: bool,
+}
+
+/// One physical-memory page class, or the capacity the reported classes leave over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryClassKind {
+    /// Process memory.
+    App,
+    /// Non-pageable kernel memory.
+    Wired,
+    /// Physical memory holding compressed pages.
+    Compressed,
+    /// Reclaimable file cache.
+    Cache,
+    /// Immediately free memory.
+    Free,
+    /// Capacity outside an exact VM partition, or left unclassified otherwise.
+    Residual,
+}
+
+/// A physical class or derived residual; an unavailable byte count remains unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryClass {
+    /// Which class the reading describes.
+    pub kind: MemoryClassKind,
+    /// Physical bytes, never uncompressed stored bytes or a process's charged footprint.
+    pub bytes: Option<u64>,
+}
+
+/// Whether the reported page classes and their residual form a physical partition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPartition {
+    /// Complete trusted macOS VM classes, with their residual, partition physical capacity.
+    Exact,
+    /// The platform or reader does not promise disjoint complete classes.
+    Inexact,
+    /// The physical size of the compressed class was not reported.
+    Incomplete,
+    /// Reported classes together exceed physical capacity.
+    Overfull,
+    /// Zero capacity cannot supply a denominator for physical shares.
+    NoCapacity,
+}
+
+/// The physical page-class evidence shared by the GUI and `sys`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalMemoryClasses {
+    /// App, wired, compressed, cache, free and residual, in that order.
+    pub classes: [MemoryClass; 6],
+    /// The physical capacity, independent of the classes' reported sum.
+    pub total: u64,
+    /// The sum of the five reported classes, excluding unknown counts and the residual.
+    pub counted: u128,
+    /// How far the reported sum exceeds physical capacity; never saturated to a byte counter.
+    pub excess: u128,
+    /// Whether these readings can honestly be drawn as a physical partition.
+    pub partition: MemoryPartition,
 }
 
 /// Virtual memory promised against the system commit limit (enforced on Windows, advisory on
@@ -475,18 +532,76 @@ impl CommitSample {
 }
 
 impl MemSample {
+    /// Project physical page classes without treating available memory, stored bytes, swap or
+    /// charged footprints as additional physical classes. Only a complete, trusted macOS
+    /// reading within a positive physical capacity establishes an exact partition; an unknown
+    /// platform never inherits the build host's identity.
+    #[must_use]
+    pub fn physical_classes(
+        &self,
+        platform: Option<crate::words::Platform>,
+    ) -> PhysicalMemoryClasses {
+        let values = [
+            Some(self.app),
+            Some(self.wired),
+            self.compressed,
+            Some(self.cached),
+            Some(self.free),
+        ];
+        let counted: u128 = values.into_iter().flatten().map(u128::from).sum();
+        let total = u128::from(self.total);
+        let residual = self
+            .total
+            .saturating_sub(u64::try_from(counted).unwrap_or(u64::MAX));
+        let partition = if self.total == 0 {
+            MemoryPartition::NoCapacity
+        } else if counted > total {
+            MemoryPartition::Overfull
+        } else if self.compressed.is_none() {
+            MemoryPartition::Incomplete
+        } else if self.exact && platform == Some(crate::words::Platform::MacOs) {
+            MemoryPartition::Exact
+        } else {
+            MemoryPartition::Inexact
+        };
+        PhysicalMemoryClasses {
+            classes: [
+                MemoryClass {
+                    kind: MemoryClassKind::App,
+                    bytes: values[0],
+                },
+                MemoryClass {
+                    kind: MemoryClassKind::Wired,
+                    bytes: values[1],
+                },
+                MemoryClass {
+                    kind: MemoryClassKind::Compressed,
+                    bytes: values[2],
+                },
+                MemoryClass {
+                    kind: MemoryClassKind::Cache,
+                    bytes: values[3],
+                },
+                MemoryClass {
+                    kind: MemoryClassKind::Free,
+                    bytes: values[4],
+                },
+                MemoryClass {
+                    kind: MemoryClassKind::Residual,
+                    bytes: Some(residual),
+                },
+            ],
+            total: self.total,
+            counted,
+            excess: counted.saturating_sub(total),
+            partition,
+        }
+    }
+
     /// The VM classes' sum: wired, app, compressed, cache and free.
     #[must_use]
     pub fn in_vm(&self) -> u64 {
-        [
-            self.wired,
-            self.app,
-            self.compressed.unwrap_or(0),
-            self.cached,
-            self.free,
-        ]
-        .into_iter()
-        .fold(0, u64::saturating_add)
+        u64::try_from(self.physical_classes(None).counted).unwrap_or(u64::MAX)
     }
 
     /// Physical memory in no VM class (A1 §4.3's "not in VM"): `total` less [`Self::in_vm`], so
@@ -506,6 +621,10 @@ impl MemSample {
             .min(self.total)
     }
 }
+
+#[cfg(test)]
+#[path = "physical_memory_tests.rs"]
+mod physical_memory_tests;
 
 /// The GPU, device-wide.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -711,11 +830,15 @@ impl LinkKind {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AccountIx(pub u8);
 
-/// One network link's cumulative counters.
+/// One network link's raw counters and their provenance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkSample {
     /// Its name (`en0`).
     pub name: String,
+    /// Interface index, compared across the counter window.
+    pub index: u32,
+    /// Effective byte-counter source, width and quantization.
+    pub byte_counter: ByteCounter,
     /// What it is.
     pub kind: LinkKind,
     /// True when the interface is up and running (`IFF_UP` and `IFF_RUNNING`).
@@ -724,9 +847,9 @@ pub struct LinkSample {
     pub loopback: bool,
     /// True when traffic on this interface counts toward machine-level totals.
     pub counts: bool,
-    /// Bytes received, cumulative.
+    /// Raw received bytes; a modulo source is not a lifetime total.
     pub rx: u64,
-    /// Bytes sent, cumulative.
+    /// Raw sent bytes; a modulo source is not a lifetime total.
     pub tx: u64,
     /// Packets received, cumulative.
     pub rx_packets: u64,
@@ -742,6 +865,22 @@ pub struct LinkSample {
     pub tx_drops: Option<u64>,
     /// The link rate the driver reports, bits per second.
     pub rate_bps: Option<u64>,
+}
+
+impl LinkSample {
+    /// Byte and packet counters kept together for the common delta rule.
+    #[must_use]
+    pub fn byte_sample(&self) -> ByteSample {
+        ByteSample {
+            index: self.index,
+            counter: self.byte_counter,
+            rx: self.rx,
+            tx: self.tx,
+            rx_packets: self.rx_packets,
+            tx_packets: self.tx_packets,
+            rate_bps: self.rate_bps,
+        }
+    }
 }
 
 /// Machine-wide TCP socket counts by connection state.
@@ -848,10 +987,12 @@ pub struct LinkRates {
 /// One network interface as `sys net` and the Network lens show it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinkView {
-    /// Cumulative counters and attributes from this reading.
+    /// Raw counters, their provenance and attributes from this reading.
     pub sample: LinkSample,
     /// Per-second rates over the last sample window (`None` on a first reading or a counter reset).
     pub rates: Option<LinkRates>,
+    /// Why this window does not establish a rate, independently of sample freshness.
+    pub rates_why: Option<DeltaError>,
 }
 
 /// Live connectivity standing derived from network links, traffic, errors, and TCP sockets.
@@ -899,6 +1040,8 @@ pub struct NetView {
     pub links: Vec<LinkView>,
     /// Rates summed across counted (`counts == true`) interfaces over the last sample window.
     pub rates: Option<LinkRates>,
+    /// Why a counted link prevents a complete machine rate.
+    pub rates_why: Option<DeltaError>,
     /// Sample window duration in nanoseconds when `rates` is present.
     pub window_ns: Option<u64>,
     /// Machine-wide TCP socket counts by state, where readable.
@@ -1054,6 +1197,77 @@ pub struct DiskFacts {
     pub watch: bool,
     /// True while a directory-sizing survey is running.
     pub sizing: bool,
+    /// What the disk journal says the software did, newest first, at most 8 runs: each run of
+    /// adjacent rows of one kind by one session is one deed
+    /// (`docs/DESIGN-disk-custody-2026-11-12.md` §4).
+    pub deeds: Vec<DiskDeed>,
+    /// The journal's removals by hour: each hour's start (unix ms) and the bytes removed in it,
+    /// oldest first, within the last 3 weeks.
+    pub removals: Vec<(i64, u64)>,
+}
+
+/// Whose a [`DiskDeed`] is: the subject of what it records. That is who did it, except where the
+/// row names the session a free-space ask concerns ([`DeedKind::Asked`]): that session is its
+/// subject, and aterm asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeedBy {
+    /// aterm itself: its disk watch, its cleaner, its reserve or its free-space ask.
+    Aterm,
+    /// A session running in a tab: the tab ([`TabRoot::tab`]) while it is open, `None` once the
+    /// session is not one of this window set's.
+    Tab(Option<u64>),
+}
+
+/// What a [`DiskDeed`] records, as the disk journal's row says it, its subject the deed's
+/// [`DeedBy`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeedKind {
+    /// A pass checked the disk (a `report` row).
+    Checked,
+    /// It began removing what is named (an intent with no outcome yet).
+    Began(String),
+    /// It removed what is named.
+    Removed(String),
+    /// It tried to remove what is named and could not.
+    CouldNotRemove(String),
+    /// It refused to remove what is named.
+    Refused(String),
+    /// A pass kept what is named: nothing of it went (a sweep's or a worktree step's `kept`).
+    Kept(String),
+    /// The build-cache cleaner stopped.
+    Stopped,
+    /// It released the reserve file.
+    ReserveReleased,
+    /// It wrote the reserve file.
+    ReserveWritten,
+    /// It could not change the reserve file.
+    ReserveRefused,
+    /// It ran short of disk space (a `poke` row): a session's screen said the disk is full, or
+    /// the session waits for more free space than the volume has, or a write of aterm's failed
+    /// for want of space.
+    RanShort,
+    /// A step of the free-space ask (a `free-ask` row): its `said` word, or `step` and the
+    /// turn-break step's word. Its subject is the session the row names, else aterm.
+    Asked(String),
+    /// A row of a kind this list does not know: its kind, and its action when it has one.
+    Other(String),
+}
+
+/// One run of the disk journal's rows: adjacent rows of one kind by one session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskDeed {
+    /// When its newest row was written, unix ms.
+    pub at_unix_ms: i64,
+    /// How many rows it stands for.
+    pub n: u32,
+    /// What it records.
+    pub kind: DeedKind,
+    /// Whose it is.
+    pub by: DeedBy,
+    /// The bytes its rows name, summed; `None` when none names any.
+    pub bytes: Option<u64>,
+    /// The bytes free its newest row read; `None` when it read none.
+    pub free: Option<u64>,
 }
 
 /// Cumulative token totals for one agent session.
@@ -1238,6 +1452,13 @@ pub struct Sample {
     /// The machine's situation and type as the host's readers last heard them
     /// ([`crate::situation`]); unread throughout where the host read none.
     pub situation: crate::situation::Situation,
+    /// The kind of netplace's place as the host read it for this reading, the one it sets on
+    /// [`Snapshot::place`]: what the strip's situation spans keep ([`crate::situation::Span`]).
+    /// `None` where the host read no place.
+    pub place: Option<PlaceKind>,
+    /// What the jobs engine's newest pass found stuck, as the host held it when it took this
+    /// reading ([`crate::blockage::StuckWork`]); `None` until a pass has run.
+    pub stuck_work: Option<crate::blockage::StuckWork>,
 }
 
 /// End of a frontend sweep on clocks shared with native owning waits.
@@ -2449,6 +2670,9 @@ pub struct RowFacts {
     pub zombies: crate::blockage::Zombies,
     /// Processes: threads in an uninterruptible wait ([`crate::blockage`]).
     pub dstate: crate::blockage::DState,
+    /// Processes: what blocks their flow at this reading, by the one rule the strip's blockage
+    /// ring keeps ([`crate::blockage::Blocked::judge`]).
+    pub blocked: crate::blockage::Blocked,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -2593,6 +2817,8 @@ pub struct Snapshot {
     pub resources: [ResourceView; 7],
     /// The home volume's free space over the last 24 hours.
     pub free_history: FreeHistory,
+    /// The home volume's free space over the last 3 weeks, in hour buckets.
+    pub free_weeks: FreeWeeks,
     /// What each row's Details and lens say beside its heat.
     pub facts: RowFacts,
     /// The process sweep's window, ns (`None` until two sweeps exist).
@@ -3177,6 +3403,26 @@ impl Stamp {
         ((-SLEEP_SKEW_MS..=SLEEP_SKEW_MS).contains(&skew) && dt <= limit)
             .then_some(dt as f64 / 1000.0)
     }
+
+    /// Whether this reading follows `then` with no gap the strip records between them: both
+    /// clocks ran on together (no sleep, no clock step), and it came within the interval a rate
+    /// reads over ([`Self::rate_dt`]) or under one strip box later. A reading late by less than
+    /// a box reads no rate and still opens no gap, so what held through `then` held up to it.
+    fn follows(self, then: Self) -> bool {
+        self.rate_dt(Some(then)).is_some()
+            || self
+                .mono_ms
+                .checked_sub(then.mono_ms)
+                .filter(|&dt| dt > 0)
+                .and_then(|dt| i64::try_from(dt).ok())
+                .zip(self.wall_ms.checked_sub(then.wall_ms))
+                .is_some_and(|(dt, wall)| {
+                    (0..BUCKET_MS).contains(&wall)
+                        && wall
+                            .checked_sub(dt)
+                            .is_some_and(|skew| (-SLEEP_SKEW_MS..=SLEEP_SKEW_MS).contains(&skew))
+                })
+    }
 }
 
 /// Last token fold and held per-minute rate for one agent session.
@@ -3305,6 +3551,21 @@ struct Rows {
     /// Memory pressure's rank ([`Pressure::rank`]), pushed beside Memory's ring: a bucket's
     /// largest reading is the worst level read in it.
     pressure: BucketRing,
+    /// Compute watts, CPU + GPU + Neural Engine ([`crate::heat::Watts::compute`]): the Heat
+    /// row's strip (A4 §4).
+    compute_w: BucketRing,
+    /// The thermal pressure level, over while Moderate or more: each box's share at pressure and
+    /// its worst level ([`crate::heat::PressureBox`]), the cap over the Heat strip.
+    thermal: BucketRing,
+    /// Process exits a second, beside the starts `rings[Processes]` holds (A4 §6.2); unread
+    /// where the start counter says no exits (Linux's forks).
+    proc_exits: BucketRing,
+    /// What blocks the processes' flow, over while anything does: each box's blocked share and
+    /// worst kind ([`crate::blockage::BlockageBox`]), the cap over the Processes strip.
+    blocked: BucketRing,
+    /// Work per joule ([`crate::heat::Judged::ipj`]), kept only to learn its peak: no row draws
+    /// a strip of it, so the checkpoint holds none.
+    work: BucketRing,
     /// Last known fixed capacity per row.
     caps: [Option<f64>; 7],
     /// aterm's figures' hour, by row.
@@ -3317,6 +3578,8 @@ struct Rows {
     tokens_in: Recent,
     peaks: Peaks,
     free: FreeHistory,
+    /// The same readings as `free`, kept 3 weeks in hour buckets.
+    weeks: FreeWeeks,
     cores_at: Option<Stamp>,
     sweep_at: Option<Stamp>,
     /// Each process of the last sweep: its start and cumulative bytes read (`None` unread).
@@ -3422,6 +3685,8 @@ pub struct Vitals {
     last_gpu_resets: u64,
     time_gaps: VecDeque<TimeGap>,
     strip_events: VecDeque<StripEvent>,
+    /// The situation's stays of the last six hours, oldest first ([`crate::situation::Span`]).
+    situation_spans: Vec<crate::situation::Span>,
     /// How many times the strip's held buckets changed other than by a bucket closing
     /// ([`Self::strip_rewrites`]).
     strip_rewrites: u64,
@@ -3429,19 +3694,23 @@ pub struct Vitals {
     heat: crate::heat::Engine,
 }
 
-/// The most gaps, and the most events, a strip keeps.
+/// The most gaps, the most events and the most situation spans a strip keeps.
 pub const STRIP_HISTORY_CAP: usize = 128;
-/// How far back the strip's gaps and events are kept, ms: the Full deck's six hours.
+/// How far back the strip's gaps, events and situation spans are kept, ms: the Full deck's six
+/// hours.
 pub const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
 
 /// How many rings a strip checkpoint holds, by slot ([`SavedStrip::ring_mut`]): the seven rows',
 /// Network's send direction, memory pressure, aterm's seven, the process count, aterm's
-/// memory/CPU coverage and raw CPU charge.
-pub const STRIP_RINGS: usize = 20;
+/// memory/CPU coverage and raw CPU charge, and the instruments' four (A4): compute watts,
+/// the thermal pressure level, process exits and blockage. A slot keeps its number for
+/// good: a tail line names its rings by it.
+pub const STRIP_RINGS: usize = 24;
 
-/// Persisted strip state across restarts and crashes (the strip folder's base, schema 3): an
+/// Persisted strip state across restarts and crashes (the strip folder's base, schema 4): an
 /// hour of 10 s buckets and seven of ten-minute ones, replayed forward by the tail's
-/// [`StripLine`]s.
+/// [`StripLine`]s, with six hours of gaps, events and situation spans and the usual Super
+/// clocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedStrip {
     /// Wall-clock timestamp (Unix ms) of the newest absorbed sample, or `0` when empty.
@@ -3468,6 +3737,16 @@ pub struct SavedStrip {
     pub aterm_unread: [crate::ring::SavedRing; 2],
     /// Inherited CPU counter charge, separate from confirmed CPU.
     pub aterm_cpu_charge: crate::ring::SavedRing,
+    /// Compute watts, CPU + GPU + Neural Engine (1-hour 10 s and 7-hour 10-minute).
+    pub compute_w: crate::ring::SavedRing,
+    /// The thermal pressure level, over while Moderate or more: a box's over time is its share
+    /// at pressure and its largest reading its worst level ([`crate::heat::PressureBox`]).
+    pub thermal: crate::ring::SavedRing,
+    /// Process exits a second, beside the starts `rings[Processes]` holds.
+    pub proc_exits: crate::ring::SavedRing,
+    /// What blocks the processes' flow, over while anything does: a box's over time is its
+    /// blocked share and its largest reading its worst kind ([`crate::blockage::BlockageBox`]).
+    pub blockage: crate::ring::SavedRing,
     /// What the Processes rings hold: starts a second (`true`), the process count (`false`), or
     /// nothing yet.
     pub proc_starts: Option<bool>,
@@ -3475,6 +3754,11 @@ pub struct SavedStrip {
     pub time_gaps: Vec<TimeGap>,
     /// Vertical event markers in the last six hours ([`STRIP_HORIZON_MS`]).
     pub strip_events: Vec<StripEvent>,
+    /// The situation's stays in the last six hours, oldest first ([`STRIP_HORIZON_MS`]): each
+    /// with netplace's kind for the place, the power source and the lid.
+    pub situation: Vec<crate::situation::Span>,
+    /// The usual Super clock per busy decile, as the heat chain had learned it.
+    pub usual: crate::heat::UsualClocks,
 }
 
 impl Default for SavedStrip {
@@ -3491,9 +3775,15 @@ impl Default for SavedStrip {
             aterm: std::array::from_fn(|_| crate::ring::SavedRing::default()),
             aterm_unread: std::array::from_fn(|_| crate::ring::SavedRing::default()),
             aterm_cpu_charge: crate::ring::SavedRing::default(),
+            compute_w: crate::ring::SavedRing::default(),
+            thermal: crate::ring::SavedRing::default(),
+            proc_exits: crate::ring::SavedRing::default(),
+            blockage: crate::ring::SavedRing::default(),
             proc_starts: None,
             time_gaps: Vec::new(),
             strip_events: Vec::new(),
+            situation: Vec::new(),
+            usual: crate::heat::UsualClocks::default(),
         }
     }
 }
@@ -3516,8 +3806,9 @@ impl SavedStrip {
     }
 
     /// The ring in slot `slot` (`0..`[`STRIP_RINGS`]): the rows' in [`Resource::ALL`] order,
-    /// then Network's send direction, memory pressure, aterm's in row order and the process
-    /// count, aterm's memory/CPU coverage and its raw CPU charge. `None` past the last.
+    /// then Network's send direction, memory pressure, aterm's in row order, the process
+    /// count, aterm's memory/CPU coverage and its raw CPU charge, compute watts, the thermal
+    /// pressure level, process exits and blockage. `None` past the last.
     pub fn ring_mut(&mut self, slot: usize) -> Option<&mut crate::ring::SavedRing> {
         match slot {
             0..7 => self.rings.get_mut(slot),
@@ -3527,6 +3818,10 @@ impl SavedStrip {
             16 => Some(&mut self.proc_count),
             17..19 => self.aterm_unread.get_mut(slot - 17),
             19 => Some(&mut self.aterm_cpu_charge),
+            20 => Some(&mut self.compute_w),
+            21 => Some(&mut self.thermal),
+            22 => Some(&mut self.proc_exits),
+            23 => Some(&mut self.blockage),
             _ => None,
         }
     }
@@ -3542,15 +3837,20 @@ impl SavedStrip {
             16 => Some(&self.proc_count),
             17..19 => self.aterm_unread.get(slot - 17),
             19 => Some(&self.aterm_cpu_charge),
+            20 => Some(&self.compute_w),
+            21 => Some(&self.thermal),
+            22 => Some(&self.proc_exits),
+            23 => Some(&self.blockage),
             _ => None,
         }
     }
 
     /// Replay `line`, a tail line written after this base: each ring takes its closed bucket
-    /// ([`crate::ring::SavedRing::put_closed`]), the capacities it read and the gaps and events
-    /// it opened, and the strip's newest wall clock moves to the line's. A line at or before
-    /// [`Self::through_k`] holds nothing the base does not, and changes nothing; the result says
-    /// whether it was replayed.
+    /// ([`crate::ring::SavedRing::put_closed`]), the capacities it read, the gaps and events
+    /// it opened, the situation spans it moved ([`crate::situation::Span::put`]) and the usual
+    /// clocks it taught, and the strip's newest wall clock moves to the line's. A line at or
+    /// before [`Self::through_k`] holds nothing the base does not, and changes nothing; the
+    /// result says whether it was replayed.
     pub fn replay(&mut self, mut line: StripLine) -> bool {
         if line.k <= self.through_k {
             return false;
@@ -3579,6 +3879,10 @@ impl SavedStrip {
         }
         self.time_gaps.extend(line.time_gaps);
         self.strip_events.extend(line.strip_events);
+        for span in line.spans {
+            crate::situation::Span::put(&mut self.situation, span, STRIP_HISTORY_CAP);
+        }
+        self.usual.put(&line.usual);
         self.last_wall_ms = self.last_wall_ms.max(line.wall_ms);
         self.through_k = line.k;
         true
@@ -3616,6 +3920,11 @@ pub struct StripLine {
     pub time_gaps: Vec<TimeGap>,
     /// Events marked since the previous line.
     pub strip_events: Vec<StripEvent>,
+    /// Situation spans opened or moved since the previous line, oldest first.
+    pub spans: Vec<crate::situation::Span>,
+    /// The usual clocks' deciles taught since the previous line
+    /// ([`crate::heat::UsualClocks::rows_unlike`]).
+    pub usual: Vec<crate::heat::UsualRow>,
 }
 
 impl Vitals {
@@ -3771,10 +4080,12 @@ impl Vitals {
         let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
         self.time_gaps.retain(|g| g.end_ms >= cutoff);
         self.strip_events.retain(|e| e.at_unix_ms >= cutoff);
+        self.situation_spans.retain(|s| s.end_ms >= cutoff);
     }
 
-    /// Snapshot the global and `aterm` time-series rings, discontinuities, and event
-    /// markers for atomic persistence (`clean_stop = true` on graceful probe shutdown).
+    /// Snapshot the global and `aterm` time-series rings, discontinuities, event markers,
+    /// situation spans and usual clocks for atomic persistence (`clean_stop = true` on graceful
+    /// probe shutdown).
     #[must_use]
     pub fn saved_strip(&self, clean_stop: bool) -> SavedStrip {
         SavedStrip {
@@ -3796,9 +4107,15 @@ impl Vitals {
             }),
             aterm_unread: self.rows.aterm.1.each_ref().map(BucketRing::saved),
             aterm_cpu_charge: self.rows.aterm.2.saved(),
+            compute_w: self.rows.compute_w.saved(),
+            thermal: self.rows.thermal.saved(),
+            proc_exits: self.rows.proc_exits.saved(),
+            blockage: self.rows.blocked.saved(),
             proc_starts: self.rows.proc_starts,
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
+            situation: self.situation_spans.clone(),
+            usual: self.heat.usual,
         }
     }
 
@@ -3809,6 +4126,10 @@ impl Vitals {
     /// [`StripEventKind::Crash`] and [`StripEventKind::Restart`] markers. When it came from a
     /// graceful stop at least one 10 s bucket ago, records a [`GapKind::Paused`] downtime span so
     /// pre-quit samples are never interpolated across the offline interval.
+    ///
+    /// The situation spans of the last six hours come back as they ended, none reaching past
+    /// `now_unix_ms`: no reading of this run joins one. The usual clocks come back as they
+    /// were learned.
     pub fn restore_strip_history(&mut self, saved: SavedStrip, now_unix_ms: i64) {
         if now_unix_ms <= 0 || saved.last_wall_ms <= 0 {
             return;
@@ -3831,10 +4152,22 @@ impl Vitals {
             .each_ref()
             .map(|ring| BucketRing::restored(ring, now_unix_ms));
         self.rows.aterm.2 = BucketRing::restored(&saved.aterm_cpu_charge, now_unix_ms);
+        self.rows.compute_w = BucketRing::restored(&saved.compute_w, now_unix_ms);
+        self.rows.thermal = BucketRing::restored(&saved.thermal, now_unix_ms);
+        self.rows.proc_exits = BucketRing::restored(&saved.proc_exits, now_unix_ms);
+        self.rows.blocked = BucketRing::restored(&saved.blockage, now_unix_ms);
         self.rows.proc_starts = saved.proc_starts;
+        self.heat.usual = crate::heat::UsualClocks::restored(&saved.usual.saved());
         self.strip_rewrites += 1;
 
         let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
+        self.situation_spans.clear();
+        for mut span in saved.situation {
+            if span.end_ms >= cutoff && span.start_ms < now_unix_ms {
+                span.end_ms = span.end_ms.min(now_unix_ms);
+                crate::situation::Span::put(&mut self.situation_spans, span, STRIP_HISTORY_CAP);
+            }
+        }
         for mut gap in saved.time_gaps {
             if gap.end_ms >= cutoff && gap.start_ms < now_unix_ms {
                 gap.end_ms = gap.end_ms.min(now_unix_ms);
@@ -3907,13 +4240,18 @@ impl Vitals {
             16 => Some(&self.rows.proc_count),
             17..19 => self.rows.aterm.1.get(slot - 17),
             19 => Some(&self.rows.aterm.2),
+            20 => Some(&self.rows.compute_w),
+            21 => Some(&self.rows.thermal),
+            22 => Some(&self.rows.proc_exits),
+            23 => Some(&self.rows.blocked),
             _ => None,
         }
     }
 
     /// Epoch `k` of every strip ring that read anything in it, for the checkpoint's tail; `None`
-    /// when none did, or while `k` is still open ([`Self::strip_open_k`]). Its gaps and events
-    /// are left for the writer, which knows what it wrote before ([`Self::strip_marks`]).
+    /// when none did, or while `k` is still open ([`Self::strip_open_k`]). Its gaps, events,
+    /// situation spans and usual clocks are left for the writer, which knows what it wrote
+    /// before ([`Self::strip_marks`], [`Self::strip_spans`], [`Self::usual_clocks`]).
     #[must_use]
     pub fn strip_line(&self, k: i64) -> Option<StripLine> {
         if self.strip_open_k().is_none_or(|open| k >= open) {
@@ -3936,7 +4274,23 @@ impl Vitals {
             proc_starts: self.rows.proc_starts,
             time_gaps: Vec::new(),
             strip_events: Vec::new(),
+            spans: Vec::new(),
+            usual: Vec::new(),
         })
+    }
+
+    /// The situation's stays of the last six hours, oldest first, as [`Self::saved_strip`]
+    /// would keep them.
+    #[must_use]
+    pub fn strip_spans(&self) -> &[crate::situation::Span] {
+        &self.situation_spans
+    }
+
+    /// The usual Super clock per busy decile, as the heat chain has learned it: the
+    /// checkpoint keeps it with the strip.
+    #[must_use]
+    pub const fn usual_clocks(&self) -> &crate::heat::UsualClocks {
+        &self.heat.usual
     }
 
     /// The strip's gaps and events, oldest first, as [`Self::saved_strip`] would keep them.
@@ -3965,9 +4319,22 @@ impl Vitals {
         &self.rows.free
     }
 
-    /// Take the free history the host persisted in an earlier run ([`FreeHistory::restored`]).
+    /// Take the free history the host persisted in an earlier run
+    /// ([`history::FreeSeries::restored`]).
     pub fn restore_free_history(&mut self, history: FreeHistory) {
         self.rows.free = history;
+    }
+
+    /// The disk's three-week free history, for the host to persist.
+    #[must_use]
+    pub fn free_weeks(&self) -> &FreeWeeks {
+        &self.rows.weeks
+    }
+
+    /// Take the three-week free history the host persisted in an earlier run
+    /// ([`history::FreeSeries::restored`]).
+    pub fn restore_free_weeks(&mut self, weeks: FreeWeeks) {
+        self.rows.weeks = weeks;
     }
 
     /// Retain a prior process's diagnostic report for export, never as a live sample.
@@ -4038,6 +4405,19 @@ impl Vitals {
         for ev in &s.note_events {
             self.record_strip_event(ev.clone());
         }
+        // The reading before this one where no gap lies between them: the stay that held
+        // through it goes on through this one.
+        let joins = self
+            .last_stamp
+            .filter(|prev| stamp.follows(*prev))
+            .map(|prev| prev.wall_ms);
+        crate::situation::Span::note(
+            &mut self.situation_spans,
+            stamp.wall_ms,
+            crate::situation::Stay::of(s.place, &s.situation),
+            joins,
+            STRIP_HISTORY_CAP,
+        );
         match self.last_stamp.replace(stamp) {
             Some(prev) if stamp.wall_ms > prev.wall_ms && stamp.mono_ms >= prev.mono_ms => {
                 let wall_dt = stamp.wall_ms - prev.wall_ms;
@@ -4324,6 +4704,21 @@ impl Vitals {
             .rows
             .blockage
             .absorb(s, pass.attribution.as_ref().map(|(m, _)| m.as_slice()));
+        facts.blocked =
+            crate::blockage::Blocked::judge(&facts.zombies, &facts.dstate, s.stuck_work.as_ref());
+        let heat = self.heat.absorb(&crate::heat::Input {
+            lane: s.coal_lane,
+            pressure: s.thermal_pressure,
+            moved: self.rows.heat_moved.take(),
+            range: s.clock_range,
+            gate: crate::heat::ClockGate::of_chip(self.rows.cpu_brand.as_deref()),
+            cores: core_fracs.as_deref().zip(cores_window_ns),
+            p_cores: cpu.as_ref().and_then(|c| super_cores(&c.clusters)),
+            host: s.host_watts,
+        });
+        // The instruments' rings take the reading here, before the re-key is judged, so a step
+        // back that re-keys one of them writes a whole base as the rows' does.
+        self.rows.note_instruments(s, facts.blocked, &heat);
         // Any strip ring re-keyed back, not only the rows': aterm's, which read nothing at a step
         // a rate cannot cross, re-key at the reading after it.
         let rekeyed = opens_before
@@ -4345,7 +4740,7 @@ impl Vitals {
                 churn_bps: mem.as_ref().and_then(|m| m.rates).map(|r| r.churn_bps),
                 churn_read: mem.as_ref().is_some_and(|m| m.sample.counters.is_some()),
                 swap_bps: facts.swap_rate,
-                swap_used: mem.as_ref().map(|m| m.sample.swap_used),
+                swap_used: mem.as_ref().and_then(|m| m.sample.swap_used),
                 block: &s.block,
             },
             &mut self.rows.peaks,
@@ -4388,16 +4783,6 @@ impl Vitals {
             _ => None,
         };
 
-        let heat = self.heat.absorb(&crate::heat::Input {
-            lane: s.coal_lane,
-            pressure: s.thermal_pressure,
-            moved: self.rows.heat_moved.take(),
-            range: s.clock_range,
-            gate: crate::heat::ClockGate::of_chip(self.rows.cpu_brand.as_deref()),
-            cores: core_fracs.as_deref().zip(cores_window_ns),
-            p_cores: cpu.as_ref().and_then(|c| super_cores(&c.clusters)),
-            host: s.host_watts,
-        });
         let mut snap = Snapshot {
             native_terminals: s.native_terminals.clone(),
             cpu_counter_sample: s.cores.clone(),
@@ -4428,6 +4813,7 @@ impl Vitals {
             slot_grid: SlotGrid::SECONDS,
             resources,
             free_history: self.rows.free.clone(),
+            free_weeks: self.rows.weeks.clone(),
             facts,
             procs_window_ns: pass.window_ns,
             cores_window_ns,
@@ -5122,6 +5508,7 @@ impl Rows {
         if let Some(v) = vol {
             self.caps[Disk.index()] = Some(v.total as f64);
             self.free.note_on(&v.mount, v.total, t, v.free);
+            self.weeks.note_on(&v.mount, v.total, t, v.free);
         }
         self.rings[Disk.index()].push(t, vol.map(|v| v.used() as f64), false);
         if let Some(v) = vol {
@@ -5206,6 +5593,9 @@ impl Rows {
         let _ = self
             .proc_count
             .push(t, s.room.procs.map(|n| n as f64), false);
+        let _ = self
+            .proc_exits
+            .push(t, facts.flow.as_ref().and_then(|f| f.exits_ps), false);
         facts.proc_read_s = self.peaks.proc_starts.read_s;
         // aterm's figure is its starts where the row is starts (its own coalition's); a tab's
         // share of them is F14's estimate, so a tab reads none until then.
@@ -5476,6 +5866,32 @@ impl Rows {
         starts
     }
 
+    /// Takes a reading into the instruments' rings (A4 §4, §6.2): compute watts, with the peak
+    /// its tiles draw against; the thermal pressure level, over while Moderate or more; what
+    /// blocks the processes' flow, over while anything does; and work per joule, for its peak
+    /// alone. A value its reader did not give adds no time to its ring.
+    fn note_instruments(
+        &mut self,
+        s: &Sample,
+        blocked: crate::blockage::Blocked,
+        heat: &crate::heat::HeatView,
+    ) {
+        let t = Taken::at(s.at_unix_ms, s.period_ms());
+        let closed = self.compute_w.push(t, heat.watts.compute().ok(), false);
+        note_peak(&self.compute_w, closed, &mut self.peaks.compute_w);
+        let level = heat.pressure.ok();
+        let _ = self.thermal.push(
+            t,
+            level.map(|p| f64::from(p.level())),
+            level.is_some_and(|p| p >= crate::heat::ThermalPressure::Moderate),
+        );
+        let (kind, held) = blocked.reading().unzip();
+        let _ = self.blocked.push(t, kind, held.unwrap_or(false));
+        let work = heat.chain.ok().and_then(|c| c.judged.ipj);
+        let closed = self.work.push(t, work, false);
+        note_peak(&self.work, closed, &mut self.peaks.work_per_joule);
+    }
+
     fn absorb_links(
         &mut self,
         s: &Sample,
@@ -5511,21 +5927,42 @@ impl Rows {
         let (mut rx_drop, mut tx_drop) = (0u64, 0u64);
         let mut any_tx_drop = false;
         let mut measured = false;
+        let mut rates_why = None;
+        let mut packets_moved_without_rate = false;
         let mut any_up = false;
         let mut moved_by: Vec<(&LinkSample, u64)> = Vec::new();
         let mut link_views: Vec<LinkView> = Vec::with_capacity(links.len());
         for l in links {
             let prev = self.links.get(&l.name);
-            let rates = dt.and_then(|d| prev.and_then(|b| link_rates(b, l, d)));
+            let result = prev.ok_or(DeltaError::Warming).and_then(|before| {
+                dt.ok_or(DeltaError::InvalidInterval)
+                    .and_then(|d| link_rates(before, l, d))
+            });
+            let rates = result.as_ref().ok().map(|(rates, _)| *rates);
+            let why = result.as_ref().err().copied();
             if !l.loopback && l.up {
                 any_up = true;
             }
             if l.counts {
-                let moved = if rates.is_some()
+                if rates.is_none()
+                    && prev.is_some_and(|before| {
+                        before.index == l.index
+                            && before.byte_counter == l.byte_counter
+                            && l.rx_packets >= before.rx_packets
+                            && l.tx_packets >= before.tx_packets
+                            && (l.rx_packets > before.rx_packets
+                                || l.tx_packets > before.tx_packets)
+                    })
+                {
+                    // Packet activity is known even when byte-wrap count is not. An active
+                    // link must not be labelled Idle merely because its rate is unknown.
+                    packets_moved_without_rate = true;
+                }
+                let moved = if let Ok((_, bytes)) = result
                     && let Some(b) = prev
                 {
-                    let d_rx = l.rx - b.rx;
-                    let d_tx = l.tx - b.tx;
+                    let d_rx = bytes.rx;
+                    let d_tx = bytes.tx;
                     rx = rx.saturating_add(d_rx);
                     tx = tx.saturating_add(d_tx);
                     rx_pkts = rx_pkts.saturating_add(l.rx_packets - b.rx_packets);
@@ -5540,6 +5977,7 @@ impl Rows {
                     measured = true;
                     d_rx.saturating_add(d_tx)
                 } else {
+                    rates_why = rates_why.or(why);
                     0
                 };
                 moved_by.push((l, moved));
@@ -5547,21 +5985,24 @@ impl Rows {
             link_views.push(LinkView {
                 sample: l.clone(),
                 rates,
+                rates_why: why,
             });
         }
         facts.link = self.pick_link(&moved_by, dt).cloned();
         self.links = links.iter().map(|l| (l.name.clone(), l.clone())).collect();
-        let rates = dt.filter(|_| measured).map(|d| LinkRates {
-            rx_bps: rx as f64 / d,
-            tx_bps: tx as f64 / d,
-            rx_pps: rx_pkts as f64 / d,
-            tx_pps: tx_pkts as f64 / d,
-            rx_err_ps: rx_err as f64 / d,
-            tx_err_ps: tx_err as f64 / d,
-            rx_drop_ps: rx_drop as f64 / d,
-            tx_drop_ps: any_tx_drop.then_some(tx_drop as f64 / d),
-        });
-        let window_ns = dt.filter(|_| measured).map(|d| (d * 1e9).round() as u64);
+        let rates = dt
+            .filter(|_| measured && rates_why.is_none())
+            .map(|d| LinkRates {
+                rx_bps: rx as f64 / d,
+                tx_bps: tx as f64 / d,
+                rx_pps: rx_pkts as f64 / d,
+                tx_pps: tx_pkts as f64 / d,
+                rx_err_ps: rx_err as f64 / d,
+                tx_err_ps: tx_err as f64 / d,
+                rx_drop_ps: rx_drop as f64 / d,
+                tx_drop_ps: any_tx_drop.then_some(tx_drop as f64 / d),
+            });
+        let window_ns = rates.and(dt).map(|d| (d * 1e9).round() as u64);
         let state = if !any_up && links.iter().any(|l| !l.loopback) {
             NetState::Offline
         } else if rates.is_some_and(|r| {
@@ -5569,7 +6010,8 @@ impl Rows {
         }) || srtt.is_some_and(|ms| ms >= 250.0)
         {
             NetState::Degraded
-        } else if rates.is_some_and(|r| r.rx_bps + r.tx_bps >= 1_024.0)
+        } else if packets_moved_without_rate
+            || rates.is_some_and(|r| r.rx_bps + r.tx_bps >= 1_024.0)
             || tcp.is_some_and(|t| t.established > 0)
         {
             NetState::Online
@@ -5581,6 +6023,7 @@ impl Rows {
         let net = has_net.then_some(NetView {
             links: link_views,
             rates,
+            rates_why,
             window_ns,
             tcp,
             srtt_ms: srtt,
@@ -5690,31 +6133,45 @@ fn window_of(res: Resource) -> i64 {
     }
 }
 
-fn link_rates(before: &LinkSample, now: &LinkSample, dt: f64) -> Option<LinkRates> {
-    if dt <= 0.0 {
-        return None;
+fn link_rates(
+    before: &LinkSample,
+    now: &LinkSample,
+    dt: f64,
+) -> Result<(LinkRates, ByteDelta), DeltaError> {
+    if !dt.is_finite() || dt <= 0.0 || dt > 90.0 {
+        return Err(DeltaError::InvalidInterval);
     }
-    let d_rx = now.rx.checked_sub(before.rx)?;
-    let d_tx = now.tx.checked_sub(before.tx)?;
-    let d_rx_pkts = now.rx_packets.checked_sub(before.rx_packets)?;
-    let d_tx_pkts = now.tx_packets.checked_sub(before.tx_packets)?;
-    let d_rx_err = now.rx_errors.checked_sub(before.rx_errors)?;
-    let d_tx_err = now.tx_errors.checked_sub(before.tx_errors)?;
-    let d_rx_drop = now.rx_drops.checked_sub(before.rx_drops)?;
+    if before.up != now.up || before.counts != now.counts {
+        return Err(DeltaError::SourceChanged);
+    }
+    let bytes = byte_delta(
+        before.byte_sample(),
+        now.byte_sample(),
+        (dt * 1e9).round() as u64,
+    )?;
+    let subtract = |now: u64, before: u64| now.checked_sub(before).ok_or(DeltaError::Discontinuity);
+    let d_rx_pkts = subtract(now.rx_packets, before.rx_packets)?;
+    let d_tx_pkts = subtract(now.tx_packets, before.tx_packets)?;
+    let d_rx_err = subtract(now.rx_errors, before.rx_errors)?;
+    let d_tx_err = subtract(now.tx_errors, before.tx_errors)?;
+    let d_rx_drop = subtract(now.rx_drops, before.rx_drops)?;
     let tx_drop_ps = match (before.tx_drops, now.tx_drops) {
-        (Some(b), Some(n)) => Some(n.checked_sub(b)? as f64 / dt),
+        (Some(b), Some(n)) => Some(subtract(n, b)? as f64 / dt),
         _ => None,
     };
-    Some(LinkRates {
-        rx_bps: d_rx as f64 / dt,
-        tx_bps: d_tx as f64 / dt,
-        rx_pps: d_rx_pkts as f64 / dt,
-        tx_pps: d_tx_pkts as f64 / dt,
-        rx_err_ps: d_rx_err as f64 / dt,
-        tx_err_ps: d_tx_err as f64 / dt,
-        rx_drop_ps: d_rx_drop as f64 / dt,
-        tx_drop_ps,
-    })
+    Ok((
+        LinkRates {
+            rx_bps: bytes.rx as f64 / dt,
+            tx_bps: bytes.tx as f64 / dt,
+            rx_pps: d_rx_pkts as f64 / dt,
+            tx_pps: d_tx_pkts as f64 / dt,
+            rx_err_ps: d_rx_err as f64 / dt,
+            tx_err_ps: d_tx_err as f64 / dt,
+            rx_drop_ps: d_rx_drop as f64 / dt,
+            tx_drop_ps,
+        },
+        bytes,
+    ))
 }
 
 fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) -> Series {

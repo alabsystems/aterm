@@ -87,6 +87,26 @@ embedded verifier until a release publishes the static
 (read with `sha256sum` or `shasum`). Then run `aterm --window`. A raw
 executable you download yourself is not enrolled for updates.
 
+### Windows
+
+```powershell
+irm https://alab.systems/get-aterm.ps1 | iex
+```
+
+In Windows PowerShell or PowerShell 7, with no administrator. It installs the
+release's signed Windows build for this user under
+`%LOCALAPPDATA%\Programs\aterm`, with Start Menu and Desktop shortcuts and the
+user PATH, after a verifier it pins by SHA-256 has checked the release's
+signature chain and the zip. To pass it flags:
+
+```powershell
+& ([scriptblock]::Create((irm https://alab.systems/get-aterm.ps1))) -Dest D:\tools\aterm -NoShortcuts -NoPath
+```
+
+alab.systems serves the script once a release carries the Windows zip and the
+script pins that release's verifier; until then there is no published Windows
+build.
+
 ### Homebrew
 
 ```sh
@@ -105,7 +125,8 @@ every window, tab and live shell survives the handoff. `aterm update status`
 and Settings ▸ Software Update show where it stands; `aterm help update` has
 the rest (Linux adds `enable`, `apply` and `rollback`). `[update] enabled =
 false` stops background checks, and `[update] auto_apply = false` leaves
-installing to you. Windows has no published build and no network updater.
+installing to you. On Windows a check stages a newer signed release and
+`aterm update apply` installs it (`--restart` starts aterm again on it).
 
 ### Build from source
 

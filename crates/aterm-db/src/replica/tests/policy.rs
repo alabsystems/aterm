@@ -1683,14 +1683,16 @@ impl Fixture {
             let mut wire = 1u32.to_le_bytes().to_vec();
             control::send_frame(&mut wire, &self.incoming).unwrap();
             stream.input = Cursor::new(wire);
-            round.receive_batch(
-                &mut stream,
-                self.peer,
-                self.scope.digest(),
-                BatchKind::Operation,
-                &mut Repair::default(),
-                &mut report,
-            )
+            round
+                .receive_batch(
+                    &mut stream,
+                    self.peer,
+                    self.scope.digest(),
+                    BatchKind::Operation,
+                    &mut Repair::default(),
+                    &mut report,
+                )
+                .map(drop)
         } else {
             let mut receipt = Sha256::digest(&self.original).to_vec();
             receipt.push(1);

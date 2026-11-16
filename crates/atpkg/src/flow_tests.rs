@@ -7857,3 +7857,152 @@ fn an_aborted_update_keeps_a_build_it_did_not_create() {
         assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&17));
     }
 }
+
+/// [`fixture`] with a harness program, `hx-alab`, in the index and pinned at `pin`, whose build 4
+/// is ay 18's pack under a manifest carrying `table` (none: no `[harness]`).
+fn fixture_with_harness(dir: &Path, pin: Option<u64>, table: Option<&str>) -> Fake {
+    let fake = fixture(dir);
+    let ay = String::from_utf8(fake.pkg[&("ay".to_string(), 18)].0.clone()).unwrap();
+    let line = |key: &str| {
+        ay.lines()
+            .find(|l| l.starts_with(&format!("{key} = ")))
+            .unwrap()
+            .to_string()
+    };
+    let pins = pin.map_or_else(String::new, |b| format!(", \"hx-alab\" = {b}"));
+    let index = format!(
+        "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+         [programs.ay]\nrepo = \"ay\"\n[programs.hx-alab]\nrepo = \"hx\"\n\
+         [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
+         pin = {{ ay = 18{pins} }}\n",
+        attr = attribution()
+    );
+    let mut fake = with_index(fake, &index);
+    let body = format!(
+        "schema = 2\nprogram = \"hx-alab\"\nversion = \"0.4\"\nbuild_number = 4\n\
+         exposes = [\"ay\"]\n{}\n\
+         [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\nasset = \"ay-18.tar.zst\"\n\
+         {}\n{}\nsize = 100\n[artifact.cost]\ndisk_installed = 1048576\n",
+        table.unwrap_or(""),
+        line("sha256"),
+        line("tree_root"),
+    );
+    fake.pkg.insert(
+        ("hx-alab".to_string(), 4),
+        (
+            body.clone().into_bytes(),
+            sign(&RELEASE_SEED, body.as_bytes()),
+        ),
+    );
+    fake
+}
+
+const HX: InstallRequest<'static> = InstallRequest {
+    channel: "stable",
+    program: "hx-alab",
+    triple: TRIPLE,
+    installed: None,
+};
+
+/// A `[harness]` table for hx-alab leading `leads`.
+fn hx_table(leads: &str) -> String {
+    format!("[harness]\nid = \"hx-alab\"\ntool = \"ay\"\nleads = [{leads}]\nname = \"Hx\"\n")
+}
+
+/// A RETAINED HARNESS BUILD IS ADMITTED AS A STAGED ONE IS: `install hx-alab --build 4` stages
+/// it, makes it current and holds it; named again once the store holds it, a manifest whose
+/// `[harness]` leads `kimi`, which the kimi-alab seed leads, is refused before anything moves,
+/// as a staged build's is. NEGATIVE CONTROL: the same build with no word another leads is
+/// admitted, and the records an older atpkg left out are kept beside it then.
+#[test]
+fn a_retained_harness_build_is_admitted_as_a_staged_one_is() {
+    let dir = scratch("named-harness-present");
+    let layout = layout(&dir);
+    let fake = fixture_with_harness(&dir, None, None);
+    let got = install_harness_build(&fake, &layout, &anchor(), fl(0), 0, &HX, named(4, None));
+    assert!(matches!(got, Ok(NamedBuild::Staged { .. })), "{got:?}");
+    let build = layout.build_dir("hx-alab", 4);
+    assert_eq!(
+        std::fs::read_link(layout.program_current("hx-alab")).unwrap(),
+        build
+    );
+    assert!(crate::pin::is_pinned(&layout, "hx-alab").unwrap());
+    assert!(
+        crate::pin::is_held(&layout, "hx-alab").unwrap(),
+        "the hold is this install's"
+    );
+    // An older atpkg kept no records beside it.
+    for suffix in [
+        crate::harness_record::PKG_SUFFIX,
+        crate::harness_record::PKG_SIG_SUFFIX,
+        crate::harness_record::ROSTER_SUFFIX,
+        crate::harness_record::ROSTER_SIG_SUFFIX,
+    ] {
+        std::fs::remove_file(crate::store::sidecar_path(&build, suffix).unwrap()).unwrap();
+    }
+
+    let leading = fixture_with_harness(&dir, None, Some(&hx_table("\"kimi\"")));
+    let refused =
+        install_harness_build(&leading, &layout, &anchor(), fl(0), 0, &HX, named(4, None));
+    assert!(
+        matches!(&refused, Err(FlowError::HarnessLead(why)) if why.contains("kimi-alab")),
+        "{refused:?}"
+    );
+    let record = crate::store::sidecar_path(&build, crate::harness_record::RECORD_SUFFIX).unwrap();
+    assert!(!record.exists(), "a refused build keeps no record");
+
+    let quiet = fixture_with_harness(&dir, None, Some(&hx_table("")));
+    let got = install_harness_build(&quiet, &layout, &anchor(), fl(0), 0, &HX, named(4, None));
+    assert!(matches!(got, Ok(NamedBuild::Present { .. })), "{got:?}");
+    assert!(record.is_file(), "its record is kept now");
+    assert!(crate::harness_record::keeps_manifest(&build));
+}
+
+/// A NAMED INSTALL'S HOLD IS ITS OWN: a harness the person pinned before `install --build` stays
+/// pinned by them and is not recorded as the install's hold, so a named update does not lift it.
+#[test]
+fn a_named_harness_install_never_takes_over_the_persons_pin() {
+    let dir = scratch("named-harness-pin");
+    let layout = layout(&dir);
+    let fake = fixture_with_harness(&dir, None, None);
+    install_harness_build(&fake, &layout, &anchor(), fl(0), 0, &HX, named(4, None)).unwrap();
+    assert!(crate::pin::is_held(&layout, "hx-alab").unwrap());
+    crate::pin::set_held(&layout, "hx-alab", false).unwrap();
+    install_harness_build(&fake, &layout, &anchor(), fl(0), 0, &HX, named(4, None)).unwrap();
+    assert!(crate::pin::is_pinned(&layout, "hx-alab").unwrap());
+    assert!(
+        !crate::pin::is_held(&layout, "hx-alab").unwrap(),
+        "the person's pin stays theirs"
+    );
+}
+
+/// THE UPDATE PASS KEEPS THE RECORDS AN OLDER ATPKG LEFT OUT: hx-alab 4 is current and keeps no
+/// signed manifest; an install that finds it up to date fetches the manifest once and, its tree
+/// being the signed one, keeps its records beside it, its `.harness` among them.
+#[test]
+fn an_up_to_date_harness_build_gets_the_records_an_older_atpkg_left_out() {
+    let dir = scratch("harness-backfill");
+    let layout = layout(&dir);
+    let fake = fixture_with_harness(&dir, Some(4), Some(&hx_table("")));
+    install(&fake, &layout, &anchor(), &HX, fl(0), 0).unwrap();
+    let build = layout.build_dir("hx-alab", 4);
+    let record = crate::store::sidecar_path(&build, crate::harness_record::RECORD_SUFFIX).unwrap();
+    assert!(record.is_file(), "a fresh install keeps its record");
+    for suffix in [
+        crate::harness_record::PKG_SUFFIX,
+        crate::harness_record::PKG_SIG_SUFFIX,
+        crate::harness_record::ROSTER_SUFFIX,
+        crate::harness_record::ROSTER_SIG_SUFFIX,
+        crate::harness_record::RECORD_SUFFIX,
+    ] {
+        std::fs::remove_file(crate::store::sidecar_path(&build, suffix).unwrap()).unwrap();
+    }
+    let up = InstallRequest {
+        installed: Some(4),
+        ..HX
+    };
+    let report = install(&fake, &layout, &anchor(), &up, fl(0), 0).unwrap();
+    assert!(report.already_current);
+    assert!(record.is_file(), "the update pass kept it");
+    assert!(crate::harness_record::keeps_manifest(&build));
+}

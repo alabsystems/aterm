@@ -490,7 +490,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     );
 
     let drag_from = |app: &mut App, from: (u16, u16)| {
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.last_mouse_cell = from;
         }
         app.begin_selection(wid, SelectionType::Simple);
@@ -704,7 +704,7 @@ fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
             );
             assert_eq!(t.grid().display_offset(), 0, "…and starts at live");
         }
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.focused = focused;
         }
         let mut c = Press::new();

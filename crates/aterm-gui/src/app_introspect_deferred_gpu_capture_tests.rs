@@ -335,13 +335,14 @@ fn deferred_gpu_capture_original_timeout_and_closed_window_reply_once() {
 #[test]
 fn cancelling_a_queued_follower_preserves_the_heads_exact_tap() {
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+    let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
     ws.capture_acquire_armed = true;
     ws.capture_client_requested = true;
     let (follower, receiver, cancellation) = capture(17);
     assert!(!follower.exact_tap);
     assert!(cancellation.cancel());
     app.deferred_gpu_captures.push_back(follower);
+    drop(ws);
     app.prune_deferred_gpu_captures();
     assert!(receiver.recv().unwrap().is_err());
     assert!(app.windows[&WindowId(0)].capture_acquire_armed);

@@ -1915,6 +1915,22 @@ fn renamed_from_m7(root: &aterm_tempfile::TempDir) -> (MachineName, MachineName)
     (before, set)
 }
 
+/// Keep a nickname-undo control distinct from the noun the fixture happened to draw.
+fn different_nickname(name: &MachineName) -> Nickname {
+    let heron = Nickname::parse("Heron").expect("a nickname");
+    let next = if name.shown_nick() == heron {
+        Nickname::parse("Otter").expect("another nickname")
+    } else {
+        heron
+    };
+    assert_ne!(
+        name.shown_nick(),
+        next,
+        "the fixture must change the shown nickname"
+    );
+    next
+}
+
 /// Labels a test must never read: an undo that keeps the number reads none.
 fn unreadable() -> io::Result<LabLabels> {
     Err(io::Error::other("the vault is busy"))
@@ -2014,10 +2030,10 @@ fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
         Some(undone.clone())
     );
 
-    let heron = Nickname::parse("Heron").expect("a nickname");
+    let next = different_nickname(&before);
     let nicked = set_nick(
         root.path(),
-        &NickTo::Word(heron),
+        &NickTo::Word(next),
         ByKind::Person,
         unread,
         NOW + 3,
@@ -2389,10 +2405,10 @@ fn undo_does_not_undo_an_undo() {
 fn undo_leaves_no_mac_unnumbered() {
     let root = state();
     let (first, _) = ensure(root.path(), no_roster, never, NOW).expect("unnumbered");
-    let heron = Nickname::parse("Heron").expect("a nickname");
+    let next = different_nickname(&first);
     set_nick(
         root.path(),
-        &NickTo::Word(heron),
+        &NickTo::Word(next),
         ByKind::Person,
         unread,
         NOW + 1,

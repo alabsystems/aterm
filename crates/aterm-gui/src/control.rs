@@ -136,6 +136,7 @@ pub(crate) use control_session::cmd_meta;
 pub(crate) use control_session::cmd_sessions_store;
 #[cfg(test)]
 pub(crate) use control_session::harness_act_face;
+pub(crate) use control_session::meta_value;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::mint_turn_id_for_test;
 pub(crate) use control_session::needs_moved;
@@ -4287,9 +4288,10 @@ fn dispatch_app_verb(
 fn retired_verb_error(verb: &str) -> Option<String> {
     match verb {
         "operator" | "operator-propose-bin" => Some(format!(
-            "ERR verb {verb} was removed with the embedded operator: a manager session \
-             replaced it (`aterm ctl survey` reads every session, `aterm ctl @self spawn \
-             agent=claude -` starts a worker)\n"
+            "ERR verb {verb} was removed with the embedded operator: use your harness's native \
+             subagents for delegation and its own shell tools for commands; `aterm ctl survey` \
+             reads existing sessions; new sessions need an explicit request or a concrete need \
+             native tools cannot meet (`aterm help workers`)\n"
         )),
         "dial" | "dial-list" | "dial-token" => Some(format!(
             "ERR verb {verb} was removed with the network drive: a fleet replaced it (`aterm \
@@ -4462,7 +4464,11 @@ fn word_journaled(store: &Store, reply: String) -> String {
 struct MetaRequest<'a> {
     rest: &'a str,
     term: &'a Arc<Mutex<Terminal>>,
+    /// A re-proof of the session's standing claimant ([`prove_self_claim_for`]).
     prove: &'a dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    /// The proof of a claim being made, under its contract ([`prove_claim_for`]).
+    prove_claim: &'a control_session::ProveClaim<'a>,
+    keep_child: &'a control_session::KeepChild<'a>,
     session: u64,
     ctx: &'a SessionCtx,
     store: &'a Store,
@@ -4474,6 +4480,8 @@ fn serve_meta(
     rest: &str,
     term: &Arc<Mutex<Terminal>>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    prove_claim: &control_session::ProveClaim<'_>,
+    keep_child: &control_session::KeepChild<'_>,
     session: u64,
     ctx: &SessionCtx,
     store: &Store,
@@ -4485,6 +4493,8 @@ fn serve_meta(
             rest,
             term,
             prove,
+            prove_claim,
+            keep_child,
             session,
             ctx,
             store,
@@ -4504,6 +4514,8 @@ fn serve_meta_with_barrier(
         rest,
         term,
         prove,
+        prove_claim,
+        keep_child,
         session,
         ctx,
         store,
@@ -4541,43 +4553,32 @@ fn serve_meta_with_barrier(
     }
     // An admitted `harness_needs` line can move the `owner=needs` entry itself, a meta change.
     let mut entry_moved = false;
-    let (resp, changed) =
-        control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), prove, rest)
-            .or_else(|| {
-                let by = control_session::log_actor(scope, ctx);
-                control_session::cmd_meta_harness_act(
-                    ctx,
-                    snapshot,
-                    serving_connection(),
-                    by,
-                    prove,
-                    rest,
-                )
-            })
-            .or_else(|| {
-                control_session::cmd_meta_harness_held(ctx, serving_connection(), prove, rest)
-            })
-            .or_else(|| {
-                control_session::cmd_meta_harness_activity(ctx, serving_connection(), prove, rest)
-            })
-            .or_else(|| {
-                control_session::cmd_meta_harness_land(ctx, serving_connection(), prove, rest)
-            })
-            .or_else(|| {
-                let (resp, moved) = control_session::cmd_meta_harness_needs(
-                    ctx,
-                    serving_connection(),
-                    prove,
-                    rest,
-                )?;
-                entry_moved = moved.entry;
-                Some((resp, moved.any()))
-            })
-            .or_else(|| control_session::meta_questions_denied(scope, rest))
-            .unwrap_or_else(|| {
-                let by = control_session::log_actor(scope, ctx);
-                control_session::cmd_meta_by(term, store, session, ctx, rest, by)
-            });
+    let (resp, changed) = control_session::cmd_meta_supervisor(
+        ctx,
+        scope,
+        serving_connection(),
+        prove_claim,
+        keep_child,
+        rest,
+    )
+    .or_else(|| {
+        let by = control_session::log_actor(scope, ctx);
+        control_session::cmd_meta_harness_act(ctx, snapshot, serving_connection(), by, prove, rest)
+    })
+    .or_else(|| control_session::cmd_meta_harness_held(ctx, serving_connection(), prove, rest))
+    .or_else(|| control_session::cmd_meta_harness_activity(ctx, serving_connection(), prove, rest))
+    .or_else(|| control_session::cmd_meta_harness_land(ctx, serving_connection(), prove, rest))
+    .or_else(|| {
+        let (resp, moved) =
+            control_session::cmd_meta_harness_needs(ctx, serving_connection(), prove, rest)?;
+        entry_moved = moved.entry;
+        Some((resp, moved.any()))
+    })
+    .or_else(|| control_session::meta_questions_denied(scope, rest))
+    .unwrap_or_else(|| {
+        let by = control_session::log_actor(scope, ctx);
+        control_session::cmd_meta_by(term, store, session, ctx, rest, by)
+    });
     if changed {
         crate::self_claim::meta_changed(ctx);
         on_change(entry_moved);
@@ -4594,6 +4595,8 @@ fn serve_meta_wired(
     rest: &str,
     term: &Arc<Mutex<Terminal>>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    prove_claim: &control_session::ProveClaim<'_>,
+    keep_child: &control_session::KeepChild<'_>,
     session: u64,
     ctx: &SessionCtx,
     store: &Store,
@@ -4604,6 +4607,8 @@ fn serve_meta_wired(
         rest,
         term,
         prove,
+        prove_claim,
+        keep_child,
         session,
         ctx,
         store,
@@ -6560,22 +6565,79 @@ impl Drop for DirectPeer {
     }
 }
 
-/// A set's PROOF: codex-alab's self-claim ([`crate::self_claim`]), or a rostered harness's
-/// contract 3 claim ([`crate::harness_claim`]) by its row's image rule.
+/// A RE-PROOF of `holder` as the session's standing claimant (a fenced input's, or an act's or a
+/// write's on another connection than the claim's): codex-alab's self-claim
+/// ([`crate::self_claim`]), or a registered harness's scoped claim ([`crate::harness_claim`])
+/// under the image rule of the contract its standing claim names
+/// ([`crate::harness_claim::image_for`]; a seed id's contract 3 claim keeps contract 3's rule),
+/// else its registry row's. It reads the registry this process read last, with no file read
+/// ([`crate::native_session_policy::SessionPolicy::read_seen`]), and the kernel's facts afresh,
+/// and reuses the image verdict the claimant last passed while nothing that verdict was judged on
+/// moved ([`crate::native_session_policy::SessionPolicy::claimant_image`]), so a typed key or an
+/// act verifies no signature and hashes no tree (HX-05's review, finding 1).
 pub(crate) fn prove_self_claim_for(
     ctx: &SessionCtx,
     holder: &str,
     master: i32,
 ) -> Option<crate::self_claim::Proven> {
-    prove_claim_with_policy(&ctx.native_policy, holder, master)
+    let policy = &ctx.native_policy;
+    let read = policy.read_seen();
+    let contract = aterm_agent::harness::contract::holder_in(read.rows, holder)
+        .filter(|(row, _)| aterm_agent::harness::registry::is_seed(row.id))
+        .and_then(|_| held_contract(ctx, holder));
+    prove_claim_under(policy, &read, holder, contract, master, true)
 }
 
+/// The PROOF OF A CLAIM BEING MADE: `holder`'s process under the image rule of the contract the
+/// claim names (`contract`, `None` for a claim without `contract=`), against the registry as it
+/// stands now and with its image judged in full; a pass serves the standing claim's re-proofs
+/// ([`prove_self_claim_for`]).
+pub(crate) fn prove_claim_for(
+    ctx: &SessionCtx,
+    holder: &str,
+    contract: Option<u32>,
+    master: i32,
+) -> Option<crate::self_claim::Proven> {
+    prove_claim_with_policy(&ctx.native_policy, holder, contract, master)
+}
+
+/// The contract of the scoped claim `holder` stands on in `ctx`'s session, if it stands on one.
+/// Its callers hold no lock on the session's meta.
+fn held_contract(ctx: &SessionCtx, holder: &str) -> Option<u32> {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .live_claim(crate::metrics::now_us())
+        .filter(|claim| claim.holder == holder)
+        .and_then(|claim| claim.scoped.as_ref())
+        .map(|scoped| scoped.claim.contract)
+}
+
+/// [`prove_claim_for`] under `policy`: the registry read now, the image judged in full.
 fn prove_claim_with_policy(
     policy: &crate::native_session_policy::SessionPolicy,
     holder: &str,
+    contract: Option<u32>,
     master: i32,
 ) -> Option<crate::self_claim::Proven> {
-    if let Some((row, pid)) = policy.holder(holder) {
+    prove_claim_under(policy, &policy.read_now(), holder, contract, master, false)
+}
+
+/// `holder`'s proof under `read`: the kernel's facts, read now (the connection's peer is the pid
+/// the holder names, which leads the session's foreground group, and its kernel start holds across
+/// the proof), and its image under the rule of `contract` (`None`: contract 4's), reusing the pass
+/// this session's claimant last made where `reuse`
+/// ([`crate::native_session_policy::SessionPolicy::claimant_image`]); the contract 2 self-claim by
+/// its own rule ([`prove_self_claim_by`]) where no row of `read` names the holder.
+fn prove_claim_under(
+    policy: &crate::native_session_policy::SessionPolicy,
+    read: &crate::native_session_policy::ProofRead,
+    holder: &str,
+    contract: Option<u32>,
+    master: i32,
+    reuse: bool,
+) -> Option<crate::self_claim::Proven> {
+    if let Some((row, pid)) = aterm_agent::harness::contract::holder_in(read.rows, holder) {
         let peer = serving_peer_pid();
         let foreground = crate::quit_safety::foreground_pgrp(master);
         let named = peer == Some(pid) && i64::from(foreground) == i64::from(pid);
@@ -6583,18 +6645,41 @@ fn prove_claim_with_policy(
             return None;
         }
         let before = aterm_agent::harness::restart_stamp::kernel_start(pid)?;
+        let claimant = crate::harness_claim::Claimant {
+            holder,
+            row,
+            contract: contract.unwrap_or(aterm_agent::harness::contract::UNIVERSAL),
+            pid,
+            start: &before,
+        };
         let proven = crate::harness_claim::prove_in(
-            policy.rows(),
+            read.rows,
             holder,
             crate::self_claim::Facts {
                 peer,
                 foreground,
-                alab_image: policy.actor_image(row, pid),
+                alab_image: policy.claimant_image(read, claimant, reuse),
             },
         )?;
         return (proven.start == before).then_some(proven);
     }
     prove_self_claim_by(holder, master, &crate::self_claim::runs_alab_build)
+}
+
+/// A contract 4 claim's CHILD, kept on the kernel's reads for its just-proven `claimant`: the
+/// session's foreground group read live from `master` and each process's lineage
+/// ([`crate::harness_claim::keep_child`]).
+pub(crate) fn keep_child_for(
+    claimant: &crate::self_claim::Proven,
+    word: aterm_agent::harness::contract::ChildWord,
+    master: i32,
+) -> Option<crate::harness_claim::KeptChild> {
+    crate::harness_claim::keep_child(
+        claimant,
+        crate::quit_safety::foreground_pgrp(master),
+        word,
+        &aterm_uds::process::read_lineage,
+    )
 }
 
 /// [`prove_self_claim_for`] with the image fact read by `alab_image`, which is asked only once the peer and the foreground facts hold.
@@ -6824,14 +6909,9 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
     for handle in handles {
         control_session::release_connection_lease(&handle.ctx, conn);
         crate::native_act::connection_closed(&handle.ctx, conn);
-        if crate::native_act::retain_exec_claim(&handle.ctx, conn) {
-            continue;
-        }
-        let by = aterm_slog::Actor::Aterm;
-        let released =
-            crate::session_timeline::publish_release_supervisor(&handle.ctx, Some(conn), now, by)
-                .published();
-        if !(crate::session_timeline::close_claim_connection(&handle.ctx, conn, now) || released) {
+        if crate::native_act::retain_exec_claim(&handle.ctx, handle.local_id, conn)
+            || !crate::session_timeline::release_closed_connection(&handle.ctx, conn, now)
+        {
             continue;
         }
         if let Some(proxy) = proxy {
@@ -7410,7 +7490,7 @@ fn drive_refused(why: &str, word: &str) -> String {
 #[cfg(any(unix, test))]
 fn drive_kind(head: &Head) -> Result<DriveKind, String> {
     const HOLD_SELECTOR: &str = "a drive's hold names its session as its argument, never a \
-                                 selector: hold s-… on|off [reason=<pct>]";
+                                 selector: hold <sid> on|off [reason=<pct>]";
     let Head {
         selector,
         verb,
@@ -7469,7 +7549,7 @@ fn drive_kind(head: &Head) -> Result<DriveKind, String> {
             }
             "close" => {
                 return Err(drive_refused(
-                    "a drive's close names its session in front: @s-… close",
+                    "a drive's close names its session in front: @<sid> close",
                     verb,
                 ));
             }
@@ -7534,7 +7614,7 @@ fn drive_gate(
     const RETIRED: &str = "a worker whose tab the driven Mac closed once its task concluded \
                            answers only @<sid> result and await task";
     const HOLD_SID: &str = "a drive's hold names a session the driven Mac hosts by its bare sid, \
-                            with no @: hold s-… on|off [reason=<pct>]";
+                            with no @: hold <sid> on|off [reason=<pct>]";
     const HOLD: &str = "hold <sid> on|off [reason=<pct>]";
     #[cfg(test)]
     DRIVE_GATED.with(|gated| gated.set(gated.get() + 1));
@@ -10001,7 +10081,7 @@ pub(crate) fn run_subscribe_with_peer_probe<W: Write, L: subscribe::PeerLiveness
             return;
         }
         let Some(body) = raw.strip_prefix('@') else {
-            let _ = writer.write_all(b"ERR usage: targets are @<sel> (e.g. @., @1, @s-...)\n");
+            let _ = writer.write_all(b"ERR usage: targets are @<sel> (e.g. @., @1, @t...)\n");
             let _ = writer.flush();
             return;
         };
@@ -11200,6 +11280,7 @@ fn serve_session_verb(
                 "blocks" => control_selection::cmd_blocks_json(&host, session, &body),
                 "edges" | "grants" => control_session::cmd_edges_json(ctx),
                 "log" => control_session::cmd_log_json(ctx, &body),
+                "described" => crate::session_log::cmd_described_json(ctx, &body),
                 "sys" => crate::sys_host::cmd_sys(
                     store,
                     session,
@@ -11684,6 +11765,8 @@ fn serve_session_verb(
             rest,
             term,
             &|holder: &str| prove_self_claim_for(ctx, holder, master),
+            &|holder: &str, contract| prove_claim_for(ctx, holder, contract, master),
+            &|claimant: &crate::self_claim::Proven, word| keep_child_for(claimant, word, master),
             session,
             ctx,
             store,
@@ -11694,6 +11777,7 @@ fn serve_session_verb(
         ),
         "timeline" => control_session::cmd_timeline(ctx, rest),
         "log" => control_session::cmd_log(ctx, rest),
+        "described" => crate::session_log::cmd_described(ctx, rest),
         "brief" => control_session::cmd_brief_with_jobs(
             ctx,
             store,
@@ -12015,6 +12099,8 @@ pub(crate) fn meta_line_for_test(
         rest,
         term,
         &|holder: &str| prove_self_claim_for(ctx, holder, -1),
+        &|holder: &str, contract| prove_claim_for(ctx, holder, contract, -1),
+        &|claimant: &crate::self_claim::Proven, word| keep_child_for(claimant, word, -1),
         session,
         ctx,
         store,
@@ -12033,12 +12119,25 @@ pub(crate) fn meta_wakes_for_test(
     rest: &str,
     conn: Option<u64>,
 ) -> (String, Vec<Wake>) {
-    meta_wakes_proving_for_test(store, term, session, ctx, rest, conn, &|holder: &str| {
-        prove_self_claim_for(ctx, holder, -1)
-    })
+    meta_wakes_with_barrier_for_test(
+        MetaRequest {
+            rest,
+            term,
+            prove: &|holder| prove_self_claim_for(ctx, holder, -1),
+            prove_claim: &|holder, contract| prove_claim_for(ctx, holder, contract, -1),
+            keep_child: &|_, _| None,
+            session,
+            ctx,
+            store,
+            scope: Scope::Owner,
+        },
+        conn,
+        crate::act_barrier::before_act,
+    )
 }
 
-/// [`meta_wakes_for_test`] with the kernel's look at a self-claim's holder answered by `prove`.
+/// [`meta_wakes_for_test`] with the kernel's look at a self-claim's holder answered by `prove`,
+/// for a claim being made as for a standing one.
 #[cfg(test)]
 pub(crate) fn meta_wakes_proving_for_test(
     store: &Store,
@@ -12049,11 +12148,30 @@ pub(crate) fn meta_wakes_proving_for_test(
     conn: Option<u64>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
 ) -> (String, Vec<Wake>) {
+    meta_wakes_keeping_for_test(store, term, session, ctx, rest, conn, prove, &|_, _| None)
+}
+
+/// [`meta_wakes_proving_for_test`] with a contract 4 claim's child kept by `keep_child` (a
+/// test's stand-in for [`keep_child_for`]'s kernel reads).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn meta_wakes_keeping_for_test(
+    store: &Store,
+    term: &Arc<Mutex<Terminal>>,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    keep_child: &control_session::KeepChild<'_>,
+) -> (String, Vec<Wake>) {
     meta_wakes_with_barrier_for_test(
         MetaRequest {
             rest,
             term,
             prove,
+            prove_claim: &|holder, _| prove(holder),
+            keep_child,
             session,
             ctx,
             store,
@@ -12080,6 +12198,8 @@ pub(crate) fn meta_wakes_barrier_for_test(
             rest,
             term,
             prove: &|holder| prove_self_claim_for(ctx, holder, -1),
+            prove_claim: &|holder, contract| prove_claim_for(ctx, holder, contract, -1),
+            keep_child: &|_, _| None,
             session,
             ctx,
             store,

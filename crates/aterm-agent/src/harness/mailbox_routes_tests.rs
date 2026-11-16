@@ -1221,29 +1221,42 @@ fn a_lower_files_entry_for_the_same_login_keeps_its_addresses() {
 #[test]
 fn an_environment_mailbox_login_overrides_the_entries() {
     use crate::harness::headless_oauth::{IMAP_USER_ENV, discover_mailbox_config_with_env};
-    let home = aterm_tempfile::tempdir().expect("home");
-    crate::vault_entry::put(
-        home.path(),
-        "ai-mailbox.toml",
-        "imap_url = \"imaps://imap.example.test/INBOX\"\npassword = \"top\"\n\
+    let text = "imap_url = \"imaps://imap.example.test/INBOX\"\npassword = \"top\"\n\
          [[mailboxes]]\nlogin = \"entry@example.test\"\npassword = \"entry-pw\"\n\
-         receives = [\"ai@pm.example.test\"]\n",
-    );
-    let target = Some("ai@pm.example.test");
-    let files = discover_mailbox_config_with_env(Some(home.path()), None, |_| None).expect("files");
-    assert_eq!(
-        files.webmail_user_for(target).as_deref(),
-        Some("entry@example.test")
-    );
-    let env = discover_mailbox_config_with_env(Some(home.path()), None, |name| {
-        (name == IMAP_USER_ENV).then(|| "env-login@example.test".into())
-    })
-    .expect("env");
-    assert!(env.mailboxes.is_empty());
-    assert_eq!(
-        env.webmail_user_for(target).as_deref(),
-        Some("env-login@example.test")
-    );
+         receives = [\"ai@pm.example.test\"]\n";
+    for vault in [
+        false,
+        #[cfg(unix)]
+        true,
+    ] {
+        let home = aterm_tempfile::tempdir().expect("home");
+        if vault {
+            #[cfg(unix)]
+            crate::vault_entry::put(home.path(), "ai-mailbox.toml", text);
+            #[cfg(not(unix))]
+            panic!("vault fixtures require Unix");
+        } else {
+            let path = home.path().join(".config/aterm/mailbox.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            aterm_uds::atomic_file::write(&path, text.as_bytes(), 0o600).unwrap();
+        }
+        let target = Some("ai@pm.example.test");
+        let files =
+            discover_mailbox_config_with_env(Some(home.path()), None, |_| None).expect("files");
+        assert_eq!(
+            files.webmail_user_for(target).as_deref(),
+            Some("entry@example.test")
+        );
+        let env = discover_mailbox_config_with_env(Some(home.path()), None, |name| {
+            (name == IMAP_USER_ENV).then(|| "env-login@example.test".into())
+        })
+        .expect("env");
+        assert!(env.mailboxes.is_empty());
+        assert_eq!(
+            env.webmail_user_for(target).as_deref(),
+            Some("env-login@example.test")
+        );
+    }
 }
 
 /// THE ROUTED HTTP VIEW: an address's entry reads its own HTTP mailbox with its own login

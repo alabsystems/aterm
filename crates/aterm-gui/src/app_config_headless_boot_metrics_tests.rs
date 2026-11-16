@@ -12,7 +12,7 @@ fn asymmetric_vertical_padding_round_trips_resize_with_remainder() {
     app.backend.set_pad_top(2);
     app.backend.set_head(5);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.metrics.pad = 12;
         ws.metrics.pad_top = 2;
         ws.metrics.head = 5;

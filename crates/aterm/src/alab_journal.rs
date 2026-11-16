@@ -101,6 +101,10 @@ fn event(note: &Note) -> Option<Event> {
         to: word(note.to.as_ref().map(journal::Key::as_str), Pk::new)?,
         tab: word(note.tab.as_ref().map(journal::Tab::as_str), Word::new)?,
         harness: word(note.harness, Word::new)?,
+        // A harness note is never a `decided`: the publisher notes those (SF-08b).
+        op: None,
+        via: None,
+        program: None,
     })
     // Only a kind about one tab's run names a tab or a harness, as every reader admits it.
     .filter(|event| (event.tab.is_none() && event.harness.is_none()) || event.kind.names_tab())

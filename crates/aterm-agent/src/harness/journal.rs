@@ -32,7 +32,7 @@
 
 #[cfg(unix)]
 use super::accounts::Store;
-use super::accounts::{Auth, Cli, Event, Kind, Roster, SignInStep, State, WindowFig};
+use super::accounts::{Auth, Cli, Event, Kind, Roster, SignInStep, State, Wall, WindowFig};
 use super::claims::LeaseKey;
 use super::provider_read::{ProbeEvent, Read};
 use crate::ai::connector::Region;
@@ -177,6 +177,7 @@ pub const KINDS: &[&str] = &[
     "token-fallback",
     "token-offered",
     "token-removed",
+    "token-differ",
     "token-stopped",
     "seen",
 ];
@@ -218,7 +219,6 @@ pub const WHYS: &[&str] = &[
     // Why aterm's wrapper started a session on its stored login (`TokenEvent::Fallback`,
     // `token_route::Fallback::word`).
     "claimed",
-    "held",
     "busy",
     "unverified",
     "awaiting-basis",
@@ -403,7 +403,7 @@ pub enum TokenEvent {
     Minted,
     /// The first status-line reading under the token (`token-served`).
     Served,
-    /// The minting Mac verified the token's account (`token-verified`).
+    /// A Mac holding the account's stored login verified the token's account (`token-verified`).
     Verified,
     /// Claude Code refused the token on this Mac (`token-rejected`).
     Rejected,
@@ -413,6 +413,9 @@ pub enum TokenEvent {
     Offered,
     /// The verb removed the account's token from the vault (`token-removed`).
     Removed,
+    /// This Mac's comparison found the token's windows another account's, so no session here
+    /// starts on it (`token-differ`); other Macs judge it by their own.
+    Differ,
     /// A check, or what another try alone does not pass, stopped the verb's capture, and the
     /// account's step is held with no clock (`token-stopped`, with the stop's word).
     Stopped,
@@ -430,6 +433,7 @@ impl TokenEvent {
             Self::Fallback => "token-fallback",
             Self::Offered => "token-offered",
             Self::Removed => "token-removed",
+            Self::Differ => "token-differ",
             Self::Stopped => "token-stopped",
         }
     }
@@ -444,9 +448,11 @@ pub fn token_note(event: TokenEvent, account: Key, t: u64, why: Option<&'static 
         TokenEvent::Minted | TokenEvent::Removed | TokenEvent::Offered | TokenEvent::Stopped => {
             "signin-flow"
         }
-        TokenEvent::Served | TokenEvent::Verified | TokenEvent::Rejected | TokenEvent::Fallback => {
-            "cli-output"
-        }
+        TokenEvent::Served
+        | TokenEvent::Verified
+        | TokenEvent::Rejected
+        | TokenEvent::Fallback
+        | TokenEvent::Differ => "cli-output",
     };
     let mut note = Note::new(t, event.kind(), account, Cli::Claude, src);
     note.why = why.filter(|why| WHYS.contains(why));
@@ -1374,7 +1380,16 @@ fn notes_of(
             }
         }
         for (name, wall) in &account.walls {
-            if !mine(&wall.by) || old.and_then(|a| a.walls.get(name)) == Some(wall) {
+            // A standing wall seen again moves only its newest sighting ([`Wall::seen`]), which
+            // tells the journal nothing its first note did not.
+            let noted = |old: &Wall| {
+                *wall
+                    == Wall {
+                        seen: wall.seen,
+                        ..old.clone()
+                    }
+            };
+            if !mine(&wall.by) || old.and_then(|a| a.walls.get(name)).is_some_and(noted) {
                 continue;
             }
             let Some(t) = secs(wall.at) else { continue };

@@ -1749,7 +1749,7 @@ fn a_private_document_beside_a_kept_list_gets_a_recovery_tab_unless_the_list_is_
 }
 
 const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
-const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+const BY: &str = "fleet:87be5228:tqn5r6e0148";
 
 /// This test thread's requests in a folder of its own until dropped.
 struct Requests(aterm_tempfile::TempDir);
@@ -1805,7 +1805,7 @@ fn a_drives_spawns_sit_under_from_their_mac() {
     let shell = land_fleet(&mut app);
     opened_for_test(true, NODE, "m114", BY, Made::Shell, &sid_of(&app, shell));
     let worker = land_fleet(&mut app);
-    mark_from(&app, worker, "s-0123456789abcdef0123");
+    mark_from(&app, worker, "tqn5r6e0148");
     opened_for_test(
         true,
         NODE,

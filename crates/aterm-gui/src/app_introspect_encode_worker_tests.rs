@@ -170,9 +170,10 @@ fn charging_stays_over_a_palette(
 
     let now = Instant::now();
     app.level_up = Some(crate::level_up::LevelUp::charging_continued(7, now, 0.0));
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.drag_hover = true;
     window.bell_flash.ring(now);
+    drop(window);
     let visuals = app.host_visual_state(wid, now);
     assert!(!visuals.invert, "a modal still suppresses the bell");
     let overlay = visuals.overlay.expect("charging remains admitted");
@@ -633,7 +634,7 @@ fn an_admitted_capture_is_charged_what_admission_reserved() {
     {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.win_px = Some(aterm_window::dpi::PhysicalSize::new(
             width as u32,
             height as u32,
@@ -681,6 +682,7 @@ fn an_admitted_capture_is_charged_what_admission_reserved() {
             },
         };
         let window_peak = stitch().peak_bytes();
+        drop(ws);
         assert_eq!(
             app.capture_bytes_estimate(wid, CaptureCharge::Window),
             window_peak,
@@ -2321,7 +2323,7 @@ fn mixed_composite_paints_every_terminal_selection_and_anchors_the_focused_one()
         native_leaf.rect.origin.x.round().max(0.0) as usize,
     );
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.fx.cursor_mut().glow_scratch = vec![aterm_render::GlowQuad {
             row: u16::try_from(terminal_rect.0).unwrap(),
             x: 0,
@@ -2709,7 +2711,8 @@ fn headless_capture_emits_and_collects_an_eligible_cat() {
             .expect("front terminal")
             .term
             .clone();
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         ws.pending_deco_birth = Some(t0);
         let mut term = crate::term_lock(&terminal);
         term.process(b"\r\n\r\n\r\nhello kitty friend");
@@ -2787,7 +2790,7 @@ fn a_capture_of_another_tab_carries_only_that_tabs_words() {
     };
     write(&app, session_a, b"\r\n\r\n\r\nhello kitty friend");
     {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("window 0");
         ws.pending_deco_birth = Some(t0);
     }
     app.capture_words(wid, t0);
@@ -2824,7 +2827,7 @@ fn a_capture_of_another_tab_carries_only_that_tabs_words() {
         format!("\x1b[6;{}Hkitty waits", tab_b_col + 1).as_bytes(),
     );
     {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("window 0");
         ws.pending_deco_birth = Some(t0);
     }
     let at = t0 + Duration::from_millis(16);
@@ -2841,7 +2844,7 @@ fn a_capture_of_another_tab_carries_only_that_tabs_words() {
 
     app.switch_tab_in(wid, 0);
     {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("window 0");
         ws.pending_deco_birth = Some(at);
     }
     assert_eq!(
@@ -2867,7 +2870,8 @@ fn headless_capture_preserves_complete_curse_wince_for_next_frame() {
             .expect("front terminal")
             .term
             .clone();
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -2916,7 +2920,8 @@ fn capture_rescan_refreshes_cells_after_snapshot_race() {
             .expect("front terminal")
             .term
             .clone();
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         let mut term = crate::term_lock(&terminal);
         term.process(b"ordinary text");
         term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
@@ -2998,7 +3003,8 @@ fn capture_during_freeze_preserves_and_resumes_episodes() {
             .expect("front terminal")
             .term
             .clone();
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         let mut term = crate::term_lock(&terminal);
         term.process(b"a happy kitty naps");
         term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
@@ -3009,7 +3015,7 @@ fn capture_during_freeze_preserves_and_resumes_episodes() {
         "the fixture's feline effect is animating (sparkle defaults on)"
     );
     {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("window 0");
         ws.fx
             .companions_mut()
             .cursor_cat
@@ -3041,7 +3047,8 @@ fn capture_during_freeze_preserves_and_resumes_episodes() {
             .expect("front terminal")
             .term
             .clone();
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         let mut term = crate::term_lock(&terminal);
         term.process(b" zzz");
         term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);

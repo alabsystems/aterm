@@ -14,12 +14,19 @@ fn a_hand_back_waits_on_a_tab_it_cannot_read_yet_and_refuses_only_one_it_never_c
         "no-foreground",
         "tab-ambiguous",
         "no-shell",
+        "shell-unread",
+        "layout-unread",
         "terminal",
+        "terminal-unread",
         "argv-unreadable",
     ] {
         assert_eq!(unsnapped_step(why), format!("wait:{why}"));
     }
-    for why in ["no-tab", "tab-identity-conflict"] {
+    for why in [
+        "no-tab",
+        "tab-identity-conflict",
+        aterm_agent::harness::relaunch::ARGV_WITHHELD,
+    ] {
         assert_eq!(unsnapped_step(why), format!("refused:{why}"));
     }
 }

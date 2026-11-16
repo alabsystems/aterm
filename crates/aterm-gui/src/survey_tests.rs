@@ -483,6 +483,48 @@ fn fleet_codes_and_credentials_are_redacted() {
     assert_eq!(excerpt_token(Some("  ")), "-");
 }
 
+/// A redacted line says nothing but that something was redacted when it is the whole-line
+/// notice, or word notices alone: a bare token's, a bare join code's, with or without
+/// punctuation around them.
+///
+/// CONTROL: a line that keeps a word beside its notice says something, and so does a line
+/// with no letter or digit that holds no notice at all.
+#[test]
+fn only_redaction_is_a_line_of_notices_alone() {
+    let hex = "ab12".repeat(16);
+    let pat = format!("ghp_{}", "0123456789abcdefghij");
+    for said in [
+        "password hunter2".to_string(),
+        hex.clone(),
+        pat.clone(),
+        format!("({pat})."),
+        format!("{hex} {pat}"),
+        "atf1-abcd".to_string(),
+        format!("atf1-abcd: {hex}"),
+    ] {
+        let line = redact(&said);
+        assert!(
+            !line.contains(&hex) && !line.contains(&pat) && !line.contains("hunter2"),
+            "{line}"
+        );
+        assert!(only_redaction(&line), "{said} -> {line}");
+    }
+    assert!(only_redaction(REDACTED_LINE) && only_redaction(REDACTED_WORD));
+    for said in [
+        format!("use {pat} here"),
+        format!("deploy {hex}"),
+        "join atf1-abcd".to_string(),
+        "->".to_string(),
+        "✅".to_string(),
+        "plain words".to_string(),
+        String::new(),
+    ] {
+        let line = redact(&said);
+        assert!(!line.contains(&hex) && !line.contains(&pat), "{line}");
+        assert!(!only_redaction(&line), "{said} -> {line}");
+    }
+}
+
 /// A FLEET KEY never leaves whole: the text of its key file (`cat
 /// …/fleet.key`) is 40 lowercase hex digits, a commit id's shape, and only a
 /// commit id's short form of it is quoted — in a line, a path, a title.
@@ -808,6 +850,7 @@ fn each_level_emits_exactly_its_fields() {
         "turns",
         "tools",
         "pinned",
+        "opened_ms",
     ];
     const CONTENT: &[&str] = &[
         "user_title",
@@ -1719,6 +1762,9 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         home: None,
         home_dir: None,
         home_free_mb: None,
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: None,
@@ -2205,6 +2251,9 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
         home: None,
         home_dir: None,
         home_free_mb: None,
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: None,
@@ -2251,6 +2300,9 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
         home: Some("/Users//a".to_owned()),
         home_dir: None,
         home_free_mb: Some(812_345),
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: Some(HomeRepos {
             read_ms: 1_793_159_000_000,
@@ -2346,6 +2398,9 @@ fn a_survey_says_where_the_updater_stands_at_either_level() {
         home: None,
         home_dir: None,
         home_free_mb: None,
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: Some(held.clone()),
@@ -2555,6 +2610,9 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
         home: None,
         home_dir: None,
         home_free_mb: None,
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: None,
@@ -2589,10 +2647,10 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
 
 /// A LISTENER'S CACHED FACTS TAKE THE LATEST LOOK IN AN ANSWER AND NONE IN A PUSH: facts the
 /// listener kept from a minute ago go out in an answer with the machine's look as it is at
-/// this reply (its own time, `m_at_ms`, within the look's keep of now) and the free space that
-/// look read, not with the look the snapshot held. The header that carries it still ends with
-/// the access word. The same facts taken for the 3-minute push take no look (a look is taken
-/// only inside an answer) and keep their free space.
+/// this reply (its own time, `m_at_ms`, within the look's keep of now) and the free space and
+/// the size that look read, not with the look the snapshot held. The header that carries it
+/// still ends with the access word. The same facts taken for the 3-minute push take no look (a
+/// look is taken only inside an answer) and keep their free space and size.
 /// NEGATIVE CONTROL (2026-11-12): with the look served from the snapshot, the reply says the
 /// stale look's time and its cores.
 #[test]
@@ -2631,6 +2689,9 @@ fn a_listeners_cached_facts_take_the_latest_look() {
         home: None,
         home_dir: None,
         home_free_mb: Some(7),
+        home_total_mb: Some(9),
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: None,
@@ -2638,8 +2699,8 @@ fn a_listeners_cached_facts_take_the_latest_look() {
     let mut pushed = facts.clone();
     take_latest(&mut pushed, Taking::NoLook);
     assert_eq!(
-        (pushed.machine, pushed.home_free_mb),
-        (None, Some(7)),
+        (pushed.machine, pushed.home_free_mb, pushed.home_total_mb),
+        (None, Some(7), Some(9)),
         "the push takes no look"
     );
     facts.machine = Some(stale);
@@ -2657,9 +2718,13 @@ fn a_listeners_cached_facts_take_the_latest_look() {
         "this machine's cores"
     );
     assert_eq!(
-        (facts.home_free_mb, machine.look.disk_free_mb),
-        (None, None),
-        "the free space is the look's: no home, no volume read"
+        (
+            facts.home_free_mb,
+            facts.home_total_mb,
+            machine.look.disk_free_mb
+        ),
+        (None, None, None),
+        "the free space and the size are the look's: no home, no volume read"
     );
 
     let store = crate::session_store::new_store();
@@ -2670,9 +2735,18 @@ fn a_listeners_cached_facts_take_the_latest_look() {
     let out = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here);
     let head = out.lines().nth(1).expect("the instance line");
     assert_eq!(fields(head)["m_at_ms"], at.to_string(), "{head}");
-    assert!(head.contains(" home_free_mb=- os="), "{head}");
     assert!(
-        head.ends_with(&format!(" roster_unread=0 access={}", here.access.word())),
+        head.contains(
+            " home_free_mb=- home_total_mb=- home_build_mb=- home_build_at_ms=- \
+             home_build_partial=- os="
+        ),
+        "{head}"
+    );
+    assert!(
+        head.ends_with(&format!(
+            " roster_unread=0 store_worst=- store_worst_pct=- access={}",
+            here.access.word()
+        )),
         "{head}"
     );
 }
@@ -2853,8 +2927,10 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
         [Some(false)]
     );
     assert!(judged("facts", &me).is_empty());
-    // The word that names the session that asked changes no answer, wherever it stands.
-    let by = "by=s-0123456789abcdef0123";
+    // The word that names the session that asked changes no answer, wherever it stands: a tab
+    // ID, or the ID a legacy tab's shell still holds.
+    let by = "by=t0123456789";
+    let legacy = "by=s-0123456789abcdef0123";
     // The header's clock (`at_ms=`) moves between two asks; nothing else may.
     let plain = |rest: &str| {
         cmd_survey(&store, rest, SurveyLevel::Content, usize::MAX, &here())
@@ -2875,6 +2951,7 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
     };
     assert_eq!(plain(&format!("facts {by}")), plain("facts"));
     assert_eq!(plain(by), plain(""));
+    assert_eq!(plain(legacy), plain(""));
     assert_eq!(
         judged(&format!("{by} facts {}", me.arg()), &me),
         [Some(true)]
@@ -2885,8 +2962,13 @@ fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
         format!("{} {}", me.arg(), me.arg()),
         format!("{} everything", me.arg()),
         format!("{by} {by}"),
+        format!("{by} {legacy}"),
         "by=someone".to_owned(),
         "by=".to_owned(),
+        // The loose `s-` forms name no session: any hex, upper case, another length.
+        "by=s-5e55".to_owned(),
+        "by=s-0123456789ABCDEF0123".to_owned(),
+        "by=s-0123456789abcdef012".to_owned(),
     ] {
         assert!(
             cmd_survey(&store, &bad, SurveyLevel::Content, usize::MAX, &here())
@@ -2906,7 +2988,7 @@ fn a_request_tab_row_names_its_request_from_and_why() {
         true,
         "87be5228c0ffee0087be5228c0ffee00",
         "m114",
-        "fleet:87be5228:s-0123456789abcdef0123",
+        "fleet:87be5228:tqn5r6e0148",
         crate::requests_host::Made::Shell,
         tab.sid.as_str(),
     );
@@ -2977,7 +3059,7 @@ fn a_fallback_why_reads_one_to_a_drive_as_at_facts() {
         true,
         "87be5228c0ffee0087be5228c0ffee00",
         "m114",
-        "fleet:87be5228:s-0123456789abcdef0123",
+        "fleet:87be5228:tqn5r6e0148",
     );
     let briefed = crate::requests_host::opened_why_for_test(
         asker,

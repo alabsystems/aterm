@@ -15,7 +15,7 @@ use aterm_uds::process::{Identity, read_identity, read_process_path};
 
 use super::{Credentials, Out, app_pids};
 
-// clt_install::receipt's whole v2 record; unknown versions fail closed.
+// clt_install::receipt's whole v3 record or the live v2 custody it still adopts.
 const RECEIPT_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
@@ -42,7 +42,38 @@ struct Binding {
     text: Vec<u8>,
     sid: String,
     child: Identity,
-    claim: String,
+    claim: ReceiptClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReceiptClaim {
+    Current(aterm_types::clt_mark::Claim),
+    Earlier(String),
+}
+
+impl ReceiptClaim {
+    fn read(version: &str, line: &str) -> Option<Self> {
+        match version {
+            "v3" => aterm_types::clt_mark::Claim::from_receipt_line(line).map(Self::Current),
+            "v2" => {
+                let build = line.strip_prefix("claimed ")?;
+                (!build.is_empty()
+                    && build.len() <= aterm_types::clt_mark::BUILD_BYTES
+                    && !build.contains(char::is_whitespace))
+                .then(|| Self::Earlier(build.to_owned()))
+            }
+            _ => None,
+        }
+    }
+
+    fn held_in(&self, record: &[u8]) -> bool {
+        match self {
+            Self::Current(claim) => {
+                std::str::from_utf8(record).is_ok_and(|text| claim.is_held_in(text))
+            }
+            Self::Earlier(build) => record == format!("opened {build}\n").as_bytes(),
+        }
+    }
 }
 
 impl Binding {
@@ -57,23 +88,21 @@ impl Binding {
         let text = aterm_uds::private_file::read_owned(&directory, name, RECEIPT_BYTES).ok()?;
         let value = std::str::from_utf8(&text).ok()?;
         let mut lines = value.split('\n');
-        if lines.next()? != "v2" {
+        let version = lines.next()?;
+        let sid = lines.next()?;
+        if !aterm_types::control_verbs::is_minted_sid(sid) {
             return None;
         }
-        let sid = lines.next()?;
-        aterm_types::tab_id::TabId::parse(sid)?;
         let pid: i32 = lines.next()?.parse().ok()?;
         let birth: u64 = lines.next()?.parse().ok()?;
-        let claim = lines.next()?.strip_prefix("claimed ")?;
+        let claim_line = lines.next()?;
+        let claim = ReceiptClaim::read(version, claim_line)?;
         if pid <= 1
             || birth == 0
-            || claim.is_empty()
-            || claim.len() > aterm_types::clt_mark::BUILD_BYTES
-            || claim.contains(char::is_whitespace)
             || lines.next() != Some("")
             || lines.next().is_some()
             || name != format!("{sid}-{pid}-{birth}")
-            || value != format!("v2\n{sid}\n{pid}\n{birth}\nclaimed {claim}\n")
+            || value != format!("{version}\n{sid}\n{pid}\n{birth}\n{claim_line}\n")
         {
             return None;
         }
@@ -82,7 +111,7 @@ impl Binding {
         let claimed =
             aterm_uds::private_file::read_owned(parent, mark_name, aterm_types::clt_mark::BYTES)
                 .ok()?;
-        if claimed != format!("opened {claim}\n").as_bytes() {
+        if !claim.held_in(&claimed) {
             return None;
         }
         let child = probe(pid)?;
@@ -99,7 +128,6 @@ impl Binding {
             return None;
         }
         let sid = sid.to_owned();
-        let claim = claim.to_owned();
         Some(Self {
             name: name.to_owned(),
             text,

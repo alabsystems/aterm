@@ -10,7 +10,7 @@ fn parts(line: &str) -> Vec<String> {
 #[test]
 fn the_client_reads_every_form_and_refuses_the_rest() {
     let list = parse(&parts(
-        "await task @s-a1,@2:5,@s-a1 all since=3 timeout=1500",
+        "await task @ta1xxxxxxxx,@2:5,@ta1xxxxxxxx all since=3 timeout=1500",
     ))
     .unwrap();
     assert_eq!(
@@ -18,7 +18,7 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
         Request {
             targets: vec![
                 Target {
-                    selector: "s-a1".into(),
+                    selector: "ta1xxxxxxxx".into(),
                     since: None,
                     fact_since: None,
                 },
@@ -36,11 +36,11 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
         },
         "a target named twice is waited on once"
     );
-    let single = parse(&parts("@s-b2 await task since=4 timeout 90000")).unwrap();
+    let single = parse(&parts("@tb2xxxxxxxx await task since=4 timeout 90000")).unwrap();
     assert_eq!(
         single.targets,
         vec![Target {
-            selector: "s-b2".into(),
+            selector: "tb2xxxxxxxx".into(),
             since: None,
             fact_since: None,
         }]
@@ -60,7 +60,10 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
     );
     assert_eq!(bare.combine, Combine::Any);
     assert!(!bare.facts);
-    let facts = parse(&parts("await task @s-a:4:2,@s-b facts=1 fact_since=7")).unwrap();
+    let facts = parse(&parts(
+        "await task @taxxxxxxxxx:4:2,@tbxxxxxxxxx facts=1 fact_since=7",
+    ))
+    .unwrap();
     assert_eq!(
         (facts.facts, facts.fact_since),
         (true, Some(7)),
@@ -70,22 +73,22 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
         facts.targets,
         vec![
             Target {
-                selector: "s-a".into(),
+                selector: "taxxxxxxxxx".into(),
                 since: Some(4),
                 fact_since: Some(2),
             },
             Target {
-                selector: "s-b".into(),
+                selector: "tbxxxxxxxxx".into(),
                 since: None,
                 fact_since: None,
             },
         ]
     );
     for bad in [
-        "@s-a await task @s-b",
-        "await task @s-a @s-b",
-        "await task @s-a:x",
-        "await task s-a",
+        "@taxxxxxxxxx await task @tbxxxxxxxxx",
+        "await task @taxxxxxxxxx @tbxxxxxxxxx",
+        "await task @taxxxxxxxxx:x",
+        "await task taxxxxxxxxx",
         "await task any all",
         "await task since=1 since=2",
         "await task timeout=soon",
@@ -96,11 +99,11 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
         "await task facts=1 fact_since=1 fact_since=2",
         "await task facts=1 fact_since=x",
         "await task fact_since=1",
-        "await task @s-a:4:2",
-        "await task @s-a:4:x facts=1",
-        "await task @s-a::2 facts=1",
-        "await task @s-a:+4",
-        "await task @s-a:4:+2 facts=1",
+        "await task @taxxxxxxxxx:4:2",
+        "await task @taxxxxxxxxx:4:x facts=1",
+        "await task @taxxxxxxxxx::2 facts=1",
+        "await task @taxxxxxxxxx:+4",
+        "await task @taxxxxxxxxx:4:+2 facts=1",
         "await task since=+1",
         "await task facts=1 fact_since=+1",
         "await task timeout=+1500",
@@ -109,10 +112,10 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
         assert!(parse(&parts(bad)).is_err(), "{bad:?}");
     }
     for empty in [
-        "await task @s-a,@,@s-c",
+        "await task @taxxxxxxxxx,@,@tcxxxxxxxxx",
         "await task @",
         "await task @:3",
-        "await task @s-a,@:2",
+        "await task @taxxxxxxxxx,@:2",
     ] {
         let e = parse(&parts(empty)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{empty:?}");
@@ -122,19 +125,19 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
             "{empty:?}"
         );
     }
-    let explicit = parse(&parts("await task @s-a,@.,@s-c")).unwrap();
+    let explicit = parse(&parts("await task @taxxxxxxxxx,@.,@tcxxxxxxxxx")).unwrap();
     assert_eq!(
         explicit
             .targets
             .iter()
             .map(|t| t.selector.as_str())
             .collect::<Vec<_>>(),
-        ["s-a", ".", "s-c"]
+        ["taxxxxxxxxx", ".", "tcxxxxxxxxx"]
     );
-    assert!(is_await_task(&parts("@s-a await task")));
-    assert!(is_await_task(&parts("await task @s-a")));
+    assert!(is_await_task(&parts("@taxxxxxxxxx await task")));
+    assert!(is_await_task(&parts("await task @taxxxxxxxxx")));
     assert!(!is_await_task(&parts("await agent idle")));
-    assert!(!is_await_task(&parts("@s-a await")));
+    assert!(!is_await_task(&parts("@taxxxxxxxxx await")));
     assert!(
         run_await_task(
             &parts("await task timeout=18446744073709551615"),
@@ -152,11 +155,11 @@ fn the_client_reads_every_form_and_refuses_the_rest() {
 #[test]
 fn a_failed_row_is_news_past_its_edge() {
     let target = |since| Target {
-        selector: "s-a".into(),
+        selector: "taxxxxxxxxx".into(),
         since,
         fact_since: None,
     };
-    let row = "@s-a rev=4 state=failed agent=claude program_state=- attention=- result_bytes=0 \
+    let row = "@taxxxxxxxxx rev=4 state=failed agent=claude program_state=- attention=- result_bytes=0 \
                conclusion=failed why=could-not-finish";
     assert!(row_news(row, &target(Some(3)), false));
     assert!(!row_news(row, &target(Some(4)), false));
@@ -168,7 +171,7 @@ fn a_failed_row_is_news_past_its_edge() {
 fn a_leg_names_each_targets_baseline() {
     let targets = vec![
         Target {
-            selector: "s-a".into(),
+            selector: "taxxxxxxxxx".into(),
             since: Some(3),
             fact_since: None,
         },
@@ -185,31 +188,35 @@ fn a_leg_names_each_targets_baseline() {
             false,
             Duration::from_secs(600)
         ),
-        "await task @s-a:3,@1 all timeout=600000\n"
+        "await task @taxxxxxxxxx:3,@1 all timeout=600000\n"
     );
     let mut facts = targets.clone();
     assert_eq!(
         leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
-        "await task @s-a:3,@1 any facts=1 timeout=0\n"
+        "await task @taxxxxxxxxx:3,@1 any facts=1 timeout=0\n"
     );
     facts[0].fact_since = Some(2);
     facts[1].fact_since = Some(5);
     assert_eq!(
         leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
-        "await task @s-a:3:2,@1 any facts=1 fact_since=5 timeout=0\n",
+        "await task @taxxxxxxxxx:3:2,@1 any facts=1 fact_since=5 timeout=0\n",
         "a target with no rev yet takes the request's fact edge"
     );
     facts[1].since = Some(9);
     assert_eq!(
         leg_request(facts.iter(), Combine::Any, true, Duration::ZERO),
-        "await task @s-a:3:2,@1:9:5 any facts=1 timeout=0\n"
+        "await task @taxxxxxxxxx:3:2,@1:9:5 any facts=1 timeout=0\n"
     );
-    assert_eq!(row_fact_rev("@s-a rev=7 fact=- fact_rev=3"), 3);
-    assert_eq!(row_fact_rev("@s-a rev=7 state=done"), 0, "never edited");
-    let row = "@s-a rev=7 state=done agent=- program_state=idle attention=- result_bytes=1";
+    assert_eq!(row_fact_rev("@taxxxxxxxxx rev=7 fact=- fact_rev=3"), 3);
+    assert_eq!(
+        row_fact_rev("@taxxxxxxxxx rev=7 state=done"),
+        0,
+        "never edited"
+    );
+    let row = "@taxxxxxxxxx rev=7 state=done agent=- program_state=idle attention=- result_bytes=1";
     assert_eq!(row_rev(row), Some(7));
     assert_eq!(row_rev("garbage"), None);
-    assert_eq!(row_sid(row), Some("s-a"));
+    assert_eq!(row_sid(row), Some("taxxxxxxxxx"));
     assert_eq!(row_sid("@3 rev=1"), None, "a row names a global sid");
     for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
         assert_eq!(row_sid(&format!("@{sid} rev=1")), Some(sid), "either form");
@@ -220,13 +227,13 @@ fn a_leg_names_each_targets_baseline() {
     assert!(!row_closed(row));
     assert_eq!(
         closed_row(Some(row), &targets[0]),
-        "@s-a rev=7 state=closed agent=- program_state=idle attention=- result_bytes=1 \
+        "@taxxxxxxxxx rev=7 state=closed agent=- program_state=idle attention=- result_bytes=1 \
          task_state=done",
         "the server's last row stands, its program's report and its record's state with it"
     );
     assert_eq!(
         closed_row(None, &targets[0]),
-        "@s-a rev=3 state=closed agent=- program_state=- attention=- result_bytes=0",
+        "@taxxxxxxxxx rev=3 state=closed agent=- program_state=- attention=- result_bytes=0",
         "a row the client writes has every column a server row has"
     );
     assert!(row_closed(&closed_row(None, &targets[0])));
@@ -235,7 +242,7 @@ fn a_leg_names_each_targets_baseline() {
         "a row the client writes says so by having no `task_news=`, which the board reads \
          as a rev no worker reported"
     );
-    let refusal = io::Error::other("ERR no such session @s-a");
+    let refusal = io::Error::other("ERR no such session @taxxxxxxxxx");
     assert_eq!(gone_target(&refusal, &targets, &[0, 1]), Some(0));
     assert_eq!(gone_target(&refusal, &targets, &[1]), None, "not live");
     let other = io::Error::other("ERR denied");
@@ -253,15 +260,15 @@ fn a_leg_names_each_targets_baseline() {
 #[test]
 fn a_close_from_the_macs_last_row_keeps_its_rev_and_one_from_none_does_not() {
     let target = Target {
-        selector: "s-0a1".into(),
+        selector: "t0a1xxxxxxx".into(),
         since: Some(9),
         fact_since: None,
     };
     let open = |rev: u64| crate::board::Row {
         rev,
-        ..crate::board::Row::started("s-0a1", 1)
+        ..crate::board::Row::started("t0a1xxxxxxx", 1)
     };
-    let last = "@s-0a1 rev=5 state=done agent=- program_state=- attention=- result_bytes=4 \
+    let last = "@t0a1xxxxxxx rev=5 state=done agent=- program_state=- attention=- result_bytes=4 \
                 conclusion=finished checked=0123456789ab@origin/main task_news=0";
     let closed = closed_row(Some(last), &target);
     assert_eq!(
@@ -277,7 +284,7 @@ fn a_close_from_the_macs_last_row_keeps_its_rev_and_one_from_none_does_not() {
     );
     assert!(
         !row.merge(
-            "@s-0a1 rev=4 state=working agent=- program_state=- attention=- result_bytes=0 \
+            "@t0a1xxxxxxx rev=4 state=working agent=- program_state=- attention=- result_bytes=0 \
              task_news=0",
             20
         ),
@@ -312,7 +319,7 @@ fn a_close_from_the_macs_last_row_keeps_its_rev_and_one_from_none_does_not() {
     );
     assert!(
         row.merge(
-            "@s-0a1 rev=3 state=working agent=- program_state=- attention=- result_bytes=0 \
+            "@t0a1xxxxxxx rev=3 state=working agent=- program_state=- attention=- result_bytes=0 \
              task_news=0",
             20
         ),
@@ -455,23 +462,23 @@ fn under_facts_1_the_rearm_carries_each_targets_fact_edge() {
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a,@s-b any facts=1 timeout=0\n",
+            "await task @taxxxxxxxxx,@tbxxxxxxxxx any facts=1 timeout=0\n",
             timed_out(&[
-                "@s-a rev=2 state=working agent=- attention=- result_bytes=0",
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                "@taxxxxxxxxx rev=2 state=working agent=- attention=- result_bytes=0",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
             ]),
         ),
         (
             x,
-            "await task @s-a:2:0,@s-b:1:4 any facts=1 timeout=600\n",
+            "await task @taxxxxxxxxx:2:0,@tbxxxxxxxxx:1:4 any facts=1 timeout=600\n",
             answered(&[
-                "@s-a rev=2 state=working agent=- attention=- result_bytes=0 \
+                "@taxxxxxxxxx rev=2 state=working agent=- attention=- result_bytes=0 \
                  fact=hold-room@v1#1 fact_rev=1",
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
             ]),
         ),
     ]);
-    let groups = one_group(x, &["s-a", "s-b"]);
+    let groups = one_group(x, &["taxxxxxxxxx", "tbxxxxxxxxx"]);
     let Ok(Waited::Rows {
         rows,
         answered: woke,
@@ -494,27 +501,27 @@ fn under_facts_1_the_rearm_carries_each_targets_fact_edge() {
     let legs = scripted(vec![
         (
             x,
-            "await task @s-b any timeout=0\n",
+            "await task @tbxxxxxxxxx any timeout=0\n",
             timed_out(&[
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=- fact_rev=4",
             ]),
         ),
         (
             x,
-            "await task @s-b:1 any timeout=600\n",
+            "await task @tbxxxxxxxxx:1 any timeout=600\n",
             timed_out(&[
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=5",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=5",
             ]),
         ),
         (
             x,
-            "await task @s-b:1 any timeout=600\n",
+            "await task @tbxxxxxxxxx:1 any timeout=600\n",
             answered(&[
-                "@s-b rev=2 state=done agent=- attention=- result_bytes=3 fact=- fact_rev=4",
+                "@tbxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3 fact=- fact_rev=4",
             ]),
         ),
     ]);
-    let (rows, woke) = waited(one_group(x, &["s-b"]), Combine::Any, None, &legs);
+    let (rows, woke) = waited(one_group(x, &["tbxxxxxxxxx"]), Combine::Any, None, &legs);
     assert!(woke);
     assert_eq!(rows.len(), 1);
 }
@@ -522,40 +529,40 @@ fn under_facts_1_the_rearm_carries_each_targets_fact_edge() {
 #[test]
 fn all_waits_do_not_latch_baseline_or_cleared_facts_or_display_attention() {
     let x = "/x.sock";
-    let a = "@s-a rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=3";
-    let b = "@s-b rev=1 state=working agent=- attention=- result_bytes=0";
-    let final_a = "@s-a rev=3 state=done agent=- attention=- result_bytes=9";
-    let final_b = "@s-b rev=2 state=done agent=- attention=- result_bytes=3";
+    let a = "@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=3";
+    let b = "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0";
+    let final_a = "@taxxxxxxxxx rev=3 state=done agent=- attention=- result_bytes=9";
+    let final_b = "@tbxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3";
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a,@s-b all facts=1 timeout=0\n",
+            "await task @taxxxxxxxxx,@tbxxxxxxxxx all facts=1 timeout=0\n",
             timed_out(&[a, b]),
         ),
         (
             x,
-            "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+            "await task @taxxxxxxxxx:1:3,@tbxxxxxxxxx:1:0 all facts=1 timeout=600\n",
             timed_out(&[
-                "@s-a rev=2 state=working agent=- attention=an%20unrelated%20owner result_bytes=0 fact=hold-room@v1#2 fact_rev=4 task_news=0",
+                "@taxxxxxxxxx rev=2 state=working agent=- attention=an%20unrelated%20owner result_bytes=0 fact=hold-room@v1#2 fact_rev=4 task_news=0",
                 b,
             ]),
         ),
         (
             x,
-            "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+            "await task @taxxxxxxxxx:1:3,@tbxxxxxxxxx:1:0 all facts=1 timeout=600\n",
             timed_out(&[
-                "@s-a rev=2 state=done agent=- attention=- result_bytes=0 fact=- fact_rev=4 task_news=unknown",
+                "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=0 fact=- fact_rev=4 task_news=unknown",
                 b,
             ]),
         ),
         (
             x,
-            "await task @s-a:1:3,@s-b:1:0 all facts=1 timeout=600\n",
+            "await task @taxxxxxxxxx:1:3,@tbxxxxxxxxx:1:0 all facts=1 timeout=600\n",
             answered(&[final_a, final_b]),
         ),
     ]);
     let result = wait_task_groups(
-        one_group(x, &["s-a", "s-b"]),
+        one_group(x, &["taxxxxxxxxx", "tbxxxxxxxxx"]),
         Combine::All,
         true,
         None,
@@ -587,25 +594,26 @@ fn all_waits_keep_authoritative_attention_news_between_legs() {
 #[test]
 fn all_waits_keep_news_the_initial_baseline_leg_already_latched() {
     let x = "/x.sock";
-    let first_news = "@s-a rev=2 state=working agent=- attention=- result_bytes=0 task_news=1";
-    let final_news = "@s-b rev=2 state=done agent=- attention=- result_bytes=3 task_news=1";
+    let first_news =
+        "@taxxxxxxxxx rev=2 state=working agent=- attention=- result_bytes=0 task_news=1";
+    let final_news = "@tbxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3 task_news=1";
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a,@s-b all timeout=0\n",
+            "await task @taxxxxxxxxx,@tbxxxxxxxxx all timeout=0\n",
             timed_out(&[
                 first_news,
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
             ]),
         ),
         (
             x,
-            "await task @s-b:1 all timeout=600\n",
+            "await task @tbxxxxxxxxx:1 all timeout=600\n",
             answered(&[final_news]),
         ),
     ]);
     let result = wait_task_groups(
-        one_group(x, &["s-a", "s-b"]),
+        one_group(x, &["taxxxxxxxxx", "tbxxxxxxxxx"]),
         Combine::All,
         false,
         None,
@@ -619,39 +627,39 @@ fn all_waits_keep_news_the_initial_baseline_leg_already_latched() {
 
 fn all_waits_keep_news_between_legs(facts: bool, attention: bool) {
     let x = "/x.sock";
-    let baseline = "@s-a rev=1 state=working agent=- attention=- result_bytes=0";
-    let other = "@s-b rev=1 state=working agent=- attention=- result_bytes=0";
+    let baseline = "@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0";
+    let other = "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0";
     let news = if attention {
-        "@s-a rev=2 state=working agent=- attention=- result_bytes=0 task_news=1"
+        "@taxxxxxxxxx rev=2 state=working agent=- attention=- result_bytes=0 task_news=1"
     } else if facts {
-        "@s-a rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=1"
+        "@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 fact=hold-room@v1#1 fact_rev=1"
     } else {
-        "@s-a rev=2 state=done agent=- attention=- result_bytes=9"
+        "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=9"
     };
     let first = if facts {
-        "await task @s-a,@s-b all facts=1 timeout=0\n"
+        "await task @taxxxxxxxxx,@tbxxxxxxxxx all facts=1 timeout=0\n"
     } else {
-        "await task @s-a,@s-b all timeout=0\n"
+        "await task @taxxxxxxxxx,@tbxxxxxxxxx all timeout=0\n"
     };
     let second = if facts {
-        "await task @s-a:1:0,@s-b:1:0 all facts=1 timeout=600\n"
+        "await task @taxxxxxxxxx:1:0,@tbxxxxxxxxx:1:0 all facts=1 timeout=600\n"
     } else {
-        "await task @s-a:1,@s-b:1 all timeout=600\n"
+        "await task @taxxxxxxxxx:1,@tbxxxxxxxxx:1 all timeout=600\n"
     };
     let third = if facts {
-        "await task @s-b:1:0 all facts=1 timeout=600\n"
+        "await task @tbxxxxxxxxx:1:0 all facts=1 timeout=600\n"
     } else {
-        "await task @s-b:1 all timeout=600\n"
+        "await task @tbxxxxxxxxx:1 all timeout=600\n"
     };
-    let final_news = "@s-b rev=2 state=done agent=- attention=- result_bytes=3";
+    let final_news = "@tbxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3";
     let legs = scripted(vec![
         (x, first, timed_out(&[baseline, other])),
         (x, second, timed_out(&[news, other])),
-        // s-a's news is held, so this leg does not ask for it again.
+        // taxxxxxxxxx's news is held, so this leg does not ask for it again.
         (x, third, answered(&[final_news])),
     ]);
     let result = wait_task_groups(
-        one_group(x, &["s-a", "s-b"]),
+        one_group(x, &["taxxxxxxxxx", "tbxxxxxxxxx"]),
         Combine::All,
         facts,
         None,
@@ -670,76 +678,86 @@ fn a_wait_rearms_past_its_baseline_and_keeps_a_worker_that_closed() {
     let legs = scripted(vec![
         (
             x,
-            "await task @1,@s-b,@. all timeout=0\n",
+            "await task @1,@tbxxxxxxxxx,@. all timeout=0\n",
             timed_out(&[
-                "@s-a rev=1 state=working agent=- attention=- result_bytes=0",
-                "@s-b rev=1 state=working agent=- attention=- result_bytes=0",
-                "@s-c rev=1 state=working agent=- attention=- result_bytes=0",
+                "@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0",
+                "@tbxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0",
+                "@tcxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0",
             ]),
         ),
         (
             x,
-            "await task @s-a:1,@s-b:1,@s-c:1 all timeout=600\n",
+            "await task @taxxxxxxxxx:1,@tbxxxxxxxxx:1,@tcxxxxxxxxx:1 all timeout=600\n",
             timed_out(&[
-                "@s-a rev=2 state=done agent=- attention=- result_bytes=9",
-                "@s-b rev=1 state=working agent=busy attention=- result_bytes=0",
-                "@s-c rev=1 state=working agent=- attention=- result_bytes=0",
+                "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=9",
+                "@tbxxxxxxxxx rev=1 state=working agent=busy attention=- result_bytes=0",
+                "@tcxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0",
             ]),
         ),
         (
             x,
-            "await task @s-b:1,@s-c:1 all timeout=600\n",
-            refused("ERR no such session @s-b"),
+            "await task @tbxxxxxxxxx:1,@tcxxxxxxxxx:1 all timeout=600\n",
+            refused("ERR no such session @tbxxxxxxxxx"),
         ),
         (
             x,
-            "await task @s-c:1 all timeout=600\n",
-            answered(&["@s-c rev=3 state=exited agent=- attention=- result_bytes=0"]),
+            "await task @tcxxxxxxxxx:1 all timeout=600\n",
+            answered(&["@tcxxxxxxxxx rev=3 state=exited agent=- attention=- result_bytes=0"]),
         ),
     ]);
-    let (rows, answered) = waited(one_group(x, &["1", "s-b", "."]), Combine::All, None, &legs);
+    let (rows, answered) = waited(
+        one_group(x, &["1", "tbxxxxxxxxx", "."]),
+        Combine::All,
+        None,
+        &legs,
+    );
     assert!(answered);
     assert_eq!(
         rows,
         [
-            "@s-a rev=2 state=done agent=- attention=- result_bytes=9",
-            "@s-b rev=1 state=closed agent=busy attention=- result_bytes=0 task_state=working",
-            "@s-c rev=3 state=exited agent=- attention=- result_bytes=0",
+            "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=9",
+            "@tbxxxxxxxxx rev=1 state=closed agent=busy attention=- result_bytes=0 task_state=working",
+            "@tcxxxxxxxxx rev=3 state=exited agent=- attention=- result_bytes=0",
         ]
     );
 
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a,@s-b all timeout=0\n",
+            "await task @taxxxxxxxxx,@tbxxxxxxxxx all timeout=0\n",
             timed_out(&[
-                "@s-a rev=1 state=working agent=- attention=- result_bytes=0",
-                "@s-b rev=4 state=closed agent=- attention=- result_bytes=0",
+                "@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0",
+                "@tbxxxxxxxxx rev=4 state=closed agent=- attention=- result_bytes=0",
             ]),
         ),
         (
             x,
-            "await task @s-a:1 all timeout=600\n",
-            refused("ERR no such session @s-a"),
+            "await task @taxxxxxxxxx:1 all timeout=600\n",
+            refused("ERR no such session @taxxxxxxxxx"),
         ),
     ]);
-    let (rows, answered) = waited(one_group(x, &["s-a", "s-b"]), Combine::All, None, &legs);
+    let (rows, answered) = waited(
+        one_group(x, &["taxxxxxxxxx", "tbxxxxxxxxx"]),
+        Combine::All,
+        None,
+        &legs,
+    );
     assert!(answered);
     assert_eq!(
         rows,
         [
-            "@s-a rev=1 state=closed agent=- attention=- result_bytes=0 task_state=working",
-            "@s-b rev=4 state=closed agent=- attention=- result_bytes=0",
+            "@taxxxxxxxxx rev=1 state=closed agent=- attention=- result_bytes=0 task_state=working",
+            "@tbxxxxxxxxx rev=4 state=closed agent=- attention=- result_bytes=0",
         ]
     );
 
     let legs = scripted(vec![(
         x,
-        "await task @s-d all timeout=0\n",
-        refused("ERR no such session @s-d"),
+        "await task @tdxxxxxxxxx all timeout=0\n",
+        refused("ERR no such session @tdxxxxxxxxx"),
     )]);
     let refusal = wait_task_groups(
-        one_group(x, &["s-d"]),
+        one_group(x, &["tdxxxxxxxxx"]),
         Combine::All,
         false,
         None,
@@ -747,7 +765,7 @@ fn a_wait_rearms_past_its_baseline_and_keeps_a_worker_that_closed() {
         &legs,
     );
     assert!(
-        matches!(&refusal, Err(e) if e.to_string() == "ERR no such session @s-d"),
+        matches!(&refusal, Err(e) if e.to_string() == "ERR no such session @tdxxxxxxxxx"),
         "the refusal ends the run"
     );
 }
@@ -756,25 +774,33 @@ fn a_wait_rearms_past_its_baseline_and_keeps_a_worker_that_closed() {
 fn a_leg_the_peer_did_not_serve_is_asked_again() {
     let x = "lab-mini";
     let busy = || step(|| Leg::Again(io::Error::other("lab-mini is busy")));
-    let working = "@s-a rev=3 state=working agent=busy attention=- result_bytes=0";
-    let done = "@s-a rev=4 state=done agent=idle attention=- result_bytes=9";
+    let working = "@taxxxxxxxxx rev=3 state=working agent=busy attention=- result_bytes=0";
+    let done = "@taxxxxxxxxx rev=4 state=done agent=idle attention=- result_bytes=9";
     let legs = scripted(vec![
-        (x, "await task @s-a any timeout=0\n", busy()),
-        (x, "await task @s-a any timeout=0\n", timed_out(&[working])),
-        (x, "await task @s-a:3 any timeout=600\n", busy()),
-        (x, "await task @s-a:3 any timeout=600\n", answered(&[done])),
+        (x, "await task @taxxxxxxxxx any timeout=0\n", busy()),
+        (
+            x,
+            "await task @taxxxxxxxxx any timeout=0\n",
+            timed_out(&[working]),
+        ),
+        (x, "await task @taxxxxxxxxx:3 any timeout=600\n", busy()),
+        (
+            x,
+            "await task @taxxxxxxxxx:3 any timeout=600\n",
+            answered(&[done]),
+        ),
     ]);
-    let (rows, answered) = waited(one_group(x, &["s-a"]), Combine::Any, None, &legs);
+    let (rows, answered) = waited(one_group(x, &["taxxxxxxxxx"]), Combine::Any, None, &legs);
     assert!(answered);
     assert_eq!(rows, [done]);
 
     let legs = scripted(vec![(
         x,
-        "await task @s-a any timeout=0\n",
+        "await task @taxxxxxxxxx any timeout=0\n",
         refused("ERR denied: node ab12cd34 is not one the dialled Mac lets drive it"),
     )]);
     let refusal = wait_task_groups(
-        one_group(x, &["s-a"]),
+        one_group(x, &["taxxxxxxxxx"]),
         Combine::Any,
         false,
         None,
@@ -789,10 +815,10 @@ fn a_leg_the_peer_did_not_serve_is_asked_again() {
 
     let legs = Legs {
         again: (Duration::ZERO, Duration::ZERO),
-        ..scripted(vec![(x, "await task @s-a any timeout=0\n", busy())])
+        ..scripted(vec![(x, "await task @taxxxxxxxxx any timeout=0\n", busy())])
     };
     let gave_up = wait_task_groups(
-        one_group(x, &["s-a"]),
+        one_group(x, &["taxxxxxxxxx"]),
         Combine::Any,
         false,
         None,
@@ -810,43 +836,43 @@ fn a_leg_the_peer_did_not_serve_is_asked_again() {
 fn instances_combine_any_and_all() {
     let (x, y) = ("/x.sock", "/y.sock");
     let two = || {
-        let mut groups = one_group(x, &["s-a"]);
-        groups.extend(one_group(y, &["s-b"]));
+        let mut groups = one_group(x, &["taxxxxxxxxx"]);
+        groups.extend(one_group(y, &["tbxxxxxxxxx"]));
         groups
     };
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a all timeout=0\n",
-            timed_out(&["@s-a rev=1 state=working agent=- attention=- result_bytes=0"]),
+            "await task @taxxxxxxxxx all timeout=0\n",
+            timed_out(&["@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             x,
-            "await task @s-a:1 all timeout=600\n",
-            answered(&["@s-a rev=2 state=done agent=- attention=- result_bytes=3"]),
+            "await task @taxxxxxxxxx:1 all timeout=600\n",
+            answered(&["@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3"]),
         ),
         (
             y,
-            "await task @s-b all timeout=0\n",
-            timed_out(&["@s-b rev=4 state=working agent=- attention=- result_bytes=0"]),
+            "await task @tbxxxxxxxxx all timeout=0\n",
+            timed_out(&["@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             y,
-            "await task @s-b:4 all timeout=600\n",
-            timed_out(&["@s-b rev=4 state=working agent=- attention=- result_bytes=0"]),
+            "await task @tbxxxxxxxxx:4 all timeout=600\n",
+            timed_out(&["@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             y,
-            "await task @s-b:4 all timeout=600\n",
-            answered(&["@s-b rev=5 state=stalled agent=- attention=- result_bytes=0"]),
+            "await task @tbxxxxxxxxx:4 all timeout=600\n",
+            answered(&["@tbxxxxxxxxx rev=5 state=stalled agent=- attention=- result_bytes=0"]),
         ),
     ]);
     assert_eq!(
         waited(two(), Combine::All, None, &legs),
         (
             rows(&[
-                "@s-a rev=2 state=done agent=- attention=- result_bytes=3",
-                "@s-b rev=5 state=stalled agent=- attention=- result_bytes=0",
+                "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3",
+                "@tbxxxxxxxxx rev=5 state=stalled agent=- attention=- result_bytes=0",
             ]),
             true
         )
@@ -857,29 +883,29 @@ fn instances_combine_any_and_all() {
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a any timeout=0\n",
-            timed_out(&["@s-a rev=1 state=working agent=- attention=- result_bytes=0"]),
+            "await task @taxxxxxxxxx any timeout=0\n",
+            timed_out(&["@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             x,
-            "await task @s-a:1 any timeout=600\n",
+            "await task @taxxxxxxxxx:1 any timeout=600\n",
             step(move || {
                 armed_rx
                     .recv_timeout(Duration::from_secs(60))
                     .expect("y parks");
                 Leg::Answered(rows(&[
-                    "@s-a rev=2 state=done agent=- attention=- result_bytes=3",
+                    "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3",
                 ]))
             }),
         ),
         (
             y,
-            "await task @s-b any timeout=0\n",
-            timed_out(&["@s-b rev=4 state=working agent=- attention=- result_bytes=0"]),
+            "await task @tbxxxxxxxxx any timeout=0\n",
+            timed_out(&["@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             y,
-            "await task @s-b:4 any timeout=600\n",
+            "await task @tbxxxxxxxxx:4 any timeout=600\n",
             step(move || {
                 let _ = armed_tx.send(());
                 let _ = release_rx.recv();
@@ -891,8 +917,8 @@ fn instances_combine_any_and_all() {
         waited(two(), Combine::Any, None, &legs),
         (
             rows(&[
-                "@s-a rev=2 state=done agent=- attention=- result_bytes=3",
-                "@s-b rev=4 state=working agent=- attention=- result_bytes=0",
+                "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3",
+                "@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0",
             ]),
             true
         )
@@ -902,13 +928,13 @@ fn instances_combine_any_and_all() {
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a all timeout=0\n",
-            timed_out(&["@s-a rev=1 state=working agent=- attention=- result_bytes=0"]),
+            "await task @taxxxxxxxxx all timeout=0\n",
+            timed_out(&["@taxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0"]),
         ),
         (
             y,
-            "await task @s-b all timeout=0\n",
-            timed_out(&["@s-b rev=4 state=working agent=- attention=- result_bytes=0"]),
+            "await task @tbxxxxxxxxx all timeout=0\n",
+            timed_out(&["@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0"]),
         ),
     ]);
     let (rows, answered) = waited(two(), Combine::All, Some(Instant::now()), &legs);
@@ -923,7 +949,7 @@ fn targets_group_by_the_instance_that_hosts_them() {
     std::fs::create_dir_all(dir.join("graph")).expect("graph dir");
     let targets = vec![
         Target {
-            selector: "s-abc".into(),
+            selector: "tabcxxxxxxx".into(),
             since: None,
             fact_since: None,
         },
@@ -955,8 +981,8 @@ fn targets_group_by_the_instance_that_hosts_them() {
     assert_eq!(local[0].sock, "/tmp/default.sock");
 }
 
-const BUSY: &str = "@s-a1 rev=3 state=working agent=busy attention=- result_bytes=0";
-const NEEDS_YOU: &str = "@s-a1 rev=3 state=working agent=idle attention=needs-you \
+const BUSY: &str = "@ta1xxxxxxxx rev=3 state=working agent=busy attention=- result_bytes=0";
+const NEEDS_YOU: &str = "@ta1xxxxxxxx rev=3 state=working agent=idle attention=needs-you \
                          result_bytes=0";
 
 const HANDSHAKE: Duration = Duration::from_millis(30);
@@ -1098,7 +1124,7 @@ fn a_wait_of_many_legs_is_one_read_of_each_mac() {
     let leg = |host: &str| {
         driven_leg(
             &asking,
-            (host, "await task @s-a1 since=0 timeout=1000\n"),
+            (host, "await task @ta1xxxxxxxx since=0 timeout=1000\n"),
             Duration::from_secs(1),
             (None, None),
         )
@@ -1125,7 +1151,7 @@ fn a_wait_of_many_legs_is_one_read_of_each_mac() {
     let again = Asking::by(named);
     let leg = driven_leg(
         &again,
-        ("lab-mini", "await task @s-a1 since=0 timeout=1000\n"),
+        ("lab-mini", "await task @ta1xxxxxxxx since=0 timeout=1000\n"),
         Duration::from_secs(1),
         (None, None),
     );
@@ -1136,7 +1162,7 @@ fn a_wait_of_many_legs_is_one_read_of_each_mac() {
 #[test]
 fn a_wait_its_own_timeout_ends_reads_the_peers_rows_of_its_last_leg() {
     let second = Some(Some(Duration::from_secs(1)));
-    match driven_wait(&parts("await task @s-a1"), second, "lab-mini", peer) {
+    match driven_wait(&parts("await task @ta1xxxxxxxx"), second, "lab-mini", peer) {
         Ok(Waited::Rows { rows, answered }) => {
             assert_eq!((rows, answered), (vec![NEEDS_YOU.to_owned()], false));
         }
@@ -1164,8 +1190,13 @@ fn a_handshake_a_later_leg_never_gets_keeps_its_cause_under_ctls_timeout() {
         })
     }
     let second = Some(Some(Duration::from_secs(1)));
-    let refused = run_driven(&parts("await task @s-a1"), second, "lab-mini", frozen_later)
-        .expect_err("unserved");
+    let refused = run_driven(
+        &parts("await task @ta1xxxxxxxx"),
+        second,
+        "lab-mini",
+        frozen_later,
+    )
+    .expect_err("unserved");
     assert_eq!(crate::exit_for(&refused), ExitCode::from(2), "{refused}");
     assert!(
         refused.to_string().contains("no fleet handshake"),
@@ -1193,11 +1224,11 @@ fn gone_after_baseline(baseline: &'static str, most: Duration) -> Legs {
 
 #[test]
 fn a_peer_that_serves_no_leg_past_its_baseline_is_asked_until_the_timeout_and_named() {
-    let working = "@s-a rev=3 state=working agent=busy attention=- result_bytes=0";
+    let working = "@taxxxxxxxxx rev=3 state=working agent=busy attention=- result_bytes=0";
     for most in [Duration::from_millis(20), AGAIN_FOR] {
         let until = Instant::now() + Duration::from_millis(300);
         let ended = wait_task_groups(
-            one_group("lab-mini", &["s-a"]),
+            one_group("lab-mini", &["taxxxxxxxxx"]),
             Combine::Any,
             false,
             Some(until),
@@ -1224,7 +1255,7 @@ fn a_peer_that_serves_no_leg_past_its_baseline_is_asked_until_the_timeout_and_na
 
 #[test]
 fn a_wait_with_no_timeout_whose_peer_serves_no_leg_ends_a_minute_on_with_its_rows() {
-    let working = "@s-a rev=3 state=working agent=busy attention=- result_bytes=0";
+    let working = "@taxxxxxxxxx rev=3 state=working agent=busy attention=- result_bytes=0";
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let legs = Legs {
         max: Duration::from_millis(600),
@@ -1239,7 +1270,7 @@ fn a_wait_with_no_timeout_whose_peer_serves_no_leg_ends_a_minute_on_with_its_row
         }),
     };
     let ended = wait_task_groups(
-        one_group("lab-mini", &["s-a"]),
+        one_group("lab-mini", &["taxxxxxxxxx"]),
         Combine::Any,
         false,
         None,
@@ -1317,7 +1348,7 @@ fn a_driven_wait_whose_peer_went_away_or_fell_silent_ends_at_its_timeout_with_it
     ] {
         let began = Instant::now();
         let waited = driven_wait(
-            &parts("await task @s-a1 timeout=1500"),
+            &parts("await task @ta1xxxxxxxx timeout=1500"),
             None,
             "lab-mini",
             drive,
@@ -1389,7 +1420,7 @@ fn a_driven_wait_whose_peer_took_its_grant_back_ends_with_its_rows_and_says_so()
         (denied, false, DENIED),
     ] {
         let waited = driven_wait(
-            &parts("await task @s-a1 timeout=15000"),
+            &parts("await task @ta1xxxxxxxx timeout=15000"),
             None,
             "lab-mini",
             drive,
@@ -1424,7 +1455,12 @@ fn a_driven_wait_whose_peer_took_its_grant_back_ends_with_its_rows_and_says_so()
     fn lowered_first(_: &str, _: Duration) -> Result<crate::DriveLink, crate::DriveRefused> {
         lowered_now()
     }
-    match driven_wait(&parts("await task @s-a1"), None, "lab-mini", lowered_first) {
+    match driven_wait(
+        &parts("await task @ta1xxxxxxxx"),
+        None,
+        "lab-mini",
+        lowered_first,
+    ) {
         Err(e) => assert_eq!(e.to_string(), LOWERED, "before the baseline, its own words"),
         Ok(_) => panic!("a wait no leg of which was served"),
     }
@@ -1463,13 +1499,13 @@ fn a_driven_wait_past_its_baseline_closes_a_gone_worker_and_ends_any_other_denia
         DIALS.store(0, Relaxed);
         *LATER.lock().unwrap() = later;
         driven_wait(
-            &parts("await task @s-a1 timeout=15000"),
+            &parts("await task @ta1xxxxxxxx timeout=15000"),
             None,
             "lab-mini",
             then,
         )
     };
-    match wait("ERR no such session @s-a1") {
+    match wait("ERR no such session @ta1xxxxxxxx") {
         Ok(Waited::Rows { rows, answered }) => assert_eq!(
             (rows, answered),
             (
@@ -1547,13 +1583,13 @@ fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_
     }
     for (wait, drive, longer) in [
         (
-            "await task @s-a1 timeout=60000",
+            "await task @ta1xxxxxxxx timeout=60000",
             frozen as crate::FleetDriveFn,
             "a longer --timeout waits as long as it names, up to the wait's timeout= of 60000 \
              ms, and 0 that whole timeout=",
         ),
         (
-            "await task @s-a1",
+            "await task @ta1xxxxxxxx",
             frozen_untimed,
             "a longer --timeout waits as long as it names, and 0 until the news comes, where a \
              peer that answers no leg is asked again for a minute",
@@ -1561,7 +1597,7 @@ fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_
         // Its timeout= ran out inside the --timeout: a longer one waits out the leg alone, what
         // was left of its timeout= and 8 s.
         (
-            "await task @s-a1 timeout=1000",
+            "await task @ta1xxxxxxxx timeout=1000",
             frozen_short,
             "a longer --timeout, or 0, waits up to the drive's own 8",
         ),
@@ -1601,18 +1637,18 @@ fn a_driven_wait_ctls_timeout_cuts_ends_as_unanswered_where_its_peer_froze_past_
 #[test]
 fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_news() {
     let target = Target {
-        selector: "s-a".into(),
+        selector: "taxxxxxxxxx".into(),
         since: Some(1),
         fact_since: None,
     };
     assert_eq!(
         closed_row(
             Some(
-                "@s-a rev=1 state=working agent=busy program_state=- attention=- result_bytes=0 task_news=0"
+                "@taxxxxxxxxx rev=1 state=working agent=busy program_state=- attention=- result_bytes=0 task_news=0"
             ),
             &target,
         ),
-        "@s-a rev=1 state=closed agent=busy program_state=- attention=- result_bytes=0 task_state=working task_news=1"
+        "@taxxxxxxxxx rev=1 state=closed agent=busy program_state=- attention=- result_bytes=0 task_state=working task_news=1"
     );
 
     let (x, y) = ("/x.sock", "/y.sock");
@@ -1622,12 +1658,12 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
                 sock: x.to_string(),
                 targets: vec![
                     Target {
-                        selector: "s-a".into(),
+                        selector: "taxxxxxxxxx".into(),
                         since: Some(0),
                         fact_since: None,
                     },
                     Target {
-                        selector: "s-c".into(),
+                        selector: "tcxxxxxxxxx".into(),
                         since: Some(0),
                         fact_since: None,
                     },
@@ -1638,7 +1674,7 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
             Group {
                 sock: y.to_string(),
                 targets: vec![Target {
-                    selector: "s-b".into(),
+                    selector: "tbxxxxxxxxx".into(),
                     since: Some(0),
                     fact_since: None,
                 }],
@@ -1651,25 +1687,25 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a:0,@s-c:0 any timeout=0\n",
+            "await task @taxxxxxxxxx:0,@tcxxxxxxxxx:0 any timeout=0\n",
             step(move || {
                 let _ = done_tx.send(());
                 Leg::Answered(rows(&[
-                    "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
-                    "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+                    "@tcxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
                 ]))
             }),
         ),
         (
             y,
-            "await task @s-b:0 any timeout=0\n",
+            "await task @tbxxxxxxxxx:0 any timeout=0\n",
             step(move || {
                 done_rx
                     .recv_timeout(Duration::from_secs(60))
                     .expect("x answered first");
                 std::thread::sleep(Duration::from_millis(10));
                 Leg::TimedOut(rows(&[
-                    "@s-b rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    "@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
                 ]))
             }),
         ),
@@ -1679,9 +1715,9 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
     assert_eq!(
         got,
         rows(&[
-            "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
-            "@s-b rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
-            "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+            "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+            "@tbxxxxxxxxx rev=4 state=working agent=- attention=- result_bytes=0 task_news=0",
+            "@tcxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
         ])
     );
 
@@ -1689,24 +1725,24 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
     let legs = scripted(vec![
         (
             x,
-            "await task @s-a:0,@s-c:0 any timeout=0\n",
+            "await task @taxxxxxxxxx:0,@tcxxxxxxxxx:0 any timeout=0\n",
             step(move || {
                 let _ = done_tx.send(());
                 Leg::Answered(rows(&[
-                    "@s-a rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
-                    "@s-c rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
+                    "@taxxxxxxxxx rev=2 state=done agent=- attention=- result_bytes=3 task_news=1",
+                    "@tcxxxxxxxxx rev=1 state=working agent=- attention=- result_bytes=0 task_news=0",
                 ]))
             }),
         ),
         (
             y,
-            "await task @s-b:0 any timeout=0\n",
+            "await task @tbxxxxxxxxx:0 any timeout=0\n",
             step(move || {
                 done_rx
                     .recv_timeout(Duration::from_secs(60))
                     .expect("x answered first");
                 std::thread::sleep(Duration::from_millis(10));
-                Leg::Failed(io::Error::other("ERR no such session @s-b"))
+                Leg::Failed(io::Error::other("ERR no such session @tbxxxxxxxxx"))
             }),
         ),
     ]);
@@ -1721,7 +1757,7 @@ fn multi_group_any_wait_keeps_interleaved_order_baseline_rows_and_closed_task_ne
         Err(err) => err,
         Ok(_) => panic!("baseline refusal on another group must not be dropped"),
     };
-    assert_eq!(err.to_string(), "ERR no such session @s-b");
+    assert_eq!(err.to_string(), "ERR no such session @tbxxxxxxxxx");
 }
 
 fn board_group(key: &str, pos: usize, sid: &str, rev: u64) -> Group {
@@ -1747,22 +1783,22 @@ fn board_group(key: &str, pos: usize, sid: &str, rev: u64) -> Group {
 fn a_row_naming_another_sid_is_no_answer_for_the_one_asked() {
     let legs = scripted(vec![(
         "drive:e",
-        "await task @s-a1 any timeout=0\n",
+        "await task @ta1xxxxxxxx any timeout=0\n",
         answered(&[
-            "@s-b2 rev=9 state=closed agent=- attention=- result_bytes=0 \
+            "@tb2xxxxxxxx rev=9 state=closed agent=- attention=- result_bytes=0 \
                     conclusion=finished",
         ]),
     )]);
     match wait_task_groups(
-        one_group("drive:e", &["s-a1"]),
+        one_group("drive:e", &["ta1xxxxxxxx"]),
         Combine::Any,
         false,
         None,
         &redial::Redial::none(),
         &legs,
     ) {
-        Err(e) => assert!(e.to_string().contains("@s-b2"), "{e}"),
-        Ok(_) => panic!("a row of another sid read as the answer for s-a1"),
+        Err(e) => assert!(e.to_string().contains("@tb2xxxxxxxx"), "{e}"),
+        Ok(_) => panic!("a row of another sid read as the answer for ta1xxxxxxxx"),
     }
 }
 
@@ -1772,7 +1808,7 @@ fn a_row_naming_another_sid_is_no_answer_for_the_one_asked() {
 fn a_board_wait_a_mac_refused_from_the_start_says_its_rows_are_the_boards() {
     let legs = scripted(vec![(
         "drive:m2",
-        "await task @s-b2:1 any timeout=0\n",
+        "await task @tb2xxxxxxxx:1 any timeout=0\n",
         step(|| Leg::Ungranted {
             why: io::Error::other(format!(
                 "{}node ab12cd34 is not one the dialled Mac lets drive it",
@@ -1782,7 +1818,7 @@ fn a_board_wait_a_mac_refused_from_the_start_says_its_rows_are_the_boards() {
         }),
     )]);
     let waited = wait_task_groups(
-        vec![board_group("drive:m2", 0, "s-b2", 1)],
+        vec![board_group("drive:m2", 0, "tb2xxxxxxxx", 1)],
         Combine::Any,
         false,
         None,
@@ -1827,10 +1863,10 @@ fn a_board_wait_keeps_one_macs_failure_to_its_rows() {
             (
                 "drive:m1",
                 m1,
-                answered(
-                    &["@s-a1 rev=4 state=done agent=- attention=- result_bytes=0 \
-                           conclusion=finished"],
-                ),
+                answered(&[
+                    "@ta1xxxxxxxx rev=4 state=done agent=- attention=- result_bytes=0 \
+                           conclusion=finished",
+                ]),
             ),
             (
                 "drive:m2",
@@ -1844,13 +1880,13 @@ fn a_board_wait_keeps_one_macs_failure_to_its_rows() {
     };
     let groups = || {
         vec![
-            board_group("drive:m1", 0, "s-a1", 3),
-            board_group("drive:m2", 1, "s-b2", 1),
+            board_group("drive:m1", 0, "ta1xxxxxxxx", 3),
+            board_group("drive:m2", 1, "tb2xxxxxxxx", 1),
         ]
     };
     let any = script(
-        "await task @s-a1:3 any timeout=0\n",
-        "await task @s-b2:1 any timeout=0\n",
+        "await task @ta1xxxxxxxx:3 any timeout=0\n",
+        "await task @tb2xxxxxxxx:1 any timeout=0\n",
     );
     let (rows, answered) = waited(groups(), Combine::Any, None, &any);
     assert!(answered);
@@ -1864,8 +1900,8 @@ fn a_board_wait_keeps_one_macs_failure_to_its_rows() {
         None,
         &redial::Redial::none(),
         &script(
-            "await task @s-a1:3 all timeout=0\n",
-            "await task @s-b2:1 all timeout=0\n",
+            "await task @ta1xxxxxxxx:3 all timeout=0\n",
+            "await task @tb2xxxxxxxx:1 all timeout=0\n",
         ),
     )
     .expect("no error for the whole wait");
@@ -1890,31 +1926,31 @@ fn a_board_wait_keeps_one_macs_failure_to_its_rows() {
 fn a_board_wait_closes_a_windowless_macs_workers_and_refuses_a_foreign_row() {
     let legs = scripted(vec![(
         "drive:m3",
-        "await task @s-c3:2 any timeout=0\n",
+        "await task @tc3xxxxxxxx:2 any timeout=0\n",
         refused("ERR no window open on this Mac"),
     )]);
     let (rows, closed) = waited(
-        vec![board_group("drive:m3", 0, "s-c3", 2)],
+        vec![board_group("drive:m3", 0, "tc3xxxxxxxx", 2)],
         Combine::Any,
         None,
         &legs,
     );
     assert!(closed, "a closed worker answers the wait");
     assert!(
-        rows[0].starts_with("@s-c3 ") && rows[0].contains("state=closed"),
+        rows[0].starts_with("@tc3xxxxxxxx ") && rows[0].contains("state=closed"),
         "{rows:?}"
     );
 
     let legs = scripted(vec![(
         "drive:m4",
-        "await task @s-d4:1 any timeout=0\n",
+        "await task @td4xxxxxxxx:1 any timeout=0\n",
         answered(&[
             "@s-0ther rev=9 state=done agent=- attention=- result_bytes=0 \
                    conclusion=finished checked=0123456789ab@origin/main",
         ]),
     )]);
     let ended = wait_task_groups(
-        vec![board_group("drive:m4", 0, "s-d4", 1)],
+        vec![board_group("drive:m4", 0, "td4xxxxxxxx", 1)],
         Combine::Any,
         false,
         None,
@@ -1929,7 +1965,7 @@ fn a_board_wait_closes_a_windowless_macs_workers_and_refuses_a_foreign_row() {
     assert_eq!(
         rows,
         [
-            "@s-d4 rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
+            "@td4xxxxxxxx rev=1 state=working agent=- program_state=- attention=- result_bytes=0 \
           read=board"
         ],
         "the board's own row, not the foreign one"
@@ -1945,7 +1981,7 @@ fn a_board_row_is_waited_on_where_its_worker_runs() {
     let other = "0b".repeat(16);
     let row = |node: Option<&str>| crate::board::Row {
         node: node.map(str::to_owned),
-        ..crate::board::Row::started("s-0a1", 1)
+        ..crate::board::Row::started("t0a1xxxxxxx", 1)
     };
     let here = (Some("/here.sock"), Some(own.as_str()));
     let sock = Reach::Socket("/here.sock".to_owned());

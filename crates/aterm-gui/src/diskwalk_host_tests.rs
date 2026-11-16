@@ -327,6 +327,7 @@ impl Rig {
             overrides: Vec::new(),
             opt_in: opt_in.to_vec(),
             own: own.to_vec(),
+            ..Facts::default()
         });
     }
 
@@ -1232,32 +1233,69 @@ fn opt_in_roots_are_walked_and_in_no_scope() {
 }
 
 #[test]
-fn atermss_own_folders_hold_its_state_and_package_prefix_on_every_unix_and_the_build_cache_on_macos()
- {
+fn atermss_own_folders_hold_every_folder_it_writes_to_and_the_build_cache_on_macos() {
     let home = Path::new("/Users//a");
     let state = home.join("Library/Application Support/aterm");
-    let mac = own_paths(Some(home), Some(state.clone()), true);
+    let mac = own_paths(
+        &OwnDirs {
+            home: Some(home.to_path_buf()),
+            state: Some(state.clone()),
+            config: Some(home.join(".config/aterm")),
+            logs: Some(home.join("Library/Logs/aterm")),
+            control: Some(state.clone()),
+        },
+        true,
+    );
     assert_eq!(
         mac,
         vec![
             state.clone(),
             home.join("Library/Caches/aterm"),
             atpkg::platform::default_prefix(home),
+            // The vault's folder is the config folder here: named once.
+            home.join(".config/aterm"),
+            home.join("Library/Logs/aterm"),
+            home.join(".aterm"),
+            home.join(".cache/aterm"),
         ]
     );
+    let home = Path::new("/home/a");
     let linux = own_paths(
-        Some(Path::new("/home/a")),
-        Some(PathBuf::from("/home/a/.local/state/aterm")),
+        &OwnDirs {
+            home: Some(home.to_path_buf()),
+            state: Some(home.join(".local/state/aterm")),
+            // `$XDG_CONFIG_HOME` moves the config folder, never the vault's.
+            config: Some(PathBuf::from("/xdg/config/aterm")),
+            logs: Some(home.join(".local/state/aterm/logs")),
+            control: None,
+        },
         false,
     );
     assert_eq!(
         linux,
         vec![
-            PathBuf::from("/home/a/.local/state/aterm"),
-            atpkg::platform::default_prefix(Path::new("/home/a")),
+            home.join(".local/state/aterm"),
+            atpkg::platform::default_prefix(home),
+            PathBuf::from("/xdg/config/aterm"),
+            home.join(".local/state/aterm/logs"),
+            home.join(".config/aterm"),
+            home.join(".aterm"),
+            home.join(".cache/aterm"),
         ],
         "no build cache folder off macOS"
     );
+    // With no home, only the folders the path functions gave.
+    assert_eq!(
+        own_paths(
+            &OwnDirs {
+                state: Some(state.clone()),
+                ..OwnDirs::default()
+            },
+            true
+        ),
+        vec![state.clone()]
+    );
+    let home = Path::new("/Users//a");
     // The prefix inside the state folder (macOS's) is that folder's; outside it (Linux's) it
     // is its own.
     let inside = own_folders(
@@ -2542,7 +2580,14 @@ fn glance_pace_on_a_real_tree_stays_inside_the_budget() {
             local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
         },
     );
-    let own = own_paths(Some(&home), state, cfg!(target_os = "macos"));
+    let own = own_paths(
+        &OwnDirs {
+            home: Some(home.clone()),
+            state,
+            ..OwnDirs::default()
+        },
+        cfg!(target_os = "macos"),
+    );
     let shared: &'static Shared = Box::leak(Box::new(Shared::new()));
     let from_walker = spawn_walker(shared, None, WALKER_CLASS).expect("the walker starts");
     let tab = DiskScope::Tab(tab_id(1));
@@ -3006,4 +3051,162 @@ fn a_change_heard_between_reads_owes_the_walker_a_read_and_rest_owes_none() {
         None,
         "the read paid what was owed"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The stores aterm keeps (`sys disk`'s store lines).
+
+/// Each asked store is read from the one walk of the own root around it: a folder's subtree, each
+/// child folder of a folder of stores, a single file by one `lstat`; a store that is not there is
+/// absent, one outside every walked root is not read at all, and the readings go into the
+/// history kept in the state folder.
+#[test]
+fn sys_disk_stores_are_sized_by_the_walk_of_the_root_around_them_and_no_other() {
+    let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+    let b = base(&tmp);
+    let home = b.join("home");
+    let own = home.join("own");
+    mkdir(&own.join("vault/records"));
+    write(&own.join("vault/records/current"), 5_000);
+    write(&own.join("vault/records/layout"), 100);
+    for (table, bytes) in [("bb", 9_000), ("aa", 3_000)] {
+        mkdir(&own.join("tables").join(table));
+        write(&own.join("tables").join(table).join("table.astream"), bytes);
+    }
+    mkdir(&own.join("alab"));
+    write(&own.join("alab/outbox.jsonl"), 700);
+    let elsewhere = home.join("elsewhere/store");
+    mkdir(&elsewhere);
+    write(&elsewhere.join("file"), 10);
+    let kept = b.join("kept");
+    aterm_uds::private_file::ensure_private_dir(&kept).expect("a private folder");
+
+    let ask = |path: PathBuf, each_child: bool| StoreAsk { path, each_child };
+    let records = own.join("vault/records");
+    let tables = own.join("tables");
+    let outbox = own.join("alab/outbox.jsonl");
+    let no_folder = own.join("vault/served");
+    let no_file = own.join("journal/missing/book.json");
+    let mut rig = Rig::new(&home);
+    rig.facts(&[], std::slice::from_ref(&own), &[]);
+    let mut facts = rig.engine.facts.clone();
+    facts.stores = vec![
+        ask(records.clone(), false),
+        ask(tables.clone(), true),
+        ask(outbox.clone(), false),
+        ask(no_folder.clone(), false),
+        ask(no_file.clone(), false),
+        ask(elsewhere.clone(), false),
+    ];
+    facts.store_history = Some(kept.clone());
+    rig.engine.take_facts(facts);
+
+    let t0 = Instant::now();
+    rig.demand(DiskScope::Aterm, Pace::Look, t0);
+    rig.engine.discover_if_due(t0);
+    assert_eq!(
+        rig.settle(t0),
+        vec![own.clone()],
+        "one walk, the own root's: none for a store"
+    );
+    let board = rig.board();
+    let seen = |path: &Path| board.stores.get(path).map(|r| r.seen.clone());
+    let sized = |seen: Option<StoreSeen>| match seen {
+        Some(StoreSeen::One(b)) => (b.logical, b.files),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(sized(seen(&records)), (5_100, 2));
+    assert_eq!(sized(seen(&outbox)), (700, 1), "a single file");
+    match seen(&tables) {
+        Some(StoreSeen::Children(children)) => assert_eq!(
+            children
+                .iter()
+                .map(|(name, b)| (name.as_str(), b.logical, b.files))
+                .collect::<Vec<_>>(),
+            [("aa", 3_000, 1), ("bb", 9_000, 1)],
+            "each table by its folder, in name order"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let numbers = |board: &Published| match board.stores.get(&tables).map(|r| r.seen.clone()) {
+        Some(StoreSeen::Children(children)) => children
+            .into_iter()
+            .map(|(name, b)| (name, b.n))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        numbers(&board),
+        [("aa".to_owned(), Some(1)), ("bb".to_owned(), Some(2))]
+    );
+    match seen(&records) {
+        Some(StoreSeen::One(b)) => assert_eq!(b.n, None, "one store, no number"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(seen(&no_folder), Some(StoreSeen::Absent));
+    assert_eq!(seen(&no_file), Some(StoreSeen::Absent));
+    assert_eq!(seen(&elsewhere), None, "under no walked root: unread");
+    // The allocation is the walk's own, and one measurement gives no growth.
+    match seen(&records) {
+        Some(StoreSeen::One(b)) => {
+            assert!(b.alloc >= b.logical, "{b:?}");
+            assert_eq!(b.growth_per_h, None);
+        }
+        other => panic!("{other:?}"),
+    }
+    // The history is kept in the state folder, each table under its folder's name.
+    let history = read_history(&kept).expect("the kept history");
+    assert_eq!(
+        history
+            .latest(&history_key(&records, None))
+            .map(|s| (s.logical, s.files)),
+        Some((5_100, 2))
+    );
+    assert_eq!(
+        history
+            .under(&history_key(&tables, None))
+            .map(|(_, s)| s.logical)
+            .collect::<Vec<_>>(),
+        [3_000, 9_000]
+    );
+    assert!(history.latest(&history_key(&no_folder, None)).is_none());
+
+    // The store grows and the root is walked again: the reading follows, with no walk of its
+    // own. A table that sorts before the others has come meanwhile.
+    write(&own.join("vault/records/current"), 8_000);
+    mkdir(&own.join("tables/0a"));
+    write(&own.join("tables/0a/table.astream"), 100);
+    let t1 = t0 + REWALK_AFTER + Duration::from_secs(1);
+    rig.demand(DiskScope::Aterm, Pace::Look, t1);
+    rig.engine.discover_if_due(t1);
+    assert_eq!(rig.engine.next_root(t1), Some(own.clone()), "owed again");
+    rig.engine.start_walk(&own);
+    while rig.engine.active.is_some() {
+        rig.engine.step_walk();
+    }
+    let board = rig.board();
+    assert_eq!(
+        sized(board.stores.get(&records).map(|r| r.seen.clone())),
+        (8_100, 2)
+    );
+    // The new table takes the next number and the others keep theirs. NEGATIVE CONTROL:
+    // numbered by position in name order, `0a` is 1, `aa` 2 and `bb` 3.
+    assert_eq!(
+        numbers(&board),
+        [
+            ("0a".to_owned(), Some(3)),
+            ("aa".to_owned(), Some(1)),
+            ("bb".to_owned(), Some(2))
+        ]
+    );
+
+    // Once no demanded scope has held the root for the retire time, its walk and the stores'
+    // readings go together.
+    let t2 = t1 + DEMAND_TTL + RETIRE_AFTER + Duration::from_secs(1);
+    rig.demand(DiskScope::Tab(tab_id(9)), Pace::Look, t2);
+    rig.engine.discover_if_due(t2);
+    let t3 = t2 + RETIRE_AFTER + Duration::from_secs(1);
+    rig.demand(DiskScope::Tab(tab_id(9)), Pace::Look, t3);
+    rig.engine.discover_if_due(t3);
+    assert!(rig.board().stores.is_empty(), "{:?}", rig.board().stores);
 }

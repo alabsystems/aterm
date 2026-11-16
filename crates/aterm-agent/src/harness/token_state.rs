@@ -23,15 +23,17 @@ pub enum Unverified {
     /// was compared with it yet.
     NoReadingYet,
     /// The token session's windows were not the basis this Mac's row recorded: this Mac starts no
-    /// session on the token. Another Mac's comparison is its own.
+    /// session on the token, and journaled `token-differ`. Another Mac's comparison is its own,
+    /// and the token stays in use there.
     WindowsDiffer,
     /// They were, and another account's current windows on this Mac were too, so the comparison
-    /// could not tell the two accounts apart and no verification follows: the token serves where
-    /// its route puts it in use, and one a person's terminal made (or whose meta names no route)
-    /// serves only its minting Mac, whose surfaces offer its replacement.
+    /// could not tell the two accounts apart and no verification follows that week (a basis of a
+    /// later week reopens it): the token serves where its route puts it in use, and one a
+    /// person's terminal made (or whose meta names no route) serves only its minting Mac, whose
+    /// surfaces offer its replacement.
     WindowsShared,
-    /// They were, and no other account's were: on the Mac that minted the token, its `verified`
-    /// stamp is on its way to the vault.
+    /// They were, and no other account's were: this Mac's `verified` stamp is on its way to the
+    /// vault, whichever Mac minted the token.
     WindowsEqual,
     /// No roster row names the account, so no stored-login reading under a row compares.
     NoRosterRow,

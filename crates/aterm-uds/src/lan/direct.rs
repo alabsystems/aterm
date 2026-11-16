@@ -11,7 +11,7 @@
 //! This crate is below the broker's server (`aterm-lan`), so the server and the reading of
 //! macOS's answer come from above: the `aterm` executable [`provide`]s them once, at start. A
 //! process that provided none (a test binary, a tool) has no direct path, as before. The path is
-//! taken only for [`super::Unavailable::NotInstalled`]: a broker that answers in another protocol
+//! taken only where no broker answers its socket: a broker that answers in another protocol
 //! or refuses this process is a broker, and its own words stand. It serves LAN uses, never a
 //! question about the broker itself (`super::Arrivals`, which hears a broker arrive).
 

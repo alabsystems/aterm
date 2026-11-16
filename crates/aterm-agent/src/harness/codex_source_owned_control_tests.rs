@@ -201,14 +201,16 @@ fn received_socket_pair_survives_senders_and_carrier_closure() {
     let (backend, frontend) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
     let fence = aterm_uds::kept_out(|| frontend.try_clone()).unwrap();
     let (control, receiver) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
-    let (callback, client) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    let (mut callback, mut client) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
     assert_eq!(
         aterm_uds::fdpass::send_with_fds(&control, b"A", &[backend.as_fd()]).unwrap(),
         1
     );
+    let nonce = b"0123456789abcdef0123456789abcdef";
+    let header = [b"F1".as_slice(), nonce.as_slice()].concat();
     assert_eq!(
-        aterm_uds::fdpass::send_with_fds(&callback, b"F", &[frontend.as_fd()]).unwrap(),
-        1
+        aterm_uds::fdpass::send_with_fds(&callback, &header, &[frontend.as_fd()]).unwrap(),
+        header.len()
     );
     let mut marker = [0];
     let mut back = aterm_uds::fdpass::recv_with_fds(&receiver, &mut marker, 1).unwrap();
@@ -216,11 +218,20 @@ fn received_socket_pair_survives_senders_and_carrier_closure() {
     assert_eq!(back.fds.len(), 1);
     assert_eq!(marker, *b"A");
     let mut back = aterm_uds::CtlStream::from(back.fds.pop().unwrap());
-    let mut front = aterm_uds::fdpass::recv_with_fds(&client, &mut marker, 1).unwrap();
-    assert_eq!(front.bytes, 1);
+    let mut received_header = [0; 34];
+    let mut front = aterm_uds::fdpass::recv_with_fds(&client, &mut received_header, 1).unwrap();
     assert_eq!(front.fds.len(), 1);
-    assert_eq!(marker, *b"F");
+    client
+        .read_exact(&mut received_header[front.bytes..])
+        .unwrap();
+    assert_eq!(received_header, header.as_slice());
     let mut front = aterm_uds::CtlStream::from(front.fds.pop().unwrap());
+    client.write_all(nonce).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut receipt = [0; 32];
+    callback.read_exact(&mut receipt).unwrap();
+    assert_eq!(&receipt, nonce);
+    assert_eq!(callback.read(&mut marker).unwrap(), 0);
     // Match Control::send_attachment: sender custody ends only after actual
     // reception. A successful SCM_RIGHTS write alone is not a physical receipt.
     drop(backend);

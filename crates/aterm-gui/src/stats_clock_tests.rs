@@ -70,9 +70,10 @@ fn sweeping() -> (crate::App, crate::WindowId, Instant) {
     let t0 = Instant::now();
     let (mut app, wid) = live_app(t0);
     app.vitals.landed_period = Some(Duration::from_secs(3600));
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.cols = 160;
     ws.scale = 2.0;
+    drop(ws);
     fit_deck(&mut app, wid);
     let _ = app.stats_deck_fp(wid);
     assert!(
@@ -113,9 +114,11 @@ fn isolated_steps_draw_without_restarting_the_native_link() {
     let _attached = crate::stats_deck::tests::attach_stats();
     let (mut app, wid, t1) = sweeping();
     let period = Duration::from_micros(8_333);
-    let clock = &mut app.windows.get_mut(&wid).unwrap().deck_clock;
+    let mut clock_guard = app.windows.get_mut(&wid).unwrap();
+    let clock = &mut clock_guard.deck_clock;
     clock.port = inert_link;
     clock.last = Some((t1 - Duration::from_secs(1), period));
+    drop(clock_guard);
     app.sync_deck_clocks(t1);
     assert!(!app.windows[&wid].deck_clock.link_running());
     let at = app.deck_clock_deadline(t1).expect("the step is still owed");
@@ -130,9 +133,11 @@ fn isolated_steps_draw_without_restarting_the_native_link() {
     present(&mut app, wid, at);
 
     let (mut dense, wid, t1) = sweeping();
-    let clock = &mut dense.windows.get_mut(&wid).unwrap().deck_clock;
+    let mut clock_guard = dense.windows.get_mut(&wid).unwrap();
+    let clock = &mut clock_guard.deck_clock;
     clock.port = inert_link;
     clock.last = Some((t1, period));
+    drop(clock_guard);
     dense.sync_deck_clocks(t1);
     assert!(
         dense.windows[&wid].deck_clock.link_running(),
@@ -362,9 +367,10 @@ fn a_frame_that_shows_nothing_new_still_serves_its_tick() {
     assert_eq!(redraws(&app, wid), before + 1, "the tick asks a frame");
     // The frame lays the deck out at the tick's vsync and proves it unchanged.
     let facts = app.live_facts(wid).expect("the deck draws");
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_needle_drawn.set(facts.needle_at(t1 + period));
     ws.deck_clock.served();
+    drop(ws);
     let facts = app.live_facts(wid).expect("the deck draws");
     let drawn = crate::stats_live::shows(app.windows[&wid].deck_needle_drawn.get());
     let next = (2..200_u32)
@@ -520,13 +526,15 @@ fn a_link_kept_running_without_ticks_falls_back_to_the_timer() {
         .deck_clock
         .port = inert_link;
     let period = app.deck_clock_period(&app.windows[&wid]);
-    let clock = &mut app.windows.get_mut(&wid).unwrap().deck_clock;
+    let mut clock_guard = app.windows.get_mut(&wid).unwrap();
+    let clock = &mut clock_guard.deck_clock;
     clock.ask_link(None);
     clock.steer(None, true, t1);
     let fell = clock.silence_deadline().expect("a running link is watched");
     assert_eq!(fell, t1 + LINK_SILENCE);
     assert!(!clock.watch_link(fell - Duration::from_nanos(1)));
     assert!(clock.watch_link(fell), "a link kept running falls silent");
+    drop(clock_guard);
     let clock = &app.windows[&wid].deck_clock;
     assert_eq!(
         clock.timing_link(),
@@ -876,7 +884,7 @@ fn a_parked_deck_frame_halves_the_clock_until_the_run_ends() {
     let (mut app, wid, t1) = sweeping();
     let period = app.deck_clock_period(&app.windows[&wid]);
     app.sync_deck_clocks(t1);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.deck_card = Some(crate::SettingsCard {
         rgba: vec![0; 4],
         pw: 1,
@@ -891,6 +899,7 @@ fn a_parked_deck_frame_halves_the_clock_until_the_run_ends() {
         delta: None,
     });
     ws.deck_motion.card_changed((0, 1));
+    drop(ws);
     app.note_deck_present(wid, t1, t1, crate::EFFECT_LANE_ACQUIRE_PARK_NS - 1);
     assert_eq!(app.deck_frame_interval(&app.windows[&wid]), period);
     app.windows

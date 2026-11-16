@@ -417,6 +417,124 @@ fn a_reproof_left_unanswered_ends_the_link() {
     assert!(mac_a.table.link_to(b.node()).is_none());
 }
 
+/// A wake or a path change asks every link to re-prove now ([`Neighbours::reprove_all`]), not at
+/// its next round: a peer that answers is proven again at once, and one that does not ends the
+/// link at the wake's deadline, long before [`REPROVE_WITHIN`]. A round already pending keeps its
+/// nonce and only has its deadline brought forward.
+/// NEGATIVE CONTROL: with `reprove_now` sending no nonce (the round left to its timer), B is
+/// never asked and notes nothing: `B answers the wake's re-proof: Timeout`.
+#[test]
+fn a_wake_reproves_every_link_at_once_and_ends_an_unanswered_one_at_its_deadline() {
+    const WITHIN: Duration = Duration::from_secs(5);
+    let (a, b, c) = (node(0x4c), node(0x4d), node(0x4e));
+    let mac_a = Mac::start(a.clone(), &[&a, &b, &c]);
+    let mac_b = Mac::start(b.clone(), &[&a, &b, &c]);
+    let mac_c = Mac::start(c.clone(), &[&a, &b, &c]);
+    let answering = mac_a.dial(&mac_b);
+    let silent = mac_a.dial(&mac_c);
+    mac_c.link_to(&mac_a).mute_reproofs();
+    while mac_a.notes.try_recv().is_ok() {}
+    assert_eq!(mac_a.table.reprove_all(WITHIN), 2, "both links are asked");
+    let proven = mac_a
+        .notes
+        .recv_timeout(HANG)
+        .expect("B answers the wake's re-proof");
+    assert_eq!((proven.by, proven.at), (ProvenBy::Reproof, Duration::ZERO));
+    let until = Instant::now() + HANG;
+    while answering.reproofs() != (1, 1) {
+        assert!(Instant::now() < until, "B's answer is counted");
+        aterm_uds::deadline::poll_yield();
+    }
+    assert_eq!(
+        answering.reproofs(),
+        (1, 1),
+        "the wake asked the answering link at once"
+    );
+    // A second wake while C's round is pending sends no second nonce.
+    assert_eq!(silent.reprove_now(WITHIN), Some(WITHIN));
+    assert_eq!(silent.reproofs(), (1, 0));
+    mac_a.clock.advance(WITHIN - Duration::from_millis(1));
+    mac_a.table.tick();
+    assert!(silent.closed().is_none(), "C still has until the deadline");
+    mac_a.clock.advance(Duration::from_millis(1));
+    mac_a.table.tick();
+    assert_eq!(
+        silent.closed().as_deref(),
+        Some("the neighbour left a re-proof unanswered"),
+        "C's link ends at the wake's deadline, not {REPROVE_WITHIN:?} on"
+    );
+    assert!(answering.closed().is_none(), "B proved itself and stays");
+}
+
+/// Every link's socket is kept alive by its kernel, so a peer that went silent (asleep, its
+/// network gone) ends the link within about 15 s whatever the link carries: keepalive probes
+/// after [`KEEPALIVE_IDLE`], [`KEEPALIVE_PROBES`] of them [`KEEPALIVE_EVERY`] apart, and
+/// unacknowledged data dropped after [`SILENCE_DROP`]; both ends, the dialer's and the
+/// listener's.
+/// NEGATIVE CONTROL: with `keep_alive` not called from `Link::start`, `SO_KEEPALIVE` reads 0:
+/// `assertion `left != right` failed: SO_KEEPALIVE; left: 0, right: 0`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn every_link_socket_ends_within_about_fifteen_seconds_of_silence() {
+    use std::os::fd::AsRawFd as _;
+    let read = |sock: &TcpStream, level: libc::c_int, name: libc::c_int| -> u64 {
+        let mut value: libc::c_int = -1;
+        let mut len = libc::socklen_t::try_from(std::mem::size_of_val(&value)).unwrap();
+        // SAFETY: `value` is a live c_int written for at most `len` bytes, on a live descriptor.
+        let got = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                level,
+                name,
+                std::ptr::from_mut(&mut value).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(got, 0, "getsockopt: {}", io::Error::last_os_error());
+        u64::try_from(value).unwrap()
+    };
+    #[cfg(target_os = "macos")]
+    let (idle, drop_after, drop_value) = (
+        libc::TCP_KEEPALIVE,
+        TCP_RXT_CONNDROPTIME,
+        SILENCE_DROP.as_secs(),
+    );
+    #[cfg(target_os = "linux")]
+    let (idle, drop_after, drop_value) = (
+        libc::TCP_KEEPIDLE,
+        libc::TCP_USER_TIMEOUT,
+        u64::try_from(SILENCE_DROP.as_millis()).unwrap(),
+    );
+    assert!(KEEPALIVE_IDLE + KEEPALIVE_EVERY * KEEPALIVE_PROBES <= SILENCE_DROP);
+    let (a, b) = (node(0x4f), node(0x50));
+    let mac_a = Mac::start(a.clone(), &[&a, &b]);
+    let mac_b = Mac::start(b.clone(), &[&a, &b]);
+    let dialed = mac_a.dial(&mac_b);
+    let took = mac_b.link_to(&mac_a);
+    for link in [&dialed, &took] {
+        let sock = &link.shared.sock;
+        // Darwin answers a set flag with its own bit, Linux with 1.
+        assert_ne!(
+            read(sock, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE"
+        );
+        assert_eq!(
+            read(sock, libc::IPPROTO_TCP, idle),
+            KEEPALIVE_IDLE.as_secs()
+        );
+        assert_eq!(
+            read(sock, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+            KEEPALIVE_EVERY.as_secs()
+        );
+        assert_eq!(
+            read(sock, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+            u64::from(KEEPALIVE_PROBES)
+        );
+        assert_eq!(read(sock, libc::IPPROTO_TCP, drop_after), drop_value);
+    }
+}
+
 #[test]
 fn withdrawn_local_authority_ends_an_established_link_without_reproof() {
     let (a, b) = (node(0x5c), node(0x5d));

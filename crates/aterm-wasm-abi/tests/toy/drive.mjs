@@ -186,6 +186,30 @@ async function suite(label, m) {
   }
   eq('utf8 length of an astral char', m.utf8_len('😀'), 4)
   eq('utf8 length of é', m.utf8_len('é'), 2)
+  const encoder = new TextEncoder()
+  const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
+  const utf8 = (s) => {
+    const bytes = encoder.encode(s)
+    const expected = decoder.decode(bytes)
+    eq(`UTF-16 round trip ${s.length}`, m.echo_str(s), expected)
+    eq(`owned UTF-16 round trip ${s.length}`, m.echo_string(s), expected)
+    eq(`UTF-16 encoded length ${s.length}`, m.utf8_len(s), bytes.length)
+  }
+  for (let unit = 0; unit <= 0xffff; unit++) utf8(String.fromCharCode(unit))
+  for (let a = 0; a < 128; a++) {
+    for (let b = 0; b < 128; b++) utf8(String.fromCharCode(a, b))
+  }
+  for (const s of ['éa', 'aé', '漢a', 'a漢', '\ud800', '\udc00', '\ud800x\udc00', '\ud83d\ude00', 'a\ud83d\ude00b', 'x'.repeat(65536) + '漢😀é']) utf8(s)
+  let seed = 0x41c6ce57
+  for (let i = 0; i < 10000; i++) {
+    let s = ''
+    for (let j = 0; j < i % 31; j++) {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0
+      s += String.fromCharCode(seed >>> 16)
+    }
+    utf8(s)
+  }
+
   await end()
 
   begin(`${label} buffers`)
@@ -419,6 +443,26 @@ begin('web init')
   await finalizers('web', m)
   await misuse('web', m)
 }
+begin('web string encoding fallback')
+{
+  const descriptor = Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encodeInto')
+  try {
+    delete TextEncoder.prototype.encodeInto
+    const m = await load()
+    await m.default({ module_or_path: bytes })
+    const encoder = new TextEncoder()
+    const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
+    for (const s of ['', 'ascii', 'é漢😀', '\ud800', '\udc00', 'x'.repeat(100000) + 'é']) {
+      const encoded = encoder.encode(s)
+      eq(`fallback round trip ${s.length}`, m.echo_str(s), decoder.decode(encoded))
+      eq(`fallback encoded length ${s.length}`, m.utf8_len(s), encoded.length)
+    }
+  } finally {
+    if (descriptor) Object.defineProperty(TextEncoder.prototype, 'encodeInto', descriptor)
+  }
+}
+await end()
+
 begin('web init forms')
 const forms = [
   ['init(bytes)', (m) => m.default(bytes), 'using deprecated parameters for the initialization function; pass a single object instead'],

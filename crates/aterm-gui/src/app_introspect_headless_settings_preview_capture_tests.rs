@@ -59,7 +59,7 @@ fn a_headless_capture_samples_a_live_settings_preview_at_its_instant() {
     .unwrap();
     app.lat_epoch = Instant::now();
     {
-        let window = app.windows.get_mut(&WID).unwrap();
+        let mut window = app.windows.get_mut(&WID).unwrap();
         window.focused = true;
         window.rows = 50;
         window.cols = 120;

@@ -51,13 +51,13 @@ fn fence_session(app: &App, session: u64, keep_hand: bool) {
 }
 
 fn arm_typed_press(app: &mut App, now: Instant) {
-    let ws = app.windows.get_mut(&WID).expect("window");
+    let mut ws = app.windows.get_mut(&WID).expect("window");
     ws.fx.cursor_mut().glow.note_typed_cells(now, 1);
     ws.fx.cursor_mut().trail.note_typed(now);
 }
 
 fn arm_navigation_press(app: &mut App, now: Instant) {
-    let ws = app.windows.get_mut(&WID).expect("window");
+    let mut ws = app.windows.get_mut(&WID).expect("window");
     ws.fx.cursor_mut().glow.note_navigation(now);
     ws.fx.cursor_mut().trail.note_navigation(now);
 }

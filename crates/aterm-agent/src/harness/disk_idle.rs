@@ -383,6 +383,11 @@ pub fn processes_clear(
                         .unwrap_or_default()
                 ));
             }
+            if !scan.users.is_empty() {
+                // A process scan reports its first use. A use of another candidate does
+                // not certify this one: ask the same provider about this candidate alone.
+                return super::discover::unused_under(&[checkout.clone(), dir.clone()], processes);
+            }
             Ok(())
         })
         .collect()

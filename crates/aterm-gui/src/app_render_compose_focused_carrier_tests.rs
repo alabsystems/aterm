@@ -139,14 +139,14 @@ fn composed_char(app: &App, wid: WindowId, pane_row: usize, pane_col: usize) -> 
 
 /// Bumps `snapshot_seq` on `composed_focus_scratch` to force the next extraction onto the full arm.
 fn disown(app: &mut App, wid: WindowId) {
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.composed_focus_scratch.snapshot_seq = ws.composed_focus_scratch.snapshot_seq.wrapping_add(1);
 }
 
 /// Writes an undeclared marker character into `composed_focus_scratch` with composed retention off.
 fn plant_marker(app: &mut App, wid: WindowId, pane_row: usize) {
     super::COMPOSE_RETAIN_OFF.with(|off| off.set(true));
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.composed_focus_scratch
         .cells
         .get_mut(pane_row)
@@ -385,7 +385,7 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
             .coordinate_generation()
     };
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.predictor.set_mode(crate::predict::PredictMode::Always);
         assert!(
             ws.predictor.predict_char(

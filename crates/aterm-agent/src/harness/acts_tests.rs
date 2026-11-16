@@ -819,3 +819,149 @@ fn only_a_step_that_brought_a_new_agent_up_started_one() {
         );
     }
 }
+
+/// Each act a harness records names the one duty it reports on (HX-06), and an act no duty
+/// names is codex-alab's contract 2 alone.
+#[test]
+fn each_act_names_the_duty_it_reports_on() {
+    use super::super::contract::Scope;
+    for (act, scope) in [
+        ("approve-all@v1", Some(Scope::Approvals)),
+        (RULE_PLAN, Some(Scope::Approvals)),
+        (RULE_ANSWER_RECOMMENDED, Some(Scope::Questions)),
+        (RULE_PROSE_SHORT_TERM, Some(Scope::Questions)),
+        (RULE_CREDENTIAL, Some(Scope::Walls)),
+        (RULE_API_RETRY, Some(Scope::Walls)),
+        (RULE_API_CUTOFF, Some(Scope::Walls)),
+        (RULE_OUTAGE_RESUME, Some(Scope::Walls)),
+        (RULE_LOGIN_BACK, Some(Scope::Walls)),
+        (RULE_COMPACT, Some(Scope::Walls)),
+        (RULE_CONTINUE, Some(Scope::TurnEnd)),
+        (RULE_POLICY_CONTINUE, Some(Scope::TurnEnd)),
+        (RULE_LIMIT_RESUME, Some(Scope::TurnEnd)),
+        (RULE_DONE_CHECK, Some(Scope::TurnEnd)),
+        (RULE_SUGGESTION, Some(Scope::TurnEnd)),
+        (RULE_OPEN_ITEMS, Some(Scope::TurnEnd)),
+        (RULE_UNCOMMITTED, Some(Scope::TurnEnd)),
+        (
+            alab_policy::cruise_carry::RULE_BACKGROUND,
+            Some(Scope::TurnEnd),
+        ),
+        (
+            alab_policy::cruise_carry::RULE_BACKGROUND_RESET,
+            Some(Scope::TurnEnd),
+        ),
+        (RULE_LAND, Some(Scope::TurnEnd)),
+        (RULE_LAND_NUDGE, Some(Scope::TurnEnd)),
+        (RULE_LAND_CHECK, Some(Scope::TurnEnd)),
+        (RULE_LANDED, Some(Scope::TurnEnd)),
+        (RULE_LEFT, Some(Scope::TurnEnd)),
+        (RULE_UPGRADE, Some(Scope::Upgrade)),
+        ("continue", None),
+        ("codex-act@v1", None),
+    ] {
+        assert_eq!(act_scope(act), scope, "{act}");
+    }
+}
+
+/// ONE ACT HAS ONE DUTY WHOEVER PERFORMS IT (HX-06): every act a self-claim's report lights or
+/// counts ([`self_claim_sort`], [`self_claim_act`]) names a duty a scoped claim can hold, and a
+/// wall retry's duty is the one the built-in engine files it under
+/// (`turn_end::is_wall_retry` → `walls`, the usage resume → `turn-end`). NEGATIVE CONTROL: before
+/// HX-06's fix the suggestion, open-items, uncommitted and background continuations named none,
+/// so a scoped claim holding `turn-end` was refused them, and compaction, the outage resume and
+/// the login's return disagreed with the engine.
+#[test]
+fn every_act_a_claim_reports_names_the_engines_duty() {
+    use super::super::contract::Scope;
+    let rules = [
+        RULE_APPROVE_ALL,
+        RULE_PLAN,
+        RULE_ANSWER_RECOMMENDED,
+        RULE_ANSWER_LONG_TERM,
+        RULE_ANSWER_SHORT_TERM,
+        RULE_ANSWER_LAND,
+        RULE_LAND_ANSWER,
+        RULE_GO_AHEAD,
+        RULE_ANSWER,
+        RULE_PROSE_LONG_TERM,
+        RULE_PROSE_SHORT_TERM,
+        RULE_CREDENTIAL,
+        RULE_CONTINUE,
+        RULE_POLICY_CONTINUE,
+        RULE_SUGGESTION,
+        RULE_DONE_CHECK,
+        RULE_OPEN_ITEMS,
+        RULE_UNCOMMITTED,
+        alab_policy::cruise_carry::RULE_BACKGROUND,
+        RULE_LAND,
+        RULE_LAND_NUDGE,
+        RULE_LAND_CHECK,
+        RULE_LIMIT_RESUME,
+        RULE_API_RETRY,
+        RULE_API_BACK,
+        RULE_API_CUTOFF,
+        RULE_OUTAGE_RESUME,
+        RULE_LOGIN_BACK,
+        RULE_COMPACT,
+        RULE_UPGRADE,
+        RULE_HOST_TURN,
+        RULE_LANDED,
+    ];
+    for rule in rules {
+        let reported = self_claim_sort(rule).act.is_some() || self_claim_act(rule).is_some();
+        assert!(reported, "{rule}: the list names only reported acts");
+        assert!(act_scope(rule).is_some(), "{rule} names no duty");
+        if rule == RULE_LIMIT_RESUME {
+            assert_eq!(act_scope(rule), Some(Scope::TurnEnd));
+        } else if crate::supervise::policy::turn_end::is_wall_retry(rule) {
+            assert_eq!(act_scope(rule), Some(Scope::Walls), "{rule}");
+        }
+    }
+}
+
+/// EVERY ACT ATERM TYPES NAMES THE DUTY THE ENGINE FILES IT UNDER (HX-05's review, finding 7):
+/// the walk is [`typed_rules`], the one list [`typed_act`] reads, so an act aterm comes to type is
+/// walked here the moment it lights anything. Each has the duty a scoped claim reports it under:
+/// the usage resume `turn-end`, the credential line and every wall retry
+/// (`turn_end::is_wall_retry`) `walls`, every other prose answer `questions`, and the rest
+/// `turn-end`, the goal restore among them, as `supervise::duty::action_scope` files a typed act
+/// no rule of its own names at a point with no wall drawn and no prose question (duty_tests'
+/// `the_goal_restore_is_filed_under_turn_end_whoever_types_it`). NEGATIVE CONTROL: before the fix
+/// `goal-restore@v1`, which main added after `act_scope` was written, named no duty, so a scoped
+/// claim holding `turn-end` was answered `ERR denied` for it where main admitted it.
+#[test]
+fn every_act_aterm_types_names_the_duty_the_engine_files_it_under() {
+    use super::super::contract::Scope;
+    use crate::supervise::policy::goal_restore::RULE_GOAL_RESTORE;
+    use crate::supervise::policy::turn_end::is_wall_retry;
+    let mut lit = std::collections::HashSet::new();
+    for (rule, act, counter) in typed_rules() {
+        assert_eq!(
+            typed_act(rule, ""),
+            Some((act, counter)),
+            "{rule}: the walk is what typed_act lights"
+        );
+        let want = if rule == RULE_LIMIT_RESUME {
+            Scope::TurnEnd
+        } else if rule == RULE_CREDENTIAL || is_wall_retry(rule) {
+            Scope::Walls
+        } else if act == Act::Answered {
+            Scope::Questions
+        } else {
+            Scope::TurnEnd
+        };
+        assert_eq!(act_scope(rule), Some(want), "{rule} ({act:?})");
+        lit.insert(act);
+    }
+    assert_eq!(
+        lit,
+        Act::ALL
+            .into_iter()
+            .filter(|act| !matches!(act, Act::Approved | Act::Declined))
+            .collect::<std::collections::HashSet<_>>(),
+        "every act a typed row lights is walked"
+    );
+    assert_eq!(self_claim_sort(RULE_GOAL_RESTORE).act, Some(Act::Resumed));
+    assert_eq!(act_scope(RULE_GOAL_RESTORE), Some(Scope::TurnEnd));
+}

@@ -65,6 +65,7 @@ fn a_press_on_a_background_tabs_marks_selects_it() {
     assert_eq!(front, Some(1), "the pushed tab is in front");
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|ws| ws.tab_set.tab_at_mut(0))
         .expect("tab 0")
         .presentation

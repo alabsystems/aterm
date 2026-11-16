@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `setup-token-lab [a|b|c|all] [tag] [--keep]`: the lab gate of Claude Code setup-tokens in the
+//! `setup-token-lab [a|b|c|d|all] [tag] [--keep]`: the lab gate of Claude Code setup-tokens in the
 //! fleet vault (`docs/DESIGN-claude-setup-token-2026-11-05.md` S9, rerun with the route on in
 //! S13), on a lab of its own in this tree's debug build, with no real sign-in.
 //!
@@ -46,6 +46,18 @@
 //!   basis; a token session under the tap must then be credited to the row (this Mac's token
 //!   table's first served reading), answered as `oat:lab-t`, and its windows, the same resets,
 //!   must make verification by windows write `verified` into the token's meta.
+//! - **D, a row whose login was never made here (FL-135).** A second roster row ([`BORROWED`])
+//!   names its login directory under the harness's store (`<store>/logins/lab-b`, as the accounts
+//!   sync names every row's) and none is made there; its token is in the vault. The real Claude
+//!   Code, cloned into the lab home's store since the wrapper serves only a build of the
+//!   configured store, starts through the wrapper on it, `LOGIN_ENV` naming that directory, and
+//!   the lab reads its screen alone (no prompt is sent): it must reach its empty composer on the
+//!   default home's first-run state (`~/.claude.json`: [`FIRST_RUN_KEYS`] and the project's
+//!   trust, as `up` lays them), its session read as the token's route, and leave the directory
+//!   with no login (`login_made` false, so the row is not enrolled). The negative control is the
+//!   same launch on a default home without that first-run state, which must open on Claude
+//!   Code's first-run screens: so the state a launch needs is the default home's, and the row's
+//!   directory needs none.
 //!
 //! A verdict table, exit 1 on a FAIL, 3 when a lane could not run. The record of what each lane
 //! saw goes to `setup-token-lab.txt` in the kept logs; no byte of the sentinel is printed, logged
@@ -78,6 +90,28 @@ pub const EMAIL: &str = "lab-t@example.test";
 /// The label of the row's stored login lane C's crediting check lays on the default login
 /// ([`crate::stub::labelled_oauth_token`]): the stub answers its turns as `oat:lab-s`.
 pub const STORED: &str = "lab-s";
+
+/// Lane D's row (FL-135): an account whose login is never made on the lab's Mac, run on its fleet
+/// token alone. The stub answers its token as `oat:lab-b`.
+pub const BORROWED: &str = "lab-b";
+
+/// [`BORROWED`]'s login email.
+pub const BORROWED_EMAIL: &str = "lab-b@example.test";
+
+/// The scratch hold ([`crate::lab::HELD`]) on lane D's clone of the managed Claude Code in the lab
+/// home's store, from before its first exec until it showed it ran
+/// ([`crate::reroute_prefix::clone_build`]).
+const STORE_CLONE_HOLD: &str = "setup-token-store-build";
+
+/// The first-run keys `up` lays in the default home's `.claude.json` beside the project's trust
+/// (`projects`): lane D's control launch runs on a profile without them.
+pub const FIRST_RUN_KEYS: [&str; 5] = [
+    "hasCompletedOnboarding",
+    "theme",
+    "lastOnboardingVersion",
+    "hasSeenAutoDefaultNotice",
+    "hasSeenAutoDefaultNudge",
+];
 
 /// The hidden verb a lane C probe runs as: `setup-token-probe <hook|mcp|statusline> <root>`.
 pub const PROBE_VERB: &str = "setup-token-probe";
@@ -681,11 +715,12 @@ fn die(what: &str, e: impl std::fmt::Display) -> Fail {
     Fail::die(format!("setup-token-lab: {what}: {e}"))
 }
 
-/// The account's lab key, as the harness keys it ([`aterm_agent::harness::journal::claude_email_key`]).
-fn account_key() -> Option<aterm_secrets::claude_token::Key> {
+/// The lab key of the account whose login email is `email`, as the harness keys it
+/// ([`aterm_agent::harness::journal::claude_email_key`]).
+fn account_key(email: &str) -> Option<aterm_secrets::claude_token::Key> {
     let key = aterm_agent::harness::journal::with_keyer(
         |realm, email| aterm_db::typed::keys::account_pk(realm, email).ok(),
-        || aterm_agent::harness::journal::claude_email_key(EMAIL),
+        || aterm_agent::harness::journal::claude_email_key(email),
     )?;
     aterm_secrets::claude_token::Key::parse(key.as_str())
 }
@@ -732,7 +767,7 @@ impl World {
         )?;
         let probes = run.w.join("setup-token-probes");
         crate::util::create_private_dir_all(&probes).map_err(|e| die("the probes' root", e))?;
-        let key = account_key().ok_or_else(|| die("the account", "it cannot be keyed"))?;
+        let key = account_key(EMAIL).ok_or_else(|| die("the account", "it cannot be keyed"))?;
         let (vault, server) = seat_scratch_vault(&run.w.join("vault-server"), &home)
             .map_err(|why| Fail::die(format!("setup-token-lab: {why}")))?;
         Ok(World {
@@ -1187,6 +1222,7 @@ fn lane_a(run: &Run, rec: &mut Record) -> Result<(), Fail> {
     let route = OpenerRoute {
         opener: run.run.join("shim/open"),
         page: OpenerPage::Window,
+        unattended: false,
         outcome: run.w.join("setup-token-a-outcome"),
         code: run.w.join("setup-token-a-outcome.code"),
     };
@@ -1639,10 +1675,10 @@ fn controls_b(run: &Run, door: &Door<'_>, rec: &mut Record, t0: SystemTime) -> R
 // ---------------------------------------------------------------------------------------------
 // Lane C: the descriptor on a real Claude Code.
 
-/// The token in the vault for lane C: lane B's where it stored one, else written here as a
-/// member write, minted on this Mac a moment ago and a year from its end.
+/// The token in the vault for lane C: lane B's where it stored one, else written here
+/// ([`write_token`]).
 fn ensure_token(world: &World, rec: &mut Record) -> Result<(), Fail> {
-    use aterm_secrets::claude_token::{self, ExpiryFrom, Lookup, Meta};
+    use aterm_secrets::claude_token::{self, Lookup};
     if matches!(
         claude_token::read(&world.vault, &world.key, HANG),
         Ok(Lookup::Found(read)) if read.token().is_some_and(|t| t.as_slice() == sentinel().as_bytes())
@@ -1650,9 +1686,25 @@ fn ensure_token(world: &World, rec: &mut Record) -> Result<(), Fail> {
         rec.saw("C: the token is lane B's, in the vault");
         return Ok(());
     }
+    let written = write_token(world, &world.key, EMAIL, &sentinel())?;
+    rec.saw(format!("C: the token written for the lane: {written:?}"));
+    Ok(())
+}
+
+/// `token` written into the vault for the account `key` names (login email `email`) as a member
+/// write, minted on this Mac a moment ago and a year from its end, then applied here by a vault
+/// pass, so a launch at once reads it (a posted write is in this Mac's vault only once a pass
+/// applies it). What the write and the pass said.
+fn write_token(
+    world: &World,
+    key: &aterm_secrets::claude_token::Key,
+    email: &str,
+    token: &str,
+) -> Result<String, Fail> {
+    use aterm_secrets::claude_token::{self, ExpiryFrom, Meta};
     let now = u64::try_from(crate::util::now_secs()).unwrap_or(0);
     let meta = Meta {
-        email: EMAIL.to_string(),
+        email: email.to_string(),
         account_id: String::new(),
         minted_at: now,
         expires_at: now + setup_token::LIFETIME - 43_200,
@@ -1667,14 +1719,17 @@ fn ensure_token(world: &World, rec: &mut Record) -> Result<(), Fail> {
     };
     let written = claude_token::write(
         &world.vault,
-        &world.key,
-        &aterm_secrets::SecretBytes::from(sentinel()),
+        key,
+        &aterm_secrets::SecretBytes::from(token.to_owned()),
         &meta,
         aterm_secrets::client::OnBusy::Refuse(Instant::now() + HANG),
     )
     .map_err(|e| die("the token's write", e))?;
-    rec.saw(format!("C: the token written for the lane: {written:?}"));
-    Ok(())
+    let applied = aterm_secrets::client::sync(&world.vault, None)
+        .map_err(|e| die("the vault pass after the token's write", e))?;
+    Ok(format!(
+        "{written:?}, applied here by a vault pass: {applied:?}"
+    ))
 }
 
 /// The settings and the user's MCP server lane C's probes run as.
@@ -1716,13 +1771,7 @@ fn lay_probes(run: &Run, world: &World) -> Result<(), Fail> {
     // reads `~/.claude.json`, not the lab's `home/.claude/.claude.json`: it starts from that one's
     // onboarding and trust, or it opens on the first-run screen, whose check of
     // api.anthropic.com no stub answers.
-    let config = world.home.join(".claude.json");
-    let mut text = scratch_text(&config);
-    if text.trim().is_empty() {
-        text = scratch_text(&world.home.join(".claude/.claude.json"));
-    }
-    let mut j = J::parse(if text.trim().is_empty() { "{}" } else { &text })
-        .map_err(|e| die("the scratch .claude.json", e))?;
+    let mut j = default_profile(world)?;
     j.set(
         "mcpServers",
         J::obj([(
@@ -1741,8 +1790,28 @@ fn lay_probes(run: &Run, world: &World) -> Result<(), Fail> {
             ]),
         )]),
     );
-    atomic_write(&config, j.dump(crate::pyjson::COMPACT).as_bytes())
+    put_default_profile(world, &j)
+}
+
+/// The default home's profile (`~/.claude.json`) a wrapped session reads, as it stands, else as
+/// `up` laid the lab's `home/.claude/.claude.json`: the wrapper refuses a `CLAUDE_CONFIG_DIR`, so
+/// a session it starts reads `~/.claude.json` alone.
+fn default_profile(world: &World) -> Result<J, Fail> {
+    let mut text = scratch_text(&world.home.join(".claude.json"));
+    if text.trim().is_empty() {
+        text = scratch_text(&world.home.join(".claude/.claude.json"));
+    }
+    J::parse(if text.trim().is_empty() { "{}" } else { &text })
         .map_err(|e| die("the scratch .claude.json", e))
+}
+
+/// `j` as the default home's profile (`~/.claude.json`).
+fn put_default_profile(world: &World, j: &J) -> Result<(), Fail> {
+    atomic_write(
+        &world.home.join(".claude.json"),
+        j.dump(crate::pyjson::COMPACT).as_bytes(),
+    )
+    .map_err(|e| die("the scratch .claude.json", e))
 }
 
 /// The pid of the Claude Code the lab launched by `bin`, among the jail's members: the one whose
@@ -2221,6 +2290,294 @@ fn credit_c(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Lane D: a row whose login was never made here, on its fleet token (FL-135).
+
+/// Whether `screen` is one of Claude Code's first-run screens (its text style, its login method,
+/// its welcome), as `restore` reads them.
+#[must_use]
+pub fn first_run_screen(screen: &str) -> bool {
+    [
+        "Choose the text style",
+        "Select login method",
+        "Welcome to Claude Code",
+        "Let's get started",
+        "Let\u{2019}s get started",
+    ]
+    .iter()
+    .any(|words| screen.contains(words))
+}
+
+/// `profile` without the first-run state `up` lays ([`FIRST_RUN_KEYS`] and the projects' trust):
+/// the default home of a Mac where Claude Code never ran.
+#[must_use]
+pub fn without_first_run(profile: &J) -> J {
+    let mut j = profile.clone();
+    for key in FIRST_RUN_KEYS.iter().chain(&["projects"]) {
+        j.remove(key);
+    }
+    j
+}
+
+/// The first-run state `profile` holds: which of [`FIRST_RUN_KEYS`] and `projects` it names.
+#[must_use]
+pub fn first_run_state(profile: &J) -> Vec<&'static str> {
+    FIRST_RUN_KEYS
+        .iter()
+        .copied()
+        .chain(["projects"])
+        .filter(|key| profile.get(key).is_some())
+        .collect()
+}
+
+/// Every entry under `dir`: its path below it and, for a file, its size, never its bytes; `None`
+/// where `dir` is not there.
+#[must_use]
+pub fn dir_listing(dir: &Path) -> Option<Vec<String>> {
+    if !dir.exists() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            if meta.is_dir() {
+                out.push(format!("{rel}/"));
+                stack.push(path);
+            } else {
+                out.push(format!("{rel} ({} B)", meta.len()));
+            }
+        }
+    }
+    out.sort();
+    Some(out)
+}
+
+/// What one [`launch_d`] saw.
+struct Seen {
+    /// How the wait for its empty composer ended.
+    wait: crate::forever::ComposerWait,
+    /// Its screen then: its non-blank lines.
+    screen: String,
+    /// The session's exec-time environment, where its process was found.
+    env: Option<Vec<String>>,
+}
+
+/// One launch of the real Claude Code (`program`, a build of the lab home's store) through the
+/// wrapper on [`BORROWED`]'s token, `LOGIN_ENV` naming `dir`, read to its empty composer or the
+/// screen it stands on, then closed. No prompt is sent: the lab reads the screen alone.
+fn launch_d(
+    run: &Run,
+    door: &Door<'_>,
+    (program, dir): (&str, &Path),
+    word: &str,
+    rec: &mut Record,
+) -> Result<Seen, Fail> {
+    let before = crate::sys::jail_pids(&run.mark).unwrap_or_default();
+    let sid = spawn_tab(door)?;
+    type_line(
+        door,
+        &sid,
+        &format!(
+            "{} {}={}; {} harness accounts token-run {BORROWED} -- {}; echo \"token-run-exit=$?\"",
+            exports(run),
+            aterm_agent::harness::accounts::LOGIN_ENV,
+            shell_quote(&dir.to_string_lossy()),
+            shell_quote(&run.aterm),
+            shell_quote(program),
+        ),
+    );
+    let wait = crate::forever::empty_composer(door, &sid, "claude")?;
+    let at = format!("@{sid}");
+    let screen = door
+        .out(&[&at, "text"])
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(40)
+        .collect::<Vec<_>>()
+        .join("\n");
+    rec.saw(format!(
+        "D({word}): {}; its screen:",
+        wait.why("Claude Code")
+            .unwrap_or_else(|| "Claude Code stood at its empty composer".to_string())
+    ));
+    for line in screen.lines() {
+        rec.saw(format!("D({word}):   {line}"));
+    }
+    let pid = claude_pid(run, program, &before);
+    let env = pid.map(exec_env);
+    close_tab(door, &sid);
+    if !wait_until(|| claude_pid(run, program, &before).is_none())? {
+        rec.saw(format!(
+            "D({word}): its Claude Code still ran {} s after its tab closed",
+            HANG.as_secs()
+        ));
+    }
+    Ok(Seen { wait, screen, env })
+}
+
+fn lane_d(run: &Run, door: &Door<'_>, world: &World, rec: &mut Record) -> Result<(), Fail> {
+    use crate::forever::ComposerWait;
+    use aterm_agent::harness::accounts;
+    println!("== lane D: a row whose login was never made here, on its fleet token (FL-135)");
+    let store = accounts::Store::at(&run.state().join("harness").join("claude-harness"));
+    let dir = store
+        .login_dir(BORROWED)
+        .ok_or_else(|| die("lane D's row", "its label is refused"))?;
+    // A kept lab may hold an earlier run's directory; the lane starts with none.
+    let _ = std::fs::remove_dir_all(&dir);
+    let roster = run.w.join("cfg/aterm").join(accounts::ACCOUNTS_FILE);
+    let text = scratch_text(&roster);
+    if !text.contains(&format!("label = \"{BORROWED}\"")) {
+        put(
+            &roster,
+            &format!(
+                "{text}\n[[account]]\nlabel = \"{BORROWED}\"\nclass = \"shared\"\nemail = \
+                 \"{BORROWED_EMAIL}\"\ndir = \"{}\"\n",
+                dir.display()
+            ),
+        )?;
+    }
+    let key =
+        account_key(BORROWED_EMAIL).ok_or_else(|| die("lane D's account", "it cannot be keyed"))?;
+    let written = write_token(
+        world,
+        &key,
+        BORROWED_EMAIL,
+        &crate::stub::labelled_oauth_token(BORROWED),
+    )?;
+    rec.saw(format!("D: {BORROWED}'s token written: {written}"));
+    {
+        use aterm_secrets::claude_token::{self, Lookup};
+        let found = matches!(
+            claude_token::read(&world.vault, &key, HANG),
+            Ok(Lookup::Found(read)) if read.token().is_some()
+        );
+        rec.ok(
+            'D',
+            found,
+            format!("{BORROWED}'s token is in this Mac's vault before the launch"),
+        );
+    }
+    let profile = default_profile(world)?;
+    put_default_profile(world, &profile)?;
+    rec.saw(format!(
+        "D: the default home's first-run state: {}; {BORROWED}'s login directory {} is {}",
+        first_run_state(&profile).join(" "),
+        dir.display(),
+        if dir.exists() { "there" } else { "not there" }
+    ));
+    // The wrapper hands a token only to a build of atpkg's store, here the lab home's
+    // (`token_route::store_build_in`), and the managed Claude Code lies in the owner's: the lane
+    // runs a clone of it in the lab home's store.
+    let program = crate::reroute_prefix::clone_build(
+        &world.home,
+        Path::new(&run.claude_bin),
+        Some(&run.run.join(crate::lab::HELD).join(STORE_CLONE_HOLD)),
+    )
+    .map_err(|e| die("lane D's store build", e))?;
+    let program = program.to_string_lossy().into_owned();
+    rec.saw(format!(
+        "D: the sessions run {program}, a clone of {} in the lab home's store",
+        run.claude_bin
+    ));
+    let security = run.w.join("security.log");
+    let keychain_before = scratch_text(&security).lines().count();
+
+    let first = launch_d(run, door, (&program, &dir), "first-run-state", rec)?;
+    rec.ok(
+        'D',
+        first.wait == ComposerWait::Ready,
+        format!(
+            "the real Claude Code on {BORROWED}'s token, its login never made here, reaches its \
+             empty composer on the default home's first-run state (no prompt sent)"
+        ),
+    );
+    let login = first
+        .env
+        .as_deref()
+        .and_then(accounts::ProcessLogin::of_exec_env);
+    rec.ok(
+        'D',
+        login.as_ref().is_some_and(|login| {
+            matches!(login.route, accounts::AuthRoute::VaultToken { .. })
+                && login.default_home
+                && login.login.as_deref() == Some(&*dir.to_string_lossy())
+        }),
+        format!(
+            "its session reads as the vault token's route on the default home, its login \
+             {BORROWED}'s directory ({})",
+            login.map_or_else(|| "unread".to_string(), |l| format!("{:?}", l.route))
+        ),
+    );
+    let listing = dir_listing(&dir);
+    rec.saw(format!(
+        "D: {BORROWED}'s login directory after the session: {}",
+        listing.as_ref().map_or_else(
+            || "not there".to_string(),
+            |entries| if entries.is_empty() {
+                "empty".to_string()
+            } else {
+                entries.join(", ")
+            }
+        )
+    ));
+    rec.ok(
+        'D',
+        !accounts::login_made(&dir),
+        "the session leaves no login in the row's directory, so the row is not enrolled here",
+    );
+    let calls: Vec<String> = scratch_text(&security)
+        .lines()
+        .skip(keychain_before)
+        .map(|line| {
+            let (cmd, svc) = tripwire_words(line);
+            format!("{cmd} {svc}")
+        })
+        .collect();
+    rec.saw(format!(
+        "D: the keychain calls the session made: {}",
+        if calls.is_empty() {
+            "none".to_string()
+        } else {
+            calls.join(", ")
+        }
+    ));
+
+    // The negative control: the same launch on a default home where Claude Code never ran.
+    let bare = without_first_run(&profile);
+    put_default_profile(world, &bare)?;
+    let control = launch_d(run, door, (&program, &dir), "no-first-run-state", rec);
+    put_default_profile(world, &profile)?;
+    let control = control?;
+    rec.ok(
+        'D',
+        control.wait != ComposerWait::Ready && first_run_screen(&control.screen),
+        "CONTROL: on a default home without that first-run state, the same launch opens on \
+         Claude Code's first-run screens, so the state a launch needs is the default home's and \
+         the row's directory holds none",
+    );
+    rec.ok(
+        'D',
+        !accounts::login_made(&dir),
+        "CONTROL: neither launch left a login in the row's directory",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
 // The verb.
 
 /// Which lanes `setup-token-lab` runs.
@@ -2229,9 +2586,20 @@ pub struct Lanes {
     pub a: bool,
     pub b: bool,
     pub c: bool,
+    pub d: bool,
 }
 
-/// `[a|b|c|all]... [tag] [--keep]`: the lanes (all when none is named), the tag and `--keep`.
+impl Lanes {
+    /// Every lane.
+    pub const ALL: Lanes = Lanes {
+        a: true,
+        b: true,
+        c: true,
+        d: true,
+    };
+}
+
+/// `[a|b|c|d|all]... [tag] [--keep]`: the lanes (all when none is named), the tag and `--keep`.
 ///
 /// # Errors
 /// An unknown flag, or a tag the lab refuses.
@@ -2240,6 +2608,7 @@ pub fn parse(args: &[String]) -> Result<(Lanes, String, bool), String> {
         a: false,
         b: false,
         c: false,
+        d: false,
     };
     let (mut tag, mut keep) = ("setup-token".to_string(), false);
     for a in args {
@@ -2248,23 +2617,21 @@ pub fn parse(args: &[String]) -> Result<(Lanes, String, bool), String> {
             "a" | "A" => lanes.a = true,
             "b" | "B" => lanes.b = true,
             "c" | "C" => lanes.c = true,
-            "all" => {
-                lanes = Lanes {
-                    a: true,
-                    b: true,
-                    c: true,
-                }
-            }
+            "d" | "D" => lanes.d = true,
+            "all" => lanes = Lanes::ALL,
             flag if flag.starts_with('-') => return Err(format!("unknown flag {flag}")),
             other => tag = other.to_string(),
         }
     }
-    if !lanes.a && !lanes.b && !lanes.c {
-        lanes = Lanes {
-            a: true,
-            b: true,
-            c: true,
-        };
+    if lanes
+        == (Lanes {
+            a: false,
+            b: false,
+            c: false,
+            d: false,
+        })
+    {
+        lanes = Lanes::ALL;
     }
     if !crate::paths::valid_tag(&tag) {
         return Err(format!("bad tag '{tag}'"));
@@ -2272,7 +2639,7 @@ pub fn parse(args: &[String]) -> Result<(Lanes, String, bool), String> {
     Ok((lanes, tag, keep))
 }
 
-/// `setup-token-lab [a|b|c|all] [tag] [--keep]` (the module's summary says what it does).
+/// `setup-token-lab [a|b|c|d|all] [tag] [--keep]` (the module's summary says what it does).
 pub fn cmd(args: &[String]) -> Res {
     let (lanes, tag, keep) =
         parse(args).map_err(|e| Fail::usage(format!("setup-token-lab: {e}")))?;
@@ -2320,6 +2687,9 @@ pub fn cmd(args: &[String]) -> Res {
         }
         if lanes.c {
             lane_c(&run, &door, &world, &mut rec)?;
+        }
+        if lanes.d {
+            lane_d(&run, &door, &world, &mut rec)?;
         }
         Ok(())
     });

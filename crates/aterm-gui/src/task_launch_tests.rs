@@ -2615,6 +2615,8 @@ impl CodexPool {
                     .then_some((accounts::SESSION_LIMIT, Some(POOL_RESET)))
                     .into_iter()
                     .collect(),
+                refusal: None,
+                limits: Default::default(),
             })
         };
         let starter = aterm_agent::harness::worker::Starter {

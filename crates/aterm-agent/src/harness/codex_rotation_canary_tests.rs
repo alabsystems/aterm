@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::harness::codex_renewal::{self as renewal, Intent, Phase, Purpose, Receipt};
+use crate::harness::codex_renewal::{self as renewal, Phase, Receipt};
 
 #[path = "codex_native_canary_model_tests.rs"]
 mod model;
@@ -12,6 +12,9 @@ mod terminal_evidence;
 
 #[path = "codex_rotation_unattached_tests.rs"]
 mod unattached;
+
+#[path = "codex_rotation_completion_tests.rs"]
+mod completion;
 
 struct Fresh<'a>(&'a Reader);
 impl UsageReader for Fresh<'_> {
@@ -39,39 +42,6 @@ impl UsageReader for Fresh<'_> {
             Some(usage)
         })()
         .into()
-    }
-}
-
-fn root(proposal: &codex_rotation::Proposal, id: &str, wall: &str) -> Receipt {
-    let next = proposal.successor().unwrap();
-    Receipt {
-        destination: Some(next.identity),
-        id: id.repeat(32),
-        intent: Intent {
-            purpose: Purpose::WeeklyQuota,
-            thread: "00000000-0000-0000-0000-000000000001".into(),
-            wall: wall.into(),
-            identity: proposal.source_identity.clone(),
-        },
-        sid: "s-one".into(),
-        old_pid: 10,
-        old_birth: 1,
-        claim_revision: 1,
-        human_seq: 0,
-        old_auth: next.old_auth,
-        new_auth: next.new_auth,
-        generation: next.generation,
-        row_stamp: renewal::row_stamp(&next.row),
-        native_prepare: "sealed native recipe".into(),
-        expires_ms: u64::MAX,
-        phase: Phase::Ready,
-        successor_pid: None,
-        successor_birth: None,
-        accepted_turn: None,
-        launch_attempted: false,
-        candidate: None,
-        current_attempt: None,
-        revoked: false,
     }
 }
 

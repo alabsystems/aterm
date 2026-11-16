@@ -207,6 +207,7 @@ fn supervisor_authority_captures_partial_full_and_expired_ownership() {
         scoped: Some(crate::harness_claim::Scoped {
             proven: proof.clone(),
             claim,
+            child: None,
         }),
     });
     let partial = meta.supervisor_authority(10);
@@ -242,10 +243,9 @@ fn supervisor_authority_captures_partial_full_and_expired_ownership() {
         let live = meta.supervisor_authority(19);
         assert_eq!(live.contract(), contract, "{holder}");
         assert_eq!(live.scopes(), None, "implicit full scope");
-        assert!(
-            live.wire_fields()
-                .contains("supervisor_scope=relaunch,upgrade,turn-end,approvals,questions,walls")
-        );
+        assert!(live.wire_fields().contains(
+            "supervisor_scope=relaunch,upgrade,turn-end,approvals,questions,walls,state,accounts"
+        ));
         for duty in Scope::ALL {
             assert_eq!(live.external_takes(host, duty), holder != host);
             assert_eq!(live.builtin_keeps(host, duty), holder == host);
@@ -279,9 +279,10 @@ fn supervisor_authority_captures_partial_full_and_expired_ownership() {
 /// the crash relaunch and its passive continuity; under `relaunch,upgrade` it keeps neither
 /// lane, and the change of relaunch ownership breaks that continuity. Under both, turn ends,
 /// approvals, questions and walls stay the built-in engine's, typed by its own holder alone, and
-/// the claim speaks for no box or wall. Under every duty, the scope its row allows since HX-07
-/// passed, the typing duties are the harness's, typed by its own connection alone, and the claim
-/// speaks for the boxes and walls.
+/// the claim speaks for no box or wall. Under all six duties contract 3 can name (its row allows
+/// every scope since HX-07 passed; `state` and `accounts` are contract 4's words), the typing
+/// duties are the harness's, typed by its own connection alone, and the claim speaks for the boxes
+/// and walls.
 #[test]
 fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_nothing_else() {
     use aterm_agent::harness::contract::{Scope, Words, read};
@@ -295,7 +296,14 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
         ("scope=relaunch,upgrade", &[Scope::Relaunch, Scope::Upgrade]),
         (
             "scope=relaunch,upgrade,turn-end,approvals,questions,walls",
-            &Scope::ALL,
+            &[
+                Scope::Relaunch,
+                Scope::Upgrade,
+                Scope::TurnEnd,
+                Scope::Approvals,
+                Scope::Questions,
+                Scope::Walls,
+            ],
         ),
     ] {
         let Words::Scoped(claim) = read(holder, &["contract=3", words, "vendor=2.1.310"]) else {
@@ -313,6 +321,7 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
                     start: "fixture-birth".to_string(),
                 },
                 claim,
+                child: None,
             },
             now,
             aterm_slog::Actor::Ctl,

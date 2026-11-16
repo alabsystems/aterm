@@ -816,7 +816,7 @@ mod link_opens {
 
     fn about() -> App {
         let mut app = settings_app("", SettingsRoute::About);
-        if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+        if let Some(mut window) = app.windows.get_mut(&WindowId(0)) {
             window.cols = 140;
             window.rows = 100;
         }

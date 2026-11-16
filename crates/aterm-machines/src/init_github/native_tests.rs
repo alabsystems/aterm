@@ -2509,6 +2509,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
                 anchor: client::Anchor::Keep,
                 fleet_reads_anchors: false,
                 read_as: None,
+                settles: None,
             },
             client::OnBusy::Refuse(std::time::Instant::now() + std::time::Duration::from_secs(60))
         )
@@ -3280,7 +3281,13 @@ fn a_native_repository_batch_respects_late_stop_but_not_an_explicit_older_hold()
 fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs() {
     use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
     for ordinary in [false, true] {
-        for changed in ["unrelated", "token", "inventory", "missing"] {
+        for changed in [
+            "unrelated",
+            "token",
+            "inventory",
+            "missing",
+            "unrelated-path",
+        ] {
             let root = aterm_tempfile::tempdir().unwrap();
             let home = root.path().join("home");
             let source = root.path().join("team.secrets");
@@ -3354,6 +3361,11 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
                             .filter(|line| !line.starts_with("github-repositories.json="))
                             .collect::<Vec<_>>()
                             .join("\n"),
+                        "unrelated-path" => {
+                            std::fs::create_dir_all(syncing.home.join(".config/gh/hosts.yml"))
+                                .unwrap();
+                            format!("{source_text}~/.config/gh/hosts.yml=cannot-materialize\n")
+                        }
                         _ => unreachable!(),
                     };
                     aterm_uds::atomic_file::write(&source, next.as_bytes(), 0o600).unwrap();
@@ -3379,7 +3391,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
                 )
                 .unwrap()
             };
-            let published = changed == "unrelated";
+            let published = matches!(changed, "unrelated" | "unrelated-path");
             assert_eq!(
                 stage(&rows).outcome == crate::model::Outcome::Changed,
                 published,
@@ -4131,8 +4143,8 @@ fn a_repository_the_disk_has_no_room_for_is_not_cloned() {
             assert_eq!(
                 why,
                 "1 repository not cloned, for want of disk space: ~/huge (about 10 GiB); \
-                 /System/Volumes/Data has 12 GiB free and keeps 8 GiB free; free space, \
-                 then press Check again in System State, or launch aterm again"
+                 /System/Volumes/Data has 12 GiB free and keeps 8 GiB free; press Check \
+                 again in System State, or launch aterm again"
             );
             assert!(!tried, "{:?}", sys.calls());
         } else {

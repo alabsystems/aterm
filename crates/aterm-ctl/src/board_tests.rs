@@ -3,6 +3,8 @@
 
 use super::*;
 
+/// A board in a scratch state folder: Unix keeps one alone (`Board::bind`).
+#[cfg(unix)]
 fn scratch() -> (aterm_tempfile::TempDir, Board) {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let board = Board::in_state(dir.path());
@@ -10,6 +12,7 @@ fn scratch() -> (aterm_tempfile::TempDir, Board) {
 }
 
 /// An hour ago, plus `ms`: a row started then is fresh, never pruned.
+#[cfg(unix)]
 fn at(ms: u64) -> u64 {
     now_ms() - 3_600_000 + ms
 }
@@ -27,7 +30,7 @@ fn worker(sid: &str, label: &str, started_ms: u64) -> Row {
 
 #[test]
 fn a_row_reads_back_as_it_was_written_its_values_escaped() {
-    let mut row = worker("s-0a1", "EW-24", 1_000);
+    let mut row = worker("t0a1xxxxxxx", "EW-24", 1_000);
     row.why = Some("tests red: 3 of 40".to_owned());
     row.checked = Some("0123456789ab@origin/main".to_owned());
     row.accept_ms = Some(9);
@@ -45,25 +48,25 @@ fn a_row_reads_back_as_it_was_written_its_values_escaped() {
 
 #[test]
 fn a_row_keeps_a_later_aterms_key_and_state_and_refuses_a_bad_row() {
-    let line = format!("{} after_three=x%20y", worker("s-0a1", "L", 1).line());
+    let line = format!("{} after_three=x%20y", worker("t0a1xxxxxxx", "L", 1).line());
     let mut row = Row::parse(&line).expect("a later key");
     assert_eq!(row.extra, [("after_three".to_owned(), "x%20y".to_owned())]);
     assert_eq!(row.line(), line, "written back as it was read");
-    assert!(row.merge("@s-0a1 rev=2 state=done conclusion=finished", 5));
+    assert!(row.merge("@t0a1xxxxxxx rev=2 state=done conclusion=finished", 5));
     assert!(
         row.line().ends_with(" after_three=x%20y"),
         "a merge keeps it"
     );
-    let later = Row::parse("sid=s-0a1 state=starting").expect("a later state");
+    let later = Row::parse("sid=t0a1xxxxxxx state=starting").expect("a later state");
     assert!(later.is_open(), "a state this aterm does not know is open");
     for bad in [
-        "sid=s-0a1 state=working sid=s-0a2",
+        "sid=t0a1xxxxxxx state=working sid=t0a2xxxxxxx",
         "sid=nope state=working",
-        "sid=s-0a1 state=a/b",
-        "sid=s-0a1",
-        "sid=s-0a1 state=working rev=x",
-        "sid=s-0a1 state=working loose",
-        "sid=s-0a1 state=working a/b=c",
+        "sid=t0a1xxxxxxx state=a/b",
+        "sid=t0a1xxxxxxx",
+        "sid=t0a1xxxxxxx state=working rev=x",
+        "sid=t0a1xxxxxxx state=working loose",
+        "sid=t0a1xxxxxxx state=working a/b=c",
     ] {
         assert!(Row::parse(bad).is_err(), "{bad} is refused");
     }
@@ -95,26 +98,29 @@ fn a_row_names_its_tab_by_its_id_in_either_form() {
 
 #[test]
 fn a_live_answer_moves_a_row_forward_never_back() {
-    let mut row = worker("s-0a1", "L", 1);
+    let mut row = worker("t0a1xxxxxxx", "L", 1);
     assert!(row.merge(
-        "@s-0a1 rev=3 state=working agent=claude attention=- result_bytes=0",
+        "@t0a1xxxxxxx rev=3 state=working agent=claude attention=- result_bytes=0",
         10
     ));
     assert_eq!((row.rev, row.heard_ms), (3, Some(10)));
     assert!(
-        !row.merge("@s-0a1 rev=2 state=done agent=claude result_bytes=9", 11),
+        !row.merge(
+            "@t0a1xxxxxxx rev=2 state=done agent=claude result_bytes=9",
+            11
+        ),
         "an older revision changes nothing"
     );
     assert_eq!(row.state, "working");
     assert!(row.merge(
-        "@s-0a1 rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
+        "@t0a1xxxxxxx rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
         12
     ));
     assert_eq!(row.conclusion.as_deref(), Some("finished"));
     assert_eq!(row.landed.as_deref(), Some("0123456789ab"));
     assert!(
         !row.merge(
-            "@s-0a1 rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
+            "@t0a1xxxxxxx rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
             13
         ),
         "the same answer again changes nothing but when it was heard"
@@ -124,23 +130,23 @@ fn a_live_answer_moves_a_row_forward_never_back() {
 
 #[test]
 fn a_closed_answer_always_lands_and_keeps_what_the_board_knew() {
-    let mut row = worker("s-0a1", "L", 1);
+    let mut row = worker("t0a1xxxxxxx", "L", 1);
     row.merge(
-        "@s-0a1 rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
+        "@t0a1xxxxxxx rev=5 state=done conclusion=finished checked=0123456789ab@origin/main",
         2,
     );
-    assert!(row.merge("@s-0a1 rev=0 state=closed agent=- result_bytes=0", 3));
+    assert!(row.merge("@t0a1xxxxxxx rev=0 state=closed agent=- result_bytes=0", 3));
     assert_eq!(row.state, "closed");
     assert_eq!(row.rev, 5, "a closed row's revision never goes back");
     assert_eq!(row.conclusion.as_deref(), Some("finished"));
     assert_eq!(row.checked.as_deref(), Some("0123456789ab@origin/main"));
     assert_eq!(row.landed.as_deref(), Some("0123456789ab"));
     assert!(
-        !row.merge("@s-0a1 rev=4 state=working", 4),
+        !row.merge("@t0a1xxxxxxx rev=4 state=working", 4),
         "an older live row does not reopen it"
     );
     assert!(
-        row.merge("@s-0a1 rev=5 state=working why=restored", 5),
+        row.merge("@t0a1xxxxxxx rev=5 state=working why=restored", 5),
         "a worker read as gone that answers again (its tab restored) is open again"
     );
     assert_eq!(row.state, "working");
@@ -150,8 +156,8 @@ fn a_closed_answer_always_lands_and_keeps_what_the_board_knew() {
         "its landing stands"
     );
 
-    let mut gone = worker("s-0a2", "L", 1);
-    gone.merge("@s-0a2 rev=0 state=closed", 2);
+    let mut gone = worker("t0a2xxxxxxx", "L", 1);
+    gone.merge("@t0a2xxxxxxx rev=0 state=closed", 2);
     assert_eq!(
         gone.conclusion.as_deref(),
         Some("failed"),
@@ -163,14 +169,17 @@ fn a_closed_answer_always_lands_and_keeps_what_the_board_knew() {
 #[cfg(unix)]
 fn required_board_accept_waits_for_its_native_writer() {
     let (_dir, board) = scratch();
-    let row = worker("s-0a1", "queued-accept", at(1));
+    let row = worker("t0a1xxxxxxx", "queued-accept", at(1));
     board.record(&row).unwrap();
     board
-        .record(&worker("s-0b2", "queued-accept", at(2)))
+        .record(&worker("t0b2xxxxxxx", "queued-accept", at(2)))
         .unwrap();
     let bound = board.bind(true).unwrap();
     let accepted_at = at(3);
-    for (who, sid) in [("@s-0a1", "s-0a1"), ("queued-accept", "s-0b2")] {
+    for (who, sid) in [
+        ("@t0a1xxxxxxx", "t0a1xxxxxxx"),
+        ("queued-accept", "t0b2xxxxxxx"),
+    ] {
         let mut expected = board.row(sid).unwrap();
         expected.accept = Some("passed".to_owned());
         expected.accept_ms = Some(accepted_at);
@@ -205,55 +214,66 @@ fn required_board_accept_waits_for_its_native_writer() {
     assert_eq!(board.scan().rows, before);
     drop(held);
     let fresh = board.accept("queued-accept", "fresh", at(5)).unwrap();
-    assert_eq!(fresh.sid, "s-0b2");
+    assert_eq!(fresh.sid, "t0b2xxxxxxx");
     assert_eq!(fresh.accept.as_deref(), Some("fresh"));
-    assert_eq!(board.row("s-0b2").unwrap(), fresh);
+    assert_eq!(board.row("t0b2xxxxxxx").unwrap(), fresh);
     assert_eq!(
-        board.accept("@s-0ff", "passed", at(6)).unwrap_err().kind(),
+        board
+            .accept("@t0ffxxxxxxx", "passed", at(6))
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::NotFound
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_board_records_reads_merges_and_accepts_its_rows() {
     let (_dir, board) = scratch();
     assert_eq!(board.scan(), Scan::default(), "no folder is an empty board");
     board
-        .record(&worker("s-0b2", "EW-19", at(2_000)))
+        .record(&worker("t0b2xxxxxxx", "EW-19", at(2_000)))
         .expect("record");
     board
-        .record(&worker("s-0a1", "EW-24", at(1_000)))
+        .record(&worker("t0a1xxxxxxx", "EW-24", at(1_000)))
         .expect("record");
     let scan = board.scan();
     let sids: Vec<&str> = scan.rows.iter().map(|r| r.sid.as_str()).collect();
-    assert_eq!(sids, ["s-0a1", "s-0b2"], "oldest first");
+    assert_eq!(sids, ["t0a1xxxxxxx", "t0b2xxxxxxx"], "oldest first");
 
     let seen = vec![
-        "@s-0a1 rev=4 state=done conclusion=finished checked=0123456789ab@origin/main".to_owned(),
-        "@s-0ff rev=1 state=working".to_owned(),
+        "@t0a1xxxxxxx rev=4 state=done conclusion=finished checked=0123456789ab@origin/main"
+            .to_owned(),
+        "@t0ffxxxxxxx rev=1 state=working".to_owned(),
     ];
     assert_eq!(board.apply(&seen, 5_000).expect("apply"), 1);
     assert!(
-        board.row("s-0ff").is_none(),
+        board.row("t0ffxxxxxxx").is_none(),
         "a worker the board did not start is not added"
     );
-    let row = board.row("s-0a1").expect("row");
+    let row = board.row("t0a1xxxxxxx").expect("row");
     assert_eq!(row.landed.as_deref(), Some("0123456789ab"));
 
     board
-        .record(&worker("s-0c3", "EW-24", at(3_000)))
+        .record(&worker("t0c3xxxxxxx", "EW-24", at(3_000)))
         .expect("record");
     let accepted = board.accept("EW-24", "passed", 6_000).expect("accept");
-    assert_eq!(accepted.sid, "s-0c3", "a label names its newest row");
+    assert_eq!(accepted.sid, "t0c3xxxxxxx", "a label names its newest row");
     assert_eq!(
-        board.row("s-0c3").expect("row").accept.as_deref(),
+        board.row("t0c3xxxxxxx").expect("row").accept.as_deref(),
         Some("passed")
     );
     assert_eq!(
-        board.accept("@s-0a1", "failed", 7_000).expect("by sid").sid,
-        "s-0a1"
+        board
+            .accept("@t0a1xxxxxxx", "failed", 7_000)
+            .expect("by sid")
+            .sid,
+        "t0a1xxxxxxx"
     );
-    assert!(board.accept("@s-0ff", "passed", 1).is_err(), "no such row");
+    assert!(
+        board.accept("@t0ffxxxxxxx", "passed", 1).is_err(),
+        "no such row"
+    );
     assert!(board.accept("EW-24", "pass ed", 1).is_err(), "no such word");
 }
 
@@ -262,11 +282,17 @@ fn a_board_records_reads_merges_and_accepts_its_rows() {
 fn a_board_never_reads_a_loose_file_and_counts_it() {
     use std::os::unix::fs::PermissionsExt;
     let (_dir, board) = scratch();
-    board.record(&worker("s-0a1", "L", at(1))).expect("record");
-    let loose = board.dir().join("s-0b2");
-    std::fs::write(&loose, worker("s-0b2", "L", at(2)).line()).expect("write");
+    board
+        .record(&worker("t0a1xxxxxxx", "L", at(1)))
+        .expect("record");
+    let loose = board.dir().join("t0b2xxxxxxx");
+    std::fs::write(&loose, worker("t0b2xxxxxxx", "L", at(2)).line()).expect("write");
     std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    std::fs::write(board.dir().join("s-0c3"), "sid=s-0d4 state=working\n").expect("write");
+    std::fs::write(
+        board.dir().join("t0c3xxxxxxx"),
+        "sid=t0d4xxxxxxx state=working\n",
+    )
+    .expect("write");
     let scan = board.scan();
     assert_eq!(scan.rows.len(), 1);
     assert_eq!(
@@ -275,25 +301,26 @@ fn a_board_never_reads_a_loose_file_and_counts_it() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_board_prunes_rows_closed_a_week_or_unheard_a_month() {
     let (_dir, board) = scratch();
     let day = 24 * 3_600_000;
     let now = now_ms();
-    let mut closed = worker("s-0a1", "L", now - 9 * day);
+    let mut closed = worker("t0a1xxxxxxx", "L", now - 9 * day);
     closed.state = "closed".to_owned();
     closed.heard_ms = Some(now - 8 * day);
-    let mut fresh_closed = worker("s-0a2", "L", now - 9 * day);
+    let mut fresh_closed = worker("t0a2xxxxxxx", "L", now - 9 * day);
     fresh_closed.state = "closed".to_owned();
     fresh_closed.heard_ms = Some(now - day);
-    let unheard = worker("s-0a3", "L", now - 31 * day);
-    let open = worker("s-0a4", "L", now - 20 * day);
+    let unheard = worker("t0a3xxxxxxx", "L", now - 31 * day);
+    let open = worker("t0a4xxxxxxx", "L", now - 20 * day);
     for row in [&closed, &fresh_closed, &unheard, &open] {
         board.record(row).expect("record");
     }
     board.prune();
     let sids: Vec<String> = board.scan().rows.into_iter().map(|r| r.sid).collect();
-    assert_eq!(sids, ["s-0a4", "s-0a2"], "oldest first");
+    assert_eq!(sids, ["t0a4xxxxxxx", "t0a2xxxxxxx"], "oldest first");
 }
 
 #[cfg(unix)]
@@ -358,7 +385,7 @@ fn an_idle_keeper_is_due_at_its_next_prune_ask_or_backoff() {
         at + KEEP_PRUNE_EVERY,
         "an idle board is due at its prune"
     );
-    closed_asked.insert("s-0b1".to_owned(), at + CLOSED_ASKED_EVERY);
+    closed_asked.insert("t0b1xxxxxxx".to_owned(), at + CLOSED_ASKED_EVERY);
     assert_eq!(
         next_due(at, Some(at), &closed_asked, &backoff, None),
         at + CLOSED_ASKED_EVERY
@@ -440,7 +467,7 @@ fn a_keeper_settles_what_its_board_owes_a_period_after_and_every_period_after() 
 #[test]
 fn a_resting_keeper_wakes_when_its_board_is_written() {
     let (_dir, board) = scratch();
-    let mut row = worker("s-0c1", "L", now_ms());
+    let mut row = worker("t0c1xxxxxxx", "L", now_ms());
     board.record(&row).expect("the initial row and lock exist");
     let lock = aterm_uds::file_watch::FileStamp::of(&board.dir().join(LOCK));
     let mut rest = Rest::new(board.dir());
@@ -495,7 +522,7 @@ fn a_rearmed_board_watch_requires_a_fresh_snapshot_after_creation() {
     assert!(board.scan().rows.is_empty());
     assert!(!rest.until(std::time::Instant::now()), "no folder to watch");
 
-    let row = worker("s-0d1", "L", now_ms());
+    let row = worker("t0d1xxxxxxx", "L", now_ms());
     board.record(&row).expect("write before the watch exists");
     let mut rest = rearmed_without_another_write(
         rest,
@@ -519,7 +546,7 @@ fn a_rearmed_board_watch_requires_a_fresh_snapshot_after_replacement() {
     assert!(rest.until(std::time::Instant::now()), "the watch is gone");
     assert!(board.scan().rows.is_empty());
 
-    let row = worker("s-0d2", "L", now_ms());
+    let row = worker("t0d2xxxxxxx", "L", now_ms());
     board
         .record(&row)
         .expect("write before the replacement watch");
@@ -547,7 +574,7 @@ fn a_board_watch_hears_replacement_of_its_state_directory() {
 
     let previous = root.path().join("previous-state");
     std::fs::rename(&state, &previous).expect("move the state ancestor");
-    let row = worker("s-0e1", "L", now_ms());
+    let row = worker("t0e1xxxxxxx", "L", now_ms());
     board
         .record(&row)
         .expect("write into the replacement board");
@@ -569,7 +596,7 @@ fn a_board_watch_hears_replacement_of_its_state_directory() {
         "the new path is armed"
     );
 
-    let later = worker("s-0e2", "L", now_ms());
+    let later = worker("t0e2xxxxxxx", "L", now_ms());
     board.record(&later).expect("write after recovery");
     let _rest = rearmed_without_another_write(rest, "a later write at the new path is heard");
     let mut rows = board.scan().rows;
@@ -605,7 +632,7 @@ fn a_spawned_row_keeps_the_brief_by_digest_never_its_text() {
         .map(|s| (*s).to_owned())
         .collect();
     let row = spawned(
-        "s-0a1",
+        "t0a1xxxxxxx",
         Placed {
             node: Some("ab".repeat(16)),
             host: Some("m100".to_owned()),
@@ -613,7 +640,7 @@ fn a_spawned_row_keeps_the_brief_by_digest_never_its_text() {
         },
         Some("EW-24".to_owned()),
         (&args, task),
-        Some("s-0d1"),
+        Some("t0d1xxxxxxx"),
         42,
     );
     let line = row.line();
@@ -623,7 +650,7 @@ fn a_spawned_row_keeps_the_brief_by_digest_never_its_text() {
     assert_eq!(row.program.as_deref(), Some("claude"));
     assert_eq!(row.model.as_deref(), Some("opus"));
     assert_eq!(row.autopilot.as_deref(), Some("land"), "a worker's default");
-    assert_eq!(row.from.as_deref(), Some("s-0d1"));
+    assert_eq!(row.from.as_deref(), Some("t0d1xxxxxxx"));
     assert_eq!((row.state.as_str(), row.rev), ("working", 0));
 }
 
@@ -635,7 +662,14 @@ fn a_program_workers_row_names_its_program_and_no_autopilot() {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-    let row = spawned("s-0a2", Placed::default(), None, (&args, b"t"), None, 42);
+    let row = spawned(
+        "t0a2xxxxxxx",
+        Placed::default(),
+        None,
+        (&args, b"t"),
+        None,
+        42,
+    );
     assert_eq!(row.program.as_deref(), Some("/opt/my tools/run"));
     assert_eq!(row.autopilot, None);
     assert_eq!(row.model, None);
@@ -655,13 +689,14 @@ fn brief_digest_is_sha256() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_board_reply_reads_back_as_rows_lines_and_json() {
     let (_dir, board) = scratch();
     board
-        .record(&worker("s-0a1", "EW-24", at(1)))
+        .record(&worker("t0a1xxxxxxx", "EW-24", at(1)))
         .expect("record");
-    let mut closed = worker("s-0b2", "EW-19", at(2));
+    let mut closed = worker("t0b2xxxxxxx", "EW-19", at(2));
     closed.state = "closed".to_owned();
     board.record(&closed).expect("record");
     let text = reply(&board.scan(), Some("m14 mini"));
@@ -686,19 +721,19 @@ fn a_board_reply_reads_back_as_rows_lines_and_json() {
     );
     assert!(json.contains("\"cwd\":\"/Users//a b/repo\""), "{json}");
     assert!(json.contains("\"label\":\"EW-19\""), "{json}");
-    assert!(parse_reply(&["worker sid=s-0a1 state=working".to_owned()]).is_err());
+    assert!(parse_reply(&["worker sid=t0a1xxxxxxx state=working".to_owned()]).is_err());
     assert!(parse_reply(&["board rows=0".to_owned(), "nope".to_owned()]).is_err());
 }
 
 #[test]
 fn a_wait_row_of_the_board_says_it_was_read_off_the_board() {
-    let mut row = worker("s-0a1", "EW-24", 1);
+    let mut row = worker("t0a1xxxxxxx", "EW-24", 1);
     row.rev = 4;
     row.state = "done".to_owned();
     row.conclusion = Some("finished".to_owned());
     assert_eq!(
         row.await_row(),
-        "@s-0a1 rev=4 state=done agent=- program_state=- attention=- result_bytes=0 \
+        "@t0a1xxxxxxx rev=4 state=done agent=- program_state=- attention=- result_bytes=0 \
          conclusion=finished read=board"
     );
     assert_eq!(row.wait_tail(Some("m14")), " label=EW-24 host=m100");
@@ -715,12 +750,12 @@ fn a_read_shows_every_open_row_before_any_closed_one() {
             row
         })
         .collect();
-    rows.insert(0, worker("s-0a1", "oldest-open", 1));
+    rows.insert(0, worker("t0a1xxxxxxx", "oldest-open", 1));
     let scan = Scan { rows, unread: 0 };
     let shown = shown(&scan);
     assert_eq!(shown.len(), SHOWN_MAX);
     assert_eq!(
-        shown[0].sid, "s-0a1",
+        shown[0].sid, "t0a1xxxxxxx",
         "the oldest row, open, is shown, oldest first"
     );
     assert!(
@@ -733,11 +768,11 @@ fn a_read_shows_every_open_row_before_any_closed_one() {
 fn a_filter_takes_a_dispatchers_rows_and_a_labels() {
     let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     let (kept, filter) =
-        Filter::take(&words(&["--json", "from=@s-0d1", "label=EW-*"])).expect("take");
+        Filter::take(&words(&["--json", "from=@t0d1xxxxxxx", "label=EW-*"])).expect("take");
     assert_eq!(kept, words(&["--json"]));
-    assert_eq!(filter.from.as_deref(), Some("s-0d1"));
-    let mut row = worker("s-0a1", "EW-24", 1);
-    row.from = Some("s-0d1".to_owned());
+    assert_eq!(filter.from.as_deref(), Some("t0d1xxxxxxx"));
+    let mut row = worker("t0a1xxxxxxx", "EW-24", 1);
+    row.from = Some("t0d1xxxxxxx".to_owned());
     assert!(row.matches(&filter));
     assert!(row.matches(&Filter::default()));
     let exact = Filter {
@@ -745,10 +780,10 @@ fn a_filter_takes_a_dispatchers_rows_and_a_labels() {
         ..Filter::default()
     };
     assert!(!row.matches(&exact), "a label without `*` names one label");
-    row.from = Some("s-0d2".to_owned());
+    row.from = Some("t0d2xxxxxxx".to_owned());
     assert!(!row.matches(&filter), "another dispatcher's");
     for bad in [
-        &["from=s-0d1", "from=s-0d2"][..],
+        &["from=t0d1xxxxxxx", "from=t0d2xxxxxxx"][..],
         &["from=nope"],
         &["label=a/b"],
         &["label=a", "label=b"],
@@ -762,21 +797,27 @@ fn a_filter_takes_a_dispatchers_rows_and_a_labels() {
 /// asker's edge never outranks the worker's own rev when it answers again.
 #[test]
 fn a_closed_row_keeps_when_it_closed_and_its_own_rev() {
-    let mut row = worker("s-0a1", "L", 1);
-    assert!(row.merge("@s-0a1 rev=3 state=working", 10));
-    assert!(row.merge("@s-0a1 rev=10 state=closed agent=- result_bytes=0", 20));
+    let mut row = worker("t0a1xxxxxxx", "L", 1);
+    assert!(row.merge("@t0a1xxxxxxx rev=3 state=working", 10));
+    assert!(row.merge(
+        "@t0a1xxxxxxx rev=10 state=closed agent=- result_bytes=0",
+        20
+    ));
     assert_eq!(
         (row.rev, row.heard_ms),
         (3, Some(20)),
         "closed at 20, rev 3"
     );
     assert!(
-        !row.merge("@s-0a1 rev=10 state=closed agent=- result_bytes=0", 30),
+        !row.merge(
+            "@t0a1xxxxxxx rev=10 state=closed agent=- result_bytes=0",
+            30
+        ),
         "gone again is no news"
     );
     assert_eq!(row.heard_ms, Some(20), "and not hearing from it");
     assert!(
-        row.merge("@s-0a1 rev=3 state=working why=restored", 40),
+        row.merge("@t0a1xxxxxxx rev=3 state=working why=restored", 40),
         "its tab restored at its own rev reopens it"
     );
     assert_eq!((row.state.as_str(), row.heard_ms), ("working", Some(40)));
@@ -787,16 +828,16 @@ fn a_closed_row_keeps_when_it_closed_and_its_own_rev() {
 /// conclusion: the regression the board's own rev on every closed row was.
 #[test]
 fn a_closed_row_its_mac_answered_is_not_reopened_by_an_older_read() {
-    let mut row = worker("s-0a1", "L", 1);
-    assert!(row.merge("@s-0a1 rev=5 state=working task_news=0", 10));
+    let mut row = worker("t0a1xxxxxxx", "L", 1);
+    assert!(row.merge("@t0a1xxxxxxx rev=5 state=working task_news=0", 10));
     assert!(row.merge(
-        "@s-0a1 rev=6 state=closed agent=- program_state=- attention=- result_bytes=0 \
+        "@t0a1xxxxxxx rev=6 state=closed agent=- program_state=- attention=- result_bytes=0 \
          conclusion=finished checked=0123456789ab@origin/main task_news=1",
         20
     ));
     assert_eq!(row.rev, 6);
     assert!(
-        !row.merge("@s-0a1 rev=5 state=working task_news=0", 30),
+        !row.merge("@t0a1xxxxxxx rev=5 state=working task_news=0", 30),
         "a read from before the close changes nothing"
     );
     assert_eq!(
@@ -812,18 +853,18 @@ fn a_closed_row_its_mac_answered_is_not_reopened_by_an_older_read() {
 /// board's rev carries its own.
 #[test]
 fn a_close_built_from_an_older_row_keeps_the_boards_newer_words() {
-    let mut row = worker("s-0a1", "L", 1);
+    let mut row = worker("t0a1xxxxxxx", "L", 1);
     assert!(row.merge(
-        "@s-0a1 rev=5 state=done conclusion=finished why=landed \
+        "@t0a1xxxxxxx rev=5 state=done conclusion=finished why=landed \
          checked=0123456789ab@origin/main task_news=1",
         10
     ));
     assert!(row.merge(
-        "@s-0a1 rev=7 state=failed conclusion=failed why=could-not-finish task_news=1",
+        "@t0a1xxxxxxx rev=7 state=failed conclusion=failed why=could-not-finish task_news=1",
         20
     ));
     assert!(row.merge(
-        "@s-0a1 rev=5 state=closed agent=- program_state=- attention=- result_bytes=0 \
+        "@t0a1xxxxxxx rev=5 state=closed agent=- program_state=- attention=- result_bytes=0 \
          conclusion=finished why=landed checked=0123456789ab@origin/main task_news=1",
         30
     ));
@@ -843,13 +884,13 @@ fn a_close_built_from_an_older_row_keeps_the_boards_newer_words() {
         "a landing read once stands"
     );
 
-    let mut row = worker("s-0a2", "L", 1);
+    let mut row = worker("t0a2xxxxxxx", "L", 1);
     assert!(row.merge(
-        "@s-0a2 rev=7 state=failed conclusion=failed why=could-not-finish task_news=1",
+        "@t0a2xxxxxxx rev=7 state=failed conclusion=failed why=could-not-finish task_news=1",
         10
     ));
     assert!(row.merge(
-        "@s-0a2 rev=7 state=closed agent=- program_state=- attention=- result_bytes=0 \
+        "@t0a2xxxxxxx rev=7 state=closed agent=- program_state=- attention=- result_bytes=0 \
          conclusion=failed why=exit task_news=1",
         20
     ));
@@ -861,29 +902,33 @@ fn a_close_built_from_an_older_row_keeps_the_boards_newer_words() {
 
 /// The regression: the keeper re-asked a closed row every ten minutes and each `gone` answer
 /// moved `heard_ms`, so the row was asked forever and never pruned.
+#[cfg(unix)]
 #[test]
 fn a_board_prunes_a_closed_row_a_keeper_keeps_reading_as_gone() {
     let (_dir, board) = scratch();
     let day = 24 * 3_600_000;
     let now = now_ms();
-    let mut row = worker("s-0a1", "L", now - 9 * day);
+    let mut row = worker("t0a1xxxxxxx", "L", now - 9 * day);
     row.state = "closed".to_owned();
     row.heard_ms = Some(now - 6 * day);
     row.conclusion = Some("failed".to_owned());
     board.record(&row).expect("record");
     // Two days on, the keeper reads it gone again.
     let later = now + 2 * day;
-    let gone = ["@s-0a1 rev=0 state=closed agent=- result_bytes=0".to_owned()];
+    let gone = ["@t0a1xxxxxxx rev=0 state=closed agent=- result_bytes=0".to_owned()];
     assert_eq!(board.apply(&gone, later).expect("apply"), 0);
     assert_eq!(
-        board.row("s-0a1").expect("still there").heard_ms,
+        board.row("t0a1xxxxxxx").expect("still there").heard_ms,
         Some(now - 6 * day),
         "a re-ask that reads it gone leaves when it closed"
     );
     let bound = board.bind(false).expect("bound board");
     let _lock = bound.lock().expect("the board's lock");
     bound.prune_locked(later);
-    assert!(board.row("s-0a1").is_none(), "closed over a week: pruned");
+    assert!(
+        board.row("t0a1xxxxxxx").is_none(),
+        "closed over a week: pruned"
+    );
 }
 
 #[cfg(unix)]
@@ -921,16 +966,22 @@ fn a_lone_dash_is_no_label_and_no_accept_word() {
     let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     assert!(take_label(&words(&["agent=claude", "label=-"])).is_err());
     assert!(take_label(&words(&["agent=claude", "label=a-"])).is_ok());
-    let (_dir, board) = scratch();
-    board.record(&worker("s-0a1", "L", at(1))).expect("record");
-    assert!(board.accept("@s-0a1", "-", at(2)).is_err());
-    assert!(board.accept("-", "passed", at(2)).is_err());
+    // Only Unix keeps a board (`Board::bind`).
+    #[cfg(unix)]
+    {
+        let (_dir, board) = scratch();
+        board
+            .record(&worker("t0a1xxxxxxx", "L", at(1)))
+            .expect("record");
+        assert!(board.accept("@t0a1xxxxxxx", "-", at(2)).is_err());
+        assert!(board.accept("-", "passed", at(2)).is_err());
+    }
     assert!(Filter::take(&words(&["label=-"])).is_err());
 }
 
 #[test]
 fn no_byte_another_mac_sends_reaches_a_terminal_as_sent() {
-    let sent = "sid=s-0a1 state=working later=\u{1b}]0;x\u{7}";
+    let sent = "sid=t0a1xxxxxxx state=working later=\u{1b}]0;x\u{7}";
     let row = Row::parse(sent).expect("a later key");
     assert!(
         !row.line().contains(['\u{1b}', '\u{7}']),
@@ -954,20 +1005,24 @@ fn no_byte_another_mac_sends_reaches_a_terminal_as_sent() {
 /// A wait writes only the rows of the Mac that answered it: one over this Mac's socket the
 /// rows of its own workers, one a person aimed at a Mac nothing, one that asked each worker
 /// where its row says it runs every row it answered.
+#[cfg(unix)]
 #[test]
 fn a_wait_writes_only_rows_of_the_mac_that_answered() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let _here = HereGuard::at(dir.path());
     let board = Board::at(dir.path());
-    let mut local = worker("s-0a1", "L", at(1));
+    let mut local = worker("t0a1xxxxxxx", "L", at(1));
     local.node = None;
     board.record(&local).expect("record");
-    board.record(&worker("s-0a2", "R", at(2))).expect("record");
+    board
+        .record(&worker("t0a2xxxxxxx", "R", at(2)))
+        .expect("record");
     let seen = [
-        "@s-0a1 rev=4 state=done conclusion=finished".to_owned(),
-        "@s-0a2 rev=4 state=closed conclusion=finished checked=0123456789ab@origin/main".to_owned(),
+        "@t0a1xxxxxxx rev=4 state=done conclusion=finished".to_owned(),
+        "@t0a2xxxxxxx rev=4 state=closed conclusion=finished checked=0123456789ab@origin/main"
+            .to_owned(),
     ];
-    let states = || ["s-0a1", "s-0a2"].map(|sid| board.row(sid).expect("a row").state);
+    let states = || ["t0a1xxxxxxx", "t0a2xxxxxxx"].map(|sid| board.row(sid).expect("a row").state);
     apply_seen(&seen, Writes::Nothing);
     assert_eq!(states(), ["working", "working"]);
     apply_seen(&seen, Writes::Here);
@@ -989,11 +1044,11 @@ fn a_keeper_lease_binds_reads_merges_and_pruning_to_its_locked_directory() {
     let state = scratch.path().join("state");
     let retired = scratch.path().join("retired");
     let board = Board::in_state(&state);
-    let original = worker("s-0a1", "original", at(1));
+    let original = worker("t0a1xxxxxxx", "original", at(1));
     board.record(&original).unwrap();
     let held = board.keeper_lock().unwrap();
     std::fs::rename(&state, &retired).unwrap();
-    let replacement = worker("s-0a1", "replacement", at(2));
+    let replacement = worker("t0a1xxxxxxx", "replacement", at(2));
     board.record(&replacement).unwrap();
     let new_keeper = board.keeper_lock().unwrap();
     assert!(!held.board.is_current());
@@ -1002,31 +1057,31 @@ fn a_keeper_lease_binds_reads_merges_and_pruning_to_its_locked_directory() {
         held.board.scan().rows.as_slice(),
         std::slice::from_ref(&original)
     );
-    let read = held.board.row("s-0a1").unwrap();
+    let read = held.board.row("t0a1xxxxxxx").unwrap();
     assert_eq!(read, original);
     assert_eq!(
         held.board
             .apply(
-                &["@s-0a1 rev=3 state=done conclusion=finished".to_owned()],
+                &["@t0a1xxxxxxx rev=3 state=done conclusion=finished".to_owned()],
                 now_ms()
             )
             .unwrap(),
         1
     );
     let old_board = Board::in_state(&retired);
-    let updated = old_board.row("s-0a1").unwrap();
+    let updated = old_board.row("t0a1xxxxxxx").unwrap();
     assert_eq!(updated.rev, 3);
     assert_eq!(updated.label, original.label);
     assert_eq!(updated.started_ms, original.started_ms);
-    assert_eq!(board.row("s-0a1").unwrap(), replacement);
+    assert_eq!(board.row("t0a1xxxxxxx").unwrap(), replacement);
     assert!(
         old_board.keeper_lock().is_none(),
         "the old lease still owns the retired board"
     );
     let _writer = held.board.lock().unwrap();
     held.board.prune_locked(now_ms() + millis(UNHEARD_KEPT));
-    assert!(old_board.row("s-0a1").is_none());
-    assert_eq!(board.row("s-0a1").unwrap(), replacement);
+    assert!(old_board.row("t0a1xxxxxxx").is_none());
+    assert_eq!(board.row("t0a1xxxxxxx").unwrap(), replacement);
     drop((held, new_keeper));
     assert!(old_board.keeper_lock().is_some());
 }
@@ -1059,7 +1114,7 @@ fn a_preopened_keeper_waiter_rebinds_after_directory_replacement() {
         .recv_timeout(Duration::from_secs(60))
         .expect("waiter pre-opened the old lock");
     std::fs::rename(&state, &retired).unwrap();
-    let replacement = worker("s-0a1", "replacement", at(1));
+    let replacement = worker("t0a1xxxxxxx", "replacement", at(1));
     board.record(&replacement).unwrap();
     drop(first);
     let second = result
@@ -1086,14 +1141,14 @@ fn a_writer_transaction_keeps_its_directory_when_the_state_path_is_replaced() {
     let state = scratch.path().join("state");
     let retired = scratch.path().join("retired");
     let board = Board::in_state(&state);
-    let original = worker("s-0a1", "original", at(1));
+    let original = worker("t0a1xxxxxxx", "original", at(1));
     board.record(&original).unwrap();
     use std::os::unix::fs::MetadataExt as _;
     let transaction = board.bind(false).unwrap();
     let old_writer = transaction.lock().unwrap();
     std::fs::rename(&state, &retired).unwrap();
     let metadata = std::fs::metadata(retired.join(DIR).join(LOCK)).unwrap();
-    let replacement = worker("s-0a1", "replacement", at(2));
+    let replacement = worker("t0a1xxxxxxx", "replacement", at(2));
     board.record(&replacement).unwrap();
     let (events, first_event) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
@@ -1105,7 +1160,7 @@ fn a_writer_transaction_keeps_its_directory_when_the_state_path_is_replaced() {
                     events.send(Some((metadata.dev(), metadata.ino()))).unwrap();
                 }
             },
-            || transaction.accept("@s-0a1", "passed", now_ms()),
+            || transaction.accept("@t0a1xxxxxxx", "passed", now_ms()),
         );
         // A wrong-directory lock would complete instead of contending: report that too,
         // so the failure is observed without using absence or a short timing threshold.
@@ -1125,11 +1180,11 @@ fn a_writer_transaction_keeps_its_directory_when_the_state_path_is_replaced() {
     assert_eq!(accepted.label, original.label);
     assert_eq!(
         Board::in_state(&retired)
-            .row("s-0a1")
+            .row("t0a1xxxxxxx")
             .unwrap()
             .accept
             .as_deref(),
         Some("passed")
     );
-    assert_eq!(board.row("s-0a1").unwrap(), replacement);
+    assert_eq!(board.row("t0a1xxxxxxx").unwrap(), replacement);
 }

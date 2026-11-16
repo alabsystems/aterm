@@ -10,12 +10,13 @@ use aterm_vitals::explain::episodes::CLAUSE_STALE_MS;
 use aterm_vitals::explain::{
     CauseId, Context, Evidence, Lead, Part, Role, Voucher, WhySubject, account_of,
 };
+use aterm_vitals::history::{WEEK_BUCKET_S, WEEK_BUCKETS};
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
-    CpuView, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
-    StripEventKind,
+    CpuView, DeedBy, DeedKind, DiskDeed, DiskFacts, HeatCell, LinkKind, Pressure, ProcScope,
+    Resource, ResourceView, Snapshot, StripEventKind,
 };
-use aterm_vitals::ring::{Cell, GapKind};
+use aterm_vitals::ring::{Agg, Cell, GapKind};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
 use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
@@ -39,7 +40,7 @@ pub(crate) enum Opened {
     Hover,
     /// A click pinned it.
     Pinned,
-    /// ⌘I: it takes ←/→/↑/↓, Return, ⌘C and Esc.
+    /// ⌘I: it takes ←/→/↑/↓, Return, ⌘C and Esc, and Tab in the Disk lens.
     Keyboard,
 }
 
@@ -51,6 +52,27 @@ pub(crate) struct Lens {
     /// The scope its lists show (↑/↓).
     pub(crate) bar: Bar,
     pub(crate) how: Opened,
+}
+
+/// Which span the Disk lens's used-space chart draws: Tab switches it in a lens that takes keys
+/// (`docs/DESIGN-disk-custody-2026-11-12.md` §4). Kept per window, never saved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum DiskSpan {
+    /// The last 24 hours, in 10-minute columns.
+    #[default]
+    Day,
+    /// The last 3 weeks, in 3-hour columns.
+    Weeks,
+}
+
+impl DiskSpan {
+    /// The span Tab switches to.
+    pub(crate) const fn other(self) -> Self {
+        match self {
+            Self::Day => Self::Weeks,
+            Self::Weeks => Self::Day,
+        }
+    }
 }
 
 /// A pointer rest armed over an instrument.
@@ -72,6 +94,8 @@ pub(crate) struct LensSlot {
     scope_tab: Option<crate::tab_model::TabId>,
     /// Stable peer/service selection within the Network State instrument.
     pub(crate) network_target: crate::network_deck::Target,
+    /// The span the Disk lens's used-space chart draws (Tab).
+    pub(crate) disk_span: DiskSpan,
     /// The open lens.
     pub(crate) open: Option<Lens>,
     /// A rest armed over an instrument.
@@ -711,6 +735,21 @@ impl<'a> Pen<'a> {
         }
     }
 
+    /// ⇥ (the Tab key) drawn as Lines, the faces lacking the glyph: an arrow to a bar, as wide as
+    /// [`Seg::TabKey`] with the gap after it.
+    fn tab_key(&mut self, x: f64, base: f64) -> f64 {
+        const L: f64 = 3.4;
+        const HW: f64 = 1.8;
+        let ink = rgba(self.inks.words2, 0xFF);
+        let yc = base - 3.0;
+        let tip = x + 1.0 + 2.0 * L;
+        self.line(x + 1.0, yc, tip, yc, ink);
+        self.line(tip, yc, tip - HW, yc - HW, ink);
+        self.line(tip, yc, tip - HW, yc + HW, ink);
+        self.line(tip + 1.0, yc - L, tip + 1.0, yc + L, ink);
+        12.0
+    }
+
     /// A cell's ink at `v`, the Deck's own ([`aterm_vitals::ink::VitalsInks::cell_at`]): the heat
     /// ramp's step for it.
     fn heat(&self, v: f32) -> Rgb {
@@ -867,10 +906,16 @@ struct Row {
 }
 
 impl Row {
+    /// Its words: its name, its scope and its figure, an empty figure left out.
     fn said(&self) -> String {
-        match &self.scope {
-            Some(scope) => format!("{} in {scope}, {}", self.name, self.figure),
-            None => format!("{}, {}", self.name, self.figure),
+        let named = match &self.scope {
+            Some(scope) => format!("{} in {scope}", self.name),
+            None => self.name.clone(),
+        };
+        if self.figure.is_empty() {
+            named
+        } else {
+            format!("{named}, {}", self.figure)
         }
     }
 }
@@ -920,21 +965,29 @@ fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], panes: &[u64]) {
     let lead = 10.0;
     let avail = (p.w - lead - fig_w - 8.0).max(0.0);
     let has_scope = rows.iter().any(|r| r.scope.is_some());
+    let has_share = rows.iter().any(|r| r.share.is_some());
     let longest = rows
         .iter()
         .map(|r| pen.width(&r.name, BODY_PT, false))
         .fold(0.0, f64::max);
-    let name_w = if has_scope || rows.iter().any(|r| r.share.is_some()) {
-        (longest + 10.0).clamp(60.0, 160.0).min(avail * 0.5)
+    // A list of scopes and no bars (What the software did) gives its names the bars' room.
+    let (name_w, scope_w) = if has_scope && !has_share {
+        let scope_w = (avail * 0.1).clamp(36.0, 52.0).min(avail);
+        ((avail - scope_w - 4.0).max(0.0), scope_w)
     } else {
-        avail
-    };
-    let scope_w = if has_scope {
-        (avail * 0.1)
-            .clamp(36.0, 52.0)
-            .min((avail - name_w - 4.0).max(0.0))
-    } else {
-        0.0
+        let name_w = if has_scope || has_share {
+            (longest + 10.0).clamp(60.0, 160.0).min(avail * 0.5)
+        } else {
+            avail
+        };
+        let scope_w = if has_scope {
+            (avail * 0.1)
+                .clamp(36.0, 52.0)
+                .min((avail - name_w - 4.0).max(0.0))
+        } else {
+            0.0
+        };
+        (name_w, scope_w)
     };
     let bar_x = p.x + lead + name_w + 4.0 + if has_scope { scope_w + 4.0 } else { 0.0 };
     let bar_w = p.x + p.w - fig_w - 8.0 - bar_x;
@@ -1056,6 +1109,11 @@ struct Trace {
     gaps: Vec<TraceGap>,
     /// Strip event markers within the trace window.
     events: Vec<TraceEvent>,
+    /// Removals the software made, at fractional bucket indices: a short tick under the axis each.
+    removals: Vec<f64>,
+    /// The span chosen, where the heading names the spans it can switch between (the Disk lens's
+    /// used-space chart); `None` where it names none.
+    chips: Option<DiskSpan>,
 }
 
 /// Maps `snap`'s discontinuity gaps and strip event markers onto fractional bucket coordinates of a
@@ -1455,6 +1513,58 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
         pen.text(lx, base, words, AXIS_PT, false, inks.words2);
         placed.push((lx, lx + lw));
     }
+    // Each removal: a short 1 pt tick in a strip under the axis, ending above the labels under
+    // it, so a removal reads by its shape and place and never by its heat alone; its ink is the
+    // words ink this ground solved.
+    for &at in &t.removals {
+        let fx = x0 + at * pitch;
+        if (x0..=x1).contains(&fx) {
+            pen.tick(fx, y1 + 1.0, y1 + 4.0, rgba(inks.words, 0xFF));
+        }
+    }
+}
+
+/// The span labels at a trace heading's right end, `24 h · 3 weeks`, the chosen one in the words
+/// ink and underlined, the other in the secondary ink (the key hint on line 1 names Tab, which
+/// switches them). Drawn only where they fit beside `name` and the first of `subs` that fits
+/// without them, so they never cost the heading its growth words, which keep the form they have
+/// without the labels. The width they take with their gap, else 0.
+fn span_chips(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String], chosen: DiskSpan) -> f64 {
+    const PAD: f64 = 4.0;
+    let spans = [(DiskSpan::Day, "24 h"), (DiskSpan::Weeks, "3 weeks")];
+    let dot_w = pen.width("\u{b7}", NOTE_PT, false);
+    let w = spans
+        .iter()
+        .map(|(_, s)| pen.width(s, NOTE_PT, false))
+        .sum::<f64>()
+        + dot_w
+        + 2.0 * PAD;
+    // What [`heading`] lays at the full width: its name, and the growth words that fit beside it.
+    let name_w = pen.width(&pen.cut(name, p.w, HEAD_PT, true), HEAD_PT, true);
+    let sub_w = first_fit(pen.m, subs, p.w - name_w - 8.0, NOTE_PT, false)
+        .map_or(0.0, |sub| 8.0 + pen.width(&sub, NOTE_PT, false));
+    if name_w + sub_w + 8.0 + w > p.w + EPS {
+        return 0.0;
+    }
+    let base = p.y + HEAD_BASE;
+    let inks = pen.inks;
+    let mut x = p.x + p.w - w;
+    for (k, (span, words)) in spans.into_iter().enumerate() {
+        if k > 0 {
+            x += pen.text(x + PAD, base, "\u{b7}", NOTE_PT, false, inks.words2) + 2.0 * PAD;
+        }
+        let ink = if span == chosen {
+            inks.words
+        } else {
+            inks.words2
+        };
+        let sw = pen.text(x, base, words, NOTE_PT, false, ink);
+        if span == chosen {
+            pen.rule(x, base + 2.0, sw, rgba(ink, 0xFF));
+        }
+        x += sw;
+    }
+    w + 8.0
 }
 
 /// A trace section.
@@ -1483,7 +1593,18 @@ fn trace_section<'d>(
         for &ch in heights {
             let (trace, subs, name) = (std::rc::Rc::clone(&trace), subs.clone(), name.to_owned());
             let draw = move |pen: &mut Pen<'_>, p: Place| {
-                heading(pen, p, &name, &subs);
+                let chips = trace
+                    .chips
+                    .map_or(0.0, |span| span_chips(pen, p, &name, &subs, span));
+                heading(
+                    pen,
+                    Place {
+                        w: p.w - chips,
+                        ..p
+                    },
+                    &name,
+                    &subs,
+                );
                 draw_trace(pen, p, &trace);
             };
             forms.push(if c.two {
@@ -1590,6 +1711,33 @@ fn growth_forms(r: &Rates) -> Vec<String> {
     }
 }
 
+/// Two days, ms: a trace's ages read in days from here.
+const TWO_DAYS_MS: i64 = 48 * 3_600_000;
+
+/// `at_ms` as its local day, `Oct 27`: month first, as the style guide's American usage writes a
+/// date.
+fn month_day(at_ms: i64, loc: &Locale) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let local_s = at_ms
+        .div_euclid(1000)
+        .saturating_add(loc.offset_at_ms(at_ms));
+    let (_, month, day) = aterm_types::rfc3339::civil_from_days(local_s.div_euclid(86_400));
+    let month = MONTHS[usize::try_from(month - 1).unwrap_or(0).min(11)];
+    format!("{month} {day}")
+}
+
+/// When a deed was done, as its row says it: the clock within 6 days (`10:30`, `Wed 10:30`), its
+/// day before that (`Oct 27`).
+fn deed_when(at_ms: i64, now_ms: i64, loc: &Locale) -> String {
+    if now_ms.saturating_sub(at_ms) < 6 * 86_400_000 {
+        loc.clock(at_ms, now_ms)
+    } else {
+        month_day(at_ms, loc)
+    }
+}
+
 /// A trace's sentence.
 fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale) -> String {
     let (start_ms, bucket_ms) = span;
@@ -1612,13 +1760,17 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
     let last = t.vals.iter().rev().flatten().next().copied().unwrap_or(v0);
     let ago = |i: usize| {
         let ms = (n - i) as i64 * bucket_ms;
-        let (k, one, many) = if ms >= 3_600_000 {
+        let (k, one, many) = if ms >= TWO_DAYS_MS {
+            ((ms as f64 / 86_400_000.0).round() as u64, "day", "days")
+        } else if ms >= 3_600_000 {
             ((ms as f64 / 3_600_000.0).round() as u64, "hour", "hours")
         } else {
             ((ms as f64 / 60_000.0).round() as u64, "minute", "minutes")
         };
         format!("{k} {} ago", if k == 1 { one } else { many })
     };
+    // A trace of more than two days names each gap's days too.
+    let days = n as i64 * bucket_ms > TWO_DAYS_MS;
     let mut out = format!("{what}: {} {unit} {}, {} now.", fmt(v0), ago(i0), fmt(last));
     let mut j = i0;
     let mut gaps = 0;
@@ -1636,18 +1788,17 @@ fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale)
                 let ms = start_ms + i as i64 * bucket_ms;
                 let mut t = clock_s(ms, loc.offset_at_ms(ms));
                 t.truncate(5);
-                t
+                if days {
+                    format!("{} {t}", month_day(ms, loc))
+                } else {
+                    t
+                }
             };
             out.push_str(&format!(" Not read from {} to {}.", at(start), at(j)));
             gaps += 1;
         }
     }
     out
-}
-
-/// Bytes as GiB with one decimal, for the memory lens.
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / 1_073_741_824.0
 }
 
 /// What every lens's builder reads.
@@ -1663,6 +1814,9 @@ struct Ctx<'d> {
     /// Two columns, and a column's width.
     two: bool,
     cw: f64,
+    fresh: bool,
+    /// The span the Disk lens's used-space chart draws.
+    disk_span: DiskSpan,
 }
 
 impl Ctx<'_> {
@@ -2036,19 +2190,24 @@ fn disk_doc(c: Ctx<'_>) -> LensDoc<'_> {
         };
         ("Wrong?", t, ink)
     });
-    let sections = vec![
-        space_section(c),
-        filling_section(c),
-        where_section(c),
-        writing_section(c),
-    ];
+    // What the software did comes after Filling and tops the right column; with no deed it is
+    // left out and the lens is as it was.
+    let did = did_section(c);
+    let two_order = if did.is_some() {
+        vec![0, 1, 2, 4, 3]
+    } else {
+        vec![0, 1, 3, 2]
+    };
+    let mut sections = vec![space_section(c), filling_section(c)];
+    sections.extend(did);
+    sections.extend([where_section(c), writing_section(c)]);
     LensDoc {
         name: "Disk",
         sources,
         explainer,
         answer,
         sections,
-        two_order: vec![0, 1, 3, 2],
+        two_order,
         keeps_first: true,
     }
 }
@@ -2168,23 +2327,14 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// GB used, last 24 hours: occupancy as space used, so a column's height and its heat both mean
-/// full, as the deck's Disk row does (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). Each
-/// 10-minute column is the space its readings used on average, each weighed by its time, and its
-/// tick the most any used ([`aterm_vitals::history::FreeHistory`] keeps each bucket's free space
-/// as an [`aterm_vitals::Agg`]: its mean and its least).
-fn filling_section(c: Ctx<'_>) -> Section<'_> {
-    let snap = c.snap;
-    let now = snap.at_unix_ms;
-    const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
-    let total = snap
-        .volume
-        .as_ref()
-        .map(|v| v.total)
-        .or_else(|| snap.free_history.volume().map(|v| v.total))
-        .filter(|&t| t > 0);
+/// Each bucket of free space as a used-space column on a volume of `total` bytes: its time-weighted
+/// mean used (GB, the column), its most used (GB, its tick: the bucket's least free) and its
+/// heat, its mean's share of `total`.
+fn used_columns(
+    buckets: &[Option<Agg>],
+    total: Option<u64>,
+) -> (Vec<Option<f64>>, Vec<Option<f64>>, Vec<HeatCell>) {
     let used = |free: f64| total.map(|t| (t as f64 - free.max(0.0)).max(0.0));
-    let buckets = snap.free_history.buckets(now);
     let mean_used: Vec<Option<f64>> = buckets
         .iter()
         .map(|b| b.and_then(|b| used(b.value()?)))
@@ -2201,6 +2351,42 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
             ..HeatCell::default()
         })
         .collect();
+    (vals, peaks, heat)
+}
+
+/// The used-space chart's subtitle forms (the disk's growth) and its one-line forms (`full in`
+/// first while the disk fills), whichever span it draws.
+fn filling_words(snap: &Snapshot) -> (Vec<String>, Vec<String>) {
+    let growth = growth_forms(&snap.facts.disk_rates);
+    let mut line = growth.clone();
+    if let Some(f) = snap.facts.filling {
+        line.insert(0, format!("full in {}", words::duration_approx(f.secs)));
+    }
+    (growth, line)
+}
+
+/// GB used, last 24 hours: occupancy as space used, so a column's height and its heat both mean
+/// full, as the deck's Disk row does (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). Each
+/// 10-minute column is the space its readings used on average, each weighed by its time, and its
+/// tick the most any used ([`aterm_vitals::history::FreeHistory`] keeps each bucket's free space
+/// as an [`aterm_vitals::Agg`]: its mean and its least). With the three-week span chosen (Tab),
+/// [`weeks_section`] draws it instead; the heading names both spans while they are offered
+/// ([`spans_offered`]).
+fn filling_section(c: Ctx<'_>) -> Section<'_> {
+    if c.disk_span == DiskSpan::Weeks {
+        return weeks_section(c);
+    }
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    const BUCKET_MS: i64 = aterm_vitals::history::FREE_BUCKET_S * 1000;
+    let total = snap
+        .volume
+        .as_ref()
+        .map(|v| v.total)
+        .or_else(|| snap.free_history.volume().map(|v| v.total))
+        .filter(|&t| t > 0);
+    let buckets = snap.free_history.buckets(now);
+    let (vals, peaks, heat) = used_columns(&buckets, total);
     let n = vals.len() as i64;
     let start_ms = (now.div_euclid(BUCKET_MS) + 1 - n) * BUCKET_MS;
     let freed = watched(snap).and_then(|d| d.freed_today.as_ref());
@@ -2211,7 +2397,7 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
             (idx, format!("aterm freed {} \u{b7} {t}", gb(*b as f64)))
         })
     });
-    let growth = growth_forms(&snap.facts.disk_rates);
+    let (growth, line) = filling_words(snap);
     let (gaps, events) = trace_overlays(snap, start_ms, BUCKET_MS, vals.len());
     let trace = Trace {
         vals,
@@ -2222,6 +2408,8 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         mark,
         gaps,
         events,
+        removals: Vec::new(),
+        chips: spans_offered(snap, DiskSpan::Day).then_some(DiskSpan::Day),
     };
     let mut said = trace_said(
         "GB used over the last 24 hours",
@@ -2237,10 +2425,6 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
             c.loc.clock(*at, now)
         ));
     }
-    let mut line = growth.clone();
-    if let Some(f) = snap.facts.filling {
-        line.insert(0, format!("full in {}", words::duration_approx(f.secs)));
-    }
     trace_section(
         c,
         "GB used, last 24 hours",
@@ -2251,6 +2435,286 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         line,
         false,
     )
+}
+
+/// Whether the Disk lens's used-space chart offers its two spans with `chosen` drawn: once the
+/// three-week history holds a reading older than the last day (before that the three weeks would
+/// show no more than the day does), and while the three weeks are chosen, so Tab can switch back.
+fn spans_offered(snap: &Snapshot, chosen: DiskSpan) -> bool {
+    // The last day's hours are the series' last 24; any reading before them is older.
+    chosen == DiskSpan::Weeks
+        || snap.free_weeks.buckets(snap.at_unix_ms)[..WEEK_BUCKETS - 24]
+            .iter()
+            .any(Option::is_some)
+}
+
+/// The labels under a three-week trace.
+const WEEKS: &[(f64, &str)] = &[
+    (0.0, "3 weeks ago"),
+    (1.0 / 3.0, "2 weeks"),
+    (2.0 / 3.0, "1 week"),
+    (1.0, "now"),
+];
+
+/// The hours a three-week trace's column merges.
+const WEEK_MERGE: usize = 3;
+/// A three-week trace's columns.
+const WEEK_COLUMNS: usize = WEEK_BUCKETS / WEEK_MERGE;
+/// An hour, ms: a three-week bucket.
+const WEEK_HOUR_MS: i64 = WEEK_BUCKET_S * 1000;
+/// A three-week trace's column, ms.
+const WEEK_COLUMN_MS: i64 = WEEK_HOUR_MS * WEEK_MERGE as i64;
+
+/// The removals the journal holds in the three-week trace starting at `start_ms`, up to the
+/// snapshot's now: each hour's start and its bytes, oldest first.
+fn weeks_removals(snap: &Snapshot, start_ms: i64) -> Vec<(i64, u64)> {
+    let now = snap.at_unix_ms;
+    snap.facts
+        .disk
+        .iter()
+        .flat_map(|d| d.removals.iter().copied())
+        .filter(|&(at, b)| b > 0 && (start_ms..=now).contains(&at))
+        .collect()
+}
+
+/// The used-space chart over the last 3 weeks, and where it starts (unix ms): 168 columns of 3
+/// hours, each the hour buckets of [`aterm_vitals::history::FreeWeeks`] in it merged (504 hour
+/// columns would be under a point wide). The columns keep the clock's 3-hour grid, the last
+/// holding now, so a column's hours never change as the hours pass. Each removal the journal
+/// holds is a tick under the axis at its hour's middle, and the largest is marked with its bytes
+/// and its day: `freed`, not `aterm freed`, since a tab removes too.
+fn weeks_trace(c: Ctx<'_>) -> (Trace, i64) {
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    let total = snap
+        .volume
+        .as_ref()
+        .map(|v| v.total)
+        .or_else(|| snap.free_weeks.volume().map(|v| v.total))
+        .filter(|&t| t > 0);
+    let start = (now.div_euclid(WEEK_COLUMN_MS) + 1 - WEEK_COLUMNS as i64) * WEEK_COLUMN_MS;
+    let hours = snap.free_weeks.buckets(now);
+    let first_hour = now.div_euclid(WEEK_HOUR_MS) + 1 - WEEK_BUCKETS as i64;
+    let merged: Vec<Option<Agg>> = (0..WEEK_COLUMNS)
+        .map(|j| {
+            let from = start.div_euclid(WEEK_HOUR_MS) + (j * WEEK_MERGE) as i64;
+            (from..from + WEEK_MERGE as i64)
+                .filter_map(|h| {
+                    let i = usize::try_from(h - first_hour).ok()?;
+                    hours.get(i).copied().flatten()
+                })
+                .fold(None, |acc: Option<Agg>, b| {
+                    let mut acc = acc.unwrap_or_default();
+                    acc.merge(&b);
+                    Some(acc)
+                })
+        })
+        .collect();
+    let (vals, peaks, heat) = used_columns(&merged, total);
+    let at_col = |at: i64| (at + WEEK_HOUR_MS / 2 - start) as f64 / WEEK_COLUMN_MS as f64;
+    let removed = weeks_removals(snap, start);
+    let removals = removed.iter().map(|&(at, _)| at_col(at)).collect();
+    let mark = removed
+        .iter()
+        .copied()
+        .reduce(|a, b| if b.1 > a.1 { b } else { a })
+        .map(|(at, b)| {
+            (
+                at_col(at),
+                format!("freed {} \u{b7} {}", gb(b as f64), month_day(at, &c.loc)),
+            )
+        });
+    let trace = Trace {
+        vals,
+        peaks,
+        heat,
+        under: WEEKS,
+        min_span: 1.0,
+        mark,
+        gaps: Vec::new(),
+        events: Vec::new(),
+        removals,
+        chips: Some(DiskSpan::Weeks),
+    };
+    (trace, start)
+}
+
+/// GB used, last 3 weeks: [`filling_section`]'s chart over [`weeks_trace`], its removals marked
+/// and said as the chart marks them, by the hour (a tick an hour that had any); the rates and
+/// `full in` stay the day's.
+fn weeks_section(c: Ctx<'_>) -> Section<'_> {
+    let snap = c.snap;
+    let (trace, start) = weeks_trace(c);
+    let mut said = trace_said(
+        "GB used over the last 3 weeks",
+        "gigabytes",
+        &trace,
+        (start, WEEK_COLUMN_MS),
+        &c.loc,
+    );
+    let removed = weeks_removals(snap, start);
+    let sum = removed.iter().fold(0_u64, |a, &(_, b)| a.saturating_add(b));
+    let most = removed
+        .iter()
+        .copied()
+        .reduce(|a, b| if b.1 > a.1 { b } else { a });
+    if let Some((at, b)) = most {
+        let speak = |b: u64| words::speak(&gb(b as f64));
+        let day = month_day(at, &c.loc);
+        if removed.len() == 1 {
+            said.push_str(&format!(" Removed {} on {day}.", speak(b)));
+        } else {
+            said.push_str(&format!(
+                " Removed {} in {} separate hours; the most, {} on {day}.",
+                speak(sum),
+                removed.len(),
+                speak(b)
+            ));
+        }
+    }
+    let (growth, line) = filling_words(snap);
+    trace_section(
+        c,
+        "GB used, last 3 weeks",
+        growth,
+        trace,
+        said,
+        "Filling",
+        line,
+        false,
+    )
+}
+
+/// What the software did (`docs/DESIGN-disk-custody-2026-11-12.md` §4): the deeds the host read
+/// off the disk journal's tail, newest first, each with when it was done, what it records, whose
+/// it is (aterm, or the tab whose session did it or that a free-space ask concerns, the subject
+/// of its words) and its bytes. The journal records the machine's disk, so the list ignores
+/// ↑/↓'s scope. `None` with no deed, which leaves the lens as it was.
+fn did_section(c: Ctx<'_>) -> Option<Section<'_>> {
+    let snap = c.snap;
+    let now = snap.at_unix_ms;
+    let mut deeds: Vec<&DiskDeed> = snap.facts.disk.as_ref()?.deeds.iter().collect();
+    if deeds.is_empty() {
+        return None;
+    }
+    deeds.sort_by_key(|d| std::cmp::Reverse(d.at_unix_ms));
+    let rows: Vec<Row> = deeds
+        .iter()
+        .map(|d| {
+            let (chip, scope) = match &d.by {
+                DeedBy::Aterm => (Some(ProcScope::Aterm), "aterm".to_owned()),
+                DeedBy::Tab(Some(k)) => {
+                    (Some(ProcScope::Tab(*k)), c.scope_word(ProcScope::Tab(*k)))
+                }
+                DeedBy::Tab(None) => (None, "a tab".to_owned()),
+            };
+            let mut name = format!(
+                "{} {}",
+                deed_when(d.at_unix_ms, now, &c.loc),
+                deed_words(&d.kind, &d.by)
+            );
+            if d.n > 1 {
+                name.push_str(&format!(" \u{d7}{}", d.n));
+            }
+            let figure = match (d.bytes.filter(|&b| b > 0), d.free) {
+                (Some(b), _) => gb(b as f64),
+                (None, Some(free)) => format!("{} free", gb(free as f64)),
+                (None, None) => String::new(),
+            };
+            Row {
+                chip,
+                name,
+                scope: Some(scope),
+                share: None,
+                figure,
+            }
+        })
+        .collect();
+    let first = rows[0].said();
+    let mut line = Vec::new();
+    if rows.len() > 1 {
+        line.push(format!("{first} \u{b7} {} more", rows.len() - 1));
+    }
+    line.push(first);
+    Some(list_section(
+        c,
+        "What the software did".into(),
+        vec![
+            "from the disk journal, newest first".into(),
+            "newest first".into(),
+        ],
+        rows,
+        None,
+        4,
+        "Journal",
+        line,
+        true,
+    ))
+}
+
+/// A deed's words: what the journal's row says, its subject `by` (the scope column beside it).
+/// A free-space ask's row whose session it names reads with that session as its subject (it was
+/// asked, chosen, freed space); one that names none, as aterm's step.
+fn deed_words(kind: &DeedKind, by: &DeedBy) -> String {
+    let what = |w: &str| {
+        if w.is_empty() {
+            "a folder".to_owned()
+        } else {
+            w.to_owned()
+        }
+    };
+    let session = matches!(by, DeedBy::Tab(_));
+    match kind {
+        DeedKind::Checked => "checked the disk".into(),
+        DeedKind::Began(w) => format!("began removing {}", what(w)),
+        DeedKind::Removed(w) => format!("removed {}", what(w)),
+        DeedKind::CouldNotRemove(w) => format!("could not remove {}", what(w)),
+        DeedKind::Refused(w) => format!("refused to remove {}", what(w)),
+        DeedKind::Kept(w) => format!("kept {}", what(w)),
+        DeedKind::Stopped => "stopped cleaning build caches".into(),
+        DeedKind::ReserveReleased => "released the reserve file".into(),
+        DeedKind::ReserveWritten => "wrote the reserve file".into(),
+        DeedKind::ReserveRefused => "could not change the reserve file".into(),
+        DeedKind::RanShort => "ran short of disk space".into(),
+        DeedKind::Asked(said) => ask_words(said, session),
+        DeedKind::Other(named) => named.clone(),
+    }
+}
+
+/// A free-space ask's row (`aterm_agent::harness::disk::ask`) in words: its `said` word, read
+/// with the session it names as its subject where it names one (`session`), else as aterm's
+/// step; a word this build does not know reads as the row does, `free-ask` and its word.
+fn ask_words(said: &str, session: bool) -> String {
+    let words = match (said, session) {
+        ("quiet", _) => "found room on the disk",
+        ("freeing", _) => "freed space itself, asking no session",
+        ("cooldown", _) => "held off asking: a session was asked lately",
+        ("opened", _) => "began asking sessions to free space",
+        ("nominating", true) => "was put forward to free space",
+        ("nominating", false) => "gathered sessions to ask to free space",
+        ("worker-runs", _) => "was freeing space as the disk worker",
+        ("elected", _) => "was chosen to free space",
+        ("owed", _) => "was to be asked to free space",
+        ("asked", _) => "was asked to free space",
+        ("freed", _) => "freed space when asked",
+        ("handoff", _) => "missed its turn to free space",
+        ("returned", _) => "was busy, so it was not asked",
+        ("waiting", _) => "waited for a session it could ask",
+        ("out", _) => "stopped asking sessions",
+        ("settled", _) => "stopped asking: a session freed space",
+        ("spent", _) => "had no asks left",
+        ("ended", _) => "stopped asking: there is room again",
+        ("step typed", _) => "was sent the request to free space",
+        ("step wait", _) => "could not be sent the request yet",
+        ("step released", _) => "may not be asked to free space",
+        ("step gone", _) => "was asked no more",
+        ("worker", _) => "started a disk worker",
+        ("worker-started", _) => "began freeing space as the disk worker",
+        ("worker-over", true) => "finished as the disk worker",
+        ("worker-over", false) => "its disk worker finished",
+        (other, _) => return format!("free-ask {other}"),
+    };
+    words.to_owned()
 }
 
 /// Where the space is (§7.4, §7.7).
@@ -3161,6 +3625,8 @@ fn memory_doc(c: Ctx<'_>) -> LensDoc<'_> {
         mark: None,
         gaps,
         events,
+        removals: Vec::new(),
+        chips: None,
     };
     let said = trace_said(
         "Used over the last hour",
@@ -3248,102 +3714,161 @@ fn memory_capacity_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// Where it is: the classes as one stacked bar, and their legend.
+/// The physical page classes, with a separately marked residual and a complete legend.
 fn classes_section(c: Ctx<'_>) -> Section<'_> {
+    use aterm_vitals::model::{MemoryClassKind, MemoryPartition};
     let Some(m) = c.snap.mem.as_ref() else {
         return line_section("Where it is", "Classes", vec!["not read yet".into()], false);
     };
-    let s = &m.sample;
-    let classes: Vec<(usize, f32, &str, &str, u64)> = [
-        (0, 1.0, "app", "app", Some(s.app)),
-        (0, 0.7, "wired", "wired", Some(s.wired)),
-        (1, 1.0, "compressed", "compr.", s.compressed),
-        (2, 1.0, "file cache", "cache", Some(s.cached)),
-        (3, 1.0, "free", "free", Some(s.free)),
-    ]
-    .into_iter()
-    .filter_map(|(i, al, long, short, b)| b.map(|b| (i, al, long, short, b)))
-    .collect();
-    let total = s.total.max(1);
-    let words: Vec<String> = vec![
+    let physical = m.sample.physical_classes(Some(c.loc.platform));
+    let exact = physical.partition == MemoryPartition::Exact;
+    let classes: Vec<_> = physical
+        .classes
+        .iter()
+        .map(|class| {
+            let name = words::memory_class_name(class.kind, physical.partition);
+            let value = class.bytes.map_or_else(|| "not read".into(), words::mem);
+            (class.kind, class.bytes, format!("{name} {value}"))
+        })
+        .collect();
+    let status = words::memory_classes_status(&physical, m.sample.used());
+    let words = vec![
         classes
             .iter()
-            .map(|(_, _, long, _, b)| format!("{long} {:.1} GiB", gib(*b)))
+            .map(|class| class.2.as_str())
             .collect::<Vec<_>>()
             .join(", "),
+        status.clone(),
     ];
-    let line = vec![
-        classes
-            .iter()
-            .map(|(_, _, long, _, b)| format!("{long} {:.1}", gib(*b)))
-            .collect::<Vec<_>>()
-            .join(" \u{b7} ")
-            + " GiB",
-    ];
-    let subs = vec![
-        format!(
-            "{} of {} GiB in use",
-            words::gib_figure(s.used()),
-            words::gib_total(s.total)
-        ),
-        format!("{} GiB in use", words::gib_figure(s.used())),
-    ];
-    let full = form(42.0, move |pen, p| {
-        heading(pen, p, "Where it is", &subs);
-        let inks = pen.inks;
-        let (by, bh) = (p.y + 16.0, 10.0);
-        pen.rect(p.x, by, p.w, bh, 1.5, rgba(inks.track, 0xFF));
-        let mut x = p.x;
-        for (i, al, _, _, b) in &classes {
-            if *i == 3 {
-                continue;
+    let status_lines = if exact {
+        Vec::new()
+    } else {
+        wrap(c.m, &status, c.cw, NOTE_PT)
+    };
+    let (mut x, mut row, mut rows) = (0.0, 0_usize, 1_usize);
+    let legend: Vec<_> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, class)| {
+            let lines = wrap(c.m, &class.2, (c.cw - 8.0).max(0.0), NOTE_PT);
+            let width = 8.0
+                + lines
+                    .iter()
+                    .map(|line| c.m.width(line, NOTE_PT, false))
+                    .fold(0.0, f64::max);
+            if x > 0.0 && (lines.len() > 1 || x + width > c.cw + EPS) {
+                x = 0.0;
+                row += 1;
             }
-            let w = (p.w * (*b as f64 / total as f64))
-                .min(p.x + p.w - x)
-                .max(0.0);
-            pen.rect(x, by, w, bh, 0.0, a(inks.mem[*i], *al));
-            x += w;
-        }
-        let base = p.y + 39.0;
-        let item = |pen: &Pen<'_>, word: &str, b: u64, k: usize| {
-            let unit = if k == 0 { " GiB" } else { "" };
-            let t = format!("{word} {:.1}{unit}", gib(b));
-            let w = pen.width(&t, NOTE_PT, false);
-            (t, w)
-        };
-        let fits = |pen: &Pen<'_>, short: bool| {
-            classes
-                .iter()
-                .enumerate()
-                .map(|(k, (_, _, long, sh, b))| {
-                    item(pen, if short { sh } else { long }, *b, k).1 + 18.0
-                })
-                .sum::<f64>()
-                <= p.w
-        };
-        let short = !fits(pen, false);
-        let mut x = p.x;
-        for (k, (i, al, long, sh, b)) in classes.iter().enumerate() {
-            let (t, w) = item(pen, if short { sh } else { long }, *b, k);
-            if x + 8.0 + w > p.x + p.w {
-                break;
-            }
-            let ink = if *i == 3 {
-                rgba(inks.track, 0xFF)
+            let entry = (i, x, row, lines);
+            rows = rows.max(row + entry.3.len());
+            if entry.3.len() > 1 {
+                row += entry.3.len();
+                x = 0.0;
             } else {
-                a(inks.mem[*i], *al)
-            };
-            pen.rect(x, base - 6.5, 6.0, 6.0, 1.0, ink);
-            pen.text(x + 8.0, base, &t, NOTE_PT, false, inks.words2);
-            x += 8.0 + w + 10.0;
-        }
-    });
+                x += width + 10.0;
+            }
+            entry
+        })
+        .collect();
+    let base = if exact {
+        39.0
+    } else {
+        ROW0_BASE + PITCH * status_lines.len() as f64
+    };
+    let full = form(
+        base + 3.0 + PITCH * rows.saturating_sub(1) as f64,
+        move |pen, p| {
+            if exact {
+                heading(pen, p, "Where it is", std::slice::from_ref(&status));
+                let (by, bh) = (p.y + 16.0, 10.0);
+                let mut x = p.x;
+                for (kind, bytes, _) in &classes {
+                    let width = (p.w * bytes.unwrap_or(0) as f64 / physical.total as f64)
+                        .min((p.x + p.w - x).max(0.0));
+                    pen.rect(x, by, width, bh, 0.0, memory_class_ink(&pen.inks, *kind));
+                    if *kind == MemoryClassKind::Residual {
+                        memory_residual_hatch(pen, x, by, width, bh);
+                    }
+                    x += width;
+                }
+            } else {
+                heading(pen, p, "Where it is", &[]);
+                for (i, line) in status_lines.iter().enumerate() {
+                    pen.text(
+                        p.x,
+                        p.y + ROW0_BASE + PITCH * i as f64,
+                        line,
+                        NOTE_PT,
+                        false,
+                        pen.inks.words2,
+                    );
+                }
+            }
+            for (i, x, row, lines) in &legend {
+                let kind = classes[*i].0;
+                let x = p.x + x;
+                let y = p.y + base + PITCH * *row as f64;
+                pen.rect(x, y - 6.5, 6.0, 6.0, 1.0, memory_class_ink(&pen.inks, kind));
+                if kind == MemoryClassKind::Residual {
+                    memory_residual_hatch(pen, x, y - 6.5, 6.0, 6.0);
+                }
+                for (j, line) in lines.iter().enumerate() {
+                    pen.text(
+                        x + 8.0,
+                        y + PITCH * j as f64,
+                        line,
+                        NOTE_PT,
+                        false,
+                        pen.inks.words2,
+                    );
+                }
+            }
+        },
+    );
     Section {
         name: "Where it is".into(),
         words,
-        right: false,
+        right: true,
         parts: Vec::new(),
-        forms: vec![full, line_form("Classes", line)],
+        // A smaller form must not silently omit physical classes.
+        forms: vec![full],
+    }
+}
+
+/// Existing page-class inks; free memory and the residual also differ by the latter's hatch.
+fn memory_class_ink(inks: &VitalsInks, kind: aterm_vitals::model::MemoryClassKind) -> Rgba {
+    use aterm_vitals::model::MemoryClassKind;
+    match kind {
+        MemoryClassKind::App => a(inks.mem[0], 1.0),
+        MemoryClassKind::Wired => a(inks.mem[0], 0.7),
+        MemoryClassKind::Compressed => a(inks.mem[1], 1.0),
+        MemoryClassKind::Cache => a(inks.mem[2], 1.0),
+        MemoryClassKind::Free | MemoryClassKind::Residual => rgba(inks.track, 0xFF),
+    }
+}
+
+/// Keep the hatch's stroke inside the residual, including a very narrow final segment.
+fn memory_residual_hatch(pen: &mut Pen<'_>, x: f64, y: f64, w: f64, h: f64) {
+    let (x, y, w, h) = (x + 0.5, y + 0.5, w - 1.0, h - 1.0);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let ink = rgba(pen.inks.words2, 0xFF);
+    let mut offset = 0.0;
+    while offset < w + h {
+        let x0 = (offset - h).max(0.0);
+        let x1 = offset.min(w);
+        if x1 > x0 {
+            pen.line(
+                x + x0,
+                y + h - (offset - x0),
+                x + x1,
+                y + h - (offset - x1),
+                ink,
+            );
+        }
+        offset += 5.0;
     }
 }
 
@@ -3490,11 +4015,10 @@ fn swap_section(c: Ctx<'_>) -> Section<'_> {
     let forms = match snap.mem.as_ref() {
         None => vec!["not read yet".to_owned()],
         Some(m) => {
-            let used = m.sample.swap_used;
-            let used_w = if used == 0 {
-                "none used".to_owned()
-            } else {
-                format!("{} used", words::mem(used))
+            let used_w = match m.sample.swap_used {
+                None => "usage not read".to_owned(),
+                Some(0) => "none used".to_owned(),
+                Some(used) => format!("{} used", words::mem(used)),
             };
             match snap.facts.swap_rate {
                 Some(r) if r > 0.0 => vec![
@@ -3553,6 +4077,8 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
         mark: None,
         gaps,
         events,
+        removals: Vec::new(),
+        chips: None,
     };
     let said = trace_said(
         &format!("Running over the last hour, {unit}"),
@@ -4336,6 +4862,8 @@ fn net_trace(c: Ctx<'_>) -> (Trace, &'static str, i64) {
         mark: None,
         gaps,
         events,
+        removals: Vec::new(),
+        chips: None,
     };
     (trace, unit, start)
 }
@@ -4654,7 +5182,12 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     }
     sources.push(format!("as of {at}"));
     let sections = vec![
-        lines_section("Now", now_lines, vec![sentence.clone()], false),
+        lines_section(
+            if c.fresh { "Now" } else { "Last" },
+            now_lines,
+            vec![sentence.clone()],
+            false,
+        ),
         lines_section("Details", lines.clone(), lines, true),
     ];
     LensDoc {
@@ -4724,13 +5257,48 @@ enum Seg {
     T(&'static str),
     Across,
     UpDown,
+    /// The Tab key, ⇥.
+    TabKey,
 }
 
-/// The key hint's forms for a lens opened `how`, longest first (§11.3).
-const fn hints(how: Opened) -> &'static [&'static [Seg]] {
-    use Seg::{Across, T, UpDown};
-    match how {
-        Opened::Pinned => &[
+/// The key hint's forms for a lens opened `how`, longest first (§11.3); with `spans` (a Disk lens
+/// whose chart offers its two spans) a lens that takes keys names Tab, which switches them.
+const fn hints(how: Opened, spans: bool) -> &'static [&'static [Seg]] {
+    use Seg::{Across, T, TabKey, UpDown};
+    match (how, spans) {
+        (Opened::Pinned, true) => &[
+            &[
+                T("pinned \u{b7} "),
+                Across,
+                T("resources \u{b7} "),
+                UpDown,
+                T("scope \u{b7} "),
+                TabKey,
+                T("span \u{b7} esc closes"),
+            ],
+            &[T("pinned \u{b7} "), TabKey, T("span \u{b7} esc closes")],
+            &[TabKey, T("span \u{b7} esc closes")],
+            &[T("esc closes")],
+        ],
+        (Opened::Keyboard, true) => &[
+            &[
+                Across,
+                T("resources \u{b7} "),
+                UpDown,
+                T("scope \u{b7} "),
+                TabKey,
+                T("span \u{b7} esc closes"),
+            ],
+            &[
+                Across,
+                T("resources \u{b7} "),
+                TabKey,
+                T("span \u{b7} esc closes"),
+            ],
+            &[TabKey, T("span \u{b7} esc closes")],
+            &[T("esc closes")],
+        ],
+        (Opened::Pinned, false) => &[
             &[
                 T("pinned \u{b7} "),
                 Across,
@@ -4741,7 +5309,7 @@ const fn hints(how: Opened) -> &'static [&'static [Seg]] {
             &[T("pinned \u{b7} esc closes")],
             &[T("esc closes")],
         ],
-        Opened::Keyboard => &[
+        (Opened::Keyboard, false) => &[
             &[
                 Across,
                 T("resources \u{b7} "),
@@ -4751,7 +5319,7 @@ const fn hints(how: Opened) -> &'static [&'static [Seg]] {
             &[Across, T("resources \u{b7} esc closes")],
             &[T("esc closes")],
         ],
-        Opened::Hover => &[&[T("click pins it")], &[T("click pins")]],
+        (Opened::Hover, _) => &[&[T("click pins it")], &[T("click pins")]],
     }
 }
 
@@ -4761,12 +5329,22 @@ fn hint_w(m: &FaceMetrics, hint: &[Seg]) -> f64 {
             Seg::T(t) => m.width(t, NOTE_PT, false),
             Seg::Across => 20.0,
             Seg::UpDown => 16.0,
+            Seg::TabKey => 12.0,
         })
         .sum()
 }
 
-/// Draw the header while it clears the foot and leaves `reserve` pt of body.
-fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, reserve: f64) -> f64 {
+/// Draw the header while it clears the foot and leaves `reserve` pt of body; `spans`: the lens is
+/// a Disk lens whose chart offers its two spans ([`hints`]).
+fn head(
+    pen: &mut Pen<'_>,
+    doc: &LensDoc<'_>,
+    how: Opened,
+    spans: bool,
+    lw: f64,
+    lh: f64,
+    reserve: f64,
+) -> f64 {
     let m = pen.m;
     let inks = pen.inks;
     let limit = lh - FOOT;
@@ -4777,7 +5355,7 @@ fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, res
     let name = pen.cut(doc.name, right - SIDE, NAME_PT, true);
     let nw = pen.text(SIDE, LINE1_BASE, &name, NAME_PT, true, inks.words);
     let tx = SIDE + nw + 8.0;
-    let hints = hints(how);
+    let hints = hints(how, spans);
     let mut chosen: Option<(usize, Option<usize>)> = None;
     'hints: for (hi, hint) in hints.iter().enumerate() {
         let hw = hint_w(m, hint);
@@ -4805,6 +5383,7 @@ fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, res
                 Seg::T(t) => pen.text(x, LINE1_BASE, t, NOTE_PT, false, inks.words2),
                 Seg::Across => pen.arrows(x, LINE1_BASE, true),
                 Seg::UpDown => pen.arrows(x, LINE1_BASE, false),
+                Seg::TabKey => pen.tab_key(x, LINE1_BASE),
             };
         }
     }
@@ -4957,7 +5536,7 @@ pub(crate) fn lay_lens(
                 two_order: Vec::new(),
                 keeps_first: false,
             };
-            let _ = head(&mut pen, &doc, lens.how, lw, lh, 0.0);
+            let _ = head(&mut pen, &doc, lens.how, false, lw, lh, 0.0);
             laid.explainer = doc.explainer;
         }
         Some(snap) => {
@@ -4970,8 +5549,10 @@ pub(crate) fn lay_lens(
                 bar: lens.bar,
                 two,
                 cw,
+                fresh: input.live.fresh,
+                disk_span: input.disk_span,
             };
-            let doc = if lens.focus == Instrument::NetworkState {
+            let mut doc = if lens.focus == Instrument::NetworkState {
                 lab_network_doc(
                     input.network,
                     input.lab,
@@ -4984,13 +5565,28 @@ pub(crate) fn lay_lens(
             } else {
                 doc_for(c, lens.focus)
             };
+            if !matches!(lens.focus, Instrument::NetworkState | Instrument::HowToRead)
+                && !input.live.fresh
+            {
+                doc.explainer = format!(
+                    "Updates delayed; last reading {}. {}",
+                    c.at(),
+                    doc.explainer
+                );
+                if let Some((label, _, _)) = &mut doc.answer
+                    && *label == "Now"
+                {
+                    *label = "Last";
+                }
+            }
             let reserve = doc
                 .sections
                 .first()
                 .filter(|_| doc.keeps_first)
                 .and_then(|s| s.forms.last())
                 .map_or(0.0, |f| f.h);
-            let top = head(&mut pen, &doc, lens.how, lw, lh, reserve);
+            let spans = lens.focus == Instrument::Disk && spans_offered(snap, input.disk_span);
+            let top = head(&mut pen, &doc, lens.how, spans, lw, lh, reserve);
             let placed = lens_body(
                 (two, cw),
                 top,
@@ -5125,6 +5721,10 @@ impl crate::App {
                 .map_or(crate::network_deck::Target::Overview, |ws| {
                     ws.stats_lens.network_target
                 }),
+            disk_span: self
+                .windows
+                .get(&wid)
+                .map_or(DiskSpan::Day, |ws| ws.stats_lens.disk_span),
             snap: self.vitals.snapshot.as_deref(),
             prev_snap: None,
             tab_panes: f.tab_panes.clone(),
@@ -5137,7 +5737,11 @@ impl crate::App {
             form: f.deck,
             contrast: f.contrast,
             locale: crate::stats_deck::host_locale(self.vitals.snapshot.as_deref()),
-            live: crate::stats_live::DeckLive::STILL,
+            live: if f.live.fresh {
+                crate::stats_live::DeckLive::STILL
+            } else {
+                crate::stats_live::DeckLive::STALE
+            },
         }
     }
 
@@ -5179,9 +5783,12 @@ impl crate::App {
         }
         self.windows
             .get(&wid)
-            .map(|ws| ws.stats_lens.network_target)
+            .map(|ws| (ws.stats_lens.network_target, ws.stats_lens.disk_span))
             .hash(&mut h);
         lens.hash(&mut h);
+        if lens.focus != Instrument::NetworkState {
+            f.live.fresh.hash(&mut h);
+        }
         (lg.dx, lg.dy, lg.w.to_bits(), lg.h.to_bits()).hash(&mut h);
         f.lens_inks.hash(&mut h);
         f.tab_panes.hash(&mut h);
@@ -5195,7 +5802,8 @@ impl crate::App {
     /// over the shell's raster, which is rasterized again only when the shell's prims move.
     pub(crate) fn splice_stats_lens(&mut self, wid: crate::WindowId) {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 let had_rect = ws.stats_lens.rect.take().is_some();
                 ws.stats_lens.retire_input();
                 ws.lens_card = None;
@@ -5238,9 +5846,10 @@ impl crate::App {
                 }
             });
         let (pw, ph) = (ground.pw, ground.ph);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         // The outgoing card's buffer takes the shell's copy, so a reading allocates no new card.
         let mut px = ws
             .lens_card
@@ -5265,6 +5874,7 @@ impl crate::App {
             serial: 0,
             delta: None,
         });
+        drop(route_guard_ws);
         if self
             .windows
             .get(&wid)
@@ -5296,7 +5906,8 @@ impl crate::App {
             .get(&wid)
             .and_then(|ws| ws.stats_lens.open)
             .map(|l| l.focus);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.stats_lens.retire_input();
             ws.stats_lens.open = Some(lens);
             ws.stats_lens.last = Some((lens.focus, lens.bar));
@@ -5325,7 +5936,7 @@ impl crate::App {
                 kind: crate::stats_paint::HitKind::Network(target),
                 ..
             }) = self.stats_hit_under_pointer(wid)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.stats_lens.network_target = target;
         }
@@ -5366,17 +5977,38 @@ impl crate::App {
         true
     }
 
+    /// Retire pointer timers on blur, keeping an explicitly opened lens and its selection.
+    pub(crate) fn stats_lens_focus_lost(&mut self, wid: crate::WindowId) {
+        let hover = {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
+                return;
+            };
+            let ws = &mut **route_guard_ws;
+            ws.stats_lens.retire_input();
+            ws.stats_lens.rest = None;
+            ws.stats_lens.leave_due = None;
+            ws.stats_lens
+                .open
+                .is_some_and(|lens| lens.how == Opened::Hover)
+        };
+        if hover {
+            self.close_stats_lens(wid);
+        }
+    }
+
     /// Close `wid`'s lens (no spring: the next frame is the first without it).
     pub(crate) fn close_stats_lens(&mut self, wid: crate::WindowId) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         ws.stats_lens.retire_input();
         let was = ws.stats_lens.open.take().is_some();
         ws.stats_lens.leave_due = None;
         ws.stats_lens.rest = None;
         if was {
             ws.native_rehover = true;
+            drop(route_guard_ws);
             self.request_window_redraw(wid);
         }
         was
@@ -5456,20 +6088,22 @@ impl crate::App {
 
     /// Pointer motion over the stats surfaces.
     pub(crate) fn stats_pointer_motion(&mut self, wid: crate::WindowId, now: Instant) -> bool {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.stats_lens.retire_input();
         }
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
         }
         if self.lens_card_point(wid).is_some() {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.stats_lens.leave_due = None;
                 ws.stats_lens.rest = None;
             }
             return true;
         }
-        let form = self.stats_bars_form();
+        let form = self.window_bars(wid);
         let hit = self.stats_hit_under_pointer(wid);
         let over_card = self.stats_card_point(wid).is_some();
         let owns = match form {
@@ -5477,9 +6111,10 @@ impl crate::App {
             StatsBars::Sill => hit.is_some(),
             StatsBars::Off => false,
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return owns;
         };
+        let ws = &mut **route_guard_ws;
         let open = ws.stats_lens.open;
         match hit {
             Some(hit) => {
@@ -5519,7 +6154,8 @@ impl crate::App {
 
     /// The pointer left the window.
     pub(crate) fn stats_pointer_left(&mut self, wid: crate::WindowId, now: Instant) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.stats_lens.retire_input();
             ws.stats_lens.rest = None;
             if ws.stats_lens.open.is_some_and(|l| l.how == Opened::Hover) {
@@ -5530,25 +6166,28 @@ impl crate::App {
 
     /// A press: on the lens it pins a hover lens.
     pub(crate) fn stats_press(&mut self, wid: crate::WindowId) -> bool {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.stats_lens.retire_input();
         }
         if self.windows.get(&wid).is_none_or(|ws| ws.overlay_open()) {
             return false;
         }
         if self.lens_card_point(wid).is_some() {
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && let Some(open) = ws.stats_lens.open.as_mut()
-                && open.how == Opened::Hover
-            {
-                open.how = Opened::Pinned;
-                if let Some(w) = ws.os_window.as_ref() {
-                    w.request_redraw();
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                if let Some(open) = ws.stats_lens.open.as_mut()
+                    && open.how == Opened::Hover
+                {
+                    open.how = Opened::Pinned;
+                    if let Some(w) = ws.os_window.as_ref() {
+                        w.request_redraw();
+                    }
                 }
             }
             return true;
         }
-        let form = self.stats_bars_form();
+        let form = self.window_bars(wid);
         let hit = self.stats_hit_under_pointer(wid);
         let over_card = self.stats_card_point(wid).is_some();
         if let Some(hit) = hit {
@@ -5567,7 +6206,7 @@ impl crate::App {
         if self.lens_card_point(wid).is_some() {
             return true;
         }
-        match self.stats_bars_form() {
+        match self.window_bars(wid) {
             StatsBars::Deck => self.stats_card_point(wid).is_some(),
             StatsBars::Sill => self.stats_hit_under_pointer(wid).is_some(),
             StatsBars::Off => false,
@@ -5584,7 +6223,8 @@ impl crate::App {
         inert: bool,
     ) -> bool {
         use aterm_window::keyboard::{Key, NamedKey};
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.stats_lens.sync_tab_scope(ws.tab_set.active_id());
         }
         let arrow = matches!(
@@ -5609,7 +6249,7 @@ impl crate::App {
         let taken = self.stats_lens_key_untimed(wid, mods, key, copy_chord, inert);
         if taken
             && let Some((before, arrival)) = before
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
             && let Some(after) = ws.stats_lens.selection(ws.tab_set.active_id())
             && before != Some(after)
         {
@@ -5642,7 +6282,8 @@ impl crate::App {
                 .autopilot_menu_spent
                 .as_ref()
                 .is_some_and(|menu| menu.wid == wid);
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         ws.stats_lens.sync_tab_scope(ws.tab_set.active_id());
         if !obstructed
             && !ws.overlay_open()
@@ -5679,7 +6320,7 @@ impl crate::App {
         }
     }
 
-    fn stats_lens_within_surface(&self, wid: crate::WindowId) -> bool {
+    pub(crate) fn stats_lens_within_surface(&self, wid: crate::WindowId) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
@@ -5699,6 +6340,7 @@ impl crate::App {
             surface.height as usize,
             frame_w,
             self.stats_frame_h(wid),
+            aterm_render::SideInsetPx(self.win_side_inset_px(wid)),
         );
         let within = |start: u32, len: u32, axis: aterm_render::AxisPlacement| {
             let start = start as usize;
@@ -5720,9 +6362,10 @@ impl crate::App {
         visible: bool,
         input: crate::metrics::PresentInput,
     ) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if !visible || input.capture_forced() {
             ws.stats_lens.retire_input();
             return;
@@ -5820,7 +6463,8 @@ impl crate::App {
                 && matches!(key, Key::Named(NamedKey::ArrowDown | NamedKey::ArrowUp))
             {
                 let band = self.network_band_px(wid);
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.stats_lens.retire_input();
                     ws.stats_lens.network_target = crate::network_deck::step(
                         &self.network_snapshot,
@@ -5830,6 +6474,20 @@ impl crate::App {
                         ws.stats_lens.network_target,
                         matches!(key, Key::Named(NamedKey::ArrowDown)),
                     );
+                }
+                self.request_window_redraw(wid);
+                return true;
+            }
+            // Tab switches the Disk lens's used-space chart between the last 24 hours and the
+            // last 3 weeks. A named key, as the lens's others are: every printable key still
+            // closes the lens and goes on to the program. ⌘, ⌃ and ⌥ with Tab go on as they did.
+            if open.focus == Instrument::Disk
+                && !(mods.super_key() || mods.control_key() || mods.alt_key())
+                && matches!(key, Key::Named(NamedKey::Tab))
+            {
+                if let Some(mut ws) = self.windows.get_mut(&wid) {
+                    ws.stats_lens.retire_input();
+                    ws.stats_lens.disk_span = ws.stats_lens.disk_span.other();
                 }
                 self.request_window_redraw(wid);
                 return true;
@@ -5907,7 +6565,15 @@ impl crate::App {
         let snap = self.vitals.snapshot.as_deref()?;
         let panes = self.deck_tab_panes(wid);
         let loc = crate::stats_deck::host_locale(Some(snap));
-        Some(lens_sentence(snap, open.focus, &panes, &loc))
+        let sentence = lens_sentence(snap, open.focus, &panes, &loc);
+        Some(
+            if open.focus != Instrument::HowToRead && !self.deck_live_now(wid).0.fresh {
+                let at = clock_s(snap.at_unix_ms, loc.offset_at_ms(snap.at_unix_ms));
+                format!("Updates delayed; last reading {at}. {sentence}")
+            } else {
+                sentence
+            },
+        )
     }
 
     /// Copy the open lens's sentence (⌘C in a pinned or keyboard lens).
@@ -5941,7 +6607,8 @@ impl crate::App {
             if let Some(rest) = rest
                 && rest.due <= now
             {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.stats_lens.rest = None;
                 }
                 let still = self

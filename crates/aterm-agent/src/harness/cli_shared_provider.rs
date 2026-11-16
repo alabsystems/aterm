@@ -67,13 +67,22 @@ pub enum Execution {
     Unknown(String),
     /// Work may have started, but an authenticated service cannot currently continue it.
     Deferred(String),
+    /// A bot protection answered the device-local sign-in's page (Cloudflare's check that did
+    /// not clear, a block page: [`super::super::login_drive::Outcome::BotCheck`]): why, never the
+    /// page's text. The account's check goes on record and nothing asks for another attempt,
+    /// since the next one meets the same check (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md`
+    /// §3).
+    BotCheck(String),
 }
 
 impl Execution {
     fn into_result(self) -> Result<(), String> {
         match self {
             Self::Completed => Ok(()),
-            Self::NotStarted(why) | Self::Unknown(why) | Self::Deferred(why) => Err(why),
+            Self::NotStarted(why)
+            | Self::Unknown(why)
+            | Self::Deferred(why)
+            | Self::BotCheck(why) => Err(why),
         }
     }
 }
@@ -441,6 +450,7 @@ fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
         }
         super::super::login_drive::Outcome::PageNotOpened(why)
         | super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
+        super::super::login_drive::Outcome::BotCheck(why) => Execution::BotCheck(why),
         _ => Execution::Unknown("device-local Codex sign-in did not complete".into()),
     }
 }

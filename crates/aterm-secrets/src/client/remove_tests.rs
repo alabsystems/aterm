@@ -18,6 +18,10 @@ mod gap_heal;
 #[path = "capacity_tests.rs"]
 mod capacity;
 
+/// The byte bound as a budget by class (FL-145), declared here for this lab.
+#[path = "vault_fill_tests.rs"]
+mod vault_fill;
+
 /// One-mesh W3's tests of `log_entries/waiting.rs`, beside it, declared here for this lab.
 #[path = "log_entries/waiting_tests.rs"]
 mod waiting;
@@ -1122,6 +1126,553 @@ fn a_persons_removal_of_a_stolen_mac_cuts_removes_and_denies_its_writer_successo
         roster.deny_labels
     );
     macs.server.stop();
+}
+
+/// A two-Mac lab whose admin, m22, holds a log that seats m7 and m7's own writer successor,
+/// which m7 let in on its statement with nobody asked: a seat with an age identity of its own,
+/// under m7's name. m22 has seeded a swarm roster, so a stolen Mac's removal writes deny-lists.
+/// The successor's home has not yet written its vault from the bundle m7 handed it.
+struct Succeeded {
+    macs: TwoMacs,
+    actor7: MemberId,
+    seat7: crate::membership_log::Member,
+    successor: crate::commons::binding::Binding,
+    heir: crate::membership_log::Member,
+    home: Paths,
+    bundle: crate::members::Bundle,
+}
+
+impl Succeeded {
+    fn new() -> Self {
+        use crate::client::{Succeeding, Succession, admit_successor};
+        let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+        let (m22, m7) = (&macs.m22, &macs.m7);
+        admin_seed_swarm_roster(m22, &[]).expect("roster");
+        sync(m7, None).expect("m7 syncs");
+        let (_, actor7, _) = member_key(m7);
+        let seat7 = log_of(m7)
+            .membership()
+            .get(&actor7)
+            .expect("m7's seat")
+            .clone();
+        let (home, request, statement) = asker(macs.root.path(), m7, "m7-successor", &seat7.name);
+        let successor = request.binding().clone();
+        let admitted = admit_successor(
+            m7,
+            &Succeeding {
+                request: &request,
+                statement: &statement,
+                reader: crate::members::bundle::Reader::BoundedLog(
+                    records_bound(&home, &load_records(&home).expect("records")).expect("bound"),
+                ),
+                lab: false,
+            },
+            aterm_time::unix_millis().expect("clock"),
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .expect("the admission");
+        let Succession::Let { bundle, .. } = admitted else {
+            panic!("{admitted:?}");
+        };
+        let bundle = crate::members::Bundle::decode(bundle.as_slice()).expect("the bundle");
+        save_records(m22, &load_records(m7).expect("m7's records").encode()).expect("m22 hears");
+        let heir = log_of(m22)
+            .membership()
+            .get(&successor.actor())
+            .expect("CONTROL: the log seats the successor")
+            .clone();
+        assert_eq!(
+            (heir.name.as_str(), heir.admitted_by, heir.node_key),
+            (seat7.name.as_str(), Some(actor7), None)
+        );
+        assert_ne!(successor.recipient(), seat7.binding.recipient());
+        let lab = Self {
+            macs,
+            actor7,
+            seat7,
+            successor,
+            heir,
+            home,
+            bundle,
+        };
+        assert!(
+            lab.everyone_newest().iter().all(|id| epochs_wrapped_to(
+                &log_of(&lab.macs.m22),
+                &lab.successor.recipient()
+            )
+            .contains(id)),
+            "CONTROL: the successor holds the newest [everyone] epoch before the removal"
+        );
+        lab
+    }
+
+    /// The newest `[everyone]` epochs m22's log holds.
+    fn everyone_newest(&self) -> BTreeSet<RecordId> {
+        let id22 = read_identity(&self.macs.m22).unwrap().unwrap();
+        log_of(&self.macs.m22)
+            .open_audience_entries(&id22)
+            .unwrap()
+            .unwrap()
+            .maximal_epochs[&EpochAudience::Everyone]
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// m22's removal took both seats out: each is removed, no newest `[everyone]` epoch is
+    /// wrapped to either key on m7's disk, and each writer's tables were cut once, before its
+    /// `Remove`, while it was still seated.
+    fn both_out(&self) {
+        let m22 = &self.macs.m22;
+        let after = log_of(m22);
+        let membership = after.membership();
+        assert!(
+            membership.removal(&self.actor7).is_some()
+                && membership.removal(&self.successor.actor()).is_some(),
+            "both seats are removed"
+        );
+        for gone in [self.successor.recipient(), self.seat7.binding.recipient()] {
+            assert!(
+                self.everyone_newest()
+                    .iter()
+                    .all(|id| !epochs_wrapped_to(&after, &gone).contains(id)),
+                "no Wrap hands a key on m7's disk the epoch minted by its removal"
+            );
+        }
+        let calls: Vec<(MemberId, CutPass, bool)> = TABLE_CUT_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dir, ..)| *dir == m22.dir)
+            .map(|(_, member, pass, seated)| (*member, *pass, *seated))
+            .collect();
+        for writer in [self.actor7, self.successor.actor()] {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(member, ..)| *member == writer)
+                    .collect::<Vec<_>>(),
+                vec![&(writer, CutPass::BeforeRemove, true)],
+                "each writer's tables are cut once, before its Remove: {calls:?}"
+            );
+        }
+        assert_eq!(
+            calls.len(),
+            2,
+            "no other writer's tables are cut: {calls:?}"
+        );
+    }
+}
+
+/// The admin's `aterm secrets revoke <Mac> --stolen --drop-sections` names the Mac by its age
+/// recipient alone, and takes the Mac's writer successor out with it as a person's `aterm
+/// members remove` does: both seats' tables are cut before their `Remove`s, both seats are
+/// removed in the batch that rotates the keys because of the theft, no epoch it mints is
+/// wrapped to either key on the stolen disk, the retirement counts both recipients, and the
+/// successor's labels go to the roster's deny-list beside the Mac's: the label its seat holds in
+/// the log, and those of a roster row bound to its key, which goes with the Mac's row. A seat
+/// the removal takes out is no other Mac that still holds its label.
+///
+/// MUTANT (each named by the assert it fails): `super::remove::with_successors` returning
+/// `recipients.clone()` alone, the recipient-named removal before the fix, cuts the Mac's
+/// tables alone, and the successor's `Remove`, which the edit's `code-only` line still owes,
+/// lands with its tables uncut (`"each writer's tables are cut once, before its Remove"`);
+/// `apply_swarm_revoke_cascade` reading the one recipient (`gone` = `named`) counts the
+/// successor as another Mac holding its own label (the deny-list assert); the cascade keeping
+/// every roster row but the Mac's own (`if own_row`) keeps the successor's row, whose labels
+/// then survive (`"the successor's roster row goes"`).
+#[test]
+fn an_admins_stolen_revoke_takes_the_macs_writer_successor_out_with_it() {
+    on_table_cuts(record_table_cuts);
+    let _answering = crate::client::ServersAnswering::set();
+    let lab = Succeeded::new();
+    let m22 = &lab.macs.m22;
+    // A roster row bound to the successor's own key, as a `[machines]` row of it would have
+    // seeded one, under labels the log gives no seat.
+    let admin = admin_open(m22).expect("admin");
+    let mut doc = admin.doc.clone();
+    let mut roster = crate::swarm_roster::SwarmRoster::from_document(&doc)
+        .expect("the roster reads")
+        .expect("the seeded roster");
+    roster.members.push(crate::swarm_roster::SwarmMember {
+        recipient: lab.successor.recipient().to_bech32(),
+        vault_name: "successor-home".to_owned(),
+        label: "m31".to_owned(),
+        aliases: vec!["m32".to_owned()],
+        hint: None,
+        hw_hint: None,
+        admitted_ms: 0,
+        claimed_label: None,
+        claimed_at_ms: None,
+        node_id: None,
+        node_key: None,
+    });
+    roster.canonicalize();
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::swarm_roster::ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .expect("the roster entry");
+    admin_publish(m22, &admin, &doc).expect("m22 publishes the roster");
+    let admin = admin_open(m22).expect("admin");
+    let done = admin_revoke_stolen(m22, &admin, "m7", true).expect("m22 revokes the stolen m7");
+    lab.both_out();
+    let retirement = done.revocation.retirement.expect("a Commons retirement");
+    assert_eq!(
+        retirement.recipients, 2,
+        "the Mac's recipient and its successor's"
+    );
+    let roster = crate::swarm_roster::SwarmRoster::from_toml(
+        std::str::from_utf8(
+            admin_open(m22)
+                .expect("admin")
+                .doc
+                .entry(&Audience::Everyone, crate::swarm_roster::ROSTER_ENTRY)
+                .expect("the roster")
+                .value
+                .as_slice(),
+        )
+        .unwrap(),
+    )
+    .expect("the roster");
+    assert!(
+        roster.deny_labels.contains(&lab.seat7.label)
+            && roster.deny_labels.contains(&lab.heir.label),
+        "{:?}",
+        roster.deny_labels
+    );
+    let successor_row = lab.successor.recipient().to_bech32();
+    assert!(
+        roster.members.iter().all(|m| m.recipient != successor_row)
+            && ["m31", "m32"]
+                .iter()
+                .all(|label| roster.deny_labels.iter().any(|denied| denied == label)),
+        "the successor's roster row goes, its labels denied: {:?}",
+        roster
+    );
+    lab.macs.server.stop();
+}
+
+/// The admin's `aterm secrets retire <Mac>`, which edits no vault text, names the Mac by its
+/// age recipient too, and takes its writer successor out with it. Its exact retry, by the Mac's
+/// full age recipient, changes nothing and counts the same two recipients.
+///
+/// MUTANT: `super::remove::with_successors` returning `recipients.clone()` alone leaves the
+/// successor seated and wrapped (`"both seats are removed"`); the retry's unchanged retirement
+/// counting the recipients named alone (`targets.len()`) counts one (`"the same two"`).
+#[test]
+fn an_admins_retire_of_a_mac_takes_its_writer_successor_out_with_it() {
+    on_table_cuts(record_table_cuts);
+    let _answering = crate::client::ServersAnswering::set();
+    let lab = Succeeded::new();
+    let m22 = &lab.macs.m22;
+    let admin = admin_open(m22).expect("admin");
+    let retirement = admin_retire(m22, &admin, &["m7".to_owned()]).expect("m22 retires m7");
+    lab.both_out();
+    assert_eq!(
+        (retirement.recipients, retirement.changed),
+        (2, true),
+        "the Mac's recipient and its successor's"
+    );
+    // A retired Mac's name no longer resolves: the retry names it by its full age recipient.
+    let again = admin_retire(
+        m22,
+        &admin_open(m22).expect("admin"),
+        &[lab.seat7.binding.recipient().to_bech32()],
+    )
+    .expect("m22 retires m7 again");
+    assert_eq!(
+        (again.recipients, again.changed),
+        (2, false),
+        "the retry changes nothing and counts the same two"
+    );
+    lab.macs.server.stop();
+}
+
+/// A Mac whose seat a `Remove` an older release signed took out alone leaves its writer
+/// successor seated and wrapped; the admin's `aterm secrets retire` of the Mac by its full age
+/// recipient, which names a removed Mac's seat as well as a seated one, takes the successor out
+/// (ATERM-KI-1111-41).
+///
+/// MUTANT: `successors_below` reading the Mac's current seats alone (not its removed ones) finds
+/// no successor below a Mac already out (`"both seats are removed"`).
+#[test]
+fn an_admins_retire_takes_out_the_successor_an_older_removal_left() {
+    on_table_cuts(record_table_cuts);
+    let _answering = crate::client::ServersAnswering::set();
+    let lab = Succeeded::new();
+    let m22 = &lab.macs.m22;
+    super::remove_actor(m22, lab.actor7)
+        .expect("the Mac's seat alone, as an older release took it");
+    let membership = log_of(m22).membership();
+    assert!(
+        membership.removal(&lab.actor7).is_some() && membership.contains(&lab.successor.actor()),
+        "CONTROL: the Mac is out and its successor in"
+    );
+    let retirement = admin_retire(
+        m22,
+        &admin_open(m22).expect("admin"),
+        &[lab.seat7.binding.recipient().to_bech32()],
+    )
+    .expect("m22 retires m7 by its full age recipient");
+    lab.both_out();
+    assert!(retirement.changed);
+    lab.macs.server.stop();
+}
+
+/// A removal of a Mac from its own writer successor's home is refused, and cuts no table first:
+/// the successor's seat is one the removal would take out with the Mac, and a Mac does not
+/// remove itself. A person's `aterm members remove` refuses it naming that cause; the table
+/// cuts an admin's revoke or retire makes first cut nothing there; and the planner of their
+/// retirement refuses it naming the same cause.
+///
+/// MUTANT (each named by the assert it fails): `cut_tables_first` cutting where the successors
+/// hold this Mac's own seat cuts the Mac's tables and its own (`"no table cut"`), as does
+/// `cut_tables_for_recipients` cutting where its seats hold this Mac's own; deleting
+/// `draft_removal`'s successor refusal has the successor's home sign the Mac's removal and its
+/// own (`"does not remove its Mac"`); deleting the planner's successor refusal leaves the
+/// retirement to refuse only later, as a member removing itself, which names no succession
+/// (`"the planner names the succession"`).
+#[test]
+fn a_removal_of_a_mac_from_its_successors_own_home_is_refused_and_cuts_nothing() {
+    on_table_cuts(record_table_cuts);
+    let _answering = crate::client::ServersAnswering::set();
+    let lab = Succeeded::new();
+    let home = &lab.home;
+    readmit_from_log_bundle(home, &lab.bundle).expect("the successor's home writes its vault");
+    let seated = || {
+        let membership = log_of(home).membership();
+        membership.contains(&lab.actor7) && membership.contains(&lab.successor.actor())
+    };
+    assert!(seated(), "CONTROL: the successor's home seats both");
+    let cut_here = || {
+        TABLE_CUT_CALLS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dir, ..)| *dir == home.dir)
+            .map(|(_, member, ..)| *member)
+            .collect::<Vec<_>>()
+    };
+
+    let error = remove_member(home, &lab.seat7.label, false)
+        .expect_err("the successor's home does not remove its Mac");
+    assert!(error.to_string().contains("writer successor"), "{error}");
+    super::remove::cut_tables_for_recipients(home, &[lab.seat7.binding.recipient()]);
+    assert_eq!(
+        cut_here(),
+        Vec::<MemberId>::new(),
+        "no table cut from the successor's home"
+    );
+    assert!(seated(), "both seats stay");
+
+    let bootstrap = Bootstrap::required(home).expect("the successor's bootstrap");
+    let (log, head) = crate::client::log_entries::trusted_commons_log(home, bootstrap.trust())
+        .expect("the log reads")
+        .expect("a trusted Commons log");
+    let lock = StateLock::try_take(home)
+        .expect("the state lock")
+        .expect("the state is free");
+    let refused = admin_open(&lab.macs.m22)
+        .expect("admin")
+        .plan_commons_members_in_log(
+            &bootstrap,
+            &log,
+            head,
+            &BTreeSet::from([lab.seat7.binding.recipient()]),
+            &lock,
+        )
+        .map(|_| ())
+        .expect_err("the planner refuses");
+    assert!(
+        refused.to_string().contains("writer successor"),
+        "the planner names the succession: {refused}"
+    );
+    drop(lock);
+    assert!(seated(), "both seats stay");
+    lab.macs.server.stop();
+}
+
+/// A vault edit that lets a Mac's key go names it on a `code-only` line, and the edit's draft
+/// owes a `Remove` of each seat of that key and of every writer successor below it, and theirs,
+/// as any other removal of the Mac takes them out. A Mac the Mac admitted under a name of its
+/// own is no successor and stays. Where a `Remove` an older release signed took the Mac's seat
+/// alone, the draft owes the successors it left in.
+///
+/// MUTANT: `pending_remove_cutoffs` with `heirs` left empty owes the Mac's own seat alone, and
+/// the assert on the seats owed fails; `successors_below` reading the Mac's current seats alone
+/// (not its removed ones) owes nothing once the Mac is out, and the last assert fails.
+#[test]
+fn a_let_go_keys_removal_owes_the_macs_writer_successors_too() {
+    use crate::membership_log::{Entrant, Evidence};
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (remover, mac) = (seat(1), seat(2));
+    let (first, second, machine) = (seat(11), seat(12), seat(13));
+    let mut log = Log::new(
+        Record::found(&[99; 32], vec![remover.entrant("m1"), mac.entrant("m2")], 1)
+            .expect("genesis"),
+    )
+    .expect("log");
+    let alone = |seat: &Seat, label: &str, name: &str| Entrant {
+        node_key: [0; 32],
+        name: name.to_owned(),
+        ..seat.entrant(label)
+    };
+    mac.sign(
+        &mut log,
+        Body::Admit {
+            entrant: alone(&first, "m11", "mac-2"),
+            evidence: Evidence::Manual,
+        },
+    );
+    first.sign(
+        &mut log,
+        Body::Admit {
+            entrant: alone(&second, "m12", "mac-2"),
+            evidence: Evidence::Manual,
+        },
+    );
+    mac.sign(
+        &mut log,
+        Body::Admit {
+            entrant: alone(&machine, "m13", "mac-13"),
+            evidence: Evidence::Manual,
+        },
+    );
+    assert_eq!(
+        log.membership().members().len(),
+        5,
+        "CONTROL: every seat is in"
+    );
+    let owed: BTreeSet<MemberId> =
+        super::log_entries::pending_remove_cutoffs(&log, &remover.actor(), |recipient| {
+            *recipient == mac.identity.recipient()
+        })
+        .into_iter()
+        .map(|(member, _)| member)
+        .collect();
+    assert_eq!(
+        owed,
+        BTreeSet::from([mac.actor(), first.actor(), second.actor()]),
+        "the let-go Mac's seat and both successors below it"
+    );
+    assert_eq!(
+        with_successors(&log, &BTreeSet::from([mac.identity.recipient()])),
+        BTreeSet::from([
+            mac.identity.recipient(),
+            first.identity.recipient(),
+            second.identity.recipient()
+        ])
+    );
+    // A `Remove` an older release signed took the Mac's seat alone and left its successors
+    // in: the next edit that names the Mac's key on a `code-only` line owes their `Remove`s.
+    let cutoff = *log
+        .records()
+        .filter(|record| record.actor() == &mac.actor())
+        .last()
+        .expect("the Mac's last record")
+        .id();
+    remover.sign(
+        &mut log,
+        Body::Remove {
+            member: mac.actor(),
+            cutoff,
+        },
+    );
+    assert!(
+        log.membership().get(&mac.actor()).is_none()
+            && log.membership().get(&first.actor()).is_some()
+            && log.membership().get(&second.actor()).is_some(),
+        "CONTROL: the Mac is out and both successors are in"
+    );
+    let owed: BTreeSet<MemberId> =
+        super::log_entries::pending_remove_cutoffs(&log, &remover.actor(), |recipient| {
+            *recipient == mac.identity.recipient()
+        })
+        .into_iter()
+        .map(|(member, _)| member)
+        .collect();
+    assert_eq!(
+        owed,
+        BTreeSet::from([first.actor(), second.actor()]),
+        "both successors a removal of the Mac's seat alone left in"
+    );
+}
+
+/// A let-go key's removal adds this Mac's share to a removal of the Mac's writer successor that
+/// another member began short of a quorum, at the cutoff that member's `Remove` names, as it adds
+/// its share to a contested removal of the Mac's own seat: the successor goes with its Mac
+/// however its removal began.
+///
+/// MUTANT: `pending_remove_cutoffs` leaving the successors out of `removed_matching` owes no
+/// share of the successor's removal (`"this Mac's share"`).
+#[test]
+fn a_let_go_keys_removal_adds_its_share_to_a_successors_contested_removal() {
+    use crate::membership_log::{Entrant, Evidence};
+    let seat = |tag: u8| Seat {
+        identity: Identity::from_secret_bytes([tag; 32]),
+        tag,
+    };
+    let (remover, mac, other, heir) = (seat(1), seat(2), seat(3), seat(11));
+    let mut log = Log::new(
+        Record::found(
+            &[99; 32],
+            vec![
+                remover.entrant("m1"),
+                mac.entrant("m2"),
+                other.entrant("m3"),
+            ],
+            1,
+        )
+        .expect("genesis"),
+    )
+    .expect("log");
+    mac.sign(
+        &mut log,
+        Body::Admit {
+            entrant: Entrant {
+                node_key: [0; 32],
+                name: "mac-2".to_owned(),
+                ..heir.entrant("m11")
+            },
+            evidence: Evidence::Manual,
+        },
+    );
+    let cutoff = log
+        .membership()
+        .get(&heir.actor())
+        .expect("CONTROL: the successor is in")
+        .entry;
+    other.sign(
+        &mut log,
+        Body::Remove {
+            member: heir.actor(),
+            cutoff,
+        },
+    );
+    let membership = log.membership();
+    let removal = membership
+        .removal(&heir.actor())
+        .expect("CONTROL: the successor is out");
+    assert!(
+        !removal.quorum && removal.by == BTreeSet::from([other.actor()]),
+        "CONTROL: short of a quorum, by the other member alone"
+    );
+    let owed = super::log_entries::pending_remove_cutoffs(&log, &remover.actor(), |recipient| {
+        *recipient == mac.identity.recipient()
+    });
+    assert!(
+        owed.contains(&(heir.actor(), cutoff)),
+        "this Mac's share of the successor's removal, at the other member's cutoff: {owed:?}"
+    );
+    assert!(
+        owed.iter().any(|(member, _)| *member == mac.actor()),
+        "and the Mac's own seat: {owed:?}"
+    );
 }
 
 /// SF-A: a Mac's writer successors are the seats one of its own seats admitted alone
@@ -3885,7 +4436,16 @@ fn passes(all: &[Paths], t0: u64, steps: u64) -> Vec<Record> {
 /// bound on what the coalesce signs ([`log_entries::rekey_bound`]), the same before the
 /// heal and after.
 fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
+    stop_lab_after(|_| {})
+}
+
+/// [`stop_lab`], built after `prepare` ran over the six Macs, each holding one log: what a test
+/// writes there is in every Mac's log before the heads part.
+fn stop_lab_after(
+    prepare: impl FnOnce(&convergence::Six),
+) -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
     let lab = convergence::six();
+    prepare(&lab);
     let (m44, _, rec44) = let_in_by(&lab.macs, &lab.macs.m7, "m44", "m44");
     let wire = load_records(&lab.all[1]).unwrap().encode();
     for paths in &lab.all[2..] {

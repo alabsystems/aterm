@@ -64,14 +64,15 @@ pub struct Plan {
 
 impl Plan {
     /// The plan for the site checkout `site_dir`: `hosting`'s config, and `public/`'s files
-    /// that `hosting.ignore` leaves, with `overlay` (by path under `public/`) laid over them.
+    /// that `hosting.ignore` leaves, with `overlay` (by path under `public/`) laid over them,
+    /// a path it names with `None` taken out.
     /// # Errors
     /// An ignore pattern this deploy cannot match, or a file it cannot list or read.
     pub fn of(
         site_dir: &Path,
         hosting: &Hosting,
         site: Option<String>,
-        overlay: &BTreeMap<String, Vec<u8>>,
+        overlay: &BTreeMap<String, Option<Vec<u8>>>,
     ) -> Result<Plan, String> {
         let ignore = files::patterns(&hosting.ignore)?;
         let listed = files::list(&site_dir.join(config::PUBLIC), &ignore, overlay)?;

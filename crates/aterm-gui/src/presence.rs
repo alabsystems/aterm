@@ -182,9 +182,22 @@ pub(crate) fn post_driven(session: &SessionId, host: &str, act: &str) {
 
 /// Session `local`'s metadata moved off a control connection.
 pub(crate) fn post_meta_changed(local: u64) {
+    #[cfg(test)]
+    META_WAKES.with(|w| w.borrow_mut().push(local));
     if let Some(proxy) = PROXY.get() {
         let _ = proxy.send_event(Wake::MetaChanged { session: local });
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static META_WAKES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every meta-changed wake posted on this thread since the last take, in order.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn take_meta_wakes() -> Vec<u64> {
+    META_WAKES.with(|w| std::mem::take(&mut *w.borrow_mut()))
 }
 
 /// Session `local`'s TASK RECORD moved.
@@ -436,17 +449,17 @@ impl AgentVerdict {
     }
 }
 
-/// The one adapter between a session's screen and its published agent verdict. `title` is the
-/// program's window title, read under the lock the rows were read under (`""` where it set
-/// none): a turn its screen does not show but its title runs reads busy
+/// The one adapter between a session's screen and its published agent verdict. `signs` are the
+/// program's run signs, read under the lock the rows were read under ([`RunSigns`]; a bare title
+/// is one with no report): a turn its screen does not show but its run sign runs reads busy
 /// ([`aterm_phase::ScreenReader::read_seen`]).
-pub(crate) fn agent_verdict(
+pub(crate) fn agent_verdict<'a>(
     program: Option<&str>,
     program_pending: bool,
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
     cursor: Cursor,
-    title: &str,
+    signs: impl Into<RunSigns<'a>>,
     now: Instant,
 ) -> AgentVerdict {
     use aterm_phase::ScreenReader;
@@ -474,7 +487,7 @@ pub(crate) fn agent_verdict(
         return AgentVerdict::NotAgent;
     };
     let (rows, cursor) = verdict_rows(reader, whole, cursor);
-    let (reading, subject, turn) = classify(reader, rows, cursor, title, now);
+    let (reading, subject, turn) = classify(reader, rows, cursor, signs, now);
     AgentVerdict::Agent {
         reading,
         by_frame,
@@ -534,13 +547,42 @@ pub(crate) fn prompt_drawn(program: aterm_phase::Program, whole: &[String]) -> O
     })
 }
 
-/// The title's run bit the agent watch keeps: whether any agent's reader reads `title` as its
-/// run going on ([`aterm_phase::ScreenReader::runs`]). Claude Code's two busy frames and Muse
-/// Code's spinner frames flip under it, so a flip moves nothing; a turn starting or ending does.
-pub(crate) fn title_runs(title: &str) -> bool {
+/// A program's run signs, read in the hold its rows are: its window title (`""` where it set
+/// none) and the OSC 7501 program-status report standing as a run sign, as the body that says it
+/// (`ProgramStateReport::run_sign`), which says before the title where the program's reader reads
+/// it ([`aterm_phase::ScreenReader::runs`]). A bare title is the signs with no report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunSigns<'a> {
+    /// The program's OSC 0/2 title.
+    pub(crate) title: &'a str,
+    /// The program-status report standing; `None` while none stands.
+    pub(crate) report: Option<&'a str>,
+}
+
+impl<'a> From<&'a str> for RunSigns<'a> {
+    fn from(title: &'a str) -> Self {
+        Self {
+            title,
+            report: None,
+        }
+    }
+}
+
+impl RunSigns<'_> {
+    /// What `reader` reads of the run from these signs ([`aterm_phase::ScreenReader::runs`]).
+    pub(crate) fn runs(self, reader: &dyn aterm_phase::ScreenReader) -> Option<bool> {
+        reader.runs(Some(self.title), self.report)
+    }
+}
+
+/// The run bit the agent watch keeps: whether any agent's reader reads `signs` as its run going
+/// on ([`RunSigns::runs`]). Claude Code's two busy frames and Muse Code's spinner frames flip
+/// under it, so a flip moves nothing; a turn starting or ending does, as Claude Code's report
+/// moving between `working` and a rest does.
+pub(crate) fn runs_bit(signs: RunSigns<'_>) -> bool {
     aterm_phase::Program::ALL
         .iter()
-        .any(|p| p.reader().runs(Some(title)) == Some(true))
+        .any(|p| signs.runs(p.reader()) == Some(true))
 }
 
 /// Whether the reader a screen sniff answered ([`aterm_phase::identify`]) names an agent.
@@ -562,16 +604,17 @@ const fn names_agent(program: aterm_phase::Program) -> bool {
     reason = "agent_verdict's seven inputs, passed through whole, and the session the fence's \
               warning names; a wrapper struct would relocate the list, not simplify it"
 )]
-pub(crate) fn agent_verdict_guarded(
+pub(crate) fn agent_verdict_guarded<'a>(
     session: u64,
     program: Option<&str>,
     program_pending: bool,
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
     cursor: Cursor,
-    title: &str,
+    signs: impl Into<RunSigns<'a>>,
     now: Instant,
 ) -> AgentVerdict {
+    let signs = signs.into();
     fenced_verdict(session, program, program_pending, known_agent, rows, || {
         agent_verdict(
             program,
@@ -579,7 +622,7 @@ pub(crate) fn agent_verdict_guarded(
             known_agent,
             rows,
             cursor,
-            title,
+            signs,
             now,
         )
     })
@@ -630,18 +673,18 @@ fn unreadable_verdict(
     }
 }
 
-/// Classify one screen with one program's reader, its phase read beside the program's window
-/// `title` ([`aterm_phase::ScreenReader::read_seen`]; `""` says nothing).
-pub(crate) fn classify(
+/// Classify one screen with one program's reader, its phase read beside the program's run
+/// `signs` ([`aterm_phase::ScreenReader::read_seen`]; an empty title and no report say nothing).
+pub(crate) fn classify<'a>(
     reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
     cursor: Cursor,
-    title: &str,
+    signs: impl Into<RunSigns<'a>>,
     now: Instant,
 ) -> (AgentReading, Option<String>, TurnFacts) {
     #[cfg(test)]
     CLASSIFIER_CALLS.with(|c| c.set(c.get() + 1));
-    let runs = reader.runs(Some(title));
+    let runs = signs.into().runs(reader);
     let r = match cursor {
         Cursor::At(row) => reader.read_seen(rows, row, None, runs),
         #[cfg(test)]

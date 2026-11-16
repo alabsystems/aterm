@@ -144,6 +144,8 @@ pub(super) use sync_commit::CUT as SYNC_COMMIT_CUT;
 pub(super) use sync_commit::EARLY_ROSTER as SYNC_COMMIT_EARLY_ROSTER;
 #[cfg(test)]
 pub(super) use sync_commit::REFUSE_BEFORE_INTENT as SYNC_COMMIT_REFUSE;
+#[cfg(any(test, debug_assertions))]
+pub use sync_commit::paused_before_receipt_for_test;
 pub(super) use sync_commit::{FleetTarget, SyncTarget, usage_target};
 
 #[path = "accounts_directory.rs"]
@@ -450,6 +452,27 @@ pub const WEEK_LIMIT: &str = "seven_day";
 
 /// The limit type of Kimi Code's monthly total ([`note_panel_window`]).
 pub const MONTH_LIMIT: &str = "monthly";
+
+/// What a limit wall's window name begins with ([`limit_wall`]).
+const LIMIT_WALL: &str = "limit:";
+
+/// The window a wall of the Codex limit `id` ([`super::codex_app_login::is_limit_id`]: a model's
+/// own, not the codex bucket) is named by, `limit:<id>`: what a usage-limit handoff asked about
+/// that limit stands its session's wall at. [`note_wall`] records such a wall in
+/// [`Account::limit_walls`], never in [`Account::walls`], so it walls the row for that limit's
+/// handoffs alone ([`Account::limit_wall_until`]).
+#[must_use]
+pub fn limit_wall(id: &str) -> String {
+    format!("{LIMIT_WALL}{id}")
+}
+
+/// The limit a window names, where it is a limit wall's ([`limit_wall`]).
+#[must_use]
+pub fn limit_of(window: &str) -> Option<&str> {
+    window
+        .strip_prefix(LIMIT_WALL)
+        .filter(|id| super::codex_app_login::is_limit_id(id))
+}
 
 /// The variable that moves a process's Claude home ([`LOGIN_ENV`]).
 pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -1444,9 +1467,16 @@ pub fn enrolled(roster: &Roster) -> BTreeSet<String> {
     roster
         .rows
         .iter()
-        .filter(|r| r.dir.as_deref().is_none_or(|d| login_made(Path::new(d))))
+        .filter(|r| login_made_here(r))
         .map(|r| r.label.clone())
         .collect()
+}
+
+/// Whether Claude Code's `row` is enrolled on this machine ([`enrolled`]): its own login directory
+/// holds a login made here ([`login_made`]), or it is the default login, which has none of its own.
+#[must_use]
+pub fn login_made_here(row: &Row) -> bool {
+    row.dir.as_deref().is_none_or(|d| login_made(Path::new(d)))
 }
 
 /// Returns the set of `cli`'s roster labels whose logins are made on this machine ([`enrolled`]
@@ -2377,6 +2407,7 @@ impl RenewalParent {
             // These observations carry no account identity or parent authority.
             binding.sign_in_attempt = None;
             binding.sign_in_task = None;
+            binding.check_stop = None;
             binding.served_at = None;
             // A first failed attempt may create a report-only default binding.
             // It carries the same identity facts as no binding at all.
@@ -3144,6 +3175,61 @@ pub struct Binding {
     /// [`note_hand_sign_in_attempt`]); a failed one is cleared by a new login, a renewal's
     /// ([`note_renewed`]) or one signed back in where it stands ([`note_signed_back`]).
     pub sign_in_attempt: Option<SignInAttempt>,
+    /// A bot protection that stopped a sign-in of the row's account on this Mac
+    /// ([`note_check_stop`]), kept apart from [`Self::sign_in_attempt`] and from the row's
+    /// sign-in workflow, so that only a login made for the row ends it.
+    pub check_stop: Option<CheckStop>,
+}
+
+/// A bot protection that stopped a sign-in of an account on this Mac, of any CLI's pool: a
+/// Claude sign-in's ([`super::open_url::MetWord::is_bot_protection`]: Cloudflare's check or
+/// block page, in the headless page or in aterm's sign-in window, or the consent page's human
+/// check), or another CLI's renewal whose page a bot protection answered
+/// ([`super::login_drive::Outcome::BotCheck`]: Cloudflare's check that did not clear, or a
+/// bot-protection block page). Nothing with nobody there signs that account in again, on any
+/// clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3), so the record outlasts what the
+/// row's attempt does not: a later stop no bot protection made (a window a person closed), a run
+/// on the row's token, a hand run that failed for another reason, another account signed in,
+/// and a change of the row's workflow policy (its class, its holder, its browser) that keeps its
+/// account. A login made for the row ends it ([`Binding::clear_failed_sign_in`]). Its readers
+/// lift it while the row's token is in use here, for the vault route alone, and end it at a
+/// signed-in `accounts browser` window since `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckStop {
+    /// The account the check stopped: the row's expected identity address then
+    /// ([`Row::expected_identity_email`]), `None` where the row named none (a Kimi Code CLI row
+    /// may). A row that names another account now is not held; one where either side names none
+    /// is, since nothing tells its account from the one the check stopped
+    /// ([`checked_account`]).
+    pub account: Option<String>,
+    /// The provider realm the row named then ([`Vendor::region`]: a Kimi Code CLI row's account
+    /// system), `None` for a CLI whose rows name none. The same address in another realm is
+    /// another account on another vendor site, which this Mac's check never met.
+    pub region: Option<Region>,
+    /// When a bot protection last stopped it (Unix seconds).
+    pub at: i64,
+}
+
+/// Whether `check` holds a row that names `now`'s account ([`Row::expected_identity_email`] in
+/// [`Vendor::region`]): the same realm and the same address, or, within the same realm, where
+/// either names no address, since nothing then tells one account from the other and a sign-in is
+/// never tried again into what may be the same check.
+pub(super) fn checked_account(check: &CheckStop, now: &Row) -> bool {
+    check.region == now.vendor.region
+        && match (check.account.as_deref(), now.expected_identity_email()) {
+            (Some(checked), Some(now)) => email_matches(checked, now),
+            _ => true,
+        }
+}
+
+/// The check a bot protection's stop of `row`'s sign-in at `at` records ([`note_check_stop`]).
+#[must_use]
+pub fn check_of(row: &Row, at: i64) -> CheckStop {
+    CheckStop {
+        account: row.expected_identity_email().map(str::to_owned),
+        region: row.vendor.region,
+        at,
+    }
 }
 
 /// How an automatic sign-in of a row ended ([`SignInAttempt::outcome`]).
@@ -3157,9 +3243,11 @@ pub enum AttemptOutcome {
     /// ([`super::open_url::Met::stopped`]): Cloudflare's bot check or block page, in the
     /// headless page or in aterm's sign-in window, the consent page's human check (aterm
     /// operates none of them), a consent page that named another account, a session with no
-    /// desktop, or a window a person closed. The upkeep waits ([`super::accounts_sync`]'s
-    /// `PERSON_BACKOFF`), opens no sign-in window for the row again, and the row's next step
-    /// is a person's own renewal at this Mac's terminal. A sign-in in the window that failed
+    /// desktop, or a window a person closed. The row's next step is a person's own renewal at
+    /// this Mac's terminal. Where a bot protection stopped it, or the record does not say what
+    /// did ([`SignInAttempt::waits_for_a_person`]), nothing tries it again with nobody there,
+    /// on any clock; anything else holds the upkeep for [`super::accounts_sync`]'s
+    /// `PERSON_BACKOFF`. A sign-in in the window that failed
     /// for any other reason (a page that did not load, a mailbox that did not answer, its
     /// deadline) is [`Self::Failed`], and is tried again on the ordinary backoff.
     Blocked,
@@ -3241,6 +3329,24 @@ pub struct SignInAttempt {
     /// counts from it: an unchanged attempt keeps `since` and writes no ledger line. Any other
     /// outcome repeats with no write at all, so here this stays `since`.
     pub tried_at: i64,
+    /// What stopped an [`AttemptOutcome::Blocked`] attempt, by its closed word
+    /// ([`note_sign_in_stop`]; `stop` in `logins.json`); `None` where the record does not say:
+    /// an earlier build's, a word this build does not know, or any other outcome.
+    pub stop: Option<super::open_url::MetWord>,
+}
+
+impl SignInAttempt {
+    /// Whether only a person ends this attempt's hold: it was [`AttemptOutcome::Blocked`] by a
+    /// bot protection ([`super::open_url::MetWord::is_bot_protection`]), or by what its record
+    /// does not name, which is held as one would be, since aterm never tries a sign-in again
+    /// into what may be one (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3).
+    #[must_use]
+    pub fn waits_for_a_person(&self) -> bool {
+        self.outcome == AttemptOutcome::Blocked
+            && self
+                .stop
+                .is_none_or(super::open_url::MetWord::is_bot_protection)
+    }
 }
 
 /// The human step a vendor renewal could not finish, without its page or error text.
@@ -3364,6 +3470,7 @@ impl Default for Binding {
             google_principal: None,
             sign_in_task: None,
             sign_in_attempt: None,
+            check_stop: None,
         }
     }
 }
@@ -3403,7 +3510,9 @@ impl Binding {
     }
 
     /// Ends a failed automatic sign-in's record once the row has a login again: what it tried is
-    /// no news of the new login, whose own end, due date or failed renewal is told afresh.
+    /// no news of the new login, whose own end, due date or failed renewal is told afresh. A
+    /// bot protection's stop ([`Self::check_stop`]) ends with it: the login is the one a person
+    /// went on to make.
     fn clear_failed_sign_in(&mut self) {
         if self
             .sign_in_attempt
@@ -3412,6 +3521,7 @@ impl Binding {
         {
             self.sign_in_attempt = None;
         }
+        self.check_stop = None;
     }
 
     /// Clamped login lifetime in seconds used to forecast expiration.
@@ -3630,7 +3740,21 @@ impl Logins {
                     tried.insert("routes".into(), Value::from(attempt.routes.clone()));
                     tried.insert("since".into(), Value::from(attempt.since));
                     tried.insert("tried_at".into(), Value::from(attempt.tried_at));
+                    if let Some(stop) = attempt.stop {
+                        tried.insert("stop".into(), Value::from(stop.as_str()));
+                    }
                     m.insert("sign_in_attempt".into(), Value::Object(tried));
+                }
+                if let Some(check) = &b.check_stop {
+                    let mut stop = Map::new();
+                    if let Some(account) = &check.account {
+                        stop.insert("account".into(), Value::from(account.clone()));
+                    }
+                    if let Some(region) = check.region {
+                        stop.insert("region".into(), Value::from(region.as_str()));
+                    }
+                    stop.insert("at".into(), Value::from(check.at));
+                    m.insert("check_stop".into(), Value::Object(stop));
                 }
                 (label.clone(), Value::Object(m))
             })
@@ -3747,7 +3871,9 @@ impl Logins {
                 }
             };
             // An attempt this build cannot read is dropped, not refused: it is a record of the
-            // ladder's last pass, which the next pass writes again.
+            // ladder's last pass, which the next pass writes again. A stop word it does not know
+            // reads as none, which holds as a bot protection does
+            // ([`SignInAttempt::waits_for_a_person`]).
             let sign_in_attempt = v.get("sign_in_attempt").and_then(|tried| {
                 let since = stamp(tried.get("since"), now)?;
                 Some(SignInAttempt {
@@ -3758,6 +3884,10 @@ impl Logins {
                     routes: one_line(tried.get("routes")?.as_str()?, ROUTES_MAX),
                     since,
                     tried_at: stamp(tried.get("tried_at"), now).unwrap_or(since),
+                    stop: tried
+                        .get("stop")
+                        .and_then(Value::as_str)
+                        .and_then(super::open_url::MetWord::parse),
                 })
             });
             let binding = Binding {
@@ -3811,6 +3941,30 @@ impl Logins {
                 },
                 sign_in_task,
                 sign_in_attempt,
+                // Capped at `now` as every stamp is: a check met is never in the future.
+                // A check that names no account is a row's that named none, and one that names
+                // no realm a row's of a CLI with none; one whose account is not an address, or
+                // whose realm is not one, is dropped, as before.
+                check_stop: v.get("check_stop").and_then(|stop| {
+                    let account = match stop.get("account") {
+                        None => None,
+                        Some(account) => Some(
+                            account
+                                .as_str()
+                                .filter(|email| email_refusal(email).is_none())?
+                                .to_owned(),
+                        ),
+                    };
+                    let region = match stop.get("region") {
+                        None => None,
+                        Some(region) => Some(Region::parse(region.as_str()?)?),
+                    };
+                    Some(CheckStop {
+                        account,
+                        region,
+                        at: stamp(stop.get("at"), now)?,
+                    })
+                }),
             };
             if binding.last_success_generation > binding.renewal_generation {
                 return Err(Unread::NotOurs(format!(
@@ -4872,8 +5026,99 @@ fn note_sign_in_attempt_by(
         routes,
         since: at,
         tried_at: at,
+        stop: None,
     });
     vec![event]
+}
+
+/// Records that `label`'s sign-in at `at` stopped at the page `word` names: the
+/// [`AttemptOutcome::Blocked`] attempt [`note_sign_in_attempt`] (or, `by_hand`,
+/// [`note_hand_sign_in_attempt`]) writes, with the page kept beside it, so the upkeep, the
+/// ladder and `accounts renew` can tell a bot protection, which only a person goes on from
+/// ([`SignInAttempt::waits_for_a_person`]), from a window someone closed or a wrong account.
+/// A bot protection is also kept as the account's [`CheckStop`] ([`note_check_stop`]), and a
+/// stop no bot protection made leaves the one that stands ([`keep_check`]): a person who closed
+/// the window in front of a check has not passed it.
+pub fn note_sign_in_stop(
+    logins: &mut Logins,
+    row: &Row,
+    by_hand: bool,
+    word: super::open_url::MetWord,
+    routes: &str,
+    at: i64,
+) -> Vec<Event> {
+    let label = row.label.as_str();
+    keep_check(logins, row);
+    let by = if by_hand { HAND_SIGN_IN } else { AUTO_SIGN_IN };
+    let events = note_sign_in_attempt_by(logins, label, by, AttemptOutcome::Blocked, routes, at);
+    if admissible_label(label)
+        && let Some(attempt) = logins
+            .entry(label)
+            .and_then(|binding| binding.sign_in_attempt.as_mut())
+        && attempt.outcome == AttemptOutcome::Blocked
+    {
+        attempt.stop = Some(word);
+    }
+    if word.is_bot_protection() {
+        note_check_stop(logins, row, at);
+    }
+    events
+}
+
+/// Records that a bot protection stopped a sign-in of `row`'s account at `at`
+/// ([`CheckStop`]), of any CLI's pool, keeping the latest time a check of the same account was
+/// met. A row that names no account records a check of none, which holds it whatever it names
+/// later in the same realm ([`checked_account`]): nothing could tell its next account from this
+/// one.
+pub fn note_check_stop(logins: &mut Logins, row: &Row, at: i64) {
+    let Some(binding) = logins.entry(&row.label) else {
+        return;
+    };
+    let at = binding
+        .check_stop
+        .as_ref()
+        .filter(|check| checked_account(check, row))
+        .map_or(at, |check| check.at.max(at));
+    binding.check_stop = Some(check_of(row, at));
+}
+
+/// Keeps the hold `row`'s current attempt makes before a write replaces it: where that attempt
+/// waits for a person ([`SignInAttempt::waits_for_a_person`], an earlier build's `blocked` record
+/// that names no page among them), it becomes the account's [`CheckStop`]
+/// ([`note_check_stop`]), so a run on the row's token, a later stop no bot protection made or
+/// any other outcome short of a login leaves it standing. A writer calls this inside the
+/// transaction it records the next attempt in.
+pub fn keep_check(logins: &mut Logins, row: &Row) {
+    if !admissible_label(&row.label) || !workflow_scope::attempt_current(logins, &row.label) {
+        return;
+    }
+    if let Some(at) = logins
+        .get(&row.label)
+        .and_then(|binding| binding.sign_in_attempt.as_ref())
+        .filter(|attempt| attempt.waits_for_a_person())
+        .map(|attempt| attempt.tried_at)
+    {
+        note_check_stop(logins, row, at);
+    }
+}
+
+/// When a bot protection last stopped a sign-in of `row` (the row as the roster file has it) on
+/// this Mac, where that stop stands on its record: its account's [`CheckStop`], whatever the
+/// row's workflow is now, or its current attempt where that waits for a person
+/// ([`SignInAttempt::waits_for_a_person`]); `None` where neither does, or the check stopped
+/// another account than the one the row names now ([`checked_account`]). The readers end it at
+/// a signed-in `accounts browser` window since and lift it while the row's token is in use here.
+#[must_use]
+pub fn check_stopped_at(row: &Row, logins: &Logins) -> Option<i64> {
+    let check = logins
+        .get(&row.label)
+        .and_then(|binding| binding.check_stop.as_ref())
+        .filter(|check| checked_account(check, row))
+        .map(|check| check.at);
+    let attempt = current_sign_in_attempt(row, logins)
+        .filter(|attempt| attempt.waits_for_a_person())
+        .map(|attempt| attempt.tried_at);
+    check.max(attempt)
 }
 
 /// Whether `row` still needs a sign-in on this machine: it has no login it can be run on here
@@ -5738,6 +5983,9 @@ pub(crate) fn fill_observations(into: &mut Account, from: Account) {
     for (window, wall) in from.walls {
         into.walls.entry(window).or_insert(wall);
     }
+    for (id, wall) in from.limit_walls {
+        into.limit_walls.entry(id).or_insert(wall);
+    }
     for (window, fig) in from.windows {
         into.windows.entry(window).or_insert(fig);
     }
@@ -5779,6 +6027,11 @@ pub struct Wall {
     pub attempts: u32,
     /// This window was cleared at `at`, rather than observed standing.
     pub cleared: bool,
+    /// The newest observation it stands on, where that is not `at` ([`Wall::seen()`]): of a wall
+    /// standing, its newest sighting, while `at` keeps its first ([`note_wall`]); of a lifted
+    /// one, when the proof that lifted it was served (a read's, a refill's, a reset step's
+    /// claim, another Mac's lift), while `at` is when the lift was recorded here.
+    pub seen: Option<i64>,
 }
 
 /// The wait `ladder` gives the `attempts`th try in a row: the rung of that number, its first for
@@ -5794,6 +6047,13 @@ pub fn rung(ladder: &[i64], attempts: u32) -> i64 {
 }
 
 impl Wall {
+    /// The newest observation it stands on (its `seen` field), else `at`: of a wall standing, its
+    /// newest sighting; of a lifted one, when its proof was served.
+    #[must_use]
+    pub fn seen(&self) -> i64 {
+        self.seen.unwrap_or(self.at)
+    }
+
     /// Returns the Unix timestamp until which this observed wall remains standing.
     #[must_use]
     pub fn stands_until(&self) -> Option<i64> {
@@ -5852,6 +6112,53 @@ pub struct Sample {
     pub at: i64,
     /// The machine that read it ([`note_sample`] stamps it).
     pub by: String,
+}
+
+/// How many whole percent less used than Claude Code's warning a later reading of the same window
+/// must find to end it ([`standing_warning`]). Two sources round one figure differently (the
+/// warning's words against a reading's tenths), so a point or two apart is one figure; a refill or
+/// a raised allowance moves it by tens of points (m2 on 2026-11-15: 99% warned, 69% read).
+pub const WARNING_END_DROP_PCT: u32 = 5;
+
+/// A usage reading of one window as [`standing_warning`] weighs it against a warning: whole percent
+/// used, when it was read, and the window's reset where the reading named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowReading {
+    /// Whole percent used.
+    pub pct: u32,
+    /// When it was read, on this Mac's clock.
+    pub at: i64,
+    /// The reset of the window it read, where it named one.
+    pub reset: Option<i64>,
+}
+
+/// `warned` as it stands beside `read`, a usage sample's figure of the same window, and `barrier`,
+/// the window's held figure with its retained refill barrier ([`WindowFig::admits_reading`]). A
+/// warning drawn before that barrier is from before a refill and no longer stands, as the outlook
+/// and the menu already read it. Within a window use only grows, so a reading made after the
+/// warning, of a window still open when the warning was said, that finds at least
+/// [`WARNING_END_DROP_PCT`] less used shows the window was refilled, or its allowance raised (a plan
+/// change), between the two: the warning's figure is from before that and no longer stands either.
+/// A later reading that finds about as much or more contradicts nothing, one of the warning's own
+/// instant proves no order, and one whose window had reset by the warning's time is of another
+/// window, so the warning stands beside each, on the side of use. A warning with no figure (a
+/// refill's marker) always stands. Both are this Mac's own readings, dated by its clock.
+fn standing_warning<'a>(
+    warned: Option<&'a WindowSaid>,
+    read: Option<WindowReading>,
+    barrier: Option<&WindowFig>,
+) -> Option<&'a WindowSaid> {
+    warned.filter(|w| {
+        let Some(said) = w.pct else {
+            return true;
+        };
+        barrier.is_none_or(|fig| fig.admits_reading(w.at))
+            && !read.is_some_and(|read| {
+                read.at > w.at
+                    && read.reset.is_none_or(|reset| reset > w.at)
+                    && read.pct.saturating_add(WARNING_END_DROP_PCT) <= said
+            })
+    })
 }
 
 fn figure(
@@ -6091,6 +6398,12 @@ pub const MAX_WINDOWS: usize = 8;
 /// A drop smaller than this, in tenths of a percent, is no refill ([`WindowRead::refilled`]).
 pub const REFILL_MIN_X10: u32 = 10;
 
+/// A drop no one process saw, smaller than this in tenths of a percent, is no refill
+/// ([`note_reading_held`]): it is two processes' figures, each served by its own request, set
+/// beside each other rather than one process's figure before and after. A refill or a raised
+/// allowance moves the figure by tens of points (m2 on 2026-11-15: 99% held, 69% read).
+pub const REFILL_UNSEEN_MIN_X10: u32 = 50;
+
 /// Single quota-window utilization reading held on an [`Account`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFig {
@@ -6254,6 +6567,14 @@ impl SampleContext {
 pub struct Account {
     /// Observation: the walls, by the vendor's limit type.
     pub walls: BTreeMap<String, Wall>,
+    /// Machine-local: the walls of Codex limits other than the codex bucket (a model's own), by
+    /// limit id ([`limit_wall`]), as a usage-limit handoff asked about that limit recorded them.
+    /// Only such a handoff reads them ([`Self::limit_wall_until`]): they are in neither
+    /// [`Self::walls`], [`Self::limited_until`], [`condition`], [`Self::observed`],
+    /// [`Self::walled_at`], the stats, the journal nor the sync, so a row with one model's limit
+    /// spent is no less fresh for every other session. `state.json` writes them as
+    /// `limit_walls`, only where there are some, so an older aterm reads none and writes none back.
+    pub limit_walls: BTreeMap<String, Wall>,
     /// Observation: the newest sample.
     pub sample: Option<Sample>,
     /// The pooled reader's configuration and login fingerprint for `sample`. This is a local
@@ -6327,6 +6648,7 @@ impl Eq for Account {}
 impl PartialEq for Account {
     fn eq(&self, other: &Self) -> bool {
         self.walls == other.walls
+            && self.limit_walls == other.limit_walls
             && self.sample == other.sample
             && self.sample_context == other.sample_context
             && self.before == other.before
@@ -6559,7 +6881,8 @@ impl Account {
             .filter(|until| *until > now)
     }
 
-    /// Returns the latest timestamp until which a standing wall blocks this account at `now`.
+    /// Returns the latest timestamp until which a standing wall blocks this account at `now`. A
+    /// limit wall ([`Self::limit_walls`]) blocks only that limit's handoffs, never this.
     #[must_use]
     pub fn limited_until(&self, now: i64) -> Option<i64> {
         self.walls
@@ -6567,6 +6890,26 @@ impl Account {
             .filter_map(Wall::stands_until)
             .filter(|end| now < *end)
             .max()
+    }
+
+    /// Until when a standing wall of the Codex limit `id` ([`limit_wall`]) holds this account off
+    /// that limit's handoffs at `now`.
+    #[must_use]
+    pub fn limit_wall_until(&self, id: &str, now: i64) -> Option<i64> {
+        self.limit_walls
+            .get(id)
+            .and_then(Wall::stands_until)
+            .filter(|end| now < *end)
+    }
+
+    /// The wall on record under `window`: a limit wall's ([`limit_of`]) in [`Self::limit_walls`],
+    /// any other in [`Self::walls`].
+    #[must_use]
+    pub fn wall(&self, window: &str) -> Option<&Wall> {
+        match limit_of(window) {
+            Some(id) => self.limit_walls.get(id),
+            None => self.walls.get(window),
+        }
     }
 
     /// Returns the timestamp until which the 5-hour session window marks this account `low` at
@@ -6583,8 +6926,7 @@ impl Account {
             .filter(|(pct, _)| *pct >= LOW_SESSION_PCT)
             .map(|(_, end)| end);
         let warned = self
-            .warned_session
-            .as_ref()
+            .session_warning()
             .and_then(|w| w.figure(SESSION_WINDOW_S, now))
             .filter(|(pct, _)| *pct >= LOW_SESSION_PCT)
             .map(|(_, end)| end);
@@ -6604,12 +6946,47 @@ impl Account {
             .filter(|(pct, _)| *pct >= LOW_WEEK_PCT)
             .map(|(_, end)| end);
         let warned = self
-            .warned_week
-            .as_ref()
+            .week_warning()
             .and_then(|w| w.figure(WEEK_WINDOW_S, now))
             .filter(|(pct, _)| *pct >= LOW_WEEK_PCT)
             .map(|(_, end)| end);
         sample.max(warned)
+    }
+
+    /// Claude Code's warning of the five-hour window ([`Self::warned_session`]) unless a refill
+    /// came after it: the window's refill barrier, or a usage [`Self::sample`] that read the window
+    /// after it and found clearly less used ([`standing_warning`]).
+    #[must_use]
+    pub fn session_warning(&self) -> Option<&WindowSaid> {
+        standing_warning(
+            self.warned_session.as_ref(),
+            self.sample.as_ref().and_then(|s| {
+                Some(WindowReading {
+                    pct: s.session_pct?,
+                    at: s.session_read_at.unwrap_or(s.at),
+                    reset: s.session_reset,
+                })
+            }),
+            self.windows.get(SESSION_LIMIT),
+        )
+    }
+
+    /// Claude Code's warning of the week ([`Self::warned_week`]) unless a refill came after it: the
+    /// week's refill barrier, or a usage [`Self::sample`] that read the week after it and found
+    /// clearly less used ([`standing_warning`]).
+    #[must_use]
+    pub fn week_warning(&self) -> Option<&WindowSaid> {
+        standing_warning(
+            self.warned_week.as_ref(),
+            self.sample.as_ref().and_then(|s| {
+                Some(WindowReading {
+                    pct: s.week_pct?,
+                    at: s.week_read_at.unwrap_or(s.at),
+                    reset: s.week_reset,
+                })
+            }),
+            self.windows.get(WEEK_LIMIT),
+        )
     }
 
     /// Returns the timestamp until which active usage credits mark this account `low` at `now`.
@@ -6641,17 +7018,15 @@ impl Account {
     }
 
     /// Returns whether Claude Code's own warning that its five-hour or weekly window is filling
-    /// ([`Self::warned_session`], [`Self::warned_week`]) still stands at `now`, at any percent:
+    /// ([`Self::session_warning`], [`Self::week_warning`]) still stands at `now`, at any percent:
     /// the first sign a session on it will need another account, well before it is [`Self::low`].
     #[must_use]
     pub fn warned(&self, now: i64) -> bool {
-        self.warned_session
-            .as_ref()
+        self.session_warning()
             .and_then(|w| w.figure(SESSION_WINDOW_S, now))
             .is_some()
             || self
-                .warned_week
-                .as_ref()
+                .week_warning()
                 .and_then(|w| w.figure(WEEK_WINDOW_S, now))
                 .is_some()
     }
@@ -6694,8 +7069,7 @@ impl Account {
         self.cleared_at
             .into_iter()
             .chain(
-                self.walls
-                    .get(window)
+                self.wall(window)
                     .filter(|wall| wall.cleared)
                     .map(|wall| wall.at),
             )
@@ -7342,6 +7716,9 @@ fn wall_json(w: &Wall) -> Value {
     o.insert("by".to_owned(), Value::from(w.by.as_str()));
     o.insert("attempts".to_owned(), Value::from(w.attempts));
     o.insert("cleared".to_owned(), Value::from(w.cleared));
+    if let Some(seen) = w.seen {
+        o.insert("seen".to_owned(), Value::from(seen));
+    }
     Value::Object(o)
 }
 
@@ -7352,6 +7729,7 @@ fn wall_of(v: &Value, cap: i64) -> Option<Wall> {
         by: word(v.get("by"), WORD_MAX).unwrap_or_default(),
         attempts: count(v.get("attempts")).unwrap_or(0),
         cleared: v.get("cleared").and_then(Value::as_bool).unwrap_or(false),
+        seen: stamp(v.get("seen"), cap),
     })
 }
 
@@ -7501,6 +7879,17 @@ fn account_json(a: &Account) -> Value {
                 .collect(),
         ),
     );
+    if !a.limit_walls.is_empty() {
+        o.insert(
+            "limit_walls".to_owned(),
+            Value::Object(
+                a.limit_walls
+                    .iter()
+                    .map(|(k, w)| (k.clone(), wall_json(w)))
+                    .collect(),
+            ),
+        );
+    }
     let sample = |s: &Option<Sample>| s.as_ref().map_or(Value::Null, sample_json);
     o.insert("sample".to_owned(), sample(&a.sample));
     o.insert(
@@ -7702,6 +8091,16 @@ fn account_of(v: &Value, now: i64) -> Account {
         .collect();
     walls.sort_by_key(|(_, w)| std::cmp::Reverse(w.at));
     walls.truncate(MAX_WALLS);
+    let mut limit_walls: Vec<(String, Wall)> = v
+        .get("limit_walls")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(id, _)| super::codex_app_login::is_limit_id(id))
+        .filter_map(|(id, w)| Some((id.clone(), wall_of(w, cap)?)))
+        .collect();
+    limit_walls.sort_by_key(|(_, w)| std::cmp::Reverse(w.at));
+    limit_walls.truncate(MAX_WALLS);
     let mut windows: Vec<(String, WindowFig)> = v
         .get("windows")
         .and_then(Value::as_object)
@@ -7752,6 +8151,7 @@ fn account_of(v: &Value, now: i64) -> Account {
             .map(str::to_owned),
         windows: windows.into_iter().collect(),
         walls: walls.into_iter().collect(),
+        limit_walls: limit_walls.into_iter().collect(),
         sample: v.get("sample").and_then(|s| sample_of(s, cap)),
         sample_context: v
             .get("sample_context")
@@ -8645,8 +9045,9 @@ pub enum LoginHere {
     NotMade,
     /// One was made and is signed out here ([`signed_out_here`]).
     SignedOut,
-    /// One was made and is signed out here, and the row runs on its vault token here instead
-    /// ([`on_token_here`]): a session runs on it, so rotation can pick it.
+    /// The row runs on its vault token here ([`on_token_here`]) with no stored login to run on:
+    /// none was made here (a row its fleet token alone runs here, FL-135), or one was made and is
+    /// signed out here. A session runs on it, so rotation can pick it, and no sign-in is owed.
     OnToken,
     /// One is here and is not signed out.
     In,
@@ -8656,8 +9057,8 @@ impl LoginHere {
     /// What every report says of a row with no login to run on here, whichever way it has none.
     pub const SIGNED_OUT: &'static str = "signed-out";
 
-    /// What every report says of a row whose stored login is signed out here while it runs on its
-    /// vault token ([`LoginHere::OnToken`], [`LoginState::OnToken`]).
+    /// What every report says of a row that runs on its vault token with no stored login to run
+    /// on here ([`LoginHere::OnToken`], [`LoginState::OnToken`]).
     pub const ON_TOKEN: &'static str = "on-token";
 
     /// Whether a session can run on the row here: a login is here and is not signed out, or the
@@ -8670,20 +9071,23 @@ impl LoginHere {
 
 /// [`LoginHere`] of `row` given `state`, whether its login is `enrolled` (made on this machine)
 /// and `now`: a lapsed credential file reads signed out whatever its records say
-/// ([`signed_out_here`]), unless the upkeep's fresh reading names the row as on its vault token
-/// here ([`on_token_here`]).
+/// ([`signed_out_here`]), and a row with no stored login to run on here (none made, or one signed
+/// out) runs on its vault token where the upkeep's fresh reading names the row as on its token
+/// here ([`on_token_here`]). A row with no login made here is such a row too (FL-135): its fleet
+/// token needs no sign-in here, so it is never read as a login made here.
 #[must_use]
 pub fn login_here(row: &Row, state: &State, enrolled: bool, now: i64) -> LoginHere {
-    if !enrolled {
+    let none_here = if !enrolled {
         LoginHere::NotMade
     } else if signed_out_here(row, state) {
-        if on_token_here(row, state, now).is_some() {
-            LoginHere::OnToken
-        } else {
-            LoginHere::SignedOut
-        }
+        LoginHere::SignedOut
     } else {
-        LoginHere::In
+        return LoginHere::In;
+    };
+    if on_token_here(row, state, now).is_some() {
+        LoginHere::OnToken
+    } else {
+        none_here
     }
 }
 
@@ -8725,8 +9129,9 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
 }
 
 /// [`condition`] as `row`'s stored login alone reads it: a row on its vault token here
-/// ([`LoginHere::OnToken`]) is [`Condition::SignedOut`], as it was before the token put it in
-/// rotation. For a reader the token never serves or must not hide: a one-shot review
+/// ([`LoginHere::OnToken`]) is [`Condition::NotEnrolled`] where no login was made here and
+/// [`Condition::SignedOut`] where one was, as it was before the token put it in rotation. For a
+/// reader the token never serves or must not hide: a one-shot review
 /// (`claude -p --output-format text` is no session-starting shape, so
 /// [`super::token_route::shape_refusal`] runs it on the stored login), and the renewal ranking,
 /// which turns renewal off for a row on its token only by the live read
@@ -8734,7 +9139,11 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
 #[must_use]
 pub fn stored_login_condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
     if login_here(row, state, enrolled, now) == LoginHere::OnToken {
-        return Condition::SignedOut;
+        return if enrolled {
+            Condition::SignedOut
+        } else {
+            Condition::NotEnrolled
+        };
     }
     condition(row, state, enrolled, now)
 }
@@ -9025,6 +9434,9 @@ impl Advice {
 /// Sort key ordering candidate target accounts (lower ranks first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rank {
+    /// The row is another Mac's that runs here on its fleet token ([`borrowed`]): it is taken
+    /// after every row of this Mac's own (FL-135).
+    pub borrowed: bool,
     /// `low`: admitted only at a wall.
     pub low: bool,
     /// The row's class.
@@ -9034,8 +9446,9 @@ pub struct Rank {
 }
 
 impl Rank {
-    fn key<'a>(&self, label: &'a str) -> (bool, Class, bool, i64, &'a str) {
+    fn key<'a>(&self, label: &'a str) -> (bool, bool, Class, bool, i64, &'a str) {
         (
+            self.borrowed,
             self.low,
             self.class,
             self.week_reset.is_none(),
@@ -9054,7 +9467,8 @@ pub enum WhyNot {
     PreparationFailed,
     /// It is the session's own account.
     Me,
-    /// Assigned only to other Macs' warm sets in `ai-pool.toml` (`Row::held_by`).
+    /// Assigned only to other Macs' warm sets in `ai-pool.toml` (`Row::held_by`), whatever route a
+    /// launch on it here would take.
     HeldElsewhere,
     /// No login was made for it on this machine ([`login_made`]).
     NotEnrolled,
@@ -9130,8 +9544,54 @@ fn effective_usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> O
     }
 }
 
+/// Whether this Mac may run `row` at `now`: no other Mac's warm set holds it ([`Row::held_by`],
+/// whatever route a launch on it takes) and the claims admit this Mac ([`State::lease_verdict`]).
 pub(super) fn row_available_here(row: &Row, state: &State, now: i64) -> bool {
     row.held_by.is_none() && state.lease_verdict(&row.label, now).is_ok()
+}
+
+/// Whether a launch onto `row` here runs on its vault token alone (FL-135): no login of the row
+/// was made on this Mac ([`login_made`]) and the upkeep's fresh reading names its token in use
+/// here ([`LoginHere::OnToken`]). Such a launch has no stored login to fall back on, so it starts
+/// only through aterm's wrapper on the token, and only under a claim this Mac recorded on the
+/// account (`super::accounts_pool::claim_admits`): the claims ring is all that keeps a second Mac
+/// off it.
+#[must_use]
+pub fn token_only(row: &Row, state: &State, enrolled: &BTreeSet<String>, now: i64) -> bool {
+    !is_enrolled(row, enrolled) && on_token_here(row, state, now).is_some()
+}
+
+/// THE ONE RULE for whether `row` is another Mac's account that this Mac borrows (FL-135): no
+/// login of it was made here ([`login_made`]), and it is neither one of this Mac's home accounts
+/// in `ai-pool.toml` ([`State::home_accounts`]) nor a row this Mac prefers ([`Class::Preferred`],
+/// which the lab sets where it names this Mac a home of the account). Such a row runs here only
+/// on its fleet token ([`token_only`]), and every reader that orders rows takes it after this
+/// Mac's own: [`Rank::borrowed`] ranks it last, its opening never makes an own low row wait
+/// ([`WhyNot::LowWhileOneIsNear`]), and a borrowed `active` is neither kept nor followed while an
+/// own row is fresh ([`launch_row`], [`advise`], [`begin_rotation`]).
+#[must_use]
+pub fn borrowed(row: &Row, state: &State, enrolled: &BTreeSet<String>) -> bool {
+    !is_enrolled(row, enrolled)
+        && !state.home_accounts.contains(&row.label)
+        && row.class != Class::Preferred
+}
+
+/// Whether a row of this Mac's own ([`borrowed`] is false of it), other than `besides`, is fresh
+/// and this Mac may run it at `now`: what keeps a borrowed `active` from holding this Mac's
+/// sessions or launches.
+fn own_fresh(
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    besides: Option<&str>,
+    now: i64,
+) -> bool {
+    roster.rows.iter().any(|row| {
+        besides != Some(row.label.as_str())
+            && !borrowed(row, state, enrolled)
+            && row_available_here(row, state, now)
+            && condition(row, state, is_enrolled(row, enrolled), now).fresh()
+    })
 }
 
 /// The trigger used to rank replacements for this session. A turn end that must
@@ -9182,8 +9642,10 @@ pub fn candidates(
         .iter()
         .map(|r| (r, condition(r, state, is_enrolled(r, enrolled), now)))
         .collect();
+    // A borrowed row's opening keeps no own low row waiting: it ranks after every own row.
     let near = conditions
         .iter()
+        .filter(|(row, _)| !borrowed(row, state, enrolled))
         .filter_map(|(row, c)| effective_usable_at(row, state, *c, now))
         .filter(|at| *at > now && at.saturating_sub(now) <= LOW_ONLY_AFTER_S)
         .min();
@@ -9195,6 +9657,7 @@ pub fn candidates(
         .iter()
         .map(|(row, cond)| {
             let rank = |low: bool| Rank {
+                borrowed: borrowed(row, state, enrolled),
                 low,
                 class: row.class,
                 week_reset: state
@@ -9481,7 +9944,10 @@ pub fn launch_row<'a>(
     {
         let cond = condition(row, state, is_enrolled(row, enrolled), now);
         let here = !matches!(cond, Condition::NotEnrolled | Condition::SignedOut);
-        if (state.pinned && here) || cond.fresh() {
+        // A borrowed `active` holds no launch while a row of this Mac's own is fresh.
+        let yields = borrowed(row, state, enrolled)
+            && own_fresh(roster, state, enrolled, Some(&row.label), now);
+        if (state.pinned && here) || (cond.fresh() && !yields) {
             return Some(row);
         }
     }
@@ -9810,7 +10276,13 @@ fn advise_with(
             if !yielding {
                 return Advice::Stay(StayWhy::Canary);
             }
-        } else if theirs.fresh() || (theirs.runs() && state.pinned) {
+        } else if (theirs.fresh()
+            && !(borrowed(active, state, enrolled)
+                && own_fresh(roster, state, enrolled, Some(&active.label), now)))
+            || (theirs.runs() && state.pinned)
+        {
+            // A borrowed `active` is not followed while a row of this Mac's own is fresh: the
+            // candidates rank that row first.
             return onto_active(active, false);
         } else if theirs.runs() {
             low_active = Some(active);
@@ -9828,8 +10300,7 @@ fn advise_with(
             // at the end of its retry backoff. An observation made at or after
             // that instant is a new wall, not evidence that the old one ended.
             record
-                .walls
-                .get(window)?
+                .wall(window)?
                 .stands_until()
                 .filter(|end| *written < *end && *end <= now)
         })
@@ -10420,7 +10891,10 @@ pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
 
 /// Records a quota wall hit by `account` and returns any resulting ledger events. Its reset
 /// `until` is believed as [`believed_reset`] says, or up to [`MONTH_RESET_BELIEVED_S`] past `at`
-/// for a [`MONTH_LIMIT`] wall.
+/// for a [`MONTH_LIMIT`] wall. A wall of the `active` row ends the owner's pin on it. A limit wall
+/// ([`limit_wall`]) is recorded under its limit's id in [`Account::limit_walls`], by the same rule
+/// and bound as every other in [`Account::walls`], and ends no pin: the row still serves every
+/// session of every other limit, and the pin is the owner's ordinary decision.
 pub fn note_wall(
     state: &mut State,
     account: &str,
@@ -10429,7 +10903,12 @@ pub fn note_wall(
     at: i64,
     now: i64,
 ) -> Vec<Event> {
-    let window = one_line(window, WORD_MAX);
+    let limit = limit_of(window).map(str::to_owned);
+    let ordinary = limit.is_none();
+    let window = match &limit {
+        Some(id) => limit_wall(id),
+        None => one_line(window, WORD_MAX),
+    };
     let until = if window == MONTH_LIMIT {
         until.filter(|until| until.saturating_sub(at) <= MONTH_RESET_BELIEVED_S)
     } else {
@@ -10446,19 +10925,22 @@ pub fn note_wall(
     if record.cleared_since(&window, at, now).is_some() {
         return out;
     }
+    let (walls, key) = match limit {
+        Some(id) => (&mut record.limit_walls, id),
+        None => (&mut record.walls, window.clone()),
+    };
     // A wall that names no reset says nothing of one a read named: it stands until then.
     let until = until.or_else(|| {
-        record
-            .walls
-            .get(&window)
+        walls
+            .get(&key)
             .and_then(|old| old.until)
             .filter(|known| *known > at)
     });
     let late = u32::from(until.is_none_or(|u| at > u));
-    if let Some(old) = record.walls.get_mut(&window) {
+    if let Some(old) = walls.get_mut(&key) {
         old.at = old.at.min(now);
     }
-    let attempts = match record.walls.get(&window) {
+    let attempts = match walls.get(&key) {
         Some(old) if at < old.at => None,
         Some(old) if old.until == until => old.stands_until().map_or(Some(late), |end| {
             if at < end {
@@ -10472,20 +10954,21 @@ pub fn note_wall(
         _ => Some(late),
     };
     if let Some(attempts) = attempts {
-        if !record.walls.contains_key(&window)
-            && record.walls.len() >= MAX_WALLS
-            && let Some(lapsed) = most_lapsed(&record.walls)
+        if !walls.contains_key(&key)
+            && walls.len() >= MAX_WALLS
+            && let Some(lapsed) = most_lapsed(walls)
         {
-            record.walls.remove(&lapsed);
+            walls.remove(&lapsed);
         }
-        record.walls.insert(
-            window.clone(),
+        walls.insert(
+            key,
             Wall {
                 until,
                 at,
                 by,
                 attempts,
                 cleared: false,
+                seen: None,
             },
         );
         let why = match until {
@@ -10493,8 +10976,17 @@ pub fn note_wall(
             None => format!("{window}, no reset named"),
         };
         out.push(Event::new(at, Kind::Wall, account).because(&why));
+    } else if let Some(old) = walls.get_mut(&key).filter(|old| !old.cleared) {
+        // The wall seen standing again keeps its first sighting and notes this one as its
+        // newest, so a lift whose proof came before it does not lift it ([`note_peer_lift`]).
+        let at = at.min(now);
+        if at > old.seen() {
+            old.seen = Some(at);
+        }
     }
-    end_pin(state, account, "wall", at, &mut out);
+    if ordinary {
+        end_pin(state, account, "wall", at, &mut out);
+    }
     out
 }
 
@@ -10503,7 +10995,7 @@ pub fn note_wall(
 /// stands, and so does one of a window it has no figure for (a month, a window its plan does not
 /// show). The caller holds a read that named a wall back, since a server can refuse use with no
 /// window full. As a reset's clearing does ([`reset_outcome`]), the mark keeps an older observer
-/// from raising it again.
+/// from raising it again; the lifted wall keeps the read's time as its proof ([`Wall::seen()`]).
 pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) -> Vec<Event> {
     let by = state.machine.clone();
     let Some(record) = account_mut(state, account) else {
@@ -10521,6 +11013,7 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
             wall.at = now;
             wall.by = by.clone();
             wall.attempts = 0;
+            wall.seen = Some(sample.at);
             out.push(
                 Event::new(now, Kind::Wall, account)
                     .because(&format!("{window}{WALL_LIFTED}a read shows room")),
@@ -10528,6 +11021,146 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
         }
     }
     out
+}
+
+/// Records what a read of `account` at `at` shows of each Codex limit other than the codex bucket
+/// ([`super::codex_app_login::Usage::limits`]), in [`Account::limit_walls`] alone, so a handoff
+/// asked about a limit passes over a row that cannot take its session there as the records hold
+/// it, the pool's `active` row too: a limit it lists with no room
+/// ([`super::codex_app_login::LimitUsage::no_room_until`]: standing, low, or with no figure) is
+/// walled to the instant that may end that, and by rungs where none is named; so is `asked`, the
+/// limit a handoff that made the read asked about, where the read does not list it. A wall of a
+/// limit it lists with room, written before the read, is lifted, as [`note_room`] lifts a
+/// window's. Any other limit the read does not list keeps what it had.
+pub fn note_limits(
+    state: &mut State,
+    account: &str,
+    limits: &BTreeMap<String, super::codex_app_login::LimitUsage>,
+    asked: Option<&str>,
+    at: i64,
+    now: i64,
+) -> Vec<Event> {
+    let mut out = Vec::new();
+    let unlisted = asked
+        .filter(|id| !limits.contains_key(*id))
+        .map(|id| (id, None));
+    let no_room: Vec<_> = limits
+        .iter()
+        .filter_map(|(id, limit)| Some((id.as_str(), limit.no_room_until(at)?)))
+        .chain(unlisted)
+        .filter(|(id, _)| super::codex_app_login::is_limit_id(id))
+        .collect();
+    for (id, until) in no_room {
+        out.extend(note_wall(state, account, &limit_wall(id), until, at, now));
+    }
+    let by = state.machine.clone();
+    let Some(record) = account_mut(state, account) else {
+        return out;
+    };
+    for (id, wall) in &mut record.limit_walls {
+        let roomy = limits.get(id).is_some_and(|limit| limit.room(at));
+        if roomy && !wall.cleared && wall.at < at {
+            wall.cleared = true;
+            wall.at = now;
+            wall.by = by.clone();
+            wall.attempts = 0;
+            wall.seen = Some(at);
+            out.push(
+                Event::new(now, Kind::Wall, account)
+                    .because(&format!("{}{WALL_LIFTED}a read shows room", limit_wall(id))),
+            );
+        }
+    }
+    out
+}
+
+/// A wall a Mac lifted on an account: its window, when the proof that lifted it was served and
+/// the reset the wall had named. This Mac's own, the newest of each window
+/// ([`Account::newest_lifts`]), go in the account's quota row on its `metrics.log`; another
+/// Mac's, read from its row, is [`PeerLift`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lift {
+    /// The wall's window ([`SESSION_LIMIT`], [`WEEK_LIMIT`], …).
+    pub window: String,
+    /// When the proof that lifted it was served, Unix seconds ([`Wall::seen()`]): a read's time
+    /// ([`note_room`]), a refill's, or the claim of a reset step ([`reset_outcome`]). A wall
+    /// observed before it is one the proof speaks for; one observed after it is not.
+    pub at: i64,
+    /// The reset the lifted wall named, or `None` where it named none.
+    pub reset: Option<i64>,
+}
+
+impl Account {
+    /// The walls `machine` lifted itself, the newest of each window (a record keeps one wall a
+    /// window), in the windows' order: a lift another Mac's word made here ([`note_peer_lift`])
+    /// carries that Mac's name and is not this Mac's to tell again. One read can lift two
+    /// windows at once, and another Mac may hold the wall of either alone, so each is told.
+    #[must_use]
+    pub fn newest_lifts(&self, machine: &str) -> Vec<Lift> {
+        self.walls
+            .iter()
+            .filter(|(_, wall)| wall.cleared && wall.by == machine)
+            .map(|(window, wall)| Lift {
+                window: window.clone(),
+                at: wall.seen(),
+                reset: wall.until,
+            })
+            .collect()
+    }
+}
+
+/// A lift another Mac published in its quota row for an account, as this Mac's reader of its
+/// peers' rows hands it to [`note_peer_lift`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerLift<'a> {
+    /// The Mac that lifted it, by its node id (`n-<16 hex>`).
+    pub peer: &'a str,
+    /// The account's lab key (`ac-<16 hex>`, [`Account::pk`]).
+    pub pk: &'a str,
+    /// The wall's window.
+    pub window: &'a str,
+    /// When that Mac's proof that lifted it was served ([`Lift::at`]), Unix seconds by its clock.
+    pub at: i64,
+    /// The reset its wall named.
+    pub reset: Option<i64>,
+}
+
+/// Lifts the wall another Mac saw come back: the account whose learned key is `lift.pk`, where
+/// its wall of `lift.window` stands at `now`, was last seen standing before the lift's proof (its
+/// newest sighting, not its first: [`Wall::seen()`]), and names the same reset (a wall that named
+/// none goes by the sighting alone). Matching on the reset, not on the two Macs' clocks alone,
+/// keeps one Mac's skew from lifting another's newer wall. One [`Kind::Wall`] row whose reason
+/// holds [`WALL_LIFTED`] and names the peer wakes the sessions waiting on it; the mark, at `now`,
+/// keeps an older observer from raising it again, as [`note_room`]'s does, so `now` is read
+/// inside the transaction that records it: a session that met the wall while the caller read its
+/// peers is older than the mark and resumes ([`Account::cleared_since`]). The mark names the
+/// peer, so this Mac does not tell the lift again as its own ([`Account::newest_lifts`]). A lift
+/// raises no wall, lifts one seen after its proof or of another reset nothing, lifts a lifted
+/// wall nothing (so one lift lifts one wall once), and leaves `active` and a pin as they were.
+pub fn note_peer_lift(state: &mut State, lift: &PeerLift<'_>, now: i64) -> Vec<Event> {
+    let Some((label, record)) = state
+        .accounts
+        .iter_mut()
+        .find(|(_, account)| account.pk.as_deref() == Some(lift.pk))
+    else {
+        return Vec::new();
+    };
+    let Some(wall) = record.walls.get_mut(lift.window).filter(|wall| {
+        wall.stands_until().is_some_and(|end| now < end)
+            && wall.seen() < lift.at
+            && wall.until.is_none_or(|until| Some(until) == lift.reset)
+    }) else {
+        return Vec::new();
+    };
+    wall.cleared = true;
+    wall.at = now;
+    wall.by = one_line(lift.peer, WORD_MAX);
+    wall.attempts = 0;
+    wall.seen = Some(lift.at);
+    vec![Event::new(now, Kind::Wall, label).because(&format!(
+        "{}{WALL_LIFTED}{} saw it come back",
+        lift.window, lift.peer
+    ))]
 }
 
 /// Records that a weekly-limit handoff's provider read of `account`, begun at `now`, answered no
@@ -10551,6 +11184,27 @@ pub fn note_unanswered(state: &mut State, account: &str, now: i64) {
         .map_or(0, |run| run.attempts)
         .saturating_add(1);
     record.unanswered = Some(Unanswered { at: now, attempts });
+}
+
+/// Leaves `account` unread by a usage-limit handoff until `until`, in a copy of the records one
+/// ask judges and never writes ([`super::codex_rotation::ReadPace`]): the run a first failed read
+/// made `until` less the first rung ago ([`Unanswered`]), which nothing but that handoff's choice of
+/// what to read consults. A run already on the copy that stands as long or longer is kept, so one
+/// on record is never shortened.
+pub(super) fn lay_unread_until(state: &mut State, account: &str, until: i64) {
+    let Some(record) = account_mut(state, account) else {
+        return;
+    };
+    if record
+        .unanswered
+        .is_some_and(|run| run.stands_until() >= until)
+    {
+        return;
+    }
+    record.unanswered = Some(Unanswered {
+        at: until.saturating_sub(UNANSWERED_S[0]),
+        attempts: 1,
+    });
 }
 
 /// Records a settled `/usage` panel [`Sample`] for `account` at `now`.
@@ -10786,6 +11440,7 @@ pub fn note_reading_held(
     if record.of_another(read.key) {
         let Account {
             walls: _,
+            limit_walls: _,
             sample: _,
             sample_context: _,
             before: _,
@@ -10847,6 +11502,7 @@ pub fn note_reading_held(
         let from_sample = sample_window(sample.as_ref(), bucket, stored.as_ref());
         let held = merge_fig(stored.as_ref(), from_sample.as_ref(), now);
         let anchored = |w: &WindowRead| held.as_ref().filter(|h| h.reset == w.reset);
+        let mut raised = false;
         let fig = w.and_then(|w| {
             let epoch = anchored(&w).and_then(|h| h.epoch_at);
             if !read.seen_before && epoch.is_some_and(|e| read.born.is_none_or(|b| b < e)) {
@@ -10860,13 +11516,36 @@ pub fn note_reading_held(
                             && h.epoch_at.is_none_or(|_| !h.cut() && from <= h.pct_x10)
                     })
                 });
+            // No one process saw this drop: the window was refilled, or its allowance raised (a
+            // plan change), while no session that saw the higher figure was served. A process
+            // that began after this Mac read the held figure was served only after it, and within
+            // a window use only grows, so any figure of it, clearly lower under the same reset,
+            // shows the change came between them ([`REFILL_UNSEEN_MIN_X10`]); its first figure
+            // may have lacked the window, or been dropped after the tap counted it (a reading of
+            // another token), so a later one shows it as well. A
+            // process older than the held figure may report what it was served before it, so it
+            // shows no order and opens no epoch. `windows` holds only this Mac's own figures
+            // (peers' reach the journal's fold, never this map), so `h.by` differs only in a home
+            // carried over from another machine, whose figures this clock did not date.
+            let unseen = !refill
+                && read.born.is_some_and(|born| {
+                    held.as_ref().is_some_and(|h| {
+                        h.reset == w.reset
+                            && h.by == by
+                            && born > h.at
+                            && at > h.at
+                            && !h.cut()
+                            && w.pct_x10.saturating_add(REFILL_UNSEEN_MIN_X10) <= h.pct_x10
+                    })
+                });
+            raised = unseen;
             Some(WindowFig {
                 pct_x10: w.pct_x10,
                 reset: w.reset,
                 at,
                 by: by.clone(),
                 source: SOURCE_TAP.to_owned(),
-                epoch_at: refill.then_some(at),
+                epoch_at: (refill || unseen).then_some(at),
             })
         });
         let merged = merge_fig(held.as_ref(), fig.as_ref(), now);
@@ -10881,7 +11560,12 @@ pub fn note_reading_held(
                 Event::new(at, Kind::Reset, account)
                     .refilling([bucket])
                     .because(&format!(
-                        "{bucket} refilled inside its window (resets {})",
+                        "{bucket} {} inside its window (resets {})",
+                        if raised {
+                            "read clearly less used by a process begun after its last figure: refilled or raised"
+                        } else {
+                            "refilled"
+                        },
                         super::usage::rfc3339_utc(merged.as_ref().map_or(0, |m| m.reset))
                     )),
             );
@@ -10890,7 +11574,8 @@ pub fn note_reading_held(
         // at the refill and not at the reset it named. One observed at or after the refill
         // stands. Read from the held figure, not from this reading's own refill, so a wall whose
         // refill an earlier reading filed is lifted by the next one. The mark keeps an older
-        // observer from raising it again, as a read's clearing does ([`note_room`]).
+        // observer from raising it again, as a read's clearing does ([`note_room`]), and the
+        // refill is the lift's proof ([`Wall::seen()`]).
         if let Some(refilled) = merged.as_ref().and_then(|m| m.epoch_at)
             && let Some(wall) = record
                 .walls
@@ -10901,9 +11586,15 @@ pub fn note_reading_held(
             wall.at = now;
             wall.by = by.clone();
             wall.attempts = 0;
+            wall.seen = Some(refilled);
             changed = true;
             events.push(Event::new(now, Kind::Wall, account).because(&format!(
-                "{bucket}{WALL_LIFTED}it refilled inside its window"
+                "{bucket}{WALL_LIFTED}it {} inside its window",
+                if raised {
+                    "was refilled or raised"
+                } else {
+                    "refilled"
+                }
             )));
         }
         if merged.is_some() {
@@ -11586,6 +12277,8 @@ pub fn reset_outcome(
         wall.at = now;
         wall.by = machine;
         wall.attempts = 0;
+        // The reset was used no earlier than its claim: a wall seen before then is one it lifts.
+        wall.seen = Some(claimed);
         let sample = record.sample.as_ref();
         let bucket = match window.as_str() {
             WEEK_LIMIT => Some((
@@ -11721,6 +12414,34 @@ pub fn begin_rotation(
     to: &str,
     now: i64,
 ) -> Result<Event, Lost> {
+    begin_rotation_for(state, roster, enrolled, expect_active, mover, to, None, now)
+}
+
+/// [`begin_rotation`] for a session that leaves a wall of the Codex limit `limit` ([`limit_of`]),
+/// where one is: a fresh `active` the records hold off that limit
+/// ([`Account::limit_wall_until`]) is no row the session could follow there, so a mover on
+/// another row rotates past it as past a low one. Its pin and its unanswered canary still hold.
+/// Advice needs no limit: it judges the pool's handoff candidates, which leave out every row the
+/// records hold off that limit, so such an `active` is not fresh there. The commit judges the
+/// stored records, and asks this.
+///
+/// # Errors
+///
+/// A [`Lost`], with nothing changed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "begin_rotation's seven, and the limit its mover leaves"
+)]
+pub fn begin_rotation_for(
+    state: &mut State,
+    roster: &Roster,
+    enrolled: &BTreeSet<String>,
+    expect_active: Option<&str>,
+    mover: Mover<'_>,
+    to: &str,
+    limit: Option<&str>,
+    now: i64,
+) -> Result<Event, Lost> {
     let sid = one_line(mover.sid, WORD_MAX);
     if sid.is_empty() {
         return Err(Lost::NoSession);
@@ -11739,6 +12460,15 @@ pub fn begin_rotation(
     };
     let runs = |label: &str| cond(label).is_some_and(Condition::runs);
     let fresh = |label: &str| cond(label).is_some_and(Condition::fresh);
+    let followed = |label: &str| {
+        fresh(label)
+            && limit.is_none_or(|id| {
+                state
+                    .accounts
+                    .get(label)
+                    .is_none_or(|account| account.limit_wall_until(id, now).is_none())
+            })
+    };
     // An `active` this Mac may not use (another Mac's senior claim, one it cannot record) holds
     // nothing, as [`advise`] moves no session onto it; where another Mac holds it, every session
     // here on it yields, so none answers its canary. A pin holds whatever the claim: only
@@ -11762,7 +12492,14 @@ pub fn begin_rotation(
                 held
             };
         }
-        if active != me && (fresh(active) || !fresh(to)) {
+        // A borrowed `active` holds no move onto a fresh row of this Mac's own.
+        let own_to = roster
+            .row(to)
+            .is_some_and(|row| !borrowed(row, state, enrolled));
+        let borrowed_active = roster
+            .row(active)
+            .is_some_and(|row| borrowed(row, state, enrolled));
+        if active != me && ((followed(active) && !(borrowed_active && own_to)) || !fresh(to)) {
             return held;
         }
     }
@@ -15270,7 +16007,7 @@ pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<WindowFull>
             if off.until.is_some_and(|until| now >= until) {
                 return None;
             }
-            let (pct, end) = account.warned_week.as_ref()?.figure(WEEK_WINDOW_S, now)?;
+            let (pct, end) = account.week_warning()?.figure(WEEK_WINDOW_S, now)?;
             (pct >= WINDOW_FULL_PCT && end.saturating_sub(now) > WINDOW_FULL_AHEAD_S).then(|| {
                 WindowFull {
                     label: row.label.clone(),
@@ -15843,3 +16580,7 @@ mod lapsed_rule_tests;
 #[cfg(test)]
 #[path = "accounts_reconcile_tests.rs"]
 mod reconcile_tests;
+
+#[cfg(test)]
+#[path = "accounts_peer_lift_tests.rs"]
+mod peer_lift_tests;

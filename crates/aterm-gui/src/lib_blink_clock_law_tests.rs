@@ -27,7 +27,7 @@ fn a_resting_window_never_flips_its_due_blink() {
     app.config.idle_rest_secs = Some(30.0);
     let wid = crate::WindowId(0);
     let t0 = Instant::now();
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.next_blink = Some(t0 + Duration::from_millis(1));
     assert!(!ws.flip_due_blink(t0), "not yet due");
     let phase = ws.blink_phase;
@@ -39,8 +39,9 @@ fn a_resting_window_never_flips_its_due_blink() {
     );
 
     let rest_at = t0 + Duration::from_secs(31);
+    drop(ws);
     app.settle_rest(rest_at);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     assert!(ws.rest.resting());
     ws.next_blink = Some(rest_at);
     let phase = ws.blink_phase;

@@ -4,7 +4,7 @@
 //! The landing handoff's encoding, pinned byte for byte, and every refusal of its reader.
 
 use super::*;
-use aterm_types::land_trailer::{Checked, Interrupted, Row};
+use aterm_land_trailer::{Checked, Interrupted, Row};
 
 /// The schema-3 bytes of [`judge_sample`]. A change to the encoding bumps [`SCHEMA`] and
 /// replaces this literal.

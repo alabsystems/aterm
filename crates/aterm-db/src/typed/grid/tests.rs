@@ -66,7 +66,13 @@ impl Book {
         let mut cells = Cells::new();
         for id in self.index.project().ordered {
             let (_, changes) = self.ops.iter().find(|op| op.0 == id).unwrap();
-            crate::documents::apply(&self.index, &mut cells, id, changes, true);
+            crate::documents::apply(
+                &|later, earlier| self.index.observes(later, earlier),
+                &mut cells,
+                id,
+                changes,
+                true,
+            );
         }
         cells
     }

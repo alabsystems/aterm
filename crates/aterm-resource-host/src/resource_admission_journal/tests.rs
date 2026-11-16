@@ -20,11 +20,9 @@ fn faults(journal: &Journal, site: &str) -> Vec<Value> {
         .collect()
 }
 
-/// A journal file is named by its session's tab ID, in either form: a tab opened before the `t`
-/// form keeps its `s-` ID until it closes. NEGATIVE CONTROL: a malformed ID of each form names
-/// no file.
+/// A journal file is named by its current or complete legacy tab ID; malformed IDs name no file.
 #[test]
-fn a_journal_file_is_named_by_a_tab_id_in_either_form() {
+fn a_journal_file_requires_a_minted_tab_id() {
     let named = |session: &str| {
         name(&Binding {
             session: session.into(),
@@ -32,7 +30,7 @@ fn a_journal_file_is_named_by_a_tab_id_in_either_form() {
         })
     };
     let attempt = "ab".repeat(16);
-    for session in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+    for session in ["tqn5r6e0148", "t000000000a", "s-0123456789abcdef0123"] {
         assert_eq!(named(session).unwrap(), format!("{session}.{attempt}.json"));
     }
     for session in [
@@ -192,7 +190,7 @@ impl World {
 
     fn binding(&self, attempt: u8) -> Binding {
         Binding {
-            session: "s-0000000000000000acde".into(),
+            session: "t000000acde".into(),
             attempt: [attempt; 16],
         }
     }
@@ -240,6 +238,11 @@ fn private_bytes(path: &std::path::Path, bytes: &[u8]) {
 
 #[test]
 fn durable_journal_settlement_retries_real_rename_without_cpu_authority() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::journal::tests::durable_journal_settlement_retries_real_rename_without_cpu_authority",
+    ) {
+        return;
+    }
     let world = World::new();
     // No ARM or child exists in this fixture. Keep actual original CPU capabilities to
     // show that acknowledging a tombstone itself never settles or reacquires CPU debt.

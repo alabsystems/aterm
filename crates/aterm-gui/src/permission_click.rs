@@ -41,8 +41,8 @@ pub(crate) enum ClickRefusal {
     Shell,
     /// No restart lane reads the agent.
     NoLane,
-    /// The agent's command line cannot be read.
-    ArgvUnread,
+    /// The agent is another user's process, whose command line aterm can never read.
+    ArgvWithheld,
     /// Another supervisor claims the tab.
     Claimed,
     /// The tab is a credit claim's worker.
@@ -60,7 +60,7 @@ impl ClickRefusal {
             harness::Refusal::NotAShellJob => Self::NotAShellJob,
             harness::Refusal::Shell => Self::Shell,
             harness::Refusal::NoLane => Self::NoLane,
-            harness::Refusal::ArgvUnread => Self::ArgvUnread,
+            harness::Refusal::ArgvWithheld => Self::ArgvWithheld,
             harness::Refusal::Claimed => Self::Claimed,
             harness::Refusal::ClaimWorker => Self::ClaimWorker,
             harness::Refusal::Coordinated => Self::Coordinated,
@@ -74,7 +74,7 @@ impl ClickRefusal {
             Self::NotAShellJob => "not started from a shell",
             Self::Shell => "its shell types no restart",
             Self::NoLane => "no restart for this agent",
-            Self::ArgvUnread => "its command line can't be read",
+            Self::ArgvWithheld => "it runs as another user",
             Self::Claimed => "another supervisor has this tab",
             Self::ClaimWorker => "a credit claim's worker",
             Self::Coordinated => "its agent must end first",

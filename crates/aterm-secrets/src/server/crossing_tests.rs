@@ -609,6 +609,7 @@ fn peer(addr: SocketAddr) -> crate::discover::DiscoveredVault {
             seq: 1,
             head: [0; 32],
             label: Some("m2".to_owned()),
+            rec: None,
         }),
     }
 }

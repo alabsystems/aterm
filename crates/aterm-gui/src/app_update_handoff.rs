@@ -1648,7 +1648,7 @@ fn handoff_claim_sources(
 
 #[cfg(unix)]
 struct HandoffClaimGuards<'a> {
-    meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
+    meta: crate::session_timeline::MetaGuard<'a>,
     timeline: std::sync::MutexGuard<'a, crate::session_timeline::SessionTimeline>,
 }
 
@@ -1656,8 +1656,8 @@ struct HandoffClaimGuards<'a> {
 /// No blocking acquisition or callback may sit between this fence and that write.
 #[cfg(unix)]
 fn with_handoff_claims<R>(sources: &[HandoffClaimSource], write: impl FnOnce() -> R) -> Option<R> {
-    fn try_guard<T>(lock: &std::sync::Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
-        match lock.try_lock() {
+    fn try_guard<G>(taken: std::sync::TryLockResult<G>) -> Option<G> {
+        match taken {
             Ok(guard) => Some(guard),
             Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -1668,8 +1668,8 @@ fn with_handoff_claims<R>(sources: &[HandoffClaimSource], write: impl FnOnce() -
         .iter()
         .map(|source| {
             Some(HandoffClaimGuards {
-                meta: try_guard(&source.ctx.meta)?,
-                timeline: try_guard(&source.ctx.timeline)?,
+                meta: try_guard(source.ctx.meta.try_lock())?,
+                timeline: try_guard(source.ctx.timeline.try_lock())?,
             })
         })
         .collect::<Option<Vec<_>>>()?;

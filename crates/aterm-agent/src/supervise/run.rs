@@ -975,9 +975,12 @@ const FRAME_REREADS: u32 = 8;
 const WRITING_CAP: Duration = Duration::from_secs(3);
 /// Duration an unvouched idle read must persist before being treated as a point.
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
-/// Hang detector for a read held while the program's window title still reports a running turn: a
-/// minute of its reply unchanged ([`ScreenReader::said_tail`]), not a latency budget. A status line
-/// that refreshes, or a footer timer, moves the screen and not the reply.
+/// Hang detector for a read held while the program's run sign (its program-status report, else its
+/// window title, [`runs_of`]) still reports a running turn: a minute of its reply unchanged
+/// ([`ScreenReader::said_tail`]), not a latency budget. A status line that refreshes, or a footer
+/// timer, moves the screen and not the reply. Either sign can outlive a program killed mid-turn
+/// (the title until another program sets one; the report until aterm parses another group's
+/// bytes, `ProgramStateReport::run_sign`), and this bounds the supervisor's hold on one.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
 /// Hang detector for a read held while the agent has drawn nothing of its own
 /// ([`Session::first_frame_owed`]): a minute of unmoved screen, not a latency budget, since a
@@ -1073,25 +1076,32 @@ enum Next {
     Idle,
     /// Past the content seq of a read the agent had drawn nothing on.
     Moved(u64),
-    /// A turn the program's title runs and its screen does not show (a Claude Code reply drawn
+    /// A turn the program's run sign runs and its screen does not show (a Claude Code reply drawn
     /// under a status line, `aterm_phase::ScreenReader::title_live`): the log wakes the wait for
     /// its end where the host keeps one, and the short settle does elsewhere. No busy row stands
     /// to wait gone, and one that never shows answers `await gone` at once.
     Run,
 }
 
-/// `screen`'s phase as its reader reads the rows beside what the window title read with them
-/// says of the program's run (`screen.title`, sent with the rows; a host that sends none says
-/// nothing): a turn the title runs and the screen does not show reads Busy
-/// ([`ScreenReader::phase_seen`]).
-fn phase_of(reader: &dyn ScreenReader, screen: &Screen) -> Phase {
-    reader.phase_seen(&screen.rows, reader.runs(screen.title.as_deref()))
+/// What the program's run sign read with `screen`'s rows says of its run
+/// ([`ScreenReader::runs`]): its program-status report standing (`screen.program_report`) where
+/// its reader reads it, else its window title (`screen.title`); a host that sends neither says
+/// nothing.
+fn runs_of(reader: &dyn ScreenReader, screen: &Screen) -> Option<bool> {
+    reader.runs(screen.title.as_deref(), screen.program_report.as_deref())
 }
 
-/// Whether the program's title, read with `screen`'s rows, runs a turn the rows do not show
-/// ([`ScreenReader::title_live`]).
+/// `screen`'s phase as its reader reads the rows beside what the program's run sign read with
+/// them says ([`runs_of`]): a turn the run sign runs and the screen does not show reads Busy
+/// ([`ScreenReader::phase_seen`]).
+fn phase_of(reader: &dyn ScreenReader, screen: &Screen) -> Phase {
+    reader.phase_seen(&screen.rows, runs_of(reader, screen))
+}
+
+/// Whether the program's run sign, read with `screen`'s rows ([`runs_of`]), runs a turn the rows
+/// do not show ([`ScreenReader::title_live`]).
 fn title_run(reader: &dyn ScreenReader, screen: &Screen) -> bool {
-    reader.title_live(&screen.rows, reader.runs(screen.title.as_deref()))
+    reader.title_live(&screen.rows, runs_of(reader, screen))
 }
 
 /// The agent's first frame, as this loop has read it ([`Session::first_frame_owed`]).
@@ -3765,6 +3775,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             generation: screen.generation.clone(),
             launch: screen.launch.clone(),
             title: screen.title.clone(),
+            program_report: screen.program_report.clone(),
             ..screen
         });
         Ok(screen)
@@ -4174,22 +4185,30 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// What the program's OSC 0/2 window title says of its turn: `Some(true)` running,
-    /// `Some(false)` at rest, `None` where its reader reads no titles, the host refuses `title`, or
-    /// the program set none (Claude Code under `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`), so the
-    /// title tells nothing.
-    /// The title read with `screen`'s rows (`text --json`'s `"title"`) is the one asked; a host
-    /// that sends none (an older build) is asked with `title`.
+    /// What the program's run sign says of its turn: `Some(true)` running, `Some(false)` at rest.
+    /// Its program-status report read with `screen`'s rows (`text --json`'s `"program_report"`)
+    /// says first, where its reader reads it ([`ScreenReader::report_runs`]); else its OSC 0/2
+    /// window title, `None` where its reader reads no titles, the host refuses `title`, or the
+    /// program set none (Claude Code under `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`), so the title
+    /// tells nothing. The title read with the rows (`"title"`) is the one asked; a host that sends
+    /// none (an older build) is asked with `title`.
     fn title_reading(
         &mut self,
         reader: &dyn ScreenReader,
         screen: &Screen,
     ) -> Result<Option<bool>, Fail> {
+        if let Some(runs) = screen
+            .program_report
+            .as_deref()
+            .and_then(|report| reader.report_runs(report))
+        {
+            return Ok(Some(runs));
+        }
         if reader.title_runs("").is_none() {
             return Ok(None);
         }
         if let Some(title) = screen.title.as_deref() {
-            return Ok(reader.runs(Some(title)));
+            return Ok(reader.runs(Some(title), None));
         }
         let r = self.call(&["title"])?;
         if self.unserved(&r) {
@@ -4525,7 +4544,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.watch_context(&screen, reader, &mut |line| review.say(line))?;
             }
             let mut phase = phase_of(reader, &screen);
-            let runs = reader.runs(screen.title.as_deref());
+            let runs = runs_of(reader, &screen);
             // A turn only the title runs holds while its reply changes, and TITLE_HOLD of the
             // reply unchanged it is read as the screen shows it, the hold's NOTE said below.
             let title_only = phase == Phase::Busy && title_run(reader, &screen);
@@ -4666,7 +4685,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     match &title_held {
                         Some((held, at)) if *held == said && self.fx.since(*at) >= TITLE_HOLD => {
                             review.note(&format!(
-                                "NOTE seq={} the agent's title still said its run goes on, its \
+                                "NOTE seq={} the agent's run sign still said its run goes on, its \
                                  reply unchanged {} s: its end read as the screen shows it",
                                 screen.seq,
                                 TITLE_HOLD.as_secs()
@@ -7677,7 +7696,7 @@ impl<C: Ctl> Session<'_, C> {
         let reader = self.reader(&screen.rows);
         self.carry_read(reader, screen);
         let carried = self.transcript_wait_seq == Some(screen.seq);
-        let runs = reader.runs(screen.title.as_deref());
+        let runs = runs_of(reader, screen);
         let unfit = if carried {
             None
         } else if phase_of(reader, screen) != Phase::Busy {
@@ -8534,8 +8553,8 @@ pub fn render_phase(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[Stri
             }
         }
         Phase::Busy => {
-            let title = turn.screen.title.as_deref();
-            match busy_rule(reader, rows, title) {
+            let runs = runs_of(reader, &turn.screen);
+            match busy_rule(reader, rows, runs) {
                 Some(b) => out.push_str(&format!("reason {b}\n")),
                 None if turn.screen.rows.is_empty() => {
                     out.push_str("reason no screen: no read answered before the timeout\n")
@@ -8546,8 +8565,8 @@ pub fn render_phase(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[Stri
             }
             // A turn over under the agent's own background work: the phase it rests at, which
             // the server publishes as `agent=` and the session log closes the turn at. A turn
-            // the title runs rests at none ([`ScreenReader::background_rest_seen`]).
-            if let Some(rest) = reader.background_rest_seen(rows, reader.runs(title)) {
+            // the run sign runs rests at none ([`ScreenReader::background_rest_seen`]).
+            if let Some(rest) = reader.background_rest_seen(rows, runs) {
                 out.push_str(&format!("rest {}\n", rest.name()));
             }
         }
@@ -8604,10 +8623,9 @@ fn esc_line(effect: Option<CancelEffect>) -> Option<&'static str> {
     }
 }
 
-/// Why `rows` read busy, beside what `title` (the window title read with them) says of the run:
-/// a turn only the title runs is `title: running`.
-fn busy_rule(reader: &dyn ScreenReader, rows: &[String], title: Option<&str>) -> Option<String> {
-    let runs = reader.runs(title);
+/// Why `rows` read busy, beside what `runs` (the run sign read with them, [`runs_of`]) says of the
+/// run: a turn only the run sign runs is `run sign: running`.
+fn busy_rule(reader: &dyn ScreenReader, rows: &[String], runs: Option<bool>) -> Option<String> {
     match reader.program() {
         Program::Claude => busy_seen(rows, runs).map(|b| b.to_string()),
         Program::Generic => busy_signal(rows).map(|b| b.to_string()),
@@ -8622,7 +8640,7 @@ fn busy_rule(reader: &dyn ScreenReader, rows: &[String], title: Option<&str>) ->
                 return None;
             }
             if reader.phase(rows) != Phase::Busy {
-                return Some("title: running".to_string());
+                return Some("run sign: running".to_string());
             }
             Some(match reader.background_wait_seen(rows, runs) {
                 Some(work) => format!("its own background work: {work}"),

@@ -2255,17 +2255,28 @@ fn the_spotlight_row_is_a_note_at_worst() {
 /// The `lan:` row's mark and whether it is measured: ok only for a current install whose
 /// socket answers, a warning for a current one that does not answer, a measured note for an
 /// owed install, and an unmeasured note for one the running broker adopts by itself and for
-/// a reading that could not be made. NEGATIVE CONTROL: off macOS (no fact) there is no row,
-/// in the report too.
+/// a reading that could not be made. One that does not answer because launchd lists its job
+/// switched off is a measured note naming what switches it back on, never setup's elevation,
+/// which leaves that job alone; a broker that answers is read as it answers. MUTANT: a row that
+/// reads no switch warns or names the elevation for the switched-off job. NEGATIVE CONTROL: off
+/// macOS (no fact) there is no row, in the report too.
 #[test]
 fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
-    let row = |install, answers| {
+    let row_with = |install, answers, switched_off| {
         let rows = super::lan_rows(&MachineFacts {
-            lan: Some(super::LanFact { install, answers }),
+            lan: Some(super::LanFact {
+                install,
+                answers,
+                switched_off,
+            }),
             ..MachineFacts::absent()
         });
         assert_eq!(rows.len(), 1);
-        (rows[0].mark, rows[0].unmeasured)
+        (rows[0].mark, rows[0].unmeasured, rows[0].fact.clone())
+    };
+    let row = |install, answers| {
+        let (mark, unmeasured, _) = row_with(install, answers, None);
+        (mark, unmeasured)
     };
     let install = |current, owed| {
         Some(Ok(super::LanInstall {
@@ -2280,6 +2291,21 @@ fn the_lan_row_marks_the_install_and_whether_the_socket_answers() {
     assert_eq!(row(install(false, false), true), (Mark::Note, true));
     assert_eq!(row(Some(Err(String::new())), true), (Mark::Note, true));
     assert_eq!(row(None, false), (Mark::Note, true));
+    // The broker's own words for a switched-off job (aterm_uds::lan::Unavailable::SwitchedOff),
+    // which the row carries as they are.
+    let off = || Some("switched off; `sudo launchctl enable` switches it back on".to_owned());
+    for (current, owed) in [(true, false), (false, true), (false, false)] {
+        let (mark, unmeasured, fact) = row_with(install(current, owed), false, off());
+        assert_eq!((mark, unmeasured), (Mark::Note, false), "{fact}");
+        assert!(
+            fact.contains("`sudo launchctl enable`") && !fact.contains("apply --plain"),
+            "{fact}"
+        );
+    }
+    let (mark, _, fact) = row_with(install(true, false), false, None);
+    assert_eq!(mark, Mark::Warn, "{fact}");
+    assert!(fact.contains("apply --plain starts it"), "{fact}");
+    assert_eq!(row_with(install(true, false), true, off()).0, Mark::Ok);
     assert!(super::lan_rows(&MachineFacts::absent()).is_empty());
     let report = doctor_checks_with_origin(
         "/bin/sh",

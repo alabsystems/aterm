@@ -3,6 +3,67 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[path = "../benches/support/mod.rs"]
+mod installer_fixture;
+
+/// A whole current pass preserves every file, including every context and skill.
+/// A stale managed skill is the positive control for both flush and drift observations.
+#[cfg(unix)]
+#[test]
+fn unchanged_install_preserves_every_file_without_flushes() {
+    use installer_fixture::{Drift, Tree};
+    let home = aterm_tempfile::tempdir().unwrap();
+    installer_fixture::seed(home.path()).unwrap();
+    let cold = auto_prime_with(home.path(), &Roots::default());
+    assert!(cold.changed());
+    assert_eq!(cold.errors().count(), 0);
+    Tree::read(home.path()).unwrap().age_files().unwrap();
+    let before = Tree::read(home.path()).unwrap();
+    let recording = aterm_durable::seam::Recording::start();
+    let warm = auto_prime_with(home.path(), &Roots::default());
+    assert_eq!(warm.errors().count(), 0);
+    assert!(!warm.changed());
+    assert!(recording.take().is_empty());
+    assert_eq!(recording.take_plain(), 0);
+    let after = Tree::read(home.path()).unwrap();
+    assert_eq!(before.drift(&after), Drift::default());
+    assert_eq!(before.logical_bytes(), after.logical_bytes());
+    eprintln!(
+        "fixture reachable_allocated_bytes={} -> {}",
+        before.allocated_bytes(),
+        after.allocated_bytes()
+    );
+    assert_eq!(before.directory_count(), after.directory_count());
+
+    let skill = before
+        .files
+        .keys()
+        .find(|path| path.ends_with("SKILL.md"))
+        .unwrap();
+    let saved = &before.files[skill].bytes;
+    let mut stale = saved.clone();
+    stale.extend_from_slice(b"\nFixture edit of a managed skill.\n");
+    std::fs::write(home.path().join(skill), stale).unwrap();
+    Tree::read(home.path()).unwrap().age_files().unwrap();
+    let stale = Tree::read(home.path()).unwrap();
+    let repaired = auto_prime_with(home.path(), &Roots::default());
+    assert!(repaired.changed());
+    assert_eq!(repaired.errors().count(), 0);
+    assert!(
+        !recording.take().is_empty(),
+        "a real repair must reach the flush seam"
+    );
+    let repaired = Tree::read(home.path()).unwrap();
+    assert_eq!(repaired.files[skill].bytes, *saved);
+    let drift = stale.drift(&repaired);
+    assert_eq!(drift.bytes, 1);
+    assert_eq!(drift.identity, 1, "retained descriptors expose replacement");
+    assert_eq!(drift.modified, 1, "the fixed past mtime exposes a rewrite");
+    assert_eq!(drift.added + drift.removed, 0);
+    assert!(!drift.directories);
+}
+
 /// THE LAND END'S WORDS ARE ONE SOURCE ([`LAND_CHECK_ANSWER`]): the primer composes them, and
 /// the supervise-agent skill, a file no constant reaches, carries them as written.
 /// Negative control: the skill's sentence reworded.
@@ -1343,6 +1404,9 @@ fn a_corrupt_block_is_an_error_row_that_stops_nothing_else() {
     assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), corrupt);
 }
 
+/// Unix's alone: Windows refuses to move a folder while a file in it is open, as the writer's
+/// lock is through the pass, so no pass there loses its folder this way.
+#[cfg(unix)]
 #[test]
 fn an_agent_folder_taken_mid_pass_is_never_made_again() {
     let home = aterm_tempfile::tempdir().unwrap();

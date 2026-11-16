@@ -224,6 +224,11 @@ pub(crate) fn commons_status_until(
     Ok(value)
 }
 
+/// The local membership history's counts and its meter. `held_bytes`, `byte_bound` and
+/// `bytes_by_kind` are the reading `aterm secrets status` says on its `log:` line
+/// ([`aterm_secrets::membership_log::Log::fill`]): the wire bytes of the complete records, the
+/// bound the class stops are shares of, and each kind's bytes. `record_bytes` counts the waiting
+/// records too.
 fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
     match aterm_secrets::client::inspect_membership_history_until(paths, deadline) {
         Ok(Some(history)) => json!({
@@ -237,6 +242,14 @@ fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
             "complete_keyed_records": history.complete.keyed,
             "remaining_records": history.remaining_records(),
             "record_bytes": history.bytes,
+            "held_bytes": history.fill.bytes,
+            "byte_bound": history.fill.bound,
+            "bytes_by_kind": history
+                .fill
+                .by_kind
+                .iter()
+                .map(|(kind, _, bytes)| (kind.word().to_owned(), json!(*bytes)))
+                .collect::<aterm_json::Map>(),
             "limits": {
                 "held_records": history.budgets.held,
                 "weighed_records": history.budgets.weighed,

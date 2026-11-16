@@ -27,6 +27,10 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 pub(crate) const MAX_RECORD_SPOOL_BYTES: usize = deadline::MAX_COMPLETE_LISTING_BYTES;
 
+/// How much of a record spool is held in memory before it is written.
+#[cfg(unix)]
+const RECORD_SPOOL_BUFFER_BYTES: usize = 64 * 1024;
+
 /// One child.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -418,7 +422,7 @@ fn run_record_spool(
         .ok_or_else(|| Error::local("record spool has no parent"))?;
     aterm_uds::private_file::check_private_dir(parent)
         .map_err(|error| Error::local(format!("record spool directory: {error}")))?;
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -427,19 +431,34 @@ fn run_record_spool(
         .map_err(|error| Error::local(format!("record spool: {error}")))?;
     let failure = Arc::new(OnceLock::<String>::new());
     let observed = failure.clone();
+    // Records reach the file a buffer at a time: two writes a record made a history's
+    // millions of rows millions of system calls, which a loaded Mac's file system slows
+    // far past the run's bound. The buffer is shared so it is flushed, and its error
+    // read, once the capture has ended, which a buffer dropped with the consumer would
+    // not say.
+    let spool = Arc::new(std::sync::Mutex::new(std::io::BufWriter::with_capacity(
+        RECORD_SPOOL_BUFFER_BYTES,
+        file,
+    )));
+    let writer = spool.clone();
     let mut written = 0usize;
     let consume = move |record: &[u8]| {
         if observed.get().is_none() {
             let next = written.checked_add(record.len() + 1);
             if next.is_none_or(|n| n > MAX_RECORD_SPOOL_BYTES) {
                 let _ = observed.set("record spool exceeds its finite byte bound".into());
-            } else if let Err(error) = file.write_all(record).and_then(|_| file.write_all(b"\n")) {
-                let _ = observed.set(format!("record spool write: {error}"));
             } else {
-                written = next.unwrap();
+                let mut out = writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(error) = out.write_all(record).and_then(|_| out.write_all(b"\n")) {
+                    let _ = observed.set(format!("record spool write: {error}"));
+                } else {
+                    written = next.unwrap();
+                }
             }
         }
-        false // all inventory DATA is on disk, never retained in ChildOut's heap
+        false // all inventory DATA goes to disk, at most one buffer of it in ChildOut's heap
     };
     let failed_sink = failure.clone();
     let mut stop_on_failure = || stopped() || failed_sink.get().is_some();
@@ -468,6 +487,15 @@ fn run_record_spool(
         .map_err(|error| error.to_string()),
     };
     drop(stop_on_failure);
+    if captured.is_ok() && failure.get().is_none() {
+        let flushed = spool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush();
+        if let Err(error) = flushed {
+            let _ = failure.set(format!("record spool write: {error}"));
+        }
+    }
     if let Some(why) = failure.get().cloned() {
         return Err(Error::local(why).with_side_effect(SideEffect::Unknown));
     }

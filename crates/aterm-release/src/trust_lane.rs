@@ -2653,10 +2653,10 @@ fn check_and_conclude(
                 &f.job.name,
                 crate::trust_credit::read_record(&f.job.target, package_identity(&f.job.name)),
             );
-            if let Some(r) = &reducer {
-                if let Err(error) = r.send(&f.job) {
-                    receipt_errors.push(error.to_string());
-                }
+            if let Some(r) = &reducer
+                && let Err(error) = r.send(&f.job)
+            {
+                receipt_errors.push(error.to_string());
             }
         };
         let ran = bench.checks(cfg, prep, jobs, slots, &mut done, out);
@@ -3115,8 +3115,8 @@ fn disk_run(cfg: &Config, root: &Path) -> atpkg::admit_disk::Run {
 ///
 /// # Errors
 /// The volume holding the root can never hold the need above its floor, has less free above it
-/// than the need once the relief ran (which no wait admits), or an interrupt ended the wait:
-/// COULD NOT RUN.
+/// than the need once its one relief ran (it ends at once rather than wait for disk), or an
+/// interrupt ended the wait: COULD NOT RUN.
 fn claim_disk(
     cfg: &Config,
     root: &Path,
@@ -3133,8 +3133,8 @@ fn claim_disk(
             "the run's disk claim was {e}; no check started, so nothing was decided"
         ))),
         Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(Stop::CouldNotRun(format!(
-            "the run's disk claim was refused, no check started: {e}, or start it at once with \
-             `--admit now`"
+            "the run's disk claim was refused, no check started: {e}; `--admit now` starts it at \
+             once"
         ))),
         Err(e) => {
             let _ = writeln!(

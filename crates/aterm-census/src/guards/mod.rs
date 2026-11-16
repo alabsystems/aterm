@@ -37,6 +37,7 @@ mod machines;
 mod mint;
 mod mktemp;
 mod no_reach_read;
+mod release_notes;
 mod rules;
 mod seam_caller;
 pub(crate) mod unmounted_test;
@@ -97,6 +98,7 @@ pub const GUARDS: &[Rule] = &[
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
     conflict_marker::CONFLICT_MARKER,
+    release_notes::RELEASE_NOTES,
     no_reach_read::NO_REACH_READ,
     unmounted_test::UNMOUNTED_TEST,
     inline_test_module::INLINE_TEST_MODULE,

@@ -180,3 +180,53 @@ fn a_store_executable_names_its_prefix_program_and_build() {
         None
     );
 }
+
+/// `clone_build` lays the owner's build in a scratch store that already holds another build,
+/// beside it and not activated, and runs it once; the clone's path is what the token wrapper's
+/// store-build check admits for the scratch home and the owner's is not. Negative controls: the
+/// same build twice, and the owner's own home, are refused.
+#[test]
+fn a_build_cloned_beside_a_store_is_that_stores_build_and_not_activated() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let source = owner_store(&root);
+    let home = root.join("home");
+    let prefix = atpkg::store::default_prefix(&home);
+    let other = prefix.join("store/claude/9/bin/claude");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "#!/bin/sh\n").unwrap();
+    let hold = root.join("held/store-build");
+    let exe = clone_build(&home, &source, Some(&hold)).expect("cloned");
+    assert!(
+        !hold.exists(),
+        "the clone printed its version: its hold went"
+    );
+    assert_eq!(
+        exe,
+        prefix.join("store/claude/1000002000001000304/bin/claude")
+    );
+    assert_eq!(
+        std::fs::read(&exe).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert!(other.is_file(), "the store's other build stays");
+    assert!(
+        !prefix.join("store/claude/current").exists(),
+        "the clone is not activated"
+    );
+    let builds = prefix.join("store/claude");
+    assert_eq!(
+        aterm_agent::harness::token_route::store_build_in(&builds, &exe),
+        Some(exe.clone())
+    );
+    assert_eq!(
+        aterm_agent::harness::token_route::store_build_in(&builds, &source),
+        None,
+        "the owner's build is not the scratch store's"
+    );
+    let again = clone_build(&home, &source, Some(&root.join("held/again"))).unwrap_err();
+    assert!(again.contains("already there"), "{again}");
+    assert!(!root.join("held/again").exists(), "{again}");
+    let owner = clone_build(&root.join("owner"), &source, Some(&hold)).unwrap_err();
+    assert!(owner.contains("never re-laid"), "{owner}");
+}

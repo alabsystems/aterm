@@ -14,10 +14,13 @@ fn stopped(word: MetWord) -> Stopped {
 }
 
 /// Only an event ends a hold: a new Claude Code or aterm build where both versions are known,
-/// a window store or mailbox configuration written after the stop, a token made after it. No
-/// time does, and nothing unknown does.
+/// a window store or mailbox configuration written after the stop, a token made after it, and,
+/// for a code page that waited on a mailbox alone, the window reading the account's mailbox now.
+/// No time does, and nothing unknown does; a mailbox read now lets no other stop through.
 /// NEGATIVE CONTROL: with `moved` counting an unknown version as a change (`then != now` alone),
-/// a build nobody knew ends the hold: `` an unknown build ended the hold ``.
+/// a build nobody knew ends the hold: `` an unknown build ended the hold ``. With `holds`
+/// reading `mailbox_read` for every word, a mailbox released a human check: `` a mailbox the
+/// window reads ended a human check's hold ``.
 #[test]
 fn only_an_event_ends_a_hold() {
     let step = stopped(MetWord::WindowHumanCheck);
@@ -27,8 +30,34 @@ fn only_an_event_ends_a_hold() {
         aterm: Some("0.199.0+g69ee51e2f4b5"),
         route_at: Some(AT),
         token_at: Some(AT),
+        mailbox_read: None,
     };
     assert!(step.holds(&same), "the stop's own second is no event");
+    assert!(
+        step.holds(&Since {
+            mailbox_read: Some(true),
+            ..same
+        }),
+        "a mailbox the window reads ended a human check's hold"
+    );
+    let no_mailbox = stopped(MetWord::WindowCodeNoMailbox);
+    assert!(no_mailbox.waits_on_a_mailbox() && !step.waits_on_a_mailbox());
+    for read in [None, Some(false)] {
+        assert!(
+            no_mailbox.holds(&Since {
+                mailbox_read: read,
+                ..same
+            }),
+            "a mailbox the window does not read ({read:?}) ended the hold"
+        );
+    }
+    assert!(
+        !no_mailbox.holds(&Since {
+            mailbox_read: Some(true),
+            ..same
+        }),
+        "a mailbox the window reads now did not end a code page's hold"
+    );
     for (since, what) in [
         (
             Since {
@@ -203,10 +232,13 @@ fn the_file_holds_each_accounts_record_and_nothing_else() {
 }
 
 /// What lets a held step through without a person is dated by its own file: the account's
-/// window store's record (on macOS), each mailbox configuration the window reads, and the
+/// window store's record (on macOS), each mailbox configuration file the window reads, and the
 /// account's saved Google mail grant, which lets the window read a Gmail row with no password.
+/// A file under `~/.secrets` dates nothing: the window reads none (the mailbox configurations
+/// there are vault entries, judged by [`mailbox_read`]).
 /// NEGATIVE CONTROL: with `route_at` reading no Google grant, a grant saved after the
-/// configuration is not seen: `` a saved Google grant was not seen ``.
+/// configuration is not seen: `` a saved Google grant was not seen ``. With `route_at` stating
+/// `~/.secrets/ai-mailbox.toml` again, `` a file under ~/.secrets dated a route ``.
 #[test]
 fn a_route_is_dated_by_its_own_files() {
     let scratch = Scratch::new("steps-route");
@@ -223,7 +255,20 @@ fn a_route_is_dated_by_its_own_files() {
     );
     let secrets = home.path().join(".secrets");
     std::fs::create_dir_all(&secrets).unwrap();
-    let config = secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE);
+    for name in [
+        super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+        super::super::headless_oauth::MAILBOX_TOML_FILE,
+    ] {
+        std::fs::write(secrets.join(name), b"").unwrap();
+    }
+    assert_eq!(
+        route_at(&store, Some(home.path()), "person@example.com"),
+        None,
+        "a file under ~/.secrets dated a route"
+    );
+    let config_dir = home.path().join(".config/aterm");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join(super::super::headless_oauth::MAILBOX_TOML_FILE);
     std::fs::write(&config, b"").unwrap();
     let written = |path: &std::path::Path| {
         std::fs::metadata(path)

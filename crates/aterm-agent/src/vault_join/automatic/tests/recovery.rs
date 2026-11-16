@@ -176,6 +176,11 @@ impl Recovery {
 #[test]
 fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
     let f = Recovery::new();
+    assert!(
+        client::read_in_place(&f.paths, "recovery-token")
+            .unwrap()
+            .is_none()
+    );
     let request = f
         .device
         .request(f.trust.network, f.trust.authority)
@@ -209,8 +214,11 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
     assert_eq!(bundle.allowed.binding(), request.binding());
     client::write_from_log_bundle(&f.paths, &bundle).unwrap();
     assert_eq!(
-        crate::vault_entry::read_text(&f.paths.home, "recovery-token", 1 << 20).text(),
-        Some("fixture-value")
+        client::read_in_place(&f.paths, "recovery-token")
+            .unwrap()
+            .expect("the recovered member reads its token from the verified store")
+            .as_slice(),
+        b"fixture-value"
     );
     assert!(matches!(
         client::status(&f.paths).unwrap().membership,

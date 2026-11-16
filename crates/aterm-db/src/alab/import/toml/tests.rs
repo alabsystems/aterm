@@ -186,7 +186,8 @@ fn every_field_of_a_mailbox_file_lands_and_the_file_is_covered() {
         row(&owner).get("imap"),
         Some(&json!("imap://127.0.0.1:1143"))
     );
-    assert_eq!(row(&owner).get("receives_domains"), Some(&json!(["*"])));
+    let domains = |pk: &str| cell::settled_texts(row(pk).fields.get("receives_domains"));
+    assert_eq!(domains(&owner), ["*"]);
     assert_eq!(
         row(&ann).get("webmail"),
         Some(&json!("https://mail.example.invalid/inbox"))
@@ -196,14 +197,8 @@ fn every_field_of_a_mailbox_file_lands_and_the_file_is_covered() {
         Some(&json!("imaps://imap.example.invalid:993"))
     );
     assert_eq!(row(&ann).get("http"), Some(&json!("http://127.0.0.1:8025")));
-    assert_eq!(
-        row(&ann).get("receives_domains"),
-        Some(&json!(["pm.example"]))
-    );
-    assert_eq!(
-        row(&bob).get("receives_domains"),
-        Some(&json!(["bob.example"]))
-    );
+    assert_eq!(domains(&ann), ["pm.example"]);
+    assert_eq!(domains(&bob), ["bob.example"]);
     let receives = row(&ann).fields["receives"].members();
     let want = [
         address("ai1@example.invalid"),
@@ -483,4 +478,49 @@ fn a_protected_login_takes_no_mailbox_from_a_file() {
     assert!(!uncovered(&sheets, &book.cells()).is_empty());
     let alone = [sheet("user = \"owner@proton.example\"\n")];
     assert!(!uncovered(&alone, &book.cells()).is_empty());
+}
+
+/// A mailbox's `receives_domains` is registry.4's text set (LT-15B): a later read of the file
+/// that drops a domain takes back the member its own earlier read wrote and adds the new one,
+/// leaving a member the owner added and the other mailboxes' domains as they are; a re-run
+/// writes nothing.
+/// NEGATIVE CONTROL (run 2026-11-15): with the importer's text-set arm of its retraction pass
+/// removed, the dropped member stays: `` left: ["other.example", "pm.example", "team.example"]
+/// right: ["other.example", "team.example"] ``.
+#[test]
+fn a_domain_the_file_drops_leaves_its_mailbox() {
+    let mut book = Book::new();
+    apply(&mut book, &planned(&[sheet(FILE)], &Cells::new()));
+    let ann = mailbox_of("ann@example.invalid");
+    let seen = book.all();
+    book.write(
+        2,
+        &seen,
+        vec![crate::typed::grid::tests::elem(
+            &MAILBOX,
+            &ann,
+            "receives_domains",
+            "team.example",
+        )],
+    );
+    let cells = book.cells();
+    let moved = FILE.replace("\"*@pm.example\"", "\"*@other.example\"");
+    let second = planned(&[sheet(&moved)], &cells);
+    let cells = apply(&mut book, &second);
+    let domains = |cells: &Cells, pk: &str| {
+        let mut held = cell::settled_texts(
+            cell::project(&MAILBOX, cells).rows[pk]
+                .fields
+                .get("receives_domains"),
+        );
+        held.sort_unstable();
+        held
+    };
+    assert_eq!(domains(&cells, &ann), ["other.example", "team.example"]);
+    assert_eq!(domains(&cells, &mailbox_of("owner@proton.example")), ["*"]);
+    assert_eq!(
+        domains(&cells, &mailbox_of("bob@example.invalid")),
+        ["bob.example"]
+    );
+    assert!(planned(&[sheet(&moved)], &cells).rows.is_empty());
 }

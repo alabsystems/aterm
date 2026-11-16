@@ -888,6 +888,7 @@ const SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
 const PROC_TYPE_APP_DEFAULT: libc::c_int = 0x100;
 
 /// Replace this process in place (`POSIX_SPAWN_SETEXEC`) with `program` as an app-type task at Darwin `role`.
+/// An unsettled process-table read returns `WouldBlock` before native preparation.
 #[cfg(target_os = "macos")]
 pub fn exec_as_app(
     program: &str,
@@ -900,6 +901,7 @@ pub fn exec_as_app(
 
 /// Replace this process as an app, retaining only stdio and the explicitly held window guard.
 /// The guard's original descriptor and close-on-exec policy remain unchanged if exec fails.
+/// An unsettled process-table read returns `WouldBlock` before duplicating any guard.
 #[cfg(target_os = "macos")]
 pub fn exec_as_app_with_guards(
     program: &str,
@@ -920,6 +922,17 @@ fn exec_as_app_inner(
     guards: Option<&[std::os::fd::BorrowedFd<'_>]>,
 ) -> io::Error {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    let _closed = match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN)
+    {
+        Ok(closed) => closed,
+        Err(reading) => {
+            return io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("refusing native app exec while {reading}"),
+            );
+        }
+    };
 
     struct Actions {
         actions: SpawnActions,

@@ -117,7 +117,10 @@ fn a_silent_drive_explains_its_failed_handshake_by_member_name() {
         .expect("record the silent member");
     })
     .expect("its book");
-    for verb in [&["@s-1", "status"][..], &["await", "task", "@s-1"]] {
+    for verb in [
+        &["@t0000000001", "status"][..],
+        &["await", "task", "@t0000000001"],
+    ] {
         let mut args = vec!["--host", other.node()];
         args.extend_from_slice(verb);
         let refused = ctl_with(&driver.0, &args, None, &[(DRIVE_WITHIN_SEAM, "100")]);
@@ -749,13 +752,23 @@ enum Typed<'a> {
     Bash(&'a str),
 }
 
-/// `aterm ctl` with its words `typed`, under the isolation every test's client has.
+/// `aterm ctl` with its words `typed`, under the isolation every test's client has. A client
+/// the server turns away (`ERR control server busy`) exits without reading its stdin, and on a
+/// loaded Mac it can be gone before the bytes are written: that write's broken pipe is no
+/// failure of the test, so the client's own exit and words decide, and a turned-away client
+/// is asked again ([`headless_boot::until_served`]).
 fn ctl_as(root: &Path, typed: Typed<'_>, stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
     headless_boot::until_served(|| {
         let mut child = ctl_spawn(root, typed, stdin.is_some(), env);
         if let Some(bytes) = stdin {
             let mut pipe = child.stdin.take().expect("its stdin");
-            pipe.write_all(bytes).expect("write its stdin");
+            if let Err(e) = pipe.write_all(bytes) {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "write its stdin: {e}"
+                );
+            }
         }
         crate::child_output::wait_and_read(child, Instant::now() + HANG)
             .unwrap_or_else(|| panic!("aterm ctl {typed:?} did not exit"))
@@ -2648,10 +2661,10 @@ fn account_renewal_runs_over_native_fleet_with_no_ssh_or_interactive_terminal() 
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
         .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
         .env("PATH", issuer.tmp.join("no-programs"));
-    let output = aterm_uds::deadline::output_with_input_until(
+    let output = aterm_uds::deadline::output_while_process_progressing_complete_stdout_with_limit(
         &mut command,
-        aterm_uds::secret::Secret::new(&[]),
-        Instant::now() + HANG,
+        HANG,
+        "native fleet account renewal",
         64 * 1024,
     )
     .expect("native renewal completed");
@@ -2690,12 +2703,30 @@ fn driven_pair_configured(
     member_env: &[(&str, &str)],
     configure: impl FnOnce(&Path, &mut std::process::Command),
 ) -> (Instance, Instance, String, String) {
+    driven_pair_seeded(tags, member_env, &|_| {}, &|_| {}, configure)
+}
+
+/// [`driven_pair_configured`], each scratch world first given what its seed lays in it (the
+/// issuer's, then the member's), before anything of the fleet is made there and before its aterm
+/// starts.
+#[expect(
+    clippy::disallowed_types,
+    reason = "configures the isolated headless child"
+)]
+fn driven_pair_seeded(
+    tags: (&str, &str),
+    member_env: &[(&str, &str)],
+    issuer_seed: &dyn Fn(&Path),
+    member_seed: &dyn Fn(&Path),
+    configure: impl FnOnce(&Path, &mut std::process::Command),
+) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
     let issuer = boot_world(
         tags.0,
         |tmp, cmd| {
+            issuer_seed(tmp);
             fleet_ok(
                 tmp,
                 &["init", "--host", "127.0.0.1", "--port", &port_word],
@@ -2722,6 +2753,7 @@ fn driven_pair_configured(
     let member = boot_world(
         tags.1,
         |tmp, cmd| {
+            member_seed(tmp);
             fleet_ok(
                 tmp,
                 &[
@@ -2896,6 +2928,142 @@ fn a_fleet_survey_carries_each_members_checkouts_and_any_host_places_by_them() {
         ),
         "{said}"
     );
+}
+
+/// Lay in `tmp`'s scratch state the disk watch's record of a sizing of `tmp`'s home volume, as the
+/// watch keeps one (claimed, then kept, in the harness state an aterm run with `ATERM_STATE_HOME`
+/// at `tmp/state` reads): `mb` MiB of build output, cut short where `partial`, the sizing ended
+/// `ago_s` seconds before now. Returns that end, in Unix seconds.
+fn seed_budget(tmp: &Path, mb: u64, ago_s: i64, partial: bool) -> i64 {
+    use aterm_agent::harness::disk::{self, Rebuildable, budget};
+    let home = tmp.join("home");
+    std::fs::create_dir_all(&home).expect("the scratch home");
+    let volume = disk::volume_of(&home, &aterm_sysprobe::volumes::table())
+        .expect("the scratch home's volume reads");
+    let now = aterm_time::unix_secs()
+        .and_then(|now| i64::try_from(now).ok())
+        .expect("the clock reads");
+    let harness = tmp
+        .join("state/harness")
+        .join(aterm_agent::harness::cli::HARNESS);
+    assert!(
+        matches!(budget::claim(&harness, now), Ok(budget::Claim::Claimed(_))),
+        "a fresh state claims its first sizing"
+    );
+    let sized_unix = now - ago_s;
+    budget::keep(
+        &harness,
+        now,
+        budget::Sizing {
+            volume: volume.key.spelled(),
+            total: volume.total,
+            used: volume.total.saturating_sub(volume.free),
+            sized: Rebuildable {
+                bytes: mb << 20,
+                partial,
+            },
+            sized_unix,
+        },
+    )
+    .expect("the record is kept");
+    sized_unix
+}
+
+/// A FLEET OF TWO SHOWS EACH MEMBER'S TOTAL, FREE AND BUILD BYTES: read over the fleet, each Mac's
+/// survey row says its home volume's size and free space and the build output its disk watch's
+/// record keeps (seeded in each scratch state before its aterm starts, as the watch keeps one:
+/// the issuer's sized whole 2 h ago, the member's cut short 5 h ago), with when that sizing
+/// ended; `survey --fleet` says the build output under each home with its age, `at least` for the
+/// member's. The member's home also holds a real build folder, which a survey that walked the
+/// home would count: the figure is the record's, never a walk's.
+/// NEGATIVE CONTROL: with the record read from the aterm state root instead of its harness state,
+/// both rows say `home_build_mb=-` and the wait ends on the hang detector; with the build output
+/// sized by walking the home, the member's says 1, not 5120.
+#[test]
+fn a_fleet_of_two_shows_each_members_total_free_and_build_bytes() {
+    /// What `host`'s `instance` object says under `key`.
+    fn said<'a>(host: &'a aterm_json::Value, key: &str) -> Option<&'a str> {
+        host.get("instance")?.get(key)?.as_str()
+    }
+
+    let issuer_at = std::cell::Cell::new(0_i64);
+    let member_at = std::cell::Cell::new(0_i64);
+    let issuer_seed = |tmp: &Path| issuer_at.set(seed_budget(tmp, 3072, 2 * 3600, false));
+    let member_seed = |tmp: &Path| {
+        let build = tmp.join("home/proj/target/debug");
+        std::fs::create_dir_all(&build).expect("a build folder");
+        std::fs::write(build.join("blob"), vec![0_u8; 1 << 20]).expect("a build file");
+        std::fs::write(
+            build
+                .parent()
+                .expect("its target")
+                .join(aterm_agent::harness::disk::RUSTC_INFO),
+            "{}",
+        )
+        .expect("the build folder's marker");
+        member_at.set(seed_budget(tmp, 5120, 5 * 3600, true));
+    };
+    let (issuer, member, _worker, _target) =
+        driven_pair_seeded(("adti", "adtm"), &[], &issuer_seed, &member_seed, |_, _| {});
+    let homes = [&issuer, &member].map(|inst| inst.tmp.join("home").display().to_string());
+
+    let mut last = String::new();
+    let hosts =
+        aterm_spec::wait::until_within(HANG, "both Macs' build output in the survey", || {
+            let read = survey_answered(&issuer.tmp, &["survey", "--fleet", "--json"]);
+            assert!(read.status.success(), "{read:?}");
+            last = String::from_utf8_lossy(&read.stdout).into_owned();
+            let hosts: aterm_json::Value =
+                aterm_json::from_str(&last).unwrap_or_else(|e| panic!("not JSON ({e}): {last}"));
+            let sized = homes.iter().all(|home| {
+                hosts.as_array().into_iter().flatten().any(|host| {
+                    said(host, "home") == Some(home.as_str())
+                        && said(host, "home_build_mb").is_some_and(|mb| mb != "-")
+                })
+            });
+            sized.then_some(hosts)
+        });
+    let hosts = hosts.as_array().expect("an array");
+    for (home, (mb, partial, at)) in homes.iter().zip([
+        ("3072", "0", issuer_at.get()),
+        ("5120", "1", member_at.get()),
+    ]) {
+        let host = hosts
+            .iter()
+            .find(|host| said(host, "home") == Some(home.as_str()))
+            .unwrap_or_else(|| panic!("{home}: {last}"));
+        let volume = aterm_agent::harness::disk::volume_of(
+            Path::new(home),
+            &aterm_sysprobe::volumes::table(),
+        )
+        .expect("the scratch home's volume reads");
+        let number = |key: &str| {
+            said(host, key)
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("{home} {key}: {last}"))
+        };
+        let total = number("home_total_mb");
+        assert_eq!(total, volume.total >> 20, "{home}: {last}");
+        assert!(number("home_free_mb") <= total, "{home}: {last}");
+        assert_eq!(said(host, "home_build_mb"), Some(mb), "{home}: {last}");
+        assert_eq!(
+            said(host, "home_build_partial"),
+            Some(partial),
+            "{home}: {last}"
+        );
+        let at_ms = u64::try_from(at).expect("a time after the epoch") * 1000;
+        assert_eq!(number("home_build_at_ms"), at_ms, "{home}: {last}");
+    }
+
+    let text = survey_answered(&issuer.tmp, &["survey", "--fleet"]);
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8_lossy(&text.stdout);
+    for line in [
+        "\n  build output 3 GiB, sized 2h ago\n",
+        "\n  build output at least 5 GiB, sized 5h ago\n",
+    ] {
+        assert!(text.contains(line), "{line:?}: {text}");
+    }
 }
 
 /// `--host any` end to end, on macOS alone: its fixture is one fake login of Codex's, whose launch

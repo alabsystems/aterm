@@ -43,7 +43,7 @@ fn split_app(now: Instant) -> (App, WindowId, u64) {
     configure_pane_backgrounds(&app, sid);
     app.recompute_sparkle();
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = true;
     }
     app.redraw_compose(wid, 24, 80, false, false, None, 0, now);
@@ -52,7 +52,7 @@ fn split_app(now: Instant) -> (App, WindowId, u64) {
         term_lock(&term).process(b"\r\nhello kitty friend\r\n");
     }
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.pending_deco_birth = Some(now);
     }
     (app, wid, sid)
@@ -157,7 +157,7 @@ fn split_companion_rides_only_the_focused_pane() {
         "negative control disables a live feed"
     );
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = true;
         ws.fx
             .companions_mut()
@@ -271,9 +271,9 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     let (cw, ch) = app.win_cell_size(wid);
     let target = (2, 24);
     let (flight_at, flying) = {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         seed_resident_pet_mid_flight_for_test(
-            ws,
+            &mut ws,
             t0 + Duration::from_millis(16),
             pane_rows,
             pane_cols,
@@ -583,7 +583,7 @@ fn a_mixed_frame_buys_word_decorations_no_frame_cadence() {
         .expect("a visible route");
     let _ = app.prepare_layout_coordinate_space(wid, route);
     compose(&mut app, wid, t0);
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     assert!(ws.fx.decos().is_active(t0), "PRECONDITION: live episodes");
     assert!(
         ws.cursor_dependents_need_frame_cadence(t0, true),

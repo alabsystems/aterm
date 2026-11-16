@@ -484,11 +484,15 @@ struct Reauthenticate<'a> {
     case: u8,
     calls: Cell<u32>,
     stage: RefCell<Option<PathBuf>>,
+    /// Its clock.
+    at: i64,
+    /// Whether a person runs it at this Mac's terminal.
+    person: bool,
 }
 
 impl AccountsHost for Reauthenticate<'_> {
     fn stdin_is_terminal(&self) -> bool {
-        false
+        self.person
     }
     fn auth_status(&self, _: &str) -> Result<Captured, String> {
         panic!("Claude status")
@@ -500,7 +504,7 @@ impl AccountsHost for Reauthenticate<'_> {
         panic!("interactive login")
     }
     fn now(&self) -> i64 {
-        2000
+        self.at
     }
     fn renews_kimi_profiles(&self) -> bool {
         true
@@ -643,10 +647,8 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                                 );
                                 Ok(Vec::new())
                             } else {
-                                Ok(vec![
-                                    accounts::Event::new(env.now, accounts::Kind::SignIn, "one")
-                                        .because("provider browser bot-check"),
-                                ])
+                                accounts::note_check_stop(logins, &row, env.now);
+                                Ok(Vec::new())
                             }
                         },
                     )
@@ -657,7 +659,7 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                         &store, &logins, &row,
                     )
                 } else {
-                    crate::harness::accounts_sync::bot_check_on_record_at(&store, &row, &logins)
+                    crate::harness::accounts_sync::check_standing_at(&store, &row, &logins)
                 };
                 assert_eq!(recorded, Some(env.now), "CONTROL: retry hold is current");
             }
@@ -669,6 +671,8 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                 case,
                 calls: Cell::new(0),
                 stage: RefCell::new(None),
+                at: env.now,
+                person: false,
             };
             let records = store.read_account_records(Some(&roster), env.now).unwrap();
             let before = records.logins.get("one").unwrap().clone();
@@ -752,6 +756,176 @@ fn rejected_kimi_profile_reauthenticates_only_with_current_evidence_and_prerequi
                     );
                 }
             }
+            // A BOT PROTECTION'S STOP HOLDS THE REAUTHENTICATION ON NO CLOCK: six hours and a
+            // minute and a day on, nobody at this Mac, the page stays unloaded. CONTROL: a
+            // person at this Mac's terminal reauthenticates.
+            if case == 8 {
+                for (later, person) in [
+                    (6 * 3_600 + 60, false),
+                    (25 * 3_600, false),
+                    (25 * 3_600 + 60, true),
+                ] {
+                    let at = env.now + later;
+                    let host = Reauthenticate {
+                        old: &old,
+                        browser: &browser,
+                        case,
+                        calls: Cell::new(0),
+                        stage: RefCell::new(None),
+                        at,
+                        person,
+                    };
+                    let records = store.read_account_records(Some(&roster), at).unwrap();
+                    let mut err = Vec::new();
+                    renew_one_for(
+                        Cli::Kimi,
+                        at,
+                        &host,
+                        &store,
+                        (records.roster.row("one").unwrap(), &roster, &records.logins),
+                        (
+                            None,
+                            crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, "one"),
+                        ),
+                        &mut Vec::new(),
+                        &mut err,
+                    );
+                    assert_eq!(
+                        host.calls.get(),
+                        u32::from(person),
+                        "case 8 {later} s on, a person here: {person}, default={default_profile}: {}",
+                        String::from_utf8_lossy(&err)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A KIMI ROW'S NATIVE REFRESH IS NOT HELD AT THE RENEW DOOR BY A BOT PROTECTION'S STOP: an
+/// agent's `accounts renew` of a row whose account's check is on record, and whose published
+/// profile refreshes with no page, runs that refresh and renews the row in place. CONTROL: the
+/// same row with no profile here is held at the door, naming the person's step, and runs
+/// nothing.
+#[test]
+fn a_kimi_native_refresh_is_not_held_at_the_renew_door_by_a_bot_check() {
+    for native in [true, false] {
+        let tmp = tmp_dir("kimi-native-checked");
+        let mut env = env_at(&tmp);
+        env.now = aterm_time::unix_secs()
+            .and_then(|n| i64::try_from(n).ok())
+            .unwrap();
+        let store = env.accounts_store_for(Cli::Kimi).unwrap();
+        let path = env.accounts_roster_for(Cli::Kimi).unwrap();
+        let raw = accounts::Row {
+            label: "one".into(),
+            email: Some("browser-alias@example.com".into()),
+            identity_email: Some(EMAIL.into()),
+            vendor: accounts::Vendor {
+                region: Some(crate::ai::connector::Region::Global),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &path,
+            accounts::row_text(&raw).unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let dir = store.claim_staging_dir("one").unwrap();
+        if native {
+            drop(shared_provider::kimi_pending_proof_fixture(
+                &dir,
+                crate::ai::connector::Region::Global,
+                EMAIL,
+                true,
+            ));
+        }
+        store
+            .transact_logins(env.now, &mut None, |state, logins| {
+                let events = if native {
+                    let events = accounts::note_renewed(
+                        state,
+                        logins,
+                        &raw.label,
+                        None,
+                        dir.to_str().unwrap(),
+                        None,
+                        env.now,
+                    );
+                    accounts::note_identity(
+                        logins,
+                        &raw.label,
+                        accounts::Proof::Status,
+                        Some(EMAIL),
+                    );
+                    events
+                } else {
+                    logins.labels.entry(raw.label.clone()).or_default();
+                    Vec::new()
+                };
+                accounts::note_check_stop(logins, &raw, env.now);
+                Ok(events)
+            })
+            .unwrap();
+        let before = store.load_logins(env.now).unwrap().0;
+        assert!(
+            before
+                .get("one")
+                .and_then(|b| b.check_stop.as_ref())
+                .is_some(),
+            "native={native}: the check is on record"
+        );
+        let host = Native {
+            store: &store,
+            roster: &path,
+            raw: &raw,
+            now: env.now,
+            case: 0,
+            calls: Cell::new(0),
+            superseded: Cell::new(false),
+            after: RefCell::new(None),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = crate::harness::cli::run_accounts_of(
+            &crate::harness::cli::AccountsOf {
+                cli: Cli::Kimi,
+                form: crate::harness::cli::AccountsCmd::Renew {
+                    labels: vec!["one".to_owned()],
+                    due: false,
+                    on: None,
+                },
+                vendor: accounts::Vendor::default(),
+            },
+            &env,
+            &host,
+            &mut out,
+            &mut err,
+        );
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(
+            host.calls.get(),
+            u32::from(native),
+            "native={native}: {code:?}: {said}"
+        );
+        if native {
+            let after = store.load_logins(env.now).unwrap().0;
+            assert!(
+                after.get("one").unwrap().renewal_generation
+                    > before.get("one").unwrap().renewal_generation,
+                "the refresh renewed the row in place: {said}"
+            );
+        } else {
+            assert!(
+                said.contains(&crate::harness::cli::left_words(Cli::Kimi, "one")),
+                "CONTROL: held at the door, naming the person's step: {said}"
+            );
         }
     }
 }

@@ -1071,6 +1071,7 @@ pub fn pack_bottle_with(
         build: request.build,
         exposes,
         shim_env: pinned::invocation_environment(&bottle_def, &version),
+        harness: None,
     };
     let row = BottleRow {
         triple: request.triple,

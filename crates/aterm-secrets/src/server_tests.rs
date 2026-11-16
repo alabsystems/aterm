@@ -10,7 +10,7 @@ const OLD: [u8; 32] = [7u8; 32];
 const NEW: [u8; 32] = [8u8; 32];
 const STRANGER: [u8; 32] = [9u8; 32];
 
-fn envelope(seed: &[u8; 32], seq: u64) -> Vec<u8> {
+pub(super) fn envelope(seed: &[u8; 32], seq: u64) -> Vec<u8> {
     envelope_with(seed, seq, Vec::new(), "alab")
 }
 
@@ -34,7 +34,7 @@ fn unsigned(seq: u64, handoff: Vec<([u8; 32], [u8; 64])>, name: &str) -> Unsigne
     }
 }
 
-fn envelope_with(
+pub(super) fn envelope_with(
     seed: &[u8; 32],
     seq: u64,
     handoff: Vec<([u8; 32], [u8; 64])>,
@@ -43,7 +43,7 @@ fn envelope_with(
     sign(&unsigned(seq, handoff, name), seed).expect("signed")
 }
 
-fn options(store: &Path, hold: Duration) -> Options {
+pub(super) fn options(store: &Path, hold: Duration) -> Options {
     Options {
         listen: "127.0.0.1:0".parse().expect("addr"),
         store: store.to_path_buf(),
@@ -54,7 +54,7 @@ fn options(store: &Path, hold: Duration) -> Options {
     }
 }
 
-fn run(options: &Options) -> Running {
+pub(super) fn run(options: &Options) -> Running {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     start(listener, options).expect("started")
 }
@@ -86,6 +86,7 @@ fn stopping_after_listener_retirement_never_connects_to_its_replacement() {
         stop: Arc::new(AtomicBool::new(false)),
         shared,
         cancel: None,
+        held_cancel: None,
         accept: Some(accept),
     }
     .stop();
@@ -217,6 +218,17 @@ fn until_closed(running: &Running) {
 /// How many PUT bodies are being read.
 fn reading(running: &Running) -> usize {
     running.shared.lock_puts().reading
+}
+
+/// A route waiter for [`Seams::routes`] that hears a change each time `changes` gets one and
+/// fails once its sender is gone; it waits beside no [`crate::wake::Closing`], so its thread
+/// ends with the test's sender.
+fn routes_from(changes: std::sync::mpsc::Receiver<()>) -> Box<HearRoutes> {
+    Box::new(move |most, _| match changes.recv_timeout(most) {
+        Ok(()) => crate::wake::Heard::Change,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => crate::wake::Heard::Nothing,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => crate::wake::Heard::Failed,
+    })
 }
 
 fn url(running: &Running) -> String {
@@ -1203,6 +1215,7 @@ fn the_advert_and_the_childrens_argv_are_exact() {
         seq: parsed.seq,
         head: parsed.digest(),
         label: None,
+        rec: None,
     };
     let with_txt = txt_strings(&vault_advert(&at, "alab-secrets", 7484, Some(&txt)).unwrap());
     let head_hex = hex32_encode(&txt.head);
@@ -1255,6 +1268,7 @@ fn vault_txt_round_trips_and_rejects_old_or_malformed_args() {
         seq: 79,
         head: parsed.digest(),
         label: None,
+        rec: None,
     };
     let mut strings = txt_strings(&vault_advert(&at, "alab-secrets", 7484, Some(&txt)).unwrap());
     assert_eq!(
@@ -1342,16 +1356,17 @@ fn vault_txt_round_trips_and_rejects_old_or_malformed_args() {
             parented: false,
             handoff: Vec::new(),
             bytes: Arc::new(raw),
+            alab: false,
         }),
     );
     assert_eq!(
         advertised_vault(&state, "alab-secrets", None, &[]),
         Some(txt.clone())
     );
-    assert_eq!(
-        advertised_vault(&state, "m22", None, &[]),
-        Some(txt.clone())
-    );
+    // Its own name names its records' digest: the empty log's, as it holds no records.
+    let mut own_txt = txt.clone();
+    own_txt.rec = Some(crate::membership_log::empty_heads_digest());
+    assert_eq!(advertised_vault(&state, "m22", None, &[]), Some(own_txt));
     let mut labelled_txt = txt;
     labelled_txt.label = Some("m22".to_owned());
     assert_eq!(
@@ -1407,11 +1422,7 @@ fn expiry_keeps_a_week_either_side_of_the_clock() {
 #[test]
 fn one_address_holds_at_most_16_connections_and_the_next_reads_503() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let tuning = Tuning {
-        liveness_every: Duration::from_millis(10),
-        ..Tuning::default()
-    };
-    let running = run_tuned(&options(root.path(), 2 * HANG_DETECTOR), tuning);
+    let running = run(&options(root.path(), 2 * HANG_DETECTOR));
     put(&running, &envelope(&OLD, 1)).expect("first");
     until_closed(&running);
     let poll = b"GET /v1/alab?after=1 HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -1447,6 +1458,161 @@ fn one_address_holds_at_most_16_connections_and_the_next_reads_503() {
         let answer = read_all(stream);
         assert!(answer.starts_with("HTTP/1.1 204 "), "{answer}");
     }
+}
+
+/// A held long-poll waits with no timer of its own: each wait it arms runs to its hold's end
+/// ([`park_until_news`]), a wake with nothing new parks it again the same way, and its client
+/// closing the connection ends the hold, heard by the `vault-held` thread ([`held`]) within
+/// [`aterm_spec::wait::MUST_HAPPEN`] of a hold twice that long.
+/// NEGATIVE CONTROL: looking every 5 s (`LIVENESS_EVERY`, the code before) arms waits short of
+/// the hold's end; a thread that polls no held stream leaves the closed client held past the
+/// hang detector.
+#[test]
+fn a_held_long_poll_waits_for_its_hold_alone_and_ends_when_its_client_closes() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let running = run(&options(root.path(), 2 * aterm_spec::wait::MUST_HAPPEN));
+    put(&running, &envelope(&OLD, 1)).expect("first");
+    until_closed(&running);
+    let client = sent(
+        &running,
+        b"GET /v1/alab?after=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    until_waiting(&running, 1);
+    let waits = || {
+        running
+            .shared
+            .park_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    // Under `server_state`, which the long-poll holds from its first look until its first wait
+    // let it go, so that wait is already counted.
+    let parked = {
+        let state = running.shared.lock_server_state();
+        let parked = waits().len();
+        if let Some(slot) = state.vaults.get("alab") {
+            slot.wake.notify_all();
+        }
+        parked
+    };
+    assert!(parked >= 1, "the long-poll parked");
+    until("the long-poll parked again after a wake", || {
+        waits().len() > parked
+    });
+    assert!(
+        waits().iter().all(|armed| *armed),
+        "a wait was armed short of the hold's end: {:?}",
+        waits()
+    );
+
+    drop(client);
+    let closed = Instant::now();
+    while running.waiting() != 0 {
+        assert!(
+            closed.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the closed client's long-poll stayed held"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    running.stop();
+}
+
+/// A long-poll a wake let go answers without waiting on the `vault-held` thread
+/// ([`held::Watched`]'s drop rings it and goes on): the long-polls one PUT lets go answer one
+/// after another under `server_state`, and each waiting there on a round trip of that thread
+/// held every other request up for all of them. Here the thread is held up each time its poll
+/// returns, and the long-poll answers all the same.
+/// NEGATIVE CONTROL: wait in the drop for the thread's poll in flight to return (the code
+/// before) and the long-poll answers only once the thread is let go, past the hang detector.
+#[test]
+fn a_long_poll_a_wake_let_go_answers_while_the_held_thread_is_held_up() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let running = run(&options(root.path(), 2 * aterm_spec::wait::MUST_HAPPEN));
+    put(&running, &envelope(&OLD, 1)).expect("first");
+    until_closed(&running);
+    let mut client = sent(
+        &running,
+        b"GET /v1/alab?after=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    until_waiting(&running, 1);
+    until("the held thread polls the client's stream", || {
+        running.shared.holds.polled() == 1
+    });
+    let held_up = running
+        .shared
+        .holds
+        .held_up
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    put(&running, &envelope(&OLD, 2)).expect("second");
+    // The head alone: the thread held up keeps the stream's second descriptor, and with it the
+    // connection, until it is let go.
+    let head = read_request_head(&mut client);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    drop(held_up);
+    running.stop();
+}
+
+/// A held client that sends more bytes after its request (a pipelined request) leaves the
+/// `vault-held` thread's poll at once ([`held`]): a stream holding data no reader takes polls
+/// ready for good, and kept in the poll it would have the thread poll again and again. Its
+/// long-poll stays held, since bytes are no end ([`gone`]).
+/// NEGATIVE CONTROL: a thread that keeps polling a stream that showed data keeps it in the poll
+/// past the hang detector.
+#[test]
+fn a_held_client_that_sends_more_leaves_the_poll() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let running = run(&options(root.path(), 2 * aterm_spec::wait::MUST_HAPPEN));
+    put(&running, &envelope(&OLD, 1)).expect("first");
+    until_closed(&running);
+    let mut client = sent(
+        &running,
+        b"GET /v1/alab?after=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    until_waiting(&running, 1);
+    until("the held thread polls the client's stream", || {
+        running.shared.holds.polled() == 1
+    });
+    client
+        .write_all(b"GET /v1/alab HTTP/1.1\r\n")
+        .expect("more");
+    until(
+        "the held thread stopped polling the stream that showed data",
+        || running.shared.holds.polled() == 0,
+    );
+    running.stop();
+}
+
+/// [`gone`] judges a client gone once it closed with nothing left to read, and never for bytes
+/// it sent, as the old peek did.
+#[test]
+fn gone_is_a_closed_client_and_never_one_that_sent_more() {
+    use std::os::fd::AsFd as _;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = listener.local_addr().expect("addr");
+    let accepted = || {
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(Instant::now() + HANG_DETECTOR),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept")
+        .0
+    };
+    let mut client = TcpStream::connect(at).expect("connect");
+    let server = accepted();
+    assert!(!gone(&server), "an idle client is there");
+    client.write_all(b"more").expect("more");
+    until("the client's bytes arrived", || {
+        aterm_uds::ready::any_now(&[server.as_fd()]).is_ok_and(|ready| !ready.is_empty())
+    });
+    assert!(!gone(&server), "a client that sent more is there");
+
+    let quiet = TcpStream::connect(at).expect("connect");
+    let held = accepted();
+    drop(quiet);
+    until("a closed client is gone", || gone(&held));
 }
 
 #[test]
@@ -1931,15 +2097,14 @@ fn a_join_is_judged_at_the_seq_published_at_the_store_file() {
 }
 
 /// A version an admin publishes at the store file ends a listing held on the join queue, as
-/// a PUT's does, naming the queue's version unchanged.
+/// a PUT's does, naming the queue's version unchanged: the file's change wakes it ([`held`]),
+/// within the hang detector of a hold twice as long.
+/// NEGATIVE CONTROL: a held thread that watches no store file leaves the listing held past the
+/// hang detector.
 #[test]
 fn a_version_published_at_the_store_file_ends_a_held_join_listing() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let tuning = Tuning {
-        liveness_every: Duration::from_millis(10),
-        ..Tuning::default()
-    };
-    let running = run_tuned(&options(root.path(), HANG_DETECTOR), tuning);
+    let running = run(&options(root.path(), 2 * HANG_DETECTOR));
     put(&running, &envelope(&OLD, 1)).expect("first");
     let listed = transport::wait_joins(&url(&running), None, HANG_DETECTOR).expect("listed");
     let transport::Joins::Listed(lines, Some(version)) = listed else {
@@ -1951,6 +2116,10 @@ fn a_version_published_at_the_store_file_ends_a_held_join_listing() {
     until_waiting(&running, 1);
     let at_path = Source::Path(root.path().join("alab.vault"));
     transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
+    until(
+        "the store file's change ended the held listing before its hold",
+        || running.waiting() == 0,
+    );
     assert_eq!(
         waiter.join().expect("waiter").expect("woken"),
         transport::Joins::Listed(lines, Some(version)),
@@ -2250,11 +2419,8 @@ fn a_first_version_is_taken_only_from_this_machine_or_under_a_pin() {
 fn a_version_published_at_the_store_file_is_served_and_kept() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let store = root.path().join("store");
-    let tuning = Tuning {
-        liveness_every: Duration::from_millis(10),
-        ..Tuning::default()
-    };
-    let running = run_tuned(&options(&store, HANG_DETECTOR), tuning);
+    // The held long-poll below ends at the file's change, inside a hold twice the hang detector.
+    let running = run(&options(&store, 2 * HANG_DETECTOR));
     put(&running, &envelope(&OLD, 1)).expect("first");
     let at_path = Source::Path(store.join("alab.vault"));
     transport::publish(&at_path, &envelope(&OLD, 2)).expect("at the path");
@@ -2283,6 +2449,10 @@ fn a_version_published_at_the_store_file_is_served_and_kept() {
     let waiter = std::thread::spawn(move || transport::fetch(&polled, Some(3), HANG_DETECTOR));
     until_waiting(&running, 1);
     transport::publish(&at_path, &envelope(&OLD, 4)).expect("at the path a third time");
+    until(
+        "the store file's change ended the held long-poll before its hold",
+        || running.waiting() == 0,
+    );
     let woke = waiter.join().expect("joined").expect("held");
     assert!(
         matches!(&woke, Fetched::Body(body) if *body == envelope(&OLD, 4)),
@@ -2342,6 +2512,170 @@ fn a_version_published_at_the_store_file_is_served_and_kept() {
     put(&rep_running, &envelope(&NEW, 2))
         .expect("unparented seq 2 accepted after unparented replacement at store file");
     rep_running.stop();
+}
+
+/// A vault's store file is read only once its stamp moved ([`take_from_store`]): requests, the
+/// looks a held long-poll makes as it wakes, and the advert's question whether this server holds
+/// the ALab vault ([`Shared::holds_alab`]) read nothing over an unchanged file, nobody reads back
+/// the file a PUT wrote, and a version an admin publishes at the path is read once, then served
+/// and judged from what the server holds.
+/// NEGATIVE CONTROL: compare no stamp in [`take_from_store`] and every look reads the file
+/// (`reads()` counts each of them).
+#[test]
+fn a_store_file_is_read_again_only_once_its_stamp_moves() {
+    const LOOKS: usize = 20;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let store = root.path().join("store");
+    let running = run(&options(&store, HANG_DETECTOR));
+    let reads = || running.shared.vault_looks.load(Ordering::SeqCst);
+    put(&running, &envelope(&OLD, 1)).expect("first");
+    for _ in 0..LOOKS {
+        assert_eq!(running.held_seq("alab"), Some(1));
+        assert!(
+            !running.shared.holds_alab(),
+            "no key this build names for the ALab vault signed it"
+        );
+        assert!(matches!(get(&running), Ok(Fetched::Body(_))));
+    }
+    assert_eq!(reads(), 0, "the PUT stamped the file it wrote");
+    transport::publish(&Source::Path(store.join("alab.vault")), &envelope(&OLD, 2))
+        .expect("at the path");
+    // The key standing in for the ALab vault's on this thread, which takes the path's version.
+    let retired = |current: Option<[u8; 32]>| {
+        crate::envelope::TEST_RETIRED.with(|cell| {
+            *cell.borrow_mut() = current.map(|current| crate::envelope::Retired {
+                keys: Vec::new(),
+                current: Some(current),
+            });
+        });
+    };
+    retired(Some(signer_public(&OLD).expect("public")));
+    for _ in 0..LOOKS {
+        assert!(
+            running.shared.holds_alab(),
+            "the path's version, judged as it was taken"
+        );
+        assert_eq!(running.held_seq("alab"), Some(2));
+    }
+    retired(None);
+    for _ in 0..LOOKS {
+        assert!(matches!(get(&running), Ok(Fetched::Body(body)) if body == envelope(&OLD, 2)));
+    }
+    assert_eq!(reads(), 1, "one read of the version published at the path");
+    running.stop();
+}
+
+/// A store file the server could not read is read again at the next look ([`take_from_store`]):
+/// a look whose read failed (here its look at the access list, which can run out of memory)
+/// and one whose read refuses the file (a mode that lets others write it, which a `chmod` can
+/// lift while a coarse clock leaves the stamp) remember nothing, and the version there is taken
+/// once a read admits it.
+/// NEGATIVE CONTROLS: remember a refused file by its stamp (`slot.stamp = seen`, the code
+/// before) and the refused file is read once (`each look reads the refused file`); take a failed
+/// look at the access list for a refusal as well and seq 2 is never taken.
+#[test]
+fn a_store_file_the_server_could_not_read_is_read_again_at_the_next_look() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let store = root.path().join("store");
+    let running = run(&options(&store, HANG_DETECTOR));
+    let reads = || running.shared.vault_looks.load(Ordering::SeqCst);
+    put(&running, &envelope(&OLD, 1)).expect("first");
+    let path = store.join("alab.vault");
+    fsx::write_atomic(&path, &envelope(&OLD, 2), 0o600).expect("at the path");
+    fsx::fail_access_lists(&path, 1);
+    assert_eq!(
+        running.held_seq("alab"),
+        Some(1),
+        "a look whose read failed"
+    );
+    assert_eq!(running.held_seq("alab"), Some(2), "taken at the next look");
+    assert_eq!(reads(), 2);
+    fsx::write_atomic(&path, &envelope(&OLD, 3), 0o600).expect("at the path");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    for look in 1..=3 {
+        assert_eq!(running.held_seq("alab"), Some(2), "a file the read refuses");
+        assert_eq!(reads(), 2 + look, "each look reads the refused file again");
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert_eq!(running.held_seq("alab"), Some(3), "taken once admitted");
+    running.stop();
+}
+
+/// The role decider is told whether the running server holds the ALab vault by its store file
+/// ([`Shared::holds_alab`], as [`tend_role_targets`] tells it): a version of the ALab vault there
+/// holds it, and that file removed, made one the server refuses, or replaced by a version no key
+/// of the ALab vault signed holds none from the next round, as a read of the file each round
+/// found; while the file stands, no round reads it.
+/// NEGATIVE CONTROLS: answer from the version the server serves (`slot.held.alab`) and the
+/// removed file still holds it; tell the decider `false` and the first round disagrees with the
+/// file.
+#[test]
+fn the_role_decider_is_told_whether_the_store_file_holds_the_alab_vault() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("alab.vault");
+    // OLD's key stands in for the ALab vault's on this thread, where the store is loaded and
+    // every round runs.
+    crate::envelope::TEST_RETIRED.with(|cell| {
+        *cell.borrow_mut() = Some(crate::envelope::Retired {
+            keys: Vec::new(),
+            current: Some(signer_public(&OLD).expect("public")),
+        });
+    });
+    fsx::write_atomic(&path, &envelope(&OLD, 1), 0o600).expect("a version of the ALab vault");
+    let running = run(&options(root.path(), HANG_DETECTOR));
+    let reads = || running.shared.vault_looks.load(Ordering::SeqCst);
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let mut decide: RoleDecider = {
+        let told = Arc::clone(&told);
+        Box::new(move |_, holds| {
+            told.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(holds);
+            None
+        })
+    };
+    let mut watcher = AlabNameWatcher::new();
+    let mut round = || {
+        tend_role_targets(
+            &mut decide,
+            running.addr.port(),
+            &running.shared,
+            None,
+            &mut watcher,
+            &[],
+            &[],
+            &[],
+            pull_pass,
+            Pass::Whole,
+            |_| None,
+        );
+        told.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .expect("the decider was asked")
+    };
+    for _ in 0..3 {
+        assert!(round(), "the store file holds the ALab vault");
+    }
+    assert_eq!(reads(), 1, "read once, at the first round");
+    std::fs::remove_file(&path).expect("removed");
+    assert!(!round(), "a removed file holds none");
+    fsx::write_atomic(&path, &envelope(&OLD, 1), 0o600).expect("put back");
+    assert!(round(), "put back");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).expect("chmod");
+    assert!(!round(), "a file the server refuses holds none");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    assert!(round(), "admitted again");
+    fsx::write_atomic(&path, &envelope(&STRANGER, 1), 0o600).expect("another key's");
+    assert!(
+        !round(),
+        "a version no key of the ALab vault signed holds none"
+    );
+    assert_eq!(running.held_seq("alab"), Some(1), "though OLD's is served");
+    crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
+    running.stop();
 }
 
 /// A publish at the store path that lands between a PUT's judgment and its lock.
@@ -2597,25 +2931,79 @@ fn a_hold_too_long_to_add_ends_with_a_newer_version() {
     running.stop();
 }
 
+/// A supervising server parks with no timeout ([`supervise`]): a health challenge written while
+/// it serves wakes it to answer, once, and its program file replaced on disk (a new file renamed
+/// over it, as an update does) wakes it to stop, ending the long-poll it holds cleanly. Its file
+/// watch tells both ([`SupervisorWatch`]).
+/// NEGATIVE CONTROL: a supervisor whose watch did not start parks [`PROGRAM_EVERY`] at a time,
+/// as every supervisor did before: "a park had a timeout".
 #[test]
-fn a_replaced_program_stops_the_server_and_ends_it_cleanly() {
+fn a_supervisor_answers_a_challenge_and_stops_for_a_replaced_program_with_no_timer() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let running = run(&options(root.path(), 2 * HANG_DETECTOR));
+    let running = run(&options(&root.path().join("store"), 2 * HANG_DETECTOR));
     put(&running, &envelope(&OLD, 1)).expect("first");
     let target = source(&running);
     let waiter = std::thread::spawn(move || transport::fetch(&target, Some(1), HANG_DETECTOR));
     until_waiting(&running, 1);
     let shared = Arc::clone(&running.shared);
-    let looks = AtomicUsize::new(0);
-    // The shared startup watch initially sees no replacement (including a missing
-    // successor), then finds a replacement and ends the existing long-poll cleanly.
-    let stopping = || {
-        (looks.fetch_add(1, Ordering::SeqCst) >= 6).then_some("this program was replaced on disk")
+    let addr = running.addr;
+
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("a program folder");
+    let program = bin.join("aterm");
+    std::fs::write(&program, b"the program").expect("a stand-in program");
+    let paths = Arc::new(crate::client::Paths::for_home(&root.path().join("home")));
+    fsx::ensure_private_dir(&paths.dir).expect("a private folder");
+    let watched = vec![
+        program.clone(),
+        crate::service_health::server_challenge(&paths),
+    ];
+    let supervisor = {
+        let started = crate::program_watch::ProgramWatch::stand_in(program.clone());
+        let paths = Arc::clone(&paths);
+        std::thread::spawn(move || {
+            supervise(running, &watched, &|| {
+                let _ = crate::service_health::bound_server(&paths, addr);
+                stop_reason(&AtomicBool::new(false), started.replaced())
+            })
+        })
     };
-    supervise(running, Duration::from_millis(1), &stopping).expect("a clean exit");
+    let parks = || {
+        shared
+            .supervise_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    until("the supervisor parked", || !parks().is_empty());
+
+    let nonce = crate::service_health::prepare_server(&paths).expect("a challenge");
+    until("the supervisor answered the challenge", || {
+        crate::service_health::server_process(&paths, &nonce, std::process::id(), addr.port())
+            .is_ok()
+    });
+    let response = paths.dir.join("server-health-response.json");
+    let answered = aterm_uds::file_watch::FileStamp::of(&response);
+    assert!(answered.is_some(), "the answer is a file");
+
+    let next = bin.join("aterm.new");
+    std::fs::write(&next, b"the next program").expect("the next program");
+    std::fs::rename(&next, &program).expect("replaced");
+    until("the supervisor returns", || supervisor.is_finished());
+    supervisor
+        .join()
+        .expect("supervisor")
+        .expect("a clean exit");
+
+    assert_eq!(
+        aterm_uds::file_watch::FileStamp::of(&response),
+        answered,
+        "the challenge was answered again"
+    );
     assert!(
-        looks.load(Ordering::SeqCst) >= 7,
-        "served until the startup watch reported replacement"
+        parks().iter().all(Option::is_none),
+        "a park had a timeout: {:?}",
+        parks()
     );
     assert!(shared.stopping.load(Ordering::SeqCst));
     assert_eq!(
@@ -2627,6 +3015,38 @@ fn a_replaced_program_stops_the_server_and_ends_it_cleanly() {
     });
 }
 
+/// A supervisor parked with no timeout returns once the accept loop ends, which unparks it
+/// ([`AcceptEnded`]), with the loop's own verdict.
+/// NEGATIVE CONTROL: an accept loop whose end unparks nobody leaves the supervisor parked past
+/// the hang detector: "never: the supervisor returns".
+#[test]
+fn a_supervisor_returns_when_the_accept_loop_ends() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut running = run(&options(root.path(), HANG_DETECTOR));
+    let shared = Arc::clone(&running.shared);
+    let cancel = running.cancel.take().expect("a running accept loop");
+    let supervisor = std::thread::spawn(move || supervise(running, &[], &|| None));
+    let parks = || {
+        shared
+            .supervise_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
+    until("the supervisor parked", || !parks().is_empty());
+    drop(cancel);
+    until("the supervisor returns", || supervisor.is_finished());
+    supervisor
+        .join()
+        .expect("supervisor")
+        .expect("the accept loop's clean end");
+    assert!(
+        parks().iter().all(Option::is_none),
+        "a park had a timeout: {:?}",
+        parks()
+    );
+}
+
 /// The binding watch already detected replacement before supervision began. That first
 /// result must stop this server, not become a fresh baseline of the replacement file.
 #[test]
@@ -2635,7 +3055,7 @@ fn a_replacement_seen_before_supervision_is_not_taken_as_its_baseline() {
     let running = run(&options(root.path(), HANG_DETECTOR));
     let shared = Arc::clone(&running.shared);
     let looked = AtomicBool::new(false);
-    supervise(running, HANG_DETECTOR, &|| {
+    supervise(running, &[], &|| {
         assert!(!looked.swap(true, Ordering::SeqCst), "one read suffices");
         Some("this program was replaced during startup")
     })
@@ -2656,11 +3076,7 @@ fn a_raised_stop_flag_stops_the_server_and_ends_it_cleanly() {
     let signalled = Arc::new(AtomicBool::new(false));
     let supervisor = {
         let signalled = Arc::clone(&signalled);
-        std::thread::spawn(move || {
-            supervise(running, 2 * HANG_DETECTOR, &|| {
-                stop_reason(&signalled, false)
-            })
-        })
+        std::thread::spawn(move || supervise(running, &[], &|| stop_reason(&signalled, false)))
     };
     signalled.store(true, Ordering::SeqCst);
     supervisor.thread().unpark();
@@ -2765,6 +3181,7 @@ fn an_advertisement_that_gives_up_its_name_is_said_once() {
             seq,
             head: [seq as u8; 32],
             label: None,
+            rec: None,
         })
     };
     let pid = |set: &ChildSet| {
@@ -2780,6 +3197,7 @@ fn an_advertisement_that_gives_up_its_name_is_said_once() {
             "alab-secrets",
             Some((targets.clone(), txt)),
             Some(Wake::Timer),
+            Instant::now(),
             &spawn,
         );
     };
@@ -2973,7 +3391,7 @@ fn the_advert_reregisters_on_a_route_change_and_says_why() {
         )),
         None,
         Seams {
-            routes: Some(Box::new(move |most| changes.recv_timeout(most).is_ok())),
+            routes: Some(routes_from(changes)),
             browse: None,
             targets: Box::new({
                 let here = Arc::clone(&here);
@@ -2985,7 +3403,8 @@ fn the_advert_reregisters_on_a_route_change_and_says_why() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
-            pull: pull_from_peers_shared,
+            pull: pull_pass,
+            now: Box::new(Instant::now),
             name_answered: Box::new(|_, _| false),
             sharing: Box::new(|| true),
         },
@@ -3057,7 +3476,7 @@ fn the_advert_and_browse_end_while_sharing_is_held_and_restart_on() {
         )),
         None,
         Seams {
-            routes: Some(Box::new(move |most| rings.recv_timeout(most).is_ok())),
+            routes: Some(routes_from(rings)),
             browse: Some(Box::new({
                 let watches = Arc::clone(&watches);
                 move |bell, own| {
@@ -3076,7 +3495,8 @@ fn the_advert_and_browse_end_while_sharing_is_held_and_restart_on() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
-            pull: pull_from_peers_shared,
+            pull: pull_pass,
+            now: Box::new(Instant::now),
             name_answered: Box::new(|_, _| false),
             sharing: Box::new({
                 let mut switch = crate::swarm::Switch::new(&home);
@@ -3153,7 +3573,7 @@ fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
     let running = run(&opts);
     let bytes = envelope(&OLD, 81);
     assert_eq!(
-        verify_probed_alab_envelope(&bytes, &running.shared),
+        verify_probed_alab_envelope(&bytes, &running.shared).map(|(seq, _)| seq),
         Some(81)
     );
     let invalid_signature = String::from_utf8(bytes)
@@ -3173,7 +3593,7 @@ fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
         holding: true,
         ..AlabNameWatcher::new()
     };
-    let mut denied: RoleDecider = Box::new(|_| None);
+    let mut denied: RoleDecider = Box::new(|_, _| None);
     let (primary, secondary) = tend_role_targets(
         &mut denied,
         running.addr.port(),
@@ -3183,7 +3603,8 @@ fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
         &[],
         &[],
         &[],
-        pull_from_peers_shared,
+        pull_pass,
+        Pass::Whole,
         |_| Some(81),
     );
     assert!(primary.is_none());
@@ -3202,6 +3623,188 @@ fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
     running.stop();
 }
 
+/// A holder and a standby that follows it under the ALab pin (`OLD`'s key here), and the
+/// holder's vault URL.
+fn holder_and_standby(root: &Path) -> (Running, Running, String) {
+    let holder = run(&options(&root.join("holder"), HANG_DETECTOR));
+    let mut opts = options(&root.join("standby"), HANG_DETECTOR);
+    opts.pins = vec![(
+        crate::ALAB_VAULT.to_owned(),
+        signer_public(&OLD).expect("public"),
+    )];
+    let standby = run(&opts);
+    let url = format!("http://{}/v1/{}", holder.addr, crate::ALAB_VAULT);
+    (holder, standby, url)
+}
+
+/// A holder probe reads and verifies each version a URL answers with once
+/// ([`probe_verified`]): a later probe at the same version asks after it and takes the `204`
+/// naming it, with no body read; a version the holder took since comes as that answer's body
+/// and is verified; and an instance whose TXT names another head is read whole again.
+#[test]
+fn a_holder_probe_verifies_each_version_once_and_asks_after_it_since() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (holder, standby, url) = holder_and_standby(root.path());
+    put(&holder, &envelope(&OLD, 5)).expect("the holder holds seq 5");
+    let asked = || {
+        (
+            standby.shared.probe_verifies.load(Ordering::SeqCst),
+            holder.envelope_gets(),
+        )
+    };
+    assert_eq!(standby.probe_alab(&url), Some(5));
+    assert_eq!(asked(), (1, 1), "the first probe reads the version whole");
+    assert_eq!(standby.probe_alab(&url), Some(5));
+    assert_eq!(asked(), (1, 2), "a later one takes the 204 naming seq 5");
+    let txt = |head: [u8; 32]| crate::discover::DiscoveredVault {
+        url: url.clone(),
+        txt: Some(VaultTxt {
+            vault: crate::ALAB_VAULT.to_owned(),
+            signer: envelope::fingerprint(&signer_public(&OLD).expect("public")),
+            seq: 5,
+            head,
+            label: Some("m9".to_owned()),
+            rec: None,
+        }),
+    };
+    let head = envelope::parse(&envelope(&OLD, 5))
+        .expect("parses")
+        .digest();
+    standby.shared.forget_probes_unlike(&[txt(head)]);
+    assert_eq!(standby.probe_alab(&url), Some(5));
+    assert_eq!(asked(), (1, 3), "a TXT naming the verified head keeps it");
+    standby.shared.forget_probes_unlike(&[txt([1; 32])]);
+    assert_eq!(standby.probe_alab(&url), Some(5));
+    assert_eq!(asked(), (2, 4), "a TXT naming another head: one whole read");
+    put(&holder, &envelope(&OLD, 6)).expect("the holder takes seq 6");
+    assert_eq!(standby.probe_alab(&url), Some(6));
+    assert_eq!(
+        asked(),
+        (3, 5),
+        "the newer version, the conditional probe's body"
+    );
+    assert_eq!(standby.probe_alab(&url), Some(6));
+    assert_eq!(asked(), (3, 6));
+    holder.stop();
+    standby.stop();
+}
+
+/// A probe of a server that holds a request asking after its verified seq (a `0.145` server
+/// ignores `X-Aterm-No-Wait` and parks while it holds nothing newer), or answers it naming no
+/// seq, still answers with that server's version, read whole at once ([`probe_verified`]), and
+/// each later probe there reads the version whole without asking after it ([`Probed::asks`]),
+/// so a `0.145` holder costs no held request's budget past the first.
+/// NEGATIVE CONTROL: keep asking after the seq at such a URL (`asks` left true) and the third
+/// probe asks after it again.
+#[test]
+fn a_probe_of_a_server_that_holds_its_ask_reads_whole_from_then_on() {
+    use crate::transport::Fetched;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (holder, standby, url) = holder_and_standby(root.path());
+    holder.stop();
+    let mut asked: Vec<Option<u64>> = Vec::new();
+    let mut probe = || {
+        probe_verified_by(&url, &standby.shared, |after| {
+            asked.push(after);
+            // An ask held past its budget, as a 204 naming no seq: neither names one.
+            Ok(match after {
+                Some(_) => Fetched::NoNewer(None),
+                None => Fetched::Body(envelope(&OLD, 5)),
+            })
+        })
+    };
+    assert_eq!(probe(), Some(5), "the first probe reads it whole");
+    assert_eq!(probe(), Some(5), "an ask held, then a whole read");
+    assert_eq!(probe(), Some(5), "a whole read alone");
+    drop(probe);
+    assert_eq!(asked, [None, Some(5), None, None]);
+    standby.stop();
+}
+
+/// A probe's `204` counts as an answer only where it names the very seq that server's answer
+/// verified: one naming an older seq (a server that missed versions now answers at that URL) is
+/// read whole, and what it verifies is older than this server's own, so the fallback clock
+/// starts. The failover bounds stand on such answers: a holder answering with `204`s keeps the
+/// name where it is, and once none answers the name is taken after exactly
+/// [`ALAB_FALLBACK_AFTER`] of failed probes (rounds of [`ADVERTISE_EVERY`] apart here).
+/// NEGATIVE CONTROL: take any `204` with an `ETag` for the kept seq ([`probe_verified`]'s
+/// `seq == known`) and the older server answers: the clock never starts.
+#[test]
+fn a_204_naming_an_older_seq_is_no_answer_and_the_name_waits_out_the_fallback() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (holder, standby, url) = holder_and_standby(root.path());
+    put(&holder, &envelope(&OLD, 6)).expect("the holder holds seq 6");
+    // A listener that drops each connection unanswered: the holder gone from its address.
+    let gone = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let gone_url = format!(
+        "http://{}/v1/{}",
+        gone.local_addr().expect("addr"),
+        crate::ALAB_VAULT
+    );
+    let dropped = accepted(gone);
+    std::thread::spawn(move || while dropped.recv_timeout(HANG_DETECTOR).is_ok() {});
+    let answering = std::cell::Cell::new(true);
+    let decide = |watcher: &mut AlabNameWatcher, now: Instant, own_seq: u64| {
+        watcher.decide(
+            &AlabNameInput {
+                own_label: "m2",
+                own_seq: Some(own_seq),
+                holders: &[],
+                now,
+            },
+            |_| standby.probe_alab(if answering.get() { &url } else { &gone_url }),
+        )
+    };
+    let start = Instant::now();
+    standby
+        .shared
+        .probed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Probed {
+            url: url.clone(),
+            seq: 9,
+            head: [9; 32],
+            pin: standby.shared.pinned_key(crate::ALAB_VAULT),
+            asks: true,
+        });
+    let mut watcher = AlabNameWatcher::new();
+    assert!(!decide(&mut watcher, start, 9));
+    assert_eq!(
+        watcher.failing_since,
+        Some(start),
+        "a 204 naming seq 6 at a URL that verified seq 9 is no answer at seq 9"
+    );
+    assert_eq!(standby.probe_alab(&url), Some(6), "what it holds, verified");
+
+    let verifies = || standby.shared.probe_verifies.load(Ordering::SeqCst);
+    let mut watcher = AlabNameWatcher::new();
+    assert!(!decide(&mut watcher, start, 6));
+    let read = verifies();
+    assert!(!decide(&mut watcher, start + ADVERTISE_EVERY, 6));
+    assert_eq!(watcher.failing_since, None, "the holder answers");
+    assert_eq!(verifies(), read, "with a 204");
+    answering.set(false);
+    let lost = start + 2 * ADVERTISE_EVERY;
+    assert!(!decide(&mut watcher, lost, 6));
+    assert_eq!(
+        watcher.failing_since,
+        Some(lost),
+        "no answer: the clock starts"
+    );
+    assert!(!decide(
+        &mut watcher,
+        lost + ALAB_FALLBACK_AFTER - Duration::from_secs(1),
+        6
+    ));
+    assert!(
+        decide(&mut watcher, lost + ALAB_FALLBACK_AFTER, 6),
+        "the name, once nothing answered for the whole fallback"
+    );
+    holder.stop();
+    standby.stop();
+}
+
 #[test]
 fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
     let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
@@ -3218,7 +3821,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
     let mut set = children.lock();
 
     // Tick 1: role decider returns `None` -> no primary registration made, pins untouched.
-    let mut decide_none: RoleDecider = Box::new(|_| None);
+    let mut decide_none: RoleDecider = Box::new(|_, _| None);
     let (p1, s1) = tend_role_targets(
         &mut decide_none,
         running.addr.port(),
@@ -3228,7 +3831,8 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         &here,
         &[],
         &[],
-        pull_from_peers_shared,
+        pull_pass,
+        Pass::Whole,
         |_| None,
     );
     assert!(p1.is_none());
@@ -3236,7 +3840,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
 
     // Tick 2: role decider pins `alab` and advertises `alab-secrets`.
     let key = [0x33u8; 32];
-    let mut decide_alab: RoleDecider = Box::new(move |pins| {
+    let mut decide_alab: RoleDecider = Box::new(move |pins, _| {
         pins.push((crate::ALAB_VAULT.to_owned(), key));
         Some(crate::alab_advertised().to_owned())
     });
@@ -3249,7 +3853,8 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         &here,
         &[],
         &[],
-        pull_from_peers_shared,
+        pull_pass,
+        Pass::Whole,
         |_| None,
     );
     let (name2, _, target2) = p2.expect("advertised on tick 2");
@@ -3258,7 +3863,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         running.shared.pins_snapshot().as_slice(),
         &[(crate::ALAB_VAULT.to_owned(), key)]
     );
-    reregister_slot(&mut set.dns, &name2, target2, None, &spawn);
+    reregister_slot(&mut set.dns, &name2, target2, None, Instant::now(), &spawn);
     let pid_alab = set
         .dns
         .held
@@ -3273,6 +3878,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         "m22",
         Some((here.to_vec(), None)),
         None,
+        Instant::now(),
         &spawn,
     );
     let pid_m22 = set
@@ -3290,7 +3896,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
     assert!(!aterm_uds::process::pid_alive(pid_alab));
 
     // Tick 4: role becomes `None` -> `reregister_slot` ends the child cleanly.
-    reregister_slot(&mut set.dns, "", None, None, &spawn);
+    reregister_slot(&mut set.dns, "", None, None, Instant::now(), &spawn);
     assert!(set.dns.held.is_empty());
     assert!(set.dns.held_name.is_none());
     assert!(!aterm_uds::process::pid_alive(pid_m22));
@@ -3339,7 +3945,7 @@ fn a_holder_whose_registration_loses_the_name_lets_it_go() {
     options.pins = vec![(crate::ALAB_VAULT.to_owned(), key)];
     let running = run(&options);
     put(&running, &envelope(&OLD, 81)).expect("m5 holds seq 81");
-    let mut decide: RoleDecider = Box::new(move |pins| {
+    let mut decide: RoleDecider = Box::new(move |pins, _| {
         pins.push((crate::ALAB_VAULT.to_owned(), key));
         Some("m5".to_owned())
     });
@@ -3371,6 +3977,7 @@ fn a_holder_whose_registration_loses_the_name_lets_it_go() {
             seq: 81,
             head: [81; 32],
             label: Some("m22".to_owned()),
+            rec: None,
         }),
     }];
     let children = Children::default();
@@ -3386,7 +3993,8 @@ fn a_holder_whose_registration_loses_the_name_lets_it_go() {
             &here,
             &[],
             &m22,
-            pull_from_peers_shared,
+            pull_pass,
+            Pass::Whole,
             |target| {
                 probed_name += usize::from(target == crate::alab_advertised());
                 Some(81)
@@ -3452,6 +4060,7 @@ fn hold_advertising(slot: &mut AdvertSlot, seq: u64, sleep: &str) {
         seq,
         head: [0x5a; 32],
         label: Some("m5".to_owned()),
+        rec: None,
     });
 }
 
@@ -3488,7 +4097,8 @@ fn member_seams(
         end_for_sleep: Arc::new(Registered::end),
         sleep_bound: SLEEP_YIELD_BOUND,
         probe: |_, _, _, _, _, _| None,
-        pull: pull_from_peers_shared,
+        pull: pull_pass,
+        now: Box::new(Instant::now),
         name_answered,
         sharing: Box::new(|| true),
     }
@@ -3997,7 +4607,7 @@ fn a_holder_that_slept_competes_for_the_name_by_the_probe_after_its_wake() {
     options.pins = vec![(crate::ALAB_VAULT.to_owned(), key)];
     let running = run(&options);
     put(&running, &envelope(&OLD, 81)).expect("m5 holds seq 81");
-    let mut decide: RoleDecider = Box::new(move |pins| {
+    let mut decide: RoleDecider = Box::new(move |pins, _| {
         pins.push((crate::ALAB_VAULT.to_owned(), key));
         Some("m5".to_owned())
     });
@@ -4032,7 +4642,8 @@ fn a_holder_that_slept_competes_for_the_name_by_the_probe_after_its_wake() {
             &here,
             &[],
             &[],
-            pull_from_peers_shared,
+            pull_pass,
+            Pass::Whole,
             |target| {
                 probed.set(probed.get() + usize::from(target == alab));
                 None
@@ -4265,7 +4876,8 @@ fn the_servers_listener_ends_its_registration_at_a_will_sleep_until_the_wake() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: HANG_DETECTOR,
             probe: |_, _, _, _, _, _| None,
-            pull: pull_from_peers_shared,
+            pull: pull_pass,
+            now: Box::new(Instant::now),
             name_answered: Box::new(|_, _| false),
             sharing: Box::new(|| true),
         },
@@ -4483,6 +5095,7 @@ fn an_answer_read_too_slowly_is_cut_at_its_deadline() {
             parented: false,
             handoff: Vec::new(),
             bytes: Arc::clone(&big),
+            alab: false,
         }),
     );
     let stream = sent(&running, b"GET /v1/alab HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -4521,6 +5134,7 @@ fn subscriber_header_records_and_persists_last_heard_while_rejecting_malformed_r
             parented: false,
             handoff: Vec::new(),
             bytes: Arc::clone(&body),
+            alab: false,
         }),
     );
     let valid = crate::age::Identity::from_secret_bytes([0x17; 32])
@@ -4785,7 +5399,7 @@ fn heard_flush_failure_eviction_and_stop_fence_cannot_prove_absence() {
     running.stop();
 }
 
-fn record_entrant(
+pub(super) fn record_entrant(
     tag: u8,
     label: &str,
 ) -> (
@@ -4878,6 +5492,7 @@ fn two_servers_given_different_records_hold_the_union_after_a_pull() {
             seq: 1,
             head: [0; 32],
             label: Some("m2".to_owned()),
+            rec: None,
         }),
     }];
     let peer_s1 = [crate::discover::DiscoveredVault {
@@ -4888,6 +5503,7 @@ fn two_servers_given_different_records_hold_the_union_after_a_pull() {
             seq: 1,
             head: [0; 32],
             label: Some("m1".to_owned()),
+            rec: None,
         }),
     }];
 
@@ -5320,34 +5936,37 @@ fn an_unseeded_records_long_poll_neither_admits_remote_seed_nor_leaks_a_slot() {
     use crate::membership_log::Record;
 
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let running = run(&options(root.path(), Duration::from_millis(80)));
-    let url = format!("http://{}/v1/unseeded", running.addr);
+    let running = run(&options(root.path(), 2 * HANG_DETECTOR));
     let (_, _, _, e1) = record_entrant(1, "m1");
     let genesis = Record::found(&[7; 32], vec![e1], 1_000).expect("genesis");
 
     // While a local long-poll is parked on `/v1/unseeded/records` before any record exists,
     // a non-local `POST /v1/unseeded/records` is still refused (`403`) because the slot holds
     // no records yet.
-    let poll_url = url.clone();
-    let poller = std::thread::spawn(move || {
-        crate::transport::fetch_records(
-            &poll_url,
-            &[],
-            Some(Duration::from_millis(80)),
-            HANG_DETECTOR,
-            None,
-        )
-        .expect("long-poll fetch")
-    });
-    until("the unseeded long-poll is parked", || {
-        running.waiting() == 1
-    });
+    let request = b"GET /v1/unseeded/records HTTP/1.1\r\nHost: x\r\n\r\n";
+    let first = sent(&running, request);
+    let second = sent(&running, request);
+    until_waiting(&running, 2);
+    // The file watcher can retain a notification after the request unregistered its watch.
+    // That reference is not another long-poll and must not keep an empty slot alive.
+    let notification = Arc::clone(&running.shared.lock_server_state().records["unseeded"].wake);
     assert_eq!(
         post_records(&running.shared, "unseeded", genesis.bytes(), false).status,
         403
     );
-    let empty = poller.join().expect("poller thread");
-    assert!(empty.is_empty());
+    drop(first);
+    until_waiting(&running, 1);
+    {
+        let state = running.shared.lock_server_state();
+        let slot = state
+            .records
+            .get("unseeded")
+            .expect("the second poll's slot");
+        assert_eq!(slot.polls, 1);
+        assert!(Arc::ptr_eq(&slot.wake, &notification));
+    }
+    drop(second);
+    until_closed(&running);
 
     // Once the unseeded long-poll ends without any record arriving, the empty slot is
     // removed rather than retained in `state.records`.
@@ -5358,7 +5977,108 @@ fn an_unseeded_records_long_poll_neither_admits_remote_seed_nor_leaks_a_slot() {
             .records
             .contains_key("unseeded")
     );
+    drop(notification);
 
+    running.stop();
+}
+
+#[test]
+fn an_empty_record_slot_lives_until_its_writer_and_polls_leave() {
+    for writer_leaves_first in [false, true] {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), 2 * HANG_DETECTOR));
+        let poll = sent(
+            &running,
+            b"GET /v1/unseeded/records HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        until_waiting(&running, 1);
+        let writing = Writing::mark(&running.shared, "unseeded");
+        if writer_leaves_first {
+            drop(writing);
+            {
+                let state = running.shared.lock_server_state();
+                let slot = state.records.get("unseeded").expect("poll keeps its slot");
+                assert!(!slot.writing);
+                assert_eq!(slot.polls, 1);
+            }
+            drop(poll);
+            until_closed(&running);
+        } else {
+            drop(poll);
+            until_closed(&running);
+            {
+                let state = running.shared.lock_server_state();
+                let slot = state
+                    .records
+                    .get("unseeded")
+                    .expect("writer keeps its slot");
+                assert!(slot.writing);
+                assert_eq!(slot.polls, 0);
+            }
+            drop(writing);
+        }
+        assert!(
+            !running
+                .shared
+                .lock_server_state()
+                .records
+                .contains_key("unseeded")
+        );
+        running.stop();
+    }
+}
+
+#[test]
+fn a_record_arriving_after_one_poll_disconnects_wakes_the_remaining_poll() {
+    use crate::membership_log::{Record, decode_records};
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let running = run(&options(root.path(), 2 * HANG_DETECTOR));
+    let first = sent(
+        &running,
+        b"GET /v1/unseeded/records HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    let url = format!("http://{}/v1/unseeded", running.addr);
+    let poller = std::thread::spawn(move || {
+        crate::transport::fetch_records(&url, &[], Some(HANG_DETECTOR), HANG_DETECTOR, None)
+            .expect("remaining poll")
+    });
+    until_waiting(&running, 2);
+    drop(first);
+    until_waiting(&running, 1);
+
+    let (_, _, _, entrant) = record_entrant(1, "m1");
+    let genesis = Record::found(&[7; 32], vec![entrant], 1_000).expect("genesis");
+    running.shared.writes_fail.store(true, Ordering::SeqCst);
+    let failed = post_records(&running.shared, "unseeded", genesis.bytes(), true).status;
+    running.shared.writes_fail.store(false, Ordering::SeqCst);
+    assert_eq!(failed, 500, "the first write failed");
+    {
+        let state = running.shared.lock_server_state();
+        let slot = state
+            .records
+            .get("unseeded")
+            .expect("the poll survives a failed write");
+        assert_eq!(slot.polls, 1);
+        assert!(!slot.writing);
+        assert!(slot.store.is_empty());
+        assert!(slot.stamp.is_none());
+    }
+    assert_eq!(
+        post_records(&running.shared, "unseeded", genesis.bytes(), true).status,
+        204
+    );
+    let bytes = poller.join().expect("poller thread");
+    let records = decode_records(&bytes).expect("returned records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id(), genesis.id());
+    until_closed(&running);
+    {
+        let state = running.shared.lock_server_state();
+        let slot = state.records.get("unseeded").expect("seeded slot");
+        assert_eq!(slot.polls, 0);
+        assert!(slot.store.contains(genesis.id()));
+    }
     running.stop();
 }
 
@@ -5584,7 +6304,7 @@ fn a_post_that_adds_a_record_appends_only_its_bytes_to_the_file() {
 }
 
 /// A browsed peer at `addr` advertising vault `vault`, as the standing browse hands it to
-/// [`pull_from_peers_shared`].
+/// [`pull_pass`].
 fn peer_at(addr: SocketAddr, vault: &str) -> crate::discover::DiscoveredVault {
     crate::discover::DiscoveredVault {
         url: format!("http://{addr}/v1/{vault}"),
@@ -5594,8 +6314,251 @@ fn peer_at(addr: SocketAddr, vault: &str) -> crate::discover::DiscoveredVault {
             seq: 1,
             head: [0; 32],
             label: Some("m9".to_owned()),
+            rec: None,
         }),
     }
+}
+
+/// The endpoints a pull dials of what a host resolved to ([`dialled`]): none of this server's
+/// (its port at one of its addresses, or at loopback), each other once and in order, an address
+/// of this Mac at another port included; IPv4 alone where the host has an IPv4 address, else its
+/// IPv6 ones that need no interface scope.
+#[test]
+fn a_pull_dials_what_a_host_resolves_to_but_this_servers_own_endpoints() {
+    let ip = |text: &str| text.parse::<IpAddr>().expect("an address");
+    let at = |text: &str| text.parse::<SocketAddr>().expect("an endpoint");
+    let here = [Target {
+        scope: Some("en0".to_owned()),
+        ip: Ipv4Addr::new(10, 0, 0, 5),
+    }];
+    let dialled_of = |addrs: &[&str], port: u16| {
+        let addrs: Vec<IpAddr> = addrs.iter().map(|text| ip(text)).collect();
+        dialled(&addrs, port, 7484, &here)
+    };
+    assert_eq!(dialled_of(&["10.0.0.5"], 7484), Vec::new(), "this server");
+    assert_eq!(dialled_of(&["127.0.0.1"], 7484), Vec::new(), "loopback");
+    assert_eq!(
+        dialled_of(&["10.0.0.5"], 7485),
+        vec![at("10.0.0.5:7485")],
+        "another server on this Mac"
+    );
+    assert_eq!(
+        dialled_of(&["10.0.0.9"], 7484),
+        vec![at("10.0.0.9:7484")],
+        "another Mac"
+    );
+    assert_eq!(
+        dialled_of(
+            &[
+                "10.0.0.5",
+                "10.0.0.9",
+                "::ffff:10.0.0.9",
+                "fe80::1",
+                "2001:db8::1",
+                "10.0.0.7"
+            ],
+            7484
+        ),
+        vec![at("10.0.0.9:7484"), at("10.0.0.7:7484")],
+        "a name two servers answer to: the other's addresses, once each"
+    );
+    assert_eq!(
+        dialled_of(&["fe80::1", "2001:db8::1"], 7484),
+        vec![at("[2001:db8::1]:7484")],
+        "no IPv4 address: the IPv6 ones a pull can dial"
+    );
+}
+
+/// A peer is pulled at the addresses its host resolves to ([`peer_endpoints`]): an instance
+/// resolving to this server's own address and port (the `alab-secrets` instance it holds) is not
+/// pulled; a server at another port is; instances resolving to one endpoint (a holder's
+/// own-label and `alab-secrets` instances, or one there naming another TXT) are one server,
+/// pulled once for what any of them names ([`grouped`]), so a TXT takes no pull away; and one
+/// whose TXT names this server's label but that resolves elsewhere is pulled, so self is the
+/// address, never the TXT.
+/// NEGATIVE CONTROLS: dialling an endpoint that is this server's (dropping `!is_self_addr` from
+/// [`dialled`]) has the server answer a GET of its own; pulling each peer of a group apart (a
+/// group per peer in [`grouped`]) asks the one endpoint twice; judging self by the TXT label
+/// (`txt.label == own_label`) leaves the last instance unpulled.
+#[test]
+fn a_peer_resolving_to_this_server_is_not_pulled_and_one_endpoint_is_pulled_once() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut opts = options(&root.path().join("a"), HANG_DETECTOR);
+    opts.pins = vec![("team".to_owned(), [0x5a; 32])];
+    let a = run_tuned(
+        &opts,
+        Tuning {
+            resolve: |_, _| Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            ..Tuning::default()
+        },
+    );
+    let b = run(&options(&root.path().join("b"), HANG_DETECTOR));
+    let named = |host: &str, port: u16, label: &str| crate::discover::DiscoveredVault {
+        url: format!("http://{host}:{port}/v1/team"),
+        txt: Some(VaultTxt {
+            vault: "team".to_owned(),
+            signer: "0000-0000-0000-0000-0000".to_owned(),
+            seq: 1,
+            head: [0; 32],
+            label: Some(label.to_owned()),
+            rec: None,
+        }),
+    };
+    let own_port = a.addr.port();
+    let pass = |peers: &[crate::discover::DiscoveredVault]| {
+        pull_pass(&a.shared, peers, own_port, Some("m1"), &[], Pass::Whole);
+    };
+
+    pass(&[named("alab-secrets.local", own_port, "m1")]);
+    assert_eq!(
+        a.envelope_gets(),
+        0,
+        "the instance resolving to this server was pulled"
+    );
+
+    let holder = named("m9.local", b.addr.port(), "m9");
+    pass(&[
+        holder.clone(),
+        named("alab-secrets.local", b.addr.port(), "m9"),
+    ]);
+    assert_eq!(
+        b.envelope_gets(),
+        1,
+        "one endpoint with one TXT is one server, pulled once"
+    );
+
+    pass(&[holder, named("m7.local", b.addr.port(), "m7")]);
+    assert_eq!(
+        b.envelope_gets(),
+        2,
+        "an instance at that endpoint naming another TXT is the same server, pulled once"
+    );
+
+    pass(&[named("m9.local", b.addr.port(), "m1")]);
+    assert_eq!(
+        b.envelope_gets(),
+        3,
+        "a TXT naming this server's label, resolving to another server, is pulled"
+    );
+    assert_eq!(a.envelope_gets(), 0, "this server was never pulled");
+    a.stop();
+    b.stop();
+}
+
+/// Peers are one group exactly where they resolve to the same endpoints in the same order
+/// ([`grouped`]), whatever their TXT: a holder's own-label and `alab-secrets` instances, and one
+/// there naming another TXT, are one server, pulled once for what any of them makes due; an
+/// instance (a forged one) copying a peer's TXT onto a host that resolves to an address of its
+/// own as well is a group of its own, whichever comes first, so it takes no pull from that peer;
+/// a peer with nothing to dial is in none.
+/// NEGATIVE CONTROL: group peers sharing any endpoint (`any` for the exact comparison in
+/// [`grouped`]) and the forged instance joins the copied peer's group (`left: 1`, `right: 2`).
+#[test]
+fn peers_are_grouped_by_exactly_the_endpoints_they_resolve_to() {
+    let at = |text: &str| {
+        (
+            text.parse::<SocketAddr>().expect("an endpoint"),
+            format!("http://{text}/v1/team"),
+        )
+    };
+    let peer = |label: &str| crate::discover::DiscoveredVault {
+        url: format!("http://{label}.local:7484/v1/team"),
+        txt: Some(VaultTxt {
+            vault: "team".to_owned(),
+            signer: "0000-0000-0000-0000-0000".to_owned(),
+            seq: 1,
+            head: [0; 32],
+            label: Some("m9".to_owned()),
+            rec: None,
+        }),
+    };
+    let (holder, alab, forged, other, silent) = (
+        peer("m9"),
+        peer("alab-secrets"),
+        peer("m66"),
+        peer("m7"),
+        peer("m5"),
+    );
+    let own = vec![at("10.0.0.9:7484")];
+    let both = vec![at("10.0.0.66:7484"), at("10.0.0.9:7484")];
+    for order in [
+        [(&forged, &both), (&holder, &own)],
+        [(&holder, &own), (&forged, &both)],
+    ] {
+        let groups = grouped(order.map(|(peer, endpoints)| (peer, endpoints.clone())));
+        assert_eq!(groups.len(), 2, "a forged copy is a group of its own");
+    }
+    let groups = grouped([
+        (&holder, own.clone()),
+        (&alab, own.clone()),
+        (&other, own.clone()),
+        (&silent, Vec::new()),
+    ]);
+    assert_eq!(groups.len(), 1, "one server, whatever its instances' TXT");
+    assert_eq!(groups[0].peers.len(), 3, "nothing to dial, no group");
+    assert_eq!(groups[0].endpoints, own);
+}
+
+/// A peer's endpoints are dialled in turn until one answers, and another is dialled only while
+/// less than one budget passed since the first was ([`pull_endpoints`]): a host resolving to
+/// many silent addresses holds its pull about two budgets at most, whatever their number. The
+/// clock here moves half a budget at each pull.
+/// NEGATIVE CONTROL: dial every endpoint whatever time passed (the code before) and all ten
+/// silent ones are pulled.
+#[test]
+fn a_peers_silent_endpoints_are_dialled_for_one_budget_alone() {
+    let budget = Duration::from_secs(2);
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let endpoints: Vec<(SocketAddr, String)> = (1..=10_u8)
+        .map(|host| {
+            let at = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, host)), 7484);
+            (at, format!("http://{at}/v1/team"))
+        })
+        .collect();
+    let mut dialled = Vec::new();
+    let stored = pull_endpoints(
+        &endpoints,
+        budget,
+        || clock.get(),
+        |_, url| {
+            dialled.push(url.to_owned());
+            clock.set(clock.get() + budget / 2);
+            PeerPull {
+                stored: 0,
+                silent: true,
+                whole: false,
+            }
+        },
+    );
+    assert_eq!(
+        (stored.stored, stored.silent, stored.whole),
+        (0, true, false)
+    );
+    assert_eq!(
+        dialled,
+        [endpoints[0].1.clone(), endpoints[1].1.clone()],
+        "dialled within one budget of the first"
+    );
+    let mut dialled = 0;
+    let stored = pull_endpoints(
+        &endpoints,
+        budget,
+        || start,
+        |_, _| {
+            dialled += 1;
+            PeerPull {
+                stored: usize::from(dialled == 3),
+                silent: dialled < 3,
+                whole: dialled == 3,
+            }
+        },
+    );
+    assert_eq!(
+        (dialled, stored.stored, stored.silent, stored.whole),
+        (3, 1, false, true),
+        "the first that answers ends the pull"
+    );
 }
 
 /// Read one request's head from `stream` (the hang detector bounds it): what arrived of it.
@@ -6693,8 +7656,8 @@ fn file_stamp(path: &Path) -> (u64, u64, u64, i64, i64, i64, i64) {
     )
 }
 
-/// F23 (rule 3): long-polls parked on a full store look at the file on each wake and each
-/// liveness tick, and a look of an unchanged file reads nothing. Before, each look read and
+/// F23 (rule 3): long-polls parked on a full store look at the file on each wake, and a look
+/// of an unchanged file reads nothing. Before, each look read and
 /// compared the whole file (up to 64 MiB) under `server_state`. The polls park for as long
 /// as the hang detector, so they are all parked until the server stops, and the test waits
 /// for their looks (counted), not for a time.
@@ -6718,11 +7681,7 @@ fn parked_subscribers_at_a_full_held_store() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let mut opts = team_options(root.path());
     opts.hold = HANG_DETECTOR;
-    let tuning = Tuning {
-        liveness_every: Duration::from_millis(10),
-        ..Tuning::default()
-    };
-    let running = run_tuned(&opts, tuning);
+    let running = run(&opts);
     let founded = Founded::new();
     let full: Vec<_> = std::iter::once(founded.genesis.clone())
         .chain((0..MAX_WAITING - 1).map(|i| founded.waiting(i)))
@@ -6748,17 +7707,16 @@ fn parked_subscribers_at_a_full_held_store() {
         assert!(parked.elapsed() < HANG_DETECTOR, "the polls never parked");
         std::thread::sleep(Duration::from_millis(1));
     }
+    // Each wake has each parked poll look again: a held long-poll looks at nothing on a timer.
     let looks = running.shared.record_looks.load(Ordering::SeqCst);
-    for _ in 0..5 {
-        if let Some(slot) = running.shared.lock_server_state().records.get("team") {
-            slot.wake.notify_all();
-        }
-    }
     while running.shared.record_looks.load(Ordering::SeqCst) < looks + LOOKS {
         assert!(
             parked.elapsed() < HANG_DETECTOR,
             "the polls stopped looking"
         );
+        if let Some(slot) = running.shared.lock_server_state().records.get("team") {
+            slot.wake.notify_all();
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     running.stop();
@@ -7473,8 +8431,8 @@ fn a_dormant_records_slot_reopens_the_same_file_after_its_trust_changes() {
     assert_eq!(fsx::reads_of(&path), reads + 1);
 }
 
-/// F23 review 3: a look while a POST appends (each parked long-poll's liveness tick, any
-/// GET) reads nothing and takes nothing: what the file holds past the slot's stamp may not be
+/// F23 review 3: a look while a POST appends (each wake of a parked long-poll, any GET) reads
+/// nothing and takes nothing: what the file holds past the slot's stamp may not be
 /// flushed yet, and reading it verified the whole file under `server_state`. The POST stamps
 /// the slot when its write is done, and then the store holds the record.
 /// NEGATIVE CONTROL: a look that ignores `RecordSlot::writing` fails "assertion `left ==

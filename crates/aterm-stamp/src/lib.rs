@@ -24,6 +24,7 @@
 use std::sync::OnceLock;
 
 pub mod civil;
+pub mod facts;
 pub mod release_version;
 
 /// Size of the identity record, in bytes: the section's fixed length.
@@ -128,6 +129,10 @@ pub struct Stamp {
     pub compiler_flavor: &'static str,
     /// The cargo profile the binary was compiled under (`"debug"`/`"release"`).
     pub build_profile: &'static str,
+    /// The binary's actual `cfg(debug_assertions)`, independent of the Cargo profile's name.
+    pub debug_assertions: Option<bool>,
+    /// The binary's compiled target architecture, independent of the compiler's host.
+    pub target_arch: &'static str,
     /// `"on"` iff the Trust verification pipeline was in the binary's compile.
     pub trust_verify: &'static str,
 }
@@ -150,6 +155,8 @@ impl Stamp {
         compiler_trust_version: "",
         compiler_flavor: "r",
         build_profile: "unknown",
+        debug_assertions: None,
+        target_arch: "unknown",
         trust_verify: "off",
     };
 

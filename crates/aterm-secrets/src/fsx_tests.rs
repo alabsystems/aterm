@@ -585,6 +585,29 @@ fn private_reads_refuse_group_or_other_bits_and_symlinks() {
     assert!(append_at(&link_dir.join("in.bin"), &real, b"ef").is_err());
 }
 
+/// A look at a file's access list that fails (macOS reads the list into memory it allocates,
+/// which can run out) is a failed read, which the next read may pass ([`Unread::Failed`]), never
+/// a refusal of the file as it is ([`Unread::Refused`]), which a reader may remember by the
+/// file's stamp and not read again until the file changes.
+/// NEGATIVE CONTROL: map the failed look to a refusal (`refused(e.to_string())`, the code
+/// before) and the first read is `Refused`.
+#[test]
+fn a_failed_look_at_an_access_list_is_a_failed_read_not_a_refusal() {
+    let root = scratch();
+    let path = root.path().join("vault");
+    write_atomic(&path, b"held", 0o600).expect("write");
+    fail_access_lists(&path, 1);
+    assert!(
+        matches!(read_owned_stamped(&path, 64), Err(Unread::Failed(_))),
+        "a look that failed refuses nothing"
+    );
+    let (stamp_read, bytes) = read_owned_stamped(&path, 64)
+        .expect("the next look passes")
+        .expect("there");
+    assert_eq!(bytes, b"held");
+    assert_eq!(Some(stamp_read), stamp(&path), "the same file, unchanged");
+}
+
 /// A read fills one buffer sized from the file's length, a byte over so it sees the end
 /// without growing: a buffer that grew freed each block it outgrew, unwiped.
 #[test]

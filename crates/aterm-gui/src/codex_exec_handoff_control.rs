@@ -4,6 +4,8 @@
 //! Native exec account preparation. Peer/claim proof and kernel launch facts
 //! replace the TUI record requirement; account policy remains the shared pool's.
 //! A selected proposal is not a commit, launcher capability or execution grant.
+//! A tab keeps one preparation and one operation for each process that asks
+//! ([`ProcessKey`]), so no run's handoff takes another run's place.
 
 use super::*;
 use aterm_agent::harness::{
@@ -12,15 +14,28 @@ use aterm_agent::harness::{
     codex_exec_handoff::{ExecCommand, ExecSource},
     codex_renewal, codex_rotation,
 };
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 #[path = "codex_exec_operation.rs"]
 mod operation;
-pub(super) use operation::Operation;
+use kept::{Kept, arm_selection};
+use operation::Operation;
 pub(super) use operation::{cancel_owner, pending, retain_claim};
+pub(super) use table::Table;
 
 const WAITING: &str = "OK codex-exec-handoff state=waiting\n";
 const NOT_NEEDED: &str = "OK codex-exec-handoff state=not-needed\n";
+
+/// How old a selection `arm` still takes, from when its read came back: past it the usage that
+/// read saw is too old to move a session on.
+const SELECTION_ARMS: Duration = Duration::from_secs(60);
+
+/// How old a selection `prepare` still offers: ten seconds short of [`SELECTION_ARMS`], so a
+/// session offered one has that long to bring it back as its `arm`. A `reserve` whose writer said
+/// nothing of a selection no `reserve`'s writer has held waits only this long from that
+/// selection's read, too ([`after_writer`]).
+const SELECTION_OFFERED: Duration = Duration::from_secs(50);
 
 /// How long an answer that the session's login stands at no wall a handoff leaves
 /// ([`codex_rotation::NoHandoff::NoWallToLeave`]) answers its later asks. A headless run is one
@@ -57,13 +72,48 @@ fn no_wall_stands(reads: u32) -> Duration {
     }
 }
 
+/// A process as its tab keeps its exec handoff ([`Table`]): its pid and kernel birth. A
+/// same-PID execve keeps both, so the successor a move execs is still the process that armed it,
+/// and a pid the kernel gives a later process is another key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ProcessKey {
+    pid: u32,
+    birth: u64,
+}
+
+impl ProcessKey {
+    fn of(process: &Process) -> Self {
+        Self {
+            pid: process.pid,
+            birth: process.birth,
+        }
+    }
+
+    /// Whether the kernel shows this process gone: its pid absent or exited, or held by a
+    /// process of another birth. A read that fails shows nothing, and the process is not gone.
+    fn gone(self) -> bool {
+        let pid = i32::try_from(self.pid).unwrap_or(-1);
+        aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 != self.birth)
+            || matches!(
+                aterm_uds::process::process_presence(pid),
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            )
+    }
+}
+
 #[derive(Debug)]
-pub(super) struct Preparation {
+struct Preparation {
     source: ExecSource,
     intent: codex_renewal::Intent,
     proof: crate::self_claim::Proven,
     revision: u64,
     human_seq: u64,
+    /// The session the shared pool knows this process's move by: the owner of a canary its read
+    /// takes, and the `sid` of the receipt its `arm` writes, which names that owner when the move
+    /// is struck or rolled back. One name for both. A process that holds its tab's claim moves
+    /// under the tab's.
+    mover: String,
     progress: Mutex<Progress>,
 }
 
@@ -92,17 +142,17 @@ struct NoneComing {
 }
 
 impl NoneComing {
-    /// Take an ask at `now`, and say whether this answer still answers it. No wall to leave is a
-    /// reading of the login at one time, and stands [`no_wall_stands`]; a login that is no row
-    /// of the pool, or that names another account than its row's, is nothing a wait changes, and
-    /// stands while the job does.
+    /// Take an ask at `now`, and say whether this answer still answers it. No wall to leave, and
+    /// no entry for the limit asked about, are each a reading of the login at one time, and
+    /// stand [`no_wall_stands`]; a login that is no row of the pool, or that names another
+    /// account than its row's, is nothing a wait changes, and stands while the job does.
     fn stands(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.asked) > STILL_ASKING {
             self.reads = 0;
         }
         self.asked = now;
         match self.end {
-            codex_rotation::NoHandoff::NoWallToLeave => {
+            codex_rotation::NoHandoff::NoWallToLeave | codex_rotation::NoHandoff::LimitAbsent => {
                 now.saturating_duration_since(self.decided) < no_wall_stands(self.reads)
             }
             codex_rotation::NoHandoff::NoRowOfThePool
@@ -111,19 +161,222 @@ impl NoneComing {
     }
 }
 
-impl Preparation {
-    fn invalidate_selection(&self, receipt: &codex_renewal::Receipt) {
-        if self.intent != receipt.intent {
-            return;
-        }
-        let mut progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
-        if matches!(&*progress, Progress::Selected(proposal, _)
-            if proposal.successor().is_some_and(|next| receipt.matches_successor(&next)))
+/// A step of a handoff that asks the selection's writer
+/// ([`codex_rotation::with_prepared_writer_now`]) before it goes on.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// `arm`, which asked the writer to create the operation's receipt: only a created one arms.
+    Arm,
+    /// `reserve` of an armed operation whose pool commit was refused; the operation lapses at
+    /// `deadline_us`, and what it keeps of its selection is `armed`.
+    Reserve { deadline_us: u64, armed: Armed },
+}
+
+/// What an armed operation keeps of its selection ([`Kept`]), as its `reserve`s judge a writer's
+/// silence by it ([`after_writer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Armed {
+    /// When the read that selected its account came back.
+    read: Instant,
+    /// Whether the writer of one of its `reserve`s has held the selection (`Ok(Some(_))`). The
+    /// `arm` that made the operation is not counted: every operation's writer held its selection
+    /// once, at its `arm`.
+    held: bool,
+}
+
+/// Whether `why`, a refusal of [`codex_rotation::with_prepared_writer_now`], says the selection it
+/// judged no longer holds, so that no later `arm` of it can go through and only a new read of the
+/// logins selects again:
+/// - `not-ready`: the receipt is no ready one, is revoked, or carries evidence of an execution;
+/// - `rotation-policy`, `policy-changed`: aterm.toml forbids a handoff, or it or either row's
+///   source documents changed while the writer judged;
+/// - `pool-commit-changed`: the pool's record of this receipt binds another move;
+/// - `account-lineage`: the roster no longer holds one row for each of the two logins;
+/// - `selection-changed`: the two rows are one, either is held for another Mac, or the target's
+///   row or login generation is not the one selected;
+/// - `target-unavailable`: the pool is pinned, or the target is no longer one a session moves to;
+/// - `source-held`, `source-conflict`, `same-login`, `identity-mismatch`: the custody of the two
+///   logins refuses them (a row held for another Mac, a fleet roster that names a row otherwise,
+///   one login file for both, a login that is no file store's or names another identity than the
+///   selection's).
+///
+/// Every other refusal says nothing of the selection: a lock another writer holds (`signin-busy`,
+/// `signin-lock`, `auth-busy`, `auth-lock`, `receipt-lock`), a file that did not read
+/// (`roster-unreadable`, `bindings-unreadable`, `state-unreadable`, `source-unreadable`), a
+/// receipt that could not be written, or a word this list does not know. Keeping a selection a
+/// word really refuted, or one a word that stands (a missing home) keeps refusing, costs no read:
+/// each `arm` of it is denied until it is too old to arm ([`SELECTION_ARMS`]), and each `reserve`
+/// waits until its read is [`SELECTION_OFFERED`] old, as long as it is offered, and is denied
+/// after, unless a `reserve`'s writer has held it ([`Armed::held`]): such a one waits to its
+/// operation's deadline. Each of those steps asks the writer once, which tries the sign-in turn
+/// and `accounts.lock` once each, so a `reserve` retried every 250 ms asks it at most 200 times,
+/// or 480 over its operation's two minutes once a writer has held its selection. Dropping a
+/// selection a word did not refute costs a read of the session's login and of each candidate's.
+fn refutes(why: &str) -> bool {
+    matches!(
+        why,
+        "not-ready"
+            | "rotation-policy"
+            | "policy-changed"
+            | "pool-commit-changed"
+            | "account-lineage"
+            | "selection-changed"
+            | "target-unavailable"
+            | "source-held"
+            | "source-conflict"
+            | "same-login"
+            | "identity-mismatch"
+    )
+}
+
+/// What a step is answered once the selection's writer said `outcome`, or `None` where the step
+/// goes on, and what becomes of the selection in `progress`. The one place a selection is dropped
+/// for what a writer said, and the one answer `arm` and `reserve` both return through.
+///
+/// - `Ok(Some(_))`, the writer holds the selection: an `arm` goes on with the receipt it created,
+///   and a `reserve` waits, since a healthy destination may still be another session's canary.
+/// - A refusal that refutes the selection ([`refutes`]): the step is denied and, where the
+///   selection in `progress` is the one the writer judged (`ours`), it is dropped at `now`, so
+///   the next ask reads the logins again. A progress that has moved on is left as it is.
+/// - Anything else (`Ok(None)`, the store's writer taken, and every other refusal): the selection
+///   is kept until it is too old. An `arm` is denied, and the next one takes the same selection
+///   with no read. A `reserve` waits, so its session asks again inside its grant, while the read
+///   behind its selection is younger than [`SELECTION_OFFERED`], as an offer of it stands; past
+///   that it is denied, so a refusal that keeps standing ends its retries there, not at the
+///   operation's deadline. A `reserve` of a selection an earlier `reserve`'s writer held
+///   ([`Armed::held`]) waits at any age, as one whose writer holds it now does: a lock another
+///   writer holds a moment later says nothing against what that writer judged.
+fn after_writer<T>(
+    progress: &mut Progress,
+    ours: bool,
+    step: Step,
+    outcome: &Result<Option<T>, &'static str>,
+    now: Instant,
+) -> Option<String> {
+    let refuted = matches!(outcome, Err(why) if refutes(why));
+    if refuted && ours && matches!(progress, Progress::Selected(_, _)) {
+        *progress = Progress::Retry(now);
+    }
+    let waits = |deadline_us: u64| {
+        Some(format!(
+            "OK codex-exec-handoff state=waiting deadline_us={deadline_us}\n"
+        ))
+    };
+    match (step, outcome) {
+        (Step::Arm, Ok(Some(_))) => None,
+        (Step::Reserve { deadline_us, .. }, Ok(Some(_))) => waits(deadline_us),
+        (Step::Reserve { deadline_us, armed }, _)
+            if !refuted
+                && (armed.held
+                    || now.saturating_duration_since(armed.read) < SELECTION_OFFERED) =>
         {
-            *progress = Progress::Retry(Instant::now());
+            waits(deadline_us)
         }
+        _ => Some(DENIED.into()),
+    }
+}
+
+/// The selection in `progress` that an `arm` naming the destination `account` and `user` takes
+/// at `now`, with when its read came back: one of that destination, read less than
+/// [`SELECTION_ARMS`] ago.
+fn selection_to_arm<'a>(
+    progress: &'a Progress,
+    account: &str,
+    user: &str,
+    now: Instant,
+) -> Option<(&'a codex_rotation::Proposal<ExecCommand>, Instant)> {
+    match progress {
+        Progress::Selected(proposal, observed)
+            if now.saturating_duration_since(*observed) < SELECTION_ARMS
+                && proposal.destination_identity.account == account
+                && proposal.destination_identity.user == user =>
+        {
+            Some((proposal, *observed))
+        }
+        _ => None,
+    }
+}
+
+/// What an armed operation keeps of its selection, kept where neither `arm` nor `serve` can reach
+/// into it: the one way to make it is the selection an `arm` takes, and the one way to read it is a
+/// refused `reserve`'s answer, so no caller stores or passes another read than the one taken.
+mod kept {
+    use super::*;
+
+    /// An operation's own [`Armed`]: made only by [`arm_selection`], of the selection it takes, and
+    /// read only by [`Kept::reserve_refused`].
+    #[derive(Debug)]
+    pub(super) struct Kept(Armed);
+
+    /// The selection an `arm` naming the destination `account` and `user` takes now from a job's
+    /// `progress` ([`selection_to_arm`]), and what the operation it makes keeps of it: when its
+    /// read came back, held by no `reserve`'s writer yet. The clock is read here, not by the
+    /// caller, so what `arm` takes is what this answers.
+    pub(super) fn arm_selection(
+        progress: &Mutex<Progress>,
+        account: &str,
+        user: &str,
+    ) -> Option<(codex_rotation::Proposal<ExecCommand>, Kept)> {
+        let progress = progress.lock().unwrap_or_else(|p| p.into_inner());
+        selection_to_arm(&progress, account, user, Instant::now())
+            .map(|(proposal, read)| (proposal.clone(), Kept(Armed { read, held: false })))
     }
 
+    impl Kept {
+        /// What a `reserve` of the armed operation that keeps this, whose pool commit was refused,
+        /// answers: the writer's word on the operation's `receipt`, through `judge`
+        /// ([`writer_answered`]), of the step this selection and `deadline_us` make, in its job's
+        /// `progress` for its `intent`. A writer that holds the selection is noted here for the
+        /// operation's later `reserve`s. Such a `reserve` never goes on: every answer is a reply.
+        pub(super) fn reserve_refused(
+            &mut self,
+            progress: &Mutex<Progress>,
+            intent: &codex_renewal::Intent,
+            deadline_us: u64,
+            receipt: &codex_renewal::Receipt,
+            judge: impl FnOnce(&codex_renewal::Receipt) -> Result<Option<()>, &'static str>,
+        ) -> String {
+            let step = Step::Reserve {
+                deadline_us,
+                armed: self.0,
+            };
+            writer_answered(progress, intent, step, receipt, |receipt| {
+                let outcome = judge(receipt);
+                self.0.held |= matches!(outcome, Ok(Some(())));
+                outcome
+            })
+            .unwrap_or_else(|| DENIED.into())
+        }
+
+        /// What this keeps now, for a test to see.
+        #[cfg(test)]
+        pub(super) fn armed(&self) -> Armed {
+            self.0
+        }
+    }
+}
+
+/// Ask the selection's writer, through `judge`, of the `receipt` made of a job's selection, and
+/// answer `step` by what it said ([`after_writer`], now), in that job's `progress` for its
+/// `intent`. The selection in hand is the one judged where it is of the receipt's intent and
+/// names its successor. `judge` runs with the progress unlocked. The one way `arm` and `reserve`
+/// ask the writer: each passes its writer and decides nothing of what it says.
+fn writer_answered<T>(
+    progress: &Mutex<Progress>,
+    intent: &codex_renewal::Intent,
+    step: Step,
+    receipt: &codex_renewal::Receipt,
+    judge: impl FnOnce(&codex_renewal::Receipt) -> Result<Option<T>, &'static str>,
+) -> Option<String> {
+    let outcome = judge(receipt);
+    let mut progress = progress.lock().unwrap_or_else(|p| p.into_inner());
+    let ours = *intent == receipt.intent
+        && matches!(&*progress, Progress::Selected(proposal, _)
+            if proposal.successor().is_some_and(|next| receipt.matches_successor(&next)));
+    after_writer(&mut progress, ours, step, &outcome, Instant::now())
+}
+
+impl Preparation {
     fn matches(
         &self,
         source: &ExecSource,
@@ -138,6 +391,120 @@ impl Preparation {
             && self.revision == revision
             && self.human_seq == human_seq
     }
+}
+
+/// A tab's exec handoffs, kept where no step of one process can reach another's: one
+/// preparation and one operation for each process that asks ([`ProcessKey`]). A preparation
+/// enters only through [`Table::job_for`] and an operation only through [`Table::keep`], each in
+/// the place of the process it was made for, and a step finds one only by its own process's key.
+/// No `prepare`, `arm` or id/cap verb of one process reads, replaces or drops another's.
+mod table {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    pub(in crate::native_act) struct Table {
+        /// Each process's preparation.
+        prepare: BTreeMap<ProcessKey, Arc<Preparation>>,
+        /// Each process's operation, under the key of the source that armed it.
+        operation: BTreeMap<ProcessKey, Arc<Mutex<Operation>>>,
+    }
+
+    impl Table {
+        /// The job a `prepare` that asks `asked` answers from: the one its process keeps where
+        /// that was made for the same ask ([`Preparation::matches`]), else `asked` itself, kept
+        /// in that process's place.
+        pub(super) fn job_for(&mut self, asked: Preparation) -> Arc<Preparation> {
+            let key = ProcessKey::of(&asked.source.process);
+            if let Some(job) = self.prepare.get(&key).filter(|job| {
+                job.matches(
+                    &asked.source,
+                    &asked.intent,
+                    &asked.proof,
+                    asked.revision,
+                    asked.human_seq,
+                )
+            }) {
+                return Arc::clone(job);
+            }
+            let job = Arc::new(asked);
+            self.prepare.insert(key, Arc::clone(&job));
+            job
+        }
+
+        /// Whether `job` is still the one its process keeps: a read started for a job that a
+        /// later ask of its process replaced, or that went with its process, selects nothing.
+        pub(super) fn holds(&self, job: &Arc<Preparation>) -> bool {
+            self.prepare
+                .get(&ProcessKey::of(&job.source.process))
+                .is_some_and(|kept| Arc::ptr_eq(kept, job))
+        }
+
+        /// The preparation `process` keeps, which its `arm` takes its selection from.
+        pub(super) fn job(&self, process: ProcessKey) -> Option<&Arc<Preparation>> {
+            self.prepare.get(&process)
+        }
+
+        /// The operation `process` armed: the one its own later `arm` and each id/cap verb of it,
+        /// or of the successor its same-PID execve made, find.
+        pub(super) fn operation(&self, process: ProcessKey) -> Option<&Arc<Mutex<Operation>>> {
+            self.operation.get(&process)
+        }
+
+        /// Keep `operation` in the place of the process whose source armed it, where it takes
+        /// the place of that process's earlier one, and give it back as the table keeps it.
+        pub(super) fn keep(&mut self, operation: Operation) -> Arc<Mutex<Operation>> {
+            let key = operation.process();
+            let kept = Arc::new(Mutex::new(operation));
+            self.operation.insert(key, Arc::clone(&kept));
+            kept
+        }
+
+        /// Every operation the table keeps, for a step of its tab that judges them all.
+        pub(super) fn operations(&self) -> Vec<Arc<Mutex<Operation>>> {
+            self.operation.values().cloned().collect()
+        }
+
+        /// Every process the table keeps a preparation or an operation for.
+        pub(super) fn processes(&self) -> BTreeSet<ProcessKey> {
+            self.prepare
+                .keys()
+                .chain(self.operation.keys())
+                .copied()
+                .collect()
+        }
+
+        /// Forget the preparation of each process in `gone`, and its operation once that holds
+        /// nothing ([`operation::idle`]): one still in custody stays for its monitor to settle
+        /// and a Stop to reach.
+        pub(super) fn forget(&mut self, gone: &BTreeSet<ProcessKey>) {
+            self.prepare.retain(|key, _| !gone.contains(key));
+            self.operation
+                .retain(|key, op| !gone.contains(key) || !operation::idle(op));
+        }
+    }
+}
+
+/// Forget, from a tab's `native` table, what it keeps of each process the kernel shows gone
+/// ([`ProcessKey::gone`], [`Table::forget`]). The kernel is read with the table unlocked; a gone
+/// process does not come back, so what it showed still holds once the table is taken again.
+fn forget_gone(native: &Mutex<Operations>) {
+    let kept = native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .exec
+        .processes();
+    let gone = kept
+        .into_iter()
+        .filter(|key| key.gone())
+        .collect::<BTreeSet<_>>();
+    if gone.is_empty() {
+        return;
+    }
+    native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .exec
+        .forget(&gone);
 }
 
 /// What an ask at `now` is answered from its job's progress, and whether it starts a read of the
@@ -158,7 +525,7 @@ fn answer(progress: &mut Progress, intent: &codex_renewal::Intent, now: Instant)
             (WAITING.into(), true)
         }
         Progress::Selected(proposal, observed)
-            if now.saturating_duration_since(*observed) < Duration::from_secs(60) =>
+            if now.saturating_duration_since(*observed) < SELECTION_OFFERED =>
         {
             (
                 format!(
@@ -270,6 +637,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     if ctx.fabric.hold().is_some() || !renewal::human_grace_ready(ctx, &env) {
         return WAITING.into();
     }
+    forget_gone(&ctx.fenced_writes.native);
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = meta.supervisor_authority(crate::metrics::now_us());
     if authority.identity() != Some(&proof)
@@ -280,32 +648,22 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     {
         return DENIED.into();
     }
-    let revision = authority.revision();
-    let human_seq = ctx.human_input.seq();
-    let mut table = ctx
+    let asked = Preparation {
+        source,
+        intent,
+        proof,
+        revision: authority.revision(),
+        human_seq: ctx.human_input.seq(),
+        mover: ctx.self_id.as_str().to_owned(),
+        progress: Mutex::new(Progress::Retry(Instant::now())),
+    };
+    let job = ctx
         .fenced_writes
         .native
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let job = if let Some(job) = table
-        .exec_prepare
-        .as_ref()
-        .filter(|job| job.matches(&source, &intent, &proof, revision, human_seq))
-    {
-        Arc::clone(job)
-    } else {
-        let job = Arc::new(Preparation {
-            source,
-            intent,
-            proof,
-            revision,
-            human_seq,
-            progress: Mutex::new(Progress::Retry(Instant::now())),
-        });
-        table.exec_prepare = Some(Arc::clone(&job));
-        job
-    };
-    drop(table);
+        .unwrap_or_else(|p| p.into_inner())
+        .exec
+        .job_for(asked);
     drop(meta);
     let reader = Arc::clone(&job);
     ask(&job.progress, &job.intent, Instant::now(), move || {
@@ -316,13 +674,12 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
 fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
     let weak = Arc::downgrade(ctx);
     let roots = ctx.native_policy.quota_fixture_roots();
-    let sid = ctx.self_id.as_str().to_owned();
     let worker = Arc::clone(&job);
     if std::thread::Builder::new()
         .name("codex-exec-quota-probe".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                renewal::observe_exec(&env, &sid, &worker.source, &worker.intent, roots)
+                renewal::observe_exec(&env, &worker.mover, &worker.source, &worker.intent, roots)
             }))
             .unwrap_or(Err("probe-panicked"));
             let current = weak.upgrade().is_some_and(|ctx| {
@@ -338,9 +695,8 @@ fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
                         .native
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .exec_prepare
-                        .as_ref()
-                        .is_some_and(|stored| Arc::ptr_eq(stored, &worker))
+                        .exec
+                        .holds(&worker)
             });
             let mut progress = worker.progress.lock().unwrap_or_else(|p| p.into_inner());
             *progress = progress_after_observation(&progress, result, current, Instant::now());

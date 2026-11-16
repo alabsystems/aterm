@@ -45,6 +45,9 @@ pub struct WorkerCli {
     /// Flag words (each flag with its value) every fresh start carries.
     pub default_flags: &'static [&'static str],
     /// CLI flag that trusts the starting folder for this run alone ([`Fresh::trusted_here`]).
+    /// `None` for Claude Code, which has no such flag: its launch has Claude Code record the
+    /// folder's trust before it starts ([`super::launch_trust`]), and its dialog, where one
+    /// still draws, is answered by the folder-trust rule.
     pub trust_flag: Option<&'static str>,
     /// CLI flag that names the permission mode a fresh start runs in
     /// ([`Fresh::permission_mode`]), and the modes it takes; `None` for a CLI with no such flag.

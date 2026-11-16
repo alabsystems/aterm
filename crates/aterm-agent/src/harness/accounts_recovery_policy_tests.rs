@@ -137,7 +137,9 @@ pub(super) fn hold_retry(
     let mut state = guard.lock().unwrap();
     state.last_attempt.insert(key.into(), clock);
     state.parked.insert(key.into(), clock);
-    state.bot_checked.insert(key.into(), clock);
+    state
+        .unrecorded_checks
+        .insert(key.into(), super::login_activity_tests::a_check_met(key));
     state.ladder.failed(key, "fixture", clock);
     state
         .activity_owners
@@ -151,7 +153,7 @@ fn retry_is_held(state: &AutoRenewGuard, key: &str) -> bool {
     let held = [
         state.last_attempt.contains_key(key),
         state.parked.contains_key(key),
-        state.bot_checked.contains_key(key),
+        state.unrecorded_checks.contains_key(key),
         state.ladder.has_backoff(key),
         state.activity_owners.contains_key(key),
         state.ladder_owners.contains_key(key),

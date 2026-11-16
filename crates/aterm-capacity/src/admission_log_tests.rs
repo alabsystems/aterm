@@ -453,6 +453,7 @@ fn only_the_accounts_own_ledger_writes_rows() {
 /// `$HOME`: given a home, it is that home's state folder, read from nothing else; with none
 /// there is none. A test binary runs under its scratch root, which keeps its log: never
 /// the account's own folder.
+#[cfg(unix)]
 #[test]
 fn the_log_follows_the_account_home() {
     let home = PathBuf::from("/Users//another-home");
@@ -460,15 +461,12 @@ fn the_log_follows_the_account_home() {
     assert!(dir.starts_with(&home), "{}", dir.display());
     assert!(dir.ends_with(super::DIR), "{}", dir.display());
     assert_eq!(super::account_dir(None), None);
-    #[cfg(unix)]
-    {
-        assert!(aterm_types::dirs::runs_under_private_state_root());
-        assert_ne!(
-            super::default_dir(),
-            super::account_dir(aterm_uds::account::home()),
-            "a test binary never logs to the account's folder"
-        );
-    }
+    assert!(aterm_types::dirs::runs_under_private_state_root());
+    assert_ne!(
+        super::default_dir(),
+        super::account_dir(aterm_uds::account::home()),
+        "a test binary never logs to the account's folder"
+    );
 }
 
 /// A row's write that fails never touches its admission: with the log's folder a regular file,

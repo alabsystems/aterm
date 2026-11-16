@@ -6,7 +6,7 @@
 
 use super::{Heard, Route, align4, refuse, u16_at, u32_at};
 #[cfg(target_os = "macos")]
-use super::{MAX_REPLY, Socket, option, sequence, set_option};
+use super::{MAX_REPLY, Socket, option, set_option};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -25,21 +25,12 @@ const RTM_GET: u8 = 0x4;
 /// (`aterm_uds::network::RTM_GET_SILENT`, XNU-private).
 const RTM_GET_SILENT: u8 = 0x11;
 
-/// The lookup of `peer`'s route as message type `kind`, which is one of the two lookups and
-/// never a message that changes a route.
-fn request(
-    peer: SocketAddr,
-    sequence: u32,
-    pid: u32,
-    bound: Option<u32>,
-    kind: u8,
-) -> io::Result<Vec<u8>> {
-    if !matches!(kind, RTM_GET | RTM_GET_SILENT) {
-        return Err(refuse("route request is not a lookup"));
-    }
+/// The lookup of `peer`'s route, with no message type or number yet: the process's one writer
+/// of lookups (`aterm_uds::network::lookup_write`) sets both as it writes it, and [`a_lookup`]
+/// holds the type it set to one of the two lookups.
+fn request(peer: SocketAddr, pid: u32, bound: Option<u32>) -> io::Result<Vec<u8>> {
     let mut bytes = vec![0; HEADER];
     bytes[2] = 5; // RTM_VERSION
-    bytes[3] = kind;
     let zone = match peer {
         SocketAddr::V6(address) => address.scope_id(),
         _ => 0,
@@ -64,7 +55,6 @@ fn request(
     // RTA_DST | RTA_IFP. Asking for the interface also returns its address.
     bytes[12..16].copy_from_slice(&0x11_u32.to_ne_bytes());
     bytes[16..20].copy_from_slice(&pid.to_ne_bytes());
-    bytes[20..24].copy_from_slice(&sequence.to_ne_bytes());
     match peer {
         SocketAddr::V4(address) => {
             let mut sockaddr = [0; 16];
@@ -102,6 +92,16 @@ fn request(
         .map_err(|_| refuse("route request exceeds its bound"))?;
     bytes[..2].copy_from_slice(&length.to_ne_bytes());
     Ok(bytes)
+}
+
+/// `bytes`, where they are one of the two lookups (`RTM_GET_SILENT` or `RTM_GET`) and never a
+/// message that changes a route or one with no type set: what alone is written to a routing
+/// socket.
+fn a_lookup(bytes: &[u8]) -> io::Result<&[u8]> {
+    match bytes.get(3) {
+        Some(&(RTM_GET | RTM_GET_SILENT)) => Ok(bytes),
+        _ => Err(refuse("route request is not a lookup")),
+    }
 }
 
 fn address(bytes: &[u8]) -> io::Result<IpAddr> {
@@ -224,10 +224,13 @@ fn parse(bytes: &[u8], sequence: u32, pid: u32) -> io::Result<Option<Route>> {
     }))
 }
 
-/// Ask the kernel for `peer`'s route over a routing socket of this lookup's own. The lookup is
-/// heard by that socket alone where the kernel allows, under the process's one latch
-/// ([`aterm_uds::network::lookup_write`]): every other routing socket on the Mac, this
-/// process's listeners' among them, would otherwise be handed each answer.
+/// Ask the kernel for `peer`'s route over a routing socket of this lookup's own, through the
+/// process's one writer of lookups ([`aterm_uds::network::lookup_write`]), which aterm-uds's
+/// lookups write through too. It numbers the lookup from the process's one counter, so an answer
+/// to another lookup of the process, aterm-uds's among them, that this socket is handed never
+/// reads as its own; and under the process's one latch the lookup is heard by that socket alone
+/// where the kernel allows: every other routing socket on the Mac, this process's listeners'
+/// among them, would otherwise be handed each answer.
 #[cfg(target_os = "macos")]
 pub(super) fn lookup(
     _local: Option<SocketAddr>,
@@ -235,25 +238,28 @@ pub(super) fn lookup(
     bound: Option<u32>,
     until: std::time::Instant,
 ) -> io::Result<Route> {
-    lookup_as(peer, bound, until, |write| {
-        aterm_uds::network::lookup_write(write)
+    lookup_as(peer, bound, until, |request, write| {
+        aterm_uds::network::lookup_write(request, write)
     })
 }
 
-/// [`lookup`], written the way `send` says: `send` is handed the writer of this lookup in a
-/// message type of its choosing, which a test calls with one type.
+/// [`lookup`], its lookup sent the way `send` says: `send` is handed the lookup, with no type or
+/// number yet, and the writer of bytes to this lookup's socket, and returns the number the lookup
+/// was written as, which the answer is read by. [`lookup`] gives both to
+/// [`aterm_uds::network::lookup_write`]; a test gives them to
+/// `aterm_uds::network::lookup_write_as`, which writes one type.
 #[cfg(target_os = "macos")]
 fn lookup_as(
     peer: SocketAddr,
     bound: Option<u32>,
     until: std::time::Instant,
-    send: impl FnOnce(&mut dyn FnMut(u8) -> io::Result<()>) -> io::Result<()>,
+    send: impl FnOnce(&mut [u8], &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<i32>,
 ) -> io::Result<Route> {
-    let sequence = sequence()?;
     let pid = std::process::id();
     let socket = Socket::new(libc::PF_ROUTE, 0)?;
-    send(&mut |kind| {
-        let bytes = request(peer, sequence, pid, bound, kind)?;
+    let mut message = request(peer, pid, bound)?;
+    let sequence = send(message.as_mut_slice(), &mut |bytes: &[u8]| {
+        let bytes = a_lookup(bytes)?;
         // SAFETY: bytes is readable for its stated length and the descriptor is live.
         let sent = unsafe { libc::write(socket.0.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
         match usize::try_from(sent) {
@@ -261,7 +267,8 @@ fn lookup_as(
             Ok(_) => Err(io::ErrorKind::WriteZero.into()),
             Err(_) => Err(io::Error::last_os_error()),
         }
-    })?;
+    })?
+    .cast_unsigned();
     let mut buffer = vec![0; MAX_REPLY];
     super::receive_route(until, || {
         socket.readable(until)?;

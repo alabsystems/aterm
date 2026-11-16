@@ -14,7 +14,8 @@ fn disabled_word_decorations_cannot_leak_prior_capture_layers() {
     app.sparkle_dirty = false;
     app.sparkle = None;
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+        let ws = &mut **field_guard_ws;
         let art = aterm_render::fx::bitmap(
             aterm_core::render::FxTexels::Rgba8Straight,
             1,

@@ -201,11 +201,12 @@ fn with_the_pet(app: &mut App, t: &mut Instant) {
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();
     assert!(app.trail_is_kitty_pet(), "fixture: the pet is the trail");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
     ws.present = Some(crate::PresentTarget::Cpu {
         surface: crate::present::CpuSurface::Scripted(Default::default()),
     });
     ws.focused = true;
+    drop(ws);
     for _ in 0..10 {
         *t += Duration::from_millis(16);
         app.redraw_window_at(WindowId(0), *t);

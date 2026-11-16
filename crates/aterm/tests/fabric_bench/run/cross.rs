@@ -4,8 +4,8 @@
 //! THE CROSS-NODE ARM (B11, leg e): two headless aterms, each with its own
 //! `aterm link serve`, on one broker in this process (`harness::Fleet`),
 //! opened with aterm's options for the run's tier. Session A posts to a
-//! session on its own node (the control), to a bare `@s-<sid>` the other node
-//! hosts, and to the same session as `@s-<sid>@n-<node>`: one at a time, then
+//! session on its own node (the control), to a bare `@<sid>` the other node
+//! hosts, and to the same session as `@<sid>@<node>`: one at a time, then
 //! in bursts. Both bridges run with the wait tally on, so the sender's
 //! per-post work — the routing reads a post to another node costs — is
 //! counted beside the times. Measures, never asserts a floor.
@@ -36,9 +36,9 @@ use crate::stats;
 enum Form {
     /// A second session on A's own node: the control.
     Local,
-    /// `@s-<sid>`, a session the other node hosts.
+    /// `@<sid>`, a session the other node hosts.
     Bare,
-    /// `@s-<sid>@n-<node>`, the same session with its node named.
+    /// `@<sid>@<node>`, the same session with its node named.
     AtNode,
 }
 
@@ -55,9 +55,9 @@ impl Form {
 
     const fn says(self) -> &'static str {
         match self {
-            Form::Local => "`@s-<sid>` on A's own node (the control)",
-            Form::Bare => "a bare `@s-<sid>` on the other node",
-            Form::AtNode => "`@s-<sid>@n-<node>` on the other node",
+            Form::Local => "`@<sid>` on A's own node (the control)",
+            Form::Bare => "a bare `@<sid>` on the other node",
+            Form::AtNode => "`@<sid>@<node>` on the other node",
         }
     }
 }

@@ -113,7 +113,7 @@ impl Operation {
             && valid_hex(&self.slot, self.slot.len())
             && self.caller.pid > 1
             && self.caller.birth > 0
-            && aterm_types::control_verbs::is_minted_sid(&self.caller.sid)
+            && aterm_types::control_request::Sid::parse(&self.caller.sid).is_some()
     }
 }
 

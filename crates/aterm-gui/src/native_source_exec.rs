@@ -5,6 +5,8 @@
 //! and target builds, a pending SDK constructor, input position and runtime DATA.
 //! Possible execution is journaled before constructor entry. Full-runtime
 //! discovery remains unavailable until restoration and recovery are integrated.
+//! Every decision reads the session in one order ([`Seen`]): the fabric's hold,
+//! then Meta, then the operation's state beneath Meta.
 use super::*;
 use aterm_agent::harness::codex_source_registry::SourceExecReservation;
 use aterm_agent::harness::source_exec_journal::{Journal, Snapshot as StoredSnapshot};
@@ -48,6 +50,18 @@ struct State {
     granted: bool,
     snapshot: Option<StoredSnapshot>,
     successor: Option<(Process, i32)>,
+    /// The claim the control EOF kept for this operation ([`retain_claim`]), handed back when
+    /// its custody ends ([`hold_to_end`]).
+    kept_claim: Option<KeptClaim>,
+}
+/// A claim a control connection's EOF left with a possible execution ([`retain_claim`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeptClaim {
+    /// The closed connection that holds the claim.
+    connection: u64,
+    /// The window's local id of the session, whose metadata wake follows the claim's release,
+    /// as it follows a release at the EOF itself.
+    local: u64,
 }
 #[derive(Debug)]
 enum Phase {
@@ -97,23 +111,58 @@ impl Drop for ConstructorOwner {
     }
 }
 
+/// The session as one decision reads it: the fabric's hold, then Meta and the
+/// supervisor authority beneath it. The hold is read from the copy each hold
+/// change stores ([`crate::fabric::SessionFabric::hold`]), never through the
+/// fabric's Inbox, which a task mark holds while it waits on Meta: a decision
+/// that waited on that Inbox beneath Meta would deadlock against the mark, and
+/// with it every later reader of this session's Meta, the window's included
+/// ([`crate::fabric::lock_rank`]). A hold change takes no Meta, so the hold is
+/// a snapshot however it is read.
+struct Seen<'a> {
+    held: bool,
+    meta: crate::session_timeline::MetaGuard<'a>,
+    authority: SupervisorAuthority,
+}
+impl<'a> Seen<'a> {
+    fn of(ctx: &'a crate::SessionCtx) -> Self {
+        let held = ctx.fabric.hold().is_some();
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let authority = meta.supervisor_authority(crate::metrics::now_us());
+        Self {
+            held,
+            meta,
+            authority,
+        }
+    }
+}
+
 impl Operation {
     fn source_current(&self) -> bool {
         Process::observe(self.source.pid).as_ref() == Some(&self.source)
             && generation(self.source.pid) == Some(self.generation)
     }
-    fn current(&self, ctx: &crate::SessionCtx, authority: &SupervisorAuthority) -> bool {
-        *authority == self.authority
+    /// The operation's close: its deadline plus the
+    /// [`aterm_agent::harness::native_act::COMPLETION_US`] a native restart's close adds,
+    /// since a successor enters through the same registry constructor a restart's does. A
+    /// successor activated before the deadline may settle until the close; at the close its
+    /// worker ends the operation, whatever is still to come ([`hold_to_end`]).
+    fn close_us(&self) -> u64 {
+        self.deadline
+            .saturating_add(aterm_agent::harness::native_act::COMPLETION_US)
+    }
+    fn current(&self, ctx: &crate::SessionCtx, seen: &Seen<'_>) -> bool {
+        seen.authority == self.authority
             && !self.cancelled.load(std::sync::atomic::Ordering::Acquire)
-            && ctx.fabric.hold().is_none()
+            && !seen.held
             && (self.input_sealed.load(std::sync::atomic::Ordering::Acquire)
                 || ctx.human_input.seq() == self.human_seq)
             && remaining(self.deadline).is_some()
     }
-    fn seal_input(&self, ctx: &crate::SessionCtx, authority: &SupervisorAuthority) -> bool {
-        // The native caller retains Meta. Check policy/process conditions
-        // before acquiring operation state, preserving the native/state order.
-        if !self.source_current() || !self.current(ctx, authority) {
+    fn seal_input(&self, ctx: &crate::SessionCtx, seen: &Seen<'_>) -> bool {
+        // The caller's Seen retains Meta. Check policy/process conditions
+        // before acquiring operation state, preserving the Meta/state order.
+        if !self.source_current() || !self.current(ctx, seen) {
             return false;
         }
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -171,7 +220,8 @@ impl Operation {
         let old = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             // A timeout, cancellation, EOF or panic cannot prove NoExec after
-            // the first journal attempt. Keep the original DATA and leases.
+            // the first journal attempt. Keep the original DATA and leases
+            // until the worker proves the operation ended ([`hold_to_end`]).
             if state.possible {
                 self.wake.notify_all();
                 return;
@@ -194,6 +244,132 @@ impl Operation {
         };
         drop(old);
         self.wake.notify_all();
+    }
+    /// End a possible execution once [`hold_to_end`] proves nothing of it can
+    /// run on, or its close has passed: its constructor, leases, input custody
+    /// and DATA pin go, and the claim the control EOF kept for it is returned.
+    fn end(&self, mut state: std::sync::MutexGuard<'_, State>) -> Option<KeptClaim> {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let kept = state.kept_claim.take();
+        let old = (
+            std::mem::replace(&mut state.phase, Phase::Closed),
+            state.custody.take(),
+            state.data.take(),
+        );
+        drop(state);
+        drop(old);
+        self.wake.notify_all();
+        kept
+    }
+}
+
+/// What one pass of [`hold_to_end`] does with a possible execution's custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// Its custody, DATA and leases go, and the claim kept for it is handed back.
+    End,
+    /// It stops holding the app handoff and keeps its input position, DATA and kept claim.
+    FreeHandoff,
+    /// It keeps everything: a step of it may still come.
+    Keep,
+}
+
+/// A possible execution as one pass of [`hold_to_end`] reads it.
+#[derive(Clone, Copy, Debug)]
+struct Standing {
+    /// Its constructor was granted, so a Go may have gone out.
+    granted: bool,
+    /// Its source's kernel process is gone.
+    source_gone: bool,
+    /// It was cancelled: by an abort, its owner's stop or a panic, or by its worker once it
+    /// went stale before its source exec'd.
+    cancelled: bool,
+    /// A successor activated it and has not settled.
+    activated: bool,
+    /// Its deadline has passed: no load, activation or Go is admitted.
+    past_deadline: bool,
+    /// Its close has passed ([`Operation::close_us`]).
+    past_close: bool,
+}
+
+impl Standing {
+    /// What this pass does with the custody.
+    /// - A constructor never granted sent no Go, and dropping its ungranted
+    ///   reservation revokes it, so no process can enter through it: NoExec,
+    ///   and the operation ends.
+    /// - A source whose kernel process is gone left nothing of the operation
+    ///   running in the tab, so it ends.
+    /// - At its close it ends, whatever is still to come: a successor that
+    ///   never settles, because a hold refused its settlement or its
+    ///   connection died, holds the tab's input and the app's updates no
+    ///   longer.
+    /// - Before the close, a granted operation that can start nothing more
+    ///   (cancelled, or past its deadline before activation) stops holding the
+    ///   app handoff, and keeps its input position until the close, since its
+    ///   granted source may still exec or its successor still start. An
+    ///   activated one may still settle until the close, so past the deadline
+    ///   it keeps the handoff too.
+    fn pass(self) -> Pass {
+        if !self.granted || self.source_gone || self.past_close {
+            Pass::End
+        } else if self.cancelled || (self.past_deadline && !self.activated) {
+            Pass::FreeHandoff
+        } else {
+            Pass::Keep
+        }
+    }
+}
+
+/// A possible execution keeps its custody, DATA and leases past its worker's
+/// last act ([`Operation::finish`]). The worker stays with it until that
+/// custody ends: a successor's settlement takes it ([`settle`]), or a pass ends
+/// it ([`Standing::pass`]). Only this worker grants the constructor, and it
+/// grants nothing once [`run`] has returned. An ended operation hands back the
+/// claim the control EOF kept for it, and the window hears that the session's
+/// metadata moved, as it does when the EOF hands a claim back itself.
+fn hold_to_end(op: &Operation, session: &Weak<crate::SessionCtx>) {
+    loop {
+        if session.strong_count() == 0 {
+            // The tab closed: its operation table drops the custody.
+            return;
+        }
+        // The kernel's process table is read before the operation's state is taken, never
+        // beneath it. A source gone after this read is seen on the next pass.
+        let source_gone = runtime_data::gone(&op.source);
+        let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(custody) = state.custody.as_ref() else {
+            return;
+        };
+        let standing = Standing {
+            granted: state.granted,
+            source_gone,
+            cancelled: op.cancelled.load(std::sync::atomic::Ordering::Acquire),
+            activated: matches!(state.phase, Phase::Activated(_)),
+            past_deadline: remaining(op.deadline).is_none(),
+            past_close: remaining(op.close_us()).is_none(),
+        };
+        match standing.pass() {
+            Pass::End => {
+                let kept = op.end(state);
+                if let (Some(kept), Some(ctx)) = (kept, session.upgrade())
+                    && crate::session_timeline::release_closed_connection(
+                        &ctx,
+                        kept.connection,
+                        crate::metrics::now_us(),
+                    )
+                {
+                    crate::presence::post_meta_changed(kept.local);
+                }
+                return;
+            }
+            Pass::FreeHandoff => custody.release_handoff_guard(),
+            Pass::Keep => {}
+        }
+        let _parked = op
+            .wake
+            .wait_timeout(state, Duration::from_secs(1))
+            .unwrap_or_else(|p| p.into_inner());
     }
 }
 
@@ -318,8 +494,8 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
         return REFUSED.into();
     }
     if verb == "seal-input" {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if !op.seal_input(ctx, &meta.supervisor_authority(crate::metrics::now_us())) {
+        let seen = Seen::of(ctx);
+        if !op.seal_input(ctx, &seen) {
             return REFUSED.into();
         }
         return op.status();
@@ -328,8 +504,8 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
         op.close();
     }
     if verb == "execute" {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if !op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us())) {
+        let seen = Seen::of(ctx);
+        if !op.current(ctx, &seen) {
             return REFUSED.into();
         }
         let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -347,8 +523,8 @@ fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
         op.wake.notify_all();
     }
     if matches!(verb, "query" | "execute") {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us())) {
+        let seen = Seen::of(ctx);
+        if op.current(ctx, &seen) {
             let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.granted
                 && let (Phase::Possible(payload), Some(snapshot)) = (&state.phase, state.snapshot)
@@ -382,24 +558,15 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
         return adopt(ctx, op, peer, generation);
     }
     let payload = {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = Seen::of(ctx);
         let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Phase::Activated(activation) = &state.phase {
-            if !activation_current(
-                ctx,
-                op,
-                peer,
-                generation,
-                &meta.supervisor_authority(crate::metrics::now_us()),
-                activation,
-            ) {
+            if !activation_current(op, peer, generation, &seen, activation) {
                 return REFUSED.into();
             }
             activation._payload.clone()
         } else {
-            if !op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us()))
-                || !state.granted
-            {
+            if !op.current(ctx, &seen) || !state.granted {
                 return REFUSED.into();
             }
             let Phase::Possible(payload) = &state.phase else {
@@ -418,23 +585,16 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
         return REFUSED.into();
     }
     let snapshot = {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = Seen::of(ctx);
         let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Phase::Activated(activation) = &state.phase {
-            return if activation_current(
-                ctx,
-                op,
-                peer,
-                generation,
-                &meta.supervisor_authority(crate::metrics::now_us()),
-                activation,
-            ) {
+            return if activation_current(op, peer, generation, &seen, activation) {
                 activation_reply(op)
             } else {
                 REFUSED.into()
             };
         }
-        if !op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us()))
+        if !op.current(ctx, &seen)
             || state
                 .successor
                 .as_ref()
@@ -484,9 +644,9 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
         return REFUSED.into();
     }
     let old = {
-        let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seen = Seen::of(ctx);
         let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us()))
+        if !op.current(ctx, &seen)
             || state.snapshot != Some(snapshot)
             || state.successor.as_ref() != Some(&(peer.clone(), generation))
             || Process::observe(peer.pid).as_ref() != Some(peer)
@@ -494,9 +654,11 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
         {
             return REFUSED.into();
         }
-        let Some(authority) =
-            meta.transfer_native_exec_claim(&op.authority, connection, crate::metrics::now_us())
-        else {
+        let Some(authority) = seen.meta.transfer_native_exec_claim(
+            &op.authority,
+            connection,
+            crate::metrics::now_us(),
+        ) else {
             return REFUSED.into();
         };
         std::mem::replace(
@@ -517,36 +679,34 @@ fn successor(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, verb: &str
     activation_reply(op)
 }
 fn activation_current(
-    ctx: &crate::SessionCtx,
     op: &Operation,
     peer: &Process,
     generation: i32,
-    authority: &SupervisorAuthority,
+    seen: &Seen<'_>,
     activation: &Activation,
 ) -> bool {
     activation.process == *peer
         && activation.generation == generation
         && activation.authority.connection() == crate::control::serving_connection()
-        && *authority == activation.authority
-        && ctx.fabric.hold().is_none()
+        && seen.authority == activation.authority
+        && !seen.held
         && !op.cancelled.load(std::sync::atomic::Ordering::Acquire)
         && Process::observe(peer.pid).as_ref() == Some(peer)
         && self::generation(peer.pid) == Some(generation)
 }
 
 fn adoption_current(
-    ctx: &crate::SessionCtx,
     op: &Operation,
     peer: &Process,
     generation: i32,
-    authority: &SupervisorAuthority,
+    seen: &Seen<'_>,
     activation: &Activation,
 ) -> bool {
     activation.settled
         && activation.process == *peer
         && activation.generation == generation
-        && *authority == activation.authority
-        && ctx.fabric.hold().is_none()
+        && seen.authority == activation.authority
+        && !seen.held
         && !op.cancelled.load(std::sync::atomic::Ordering::Acquire)
         && Process::observe(peer.pid).as_ref() == Some(peer)
         && self::generation(peer.pid) == Some(generation)
@@ -560,19 +720,12 @@ fn adopt(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i3
         return REFUSED.into();
     };
     let payload = {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = Seen::of(ctx);
         let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
         let Phase::Activated(activation) = &state.phase else {
             return REFUSED.into();
         };
-        if !adoption_current(
-            ctx,
-            op,
-            peer,
-            generation,
-            &meta.supervisor_authority(crate::metrics::now_us()),
-            activation,
-        ) {
+        if !adoption_current(op, peer, generation, &seen, activation) {
             return REFUSED.into();
         }
         activation._payload.clone()
@@ -586,19 +739,12 @@ fn adopt(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i3
     {
         return REFUSED.into();
     }
-    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let mut seen = Seen::of(ctx);
     let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
     let Phase::Activated(activation) = &mut state.phase else {
         return REFUSED.into();
     };
-    if !adoption_current(
-        ctx,
-        op,
-        peer,
-        generation,
-        &meta.supervisor_authority(crate::metrics::now_us()),
-        activation,
-    ) {
+    if !adoption_current(op, peer, generation, &seen, activation) {
         return REFUSED.into();
     }
     if !activation.adopted && activation.authority.connection() == Some(connection) {
@@ -616,7 +762,7 @@ fn adopt(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i3
         );
     }
     if !activation.adopted || activation.authority.connection() != Some(connection) {
-        let Some(authority) = meta.transfer_native_exec_claim(
+        let Some(authority) = seen.meta.transfer_native_exec_claim(
             &activation.authority,
             connection,
             crate::metrics::now_us(),
@@ -635,19 +781,12 @@ fn adopt(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i3
 
 fn settle(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i32) -> String {
     let payload = {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = Seen::of(ctx);
         let state = op.state.lock().unwrap_or_else(|p| p.into_inner());
         let Phase::Activated(activation) = &state.phase else {
             return REFUSED.into();
         };
-        if !activation_current(
-            ctx,
-            op,
-            peer,
-            generation,
-            &meta.supervisor_authority(crate::metrics::now_us()),
-            activation,
-        ) {
+        if !activation_current(op, peer, generation, &seen, activation) {
             return REFUSED.into();
         }
         activation._payload.clone()
@@ -668,19 +807,12 @@ fn settle(ctx: &crate::SessionCtx, op: &Operation, peer: &Process, generation: i
         return REFUSED.into();
     }
     let old = {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let seen = Seen::of(ctx);
         let mut state = op.state.lock().unwrap_or_else(|p| p.into_inner());
         let Phase::Activated(activation) = &state.phase else {
             return REFUSED.into();
         };
-        if !activation_current(
-            ctx,
-            op,
-            peer,
-            generation,
-            &meta.supervisor_authority(crate::metrics::now_us()),
-            activation,
-        ) {
+        if !activation_current(op, peer, generation, &seen, activation) {
             return REFUSED.into();
         }
         if activation.settled {
@@ -754,15 +886,15 @@ fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String 
     let Some(worker) = Worker::reserve() else {
         return REFUSED.into();
     };
-    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let authority = meta.supervisor_authority(crate::metrics::now_us());
+    let seen = Seen::of(ctx);
+    let authority = seen.authority.clone();
     if authority.contract() != Some(2)
         || authority.identity() != Some(&proof)
         || authority.connection() != crate::control::serving_connection()
         || authority
             .scopes()
             .is_none_or(|scopes| !scopes.contains(Scope::Upgrade))
-        || ctx.fabric.hold().is_some()
+        || seen.held
         || Process::observe(pid).as_ref() != Some(&source)
         || self::generation(pid) != Some(generation)
     {
@@ -842,12 +974,13 @@ fn prepare(ctx: &Arc<crate::SessionCtx>, master: i32, recipe: Recipe) -> String 
             granted: false,
             snapshot: None,
             successor: None,
+            kept_claim: None,
         }),
         wake: std::sync::Condvar::new(),
     });
     let previous = table.source_exec.replace(op.clone());
     drop(table);
-    drop(meta);
+    drop(seen);
     drop(previous);
     worker.start(Job {
         ctx: Arc::downgrade(ctx),
@@ -879,7 +1012,9 @@ impl Worker {
                 let _budget = budget;
                 if let Ok(job) = receive.recv() {
                     let op = job.op.clone();
+                    let session = job.ctx.clone();
                     guarded(&op, || run(job));
+                    guarded(&op, || hold_to_end(&op, &session));
                 }
             })
             .ok()?;
@@ -991,11 +1126,8 @@ fn execute(job: &Job, ctx: &crate::SessionCtx, payload: &Arc<Payload>) {
         return;
     }
     {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if !job
-            .op
-            .current(ctx, &meta.supervisor_authority(crate::metrics::now_us()))
-        {
+        let seen = Seen::of(ctx);
+        if !job.op.current(ctx, &seen) {
             return;
         }
         let mut state = job.op.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1016,14 +1148,8 @@ fn execute(job: &Job, ctx: &crate::SessionCtx, payload: &Arc<Payload>) {
     if !job.op.source_current() {
         return;
     }
-    {
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        if !job
-            .op
-            .current(ctx, &meta.supervisor_authority(crate::metrics::now_us()))
-        {
-            return;
-        }
+    if !job.op.current(ctx, &Seen::of(ctx)) {
+        return;
     }
     if payload
         .constructor
@@ -1153,12 +1279,7 @@ fn run(job: Job) {
             return;
         };
         let current = job.op.source_current();
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        let valid = current
-            && job
-                .op
-                .current(&ctx, &meta.supervisor_authority(crate::metrics::now_us()));
-        drop(meta);
+        let valid = current && job.op.current(&ctx, &Seen::of(&ctx));
         let possible = job
             .op
             .state
@@ -1203,12 +1324,7 @@ fn run(job: Job) {
             return;
         };
         let current = job.op.source_current();
-        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        let valid = current
-            && job
-                .op
-                .current(&ctx, &meta.supervisor_authority(crate::metrics::now_us()));
-        drop(meta);
+        let valid = current && job.op.current(&ctx, &Seen::of(&ctx));
         // Once the original source execs, the retained operation belongs to
         // the successor front door. Image replacement is not cancellation.
         if !current
@@ -1254,7 +1370,11 @@ fn run(job: Job) {
 
 /// EOF cannot retract possible execution or return this exact claim's input
 /// duty to the built-in harness while the operation retains native custody.
-pub(super) fn retain_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
+/// The claim kept moves to a successor's connection when one activates or
+/// adopts (`transfer_native_exec_claim` closes the old one), and otherwise
+/// goes back when the custody ends ([`hold_to_end`]). `local` is the window's
+/// id of the session `ctx` is.
+pub(super) fn retain_claim(ctx: &crate::SessionCtx, local: u64, connection: u64) -> bool {
     let op = ctx
         .fenced_writes
         .native
@@ -1301,7 +1421,12 @@ pub(super) fn retain_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
         Phase::Activated(activation) => &activation.authority,
         _ => &op.authority,
     };
-    authority.connection() == Some(connection) && state.possible && state.custody.is_some()
+    let kept =
+        authority.connection() == Some(connection) && state.possible && state.custody.is_some();
+    if kept {
+        state.kept_claim = Some(KeptClaim { connection, local });
+    }
+    kept
 }
 
 pub(super) fn pending(ctx: &crate::SessionCtx) -> bool {

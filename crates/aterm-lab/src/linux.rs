@@ -1145,9 +1145,9 @@ pub fn run_verb(lane: &str) -> String {
         .map_or_else(|| format!("lab {lane}"), |(verb, ..)| verb.clone())
 }
 
-/// The remedy beside what to free that a lane's claim refused as UNMET names: the lane's own
+/// What a lane's claim refused as UNMET offers beside the refusal: the lane's own
 /// `--admit now`, which takes the claim at once.
-pub const AT_ONCE: &str = "or boot at once by adding `--admit now` before the verb";
+pub const AT_ONCE: &str = "`--admit now` before the verb boots it at once";
 
 /// How this run admits its boot's disk and its VM (`--admit wait|now`, [`name_run`]): waiting,
 /// unless the dispatch named `now`.
@@ -1181,10 +1181,10 @@ impl LaneLock {
 
     /// Take the lane for a run that boots the VM: the VM's turn to boot first
     /// ([`LaneLock::turn`]), then the boot's disk claimed ([`claim_boot_disk`]), so no run holds
-    /// the lane while it waits for disk and none that holds disk waits behind one that does, then
-    /// the lane ([`LaneLock::take`]). The claim is held, and the VM's directory measured, until
-    /// the lock is let go at the run's end. A lima lane with no `limactl` is NOT RUN before any
-    /// wait.
+    /// the lane while its disk claim is relieved and decided (or waits for memory) and none that
+    /// holds disk waits behind one that does, then the lane ([`LaneLock::take`]). The claim is
+    /// held, and the VM's directory measured, until the lock is let go at the run's end. A lima
+    /// lane with no `limactl` is NOT RUN before any wait.
     /// # Errors
     /// As [`LaneLock::turn`], [`claim_boot_disk`] and [`LaneLock::take`], and lima's absence.
     pub fn boot() -> Result<LaneLock, Fail> {
@@ -1642,13 +1642,13 @@ fn linux_boot_run(kind: Kind) -> Result<atpkg::admit_disk::Run, Fail> {
 }
 
 /// Claims a lane VM boot's disk before it boots ([`atpkg::admit_disk::admit`]), as this run
-/// admits ([`name_run`]; `--admit now` takes it at once): a short volume is relieved and then
-/// waited for, each line printed as `<lane>: <line>`. A ledger that cannot be used is said, and
-/// the VM boots without a claim.
+/// admits ([`name_run`]; `--admit now` takes it at once): a short volume is relieved once, and
+/// the boot then starts if the volume's room fits it or ends at once, each line printed as
+/// `<lane>: <line>`. A ledger that cannot be used is said, and the VM boots without a claim.
 ///
 /// # Errors
 /// NOT RUN: the need is more than the volume holds above its floor, or than it has free above its
-/// floor once the relief ran, which no wait admits.
+/// floor once its one relief ran (it ends at once rather than wait for disk).
 pub fn claim_boot_disk(
     lane: &str,
     run: atpkg::admit_disk::Run,
@@ -1684,11 +1684,10 @@ fn claim_boot_disk_with(
     match admit(run, &mut |line| println!("{lane}: {line}")) {
         Ok(held) => Ok(Some(held)),
         Err(atpkg::admit_disk::Error::Never(why)) => Err(not_run(format!(
-            "{why}; the VM can never boot there. Fix: free room on that volume, or move the VM \
-             to a larger one"
+            "{why}; the VM can never boot there. Fix: move the VM to a larger volume"
         ))),
         Err(e @ atpkg::admit_disk::Error::Unmet { .. }) => Err(not_run(format!(
-            "{lane}: the boot's disk claim was refused: {e}, {AT_ONCE}; this run booted nothing"
+            "{lane}: the boot's disk claim was refused: {e}; {AT_ONCE}; this run booted nothing"
         ))),
         Err(e @ atpkg::admit_disk::Error::Stopped { signal, .. }) => Err(Fail {
             stopped: signal.inspect(|sig| crate::stop::note(*sig)),

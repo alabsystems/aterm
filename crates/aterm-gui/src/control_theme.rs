@@ -514,7 +514,7 @@ impl App {
         }
         for view in views {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
-                self.native_runtime.view_state_mut(view)
+                self.native_runtime.view_state_mut(view).as_deref_mut()
             {
                 state.refuse_theme_trial(id, why);
             }

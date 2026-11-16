@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-#[test]
-fn background_is_only_a_repeatable_tree_sample() {
-    let parse = |args: &[&str]| super::parse(args.iter().copied());
-    assert!(
-        parse(&["release", "--tree", "--background"])
-            .unwrap()
-            .background
-    );
-    for args in [
-        vec!["test", "--background"],
-        vec!["release", "--background"],
-        vec!["release", "--bundle", "--app", "app", "--background"],
-    ] {
-        assert!(parse(&args).is_err());
-    }
-}
 use super::*;
 
 fn ok(args: &[&str]) -> Args {

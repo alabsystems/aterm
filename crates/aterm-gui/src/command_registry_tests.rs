@@ -42,6 +42,16 @@ fn menu_faces_carry_stable_identities() {
         menu_command(menu::MenuAction::ToggleSettings).authority
     );
     assert_eq!(system_state.content, ContentRequirement::Any);
+    let tables = menu_command(menu::MenuAction::Tables);
+    assert_eq!(tables.id.as_str(), "app.tables.open");
+    assert_eq!(
+        (tables.scope, tables.authority, tables.content),
+        (
+            system_state.scope,
+            system_state.authority,
+            system_state.content
+        )
+    );
 
     let allocation = menu_command(menu::MenuAction::Allocation);
     assert_eq!(allocation.id.as_str(), "app.allocation.open");

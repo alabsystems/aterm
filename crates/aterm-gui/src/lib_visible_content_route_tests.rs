@@ -215,7 +215,7 @@ fn output_redraw_admission_stamps_headless_co_viewers_and_skips_background_tabs(
 
     let sid = app.next_session_id;
     app.push_stub_tab(original, stub_session(sid));
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.pending_deco_birth = None;
     }
     let second = Instant::now();
@@ -334,7 +334,7 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
         });
         locked_rx.recv().expect("holder took the lock");
 
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.pending_deco_birth = None;
         }
         let t0 = Instant::now();

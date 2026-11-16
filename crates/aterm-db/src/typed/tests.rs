@@ -202,7 +202,13 @@ impl Book {
                 continue;
             }
             let (_, _, _, changes) = self.ops.iter().find(|op| op.0 == id).unwrap();
-            crate::documents::apply(index, &mut cells, id, changes, true);
+            crate::documents::apply(
+                &|later, earlier| index.observes(later, earlier),
+                &mut cells,
+                id,
+                changes,
+                true,
+            );
         }
         cells
     }
@@ -1982,4 +1988,390 @@ fn vault_refs_foreign_keys_and_set_elements_enforce_credential_and_type_guards()
         )
         .is_err()
     );
+}
+
+/// The lab tracker's TSVs at publication 384b3a9f, each with the SHA-256 of its bytes: the
+/// corpus the design's finding 13 counted (docs/DESIGN-lab-tracker-2026-11-14.md §7).
+const PUBLICATION_384B3A9F: [(&str, &str); 11] = [
+    (
+        "competitions.tsv",
+        "151083e2bd912bdae804f828e3683af95516e5a4dbca165c1e0b3f0fa9ae4418",
+    ),
+    (
+        "decisions.tsv",
+        "750fe4adcbddaa8a7e81ce2b40780d7c7b261ce14737d1a83b9a0106b05f36e6",
+    ),
+    (
+        "goals.tsv",
+        "f871d4a437a67a7114c61a0035ce8d1382b7bc856df0da6c72633e73906c3032",
+    ),
+    (
+        "groups.tsv",
+        "2661d330d22f4022ae994a7e461d48929ebcbbf5c17c5ffcc125a00c97ac72b3",
+    ),
+    (
+        "lanes.tsv",
+        "15a984c2441fcf6f020f1b8e5525b08de26976b92e0cbaf64c02e4b89cb7e5b8",
+    ),
+    (
+        "metrics.tsv",
+        "ebe967c50b0e9e25cb0868616a8f77dfe05df5fbb14a0ec3d01ec64dfb0613e6",
+    ),
+    (
+        "packages.tsv",
+        "9a483dcf9e75f0f02bea0fc70ccbecd203658c4d57c3af2694cd29e2053f81b1",
+    ),
+    (
+        "plan.tsv",
+        "b31141b839f06c684fcb1b2e0a53efa992e3a679fe1f8048e7d04b4a694e4f6f",
+    ),
+    (
+        "projects.tsv",
+        "cfb50792ad5f068b49961e1d003a40e107715893fbc33f31ddc99e4c6fb8387b",
+    ),
+    (
+        "rulings.tsv",
+        "2a08014e9cd9f084cc05dbf9aeda411de60434fab9ec1eef3538598dfb2b00bb",
+    ),
+    (
+        "stops.tsv",
+        "9eeb3c5df56a9d15b17adf2b01020678428f5654ca7e67fc7d214480fc05f33c",
+    ),
+];
+
+/// The tracker type a publication column takes (design §3), as the import holds its cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// Prose of at most this many bytes: titles, outcomes, reasons, quotes, and the words of
+    /// enums, ids and links, whose originals the import keeps beside their keys (`id`).
+    Prose(usize),
+    /// A shell command: an exit test, a measurement's source.
+    Command,
+    /// A UTC day, from `YYYY-MM-DD`.
+    Day,
+    /// A principal, as an imported record names its writer (`said`).
+    Principal,
+    /// One note of evidence.
+    Evidence,
+    /// A decimal, or else the column's prose (`baseline_text`): a measurement in words is
+    /// TK-16's finding, never a refusal.
+    DecimalOrProse,
+    /// A set of paths, or else the column's prose: an `owns` entry in words.
+    PathsOrProse,
+    /// An https URL with no query or fragment.
+    Url,
+}
+
+/// The type each column of each file takes; a column this omits fails the test.
+fn publication_column(file: &str, column: &str) -> Option<Held> {
+    const LINE: usize = 512;
+    const BODY: usize = 16 * 1024;
+    Some(match (file, column) {
+        (_, "date" | "claimed_on" | "done_on") => Held::Day,
+        (_, "claimed_by" | "decided_by" | "coordinator") => Held::Principal,
+        ("packages.tsv", "exit_command") | ("metrics.tsv", "source") => Held::Command,
+        ("packages.tsv", "evidence") => Held::Evidence,
+        ("packages.tsv", "owns") => Held::PathsOrProse,
+        ("metrics.tsv", "value") | ("goals.tsv", "baseline" | "target") => Held::DecimalOrProse,
+        ("competitions.tsv", "url") => Held::Url,
+        (
+            _,
+            "outcome" | "exit_expect" | "decision" | "reason" | "detail" | "bottleneck" | "note"
+            | "quote" | "source" | "item" | "real" | "gap" | "depends",
+        ) => Held::Prose(BODY),
+        (
+            _,
+            "id" | "lane" | "order" | "goal" | "title" | "repo" | "size" | "state" | "group"
+            | "horizon" | "name" | "summary" | "scoreboard" | "value" | "of" | "prefix" | "repos"
+            | "goals" | "metric" | "unit" | "machine" | "target_by" | "kind" | "edition" | "tracks"
+            | "catalog" | "scoring" | "limits" | "engine" | "next" | "today" | "about" | "key"
+            | "project" | "score",
+        ) => Held::Prose(LINE),
+        _ => return None,
+    })
+}
+
+/// The UTC day number of `YYYY-MM-DD` (days since 1970-01-01).
+fn civil_day(text: &str) -> Option<u64> {
+    let mut parts = text.split('-').map(|part| part.parse::<i64>().ok());
+    let (Some(Some(y)), Some(Some(m)), Some(Some(d)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if text.len() != 10 || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    u64::try_from(era * 146_097 + doe - 719_468).ok()
+}
+
+/// What one cell of the corpus became.
+#[derive(Default, Debug)]
+struct Taken {
+    cells: usize,
+    days: usize,
+    principals: usize,
+    evidence: usize,
+    commands: usize,
+    decimals: usize,
+    in_words: usize,
+    path_sets: usize,
+    paths: usize,
+    urls: usize,
+}
+
+/// Check one cell under its column's type: the rule it breaks, never the cell.
+fn hold(held: Held, cell: &str, taken: &mut Taken) -> std::result::Result<(), &'static str> {
+    let check = |ty: &Ty, x: Value| {
+        cell::validate(&PROBE, &Column::new("probe", *ty), &x).map_err(|_| "refused")
+    };
+    match held {
+        Held::Prose(max) => cell::admissible(&Ty::Prose(max), &json!(cell))
+            .then_some(())
+            .ok_or("prose refused"),
+        Held::Command => {
+            taken.commands += 1;
+            check(&Ty::Command(values::MAX_COMMAND), json!(cell))
+        }
+        Held::Day => {
+            taken.days += 1;
+            check(&Ty::Day, json!(civil_day(cell).ok_or("not a day")?))
+        }
+        Held::Principal => {
+            taken.principals += 1;
+            check(&Ty::Principal, values::Principal::said(cell).to_value())
+        }
+        Held::Evidence => {
+            taken.evidence += 1;
+            let note = values::Evidence::note(cell).to_value();
+            check(
+                &Ty::List(&Ty::Evidence, values::MAX_EVIDENCE),
+                json!([note]),
+            )
+        }
+        Held::DecimalOrProse => {
+            if check(&Ty::Decimal, json!(cell)).is_ok() {
+                taken.decimals += 1;
+                Ok(())
+            } else {
+                taken.in_words += 1;
+                check(&Ty::Prose(16 * 1024), json!(cell))
+            }
+        }
+        Held::PathsOrProse => {
+            let parts: Vec<&str> = cell.split(',').map(str::trim).collect();
+            let set = Column::new("owns", Ty::Set(&Ty::Path));
+            if parts.iter().all(|part| cell::element(&set, part).is_ok()) {
+                taken.path_sets += 1;
+                taken.paths += parts.len();
+                Ok(())
+            } else {
+                taken.in_words += 1;
+                check(&Ty::Prose(16 * 1024), json!(cell))
+            }
+        }
+        Held::Url => {
+            taken.urls += 1;
+            check(&Ty::Url, json!(cell))
+        }
+    }
+}
+
+crate::att_collection!(
+    PROBE = Collection {
+        name: "probe",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "pr",
+        derive: Derive::Random,
+        columns: &[Column::new("row", Ty::Enum(LIFE))],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
+/// Every cell of the lab tracker's TSVs at publication 384b3a9f is held by the tracker type its
+/// column takes (design §3), where the registry's text guard refuses a cell of 821 of the 1,121
+/// packages (a commit's 40 hex digits, a long path or test name, any `@`, a `KI-1114-533` read
+/// as a phone number; §7, finding 13). A measurement or an `owns` entry in words is its column's prose, as
+/// the import keeps it. And each real token (a provider's prefix with its body, a PEM private
+/// key, an `otpauth://` seed, a bare or grouped TOTP seed, a URL's password, a random base62 or
+/// base64 key, a Slack webhook, an age key) is
+/// refused by every one of those types, alone and inside a corpus cell.
+///
+/// The corpus is withheld from the public snapshot with `publish/` (publish/manifest.txt), so a
+/// tree with neither runs the token half alone; a checkout that has the manifest and not the
+/// corpus fails.
+///
+/// NEGATIVE CONTROL: with `guard::secret_shaped` asking `credential_shaped` (its 40-character
+/// run), the corpus half fails at `decisions.tsv` `reason`; with `secret_shaped` dropping its
+/// `random_token`, the token half fails: `` a random key passes Prose ``.
+#[test]
+fn the_publication_384b3a9f_cells_pass_the_tracker_types_and_a_real_token_does_not() {
+    let root = aterm_tempfile::manifest_dir();
+    let dir = root.join("testdata/publication-384b3a9f");
+    let mut sample = None;
+    if !dir.exists() {
+        assert!(
+            !root.join("../../publish/manifest.txt").exists(),
+            "a checkout with publish/ holds the corpus; only the export withholds it"
+        );
+    } else {
+        let mut taken = Taken::default();
+        let mut refused_by_text = BTreeSet::<String>::new();
+        for (file, digest) in PUBLICATION_384B3A9F {
+            let bytes = std::fs::read(dir.join(file))
+                .unwrap_or_else(|e| panic!("{file}: the corpus is unreadable: {e}"));
+            assert_eq!(
+                aterm_digest::Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                digest,
+                "{file} is not publication 384b3a9f's"
+            );
+            let text = String::from_utf8(bytes).expect("the corpus is UTF-8");
+            let mut lines = text.lines();
+            let header: Vec<&str> = lines.next().expect("a header").split('\t').collect();
+            for (row, line) in lines.enumerate() {
+                let cells: Vec<&str> = line.split('\t').collect();
+                assert_eq!(cells.len(), header.len(), "{file} row {row} is ragged");
+                for (column, cell) in header.iter().zip(&cells) {
+                    let held = publication_column(file, column)
+                        .unwrap_or_else(|| panic!("{file} {column} has no tracker type"));
+                    if cell.is_empty() {
+                        continue;
+                    }
+                    taken.cells += 1;
+                    if let Err(rule) = hold(held, cell, &mut taken) {
+                        panic!("{file} row {row} {column}: {rule}");
+                    }
+                    if file == "packages.tsv" && guard::text(cell, usize::MAX).is_err() {
+                        refused_by_text.insert(cells[0].to_owned());
+                    }
+                    if file == "packages.tsv" && *column == "outcome" && sample.is_none() {
+                        sample = Some((*cell).to_owned());
+                    }
+                }
+            }
+        }
+        // Finding 13, read again: the registry's guard, every rule of it, refuses a cell of 821
+        // packages (the design counted 801 for its 40-character run and its `@`; those two alone
+        // refuse 790).
+        assert_eq!(
+            refused_by_text.len(),
+            821,
+            "packages the text guard refuses"
+        );
+        // Every typed column took its cells; the counts are the corpus's own.
+        assert_eq!(taken.days, 1220, "{taken:?}");
+        assert!(taken.principals > 0 && taken.evidence > 0 && taken.commands > 0);
+        assert!(taken.decimals > 0 && taken.path_sets > 0 && taken.urls > 0);
+        assert!(
+            taken.decimals >= 156,
+            "the decimal measurements are decimals: {taken:?}"
+        );
+    }
+    // In halves, so no scan reads a token here.
+    let tokens = [
+        concat!("ghp", "_", "R7w2Kq9ZbX4mVn8LpT3sYc6HdJ1fGa5Ue0Wi"),
+        concat!(
+            "github",
+            "_pat_",
+            "11ABCDEFG0",
+            "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1gI3kM5oQ7sU9wY1aC3eG5iK7mO9qS1uW3yZ5bD7"
+        ),
+        concat!(
+            "sk",
+            "-ant-api03-",
+            "Zx8Qw2Er4Ty6Ui8Op0As2Df4Gh6Jk8Lz0Xc2Vb4Nm6"
+        ),
+        concat!(
+            "sk",
+            "-proj-",
+            "Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8L9z0X1c2V3b4"
+        ),
+        concat!("AK", "IA", "Z7Q2W9X4C6V8B3N5"),
+        concat!("AI", "za", "Sy4Kd9Wq2Lm7Zx3Vb8Nc1Hj6Gf5Ds0Ra2Te"),
+        concat!(
+            "xo",
+            "xb-",
+            "123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+        ),
+        concat!(
+            "ya",
+            "29.",
+            "a0AfH6SMBx7Kq2Wz9Lp4Rt8Yv3Nm_",
+            "Qe5Tg1Hb6Jc0Lk-Pa2Sd7Fg3Hj9Kl4Zx8Cv1Bn"
+        ),
+        concat!("xa", "i-", "Kq7Zp2Wx9Lm4Vb8Nc3Hj6Gf1Ds5Ra0Te"),
+        concat!("glp", "at-", "Xq7Zp2Wx9Lm4Vb8Nc3Hj"),
+        concat!("-----BEGIN OPENSSH ", "PRIVATE KEY-----"),
+        concat!(
+            "otpauth://totp/lab:ann?sec",
+            "ret=JBSWY3DPEHPK3PXP&issuer=lab"
+        ),
+        concat!("JBSWY3DP", "EHPK3PXP"),
+        concat!("jbsw y3dp ", "ehpk 3pxp"),
+        concat!(
+            "https://ann:",
+            "synthetic-pass-08",
+            "@git.example.invalid/repo"
+        ),
+        concat!("epJL7EGWiFbCY2pB", "Vjb2A1NPXIyzSropDjP8HKn4"),
+        concat!("7juFZhZSGOV2DpXC", "HxqnMKFDMR8mQb00"),
+        concat!("wJalrXUtnFEMI/K7MD", "ENG/bPxRfiCYEXAMPLEKEY"),
+        concat!(
+            "https://hooks.slack.com/services/",
+            "T0123ABCD/B0123ABCD/Kq7Zp2Wx9Lm4Vb8Nc3Hj6Gf1"
+        ),
+        concat!(
+            "AGE-SECRET-KEY-1",
+            "QL3Z7HNZ0Y8X9W6V5U4T3S2R1Q0P9N8M7L6K5J4H3G2F1E0D9C8B7A6"
+        ),
+        concat!("otpauth://totp/x?sec", "ret=jbswy3dpehpk3pxp)"),
+    ];
+    let prose = |text: &str| cell::admissible(&Ty::Prose(16 * 1024), &json!(text));
+    let command = |text: &str| cell::admissible(&Ty::Command(4096), &json!(text));
+    for token in tokens {
+        let head = &token[..token.len().min(8)];
+        assert!(!prose(token), "{head}… passes Prose");
+        assert!(!command(&format!("echo {token}")), "{head}… passes Command");
+        assert!(
+            !cell::admissible(&Ty::Principal, &values::Principal::said(token).to_value()),
+            "{head}… passes Principal"
+        );
+        let note = values::Evidence::Note(token.to_owned()).to_value();
+        assert!(
+            !cell::admissible(&Ty::Evidence, &note),
+            "{head}… passes Evidence"
+        );
+        if !token.contains(' ') {
+            assert!(
+                !cell::admissible(&Ty::Path, &json!(format!("docs/{token}"))),
+                "{head}… passes Path"
+            );
+            let session = values::Principal {
+                session: Some(token.to_owned()),
+                ..values::Principal::default()
+            };
+            assert!(
+                !cell::admissible(&Ty::Principal, &session.to_value()),
+                "{head}… passes as a session"
+            );
+        }
+        if let Some(sample) = &sample {
+            assert!(
+                !prose(&format!("{sample} {token}")),
+                "{head}… passes inside a corpus cell"
+            );
+        }
+    }
 }

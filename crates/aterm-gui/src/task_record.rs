@@ -969,7 +969,7 @@ pub(crate) struct TaskMark {
 
 /// Usage error line for `task`.
 pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|stalled|failed> \
-     [from=<s-…|ctl>] [why=<word>] [checked=<word>] [left=<word>] [exit=<n>] [result_bytes=<n>] \
+     [from=<sid|ctl>] [why=<word>] [checked=<word>] [left=<word>] [exit=<n>] [result_bytes=<n>] \
      [result_path=<pct>]]\n";
 
 impl TaskMark {
@@ -1004,7 +1004,10 @@ impl TaskMark {
             match key {
                 "from" if valid_from(value) => mark.from = Some(value.to_string()),
                 "from" => {
-                    return Err("ERR task mark: from= is a session id (s-<hex>) or ctl\n".into());
+                    return Err(
+                        "ERR task mark: from= is a session id (t…, or a legacy tab's s-…) or ctl\n"
+                            .into(),
+                    );
                 }
                 "why" => {
                     mark.why = Some(why_word(value).ok_or_else(|| {

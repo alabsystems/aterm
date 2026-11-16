@@ -12,7 +12,7 @@ use crate::phase::{
 };
 use crate::prompt::fixtures::{
     MEMORY_BANNER_IDLE, STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
-    STATUSLINE_REPLY_DONE_2_1_311, screen,
+    STATUSLINE_MIDREPLY_ANSWERED_2_1_323, STATUSLINE_REPLY_DONE_2_1_311, screen,
 };
 use crate::{ClaudeReader, MuseReader, Program, Reading, ScreenReader, read_at, read_seen};
 use alab_policy::vocab::Phase;
@@ -92,7 +92,7 @@ fn claude_codes_rest_glyph_is_its_title_at_rest() {
 }
 
 /// The two 2.1.311 frames of a reply still being drawn under a status line read Busy, the
-/// title's own busy (`title: running`), under a running title; the finished frame under it
+/// title's own busy (`run sign: running`), under a running title; the finished frame under it
 /// reads idle with every `NEEDS YOU` line, its done row the end the title cannot overrule.
 #[test]
 fn a_running_title_holds_a_reply_drawn_under_a_status_line_busy() {
@@ -111,9 +111,9 @@ fn a_running_title_holds_a_reply_drawn_under_a_status_line_busy() {
         ),
     ] {
         let rows = screen(text);
-        let runs = ClaudeReader.runs(Some(title));
+        let runs = ClaudeReader.runs(Some(title), None);
         assert_eq!(runs, Some(true), "{title}");
-        let r = read_seen(Some("claude"), &rows, None, None, Some(title));
+        let r = read_seen(Some("claude"), &rows, None, None, Some(title), None);
         assert_eq!(
             (r.phase.clone(), r.phase_authoritative, r.wall.is_none()),
             (Phase::Busy, true, true),
@@ -124,7 +124,7 @@ fn a_running_title_holds_a_reply_drawn_under_a_status_line_busy() {
         assert_eq!(
             busy,
             Some(Busy {
-                zone: Zone::Title,
+                zone: Zone::RunSign,
                 rule: "running",
                 soft: false
             }),
@@ -132,7 +132,7 @@ fn a_running_title_holds_a_reply_drawn_under_a_status_line_busy() {
         );
         assert_eq!(
             busy.map(|b| b.to_string()).as_deref(),
-            Some("title: running")
+            Some("run sign: running")
         );
         assert_eq!(
             busy_signal(&rows),
@@ -142,7 +142,7 @@ fn a_running_title_holds_a_reply_drawn_under_a_status_line_busy() {
     }
     let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
     for title in RUNNING {
-        let r = read_seen(Some("claude"), &done, caret(&done), None, Some(title));
+        let r = read_seen(Some("claude"), &done, caret(&done), None, Some(title), None);
         assert_eq!(
             (r.phase.clone(), r.phase_authoritative, needs(&r)),
             (Phase::Idle, true, 4),
@@ -165,10 +165,10 @@ fn a_title_that_says_no_run_reads_as_the_screen_alone() {
         let rows = screen(text);
         let alone = read_at(Some("claude"), &rows, caret(&rows), None);
         for title in NOT_RUNNING {
-            let runs = ClaudeReader.runs(title);
+            let runs = ClaudeReader.runs(title, None);
             assert_ne!(runs, Some(true), "{title:?}");
             assert_eq!(
-                read_seen(Some("claude"), &rows, caret(&rows), None, title),
+                read_seen(Some("claude"), &rows, caret(&rows), None, title, None),
                 alone,
                 "{title:?}"
             );
@@ -193,7 +193,7 @@ fn a_turn_the_screen_shows_reads_as_the_screen_shows_it_under_a_running_title() 
     let rows = screen(WATCHDOG_STATUSLINE);
     for title in RUNNING {
         assert_eq!(
-            read_seen(Some("claude"), &rows, None, None, Some(title)),
+            read_seen(Some("claude"), &rows, None, None, Some(title), None),
             read_at(Some("claude"), &rows, None, None),
             "{title}"
         );
@@ -241,7 +241,7 @@ fn handed_off_work_on_the_screen_leaves_the_reading_to_the_screen() {
             "{name}"
         );
         assert_eq!(
-            read_seen(Some("claude"), rows, None, None, Some(RUNNING[0])),
+            read_seen(Some("claude"), rows, None, None, Some(RUNNING[0]), None),
             read_at(Some("claude"), rows, None, None),
             "{name}"
         );
@@ -278,10 +278,10 @@ fn a_qualified_monitor_in_the_pill_is_no_handed_off_work() {
         assert!(title_live(&rows, Some(true)), "{count}");
         assert_eq!(
             busy_seen(&rows, Some(true)).map(|b| b.zone),
-            Some(Zone::Title),
+            Some(Zone::RunSign),
             "{count}"
         );
-        let r = read_seen(Some("claude"), &rows, None, None, Some(RUNNING[0]));
+        let r = read_seen(Some("claude"), &rows, None, None, Some(RUNNING[0]), None);
         assert_eq!(
             (r.phase.clone(), r.phase_authoritative),
             (Phase::Busy, true),
@@ -298,7 +298,7 @@ fn a_qualified_monitor_in_the_pill_is_no_handed_off_work() {
         assert!(delegated_shown(&rows), "{count}");
         assert!(!title_live(&rows, Some(true)), "{count}");
         assert_eq!(
-            read_seen(Some("claude"), &rows, None, None, Some(RUNNING[0])),
+            read_seen(Some("claude"), &rows, None, None, Some(RUNNING[0]), None),
             read_at(Some("claude"), &rows, None, None),
             "{count}"
         );
@@ -322,7 +322,7 @@ fn a_shell_pill_under_a_running_title_is_a_live_turn_not_a_break() {
     assert_eq!(ClaudeReader.background_wait_seen(&shells, Some(true)), None);
     assert_eq!(
         busy_seen(&shells, Some(true)).map(|b| b.zone),
-        Some(Zone::Title)
+        Some(Zone::RunSign)
     );
     assert_eq!(
         background_rest(&shells),
@@ -431,7 +431,14 @@ fn the_memory_banner_beside_a_reply_under_a_status_line_is_no_end_of_it() {
         assert!(crate::wall::turn_wall(&shown).is_none());
         for title in RUNNING {
             assert!(title_live(&shown, Some(true)), "{title}");
-            let r = read_seen(Some("claude"), &shown, caret(&shown), None, Some(title));
+            let r = read_seen(
+                Some("claude"),
+                &shown,
+                caret(&shown),
+                None,
+                Some(title),
+                None,
+            );
             assert_eq!(
                 (r.phase.clone(), r.phase_authoritative),
                 (Phase::Busy, true),
@@ -450,7 +457,7 @@ fn the_memory_banner_beside_a_reply_under_a_status_line_is_no_end_of_it() {
         );
         for title in NOT_RUNNING {
             assert_eq!(
-                read_seen(Some("claude"), &shown, caret(&shown), None, title),
+                read_seen(Some("claude"), &shown, caret(&shown), None, title, None),
                 alone,
                 "{title:?}"
             );
@@ -498,7 +505,7 @@ fn no_title_reads_every_capture_as_today() {
         let rows = screen(&text);
         let reader = crate::identify(None, &rows);
         for title in [None, Some("")] {
-            let runs = reader.runs(title);
+            let runs = reader.runs(title, None);
             assert_eq!(runs, None, "{name}");
             assert_eq!(
                 reader.read_seen(&rows, None, None, runs),
@@ -545,7 +552,7 @@ fn claude_code_2_1_318_under_the_usage_tap_reads_its_title_beside_the_screen() {
     );
     for title in RUNNING {
         assert_eq!(
-            read_seen(Some("claude"), &mid, caret(&mid), None, Some(title)),
+            read_seen(Some("claude"), &mid, caret(&mid), None, Some(title), None),
             read_at(Some("claude"), &mid, caret(&mid), None),
             "{title}"
         );
@@ -554,7 +561,7 @@ fn claude_code_2_1_318_under_the_usage_tap_reads_its_title_beside_the_screen() {
     let done = screen(TAP_DONE_2_1_318);
     assert!(!title_live(&done, Some(true)), "its done row");
     for title in RUNNING {
-        let r = read_seen(Some("claude"), &done, caret(&done), None, Some(title));
+        let r = read_seen(Some("claude"), &done, caret(&done), None, Some(title), None);
         assert_eq!(r, read_at(Some("claude"), &done, caret(&done), None));
         assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
     }
@@ -575,7 +582,14 @@ fn claude_code_2_1_318_under_the_usage_tap_reads_its_title_beside_the_screen() {
         "the screen alone"
     );
     for title in RUNNING {
-        let r = read_seen(Some("claude"), &drawn, caret(&drawn), None, Some(title));
+        let r = read_seen(
+            Some("claude"),
+            &drawn,
+            caret(&drawn),
+            None,
+            Some(title),
+            None,
+        );
         assert_eq!(
             (r.phase.clone(), r.phase_authoritative, r.wall.is_none()),
             (Phase::Busy, true, true),
@@ -585,12 +599,12 @@ fn claude_code_2_1_318_under_the_usage_tap_reads_its_title_beside_the_screen() {
             busy_seen(&drawn, Some(true))
                 .map(|b| b.to_string())
                 .as_deref(),
-            Some("title: running")
+            Some("run sign: running")
         );
     }
     for title in NOT_RUNNING {
         assert_eq!(
-            read_seen(Some("claude"), &drawn, caret(&drawn), None, title),
+            read_seen(Some("claude"), &drawn, caret(&drawn), None, title, None),
             alone,
             "{title:?}"
         );
@@ -604,15 +618,15 @@ fn claude_code_2_1_318_under_the_usage_tap_reads_its_title_beside_the_screen() {
 fn muse_codes_spinner_title_holds_its_idle_busy() {
     let rows = screen(MUSE_IDLE);
     assert_eq!(MuseReader.phase(&rows), Phase::Idle, "the control frame");
-    let spinning = MuseReader.runs(Some("⠙ proj"));
+    let spinning = MuseReader.runs(Some("⠙ proj"), None);
     assert_eq!(spinning, Some(true));
     assert_eq!(MuseReader.phase_seen(&rows, spinning), Phase::Busy);
     assert_eq!(
-        read_seen(Some("muse"), &rows, None, None, Some("⠙ proj")).phase,
+        read_seen(Some("muse"), &rows, None, None, Some("⠙ proj"), None).phase,
         Phase::Busy
     );
     for title in [Some("proj"), Some(""), None] {
-        let runs = MuseReader.runs(title);
+        let runs = MuseReader.runs(title, None);
         assert_eq!(MuseReader.phase_seen(&rows, runs), Phase::Idle, "{title:?}");
     }
     // A run its status row shows is no run only the title says: the supervisor waits that row
@@ -631,7 +645,184 @@ fn muse_codes_spinner_title_holds_its_idle_busy() {
     assert_eq!(MuseReader.phase_seen(&busy, spinning), Phase::Busy);
     for p in Program::ALL {
         if !matches!(p, Program::Claude | Program::Muse) {
-            assert_eq!(p.reader().runs(Some("⠙ proj")), None, "{}", p.name());
+            assert_eq!(p.reader().runs(Some("⠙ proj"), None), None, "{}", p.name());
+        }
+    }
+}
+
+/// Claude Code's report of a running turn as the terminal carries it (`program_report`): what
+/// 2.1.323 writes once its query is answered, before the frame that shows the turn.
+const WORKING: &str = "state=working:app=claude-code";
+
+/// Its reports of no running turn, as the terminal carries them: at rest, a turn done, a turn
+/// failed, and a box (2.1.323 lab).
+const RESTING: [&str; 4] = [
+    "state=idle:app=claude-code",
+    "state=done:app=claude-code",
+    "state=error:app=claude-code",
+    "state=blocked:app=claude-code:kind=permission",
+];
+
+/// The titles Claude Code writes with its query answered: no glyph, and none during its trust
+/// dialog; and no title from a host that sends none.
+const ANSWERED_TITLES: [Option<&str>; 3] = [Some("Claude Code"), Some(""), None];
+
+/// A reply half drawn under a status line with Claude Code's query answered
+/// (2.1.323 lab): its title `Claude Code` carries no run glyph, and the report standing says
+/// `working`, which holds the frame Busy (`run sign: running`). The 2.1.311 frames of a reply
+/// still being drawn read the same under that report.
+#[test]
+fn a_working_report_holds_a_reply_drawn_under_a_glyphless_title_busy() {
+    for (name, text) in [
+        ("2.1.323 answered", STATUSLINE_MIDREPLY_ANSWERED_2_1_323),
+        ("2.1.311 mid-reply", STATUSLINE_MIDREPLY_2_1_311),
+        ("2.1.311 last line held", STATUSLINE_LAST_LINE_HELD_2_1_311),
+    ] {
+        let rows = screen(text);
+        assert_eq!(
+            busy_signal(&rows),
+            None,
+            "{name}: the screen alone shows nothing"
+        );
+        for title in ANSWERED_TITLES {
+            let runs = ClaudeReader.runs(title, Some(WORKING));
+            assert_eq!(runs, Some(true), "{name} {title:?}");
+            let r = read_seen(
+                Some("claude"),
+                &rows,
+                caret(&rows),
+                None,
+                title,
+                Some(WORKING),
+            );
+            assert_eq!(
+                (r.phase.clone(), r.phase_authoritative, r.wall.is_none()),
+                (Phase::Busy, true, true),
+                "{name} under {title:?}: {r:?}"
+            );
+            assert_eq!(
+                busy_seen(&rows, runs).map(|b| b.to_string()).as_deref(),
+                Some("run sign: running"),
+                "{name}"
+            );
+            assert_eq!(background_rest_seen(&rows, runs), None, "{name}");
+        }
+    }
+}
+
+/// Negative control: the 2.1.323 frame with no report standing reads as it reads today, idle,
+/// under every title it writes with its query answered: the title alone says no run.
+#[test]
+fn with_no_report_the_answered_reply_reads_as_the_screen_alone() {
+    let rows = screen(STATUSLINE_MIDREPLY_ANSWERED_2_1_323);
+    let alone = read_at(Some("claude"), &rows, caret(&rows), None);
+    assert_eq!(
+        (alone.phase.clone(), alone.phase_authoritative),
+        (Phase::Idle, true),
+        "the screen alone"
+    );
+    for title in ANSWERED_TITLES {
+        let runs = ClaudeReader.runs(title, None);
+        assert_ne!(runs, Some(true), "{title:?}");
+        assert_eq!(
+            read_seen(Some("claude"), &rows, caret(&rows), None, title, None),
+            alone,
+            "{title:?}"
+        );
+    }
+}
+
+/// A report of no running turn says the run is over, whatever the title: the frames read as the
+/// screen alone reads them, and the done row under `done` reads idle with every `NEEDS YOU` line.
+#[test]
+fn a_resting_report_reads_every_frame_as_the_screen_alone() {
+    for text in [
+        STATUSLINE_MIDREPLY_ANSWERED_2_1_323,
+        STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311,
+        WATCHDOG_STATUSLINE,
+    ] {
+        let rows = screen(text);
+        let alone = read_at(Some("claude"), &rows, caret(&rows), None);
+        for report in RESTING {
+            for title in [Some("Claude Code"), Some(RUNNING[0]), None] {
+                assert_eq!(
+                    ClaudeReader.runs(title, Some(report)),
+                    Some(false),
+                    "{report}"
+                );
+                assert_eq!(
+                    read_seen(
+                        Some("claude"),
+                        &rows,
+                        caret(&rows),
+                        None,
+                        title,
+                        Some(report)
+                    ),
+                    alone,
+                    "{report} {title:?}"
+                );
+            }
+        }
+    }
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let r = read_seen(
+        Some("claude"),
+        &done,
+        caret(&done),
+        None,
+        Some("Claude Code"),
+        Some(RESTING[1]),
+    );
+    assert_eq!(
+        (r.phase.clone(), r.phase_authoritative, needs(&r)),
+        (Phase::Idle, true, 4)
+    );
+}
+
+/// A report Claude Code did not write, or one this reader cannot read, says nothing: the title
+/// says, as with no report. Its reports' `kind` and base64 `msg` are read past, and no other
+/// reader takes a report.
+#[test]
+fn a_report_claude_code_did_not_write_leaves_the_run_to_the_title() {
+    for report in [
+        "state=working:app=codex",
+        "state=working:app=grok-build",
+        "state=working:app=muse",
+        "state=working",
+        "app=claude-code",
+        "state=busy:app=claude-code",
+        "state=working:app=claude-code:state=idle",
+        "state=working:app=claude-code:app=codex",
+        "state=working:app=claude-code:id",
+        "",
+    ] {
+        assert_eq!(crate::phase::report_runs(report), None, "{report:?}");
+        for (title, runs) in [
+            (Some(RUNNING[0]), Some(true)),
+            (Some("✳ Claude Code"), Some(false)),
+            (Some("Claude Code"), Some(false)),
+            (None, None),
+        ] {
+            assert_eq!(
+                ClaudeReader.runs(title, Some(report)),
+                runs,
+                "{report:?} {title:?}"
+            );
+        }
+    }
+    assert_eq!(
+        crate::phase::report_runs("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZQ=="),
+        Some(false)
+    );
+    assert_eq!(
+        crate::phase::report_runs("state=error:app=claude-code:msg=QVBJIEVycm9y"),
+        Some(false)
+    );
+    for p in Program::ALL {
+        if p != Program::Claude {
+            assert_eq!(p.reader().runs(None, Some(WORKING)), None, "{}", p.name());
         }
     }
 }

@@ -165,7 +165,7 @@ fn running_page() -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).expect("the headless window");
+        let mut window = app.windows.get_mut(&wid).expect("the headless window");
         // 975×840 points of the cells a 2x window's font makes (15×28 px, 130×60 of them): the
         // running row's spinner sits at y 680, so it shows.
         window.metrics.font_px = crate::font_px_for_scale(window.metrics.font_px, 2.0);
@@ -286,6 +286,7 @@ fn page_cases(frames: usize) -> Vec<MotionCost> {
         if let Some(cache) = app
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.leaf_render_cache.get_mut(&view))
         {
             cache.native_damage = Some(native_app::DamageRegion::Rect {

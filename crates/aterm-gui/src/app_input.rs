@@ -3674,7 +3674,8 @@ impl App {
             self.clear_move_license_keeping_hand(wid);
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx
                 .cursor_mut()
                 .glow
@@ -3685,7 +3686,8 @@ impl App {
 
     /// [`Self::clear_move_license_from`] for a boundary that cannot take the hand off its row.
     pub(crate) fn clear_move_license_keeping_hand(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let fx = ws.fx.cursor_mut();
             fx.glow.clear_typed_keeping_hand(input_clock());
             fx.trail.clear_typed();
@@ -3755,13 +3757,15 @@ impl App {
     pub(crate) fn reconcile_licence(&mut self, wid: WindowId) {
         let front = self.front_terminal(wid).map(|terminal| terminal.session);
         let pool = &self.pool;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let owed = crate::licence_fence::owed(&mut ws.licence_seen, front, |session| {
             pool.get(session).map(|owner| owner.ctx.licence.clone())
         });
         if let Some(keep_hand) = owed {
+            drop(route_guard_ws);
             self.fence_move_license_from(wid, keep_hand, BoundaryOrigin::ControlFence);
         }
     }
@@ -3805,7 +3809,8 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx
                 .companions_mut()
                 .tone_tracker
@@ -3983,7 +3988,8 @@ impl App {
         };
         self.kitty_log
             .favourite(&sighting, &rs.lexicon, now, enabled);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.companions_mut().cursor_cat.on_collect(now, look);
             if let Some(w) = ws.os_window.as_ref() {
                 w.request_redraw();
@@ -4010,7 +4016,8 @@ impl App {
         let Some(look) = self.kitty_log.wear(key, now, enabled) else {
             return Err(format!("no cat named {key:?} in the collection"));
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.fx.companions_mut().cursor_cat.on_collect(now, look);
             if let Some(w) = ws.os_window.as_ref() {
                 w.request_redraw();
@@ -4089,9 +4096,10 @@ impl App {
         if !rs.cfg.feline {
             return;
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if hit.profanity
             && ws.fx.companions_mut().cursor_cat.on_curse(now, 1)
             && let Some(w) = ws.os_window.as_ref()
@@ -4113,9 +4121,10 @@ impl App {
             &mut self.kitty_summon_seq,
             aterm_effects::kitty_summon::DOG_SUMMON_IDENT_TAG,
         );
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.fx.companions_mut().dog_cameo.on_summon(now, seed);
         ws.fx.companions_mut().dog_cameo_session = Some(session);
         if let Some(w) = ws.os_window.as_ref() {
@@ -4282,7 +4291,7 @@ impl App {
         }
         let _audit = src;
         if is_present_recovery_stimulus(&ev)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.rearm_present(false);
         }
@@ -4293,7 +4302,7 @@ impl App {
             && self
                 .windows
                 .get_mut(&wid)
-                .is_some_and(|ws| ws.overlay_consumed_keys.remove(key))
+                .is_some_and(|mut ws| ws.overlay_consumed_keys.remove(key))
         {
             return InputOutcome::Ok;
         }
@@ -4328,7 +4337,7 @@ impl App {
                     key, event_type, ..
                 } = &ev
                     && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.overlay_consumed_keys.insert(key.clone());
                 }
@@ -4357,7 +4366,7 @@ impl App {
                 key, event_type, ..
             } = &ev
                 && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.overlay_consumed_keys.insert(key.clone());
             }
@@ -4368,7 +4377,7 @@ impl App {
                 key, event_type, ..
             } = &ev
                 && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.overlay_consumed_keys.insert(key.clone());
             }
@@ -4379,7 +4388,7 @@ impl App {
                 key, event_type, ..
             } = &ev
                 && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.overlay_consumed_keys.insert(key.clone());
             }
@@ -4444,6 +4453,14 @@ impl App {
                 if matches!(src, Source::Human) && self.pool.is_rewound(target) {
                     return InputOutcome::Ok;
                 }
+                let person_ctx = (matches!(src, Source::Human)
+                    && !self.person_gesture_refused()
+                    && crate::human_input::is_person_gesture(&ev))
+                .then(|| self.pool.get(target).map(|owner| owner.ctx.clone()))
+                .flatten();
+                let _person_delivery = person_ctx
+                    .as_ref()
+                    .map(|ctx| ctx.human_input.begin_delivery());
                 self.note_person_input(target, &ev, src);
                 return self.input_to_hidden_session(target, ev, phase, completion);
             };
@@ -4500,9 +4517,9 @@ impl App {
             && crate::rewind::withheld(&ev)
         {
             if let InputEvent::MouseMove { row, col, side, .. } = ev
-                && let Some(ws) = self.windows.get_mut(&wid).filter(|ws| ws.selecting)
+                && self.windows.get(&wid).is_some_and(|ws| ws.selecting)
             {
-                ws.last_mouse_side = side;
+                self.windows.get_mut(&wid).unwrap().last_mouse_side = side;
                 self.drag_selection(wid, row, col);
                 return InputOutcome::Ok;
             }
@@ -4511,6 +4528,14 @@ impl App {
             }
             return InputOutcome::Ok;
         }
+        let person_ctx = (matches!(src, Source::Human)
+            && !self.person_gesture_refused()
+            && crate::human_input::is_person_gesture(&ev))
+        .then(|| self.pool.get(session).map(|owner| owner.ctx.clone()))
+        .flatten();
+        let _person_delivery = person_ctx
+            .as_ref()
+            .map(|ctx| ctx.human_input.begin_delivery());
         self.note_person_input(session, &ev, src);
         let input_now = match &ev {
             InputEvent::Key {
@@ -4524,10 +4549,10 @@ impl App {
             _ => None,
         };
         if let (InputEvent::Paste(..), Some(now)) = (&ev, input_now)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             // The pasted text's echo cannot be told from the held keys'.
-            crate::aos_host::refute_hold(ws, now);
+            crate::aos_host::refute_hold(&mut ws, now);
         }
         match ev {
             ev @ (InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)) => {
@@ -4611,11 +4636,11 @@ impl App {
                             .windows
                             .get_mut(&wid)
                             .filter(|ws| ws.predictor.wants_key_row())
-                            .map(|ws| std::mem::take(&mut ws.predict_key_row)),
+                            .map(|mut ws| std::mem::take(&mut ws.predict_key_row)),
                         Some(PredictKey::Edit(_)) if pediting => self
                             .windows
                             .get_mut(&wid)
-                            .map(|ws| std::mem::take(&mut ws.predict_key_row)),
+                            .map(|mut ws| std::mem::take(&mut ws.predict_key_row)),
                         Some(PredictKey::Edit(_)) | None => None,
                     };
                     let kitty_keyed_arrow = matches!(
@@ -4680,7 +4705,7 @@ impl App {
                             self.glow_style(),
                             crate::cursor_glow::GlowStyle::RainbowKitty
                         );
-                    if !inert_modifier && let Some(ws) = self.windows.get_mut(&wid) {
+                    if !inert_modifier && let Some(mut ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
                         ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
                         ws.last_key_at = Some(input_now);
@@ -4801,7 +4826,8 @@ impl App {
                     vim_input = self.prepare_vim_input(wid, &ev, typed_forward == Some(true));
                     let keeps_hand = line_edit_key
                         || (!inert_modifier && !supersedes && self.boundary_keeps_hand(wid));
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         if let Some(prompt) =
                             front_prompt.filter(|_| line_terminator || keyed_enter)
                         {
@@ -5118,7 +5144,8 @@ impl App {
                     {
                         // Split panes predict too: `sync_window` resets the predictor
                         // when the focused pane or tab changes.
-                        if let Some(ws) = self.windows.get_mut(&wid) {
+                        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                            let ws = &mut **route_guard_ws;
                             let now = input_now;
                             let was_displaying = ws.predictor.is_displaying(now);
                             let op_before = ws.predictor.newest_op();
@@ -5230,7 +5257,7 @@ impl App {
                     written.as_ref(),
                 );
                 if let Some(written) = written
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     crate::aos_host::echo::note_written(&mut ws.aos, written);
                 }
@@ -5245,22 +5272,22 @@ impl App {
                 }
                 if swallowed_press
                     && !outcome.failed()
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.fx.cursor_mut().glow.note_typed_swallowed_no_echo();
                 }
                 if outcome == InputOutcome::Ok
                     && (!wrote_inline || receipt.accepted_order().is_some())
                     && let (Some(now), Some(kind)) = (input_now, console_input)
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.fx.companion_mut().note_console_input(now, kind);
                 }
                 if (!wrote_inline || outcome.failed())
                     && let Some(armed_at) = input_now
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
-                    revoke_dispatch(ws, armed_at, outcome.failed());
+                    revoke_dispatch(&mut ws, armed_at, outcome.failed());
                 }
                 if !is_release {
                     if wrote_inline && receipt.accepted_order().is_some() {
@@ -5318,7 +5345,7 @@ impl App {
                         .map(|rs| rs.cfg.scan_opts())
                         .unwrap_or_default();
                     let summoned = match self.windows.get_mut(&wid) {
-                        Some(ws) => {
+                        Some(mut ws) => {
                             // The typed-edit witness (above), armed first: edits only
                             // (walking the caret over a word is not retyping it), scoped to
                             // this pane's session so it never re-arms another pane.
@@ -5370,7 +5397,8 @@ impl App {
                                 .allows(crate::motion::SeriousEffect::CursorCat);
                         let flash_on = self.sparkle.is_some();
                         match self.windows.get_mut(&wid) {
-                            Some(ws) => {
+                            Some(mut route_guard_ws) => {
+                                let ws = &mut **route_guard_ws;
                                 ws.trick_fire = ws.trick_fire.for_session(session);
                                 let TrickFeed {
                                     event,
@@ -5451,7 +5479,7 @@ impl App {
                     };
                     if let Some((trick, confirmed)) = pet_note
                         && self.trail_is_kitty_pet()
-                        && let Some(ws) = self.windows.get_mut(&wid)
+                        && let Some(mut ws) = self.windows.get_mut(&wid)
                     {
                         ws.fx
                             .companion_mut()
@@ -5479,7 +5507,8 @@ impl App {
                 } else {
                     unreachable!()
                 };
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.last_mouse_side = side;
                 }
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
@@ -5530,14 +5559,14 @@ impl App {
                 // the key arms do, or `ctl paste` into an unfocused window would
                 // paint nothing.
                 if let Some(now) = input_now
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.last_key_at = Some(now);
                     ws.predictor.note_unmodelled_input(now);
                     ws.trick_listener.rekey(session);
                     ws.trick_fire = ws.trick_fire.for_session(session);
                     if ws.trick_listener.note_break().event == Some(TrickEvent::Revoke) {
-                        revoke_trick_line(ws, now);
+                        revoke_trick_line(&mut ws, now);
                     }
                 }
                 self.input_paste(
@@ -5618,7 +5647,8 @@ impl App {
             && button == aterm_types::mouse::MouseButton::Left
             && fronted
         {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.last_mouse_cell = (row, col);
                 ws.last_mouse_side = side;
             }
@@ -5645,9 +5675,14 @@ impl App {
         }: PointerPath<'_>,
     ) -> InputOutcome {
         self.fence_pointer_license(wid);
-        if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
+        if let Some(route_guard_rain) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.fx.rain_mut())
             && modes.alternate_screen()
         {
+            let rain = &mut *route_guard_rain;
             rain.note_alt_scroll();
         }
         if let InputEvent::Wheel { mods, .. } = ev
@@ -5682,7 +5717,8 @@ impl App {
                     self.settle_scroll_motion_at_target(wid, now);
                     crate::term_lock_ui(term, ui_waiting, crate::metrics::TermWaitSite::Mouse)
                         .scroll_display(delta);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.scroll_pill.touch(now);
                         if let Some(w) = ws.os_window.as_ref() {
                             w.request_redraw();
@@ -5734,7 +5770,8 @@ impl App {
         wid: WindowId,
         now: std::time::Instant,
     ) -> bool {
-        let Some((glide, redraw, changed)) = self.windows.get_mut(&wid).map(|ws| {
+        let Some((glide, redraw, changed)) = self.windows.get_mut(&wid).map(|mut ws| {
+            let ws = &mut **ws;
             let glide = ws.scroll_glide.take();
             let overscroll = ws.overscroll.take();
             let changed = glide.is_some() || overscroll.is_some() || ws.scroll_frac_px != 0;
@@ -5884,7 +5921,8 @@ impl App {
             };
             shown.scroll_display(delta_rows);
             drop(shown);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.scroll_pill.touch(now);
                 if let Some(w) = ws.os_window.as_ref() {
                     w.request_redraw();
@@ -5927,9 +5965,10 @@ impl App {
                 )
             }
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let tick_interval = ws.frame_interval.unwrap_or(app_interval);
         if let Some(dy_px) = precise {
             // Direct manipulation: the band goes where the finger is. A fresh gesture
@@ -5961,10 +6000,12 @@ impl App {
                 (excess, (pos >= max_px, pos <= 0))
             });
             let (at_top, at_live) = edges;
+            drop(route_guard_ws);
             self.apply_scroll_glide_sample(wid, now);
-            let Some(ws) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                 return;
             };
+            let ws = &mut **route_guard_ws;
             let stale = ws.overscroll.as_ref().is_some_and(|sp| {
                 let d = sp.sample(now).0;
                 (d <= 0.0 && !at_top) || (d >= 0.0 && !at_live)
@@ -6037,9 +6078,10 @@ impl App {
     /// Presents the glide's sample at `now`.
     fn apply_scroll_glide_sample(&mut self, wid: WindowId, now: std::time::Instant) {
         let app_interval = self.frame_interval;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some((term, cell_h, pos_px, mut done, engine_row)) =
             ws.scroll_glide.as_ref().map(|st| {
                 let (pos, done) = st.glide.sample(now);
@@ -6059,6 +6101,7 @@ impl App {
             let mut t = term_lock(&term);
             if t.grid().reflow_offload_in_flight() {
                 drop(t);
+                drop(route_guard_ws);
                 self.settle_scroll_motion_at_target(wid, now);
                 return;
             }
@@ -6147,10 +6190,11 @@ impl App {
         }
         for id in glide_due {
             self.tick_scroll_glide(id, now);
-            if let Some(ws) = self.windows.get_mut(&id)
-                && let Some(sp) = ws.overscroll.as_ref()
-            {
-                ws.scroll_frac_px = sp.sample(now).0.round() as i32;
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&id) {
+                let ws = &mut **route_guard_ws;
+                if let Some(sp) = ws.overscroll.as_ref() {
+                    ws.scroll_frac_px = sp.sample(now).0.round() as i32;
+                }
             }
             ticked.push(id);
             if !bounce_due.contains(&id)
@@ -6183,9 +6227,10 @@ impl App {
     pub(crate) fn tick_overscroll(&mut self, wid: WindowId, now: std::time::Instant) {
         let animate = self.smooth_scroll_animates(wid);
         let app_interval = self.frame_interval;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some((disp, done)) = ws.overscroll.as_ref().map(|sp| sp.sample(now)) else {
             return;
         };
@@ -6228,9 +6273,14 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
     ) -> InputOutcome {
         self.clear_move_license_from(wid, BoundaryOrigin::Scroll);
-        if let Some(rain) = self.windows.get_mut(&wid).and_then(|ws| ws.fx.rain_mut())
+        if let Some(route_guard_rain) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.fx.rain_mut())
             && term_lock(term).is_alternate_screen()
         {
+            let rain = &mut *route_guard_rain;
             rain.note_alt_scroll();
         }
         {
@@ -6253,7 +6303,8 @@ impl App {
             }
         }
         self.drop_front_scroll_motion(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.scroll_pill.touch(std::time::Instant::now());
         }
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -6307,7 +6358,7 @@ impl App {
             _ => None,
         };
         if let Some(prompt) = submitted
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.aos.note_submitted(session, prompt);
         }
@@ -6348,7 +6399,7 @@ impl App {
             }
         }
         self.snap_to_bottom(wid);
-        if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
+        if movement_capable && let Some(mut ws) = self.windows.get_mut(&wid) {
             ws.fx.cursor_mut().glow.note_user_gesture(input_now);
             ws.fx.cursor_mut().trail.note_user_gesture(input_now);
             ws.erase_prices.push_zeros(erase_zeros);
@@ -6358,8 +6409,8 @@ impl App {
                 w.request_redraw();
             }
         }
-        if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
-            revoke_dispatch(ws, input_now, false);
+        if movement_capable && let Some(mut ws) = self.windows.get_mut(&wid) {
+            revoke_dispatch(&mut ws, input_now, false);
             ws.fx
                 .companion_mut()
                 .note_console_input(input_now, PetInputKind::Paste);
@@ -6424,7 +6475,8 @@ impl App {
             return InputOutcome::NotApplied("resize px: no window to resize");
         };
         #[cfg(target_os = "linux")]
-        if let Some(ws) = self.windows.get_mut(&target) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&target) {
+            let ws = &mut **route_guard_ws;
             ws.initial_frame_settle = None;
         }
         let held = self.held_window_size(target, asked);
@@ -6436,7 +6488,8 @@ impl App {
                 // fed through the event's path.
                 if let Some(applied) = w.request_inner_size(held) {
                     crate::metrics::note_resize_arrival();
-                    if let Some(ws) = self.windows.get_mut(&target) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&target) {
+                        let ws = &mut **route_guard_ws;
                         ws.win_px = Some(applied);
                         ws.last_resized_event_at = Some(std::time::Instant::now());
                     }
@@ -6524,7 +6577,8 @@ impl App {
             physical_key,
             crate::PhysicalPressOwner::Consumed { window: wid },
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.consumed_press_keys.insert(physical_key);
         }
     }
@@ -6723,7 +6777,8 @@ impl App {
                 action,
             },
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.consumed_press_keys.insert(physical_key);
         }
     }
@@ -7029,7 +7084,8 @@ impl App {
             return false;
         };
         self.physical_press_owners.remove(&physical_key);
-        if let Some(ws) = self.windows.get_mut(&window) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&window) {
+            let ws = &mut **route_guard_ws;
             ws.consumed_press_keys.remove(&physical_key);
         }
         #[cfg(test)]
@@ -7094,7 +7150,8 @@ impl App {
             return false;
         };
         self.physical_press_owners.remove(&physical_key);
-        if let Some(ws) = self.windows.get_mut(&window) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&window) {
+            let ws = &mut **route_guard_ws;
             ws.consumed_press_keys.remove(&physical_key);
         }
         #[cfg(test)]
@@ -7473,10 +7530,23 @@ impl App {
                 (!text.is_empty()).then(|| read(&[text]))
             }
             Some(crate::native_app::AppViewState::Tables(state)) => {
+                let crate::native_app::NativeApp::Tables(app) =
+                    self.native_runtime.app(instance)?
+                else {
+                    return None;
+                };
                 let key = state.common.last_focus.as_ref()?;
-                let text = crate::native_tables::TablesApp::field_input(state, key.as_str())?
-                    .selected_text();
-                (!text.is_empty()).then(|| read(&[text]))
+                match crate::native_tables::TablesApp::field_input(state, key.as_str()) {
+                    Some(input) => {
+                        let text = input.selected_text();
+                        (!text.is_empty()).then(|| read(&[text]))
+                    }
+                    // The selected cell, or the range's cells as tab-separated lines.
+                    None => {
+                        let cells = app.selection_tsv(state)?;
+                        Some(read(&[cells.as_str()]))
+                    }
+                }
             }
             Some(
                 crate::native_app::AppViewState::About(_)
@@ -7522,7 +7592,8 @@ impl App {
                 self.fence_move_license_from(wid, keep_hand, BoundaryOrigin::PhysicalPress)
             }
             None if !inert => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.fx.cursor_mut().glow.supersede_typed_press();
                 }
             }
@@ -8157,7 +8228,7 @@ impl App {
                     // The last pane marks its originating window for closure;
                     // `window_event` closes it after `on_key` returns.
                     if let Some(closed) = self.close_active_tab_in(wid)
-                        && let Some(ws) = self.windows.get_mut(&closed)
+                        && let Some(mut ws) = self.windows.get_mut(&closed)
                     {
                         ws.pending_close = true;
                     }
@@ -8493,9 +8564,10 @@ impl App {
         let front = self
             .front_terminal(wid)
             .map(|terminal| terminal.term.clone());
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let elsewhere = ws.scroll_glide.as_ref().is_some_and(|glide| {
             front
                 .as_ref()
@@ -8660,7 +8732,8 @@ impl App {
                     ..
                 } => {
                     self.close_tab_menu(wid);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.tab_menu_consumed_button = Some(*button);
                     }
                     true
@@ -8683,11 +8756,12 @@ impl App {
                     pressed: false,
                     ..
                 } => {
-                    if let Some(ws) = self.windows.get_mut(&wid)
-                        && ws.tab_menu_consumed_button == Some(*button)
-                    {
-                        ws.tab_menu_consumed_button = None;
-                        return true;
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
+                        if ws.tab_menu_consumed_button == Some(*button) {
+                            ws.tab_menu_consumed_button = None;
+                            return true;
+                        }
                     }
                 }
                 InputEvent::MouseMove { .. } => return true,
@@ -8715,10 +8789,11 @@ impl App {
 
     /// Set the open menu's highlight and repaint if it moved.
     fn set_tab_menu_highlight(&mut self, wid: WindowId, to: Option<usize>) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some(menu) = ws.tab_menu.as_mut() else {
+        let ws = &mut **route_guard_ws;
+        let Some(menu) = ws.routing.menu_mut() else {
             return;
         };
         if menu.highlight == to {
@@ -8758,7 +8833,7 @@ impl App {
             }
             Action::CloseTab => {
                 if let Some(closed) = self.close_active_tab_in(wid)
-                    && let Some(ws) = self.windows.get_mut(&closed)
+                    && let Some(mut ws) = self.windows.get_mut(&closed)
                 {
                     ws.pending_close = true;
                 }
@@ -8922,14 +8997,18 @@ impl App {
                 .get(&wid)
                 .is_some_and(|window| window.ime_compose.is_none_or(|(_, ended)| ended));
         if starts {
-            let previous = self.windows.get_mut(&wid).and_then(|window| {
-                window.ime_recipient.replace(ImeComposition {
-                    cancelled: recipient.surface == PreeditOwner::Native
-                        && recipient.native.is_none(),
-                    recipient: recipient.clone(),
-                    by: aterm_window::event::InputOrigin::Person,
-                })
-            });
+            let previous = self
+                .windows
+                .get_mut(&wid)
+                .as_deref_mut()
+                .and_then(|window| {
+                    window.ime_recipient.replace(ImeComposition {
+                        cancelled: recipient.surface == PreeditOwner::Native
+                            && recipient.native.is_none(),
+                        recipient: recipient.clone(),
+                        by: aterm_window::event::InputOrigin::Person,
+                    })
+                });
             if let Some(previous) = previous {
                 self.cancel_ime_projection(&previous.recipient);
             }
@@ -8939,13 +9018,15 @@ impl App {
             && let Some(composition) = self
                 .windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|window| window.ime_recipient.as_mut())
         {
             composition.by = composition.by.max(origin);
         }
         let accepted = self.check_ime_recipient(wid);
         let mut changed = false;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let caret = cursor.map(|(start, _end)| start);
             let native =
                 ws.ime_recipient.as_ref().is_some_and(|composition| {
@@ -9002,20 +9083,23 @@ impl App {
 
     /// The platform turned text input on or off (`Ime::Enabled` / `Ime::Disabled`).
     pub(crate) fn on_ime_enablement_changed(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_ime_rect = None;
         }
         self.on_ime_preedit(wid, String::new(), None);
-        if let Some(composition) = self
+        if let Some(mut route_guard_composition) = self
             .windows
             .get_mut(&wid)
-            .and_then(|window| window.ime_recipient.take())
+            .and_then(|mut window| window.ime_recipient.take())
         {
+            let composition = &mut route_guard_composition;
             self.cancel_ime_projection(&composition.recipient);
         }
         if self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.ime_compose.take())
             .is_some()
         {
@@ -9072,9 +9156,10 @@ impl App {
 
     /// Window-space physical caret box shared by terminal cells and native text fields.
     pub(crate) fn report_ime_cursor_rect(&mut self, wid: WindowId, rect: (i32, i32, u32, u32)) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws.last_ime_rect == Some(rect) {
             return;
         }
@@ -9096,13 +9181,15 @@ impl App {
         if as_paste {
             self.clear_move_license_keeping_hand(wid);
         } else if reaches_pty {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.fx.cursor_mut().glow.supersede_typed_press();
             }
         } else {
             self.clear_move_license_from(wid, BoundaryOrigin::ImeCommit);
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.preedit.clear();
             ws.preedit_caret = None;
             ws.ime_recipient = None;
@@ -9177,6 +9264,10 @@ impl App {
     /// Whether window `wid`'s Option keys should be an Alt
     /// ([`crate::platform::set_option_as_alt`]).
     pub(crate) fn option_is_alt(&self, wid: WindowId) -> bool {
+        #[cfg(test)]
+        if let Some(ws) = self.windows.get(&wid) {
+            ws.routing.signal().record_evaluation();
+        }
         self.option_as_meta && (self.typing_reaches_grid(wid) || self.typing_reaches_editor(wid))
     }
 
@@ -9185,21 +9276,27 @@ impl App {
         let Some((_, view)) = self.active_native_view(wid) else {
             return false;
         };
-        matches!(
-            self.native_runtime.view_state(view),
-            Some(crate::native_app::AppViewState::Editor(state))
-                if state.markdown.as_ref().is_none_or(|workspace| workspace.editor_focused())
-        ) && self.inline_rename_edit(wid).is_none()
+        self.native_runtime
+            .view_state(view)
+            .is_some_and(crate::native_app::AppViewState::editor_has_typing_focus)
+            && self.inline_rename_edit(wid).is_none()
             && self
                 .windows
                 .get(&wid)
                 .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none())
     }
 
-    /// Bring every window's Option keys to [`Self::option_is_alt`].
-    pub(crate) fn sync_option_as_alt(&self) {
-        for (wid, ws) in &self.windows {
-            let alt = self.option_is_alt(*wid);
+    /// Reconcile only windows whose authoritative route inputs changed.
+    pub(crate) fn sync_option_as_alt(&mut self) {
+        for wid in self.windows.take_pending(self.option_as_meta) {
+            let Some(ws) = self.windows.get(&wid) else {
+                continue;
+            };
+            if let Some((_, view)) = self.active_native_view(wid) {
+                self.native_runtime
+                    .bind_option_route(view, ws.routing.signal().clone());
+            }
+            let alt = self.option_is_alt(wid);
             if ws.option_as_alt.replace(alt) != alt
                 && let Some(window) = ws.os_window.as_ref()
             {
@@ -9419,18 +9516,19 @@ impl App {
         let retired: Vec<_> = self
             .windows
             .values_mut()
-            .filter_map(|window| window.ime_recipient.as_mut())
-            .filter(|composition| {
-                !composition.cancelled
-                    && composition
+            .filter_map(|mut window| {
+                let composition = window.ime_recipient.as_mut()?;
+                if composition.cancelled
+                    || !composition
                         .recipient
                         .native
                         .as_ref()
                         .is_some_and(|native| native.view == view)
-            })
-            .map(|composition| {
+                {
+                    return None;
+                }
                 composition.cancelled = true;
-                composition.recipient.clone()
+                Some(composition.recipient.clone())
             })
             .collect();
         for recipient in retired {
@@ -9454,9 +9552,9 @@ impl App {
     /// its remaining preedit or committed text to the new recipient.
     fn check_ime_recipient(&mut self, wid: WindowId) -> bool {
         let current = self.ime_recipient(wid);
-        let Some(composition) = self
-            .windows
-            .get_mut(&wid)
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(composition) = route_projection
+            .as_deref_mut()
             .and_then(|window| window.ime_recipient.as_mut())
         else {
             return true;
@@ -9469,6 +9567,7 @@ impl App {
         }
         composition.cancelled = true;
         let retired = composition.recipient.clone();
+        drop(route_projection);
         self.cancel_ime_projection(&retired);
         false
     }
@@ -9833,6 +9932,11 @@ impl App {
                     self.user_set_deck_size(pref);
                 }
             }
+            MenuAction::ShowSystemResourcesHere => {
+                if let Some(wid) = self.frontmost_window {
+                    let _ = self.toggle_window_band(wid);
+                }
+            }
             MenuAction::ToggleStatsLens => {
                 let _ = self.toggle_stats_lens();
             }
@@ -9953,6 +10057,7 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             MenuAction::SystemState => self.open_system_state_from_menu(),
+            MenuAction::Tables => self.open_tables_from_menu(),
             MenuAction::Allocation => {
                 if let Err(error) = self.open_allocation(true) {
                     self.pending_action_refusal = Some(error);
@@ -10054,7 +10159,7 @@ impl App {
         };
         // As the `Wake::CloseTab` handler: the last tab escalates the window.
         if self.close_tab_at(window, index)
-            && let Some(ws) = self.windows.get_mut(&window)
+            && let Some(mut ws) = self.windows.get_mut(&window)
         {
             ws.pending_close = true;
         }

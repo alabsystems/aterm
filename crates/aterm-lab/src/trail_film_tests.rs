@@ -214,6 +214,49 @@ fn the_busiest_second_is_half_open() {
     assert_eq!(most_in_a_second(&[]), (0, 0));
     assert_eq!(most_in_a_second(&[0, 500, 999, 1_000, 1_400]), (4, 1));
     assert_eq!(most_in_a_second(&[0, 1_000, 2_000]), (1, 0));
+    assert_eq!(most_within(&[7, 7, 8], 0), (0, 0));
+    assert_eq!(most_within(&[7, 7, 8], 1), (2, 0));
+    assert_eq!(most_within(&[0, 10, 10, 20], 10), (2, 1));
+    let last = u32::MAX;
+    assert_eq!(most_within(&[last - 1, last], 2), (2, 0));
+    assert_eq!(most_within(&[last, last], 1), (2, 0));
+    assert_eq!(most_within(&[0, last], last), (1, 0));
+    assert_eq!(most_within(&[1, last], last), (2, 0));
+}
+
+#[test]
+fn the_busiest_window_matches_its_mathematical_count() {
+    const TIMES: [u32; 6] = [0, 1, 2, u32::MAX - 2, u32::MAX - 1, u32::MAX];
+    const WINDOWS: [u32; 6] = [0, 1, 2, 3, 1_000, u32::MAX];
+
+    fn check(times: &mut Vec<u32>, first: usize) {
+        for window in WINDOWS {
+            let mut expected = (0, 0);
+            for (i, &start) in times.iter().enumerate() {
+                let count = times[i..]
+                    .iter()
+                    .filter(|&&time| u64::from(time) - u64::from(start) < u64::from(window))
+                    .count();
+                if count > expected.0 {
+                    expected = (count, i);
+                }
+            }
+            assert_eq!(
+                most_within(times, window),
+                expected,
+                "times={times:?}, window={window}"
+            );
+        }
+        if times.len() < 4 {
+            for i in first..TIMES.len() {
+                times.push(TIMES[i]);
+                check(times, i);
+                times.pop();
+            }
+        }
+    }
+
+    check(&mut Vec::new(), 0);
 }
 
 #[test]
@@ -581,6 +624,103 @@ fn the_page_excuses_no_flash_the_effects_carry_over_the_bound() {
         read(page.clone(), page, false),
         [none(), none(), none(), this(), none()]
     );
+}
+
+#[test]
+fn page_windows_include_the_clock_endpoint() {
+    let last = u32::MAX;
+    for step in [0, 16, 1_000, u32::MAX] {
+        assert!(over_wherever(&[last], &[last], 0, step));
+        assert!(!over_wherever(&[last], &[], 0, step));
+    }
+}
+
+#[test]
+fn page_windows_do_not_saturate_their_upper_edge() {
+    let last = u32::MAX;
+    for window in [984, 1_000] {
+        let (a, b) = (last - window, last - 1);
+        let times = [a, b, b, b, b, last];
+        let part = [a, b, b, b, last];
+        assert!(over_wherever(&times, &part, 1, SECOND_MS - window));
+        assert!(!over_wherever(
+            &times,
+            &[a, b, b, last],
+            1,
+            SECOND_MS - window
+        ));
+    }
+}
+
+#[test]
+fn every_page_window_matches_an_independent_subtractive_count() {
+    const TIMES: [u32; 6] = [0, 1, 6, u32::MAX - 6, u32::MAX - 1, u32::MAX];
+
+    fn oracle(times: &[u32], part: &[u32], window: u32, per: usize) -> bool {
+        // Every nonempty integer window starts within `window` positions before an event.
+        times.iter().all(|&time| {
+            (0..window).all(|delta| {
+                let Some(from) = u64::from(time).checked_sub(u64::from(delta)) else {
+                    return true;
+                };
+                let count = |events: &[u32]| {
+                    events
+                        .iter()
+                        .filter(|&&t| {
+                            u64::from(t)
+                                .checked_sub(from)
+                                .is_some_and(|d| d < u64::from(window))
+                        })
+                        .count()
+                };
+                count(times) <= per * FLASH_MOST || count(part) > per * FLASH_MOST
+            })
+        })
+    }
+
+    fn check(times: &mut Vec<u32>, first: usize) {
+        for window in [1, 2, 7] {
+            for mask in 0..(1usize << times.len()) {
+                let part: Vec<u32> = times
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &t)| ((mask & (1 << i)) != 0).then_some(t))
+                    .collect();
+                for per in [0, 1] {
+                    assert_eq!(
+                        over_wherever(times, &part, per, SECOND_MS - window),
+                        oracle(times, &part, window, per),
+                        "times={times:?}, part={part:?}, window={window}, per={per}"
+                    );
+                }
+            }
+        }
+        if times.len() < 4 {
+            for i in first..TIMES.len() {
+                times.push(TIMES[i]);
+                check(times, i);
+                times.pop();
+            }
+        }
+    }
+
+    check(&mut Vec::new(), 0);
+}
+
+#[test]
+fn page_attribution_keeps_the_last_turn_at_the_clock_endpoint() {
+    let times: Vec<u32> = (0..7).map(|k| u32::MAX - 768 + 128 * k).collect();
+    let turns: HashMap<u32, Vec<u32>> = [(10, times.clone())].into_iter().collect();
+    let read = |page: Vec<u32>| {
+        let page: HashMap<u32, Vec<u32>> = [(10, page)].into_iter().collect();
+        by_place(&turns, (2, 16), W, &HashMap::new(), &page).map(|read| read.over)
+    };
+    let (none, this) = (Vec::<u32>::new, || vec![10u32]);
+    assert_eq!(
+        read(times[..6].to_vec()),
+        [none(), none(), none(), none(), this()]
+    );
+    assert_eq!(read(times), [none(), none(), none(), this(), none()]);
 }
 
 #[test]
@@ -952,6 +1092,29 @@ fn a_calm_film_keeps_every_law() {
     // A folder with no film is an error, never a clean reading.
     let empty = aterm_tempfile::tempdir().expect("a scratch folder");
     assert!(judge_film(empty.path(), false).is_err());
+}
+
+/// THE CARET KEEPS 4.5:1 IN A FILM (CT-51 Rule 0): the caret's bar is the legibility law's, so a
+/// film whose caret reads 4.0 at its worst breaks it, where WCAG 1.4.11's 3:1 for a mark passed it.
+/// Negative control: a caret at the bar keeps the law.
+#[test]
+fn a_caret_under_the_legibility_bar_breaks_the_film() {
+    let dir = film(6, |_, _| {}, |_| NO_PET.to_string());
+    let mut read = judge_film(dir.path(), false).expect("the film reads");
+    read.contrast.caret_floor = Some((4.0, 48));
+    let broken = read.broken();
+    assert!(
+        broken
+            .iter()
+            .any(|l| l.contains("the caret reads 4.00:1 at 48 ms")),
+        "{broken:?}"
+    );
+    read.contrast.caret_floor = Some((LEGIBLE, 48));
+    assert!(
+        read.broken().is_empty(),
+        "negative control: {:?}",
+        read.broken()
+    );
 }
 
 #[test]

@@ -1914,12 +1914,30 @@ fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, D
     Ok(bindings)
 }
 
+/// `path` canonicalized through its deepest existing ancestor, the missing rest appended. That
+/// ancestor must be a directory: Windows reports a missing name under a regular file as
+/// `NotFound` where Unix reports `NotADirectory`, and either way no file can be made there.
 fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf, DocumentHostError> {
     let mut cursor = path;
     let mut suffix = Vec::new();
     loop {
         match fs::canonicalize(cursor) {
             Ok(mut existing) => {
+                if !suffix.is_empty() {
+                    let ancestor =
+                        fs::metadata(&existing).map_err(|error| DocumentHostError::Io {
+                            stage: AtomicSaveStage::Preflight,
+                            kind: Some(error.kind()),
+                            message: error.to_string(),
+                        })?;
+                    if !ancestor.is_dir() {
+                        return Err(DocumentHostError::Io {
+                            stage: AtomicSaveStage::Preflight,
+                            kind: Some(std::io::ErrorKind::NotADirectory),
+                            message: format!("{} is not a directory", existing.display()),
+                        });
+                    }
+                }
                 for component in suffix.iter().rev() {
                     existing.push(component);
                 }

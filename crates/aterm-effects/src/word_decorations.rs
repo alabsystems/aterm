@@ -431,34 +431,301 @@ thread_local! {
 pub const HEAD_FLIGHT: Duration = crate::kitty_cursor::CURSOR_FOLD_DURATION;
 
 /// The flying head's flight on one frame ([`HEAD_FLIGHT`]): where it took off (its sprite's
-/// top-left as last drawn), how far through the flight the frame is (`0..1`), and the arc's
-/// height at the middle, px.
+/// top-left as last drawn), how far through the flight the frame is (`0..1`), the arc's height
+/// at the middle, px, the way it goes ([`FlightPath`]) and the steps it takes there, px: one for
+/// the head, which glides there, and the glide's stride for the glide, which steps there as it
+/// steps along a typed line.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HeadFlightSample {
     from: (i32, i32),
     progress: f32,
     arc_px: i32,
+    path: FlightPath,
+    step: i32,
+    /// The size it was drawn at where it took off, px: a stepped flight goes from it to the
+    /// landing's size with its steps ([`Self::size`]); `(0, 0)` for the head, drawn at the
+    /// landing's size all the way.
+    from_wh: (u16, u16),
+    /// Whether a [`FlightPath::Fade`] goes out where it took off: not where the caret or ink the
+    /// program wrote has come under that place, where it comes in at the landing only.
+    out: bool,
+    /// The most steps it takes ([`flight_steps`] of its host's frame).
+    most_steps: i32,
 }
+
+/// How a flight goes from its take-off to its landing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlightPath {
+    /// Not yet laid over the page (the frame it took off on, before the letter law has read it).
+    Unplanned,
+    /// Straight, along a low arc.
+    Arc,
+    /// Up to the top `y` px first, across at it, and down to the landing last: over the line it
+    /// leaves or comes to, not through its letters or the caret
+    /// ([`WordDecorations::plan_kitty_cursor_flight`]).
+    Over(i32),
+    /// Out where it was over the flight's first [`FADE_OUT`] and in at the landing over the
+    /// rest, where every way there crosses letters or the caret (a full row between the two).
+    Fade,
+}
+
+/// The share of a [`FlightPath::Fade`] it takes to go out where it was: short, so a caret typed
+/// on does not reach it there.
+const FADE_OUT: f32 = 0.25;
+
+/// How long a [`FlightPath::Fade`] takes: the head's flight, or, where it does not go out where
+/// it took off ([`HeadFlightSample::out`]), the share of it the way in takes.
+fn fade_span(out: bool) -> Duration {
+    if out {
+        HEAD_FLIGHT
+    } else {
+        HEAD_FLIGHT.mul_f32(1.0 - FADE_OUT)
+    }
+}
+
+/// The longer side of the move from `a` to `b`, px.
+#[inline]
+const fn side(a: (i32, i32), b: (i32, i32)) -> i32 {
+    let (dx, dy) = ((b.0 - a.0).abs(), (b.1 - a.1).abs());
+    if dx > dy { dx } else { dy }
+}
+
+/// How soon after a stepped flight took off a flight back along its way fades instead of
+/// flying ([`WordDecorations::plan_kitty_cursor_flight`]): the flash law's second.
+const FLIGHT_BACK_WITHIN: Duration = Duration::from_secs(1);
+
+/// How long after `earlier` the flight that took off at `at` did.
+#[inline]
+fn flight_started(at: Instant, earlier: Instant) -> Duration {
+    at.saturating_duration_since(earlier)
+}
+
+/// A 60 Hz frame: a stepped flight's time a step in the terminal ([`HeadFlightSample::stepped`]);
+/// a host that draws less often (the settings preview) gives its own frame
+/// ([`WordDecorations::fly_kitty_glide`]), so each frame it draws shows one step.
+pub const FLIGHT_FRAME: Duration = Duration::from_micros(16_667);
+
+/// The most steps a stepped flight takes at a frame a step: the frames [`HEAD_FLIGHT`] holds
+/// (16 at 60 Hz), so the glide is no slower to a far caret than the head.
+fn flight_steps(frame: Duration) -> i32 {
+    let frame = frame.as_micros().max(1);
+    i32::try_from(HEAD_FLIGHT.as_micros() / frame)
+        .unwrap_or(i32::MAX)
+        .max(1)
+}
+
+/// The share of a flight [`FlightPath::Over`] spends rising to its height, and as much again
+/// coming down to the landing.
+const FLIGHT_CLIMB: f32 = 0.3;
 
 impl HeadFlightSample {
     /// Where the head is drawn on this frame of its flight to `to` (the landing's top-left):
-    /// eased out of the take-off and into the landing, along a low arc.
+    /// eased out of the take-off and into the landing, along a low arc, or over the line
+    /// ([`FlightPath::Over`]); in steps of [`Self::step`] px along the way where that is more
+    /// than one ([`Self::stepped`]).
     #[inline]
     fn at(self, to: (i32, i32)) -> (i32, i32) {
         let q = self.progress.clamp(0.0, 1.0);
-        let e = q * q * (3.0 - 2.0 * q);
-        let lerp = |a: i32, b: i32| -> i32 {
+        if self.step > 1 {
+            return self.stepped(to);
+        }
+        let ease = |q: f32| q * q * (3.0 - 2.0 * q);
+        let lerp = |a: i32, b: i32, e: f32| -> i32 {
             ((a as f64) + ((b as f64) - (a as f64)) * f64::from(e))
                 .round()
                 .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
         };
-        let lift = (self.arc_px as f32 * 4.0 * q * (1.0 - q)).round() as i32;
-        (
-            lerp(self.from.0, to.0),
-            lerp(self.from.1, to.1).saturating_sub(lift),
-        )
+        let FlightPath::Over(top) = self.path else {
+            let lift = (self.arc_px as f32 * 4.0 * q * (1.0 - q)).round() as i32;
+            return (
+                lerp(self.from.0, to.0, ease(q)),
+                lerp(self.from.1, to.1, ease(q)).saturating_sub(lift),
+            );
+        };
+        let rise = if self.from.1 > top { FLIGHT_CLIMB } else { 0.0 };
+        let fall = if to.1 > top { FLIGHT_CLIMB } else { 0.0 };
+        let across = (1.0 - rise - fall).max(f32::EPSILON);
+        let x = lerp(
+            self.from.0,
+            to.0,
+            ease(((q - rise) / across).clamp(0.0, 1.0)),
+        );
+        let y = if q < rise {
+            lerp(self.from.1, top, ease(q / rise))
+        } else if q > 1.0 - fall {
+            lerp(top, to.1, ease((q - (1.0 - fall)) / fall))
+        } else {
+            top
+        };
+        (x, y)
+    }
+
+    /// The corners of the way to `to` after the take-off, and the way's length, px (the sum of
+    /// its legs' longer sides).
+    fn legs(self, to: (i32, i32)) -> ([(i32, i32); 3], i32) {
+        let legs = match self.path {
+            FlightPath::Over(top) => {
+                let top = top.min(self.from.1);
+                [(self.from.0, top), (to.0, top), to]
+            }
+            _ => [to; 3],
+        };
+        let mut len = side(self.from, legs[0]);
+        for w in legs.windows(2) {
+            len += side(w[0], w[1]);
+        }
+        (legs, len)
+    }
+
+    /// The way's first leg, px, where it is taken in one step ([`Self::stepped`]): a rise off the
+    /// line longer than a step and no more than twice the steps after it, so the move law reads
+    /// it as the first of a flight's steps, not a pop.
+    fn lift_off(self, to: (i32, i32)) -> i32 {
+        let (legs, len) = self.legs(to);
+        let rise = side(self.from, legs[0]);
+        let step = self.step.max(1);
+        let rest = len - rise;
+        let after = rest / ((rest + step - 1) / step).max(1);
+        if matches!(self.path, FlightPath::Over(_)) && rise > step && rise <= 2 * after {
+            rise
+        } else {
+            0
+        }
+    }
+
+    /// How many steps the way to `to` is taken in ([`Self::stepped`]): no more than
+    /// [`Self::most_steps`], so a far one takes no longer than the head's flight, each step
+    /// longer.
+    fn steps(self, to: (i32, i32)) -> i32 {
+        let (_, len) = self.legs(to);
+        let lift = self.lift_off(to);
+        let step = self.step.max(1);
+        (i32::from(lift > 0) + (len - lift + step - 1) / step).min(self.most_steps)
+    }
+
+    /// [`Self::at`] in steps: the way's points no more than [`Self::step`] px apart along it (or
+    /// [`Self::most_steps`] of them, on a way too far for that), evenly spaced, the frame's the one
+    /// its progress has reached, straight along each leg; a rise off the line of two steps or
+    /// less in one ([`Self::lift_off`]). A glide eased smoothly along its way showed each pixel
+    /// under it a look a frame: a five-cell hop turned the pixels it crossed eight to ten times in
+    /// that second, past the flash law, where its stride shows each a look a step
+    /// (`the_flier_never_flashes`). Its first step is its take-off frame's, so it leaves at once
+    /// the letters a paste or a completion wrote under it; drawn where it was on that frame, a
+    /// two-step rise held it there a frame more, a look more for each pixel it crossed than the
+    /// pop it replaced (`lab trail-film --scene burst`, 3 pet pixels over main's). It takes a 60
+    /// Hz frame a step ([`WordDecorations::plan_kitty_cursor_flight`]), so no
+    /// frame takes two where its neighbours take one, and none takes a step whose neighbours
+    /// stand still.
+    fn stepped(self, to: (i32, i32)) -> (i32, i32) {
+        let q = self.progress.clamp(0.0, 1.0);
+        if q >= 1.0 {
+            return to;
+        }
+        if self.path == FlightPath::Fade {
+            return if self.fading_out() { self.from } else { to };
+        }
+        let (legs, len) = self.legs(to);
+        if len == 0 {
+            return to;
+        }
+        let lift = self.lift_off(to);
+        let (k, steps) = self.reached(to);
+        let mut left = if k <= 0 {
+            0
+        } else if lift > 0 {
+            lift + (k - 1).saturating_mul(len - lift) / (steps - 1).max(1)
+        } else {
+            k.saturating_mul(len) / steps
+        }
+        .min(len);
+        let mut at = self.from;
+        for next in legs {
+            let leg = side(at, next);
+            if left <= leg {
+                if leg > 0 {
+                    let t = left as f32 / leg as f32;
+                    at = (
+                        at.0 + ((next.0 - at.0) as f32 * t).round() as i32,
+                        at.1 + ((next.1 - at.1) as f32 * t).round() as i32,
+                    );
+                }
+                return at;
+            }
+            left -= leg;
+            at = next;
+        }
+        to
+    }
+
+    /// The steps of the way to `to` the frame has taken, and how many it takes in all
+    /// ([`Self::stepped`]): the frame's the one its progress has reached, and its take-off frame
+    /// the first, so the place it was drawn is shown no longer.
+    fn reached(self, to: (i32, i32)) -> (i32, i32) {
+        let q = self.progress.clamp(0.0, 1.0);
+        let steps = self.steps(to).max(1);
+        #[cfg(any(test, debug_assertions))]
+        let first = i32::from(!TAKE_OFF_DRAWN.with(std::cell::Cell::get));
+        #[cfg(not(any(test, debug_assertions)))]
+        let first = 1;
+        let k = (((q * steps as f32) + 0.75).floor() as i32 + first).min(steps);
+        (k, steps)
+    }
+
+    /// Whether this frame of a [`FlightPath::Fade`] is on its way out where it took off.
+    #[inline]
+    fn fading_out(self) -> bool {
+        self.out && self.progress.clamp(0.0, 1.0) < FADE_OUT
+    }
+
+    /// The size the body is drawn at on this frame of its flight to the landing `to`, of size
+    /// `to_wh`: where it is stepped, the take-off's for a fade's way out and the landing's for
+    /// its way in, and along the way the take-off's grown or shrunk to the landing's step by
+    /// step, as far as the frame's steps have taken it. Drawn at the landing's size from the
+    /// take-off frame on, the glide shrank at full alpha in one frame where it left a whole seat
+    /// for a fitted one (a program's lines under it, the wall's row), a flash; the head is.
+    fn size(self, to: (i32, i32), to_wh: (u16, u16)) -> (u16, u16) {
+        if self.step <= 1 || self.from_wh == (0, 0) || self.progress >= 1.0 {
+            return to_wh;
+        }
+        if self.path == FlightPath::Fade {
+            return if self.fading_out() {
+                self.from_wh
+            } else {
+                to_wh
+            };
+        }
+        let (k, steps) = self.reached(to);
+        let t = (k.clamp(0, steps) as f32) / (steps.max(1) as f32);
+        let lerp = |a: u16, b: u16| -> u16 {
+            (f32::from(a) + (f32::from(b) - f32::from(a)) * t)
+                .round()
+                .clamp(1.0, f32::from(u16::MAX)) as u16
+        };
+        (lerp(self.from_wh.0, to_wh.0), lerp(self.from_wh.1, to_wh.1))
+    }
+
+    /// The share of the frame's alpha the body is drawn at on this frame of its flight: all of
+    /// it, but for [`FlightPath::Fade`]'s way out and in (in only, where it does not go out
+    /// where it took off, [`Self::out`]).
+    #[inline]
+    fn alpha_share(self) -> f32 {
+        if self.path != FlightPath::Fade {
+            return 1.0;
+        }
+        let q = self.progress.clamp(0.0, 1.0);
+        if !self.out {
+            q
+        } else if q < FADE_OUT {
+            1.0 - q / FADE_OUT
+        } else {
+            (q - FADE_OUT) / (1.0 - FADE_OUT)
+        }
     }
 }
+
+/// A cursor kitty's placement state ([`WordDecorations::kitty_cursor_placement_mark`]).
+#[derive(Clone, Copy)]
+pub struct KittyCursorPlacementMark(KittyCursorPlacementState);
 
 /// One cursor-kitty placement resolved once for palette sampling and sprite emission.
 #[derive(Clone, Copy, Debug)]
@@ -470,6 +737,38 @@ pub struct KittyCursorPlacement {
     drawn: Option<PreparedKittyCursorDraw>,
     /// The head's flight to this frame's landing, while it flies ([`HEAD_FLIGHT`]).
     flight: Option<HeadFlightSample>,
+    /// The share of the frame's alpha it is drawn at as it leaves a wall that holds no seat for
+    /// it and comes back ([`WordDecorations::veil_kitty_cursor`]): 1 elsewhere.
+    veil: f32,
+}
+
+/// The glide's way off a wall that holds no seat for it and back
+/// ([`WordDecorations::veil_kitty_cursor`]): since when, from what share of its alpha, and
+/// which way.
+#[derive(Clone, Copy, Debug)]
+struct KittyVeil {
+    since: Instant,
+    from: f32,
+    out: bool,
+    /// Where it is held on its way out: where it was drawn on the frame it began to leave.
+    at: Option<CatFootprint>,
+}
+
+impl KittyVeil {
+    /// The share of its alpha at `now`: out over a fade's way out, in over its way in
+    /// ([`FADE_OUT`] of [`HEAD_FLIGHT`] and the rest).
+    fn share(veil: Option<Self>, now: Instant) -> f32 {
+        let Some(veil) = veil else {
+            return 1.0;
+        };
+        let dt = now.saturating_duration_since(veil.since).as_secs_f32();
+        let flight = HEAD_FLIGHT.as_secs_f32();
+        if veil.out {
+            (veil.from - dt / (flight * FADE_OUT)).max(0.0)
+        } else {
+            (veil.from + dt / (flight * (1.0 - FADE_OUT))).min(1.0)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -487,11 +786,14 @@ impl PreparedKittyCursorDraw {
     fn shown(self) -> CatFootprint {
         match self.flight {
             Some(flight) => {
-                let (x, y) = flight.at((self.rect.x, self.rect.y));
+                let to = (self.rect.x, self.rect.y);
+                let (x, y) = flight.at(to);
+                let (w, h) = flight.size(to, (self.rect.w, self.rect.h));
                 CatFootprint {
                     x,
                     y: y.max(0),
-                    ..self.rect
+                    w,
+                    h,
                 }
             }
             None => self.rect,
@@ -509,6 +811,7 @@ impl KittyCursorPlacement {
             sampled_at: None,
             drawn: None,
             flight: None,
+            veil: 1.0,
         }
     }
 
@@ -518,6 +821,14 @@ impl KittyCursorPlacement {
     #[must_use]
     pub fn drawn_footprint(self) -> Option<CatFootprint> {
         self.drawn.map(PreparedKittyCursorDraw::shown)
+    }
+
+    /// Where the body rests on this frame (its flight's landing, while it flies), after its
+    /// follower, pose and fold leg.
+    #[inline]
+    #[must_use]
+    pub fn landing_footprint(self) -> Option<CatFootprint> {
+        self.drawn.map(|d| d.rect)
     }
 
     /// Keep the prepared head off the caret's cell and every lettered cell
@@ -770,27 +1081,127 @@ struct KittyCursorActiveFold {
     from_sprite: Option<(i32, i32)>,
 }
 
-/// The flying head's flight to a far caret ([`HEAD_FLIGHT`]): when it took off and its sprite's
-/// top-left as last drawn there.
+/// The flying head's flight to a far caret ([`HEAD_FLIGHT`]): when it took off, its sprite's
+/// top-left as last drawn there, its way and its step ([`HeadFlightSample`]).
 #[derive(Clone, Copy, Debug)]
 struct KittyHeadFlight {
     started: Instant,
     from: (i32, i32),
+    path: FlightPath,
+    step: i32,
+    /// How long it takes: [`HEAD_FLIGHT`], or a frame a step where it steps.
+    span: Duration,
+    /// The size it was drawn at where it took off ([`HeadFlightSample::from_wh`]).
+    from_wh: (u16, u16),
+    /// Whether a fade goes out where it took off ([`HeadFlightSample::out`]).
+    out: bool,
+    /// The landing its way was laid to, once laid ([`WordDecorations::plan_kitty_cursor_flight`]):
+    /// a landing that moves on by more than a stride is a new flight from where it is drawn.
+    to: Option<(i32, i32)>,
+    /// Its host's frame, a step's time ([`FLIGHT_FRAME`] in the terminal).
+    frame: Duration,
+}
+
+/// [`WordDecorations::plan_kitty_cursor_flight`]'s way for `flight` to the landing `rect`: of a
+/// straight low arc, over the line at the higher end's height or at each height whose box stands
+/// just over a row's top, and a fade, the one with the fewest of its frames on a letter or the
+/// caret's cell, the first of those listed where they tie.
+fn flight_path<F>(
+    flight: HeadFlightSample,
+    rect: CatFootprint,
+    geom: EffectGeom,
+    caret: (u16, u16),
+    ink: &F,
+) -> FlightPath
+where
+    F: Fn(u16, u16) -> Option<bool>,
+{
+    use crate::rainbow_kitty::companion::box_clear;
+    let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+    // The tallest it is drawn along the way: the take-off's or the landing's.
+    let h = i32::from(rect.h.max(flight.from_wh.1));
+    if cw <= 0 || ch <= 0 {
+        return FlightPath::Arc;
+    }
+    const SAMPLES: u16 = 32;
+    let over = |path: FlightPath| {
+        (0..=SAMPLES)
+            .filter(|&i| {
+                let sample = HeadFlightSample {
+                    progress: f32::from(i) / f32::from(SAMPLES),
+                    path,
+                    ..flight
+                };
+                let to = (rect.x, rect.y);
+                let (x, y) = sample.at(to);
+                let (sw, sh) = sample.size(to, (rect.w, rect.h));
+                sample.alpha_share() > 0.0
+                    && !box_clear(
+                        (x, y.max(0), i32::from(sw), i32::from(sh)),
+                        caret,
+                        (cw, ch, geom.rows, geom.cols),
+                        0,
+                        ink,
+                    )
+            })
+            .count()
+    };
+    let low = flight.from.1.min(rect.y);
+    let mut ways = vec![FlightPath::Arc, FlightPath::Over(low)];
+    let mut row = (low + h) / ch;
+    while row > 0 {
+        let top = row * ch - h - 1;
+        if top < 0 {
+            break;
+        }
+        if top < low {
+            ways.push(FlightPath::Over(top));
+        }
+        row -= 1;
+    }
+    ways.push(FlightPath::Fade);
+    let mut best = (usize::MAX, FlightPath::Arc);
+    for way in ways {
+        let n = over(way);
+        if n < best.0 {
+            best = (n, way);
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    best.1
 }
 
 /// The height of the flying head's arc at the middle of its flight, cells
 /// ([`HeadFlightSample`]): a fold's hop over the caret's line.
 const HEAD_FLIGHT_ARC: f32 = 0.18;
 
+/// A stepped flight's take-off time and its way, from and to, each a footprint's top-left
+/// ([`KittyCursorPlacementState::last_way`]).
+type FlownWay = (Instant, (i32, i32), (i32, i32));
+
+#[derive(Clone, Copy)]
 struct KittyCursorPlacementState {
     key: Option<KittyCursorPlacementKey>,
     last_target: Option<CatFootprint>,
     last_sprite: Option<(i32, i32)>,
+    /// The size of the footprint drawn at [`Self::last_sprite`].
+    last_wh: Option<(u16, u16)>,
     last_emitted_at: Option<Instant>,
     settle: Option<(f32, f32)>,
     seen_fold: Option<(Instant, crate::kitty_cursor::CatFoldDirection)>,
     active: Option<KittyCursorActiveFold>,
     flight: Option<KittyHeadFlight>,
+    /// The last stepped flight's take-off time and its way, from and to, while within
+    /// [`FLIGHT_BACK_WITHIN`] ([`WordDecorations::plan_kitty_cursor_flight`]).
+    last_way: Option<FlownWay>,
+    /// Its way off a wall with no seat and back, while it is off or on its way
+    /// ([`WordDecorations::veil_kitty_cursor`]).
+    veil: Option<KittyVeil>,
+    /// The way a stepped flight faced, and the caret it flew to, held once it lands until the
+    /// caret moves on ([`WordDecorations::fly_kitty_glide`]).
+    faced: Option<(bool, (u16, u16))>,
 }
 
 impl KittyCursorPlacementState {
@@ -798,11 +1209,15 @@ impl KittyCursorPlacementState {
         key: None,
         last_target: None,
         last_sprite: None,
+        last_wh: None,
         last_emitted_at: None,
         settle: None,
         seen_fold: None,
         active: None,
         flight: None,
+        last_way: None,
+        veil: None,
+        faced: None,
     };
 }
 
@@ -2458,29 +2873,6 @@ impl WordDecorations {
         !self.away
     }
 
-    /// The least share of its `rest` footprint the flier at `layout` is fitted to by the wall
-    /// ([`crate::rainbow_kitty::companion::head_fit_seat`]): the head's
-    /// [`crate::rainbow_kitty::companion::HEAD_FIT_FLOOR`], and for the glide, which is wider
-    /// for its height, the share that is the default head's floor width. So the glide needs no
-    /// more room past the caret than the head did: at the floor's share it ran out of room a
-    /// column sooner, and at a full last row's end it lay on the caret's cell (`lab trail-film
-    /// --scene last-row`: 295 frames to the head's 2).
-    #[must_use]
-    pub fn kitty_cursor_fit_floor(&self, layout: KittyCursorLayout, rest: CatFootprint) -> f32 {
-        use crate::rainbow_kitty::companion::HEAD_FIT_FLOOR;
-        if matches!(layout.body, crate::kitty_cursor::CursorBody::Head) || rest.w == 0 {
-            return HEAD_FIT_FLOOR;
-        }
-        let head = self.kitty_cursor_footprint(KittyCursorLayout {
-            look: KittyLook::DEFAULT,
-            body: crate::kitty_cursor::CursorBody::Head,
-            ..layout
-        });
-        head.map_or(HEAD_FIT_FLOOR, |head| {
-            (HEAD_FIT_FLOOR * f32::from(head.w) / f32::from(rest.w)).min(HEAD_FIT_FLOOR)
-        })
-    }
-
     /// The flying cursor kitty's dest rect for `layout`, from the emitter's own sizing and placement math.
     #[inline]
     #[must_use]
@@ -2553,11 +2945,8 @@ impl WordDecorations {
         // caret's column rounded up to the stride, so it is never nearer the caret than the
         // head's rest and is a cell further at most.
         let anchor_right = if matches!(body, crate::kitty_cursor::CursorBody::Glide(_)) {
-            let stride = glide_stride();
-            let col = ccol as i32;
-            let rem = col % stride;
-            let col = if rem == 0 { col } else { col + stride - rem };
-            col.saturating_add(1).saturating_mul(cw)
+            let col = crate::rainbow_kitty::companion::stride_ahead(ccol, glide_stride());
+            (col as i32).saturating_add(1).saturating_mul(cw)
         } else {
             cursor_right
         };
@@ -2640,6 +3029,7 @@ impl WordDecorations {
             sampled_at: Some(motion.sampled_at),
             drawn: None,
             flight,
+            veil: 1.0,
         };
         if self.kitty_cursor_placement.key != Some(key) || stale {
             self.kitty_cursor_placement.key = Some(key);
@@ -2740,6 +3130,13 @@ impl WordDecorations {
             return false;
         }
         let state = &self.kitty_cursor_placement;
+        // A stepped flight under way (the glide's) flies on: one that keeps its landing goes on
+        // there, and one whose landing moved on is flown on from where it is
+        // ([`Self::fly_glide_jump`]). Launched afresh, a fade began again at full alpha at each
+        // jump of a history scrolled through, a blink every other frame.
+        if state.flight.is_some_and(|f| f.step > 1) {
+            return true;
+        }
         let from = match (state.last_sprite, state.last_emitted_at) {
             (Some(from), Some(at))
                 if now.saturating_duration_since(at)
@@ -2753,10 +3150,389 @@ impl WordDecorations {
             }
         };
         let state = &mut self.kitty_cursor_placement;
-        state.flight = Some(KittyHeadFlight { started: now, from });
+        state.flight = Some(KittyHeadFlight {
+            started: now,
+            from,
+            path: FlightPath::Unplanned,
+            step: 1,
+            span: HEAD_FLIGHT,
+            from_wh: state.last_wh.unwrap_or((0, 0)),
+            out: true,
+            to: None,
+            frame: FLIGHT_FRAME,
+        });
         state.settle = None;
         state.active = None;
         true
+    }
+
+    /// THE GLIDE NEVER POPS. Drawn at its rest (it has no follower, [`GLIDE_FOLLOWS`]), the glide
+    /// stood whole at a rest more than its stride from where it was drawn on the move's own
+    /// frame: a paste, a completion, a word kill, a hop or a row change the trail mints no meteor
+    /// for, a caret the program moved, a seat it changed. It vanished at full alpha in one place
+    /// and stood in another, a pop. Such a move it flies, from where it was last drawn, as the
+    /// head flies to a far caret, stepped ([`Self::plan_kitty_cursor_flight`]); a step of its
+    /// stride or less (a typing advance, a breath) it still takes at once, so a burst's pixels
+    /// see no more looks than the stride's. `placement` is this frame's for `layout`, prepared
+    /// and kept off the letters. `take_off`, where given and a stride or less from where it was
+    /// drawn, is where it leaves from instead: its row's seat for this caret as it rises off the
+    /// row by the wall, where the place it was drawn is the caret's next cell.
+    #[inline]
+    pub fn fly_glide_jump(
+        &mut self,
+        placement: &mut KittyCursorPlacement,
+        layout: KittyCursorLayout,
+        take_off: Option<(i32, i32)>,
+    ) {
+        if !matches!(layout.body, crate::kitty_cursor::CursorBody::Glide(_))
+            || !matches!(placement.leg, KittyCursorPlacementLeg::Settled)
+        {
+            return;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if GLIDE_JUMPS.with(std::cell::Cell::get) {
+            return;
+        }
+        #[cfg(test)]
+        if HEAD_FLIGHT_OFF.with(std::cell::Cell::get) {
+            return;
+        }
+        let (cw, ch) = (i32::from(layout.geom.cell_w), i32::from(layout.geom.cell_h));
+        let stride_px = i32::from(glide_stride()) * cw;
+        let near = |a: (i32, i32), b: (i32, i32)| {
+            (a.0 - b.0).abs() <= stride_px && (a.1 - b.1).abs() <= ch / 4
+        };
+        // A stepped flight whose landing moved on by more than a stride since its way was laid
+        // (a paste the PTY delivers in reads, a key that moves the caret on while it flies) is
+        // flown again from where it was drawn, to the new landing: its first way's steps, laid to
+        // the old landing and spread to the new one, grew past several strides a frame. A fade
+        // keeps its time, so its alpha never steps back up.
+        if let Some(flight) = self.kitty_cursor_placement.flight {
+            #[cfg(any(test, debug_assertions))]
+            let kept = RETARGET_KEPT.with(std::cell::Cell::get);
+            #[cfg(not(any(test, debug_assertions)))]
+            let kept = false;
+            let moved_on = match (flight.to, placement.drawn) {
+                (Some(to), Some(draw)) => !near((draw.rect.x, draw.rect.y), to),
+                _ => false,
+            };
+            if kept || flight.step <= 1 || flight.path == FlightPath::Fade || !moved_on {
+                return;
+            }
+            // The way it flew ends where it got to.
+            let state = &mut self.kitty_cursor_placement;
+            if let (Some((at, a, _)), Some(got)) = (state.last_way, state.last_sprite)
+                && at == flight.started
+            {
+                state.last_way = Some((at, a, got));
+            }
+            self.kitty_cursor_placement.flight = None;
+            placement.flight = None;
+            if let Some(draw) = placement.drawn.as_mut() {
+                draw.flight = None;
+            }
+        }
+        if placement.flight.is_some() {
+            return;
+        }
+        let (Some(at), Some(draw), Some(from), Some(prev)) = (
+            placement.sampled_at,
+            placement.drawn.as_mut(),
+            self.kitty_cursor_placement.last_sprite,
+            self.kitty_cursor_placement.last_emitted_at,
+        ) else {
+            return;
+        };
+        if at.saturating_duration_since(prev) >= crate::kitty_cursor::CURSOR_FOLD_DURATION {
+            return;
+        }
+        let from_wh = self.kitty_cursor_placement.last_wh.unwrap_or((0, 0));
+        let from = match take_off {
+            Some(seat) if near(seat, from) => seat,
+            _ => from,
+        };
+        if near((draw.rect.x, draw.rect.y), from) {
+            return;
+        }
+        self.kitty_cursor_placement.flight = Some(KittyHeadFlight {
+            started: at,
+            from,
+            path: FlightPath::Unplanned,
+            step: 1,
+            span: HEAD_FLIGHT,
+            from_wh,
+            out: true,
+            to: None,
+            frame: FLIGHT_FRAME,
+        });
+        let sample = HeadFlightSample {
+            from,
+            progress: 0.0,
+            arc_px: (HEAD_FLIGHT_ARC * ch as f32).round() as i32,
+            path: FlightPath::Unplanned,
+            step: 1,
+            from_wh,
+            out: true,
+            most_steps: flight_steps(FLIGHT_FRAME),
+        };
+        placement.flight = Some(sample);
+        draw.flight = Some(sample);
+    }
+
+    /// THE GLIDE'S FLIGHT KEEPS OFF THE LETTERS AND THE CARET, AND STEPS. Flown straight along
+    /// its low arc, the glide crossed the line it left or came to (Home and End along a typed
+    /// line: 23 frames over its letters and 3 on the caret, `lab trail-film --scene jump`), and
+    /// eased there smoothly it showed each pixel it crossed a look a frame. A flight is laid over
+    /// the page `ink` on the frame it takes off, from its take-off to `placement`'s landing (kept
+    /// off the letters already), by [`flight_path`]: straight where that way is clear of every
+    /// letter and the caret's cell, else up to the lowest height whose way across is, across at
+    /// it and down ([`FlightPath::Over`]), else, where every way crosses them, out and in again
+    /// ([`FlightPath::Fade`]). It goes there `step` px at a time ([`HeadFlightSample::stepped`]):
+    /// the glide's stride. Kept for the rest of the flight. The head (`step` 1), which eases, is
+    /// flown as it was.
+    #[inline]
+    pub fn plan_kitty_cursor_flight<F>(
+        &mut self,
+        placement: &mut KittyCursorPlacement,
+        (geom, step, frame): (EffectGeom, i32, Duration),
+        caret: (u16, u16),
+        ink: F,
+    ) where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        let (Some(flight), Some(draw), Some(state)) = (
+            placement.flight.as_mut(),
+            placement.drawn.as_mut(),
+            self.kitty_cursor_placement.flight.as_mut(),
+        ) else {
+            return;
+        };
+        #[cfg(any(test, debug_assertions))]
+        let step = if FLIGHT_UNPLANNED.with(std::cell::Cell::get) {
+            1
+        } else {
+            step
+        };
+        if state.path == FlightPath::Unplanned {
+            state.step = step.max(1);
+            state.to = Some((draw.rect.x, draw.rect.y));
+            state.frame = frame;
+            flight.most_steps = flight_steps(frame);
+            if state.step > 1 {
+                // A fade goes out where it took off only where that place is still clear: where
+                // the caret or the program's ink has come under it, it is gone from there on the
+                // take-off frame and comes in at the landing (`the_flier_never_flashes`'s
+                // `lines-down`, `two-full-above-wall`).
+                let (w, h) = if state.from_wh == (0, 0) {
+                    (draw.rect.w, draw.rect.h)
+                } else {
+                    state.from_wh
+                };
+                #[cfg(any(test, debug_assertions))]
+                let held = FADE_OUT_ANYWHERE.with(std::cell::Cell::get);
+                #[cfg(not(any(test, debug_assertions)))]
+                let held = false;
+                state.out = held
+                    || crate::rainbow_kitty::companion::box_clear(
+                        (
+                            state.from.0,
+                            state.from.1.max(0),
+                            i32::from(w),
+                            i32::from(h),
+                        ),
+                        caret,
+                        (
+                            i32::from(geom.cell_w),
+                            i32::from(geom.cell_h),
+                            geom.rows,
+                            geom.cols,
+                        ),
+                        0,
+                        &ink,
+                    );
+                let to = (draw.rect.x, draw.rect.y);
+                // Over the way it flew within the flash law's second (Home and End in turn, a
+                // history recalled again), a flight crossed the same pixels again: each way's
+                // steps are a look or two at every pixel under them, and three ways in a second
+                // turned them past six times, where the low way eased once did fewer
+                // (`the_flier_never_flashes`'s `home-end`). It fades out where it is and in at
+                // the landing instead: two looks at its ends, none between. The way flown is the
+                // last way as far as it got ([`Self::fly_glide_jump`]): a flight flown on from
+                // where it is to a landing that moved on crosses none of it again.
+                #[cfg(any(test, debug_assertions))]
+                let reflies = REFLY_BACK.with(std::cell::Cell::get);
+                #[cfg(not(any(test, debug_assertions)))]
+                let reflies = false;
+                let h = i32::from(draw.rect.h);
+                let from = state.from;
+                let back = !reflies
+                    && self
+                        .kitty_cursor_placement
+                        .last_way
+                        .is_some_and(|(at, a, b)| {
+                            let span = |p: i32, q: i32| (p.min(q), p.max(q));
+                            let meet = |(p0, p1): (i32, i32), (q0, q1): (i32, i32)| {
+                                p1.min(q1) - p0.max(q0)
+                            };
+                            let flown = span(a.0, b.0);
+                            let rows = meet(
+                                (a.1.min(b.1) - h, a.1.max(b.1) + h),
+                                (from.1.min(to.1), from.1.max(to.1)),
+                            );
+                            flight_started(state.started, at) < FLIGHT_BACK_WITHIN
+                                && rows > 0
+                                && meet(flown, span(from.0, to.0)) > state.step
+                        });
+                state.path = if back {
+                    FlightPath::Fade
+                } else {
+                    flight_path(
+                        HeadFlightSample {
+                            step: state.step,
+                            out: state.out,
+                            ..*flight
+                        },
+                        draw.rect,
+                        geom,
+                        caret,
+                        &ink,
+                    )
+                };
+                if state.path != FlightPath::Fade {
+                    self.kitty_cursor_placement.last_way = Some((state.started, state.from, to));
+                }
+                state.span = if state.path == FlightPath::Fade {
+                    fade_span(state.out)
+                } else {
+                    let steps = HeadFlightSample {
+                        path: state.path,
+                        step: state.step,
+                        ..*flight
+                    }
+                    .steps((draw.rect.x, draw.rect.y));
+                    frame * u32::try_from(steps.max(1)).unwrap_or(1)
+                };
+            } else {
+                state.path = FlightPath::Arc;
+            }
+        }
+        for f in [Some(&mut *flight), draw.flight.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            f.path = state.path;
+            f.step = state.step;
+            f.out = state.out;
+            f.most_steps = flight_steps(state.frame);
+        }
+        // A stepped flight faces the way it goes: drawn as it faced on the line, a flight back
+        // along it (Home, a word kill, a hop back) flew tail first for its whole way
+        // (`lab trail-film --scene jump`). It keeps that facing where it lands
+        // ([`Self::fly_kitty_glide`]).
+        #[cfg(any(test, debug_assertions))]
+        let faces = !FLIGHT_FACES_OFF.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let faces = true;
+        if faces && state.step > 1 && state.path != FlightPath::Fade {
+            let dx = draw.rect.x - state.from.0;
+            if dx.abs() > state.step {
+                placement.facing_left = dx < 0;
+            }
+        }
+    }
+
+    /// THE GLIDE LEAVES A WALL THAT HOLDS NO SEAT FOR IT. Typed into the right wall on a page
+    /// with no blank row within reach above or below (a screen of output, the prompt on its last
+    /// row), the glide has no seat off the letters and the caret at its row's size: shrunk with
+    /// the room as the head is, it was smaller there and lay on the caret's cell and the letters
+    /// behind it for 41 frames at a 26 px row (`the_flier_never_flashes`'s `full-above-wall`). Where
+    /// it `leaves` ([`crate::rainbow_kitty::companion::HeadFitSeat::Leave`], read a stride before
+    /// the caret reaches it), it fades out at its seat for that caret, held there, over a fade's
+    /// way out, and once a seat holds it again it comes in there over a fade's way in, as a
+    /// flight's [`FlightPath::Fade`] does. `placement` is this frame's, prepared; it is drawn at
+    /// the veil's share of its alpha.
+    #[inline]
+    pub fn veil_kitty_cursor(
+        &mut self,
+        placement: &mut KittyCursorPlacement,
+        now: Instant,
+        leaves: bool,
+    ) {
+        let on_glass = self.kitty_cursor_on_glass(now);
+        let state = &mut self.kitty_cursor_placement;
+        let share = KittyVeil::share(state.veil, now);
+        if leaves {
+            if !state.veil.is_some_and(|v| v.out) {
+                // Its seat for this caret, or its place on a flight under way: the caret's next
+                // key does not reach it there (the seat is a stride on from the place it was
+                // last drawn, which that key's cell lies under).
+                state.veil = Some(KittyVeil {
+                    since: now,
+                    from: if on_glass { share } else { 0.0 },
+                    out: true,
+                    at: placement.drawn.map(PreparedKittyCursorDraw::shown),
+                });
+            }
+            // Held there on its way out.
+            state.flight = None;
+            placement.flight = None;
+            if let (Some(draw), Some(at)) =
+                (placement.drawn.as_mut(), state.veil.and_then(|v| v.at))
+            {
+                draw.rect = at;
+                draw.flight = None;
+            }
+        } else if state.veil.is_some_and(|v| v.out) {
+            state.veil = Some(KittyVeil {
+                since: now,
+                from: share,
+                out: false,
+                at: None,
+            });
+        } else if share >= 1.0 {
+            state.veil = None;
+        }
+        placement.veil = KittyVeil::share(state.veil, now);
+    }
+
+    /// Where the flying body's footprint was last drawn (its top-left), while it is on glass at
+    /// `now` ([`Self::kitty_cursor_on_glass`]).
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_last_drawn(&self, now: Instant) -> Option<(i32, i32)> {
+        self.kitty_cursor_placement
+            .last_sprite
+            .filter(|_| self.kitty_cursor_on_glass(now))
+    }
+
+    /// Whether the flying body was drawn within its fold's time before `now` more than `reach`
+    /// px along and `rise` px across from `to`, a footprint's top-left: a move it flies
+    /// ([`Self::fly_glide_jump`]), not a step.
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_flies_to(
+        &self,
+        now: Instant,
+        to: (i32, i32),
+        (reach, rise): (i32, i32),
+    ) -> bool {
+        self.kitty_cursor_on_glass(now)
+            && self
+                .kitty_cursor_placement
+                .last_sprite
+                .is_some_and(|(x, y)| (x - to.0).abs() > reach || (y - to.1).abs() > rise)
+    }
+
+    /// Whether the flying body was drawn within its fold's time before `now`: on glass, not
+    /// coming on.
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_on_glass(&self, now: Instant) -> bool {
+        self.kitty_cursor_placement
+            .last_emitted_at
+            .is_some_and(|at| {
+                now.saturating_duration_since(at) < crate::kitty_cursor::CURSOR_FOLD_DURATION
+            })
     }
 
     /// The head's flight at `now` ([`Self::launch_kitty_cursor_flight`]), ended once it has
@@ -2764,8 +3540,8 @@ impl WordDecorations {
     #[inline]
     fn kitty_cursor_flight_at(&mut self, now: Instant, cell_h: u16) -> Option<HeadFlightSample> {
         let flight = self.kitty_cursor_placement.flight?;
-        let progress =
-            now.saturating_duration_since(flight.started).as_secs_f32() / HEAD_FLIGHT.as_secs_f32();
+        let progress = now.saturating_duration_since(flight.started).as_secs_f32()
+            / flight.span.as_secs_f32().max(f32::EPSILON);
         if progress >= 1.0 {
             self.kitty_cursor_placement.flight = None;
             return None;
@@ -2774,13 +3550,30 @@ impl WordDecorations {
             from: flight.from,
             progress,
             arc_px: (HEAD_FLIGHT_ARC * f32::from(cell_h)).round() as i32,
+            path: flight.path,
+            step: flight.step,
+            from_wh: flight.from_wh,
+            out: flight.out,
+            most_steps: flight_steps(flight.frame),
         })
     }
 
     /// Re-anchor the cursor kitty after the host detects a coordinate-space tear between effect sampling and the presented frame.
     #[inline]
     pub const fn rebase_kitty_cursor_placement(&mut self) {
+        // The ways it flew within the flash law's second are kept: the pixels they crossed
+        // are still on glass ([`Self::plan_kitty_cursor_flight`]).
+        // So is its way off a wall with no seat: re-anchored, it is no more on glass than it was.
+        // And the way a landed flight faces, held by the caret's cell, not by a coordinate.
+        let (last_way, veil, faced) = (
+            self.kitty_cursor_placement.last_way,
+            self.kitty_cursor_placement.veil,
+            self.kitty_cursor_placement.faced,
+        );
         self.kitty_cursor_placement = KittyCursorPlacementState::EMPTY;
+        self.kitty_cursor_placement.last_way = last_way;
+        self.kitty_cursor_placement.veil = veil;
+        self.kitty_cursor_placement.faced = faced;
     }
 
     const COMPANION_CELL_H: f32 = 1.70;
@@ -2809,6 +3602,22 @@ impl WordDecorations {
     #[inline]
     pub const fn kitty_cursor_lead_px(cell_w: u16) -> i32 {
         (cell_w as i32).saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN
+    }
+
+    /// The cells the flier `body` moves at a time in every seat it takes
+    /// ([`crate::rainbow_kitty::companion::SeatQuery::stride`]): the glide's [`GLIDE_STRIDE`],
+    /// behind the caret and fitted to its row as ahead of it, and the head's one.
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_stride(body: crate::kitty_cursor::CursorBody) -> u16 {
+        if !matches!(body, crate::kitty_cursor::CursorBody::Glide(_)) {
+            return 1;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if GLIDE_SEATS_UNSTRIDED.with(std::cell::Cell::get) {
+            return 1;
+        }
+        glide_stride()
     }
 
     const PLACE_TAU: f32 = 0.08;
@@ -2875,6 +3684,119 @@ impl WordDecorations {
         Some(placement)
     }
 
+    /// [`Self::kitty_cursor_kept_off`] for a host that keeps this placement's state from frame to
+    /// frame (the settings preview's scene, whose clock is its phase): sampled `at`, and on its
+    /// flight while one is under way, so [`Self::fly_kitty_glide`] flies its moves as the
+    /// terminal's are flown.
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_kept_off_at<F>(
+        &mut self,
+        frame: &KittyCursorFrame,
+        ink: F,
+        fitted: bool,
+        at: Instant,
+    ) -> Option<KittyCursorPlacement>
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        if frame.alpha == 0 || frame.geom.cell_w == 0 || frame.geom.cell_h == 0 {
+            return None;
+        }
+        let footprint = self.kitty_cursor_footprint(KittyCursorLayout {
+            geom: frame.geom,
+            cursor: frame.cursor,
+            look: frame.look,
+            body: frame.body,
+            bob: frame.bob,
+            lift: frame.lift,
+        })?;
+        let mut placement = KittyCursorPlacement::settled(footprint);
+        placement.sampled_at = Some(at);
+        placement.flight = self.kitty_cursor_flight_at(at, frame.geom.cell_h);
+        placement.drawn =
+            Some(self.kitty_cursor_draw_geometry(
+                frame.geom, frame.bob, frame.pose, placement, frame.body,
+            ));
+        if fitted {
+            placement.keep_fitted_off_letters(frame.geom, frame.cursor, ink);
+        } else {
+            placement.keep_off_letters(frame.geom, frame.cursor, ink);
+        }
+        Some(placement)
+    }
+
+    /// The glide's moves past its stride flown, never drawn whole at their end on their own
+    /// frame ([`Self::fly_glide_jump`]), and its every flight laid over `ink`'s letters, off them
+    /// and the caret, and stepped at its stride ([`Self::plan_kitty_cursor_flight`]): the one
+    /// path the terminal's flier ([`crate::EffectsPipeline::prepare_flying_head`]) and the
+    /// settings preview's take. `placement` is this frame's for `layout`, prepared and kept off
+    /// the letters, by a host that draws a frame each `frame` ([`FLIGHT_FRAME`] in the terminal);
+    /// `take_off` is [`Self::fly_glide_jump`]'s.
+    #[inline]
+    pub fn fly_kitty_glide<F>(
+        &mut self,
+        placement: &mut KittyCursorPlacement,
+        (layout, frame): (KittyCursorLayout, Duration),
+        take_off: Option<(i32, i32)>,
+        ink: F,
+    ) where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        self.fly_glide_jump(placement, layout, take_off);
+        // The flight's step is the stride its seats take, from the one source they read.
+        let step = if matches!(layout.body, crate::kitty_cursor::CursorBody::Glide(_)) {
+            i32::from(glide_stride()) * i32::from(layout.geom.cell_w)
+        } else {
+            1
+        };
+        self.plan_kitty_cursor_flight(placement, (layout.geom, step, frame), layout.cursor, ink);
+        // Landed, it faces the way it flew until the caret moves on: turned back on the frame it
+        // landed, it turned its every pixel twice for one move, and a word kill's pixels passed
+        // six turns with its breath (`the_flier_never_flashes`'s `word-kill`, a 20 px row on a
+        // dark page).
+        #[cfg(any(test, debug_assertions))]
+        let held = !LANDING_TURNS.with(std::cell::Cell::get)
+            && !FLIGHT_FACES_OFF.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let held = true;
+        let state = &mut self.kitty_cursor_placement;
+        let flying = placement.flight.is_some()
+            && state
+                .flight
+                .is_some_and(|f| f.step > 1 && f.path != FlightPath::Fade);
+        if flying {
+            state.faced = Some((placement.facing_left, layout.cursor));
+        } else {
+            match state.faced {
+                Some((left, at)) if held && at == layout.cursor => placement.facing_left = left,
+                _ => state.faced = None,
+            }
+        }
+    }
+
+    /// This cursor kitty's placement state, to put back with
+    /// [`Self::restore_kitty_cursor_placement`]: a host that draws one frame more than once (the
+    /// settings preview's refit) draws each from the state the frame began with.
+    #[inline]
+    #[must_use]
+    pub const fn kitty_cursor_placement_mark(&self) -> KittyCursorPlacementMark {
+        KittyCursorPlacementMark(self.kitty_cursor_placement)
+    }
+
+    /// Put back a placement state [`Self::kitty_cursor_placement_mark`] took.
+    #[inline]
+    pub const fn restore_kitty_cursor_placement(&mut self, mark: KittyCursorPlacementMark) {
+        self.kitty_cursor_placement = mark.0;
+    }
+
+    /// Forget every placement this cursor kitty was drawn at, its flights' ways included: a host
+    /// whose clock went back or jumped (a preview's loop, a phase shown out of order).
+    #[inline]
+    pub const fn forget_kitty_cursor_placement(&mut self) {
+        self.kitty_cursor_placement = KittyCursorPlacementState::EMPTY;
+    }
+
     /// Resolve the body's exact draw rectangle before the word pass, without advancing its follower.
     #[inline]
     #[must_use]
@@ -2907,7 +3829,8 @@ impl WordDecorations {
         // The glide is drawn at its rest, not eased after it: the follower's steps between two
         // rests are more looks of each pixel under the art at other columns of it, and through
         // a burst they turned those pixels up to twelve times a second
-        // (`the_flier_never_flashes`). Its stride ([`GLIDE_STRIDE`]) is its motion.
+        // (`the_flier_never_flashes`). Its stride ([`GLIDE_STRIDE`]) is its motion, and a move
+        // past it a flight ([`Self::fly_glide_jump`]).
         #[cfg(any(test, debug_assertions))]
         let follows = GLIDE_FOLLOWS.with(std::cell::Cell::get);
         #[cfg(not(any(test, debug_assertions)))]
@@ -3083,6 +4006,19 @@ impl WordDecorations {
             sing,
             notes,
         } = frame;
+        // A flight that fades out and in where every way crosses letters ([`FlightPath::Fade`]).
+        let alpha = match placement.flight {
+            Some(flight) if alpha > 0 => {
+                ((f32::from(alpha) * flight.alpha_share()).round() as u8).max(1)
+            }
+            _ => alpha,
+        };
+        // Off a wall with no seat for it, and back ([`Self::veil_kitty_cursor`]).
+        let alpha = if placement.veil < 1.0 {
+            (f32::from(alpha) * placement.veil.max(0.0)).round() as u8
+        } else {
+            alpha
+        };
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
@@ -3275,6 +4211,7 @@ impl WordDecorations {
             // Where the footprint was drawn (a glide's ink box, not its tile): a flight or a fold
             // flies the footprint on from there.
             self.kitty_cursor_placement.last_sprite = Some((shown.x, shown.y));
+            self.kitty_cursor_placement.last_wh = Some((shown.w, shown.h));
             self.kitty_cursor_placement.last_emitted_at = Some(at);
         }
 
@@ -7438,7 +8375,7 @@ impl GlideGeometry {
 /// of that pixel at another column of the art: a cell a key turned the pixels under its head
 /// seven and eight times a second through a 20-key-a-second burst, past the flash law with a
 /// blink before it (`the_flier_never_flashes`); a two-cell stride halves the looks.
-pub const GLIDE_STRIDE: i32 = 2;
+pub const GLIDE_STRIDE: u16 = 2;
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -7447,11 +8384,43 @@ thread_local! {
     /// The negative control of the glide's placement without the follower: it eases after its
     /// rest, as the head does ([`WordDecorations::PLACE_TAU`]).
     pub static GLIDE_FOLLOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of [`WordDecorations::fly_glide_jump`]: the glide is drawn at a rest
+    /// more than its stride away on the move's own frame, as at 0a12236dc7b.
+    pub static GLIDE_JUMPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of [`WordDecorations::plan_kitty_cursor_flight`]: the glide flies
+    /// straight along its low arc and eases there, as the head does, as at 0a12236dc7b.
+    pub static FLIGHT_UNPLANNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of [`WordDecorations::kitty_cursor_stride`]: the glide keeps its
+    /// stride only ahead of the caret, and behind it and fitted to its row moves a cell a key,
+    /// as at 0a12236dc7b.
+    pub static GLIDE_SEATS_UNSTRIDED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of a stepped flight's first step on its take-off frame
+    /// ([`HeadFlightSample::stepped`]): that frame draws it where it was, as at 0a12236dc7b's
+    /// flight.
+    pub static TAKE_OFF_DRAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a stepped flight flown again to a landing that moved on
+    /// ([`WordDecorations::fly_glide_jump`]): it keeps the way laid to its first landing.
+    pub static RETARGET_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a fade that goes out only where it took off clear
+    /// ([`WordDecorations::plan_kitty_cursor_flight`]): it goes out there over the caret or the
+    /// program's new ink.
+    pub static FADE_OUT_ANYWHERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a flight back along the way it flew within the flash law's
+    /// second ([`WordDecorations::plan_kitty_cursor_flight`]): it flies that way again.
+    pub static REFLY_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a stepped flight's facing
+    /// ([`WordDecorations::plan_kitty_cursor_flight`]): it faces the way it faced on the line,
+    /// tail first back along it.
+    pub static FLIGHT_FACES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a landed flight's facing ([`WordDecorations::fly_kitty_glide`]):
+    /// it turns back on the frame it lands.
+    pub static LANDING_TURNS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`GLIDE_STRIDE`], or a cell under its control.
 #[inline]
-fn glide_stride() -> i32 {
+fn glide_stride() -> u16 {
     #[cfg(any(test, debug_assertions))]
     if GLIDE_STRIDE_OFF.with(std::cell::Cell::get) {
         return 1;
@@ -8187,22 +9156,88 @@ const fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
     amp * carrier * (1.0 - p)
 }
 
+/// The share of its own reading a word's self-glow on paper left its letter's colour before
+/// CT-51 (the control of [`with_paper_glow_floor_old`]); the floor itself is the letter guard's
+/// ([`crate::cursor_glow::word_glow_floor`]).
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static PAPER_GLOW_FLOOR_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with a word's self-glow on paper held to
+/// [`PAPER_GLOW_KEEP`] of its letter's own reading, as before CT-51, which let a dim letter
+/// fall under the share the trail judge keeps. Debug and test builds only; the flag is this
+/// thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_paper_glow_floor_old<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            PAPER_GLOW_FLOOR_OLD.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(PAPER_GLOW_FLOOR_OLD.with(|c| c.replace(true)));
+    f()
+}
+
+/// The colour Feline's self-glow on paper lays a letter of `fg` at on a page `bg` at the
+/// glow's whole amplitude, the most the envelope reaches ([`feline_glow_env`]), under the
+/// floor this thread's control picks ([`with_paper_glow_floor_old`]). Debug and test builds
+/// only: a renderer test reads the letter it lays by its raster.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn paper_glow_peak(fg: u32, bg: u32) -> u32 {
+    let table = crate::color_math::relative_luminance_table();
+    let fg = fg & 0x00FF_FFFF;
+    let lit = mix_rgb(fg, 0x00FF_FFFF, FELINE_GLOW_LIFT);
+    let lum_bg = crate::color_math::relative_luminance_with(table, bg & 0x00FF_FFFF);
+    let scale = paper_glow_scale_lum(
+        table,
+        fg,
+        lit,
+        lum_bg,
+        (FELINE_GLOW_AMP, paper_glow_floor_old()),
+    );
+    mix_rgb(fg, lit, FELINE_GLOW_AMP * scale)
+}
+
+/// Whether the control of [`with_paper_glow_floor_old`] is on.
+#[inline]
+fn paper_glow_floor_old() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        PAPER_GLOW_FLOOR_OLD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// The share of the self-glow `amp` a letter in `fg` on a page of luminance `lum_bg` keeps,
+/// lit toward `lit`: the most at which its colour still reads the floor of its own reading
+/// ([`crate::cursor_glow::word_glow_floor`]; `old`, [`PAPER_GLOW_KEEP`] of it).
 #[inline]
 const fn paper_glow_scale_lum(
     table: &crate::color_math::RelativeLuminanceTable,
     fg: u32,
     lit: u32,
     lum_bg: f32,
-    amp: f32,
+    (amp, old): (f32, bool),
 ) -> f32 {
     let lum_fg = crate::color_math::relative_luminance_with(table, fg);
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
     let num = lum_bg + 0.05;
-    let floor = PAPER_GLOW_KEEP * num / (lum_fg + 0.05);
+    let own = num / (lum_fg + 0.05);
+    let floor = if old {
+        PAPER_GLOW_KEEP * own
+    } else {
+        crate::cursor_glow::word_glow_floor(own)
+    };
     #[inline]
     const fn reads_rgb(
         table: &crate::color_math::RelativeLuminanceTable,
@@ -8245,7 +9280,7 @@ const fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
         fg,
         lit,
         crate::color_math::relative_luminance_with(table, bg),
-        amp,
+        (amp, false),
     )
 }
 
@@ -8316,6 +9351,7 @@ fn emit_ink(
                 occ.ink_bg[2] as usize,
             );
             let mut memo: Option<([u8; 3], [u8; 3])> = None;
+            let old = paper_glow_floor_old();
             let mut i = 0;
             while i < cols.len() {
                 let col = cols[i];
@@ -8328,7 +9364,7 @@ fn emit_ink(
                         let v = u32_to_rgb3(mix_rgb(
                             fg,
                             lit,
-                            glow * paper_glow_scale_lum(table, fg, lit, lum_bg, amp),
+                            glow * paper_glow_scale_lum(table, fg, lit, lum_bg, (amp, old)),
                         ));
                         memo = Some((fg_rgb, v));
                         v

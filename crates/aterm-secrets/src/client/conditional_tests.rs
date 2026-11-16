@@ -26,7 +26,8 @@ fn conditional_publish_binds_its_parent_and_regular_updates_keep_it() {
     let mut doc = before.doc.clone();
     doc.set_entry(&Audience::Everyone, "test", b"conditional")
         .unwrap();
-    let outcome = admin_publish_conditional_until(&paths, &before, &doc, until()).unwrap();
+    let outcome =
+        admin_publish_conditional_until(&paths, &before, &doc, until(), Author::Person).unwrap();
     assert_eq!(outcome.seq, before.seq + 1);
     let bytes = fsx::read_owned(&source, envelope::MAX_ENVELOPE)
         .unwrap()
@@ -71,7 +72,10 @@ fn a_higher_sequence_does_not_license_a_stale_conditional_parent() {
     let retained = fsx::read_owned(&source, envelope::MAX_ENVELOPE)
         .unwrap()
         .unwrap();
-    assert!(admin_publish_conditional_until(&paths, &stale, &stale_doc, until()).is_err());
+    assert!(
+        admin_publish_conditional_until(&paths, &stale, &stale_doc, until(), Author::Person)
+            .is_err()
+    );
     assert_eq!(
         fsx::read_owned(&source, envelope::MAX_ENVELOPE)
             .unwrap()
@@ -116,7 +120,7 @@ fn http_store_rejects_a_sibling_and_a_parentless_downgrade() {
     let mut doc = current.doc.clone();
     doc.set_entry(&Audience::Everyone, "test", b"winner")
         .unwrap();
-    admin_publish_conditional_until(&paths, &current, &doc, until()).unwrap();
+    admin_publish_conditional_until(&paths, &current, &doc, until(), Author::Person).unwrap();
     let source = Source::Url(url);
     let read = || match transport::fetch(&source, None, Duration::from_secs(60)).unwrap() {
         Fetched::Body(bytes) => bytes,
@@ -131,7 +135,9 @@ fn http_store_rejects_a_sibling_and_a_parentless_downgrade() {
     let mut fork = sibling.doc.clone();
     fork.set_entry(&Audience::Everyone, "test", b"sibling")
         .unwrap();
-    assert!(admin_publish_conditional_until(&paths, &sibling, &fork, until()).is_err());
+    assert!(
+        admin_publish_conditional_until(&paths, &sibling, &fork, until(), Author::Person).is_err()
+    );
     // A legacy parentless write cannot turn off protection at this store.
     assert!(admin_publish(&paths, &sibling, &fork).is_err());
     assert_eq!(read(), retained);
@@ -149,7 +155,10 @@ fn http_store_rejects_a_sibling_and_a_parentless_downgrade() {
     doc.set_entry(&Audience::Everyone, "test", b"stored before lost response")
         .unwrap();
     CUT_AFTER_STORE.with(|cut| cut.set(true));
-    assert!(admin_publish_conditional_until(&paths, &before_cut, &doc, until()).is_err());
+    assert!(
+        admin_publish_conditional_until(&paths, &before_cut, &doc, until(), Author::Person)
+            .is_err()
+    );
     assert_eq!(admin_cached(&paths).unwrap().seq(), before_cut.seq());
     assert_eq!(envelope::parse(&read()).unwrap().seq, before_cut.seq() + 1);
     sync_reader_until(&paths, until()).unwrap();

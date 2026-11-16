@@ -92,7 +92,7 @@ no_heap!(
     super::checkpoint_output::Vt52AddressRepr,
     super::checkpoint_holder::HolderAnchorRepr,
     super::checkpoint_holder::HolderSpanRepr,
-    super::program_state::ProgramStateReport,
+    super::program_state::ProgramStateRecord,
     super::shell_integration_auth::ShellIntegrationAuth,
     super::clipboard_auth::ClipboardAuth,
     super::state::ConfiguredModes,
@@ -501,12 +501,14 @@ impl Heap for OutputStateRepr {
             sgr_stack,
             saved_modes,
             program_state,
+            other_program_state,
         } = self;
         [
             hyperlink.heap(),
             sgr_stack.heap(),
             saved_modes.heap(),
             program_state.heap(),
+            other_program_state.heap(),
         ]
         .into_iter()
         .fold(0, usize::saturating_add)

@@ -10,7 +10,8 @@ fn external_celebration_wakes_initial_green_then_only_bars_outro_and_settle() {
         CelebrateOn, SING_BAR_SECONDS, SING_WIND_DOWN, song_signature,
     };
     let mut app = crate::App::headless_for_test();
-    let ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
+    let mut field_guard_ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
+    let ws = &mut **field_guard_ws;
     ws.focused = true;
     let start = Instant::now();
     let sid = ws.front_terminal().unwrap().session;

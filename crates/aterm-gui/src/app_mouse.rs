@@ -607,6 +607,7 @@ fn divider_drag_off_axis(g: usize, raw: u16, cell: usize) -> u16 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PointerGeometry {
+    inset: usize,
     cell: (usize, usize),
     pad: usize,
     pad_top: usize,
@@ -633,6 +634,37 @@ struct PressStreak {
     at: std::time::Instant,
     view: crate::tab_model::ViewId,
     key: crate::native_ui::UiKey,
+    /// How many presses the run holds, this one included.
+    count: u8,
+}
+
+/// A POINTER HELD ON A CONTROL THAT IS DRAGGED ([`crate::native_ui::Control::drags`]): the page
+/// hears the pointer's travel across since the press while it moves, and once more at the
+/// release, wherever that lands ([`crate::native_app::SemanticInput::Drag`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NativeDrag {
+    view: crate::tab_model::ViewId,
+    action: crate::native_ui::ActionId,
+    /// The window pixel the press landed on, and its page's device pixels per point.
+    from_px: f64,
+    scale: f64,
+    /// The presses of the run the press belongs to ([`PressStreak`]).
+    presses: u8,
+}
+
+impl NativeDrag {
+    fn input(&self, x: f64, done: bool) -> crate::native_app::SemanticInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a pointer's travel in points, far inside f32"
+        )]
+        let dx = ((x - self.from_px) / self.scale.max(f64::EPSILON)) as f32;
+        crate::native_app::SemanticInput::Drag {
+            dx,
+            done,
+            presses: self.presses,
+        }
+    }
 }
 
 impl NativePointerRest {
@@ -683,12 +715,14 @@ impl NativePointerRest {
         here.streak = Some(match continues {
             Some(streak) => PressStreak {
                 at: now,
+                count: streak.count.saturating_add(1),
                 ..streak.clone()
             },
             None => PressStreak {
                 at: now,
                 view,
                 key: key.clone(),
+                count: 1,
             },
         });
         onto_another
@@ -707,6 +741,12 @@ impl NativePointerRest {
                     .as_ref()
                     .is_some_and(|(seen_view, seen)| *seen_view == view && seen == key)
         })
+    }
+
+    /// The presses the run at this rest holds ([`PressStreak`]); 1 where it holds none.
+    fn presses(rest: Option<&Self>) -> u8 {
+        rest.and_then(|rest| rest.streak.as_ref())
+            .map_or(1, |streak| streak.count)
     }
 
     fn on(
@@ -903,10 +943,11 @@ impl App {
         claim: fn(&mut Self, WindowId) -> bool,
         motion: fn(&mut Self, WindowId, f64, f64),
     ) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        ws.overlay = Some(overlay);
+        let ws = &mut **route_guard_ws;
+        ws.routing.set_overlay(Some(overlay));
         ws.scroll_residual = 0.0;
         if let Some(w) = &ws.os_window {
             if raise {
@@ -914,6 +955,7 @@ impl App {
             }
             w.request_redraw();
         }
+        drop(route_guard_ws);
         self.retire_native_input_in(wid);
         self.settle_pointer_drags(wid);
         let _ = claim(self, wid);
@@ -931,15 +973,16 @@ impl App {
         is_open: fn(&crate::WindowState) -> bool,
     ) {
         let mut closed = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && is_open(ws)
-        {
-            ws.overlay = None;
-            ws.scroll_residual = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if is_open(ws) {
+                ws.routing.set_overlay(None);
+                ws.scroll_residual = 0.0;
+                if let Some(w) = &ws.os_window {
+                    w.request_redraw();
+                }
+                closed = true;
             }
-            closed = true;
         }
         self.overlay_a11y_update();
         if closed {
@@ -1102,6 +1145,7 @@ impl App {
         let changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
             .is_some_and(|palette| palette.pointer_hover(hit));
         self.repaint_palette_pointer(wid, changed);
@@ -1112,6 +1156,7 @@ impl App {
         let changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
             .is_some_and(|palette| palette.pointer_press(hit));
         self.repaint_palette_pointer(wid, changed);
@@ -1122,6 +1167,7 @@ impl App {
         let (changed, activate) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
             .map_or((false, false), |palette| palette.pointer_release(hit));
         self.repaint_palette_pointer(wid, changed);
@@ -1134,6 +1180,7 @@ impl App {
         let mut changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
             .is_some_and(|palette| palette.scroll_by(delta));
         let (x, y) = self
@@ -1144,6 +1191,7 @@ impl App {
         changed |= self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
             .is_some_and(|palette| palette.pointer_hover(hit));
         self.repaint_palette_pointer(wid, changed);
@@ -1416,7 +1464,7 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.pane_overlay.hover)
             .is_some_and(|h| !self.active_tab_shows_session(wid, h))
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.pane_overlay.hover = None;
         }
@@ -1440,7 +1488,8 @@ impl App {
             self.write_owner_release(button, owner);
             released.push(button);
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             for button in released {
                 forget_reported_button(ws, button);
             }
@@ -1450,7 +1499,8 @@ impl App {
     /// Re-derive window `wid`'s pane-local pointer cell (`last_mouse_cell`) from its window cell and the focused pane's rect.
     pub(crate) fn rederive_pointer_cell(&mut self, wid: WindowId) {
         let rect = self.focused_pane_rect(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_mouse_cell = cell_in_rect(ws.last_mouse_window_cell, rect);
         }
     }
@@ -1611,6 +1661,7 @@ impl App {
         } else {
             self.windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|window| window.tab_set.active_mut())
                 .is_some_and(|tab| tab.set_focus(hit))
         };
@@ -1623,7 +1674,8 @@ impl App {
             debug_assert!(synced);
         }
         let (ro, co) = hit_origin;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_mouse_cell = (wr.saturating_sub(ro), wc.saturating_sub(co));
         }
         self.resync_active_or_window(wid);
@@ -1701,7 +1753,8 @@ impl App {
                 crate::tab_model::SplitAxis::Vertical => CursorIcon::RowResize,
             },
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.divider_drag = Some(hit);
             if let Some(w) = &ws.os_window {
                 w.set_cursor(icon);
@@ -1790,6 +1843,7 @@ impl App {
                 (
                     self.windows
                         .get_mut(&wid)
+                        .as_deref_mut()
                         .and_then(|window| window.tab_set.active_mut())
                         .is_some_and(|tab| tab.set_divider_ratio(path, ratio)),
                     false,
@@ -1826,7 +1880,8 @@ impl App {
         }
         PANE_DRAG_APPLIED_AT.with(|c| c.set(None));
         PANE_DRAG_CELL.with(|c| c.set(None));
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.divider_drag = None;
             ws.hover_pointer = false;
             ws.native_text_cursor = false;
@@ -1846,7 +1901,8 @@ impl App {
     }
 
     pub(crate) fn settle_native_pointer_press(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.page_buttons = 0;
         }
         if let Some((_, view)) = self.active_native_view(wid)
@@ -1855,7 +1911,7 @@ impl App {
                 .view_state(view)
                 .is_some_and(|state| state.common().pressed.is_some())
         {
-            if let Some(state) = self.native_runtime.view_state_mut(view) {
+            if let Some(mut state) = self.native_runtime.view_state_mut(view) {
                 state.common_mut().pressed = None;
             }
             self.invalidate_native_pointer_style(wid, view);
@@ -1868,13 +1924,14 @@ impl App {
         self.scrollbar_release(wid);
         self.settle_native_pointer_press(wid);
         if self.finish_divider_drag(wid)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.held_mouse_button = held_button(ws.reported_buttons);
         }
         if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             self.finish_selection(wid, false);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
             }
         }
@@ -2019,6 +2076,7 @@ impl App {
 
     fn pointer_geometry(&self, wid: WindowId) -> PointerGeometry {
         PointerGeometry {
+            inset: self.win_side_inset_px(wid),
             cell: self.win_cell_size(wid),
             pad: self.win_pad(wid),
             pad_top: self.win_pad_top(wid),
@@ -2137,7 +2195,8 @@ impl App {
             None => self.focused_pane_rect(wid),
         };
         let (lr, lc) = cell_in_rect((row, col), pane_rect);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_mouse_window_cell = (row, col);
             ws.last_mouse_cell = (lr, lc);
         }
@@ -2363,10 +2422,11 @@ impl App {
             PointerAction::Mods(mods) => {
                 // Keep the person's own modifiers aside, once per script, for
                 // their next input to put back (`App::release_scripted_mods`).
-                if let Some(ws) = self.windows.get_mut(&wid)
-                    && ws.scripted_mods_saved.is_none()
-                {
-                    ws.scripted_mods_saved = Some(ws.mods);
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
+                    if ws.scripted_mods_saved.is_none() {
+                        ws.scripted_mods_saved = Some(ws.mods);
+                    }
                 }
                 self.on_modifiers_changed(wid, mods);
             }
@@ -2474,15 +2534,16 @@ impl App {
         if !self.prepare_native_input_scratch_from_capture_plan(wid, &plan) {
             return false;
         }
-        let Some(raster) = self
-            .windows
-            .get_mut(&wid)
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(raster) = route_projection
+            .as_deref_mut()
             .and_then(|ws| ws.leaf_render_cache.get_mut(&view))
             .and_then(|cache| cache.native.as_mut())
         else {
             return false;
         };
         raster.presented = true;
+        drop(route_projection);
         self.refresh_native_hover_for_frame_from_plan(wid, &plan);
         true
     }
@@ -2598,6 +2659,7 @@ impl App {
         crate::native_ui::UiKey,
         bool,
         bool,
+        bool,
     )> {
         if over_chrome {
             return None;
@@ -2615,6 +2677,7 @@ impl App {
                     hit.key,
                     is_text,
                     hit.look_first,
+                    hit.drags,
                 ))
             })
             .filter(|(target, generation, ..)| {
@@ -2669,7 +2732,8 @@ impl App {
             || self.find_bar_cell_at(wid, x, y).is_some()
             || self.stats_owns_pointer(wid);
         let hit = self.native_hover_hit(wid, x, y, over_chrome, Some(plan));
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.native_rehover = false;
         }
         self.apply_native_hover(wid, hit.map(|(view, _, key, ..)| (view, key)));
@@ -2687,7 +2751,8 @@ impl App {
         if !self.stats_lens_at(wid, x, y) {
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.native_rest = None;
             if ws.hover_pointer || ws.native_text_cursor {
                 ws.hover_pointer = false;
@@ -2772,9 +2837,9 @@ impl App {
 
     /// Where the padded frame's top-left sits inside the raw window.
     pub(crate) fn frame_origin(&self, wid: WindowId) -> (i64, i64) {
-        // The bail-outs are geometry-free, so they come before `pointer_geometry`.
+        // A headless surface is the frame plus its side inset.
         if !self.windows.get(&wid).is_some_and(|ws| ws.win_px.is_some()) {
-            return (0, 0);
+            return (self.win_side_inset_px(wid) as i64, 0);
         }
         self.frame_origin_with(wid, self.pointer_geometry(wid))
     }
@@ -2784,7 +2849,7 @@ impl App {
             return (0, 0);
         };
         let Some(size) = ws.win_px else {
-            return (0, 0);
+            return (geom.inset as i64, 0);
         };
         let (cw, ch) = geom.cell;
         let (pad, pad_top, head) = (geom.pad, geom.pad_top, geom.head);
@@ -2797,10 +2862,79 @@ impl App {
             .saturating_add(head)
             .saturating_add(pad_top)
             .saturating_add(pad);
-        (
-            aterm_render::band_offset(size.width as usize, frame_w),
-            aterm_render::band_offset_y(size.height as usize, frame_h),
-        )
+        let place = aterm_render::frame_placement(
+            size.width as usize,
+            size.height as usize,
+            frame_w,
+            frame_h,
+            aterm_render::SideInsetPx(geom.inset),
+        );
+        (place.x.origin, place.y.origin)
+    }
+
+    /// The reserved side space not covered by the visible frame. An oversized frame may
+    /// overlap the nominal inset; those painted pixels retain their normal pointer routes.
+    pub(crate) fn in_side_inset(&self, wid: WindowId, x: f64) -> bool {
+        x >= 0.0
+            && x < self.win_side_inset_px(wid) as f64
+            && x < self.frame_origin(wid).0.max(0) as f64
+    }
+
+    fn pointer_gesture_live(&self, wid: WindowId) -> bool {
+        self.windows.get(&wid).is_some_and(|ws| {
+            ws.selecting
+                || ws.held_mouse_button.is_some()
+                || ws.divider_drag.is_some()
+                || ws.strip_drag.is_some()
+                || ws.pane_overlay.drag.is_some()
+                || ws.page_buttons != 0
+        })
+    }
+
+    /// Refresh a still pointer after placement changes, without dispatching a motion or
+    /// any program input. The next native paint re-resolves its retained hit as well.
+    pub(crate) fn refresh_pointer_after_frame_placement(&mut self, wid: WindowId) {
+        if self.backend.is_pending() {
+            return;
+        }
+        let Some((x, y)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)
+            .map(|ws| ws.last_cursor_px)
+        else {
+            return;
+        };
+        let geom = self.pointer_geometry(wid);
+        self.refresh_mouse_cell(wid, geom, x, y);
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.hover_memo = None;
+            ws.hover_grid_owned = false;
+            ws.native_rest = None;
+            ws.native_rehover = true;
+            ws.inset_hover_cleared = false;
+        }
+        self.update_hover_cursor(wid);
+    }
+
+    /// Retire pane hover once on entering the inset. Keep the window-space position known,
+    /// so later modifier/frame resolutions cannot revive the last pane cell.
+    fn clear_side_inset_hover(&mut self, wid: WindowId) {
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        if ws.inset_hover_cleared {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+            return;
+        }
+        let known = ws.pointer_position_known;
+        // Native leave clears the flags, so request the OS cursor before retiring them.
+        self.request_hover_cursor(wid, CursorIcon::Default, false, false);
+        self.on_cursor_left(wid);
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.pointer_position_known = known;
+            ws.inset_hover_cleared = true;
+        }
     }
 
     /// Translate a window-space pixel to frame space (strip the leading bands).
@@ -2877,7 +3011,8 @@ impl App {
                 }
                 _ => {
                     #[cfg(windows)]
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.band_menu_release_pending = true;
                     }
                     #[cfg(target_os = "linux")]
@@ -2913,7 +3048,13 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<u16> {
-        if !self.tab_strip_enabled() {
+        if !self.tab_strip_enabled()
+            || (self.in_side_inset(wid, x)
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_none_or(|ws| ws.strip_drag.is_none()))
+        {
             return None;
         }
         let (cw, ch) = geom.cell;
@@ -3002,10 +3143,11 @@ impl App {
 
     fn track_tab_menu_hover(&mut self, wid: WindowId, x: f64, y: f64) {
         let hovered = self.tab_menu_action_at(wid, x, y);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let Some(menu) = ws.tab_menu.as_mut() else {
+        let ws = &mut **route_guard_ws;
+        let Some(menu) = ws.routing.menu_mut() else {
             return;
         };
         if hovered.is_none() && menu.keyboard {
@@ -3037,9 +3179,10 @@ impl App {
             return false;
         }
         let (fx, fy) = self.window_to_frame(wid, px, py);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         if ws.fx.companion_mut().press(at, (fx as f32, fy as f32))
             != aterm_effects::host::PressOutcome::Pet
         {
@@ -3073,9 +3216,10 @@ impl App {
             Some(crate::tab_bar::TabHit::Caption(button)) => Some(button),
             _ => None,
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws.strip_hover == hovered
             && ws.strip_hover_new_tab == on_new_tab
             && ws.strip_hover_version == on_version
@@ -3105,7 +3249,8 @@ impl App {
                 return false;
             }
             let window = ws.os_window.clone();
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.caption_move = None;
                 ws.strip_band_press = None;
             }
@@ -3132,9 +3277,10 @@ impl App {
         } else {
             None
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         let Some(dir) = edge else {
             if ws.frame_edge.take().is_some() {
                 ws.hover_pointer = true;
@@ -3197,7 +3343,7 @@ impl App {
     pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
         self.apply_native_hover(wid, None);
         let native_front = self.active_native_view(wid).is_some();
-        if native_front && let Some(ws) = self.windows.get_mut(&wid) {
+        if native_front && let Some(mut ws) = self.windows.get_mut(&wid) {
             ws.hover_pointer = false;
             ws.native_text_cursor = false;
         }
@@ -3205,10 +3351,12 @@ impl App {
         self.clear_claude_light_hover(wid);
         self.scrollbar_pointer_left(wid);
         self.stats_pointer_left(wid, crate::metrics::host_now());
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.pointer_position_known = false;
+        ws.inset_hover_cleared = false;
         ws.hover_grid_owned = false;
         ws.native_rehover = false;
         ws.frame_edge = None;
@@ -3260,7 +3408,8 @@ impl App {
         if !stepped {
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.strip_drag = Some(StripDrag {
                 origin_col: col,
                 ..drag
@@ -3435,6 +3584,7 @@ impl App {
     fn park_link_target(&mut self, wid: WindowId) -> Option<crate::link_target::LinkHover> {
         self.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.link_hover.take())
     }
 
@@ -3469,7 +3619,8 @@ impl App {
             HoverProbe::Resolved(hover) => hover,
             HoverProbe::Deferred => parked,
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.link_hover = resolved;
         }
     }
@@ -3500,6 +3651,13 @@ impl App {
         if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
             return Resolved(None);
         }
+        let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
+            return Resolved(None);
+        };
+        if self.in_side_inset(wid, px) && !self.pointer_gesture_live(wid) {
+            self.clear_side_inset_hover(wid);
+            return Resolved(None);
+        }
         if self.active_native_view(wid).is_some() {
             return Resolved(None);
         }
@@ -3510,9 +3668,7 @@ impl App {
         {
             return Resolved(None);
         }
-        let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
-            return Resolved(None);
-        };
+
         if self.stats_lens_at(wid, px, py) {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return Resolved(None);
@@ -3615,14 +3771,16 @@ impl App {
             .pool
             .get(session)
             .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return Resolved(None);
         };
+        let ws = &mut **route_guard_ws;
         let frame = HoverMemo::frame_of(ws);
         let min_contrast = self.render_knobs.minimum_contrast;
         let answered = ws.hover_memo.as_ref().is_some_and(|memo| {
             memo.answers(session, window_cell, mod_held, cell_is_under_pointer, frame)
         });
+        drop(route_guard_ws);
         if !answered {
             let (disclosed, plain_url, citation) = match probe {
                 Some(t) => {
@@ -3645,9 +3803,10 @@ impl App {
                 None => disclosed,
             };
             let citation = target;
-            let Some(ws) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                 return Resolved(None);
             };
+            let ws = &mut **route_guard_ws;
             ws.hover_memo = Some(HoverMemo {
                 session,
                 window_cell,
@@ -3663,12 +3822,14 @@ impl App {
                 named,
             });
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return Resolved(None);
         };
+        let ws = &mut **route_guard_ws;
         let (disclosed, plain_url) = ws.hover_memo.as_ref().map_or((false, false), |memo| {
             (memo.disclosed.is_some(), memo.plain_url)
         });
+        drop(route_guard_ws);
         if mod_held && (disclosed || plain_url) {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
         } else if tracking {
@@ -3684,15 +3845,24 @@ impl App {
     }
 
     fn set_hover_cursor(&mut self, wid: WindowId, icon: CursorIcon, pointer: bool, text: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(ws) = self.windows.get(&wid) else {
             return;
         };
         let divider = pointer && text;
         if !divider && ws.hover_pointer == pointer && ws.native_text_cursor == text {
             return;
         }
+        self.request_hover_cursor(wid, icon, pointer, text);
+    }
+
+    fn request_hover_cursor(&mut self, wid: WindowId, icon: CursorIcon, pointer: bool, text: bool) {
+        let Some(mut ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
         ws.hover_pointer = pointer;
         ws.native_text_cursor = text;
+        #[cfg(test)]
+        CURSOR_REQUESTS_FOR_TEST.with_borrow_mut(|requests| requests.push((wid, icon)));
         if let Some(w) = &ws.os_window {
             w.set_cursor(icon);
         }
@@ -3865,7 +4035,8 @@ impl App {
         }
         let divider_changed = divider && !dragging;
         if (focus_changed || divider_changed)
-            && let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view)
+            && let Some(AppViewState::Editor(state)) =
+                self.native_runtime.view_state_mut(view).as_deref_mut()
         {
             if focus_changed
                 && let (Some(workspace), Some(focus)) = (state.markdown.as_mut(), focus)
@@ -4001,8 +4172,9 @@ impl App {
         notches: i32,
         precise: bool,
     ) -> bool {
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return false;
         };
@@ -4026,6 +4198,7 @@ impl App {
         } else {
             signed
         };
+        drop(route_native_guard);
         if columns != 0 {
             let _ = self.native_editor_grid_scroll(wid, view, columns);
         }
@@ -4048,8 +4221,9 @@ impl App {
         if view != expected_view {
             return false;
         }
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return false;
         };
@@ -4060,6 +4234,7 @@ impl App {
                     && at.saturating_duration_since(then).as_millis() <= crate::multi_click_ms()
             });
         state.grid_press = (!open).then_some((at, record, column));
+        drop(route_native_guard);
         let handled = self
             .dispatch_editor_event(
                 instance,
@@ -4093,7 +4268,7 @@ impl App {
             return false;
         }
         if let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            self.native_runtime.view_state_mut(view).as_deref_mut()
         {
             state.grid_press = None;
         }
@@ -4130,8 +4305,9 @@ impl App {
         if self.native_runtime.document_id(instance).is_none() {
             return false;
         }
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return false;
         };
@@ -4153,6 +4329,7 @@ impl App {
         if changed {
             state.common.presentation_revision =
                 state.common.presentation_revision.saturating_add(1);
+            drop(route_native_guard);
             self.invalidate_native_ui_cache(wid);
             self.request_redraw_all_windows();
         }
@@ -4200,26 +4377,39 @@ impl App {
                 .get(&wid)
                 .is_some_and(|ws| ws.hover_mapping == self.hover_mapping(wid))
         {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.link_hover = parked;
             }
             return;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_cursor_px = (x, y);
             ws.pointer_position_known = true;
             ws.hover_grid_owned = false;
             ws.native_rehover = false;
         }
         if self.route_frame_motion(wid, x, y) {
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.inset_hover_cleared = false;
+            }
             return;
         }
         let geom = self.pointer_geometry(wid);
+        if (!self.in_side_inset(wid, x) || self.pointer_gesture_live(wid))
+            && let Some(mut ws) = self.windows.get_mut(&wid)
+        {
+            ws.inset_hover_cleared = false;
+        }
         self.track_strip_hover(wid, geom, x, y);
         let over_claude_chips = self.track_claude_light_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
             self.scrollbar_pointer_left(wid);
             self.palette_pointer_motion(wid, x, y);
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.inset_hover_cleared = false;
+            }
             return;
         }
         if self
@@ -4230,17 +4420,30 @@ impl App {
             self.scrollbar_pointer_left(wid);
             self.refresh_mouse_cell(wid, geom, x, y);
             self.track_tab_menu_hover(wid, x, y);
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.inset_hover_cleared = false;
+            }
             return;
         }
         if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
             self.scrollbar_pointer_left(wid);
             self.refresh_mouse_cell(wid, geom, x, y);
             self.autopilot_menu_motion(wid, x, y);
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.inset_hover_cleared = false;
+            }
             return;
         }
         if self.overview_claims_pointer(wid) {
             self.scrollbar_pointer_left(wid);
             self.overview_pointer_motion(wid, x, y);
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.inset_hover_cleared = false;
+            }
+            return;
+        }
+        if self.in_side_inset(wid, x) && !self.pointer_gesture_live(wid) {
+            self.clear_side_inset_hover(wid);
             return;
         }
         if !self.windows.get(&wid).is_some_and(|ws| {
@@ -4251,7 +4454,8 @@ impl App {
         }) && self.stats_pointer_motion(wid, crate::metrics::host_now())
         {
             self.scrollbar_pointer_left(wid);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.native_rest = None;
                 if ws.hover_pointer || ws.native_text_cursor {
                     ws.hover_pointer = false;
@@ -4279,7 +4483,8 @@ impl App {
                 x: divider_drag_off_axis(gx, raw_c, geom.cell.0),
                 y: divider_drag_off_axis(gy, raw_r, geom.cell.1),
             };
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.last_mouse_px_off = px_off;
             }
             self.drag_divider(wid);
@@ -4308,6 +4513,24 @@ impl App {
             if self.active_tab_has_multiple_visible_panes(wid) {
                 self.refresh_mouse_cell_with_plan(wid, geom, x, y, motion_plan.as_ref());
             }
+            if let Some(drag) = self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.native_drag.clone())
+                .filter(|drag| drag.view == view)
+            {
+                // A held edge follows the pointer wherever it goes, off its own few points too.
+                let _ = self.dispatch_native_view_event(
+                    wid,
+                    view,
+                    crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                        value: Some(drag.input(x, false)),
+                        id: drag.action,
+                    }),
+                );
+                self.set_hover_cursor(wid, CursorIcon::ColResize, true, true);
+                return;
+            }
             let dragging_editor = self
                 .native_runtime
                 .view_state(view)
@@ -4324,18 +4547,20 @@ impl App {
                 || self.find_bar_cell_at(wid, x, y).is_some();
             let over_chrome = over_pane_header || over_strip || over_banner;
             let native_hover = self.native_hover_hit(wid, x, y, over_chrome, motion_plan.as_ref());
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.native_rest = NativePointerRest::after_motion(
                     ws.native_rest.take(),
                     (x, y),
                     native_hover
                         .as_ref()
-                        .map(|(view, _, key, _, asks)| (*view, key, *asks)),
+                        .map(|(view, _, key, _, asks, _)| (*view, key, *asks)),
                 );
             }
             let text_field_hovered = native_hover
                 .as_ref()
-                .is_some_and(|(_, _, _, is_text, _)| *is_text);
+                .is_some_and(|(_, _, _, is_text, ..)| *is_text);
+            let edge_hovered = native_hover.as_ref().is_some_and(|(.., drags)| *drags);
             self.apply_native_hover(
                 wid,
                 native_hover
@@ -4368,25 +4593,35 @@ impl App {
                             .is_some_and(|(_, _, key, ..)| key.as_str() != "editor/buffer"));
                 let icon = if text_cursor {
                     CursorIcon::Text
+                } else if edge_hovered && !over_chrome {
+                    // An edge that is dragged across (a sheet column's) shows that it is.
+                    CursorIcon::ColResize
                 } else if pointer {
                     CursorIcon::Pointer
                 } else {
                     CursorIcon::Default
                 };
-                self.set_hover_cursor(wid, icon, pointer, text_cursor);
+                if edge_hovered && !over_chrome && !text_cursor {
+                    // Set whatever was shown before, as a divider's is: the two flags alone do
+                    // not tell this cursor from a pointing hand.
+                    self.set_hover_cursor(wid, icon, true, true);
+                } else {
+                    self.set_hover_cursor(wid, icon, pointer, text_cursor);
+                }
             }
             if !self.pointer_routes_to_a_terminal_pane_with_plan(wid, motion_plan.as_ref()) {
                 return;
             }
         }
         if self.strip_col_at_with(wid, geom, x, y).is_some() {
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && (ws.hover_pointer || ws.native_text_cursor)
-            {
-                ws.hover_pointer = false;
-                ws.native_text_cursor = false;
-                if let Some(w) = &ws.os_window {
-                    w.set_cursor(CursorIcon::Default);
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                if ws.hover_pointer || ws.native_text_cursor {
+                    ws.hover_pointer = false;
+                    ws.native_text_cursor = false;
+                    if let Some(w) = &ws.os_window {
+                        w.set_cursor(CursorIcon::Default);
+                    }
                 }
             }
             if !self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
@@ -4425,20 +4660,22 @@ impl App {
             }
             crate::claude_lights::OverChips::No => {}
         }
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && pet_wake_wanted(
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if pet_wake_wanted(
                 ws.fx.companion_mut().hit_rect().is_some(),
                 ws.fx.companion_mut().needs_frames(),
                 ws.pet_pointer_sampled_px,
                 (x, y),
                 geom.cell,
-            )
-            && let Some(w) = ws.os_window.as_ref()
-        {
-            w.request_redraw();
+            ) && let Some(w) = ws.os_window.as_ref()
+            {
+                w.request_redraw();
+            }
         }
         let mapping = self.hover_mapping_with(wid, geom, mapped_cell.pane_rect);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.hover_grid_owned = true;
             ws.hover_mapping = mapping;
         }
@@ -4463,7 +4700,8 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.held_mouse_button)
             .map_or(3u8, |button| button.code());
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_mouse_px_off = px_off;
         }
         self.selection_autoscroll_with(wid, geom, y, mapped_cell.pane_rect);
@@ -4480,11 +4718,12 @@ impl App {
         let tracking = session
             .and_then(|session| self.pool.get(session))
             .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
-        if let (Some(session), Some(ws)) = (session, self.windows.get_mut(&wid)) {
-            note_owner_cell(ws, session, (row, col), px_off);
+        if let (Some(session), Some(mut ws)) = (session, self.windows.get_mut(&wid)) {
+            note_owner_cell(&mut ws, session, (row, col), px_off);
         }
         if !tracking && !self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.last_mouse_side = side;
             }
             return;
@@ -4509,9 +4748,10 @@ impl App {
             return;
         };
         let controller = self.person_gesture_refused();
-        let Some(fws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_fws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let fws = &mut **route_guard_fws;
         // A control client's move steers the selection the button's release would copy.
         fws.sel_by_controller |= controller;
         let (sel_row, col) = {
@@ -4613,7 +4853,8 @@ impl App {
             None => return false,
         };
         if !selecting {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.next_autoscroll = None;
             }
             return false;
@@ -4630,7 +4871,8 @@ impl App {
             crate::app_render::selection_autoscroll_lines(y, pane_top, strip_px, ch, pane_rows);
         if lines == 0 {
             // Pointer is back inside the grid → stop auto-scrolling.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.next_autoscroll = None;
             }
             return false;
@@ -4644,7 +4886,8 @@ impl App {
                     // A tab close/switch can retire the front terminal between
                     // repeat ticks. Drop the old level-triggered deadline here or
                     // the event loop keeps re-observing a time in the past.
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.next_autoscroll = None;
                     }
                     return false;
@@ -4655,7 +4898,8 @@ impl App {
             term.scroll_display(lines);
             term.grid().display_offset() != before
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.next_autoscroll = Some(Instant::now() + crate::SELECTION_AUTOSCROLL_INTERVAL);
         }
         if moved && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
@@ -4704,7 +4948,8 @@ impl App {
                 .map_or(SelectionSide::Left, |ws| ws.last_mouse_side)
         });
         self.extend_selection_to(wid, sel_row, col, side);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.last_press = Some((at, (sel_row, col)));
             ws.click_count = 1;
             if let Some(w) = &ws.os_window {
@@ -4721,9 +4966,10 @@ impl App {
         else {
             return 1;
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return 1;
         };
+        let ws = &mut **route_guard_ws;
         let (row, col) = ws.last_mouse_cell;
         let (sel_row, col) = {
             let term = term_lock(&term);
@@ -4783,7 +5029,8 @@ impl App {
             note_selection_custody(&mut term, true);
             (start, end, col)
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.gesture = Some(GestureOrigin {
                 row: start.0,
                 end_row: end.0,
@@ -4810,7 +5057,8 @@ impl App {
             let (col, _) = pointer_anchor_at_sel_row(&term, sel_row, col, SelectionSide::Left);
             (first_row, last_row, term.cols().saturating_sub(1), col)
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.gesture = Some(GestureOrigin {
                 row: first_row,
                 end_row: last_row,
@@ -4827,12 +5075,13 @@ impl App {
         let pane = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.staged_drag_pane.take())
+            .and_then(|mut ws| ws.staged_drag_pane.take())
             .unwrap_or_else(|| self.focused_pane_rect(wid));
         let controller = self.person_gesture_refused();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.selecting = true;
         ws.sel_by_controller = controller;
         ws.drag_pane = pane;
@@ -4851,12 +5100,13 @@ impl App {
         let pane = self
             .windows
             .get_mut(&wid)
-            .and_then(|ws| ws.staged_drag_pane.take())
+            .and_then(|mut ws| ws.staged_drag_pane.take())
             .unwrap_or_else(|| self.focused_pane_rect(wid));
         let controller = self.person_gesture_refused();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let (row, col) = ws.last_mouse_cell;
         let (sel_row, col) = {
             let mut term = term_lock(&term);
@@ -4924,9 +5174,10 @@ impl App {
             return false;
         };
         let released_by_controller = self.person_gesture_refused();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         // A selection a control client started, dragged or let go of is the client's: its end
         // copies nothing on select, even at the person's release.
         let by_controller = std::mem::take(&mut ws.sel_by_controller) || released_by_controller;
@@ -4947,6 +5198,7 @@ impl App {
         if let Some(w) = &ws.os_window {
             w.request_redraw();
         }
+        drop(route_guard_ws);
         let fired = completed && self.copy_on_select && !suppress_copy_on_select;
         if fired {
             // Under the client's mark, `copy_selection_in` refuses it and logs why.
@@ -5094,7 +5346,8 @@ impl App {
                 .map(|(wid, _)| *wid)
                 .collect();
         for wid in stale {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.hover_memo = None;
             }
             self.update_hover_cursor(wid);
@@ -5210,7 +5463,8 @@ impl App {
                 .map(|shown| shown.names.clone())
         });
         if !caption_admits(shown.as_ref(), pressed, path.as_ref()) {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.hover_memo = None;
                 if let Some(w) = &ws.os_window {
                     w.request_redraw();
@@ -5292,7 +5546,8 @@ impl App {
             && let Some(button) = winit_mouse_button(button)
         {
             self.end_unpaired_release(wid, button);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.page_buttons &= !(1 << button.slot());
             }
         }
@@ -5309,7 +5564,8 @@ impl App {
         if let Some(owner) = owner {
             self.write_owner_release(button, owner);
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             forget_reported_button(ws, button);
         }
     }
@@ -5467,7 +5723,7 @@ impl App {
         self.fence_pointer_license(wid);
         let pressed = state == ElementState::Pressed;
         if button == WinitMouseButton::Left
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             #[cfg(target_os = "linux")]
             if pressed && let Some(edge) = ws.frame_edge {
@@ -5488,7 +5744,7 @@ impl App {
         }
         if !pressed
             && button == WinitMouseButton::Left
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.strip_drag = None;
         }
@@ -5564,6 +5820,15 @@ impl App {
             if !pressed {
                 self.settle_pointer_drags(wid);
             }
+            return None;
+        }
+        if pressed
+            && !self.pointer_gesture_live(wid)
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
+        {
             return None;
         }
         let mods_state = self.windows.get(&wid).map(|ws| ws.mods)?;
@@ -5720,7 +5985,7 @@ impl App {
                     .active_native_view(wid)
                     .is_some_and(|(_, view)| native_press == Some(view))
                 && let Some(button) = winit_mouse_button(button)
-                && let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(mut ws) = self.windows.get_mut(&wid)
             {
                 ws.page_buttons |= 1 << button.slot();
             }
@@ -5730,7 +5995,8 @@ impl App {
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if !pressed && button == WinitMouseButton::Left {
                 if self.finish_divider_drag(wid) {
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.held_mouse_button = held_button(ws.reported_buttons);
                     }
                     return native_press;
@@ -5738,6 +6004,34 @@ impl App {
                 let Some((_, view)) = self.active_native_view(wid) else {
                     return native_press;
                 };
+                if let Some(drag) = self
+                    .windows
+                    .get_mut(&wid)
+                    .and_then(|mut ws| ws.native_drag.take())
+                {
+                    // A drag ends where the pointer is, on its control or off it.
+                    if let Some(mut state) = self.native_runtime.view_state_mut(drag.view) {
+                        state.common_mut().pressed = None;
+                    }
+                    self.invalidate_native_pointer_style(wid, drag.view);
+                    self.request_redraw_all_windows();
+                    if drag.view == view {
+                        if let Some(mut ws) = self.windows.get_mut(&wid) {
+                            ws.native_rehover = true;
+                        }
+                        let _ = self.dispatch_native_view_event(
+                            wid,
+                            view,
+                            crate::native_app::AppEvent::Action(
+                                crate::native_app::ActionInvocation {
+                                    value: Some(drag.input(px, true)),
+                                    id: drag.action,
+                                },
+                            ),
+                        );
+                    }
+                    return native_press;
+                }
                 let armed = self
                     .native_runtime
                     .view_state(view)
@@ -5781,7 +6075,7 @@ impl App {
                         });
                     Some((artifact.view, artifact.generation, hit, value))
                 });
-                if let Some(state) = self.native_runtime.view_state_mut(view) {
+                if let Some(mut state) = self.native_runtime.view_state_mut(view) {
                     state.common_mut().pressed = None;
                 }
                 self.invalidate_native_pointer_style(wid, view);
@@ -5797,7 +6091,8 @@ impl App {
                     // WHAT IS LIT IS WHAT A PRESS HITS: the action may move the page under the
                     // still pointer (a page that replaces it, a row it removes), so its next
                     // frame on glass is hovered where the pointer then is, as a wheel's is.
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.native_rehover = true;
                     }
                     let _ = self.dispatch_native_pointer_action(
@@ -5853,8 +6148,12 @@ impl App {
                             hit.action.clone(),
                             artifact.compiled.text_field_byte_at(&hit.key, x),
                             hit.look_first,
+                            hit.drags.then_some(artifact.scale),
                         ))
                     });
+                if let Some(mut ws) = self.windows.get_mut(&wid) {
+                    ws.native_drag = None;
+                }
                 let picture = if press.is_none() {
                     self.retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan)
                         .and_then(|(artifact, x, y)| {
@@ -5870,7 +6169,8 @@ impl App {
                     None
                 };
                 let onto_another = press.as_ref().is_some_and(|(target_view, _, key, ..)| {
-                    self.windows.get_mut(&wid).is_some_and(|ws| {
+                    self.windows.get_mut(&wid).is_some_and(|mut ws| {
+                        let ws = &mut **ws;
                         NativePointerRest::press(
                             &mut ws.native_rest,
                             (px, py),
@@ -5879,7 +6179,7 @@ impl App {
                         )
                     })
                 });
-                if let Some((target_view, generation, key, _, _, asks)) = &press
+                if let Some((target_view, generation, key, _, _, asks, _)) = &press
                     && (onto_another
                         || !NativePointerRest::looked_at(
                             self.windows
@@ -5889,7 +6189,8 @@ impl App {
                             (*target_view, key, *asks),
                         ))
                 {
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         let streak = ws.native_rest.take().and_then(|rest| rest.streak);
                         ws.native_rest = Some(NativePointerRest::on(
                             (px, py),
@@ -5898,7 +6199,7 @@ impl App {
                         ));
                     }
                     if self.native_runtime.view_generation(*target_view) == Some(*generation)
-                        && let Some(state) = self.native_runtime.view_state_mut(*target_view)
+                        && let Some(mut state) = self.native_runtime.view_state_mut(*target_view)
                     {
                         let common = state.common_mut();
                         common.hovered = Some(key.clone());
@@ -5908,15 +6209,28 @@ impl App {
                     self.request_redraw_all_windows();
                     return native_press;
                 }
-                if let Some((target_view, generation, key, action, text_position, _)) = press {
+                if let Some((target_view, generation, key, action, text_position, _, dragged)) =
+                    press
+                {
                     if self.native_runtime.view_generation(target_view) == Some(generation)
-                        && let Some(state) = self.native_runtime.view_state_mut(target_view)
+                        && let Some(mut state) = self.native_runtime.view_state_mut(target_view)
                     {
                         let common = state.common_mut();
                         common.hovered = Some(key.clone());
                         common.pressed = Some(key.clone());
                         common.last_focus = Some(key.clone());
                         common.focus_visible = false;
+                        if let Some(scale) = dragged
+                            && let Some(mut ws) = self.windows.get_mut(&wid)
+                        {
+                            ws.native_drag = Some(NativeDrag {
+                                view: target_view,
+                                action: action.clone(),
+                                from_px: px,
+                                scale,
+                                presses: NativePointerRest::presses(ws.native_rest.as_ref()),
+                            });
+                        }
                     }
                     self.invalidate_native_pointer_style(wid, target_view);
                     self.request_redraw_all_windows();
@@ -5964,9 +6278,14 @@ impl App {
                         None => {}
                     }
                 } else if let Some((_, view)) = self.active_native_view(wid)
-                    && let Some(state) = self.native_runtime.view_state_mut(view)
+                    && self
+                        .native_runtime
+                        .view_state_mut(view)
+                        .map(|mut state| {
+                            state.common_mut().pressed = None;
+                        })
+                        .is_some()
                 {
-                    state.common_mut().pressed = None;
                     self.invalidate_native_pointer_style(wid, view);
                     if let Some((target_view, key)) = picture {
                         let _ = self.dispatch_native_view_event(
@@ -5985,7 +6304,8 @@ impl App {
                     .get(&wid)
                     .is_some_and(|ws| ws.band_menu_release_pending)
             {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.band_menu_release_pending = false;
                 }
                 if !pressed {
@@ -6049,7 +6369,7 @@ impl App {
                 }
                 #[cfg(windows)]
                 if button == WinitMouseButton::Right
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.band_menu_release_pending = false;
                 }
@@ -6070,7 +6390,7 @@ impl App {
                 }
                 #[cfg(windows)]
                 if button == WinitMouseButton::Right
-                    && let Some(ws) = self.windows.get_mut(&wid)
+                    && let Some(mut ws) = self.windows.get_mut(&wid)
                 {
                     ws.band_menu_release_pending = false;
                 }
@@ -6119,7 +6439,8 @@ impl App {
                 .get(&wid)
                 .is_some_and(|ws| ws.band_menu_release_pending)
         {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.band_menu_release_pending = false;
             }
             if !pressed {
@@ -6243,7 +6564,8 @@ impl App {
                     return None;
                 }
             } else if self.finish_divider_drag(wid) {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.held_mouse_button = held_button(ws.reported_buttons);
                 }
                 return native_press;
@@ -6289,7 +6611,8 @@ impl App {
                     return native_press;
                 }
                 let drag_pane = self.focused_pane_rect_with_plan(wid, input_plan.as_ref());
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.staged_drag_pane = Some(drag_pane);
                 }
                 click_count = self.advance_click_streak(wid, at);
@@ -6300,7 +6623,8 @@ impl App {
                         .map_or((0, 0), |ws| ws.last_mouse_cell);
                     let block = press_selection_kind(option_held, tracking) == SelectionType::Block;
                     self.seam_left_press(wid, row, col, click_count, block);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.staged_drag_pane = None;
                     }
                     return native_press;
@@ -6308,14 +6632,16 @@ impl App {
             }
             if !pressed && self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                 self.finish_selection(wid, false);
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
                 }
                 return native_press;
             }
         }
         let Some(button) = winit_mouse_button(button) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.staged_drag_pane = None;
             }
             return native_press;
@@ -6331,7 +6657,8 @@ impl App {
             self.owner_route_with_plan(wid, owner, input_plan.as_ref())
         };
         if pressed && route == PointerRoute::Nowhere {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.staged_drag_pane = None;
             }
             return native_press;
@@ -6358,7 +6685,8 @@ impl App {
             PointerRoute::Pane { session, .. } => Some(session),
             _ => self.front_terminal(wid).map(|front| front.session),
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             if pressed {
                 ws.reported_buttons |= bit;
                 ws.button_owners[slot] = pressed_into.map(|session| ButtonOwner {
@@ -6391,7 +6719,8 @@ impl App {
                 px_off,
             },
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.staged_drag_pane = None;
         }
         native_press
@@ -6436,7 +6765,8 @@ impl App {
         delta: MouseScrollDelta,
     ) -> Option<(WheelDir, i32)> {
         let cell = self.win_cell_size(wid);
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         wheel_notches_in(
             delta,
             cell,
@@ -6494,6 +6824,14 @@ impl App {
         self.fence_pointer_license(wid);
         let palette = self.palette_claims_pointer(wid);
         let overview = self.overview_claims_pointer(wid);
+        if !(palette || overview || self.pointer_gesture_live(wid))
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
+        {
+            return;
+        }
         let wheel_plan = (!(palette || overview)
             && (self.active_tab_has_multiple_visible_panes(wid)
                 || self.active_tab_contains_native(wid)))
@@ -6572,6 +6910,18 @@ impl App {
             if self.native_editor_grid_sideways(wid, view, right, lines, precise) {
                 return;
             }
+            // The Tables grid scrolls its columns across beside its key column.
+            if matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Tables(_))
+            ) {
+                if let Some(mut ws) = self.windows.get_mut(&wid) {
+                    ws.native_rehover = true;
+                }
+                let _ =
+                    self.scroll_native_view_across(wid, view, if right { lines } else { -lines });
+                return;
+            }
         }
         if vertical_up.is_none() && (palette || overview || native_page) {
             return;
@@ -6592,7 +6942,8 @@ impl App {
             }
             if let Some(view) = native_view {
                 let signed = if up { -lines } else { lines };
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.native_rehover = true;
                 }
                 let key = self.native_scroll_target(wid, view, wheel_plan.as_ref());
@@ -6616,7 +6967,8 @@ impl App {
             .map_or(crate::input::PixelOffset::CELL_ORIGIN, |ws| {
                 ws.last_mouse_px_off
             });
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.wheel_precise_px = track_px;
         }
         self.send_pointer(
@@ -6632,7 +6984,8 @@ impl App {
                 px_off,
             },
         );
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.wheel_precise_px = None;
         }
     }
@@ -6695,9 +7048,10 @@ impl App {
     /// [`Self::release_scroll_track`] at an explicit `now`.
     pub(crate) fn release_scroll_track_at(&mut self, wid: WindowId, now: Instant) {
         let app_interval = self.frame_interval;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let tick_interval = ws.frame_interval.unwrap_or(app_interval);
         if let Some(st) = ws.scroll_glide.as_mut() {
             let parked = now < st.glide.settle_start();
@@ -6719,9 +7073,10 @@ impl App {
         else {
             return;
         };
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws
             .scroll_glide
             .as_ref()
@@ -6973,3 +7328,12 @@ mod menu_regrid_tests;
 #[cfg(test)]
 #[path = "app_mouse_system_state_split_tests.rs"]
 mod system_state_split_tests;
+
+#[cfg(test)]
+thread_local! {
+    static CURSOR_REQUESTS_FOR_TEST: std::cell::RefCell<Vec<(WindowId, CursorIcon)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[path = "app_mouse_side_inset_tests.rs"]
+mod side_inset_tests;

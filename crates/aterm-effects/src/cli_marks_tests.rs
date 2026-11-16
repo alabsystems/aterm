@@ -45,7 +45,7 @@ fn icon_inks_read_at_3_on_every_ground() {
             && grounds.iter().filter(|(_, g)| !dark_ground(*g)).count() > 1,
         "grounds of both polarities"
     );
-    for mark in CliMark::ALL {
+    for mark in CliMark::SEEDS {
         let b = brand(mark);
         for &(name, g) in &grounds {
             let raw = b.icon.on(dark_ground(g));
@@ -93,7 +93,7 @@ fn icon_inks_read_at_3_on_every_ground() {
     let (paper, core) = (ground("Gruvbox Light"), MUSE.icon.paper[1]);
     let raw = contrast_ratio(core, paper);
     assert!(raw < ICON_CONTRAST, "CONTROL: the raw core reads {raw:.2}");
-    let floored = icon_palette(CliMark::Muse, paper)[1].color;
+    let floored = icon_palette(CliMark::MUSE, paper)[1].color;
     assert_ne!(floored, core, "CONTROL: the floor moved it");
     assert!(contrast_ratio(floored, paper) >= ICON_CONTRAST, "CONTROL");
 }
@@ -103,7 +103,7 @@ fn icon_inks_read_at_3_on_every_ground() {
 fn names_read_at_4_5_on_every_ground() {
     let default = ground("Default");
     let mut moved = 0;
-    let names = CliMark::ALL
+    let names = CliMark::SEEDS
         .into_iter()
         .flat_map(|mark| Build::ALL.map(|build| (mark, mark.name(build))));
     for (mark, word) in names {
@@ -137,23 +137,23 @@ fn names_read_at_4_5_on_every_ground() {
         raw < NAME_CONTRAST && (raw - 2.94).abs() < 0.01,
         "CONTROL: Claude's raw name reads {raw:.2} on Default Light"
     );
-    let floored = name_fg(CliMark::Claude, 0, paper);
+    let floored = name_fg(CliMark::CLAUDE, 0, paper);
     assert_ne!(floored, ink, "CONTROL: the floor moved it");
     assert!(contrast_ratio(floored, paper) >= NAME_CONTRAST, "CONTROL");
-    let alab = CliMark::Codex.name(Build::Alab);
+    let alab = CliMark::CODEX.name(Build::Alab);
     assert_eq!(alab, "codex-alab", "the owner's name for the ALab build");
     let last = alab.len() - 1;
     assert!(
-        last >= CliMark::Codex.word().len(),
+        last >= CliMark::CODEX.word().len(),
         "past the vendor's word"
     );
-    let raw = name_ink(CliMark::Codex, last, true);
+    let raw = name_ink(CliMark::CODEX, last, true);
     let reads = contrast_ratio(raw, CODEX_SLAB);
     assert!(
         reads < NAME_CONTRAST && (reads - 3.65).abs() < 0.01,
         "CONTROL: codex-alab's raw last letter reads {reads:.2} on the slab"
     );
-    let floored = name_fg(CliMark::Codex, last, CODEX_SLAB);
+    let floored = name_fg(CliMark::CODEX, last, CODEX_SLAB);
     assert_ne!(floored, raw, "CONTROL: the floor moved it");
     assert!(
         contrast_ratio(floored, CODEX_SLAB) >= NAME_CONTRAST,
@@ -164,8 +164,8 @@ fn names_read_at_4_5_on_every_ground() {
 /// `codex-alab` prints `codex-alab` while every other mark prints its canonical word on either build.
 #[test]
 fn every_build_prints_its_own_name() {
-    for mark in CliMark::ALL {
-        let want = if mark == CliMark::Codex {
+    for mark in CliMark::SEEDS {
+        let want = if mark == CliMark::CODEX {
             "codex-alab"
         } else {
             mark.word()
@@ -181,19 +181,19 @@ fn every_build_prints_its_own_name() {
         }
     }
     assert_eq!(
-        CliMark::Codex.lockup_cells(Build::Alab) - CliMark::Codex.lockup_cells(Build::Vendor),
+        CliMark::CODEX.lockup_cells(Build::Alab) - CliMark::CODEX.lockup_cells(Build::Vendor),
         5,
         "`-alab`"
     );
     assert_eq!(
-        CliMark::Codex.name(Build::Vendor),
+        CliMark::CODEX.name(Build::Vendor),
         "codex",
         "CONTROL: vendor codex keeps its word"
     );
     assert_eq!(
-        CliMark::for_app("codex-alab"),
+        CliMark::seed("codex-alab"),
         None,
-        "the app id stays the CLI's word"
+        "the lockup word stays the CLI's word"
     );
 }
 
@@ -242,13 +242,18 @@ fn master_faults(rows: &[&str], chars: &[u8]) -> Vec<String> {
 /// Every master is rectangular, holds only its declared chars, preserves its symmetry, and fits centred at integer scale.
 #[test]
 fn every_mark_is_crisp_and_centred() {
-    use CliMark::{Agy, Claude, Codex, Grok, Kimi, Muse};
+    const CLAUDE: CliMark = CliMark::CLAUDE;
+    const CODEX: CliMark = CliMark::CODEX;
+    const AGY: CliMark = CliMark::AGY;
+    const MUSE: CliMark = CliMark::MUSE;
+    const GROK: CliMark = CliMark::GROK;
+    const KIMI: CliMark = CliMark::KIMI;
     use Master::{Hd, Sd};
-    for mark in CliMark::ALL {
+    for mark in CliMark::SEEDS {
         let b = brand(mark);
         assert_eq!(
             b.hd.is_some(),
-            mark != Agy,
+            mark != AGY,
             "{mark:?}: §2.4 draws an HD master"
         );
         for master in [Sd, Hd] {
@@ -263,51 +268,51 @@ fn every_mark_is_crisp_and_centred() {
                 (rows[0].len(), rows.len()),
                 "{mark:?} {master:?}"
             );
-            if matches!(mark, Claude | Agy | Muse) {
+            if [CLAUDE, AGY, MUSE].contains(&mark) {
                 assert!(mirrored(rows), "{mark:?} {master:?} mirrors");
             }
-            if matches!(mark, Codex | Muse) {
+            if [CODEX, MUSE].contains(&mark) {
                 assert!(turned(rows), "{mark:?} {master:?} turns half round");
             }
         }
     }
     let table = [
-        ((7, 14), Claude, Sd, 1, (0, 2)),
-        ((7, 14), Codex, Sd, 1, (1, 1)),
-        ((7, 14), Agy, Sd, 1, (1, 2)),
-        ((7, 14), Muse, Sd, 1, (1, 1)),
-        ((7, 14), Grok, Sd, 1, (1, 1)),
-        ((7, 14), Kimi, Sd, 1, (1, 1)),
-        ((9, 23), Claude, Sd, 1, (2, 6)),
-        ((9, 23), Codex, Sd, 1, (3, 5)),
-        ((9, 23), Agy, Sd, 1, (3, 6)),
-        ((9, 23), Muse, Sd, 1, (3, 5)),
-        ((9, 23), Grok, Sd, 1, (3, 5)),
-        ((9, 23), Kimi, Sd, 1, (3, 5)),
-        ((11, 21), Claude, Sd, 1, (4, 5)),
-        ((11, 21), Codex, Sd, 1, (5, 4)),
-        ((11, 21), Agy, Sd, 1, (5, 5)),
-        ((11, 21), Muse, Sd, 1, (5, 4)),
-        ((11, 21), Grok, Sd, 1, (5, 4)),
-        ((11, 21), Kimi, Sd, 1, (5, 4)),
-        ((15, 28), Claude, Hd, 1, (1, 6)),
-        ((15, 28), Codex, Hd, 1, (3, 2)),
-        ((15, 28), Agy, Sd, 2, (3, 4)),
-        ((15, 28), Muse, Hd, 1, (3, 2)),
-        ((15, 28), Grok, Hd, 1, (3, 2)),
-        ((15, 28), Kimi, Hd, 1, (3, 2)),
-        ((22, 42), Claude, Sd, 3, (1, 6)),
-        ((22, 42), Codex, Sd, 3, (4, 3)),
-        ((22, 42), Agy, Sd, 3, (4, 6)),
-        ((22, 42), Muse, Sd, 3, (4, 3)),
-        ((22, 42), Grok, Sd, 3, (4, 3)),
-        ((22, 42), Kimi, Sd, 3, (4, 3)),
-        ((30, 56), Claude, Hd, 2, (2, 12)),
-        ((30, 56), Codex, Hd, 2, (6, 4)),
-        ((30, 56), Agy, Sd, 5, (0, 3)),
-        ((30, 56), Muse, Hd, 2, (6, 4)),
-        ((30, 56), Grok, Hd, 2, (6, 4)),
-        ((30, 56), Kimi, Hd, 2, (6, 4)),
+        ((7, 14), CLAUDE, Sd, 1, (0, 2)),
+        ((7, 14), CODEX, Sd, 1, (1, 1)),
+        ((7, 14), AGY, Sd, 1, (1, 2)),
+        ((7, 14), MUSE, Sd, 1, (1, 1)),
+        ((7, 14), GROK, Sd, 1, (1, 1)),
+        ((7, 14), KIMI, Sd, 1, (1, 1)),
+        ((9, 23), CLAUDE, Sd, 1, (2, 6)),
+        ((9, 23), CODEX, Sd, 1, (3, 5)),
+        ((9, 23), AGY, Sd, 1, (3, 6)),
+        ((9, 23), MUSE, Sd, 1, (3, 5)),
+        ((9, 23), GROK, Sd, 1, (3, 5)),
+        ((9, 23), KIMI, Sd, 1, (3, 5)),
+        ((11, 21), CLAUDE, Sd, 1, (4, 5)),
+        ((11, 21), CODEX, Sd, 1, (5, 4)),
+        ((11, 21), AGY, Sd, 1, (5, 5)),
+        ((11, 21), MUSE, Sd, 1, (5, 4)),
+        ((11, 21), GROK, Sd, 1, (5, 4)),
+        ((11, 21), KIMI, Sd, 1, (5, 4)),
+        ((15, 28), CLAUDE, Hd, 1, (1, 6)),
+        ((15, 28), CODEX, Hd, 1, (3, 2)),
+        ((15, 28), AGY, Sd, 2, (3, 4)),
+        ((15, 28), MUSE, Hd, 1, (3, 2)),
+        ((15, 28), GROK, Hd, 1, (3, 2)),
+        ((15, 28), KIMI, Hd, 1, (3, 2)),
+        ((22, 42), CLAUDE, Sd, 3, (1, 6)),
+        ((22, 42), CODEX, Sd, 3, (4, 3)),
+        ((22, 42), AGY, Sd, 3, (4, 6)),
+        ((22, 42), MUSE, Sd, 3, (4, 3)),
+        ((22, 42), GROK, Sd, 3, (4, 3)),
+        ((22, 42), KIMI, Sd, 3, (4, 3)),
+        ((30, 56), CLAUDE, Hd, 2, (2, 12)),
+        ((30, 56), CODEX, Hd, 2, (6, 4)),
+        ((30, 56), AGY, Sd, 5, (0, 3)),
+        ((30, 56), MUSE, Hd, 2, (6, 4)),
+        ((30, 56), GROK, Hd, 2, (6, 4)),
+        ((30, 56), KIMI, Hd, 2, (6, 4)),
     ];
     for ((cw, ch), mark, master, scale, (dx, dy)) in table {
         let f = fit(mark, cw, ch).unwrap_or_else(|| panic!("{mark:?} fits {cw}×{ch}"));
@@ -334,9 +339,9 @@ fn every_mark_is_crisp_and_centred() {
             "{at}: centred"
         );
     }
-    for mark in CliMark::ALL {
+    for mark in CliMark::SEEDS {
         let f = fit(mark, 6, 12);
-        if mark == Agy {
+        if mark == AGY {
             let want = Fit {
                 master: Sd,
                 scale: 1,
@@ -411,7 +416,7 @@ fn banner_pixels(
 /// `agy`'s SD master matches its launch banner on both ground polarities, one half-cell per pixel.
 #[test]
 fn agys_mark_is_its_banner() {
-    let b = brand(CliMark::Agy);
+    let b = brand(CliMark::AGY);
     let size = (b.sd[0].len(), b.sd.len());
     let master = |dark: bool| -> Vec<Vec<Option<u32>>> {
         b.sd.iter()
@@ -515,7 +520,7 @@ fn the_marks_are_their_maps_on_the_cpu() {
         let w = 3 * usize::from(ICON_CELLS) * usize::from(cw);
         let at = (usize::from(ICON_CELLS) * usize::from(cw), usize::from(ch));
         let offset = (at.0 as i32, at.1 as i32);
-        for mark in CliMark::ALL {
+        for mark in CliMark::SEEDS {
             for ground in [ground("Default"), ground("Default Light"), CODEX_SLAB] {
                 let f = fit(mark, cw, ch).unwrap_or_else(|| panic!("{mark:?} fits"));
                 let want = map_pixels(mark, f, ground, at, (w, 3 * usize::from(ch)));

@@ -11,7 +11,7 @@ use aterm_agent::harness::footer;
 use aterm_slog::Tier;
 
 use super::super::tests::{
-    WALL0, hand_clock, lines, lines_of, stamp, time_order_holds, with_claude,
+    Engine, WALL0, hand_clock, lines, lines_of, stamp, time_order_holds, with_claude,
 };
 use super::*;
 use crate::claude_footer::{LogWake, rig};
@@ -1444,17 +1444,20 @@ fn a_stopped_rollout_tap_says_stopped_and_keeps_its_count() {
     );
 }
 
+/// The codex's report `state`, written by its `engine` at the log's clock and swept with its
+/// mark: the engine's edges move the run's claimed turns, the mark none.
 fn claimed(
     tl: &Arc<Mutex<SessionTimeline>>,
+    engine: &mut Engine,
     state: aterm_core::terminal::program_state::ProgramStateWord,
 ) {
-    tl.lock().unwrap().note_program_state(
+    engine.says(
+        &mut tl.lock().unwrap(),
         Some(aterm_core::terminal::program_state::ProgramState {
             state,
             kind: None,
             app: aterm_core::terminal::program_state::ProgramApp::Codex,
         }),
-        1,
     );
 }
 
@@ -1481,6 +1484,7 @@ fn rewrite_rollout(home: &std::path::Path, text: &str) {
 fn two_claimed_turns(name: &str, build: &str, image: Image) -> (Vec<String>, String) {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     let (tl, home, target, claim) = codex_rig(name, "codex", build);
+    let mut engine = Engine::new();
     let hand = hand_clock(&tl);
     hand.set(10_000);
     let rows: Vec<String> = rollout_rows_as(THREAD, build, 9_000, "turn")
@@ -1488,19 +1492,19 @@ fn two_claimed_turns(name: &str, build: &str, image: Image) -> (Vec<String>, Str
         .map(|l| format!("{l}\n"))
         .collect();
     let mut host = Host::default();
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     rewrite_rollout(home.path(), &rows[..6].concat());
     hand.set(12_400);
     let _ = host.ask(0xC0DE_0071, &claim.0, target.clone(), image);
     hand.set(12_500);
-    claimed(&tl, W::Idle);
+    claimed(&tl, &mut engine, W::Idle);
     hand.set(12_900);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     rewrite_rollout(home.path(), &rows.concat());
     hand.set(13_200);
     let _ = host.ask(0xC0DE_0071, &claim.0, target, image);
     hand.set(13_300);
-    claimed(&tl, W::Done);
+    claimed(&tl, &mut engine, W::Done);
     let fields = tl.lock().unwrap().slog().rollout_fields();
     (lines_of(&tl), fields)
 }
@@ -1621,14 +1625,15 @@ fn a_refused_rollouts_codex_alab_still_has_its_claimed_turns() {
             1,
         ),
     );
+    let mut engine = Engine::new();
     let hand = hand_clock(&tl);
     hand.set(10_000);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     let mut host = Host::default();
     hand.set(11_000);
     let _ = host.ask(0xC0DE_0081, &claim.0, target, MEASURED);
     hand.set(14_000);
-    claimed(&tl, W::Idle);
+    claimed(&tl, &mut engine, W::Idle);
     assert_eq!(
         tl.lock().unwrap().slog().rollout_fields(),
         "rollout=unknown-meta rollout_asks=1"
@@ -1652,11 +1657,12 @@ fn a_refused_rollouts_codex_alab_still_has_its_claimed_turns() {
 
     let (claude, _home, _, _claim) =
         codex_rig("schema-claude", "claude", "0.164.0-dev.12521+g3d3eb12d8");
+    let mut claude_engine = Engine::new();
     let hand = hand_clock(&claude);
     hand.set(10_000);
-    claimed(&claude, W::Working);
+    claimed(&claude, &mut claude_engine, W::Working);
     hand.set(14_000);
-    claimed(&claude, W::Idle);
+    claimed(&claude, &mut claude_engine, W::Idle);
     assert!(
         turn_opens(&lines_of(&claude)).is_empty(),
         "NEGATIVE CONTROL: {:#?}",
@@ -1674,6 +1680,7 @@ fn a_claimed_rest_read_before_the_rollouts_end_continues_no_turn() {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     let build = "0.164.0-dev.99999+g0123abcd";
     let (tl, home, target, claim) = codex_rig("rest-first", "codex", build);
+    let mut engine = Engine::new();
     let hand = hand_clock(&tl);
     hand.set(10_000);
     let rows: Vec<String> = rollout_rows_as(THREAD, build, 9_000, "turn")
@@ -1681,19 +1688,19 @@ fn a_claimed_rest_read_before_the_rollouts_end_continues_no_turn() {
         .map(|l| format!("{l}\n"))
         .collect();
     let mut host = Host::default();
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     rewrite_rollout(home.path(), &rows[..5].concat());
     hand.set(12_400);
     let _ = host.ask(0xC0DE_0091, &claim.0, target.clone(), UNMEASURED);
     hand.set(12_500);
-    claimed(&tl, W::Idle);
+    claimed(&tl, &mut engine, W::Idle);
     hand.set(12_900);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     rewrite_rollout(home.path(), &rows.concat());
     hand.set(13_200);
     let _ = host.ask(0xC0DE_0091, &claim.0, target, UNMEASURED);
     hand.set(13_300);
-    claimed(&tl, W::Done);
+    claimed(&tl, &mut engine, W::Done);
     let got = lines_of(&tl);
     let opens = turn_opens(&got);
     assert!(
@@ -1730,6 +1737,7 @@ fn a_stopped_rollout_tap_hands_a_measured_runs_turns_back_to_its_claims() {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     let build = "0.164.0-dev.12521+g3d3eb12d8";
     let (tl, home, target, claim) = codex_rig("stopped-claims", "codex", build);
+    let mut engine = Engine::new();
     let hand = hand_clock(&tl);
     let mut host = Host::default();
     hand.set(10_000);
@@ -1737,9 +1745,9 @@ fn a_stopped_rollout_tap_hands_a_measured_runs_turns_back_to_its_claims() {
     let read = turn_opens(&lines_of(&tl)).len();
     assert_eq!(read, 2, "{:#?}", lines_of(&tl));
     hand.set(15_000);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     hand.set(16_000);
-    claimed(&tl, W::Idle);
+    claimed(&tl, &mut engine, W::Idle);
     assert_eq!(
         turn_opens(&lines_of(&tl)).len(),
         read,
@@ -1752,9 +1760,9 @@ fn a_stopped_rollout_tap_hands_a_measured_runs_turns_back_to_its_claims() {
         "rollout=stopped rollout_asks=1"
     );
     hand.set(17_000);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     hand.set(19_500);
-    claimed(&tl, W::Idle);
+    claimed(&tl, &mut engine, W::Idle);
     let got = lines_of(&tl);
     let opens = turn_opens(&got);
     assert!(
@@ -1771,7 +1779,7 @@ fn a_stopped_rollout_tap_hands_a_measured_runs_turns_back_to_its_claims() {
     hand.set(20_000);
     let _ = host.ask(0xC0DE_00A1, &claim.0, target, MEASURED);
     hand.set(21_000);
-    claimed(&tl, W::Working);
+    claimed(&tl, &mut engine, W::Working);
     let got = lines_of(&tl);
     assert_eq!(
         tl.lock().unwrap().slog().rollout_fields(),

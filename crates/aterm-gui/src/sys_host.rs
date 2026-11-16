@@ -4,6 +4,7 @@
 //! `aterm ctl sys` and the machine terms of `await sys`.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -12,11 +13,12 @@ use aterm_core::terminal::Terminal;
 use aterm_vitals::events::Event;
 use aterm_vitals::explain::WhySubject;
 use aterm_vitals::model::Snapshot;
+use aterm_vitals::sys::held as disk_held;
 use aterm_vitals::sys::predicate::{EndedJob, Latch, Parsed, evaluate_with, met_reply};
 use aterm_vitals::sys::{
-    AwaitSys, Ctx, Cursor, DiskTotals, Fingerprints, Freshness, Gap, Machine, Reply, Root,
-    RootSize, ScopeArg, SysQuery, TabFact, Target, View, VolumeFacts, apply_delta, fingerprints,
-    render_json, render_text,
+    AwaitSys, Ctx, Cursor, DiskForm, DiskTotals, Fingerprints, Freshness, Gap, Machine, Reply,
+    Root, RootSize, ScopeArg, SysQuery, TabFact, Target, View, VolumeFacts, apply_delta,
+    fingerprints, render_json, render_text,
 };
 
 use crate::occupancy_host::Arming;
@@ -76,6 +78,8 @@ pub(crate) struct Held {
 struct ReplyKey {
     seq: u64,
     view: View,
+    /// The disk view's form: `disk held` prints other lines than plain `disk`.
+    form: Option<DiskForm>,
     scope: Option<ScopeArg>,
     target: u64,
     /// `top=` and `depth=`: how many rows print, and for a `why` whether
@@ -762,11 +766,15 @@ struct Gathered {
     tabs: Vec<TabFact>,
     roots: Vec<Root>,
     disk: Option<DiskTotals>,
+    /// The stores aterm keeps, for `sys disk`'s `store` lines (none for another view).
+    stores: Vec<aterm_vitals::sys::StoreFact>,
     volume: Option<VolumeFacts>,
     /// The sessions of the caller's own tab; `None` with no caller session
     /// (`Ctx::caller_panes`).
     caller_panes: Option<Vec<u64>>,
     home: Option<String>,
+    /// `disk held`'s rows ([`held_now`]); `None` for every other request.
+    held: Option<disk_held::Holdings>,
 }
 
 type PaneTerm = (u64, Arc<Mutex<Terminal>>);
@@ -874,6 +882,23 @@ fn gather(
         })
     });
     let home = aterm_types::dirs::home_dir().map(|h| h.display().to_string());
+    if q.form == Some(DiskForm::Held) {
+        // Every holding on home's volume, from what aterm already holds: no root of the
+        // target's scope, and no walk demanded.
+        let volume = home.as_deref().and_then(|h| volume_facts(Path::new(h)));
+        let held = held_now(store, home.as_deref().map(Path::new));
+        return Gathered {
+            target,
+            tabs,
+            roots: Vec::new(),
+            disk: None,
+            stores: Vec::new(),
+            volume,
+            caller_panes,
+            home,
+            held: Some(held),
+        };
+    }
     let (roots, disk, volume) = if q.view == View::Disk || q.view == View::Tab {
         let scope = q.effective_scope().unwrap_or(ScopeArg::Tab);
         let keys: Vec<u64> = match scope {
@@ -929,15 +954,661 @@ fn gather(
     } else {
         (Vec::new(), None, None)
     };
+    // Read after `disk_roots`, which demands aterm's scope: the walk of each own root sizes the
+    // stores under it.
+    let stores = if q.view == View::Disk {
+        crate::disk_stores::facts_now()
+    } else {
+        Vec::new()
+    };
     Gathered {
         target,
         tabs,
         roots,
         disk,
+        stores,
         volume,
         caller_panes,
         home,
+        held: None,
     }
+}
+
+/// What aterm's own passes do by themselves on this Mac, as `sys disk held` says them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Passes {
+    /// The low-disk tier pass runs: `disk.auto_free_gib` is above 0.
+    pub(crate) low_disk: bool,
+    /// The daily build-cache pass runs (macOS, with the tier pass on and
+    /// `disk.dead_build_dirs`), taking a part unwritten for this many days.
+    pub(crate) daily_days: Option<u64>,
+    /// A verify run's end trims a build directory of aterm's build cache where a run kept its
+    /// record of the units it used (macOS, where that cache lies; no setting turns it off).
+    pub(crate) run_end: bool,
+}
+
+impl Passes {
+    /// The passes aterm.toml leaves on now: one that cannot be read turns every removal off
+    /// ([`aterm_agent::harness::cli::disk_config_read`]).
+    fn now() -> Self {
+        use aterm_agent::harness::cli::disk_config_read;
+        let path = crate::app_config::config_path();
+        let config = disk_config_read(path.as_deref()).config;
+        Self::of(&config, cfg!(target_os = "macos"))
+    }
+
+    /// The passes `config` leaves on, on macOS (`mac`) or elsewhere: the daily pass and a
+    /// verify run's trim reach aterm's build cache, which only macOS has.
+    pub(crate) fn of(config: &aterm_agent::harness::disk::Config, mac: bool) -> Self {
+        let on = config.auto_free_gib > 0;
+        let days = atpkg::build_cache::RECLAIM_STALE.as_secs() / (24 * 60 * 60);
+        Self {
+            low_disk: on,
+            daily_days: (mac && on && config.dead_build_dirs).then_some(days),
+            run_end: mac,
+        }
+    }
+}
+
+/// The next pass of each kind of holding a pass takes, from the passes that are on.
+#[derive(Clone, Copy)]
+struct Nexts {
+    /// Build output outside aterm's build cache: the tier pass.
+    low: disk_held::Next,
+    /// aterm's build cache: the daily pass, else as `low`.
+    cached: disk_held::Next,
+    /// A build mirror whose session is at work, in whose build directory a verify run kept its
+    /// record: that run's end, else as `cached`.
+    at_end: disk_held::Next,
+}
+
+impl Nexts {
+    fn of(passes: Passes) -> Self {
+        use aterm_vitals::sys::held::Next;
+        let low = if passes.low_disk {
+            Next::TierPass
+        } else {
+            Next::CleanupOff
+        };
+        let daily = |stale_days| Next::DailyCache { stale_days };
+        let cached = passes.daily_days.map_or(low, daily);
+        let at_end = if passes.run_end {
+            Next::RunEnd {
+                stale_days: passes.daily_days,
+            }
+        } else {
+            cached
+        };
+        Self {
+            low,
+            cached,
+            at_end,
+        }
+    }
+
+    /// A cache the daily pass empties entry by entry, each once nothing used it for `after`:
+    /// that pass where it runs, else as `low`.
+    fn unused(self, after: Duration) -> disk_held::Next {
+        use aterm_vitals::sys::held::Next;
+        match self.cached {
+            Next::DailyCache { .. } => Next::DailyUnused {
+                after_s: after.as_secs(),
+            },
+            other => other,
+        }
+    }
+
+    /// A build mirror in aterm's build cache: a verify run's end where its session is at work
+    /// and a run kept its record in its build directory (`kept`), else the daily pass.
+    fn mirror(self, mark: disk_held::Mark, kept: bool) -> disk_held::Next {
+        if mark == disk_held::Mark::AtWork && kept {
+            self.at_end
+        } else {
+            self.cached
+        }
+    }
+}
+
+/// The sessions at work that claim a folder, and the tab and program of the one that claims it
+/// most nearly.
+struct HeldBy {
+    /// Their local keys, least first: a caller in one of their tabs may read the folder's path.
+    keys: Vec<u64>,
+    /// At work, gone or none.
+    mark: disk_held::Mark,
+    /// The nearest one's tab, 1-based.
+    tab: Option<usize>,
+    /// The program whose folder the nearest one's pane is in.
+    exe: Option<String>,
+}
+
+impl HeldBy {
+    /// `ranked`, the sessions at work that claim it, the nearest first, with `mark`: the tab
+    /// and program of the first.
+    fn of(board: &crate::diskwalk_host::Published, ranked: &[u64], mark: disk_held::Mark) -> Self {
+        let first = ranked.first().copied();
+        let pane = first.and_then(|k| board.panes.get(&k));
+        let tab = first.and_then(|k| board.tab_of(k));
+        let mut keys = ranked.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        Self {
+            keys,
+            mark,
+            tab: tab.and_then(|t| t.number),
+            exe: pane.and_then(|v| v.exe.clone()),
+        }
+    }
+
+    /// The panes whose folders hold `path`, the one whose folder lies deepest first (then the
+    /// least key): those whose sessions are at work, else whether any held it.
+    fn of_path(
+        board: &crate::diskwalk_host::Published,
+        live: &[(u64, String)],
+        path: &Path,
+    ) -> Self {
+        use aterm_diskwalk::within;
+        use aterm_vitals::sys::held::Mark;
+        let fold = board.fold_case;
+        let mut claimers: Vec<(usize, u64)> = board
+            .panes
+            .iter()
+            .filter_map(|(k, v)| {
+                v.members
+                    .iter()
+                    .filter(|m| within(path, &m.path, fold))
+                    .map(|m| m.path.components().count())
+                    .max()
+                    .map(|depth| (depth, *k))
+            })
+            .collect();
+        claimers.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let ranked: Vec<u64> = claimers
+            .iter()
+            .map(|&(_, k)| k)
+            .filter(|k| live.iter().any(|(l, _)| l == k))
+            .collect();
+        let mark = if !ranked.is_empty() {
+            Mark::AtWork
+        } else if claimers.is_empty() {
+            Mark::NoSession
+        } else {
+            Mark::Gone
+        };
+        Self::of(board, &ranked, mark)
+    }
+
+    /// The sessions among `sessions` (by id) that are at work, the least key first, else gone.
+    fn of_sessions(
+        board: &crate::diskwalk_host::Published,
+        live: &[(u64, String)],
+        sessions: &[String],
+    ) -> Self {
+        use aterm_vitals::sys::held::Mark;
+        let mut ranked: Vec<u64> = live
+            .iter()
+            .filter(|(_, sid)| sessions.contains(sid))
+            .map(|(k, _)| *k)
+            .collect();
+        ranked.sort_unstable();
+        let mark = if ranked.is_empty() {
+            Mark::Gone
+        } else {
+            Mark::AtWork
+        };
+        Self::of(board, &ranked, mark)
+    }
+}
+
+/// What `sys disk held` reads beside the walker's board, each once per reply.
+pub(crate) struct HeldFacts<'a> {
+    /// The build-start record's lines.
+    pub(crate) starts: &'a [atpkg::build_start::Start],
+    /// The sessions aterm's table holds: each one's local key and id.
+    pub(crate) live: &'a [(u64, String)],
+    /// Home.
+    pub(crate) home: Option<&'a Path>,
+    /// The passes aterm.toml leaves on.
+    pub(crate) passes: Passes,
+    /// Whether a verify run kept its record of the units it used in a build mirror's build
+    /// directory ([`run_kept`]).
+    pub(crate) kept: &'a dyn Fn(&Path) -> bool,
+    /// When the reply reads them.
+    pub(crate) now: Instant,
+}
+
+/// `sys disk held`'s rows now: the walker's last board, the build-start record's lines, the
+/// sessions aterm's table holds, the passes aterm.toml leaves on, and, for a build mirror,
+/// whether a verify run kept its record there.
+fn held_now(store: &Store, home: Option<&Path>) -> disk_held::Holdings {
+    let live: Vec<(u64, String)> = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        g.live_handles()
+            .map(|h| (h.local_id, h.sid.as_str().to_owned()))
+            .collect()
+    };
+    let starts = atpkg::build_start::record()
+        .map(|r| atpkg::build_start::read(&r))
+        .unwrap_or_default();
+    let facts = HeldFacts {
+        starts: &starts,
+        live: &live,
+        home,
+        passes: Passes::now(),
+        kept: &run_kept,
+        now: Instant::now(),
+    };
+    held_read(&crate::diskwalk_host::DISKWALK, &facts)
+}
+
+/// Whether a verify run kept its record of the units it used (`atpkg::build_cache::stale::USED`)
+/// in the build directory of the build mirror `mirror`: a run's end trims only there.
+fn run_kept(mirror: &Path) -> bool {
+    use atpkg::build_cache::{LEAF, stale::USED};
+    std::fs::symlink_metadata(mirror.join(LEAF).join(USED)).is_ok_and(|m| m.is_file())
+}
+
+/// `sys disk held`'s rows from `walk`'s last board, read as aterm's scope: it demands no walk
+/// and waits on none, and reads whether anything else demands one now.
+pub(crate) fn held_read(
+    walk: &crate::diskwalk_host::Shared,
+    facts: &HeldFacts<'_>,
+) -> disk_held::Holdings {
+    use crate::diskwalk_host::{DiskScope, build_report};
+    let board = walk.board();
+    let report = build_report(DiskScope::Aterm, &board, walk.walker_state());
+    held_rows(&board, &report, walk.demanded(facts.now), facts)
+}
+
+/// `sys disk held`'s rows from one board's aterm report: each root on home's volume once, its
+/// pinned children's bytes out of it; and, out of the measured root that holds it most nearly,
+/// a row of its own for each [`HeldPart`] its walk listed. A row's mark, tab and program come from
+/// the panes whose folders hold it (a build mirror's, from the sessions its own lines name) and
+/// the sessions aterm's table holds; its class and next pass from its kind, where it lies and
+/// the passes that are on. Where no walk is `demanded`, a root no walk measured is not
+/// sampled, not walking: no walk will come for it.
+pub(crate) fn held_rows(
+    board: &crate::diskwalk_host::Published,
+    report: &crate::diskwalk_host::DiskReport,
+    demanded: bool,
+    facts: &HeldFacts<'_>,
+) -> disk_held::Holdings {
+    use crate::diskwalk_host::{Pool, RootRow, WalkerState};
+    use aterm_vitals::sys::held::{Bytes, Holding, Walk};
+    let fold = board.fold_case;
+    let nexts = Nexts::of(facts.passes);
+    let walk = match report.walker {
+        WalkerState::NotStarted | WalkerState::Failed => Walk::Stopped,
+        WalkerState::Running if !report.walking => Walk::Complete,
+        WalkerState::Running if demanded => Walk::Walking,
+        WalkerState::Running => Walk::Idle,
+    };
+    let shown: Vec<&RootRow> = report
+        .roots
+        .iter()
+        .filter(|r| r.pool == Pool::Same)
+        .collect();
+    let parts = parts_of(board, &shown, facts, nexts);
+    let mut rows: Vec<Holding> = Vec::new();
+    for (at, row) in shown.iter().enumerate() {
+        let path = row.claim.path.as_path();
+        let inner: Vec<&RootRow> = shown
+            .iter()
+            .copied()
+            .filter(|c| c.inside == Some(row.n))
+            .collect();
+        let by = HeldBy::of_path(board, facts.live, path);
+        let (worktree, class, next) = classify(row, by.mark, facts, fold, nexts);
+        let mut bytes = root_bytes(row, &inner, walk == Walk::Walking);
+        if let (Bytes::Measured(whole), Some(complete)) = (bytes, &row.record.complete) {
+            let inner_paths: Vec<&Path> = inner.iter().map(|c| c.claim.path.as_path()).collect();
+            let mine: Vec<&HeldPart> = parts.iter().filter(|p| p.owner == at).collect();
+            let (left, split_rows) =
+                split(path, whole, &complete.biggest, &mine, &inner_paths, fold);
+            rows.extend(split_rows);
+            bytes = Bytes::Measured(left);
+        }
+        rows.push(Holding {
+            project: project_of(path),
+            worktree,
+            path: path.display().to_string(),
+            keys: by.keys,
+            mark: by.mark,
+            tab: by.tab,
+            exe: by.exe,
+            bytes,
+            class,
+            next,
+        });
+    }
+    let age = |t: Instant| facts.now.saturating_duration_since(t).as_secs();
+    disk_held::Holdings {
+        rows,
+        walk,
+        oldest_walk_s: report.figure.oldest.map(age),
+    }
+}
+
+/// A folder a measured root row holds that is a row of its own, out of that row's bytes: a
+/// project's `target`; aterm's build cache, the root that cache moved from, or its tooling
+/// cache; or a build mirror in the build cache that a build-start line names.
+struct HeldPart {
+    /// The index, among the shown rows, of the row that holds it most nearly.
+    owner: usize,
+    /// Its path.
+    path: PathBuf,
+    /// Its row, whose bytes its owner's walk gives ([`split`]).
+    holding: disk_held::Holding,
+}
+
+/// The parts of the shown root rows ([`HeldPart`]): each project's `target` (the tier pass's);
+/// aterm's build cache (the daily pass's), the root it moved from and its tooling cache (each
+/// entry the daily pass's once unused, the tooling costly to fetch again); and each build
+/// mirror in the build cache that a build-start line names, marked by the sessions its own
+/// lines name ([`Nexts::mirror`]). Each once, held by the deepest shown row that holds it, and
+/// none that is a shown row itself.
+fn parts_of(
+    board: &crate::diskwalk_host::Published,
+    shown: &[&crate::diskwalk_host::RootRow],
+    facts: &HeldFacts<'_>,
+    nexts: Nexts,
+) -> Vec<HeldPart> {
+    use aterm_diskwalk::within;
+    use aterm_vitals::sys::held::{Class, Worktree};
+    let fold = board.fold_case;
+    let same = |a: &Path, b: &Path| within(a, b, fold) && within(b, a, fold);
+    let mut found: Vec<(PathBuf, disk_held::Holding)> = Vec::new();
+    for row in shown {
+        if matches!(worktree_of(row), Worktree::Checkout | Worktree::Linked) {
+            let target = row.claim.path.join("target");
+            let by = HeldBy::of_path(board, facts.live, &target);
+            let project = project_of(&row.claim.path);
+            let next = nexts.low;
+            found.push(part(
+                target,
+                project,
+                Worktree::Build,
+                Class::Rebuildable,
+                next,
+                by,
+            ));
+        }
+    }
+    if let Some(home) = facts.home {
+        use atpkg::build_cache::{MOVED_AFTER, RECLAIM_IDLE, cache_root, moved_from, tooling};
+        let caches = [
+            (
+                cache_root(home),
+                Worktree::Cache,
+                Class::Rebuildable,
+                nexts.cached,
+            ),
+            (
+                moved_from(home),
+                Worktree::Cache,
+                Class::Rebuildable,
+                nexts.unused(MOVED_AFTER),
+            ),
+            (
+                tooling::root(home),
+                Worktree::Tooling,
+                Class::Costly,
+                nexts.unused(RECLAIM_IDLE),
+            ),
+        ];
+        for (path, worktree, class, next) in caches {
+            let by = HeldBy::of_path(board, facts.live, &path);
+            found.push(part(path, "aterm".to_owned(), worktree, class, next, by));
+        }
+        let root = cache_root(home);
+        let mut named: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        for s in facts.starts {
+            let mirror = crate::diskwalk_host::build_mirror(&root, &s.workspace);
+            if !within(&mirror, &root, fold) || within(&root, &mirror, fold) {
+                continue;
+            }
+            match named.iter_mut().find(|(m, _)| same(m, &mirror)) {
+                Some((_, sessions)) => sessions.push(s.session.clone()),
+                None => named.push((mirror, vec![s.session.clone()])),
+            }
+        }
+        for (mirror, sessions) in named {
+            let by = HeldBy::of_sessions(board, facts.live, &sessions);
+            let next = nexts.mirror(by.mark, (facts.kept)(&mirror));
+            let project = project_of(&mirror);
+            found.push(part(
+                mirror,
+                project,
+                Worktree::Build,
+                Class::Rebuildable,
+                next,
+                by,
+            ));
+        }
+    }
+    let mut out: Vec<HeldPart> = Vec::new();
+    for (path, holding) in found {
+        let twice = out.iter().any(|p| same(&p.path, &path));
+        let is_row = shown.iter().any(|r| same(&r.claim.path, &path));
+        if twice || is_row {
+            continue;
+        }
+        let owner = shown
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| within(&path, &r.claim.path, fold))
+            .max_by_key(|(_, r)| r.claim.path.components().count())
+            .map(|(i, _)| i);
+        if let Some(owner) = owner {
+            out.push(HeldPart {
+                owner,
+                path,
+                holding,
+            });
+        }
+    }
+    out
+}
+
+/// One part's row, its bytes not yet read ([`split`] gives them), and its path.
+fn part(
+    path: PathBuf,
+    project: String,
+    worktree: disk_held::Worktree,
+    class: disk_held::Class,
+    next: disk_held::Next,
+    by: HeldBy,
+) -> (PathBuf, disk_held::Holding) {
+    let holding = disk_held::Holding {
+        project,
+        worktree,
+        path: path.display().to_string(),
+        keys: by.keys,
+        mark: by.mark,
+        tab: by.tab,
+        exe: by.exe,
+        bytes: disk_held::Bytes::Unmeasured("not_sampled"),
+        class,
+        next,
+    };
+    (path, holding)
+}
+
+/// `whole`, a measured root row's bytes, less its parts `mine`: each part's floor is the
+/// outermost of the row's walk's largest folders `dirs` (relative to `base`) that lie in it
+/// ([`outermost`], `inner` the row's pinned children), taken out of what the nearest part
+/// around it leaves, else out of the row, outermost first. A part left no bytes of its own is
+/// no row. What the row keeps, and the parts' rows, each a floor.
+fn split(
+    base: &Path,
+    whole: u64,
+    dirs: &[crate::diskwalk_host::DirRow],
+    mine: &[&HeldPart],
+    inner: &[&Path],
+    fold: bool,
+) -> (u64, Vec<disk_held::Holding>) {
+    use aterm_diskwalk::within;
+    let floor: Vec<u64> = mine
+        .iter()
+        .map(|p| {
+            outermost(
+                base,
+                dirs,
+                &|d: &Path| within(d, &p.path, fold),
+                inner,
+                fold,
+            )
+        })
+        .collect();
+    let depth = |i: usize| mine[i].path.components().count();
+    let parent: Vec<Option<usize>> = (0..mine.len())
+        .map(|i| {
+            (0..mine.len())
+                .filter(|&j| {
+                    j != i
+                        && within(&mine[i].path, &mine[j].path, fold)
+                        && !within(&mine[j].path, &mine[i].path, fold)
+                })
+                .max_by_key(|&j| depth(j))
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..mine.len()).collect();
+    order.sort_by_key(|&i| depth(i));
+    let mut left = whole;
+    let mut kept = vec![0u64; mine.len()];
+    for i in order {
+        let from = match parent[i] {
+            Some(p) => &mut kept[p],
+            None => &mut left,
+        };
+        let take = floor[i].min(*from);
+        *from -= take;
+        kept[i] = take;
+    }
+    let rows = mine
+        .iter()
+        .zip(kept)
+        .filter(|(_, k)| *k > 0)
+        .map(|(p, k)| disk_held::Holding {
+            bytes: disk_held::Bytes::AtLeast(k),
+            ..p.holding.clone()
+        })
+        .collect();
+    (left, rows)
+}
+
+/// A root row's bytes: its complete walk's figure (kept behind a running rewalk) less its
+/// pinned children's, which are rows of their own; else why it has none, `walking` only where
+/// a walk is coming (`walks`).
+fn root_bytes(
+    row: &crate::diskwalk_host::RootRow,
+    children: &[&crate::diskwalk_host::RootRow],
+    walks: bool,
+) -> disk_held::Bytes {
+    use crate::diskwalk_host::RootState;
+    use aterm_vitals::sys::held::Bytes;
+    let measured = row.record.complete.is_some();
+    let owed = if walks { "walking" } else { "not_sampled" };
+    match row.record.state {
+        RootState::OneLevel => Bytes::Unmeasured("too_broad"),
+        RootState::NotMeasured(why) => Bytes::Unmeasured(refusal_word(why)),
+        RootState::Complete if !measured => Bytes::Unmeasured("not_sampled"),
+        RootState::Queued | RootState::Walking if !measured => Bytes::Unmeasured(owed),
+        RootState::Queued | RootState::Walking | RootState::Complete => {
+            let inside: u64 = children.iter().map(|c| c.alloc()).sum();
+            Bytes::Measured(row.alloc().saturating_sub(inside))
+        }
+    }
+}
+
+/// A root row's kind of folder: aterm's own, build output, a linked worktree or a checkout, a
+/// folder, else an opt-in.
+fn worktree_of(row: &crate::diskwalk_host::RootRow) -> disk_held::Worktree {
+    use crate::diskwalk_host::RootKind;
+    use aterm_vitals::sys::held::Worktree;
+    let kinds = &row.claim.kinds;
+    if kinds.contains(&RootKind::Own) {
+        Worktree::Aterm
+    } else if kinds.contains(&RootKind::Build) {
+        Worktree::Build
+    } else if kinds.contains(&RootKind::Project) && row.claim.linked_worktree {
+        Worktree::Linked
+    } else if kinds.contains(&RootKind::Project) {
+        Worktree::Checkout
+    } else if kinds.contains(&RootKind::Folder) {
+        Worktree::Folder
+    } else {
+        Worktree::OptIn
+    }
+}
+
+/// A root row's kind of folder, class and next pass: aterm's own folders (kept; its caches are
+/// parts of their own), build output (rebuildable: in aterm's build cache a verify run's end or
+/// the daily pass's, [`Nexts::mirror`]; elsewhere the tier pass's), a project or a folder
+/// (kept), else an opt-in (not aterm's).
+fn classify(
+    row: &crate::diskwalk_host::RootRow,
+    mark: disk_held::Mark,
+    facts: &HeldFacts<'_>,
+    fold: bool,
+    nexts: Nexts,
+) -> (disk_held::Worktree, disk_held::Class, disk_held::Next) {
+    use aterm_diskwalk::within;
+    use aterm_vitals::sys::held::{Class, Next, Worktree};
+    let path = row.claim.path.as_path();
+    let worktree = worktree_of(row);
+    match worktree {
+        Worktree::Build => {
+            let cache = facts.home.map(atpkg::build_cache::cache_root);
+            let next = if cache.is_some_and(|c| within(path, &c, fold)) {
+                nexts.mirror(mark, (facts.kept)(path))
+            } else {
+                nexts.low
+            };
+            (worktree, Class::Rebuildable, next)
+        }
+        Worktree::OptIn => (worktree, Class::Kept, Next::NotAterms),
+        _ => (worktree, Class::Kept, Next::Nothing),
+    }
+}
+
+/// A holding's project: its folder's last component (a build mirror's is its workspace's).
+fn project_of(path: &Path) -> String {
+    match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path.display().to_string(),
+    }
+}
+
+/// The bytes of the outermost of a walk's largest folders `dirs` (each relative to `base`)
+/// that `keep` takes and that neither hold nor lie in a row of `rows`, which count on their
+/// own. The walk lists only its largest folders, so this is a floor.
+fn outermost(
+    base: &Path,
+    dirs: &[crate::diskwalk_host::DirRow],
+    keep: &dyn Fn(&Path) -> bool,
+    rows: &[&Path],
+    fold: bool,
+) -> u64 {
+    use aterm_diskwalk::within;
+    let mut picked: Vec<(PathBuf, u64)> = dirs
+        .iter()
+        .map(|d| (base.join(&d.rel), d.alloc))
+        .filter(|(p, _)| keep(p))
+        .filter(|(p, _)| {
+            !rows
+                .iter()
+                .any(|r| within(p, r, fold) || within(r, p, fold))
+        })
+        .collect();
+    picked.sort_by_key(|(p, _)| p.components().count());
+    let mut kept: Vec<(PathBuf, u64)> = Vec::new();
+    for (p, alloc) in picked {
+        if !kept.iter().any(|(k, _)| within(&p, k, fold)) {
+            kept.push((p, alloc));
+        }
+    }
+    kept.iter().map(|(_, alloc)| alloc).sum()
 }
 
 /// The kernel reads `scope=request` takes of its live tabs' trees: none in a test.
@@ -1707,6 +2378,7 @@ fn answer(
     let key = ReplyKey {
         seq: head.seq,
         view: q.view,
+        form: q.form,
         scope: q.effective_scope(),
         target: g.target.key,
         top: q.top,
@@ -1737,14 +2409,17 @@ fn answer(
         volume: g.volume.as_ref(),
         roots: &g.roots,
         disk: g.disk.as_ref(),
+        stores: &g.stores,
         home: g.home.as_deref(),
         events: &since.events,
         gap: since.gap,
         head_seq: head.seq,
+        held: g.held.as_ref(),
     };
     if q.json {
         let mut reply = Reply {
             view: q.view,
+            form: q.form,
             scope: q.view.default_scope().and(q.effective_scope()),
             subject: aterm_vitals::sys::why::subject_word(q, ctx.snap),
             lines: Vec::new(),

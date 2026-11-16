@@ -128,26 +128,32 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
             from: None
         })
     );
-    assert_eq!(
-        agent_of("cwd=/w raise=false agent=claude model=claude-opus-4.1 from=s-ab12 len=3"),
-        Some(AgentSpec::Worker {
-            agent: aterm_phase::Program::Claude,
-            model: Some("claude-opus-4.1".to_string()),
-            effort: None,
-            autopilot: None,
-            from: Some(aterm_session::SessionId::new("s-ab12")),
-        })
-    );
-    assert_eq!(
-        agent_of("agent=agy model=gemini-2.5-pro- from=s-ab12 len=3"),
-        Some(AgentSpec::Worker {
-            agent: aterm_phase::Program::Agy,
-            model: Some("gemini-2.5-pro-".to_string()),
-            effort: None,
-            autopilot: None,
-            from: Some(aterm_session::SessionId::new("s-ab12")),
-        })
-    );
+    for parent in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert_eq!(
+            agent_of(&format!(
+                "cwd=/w raise=false agent=claude model=claude-opus-4.1 from={parent} len=3"
+            )),
+            Some(AgentSpec::Worker {
+                agent: aterm_phase::Program::Claude,
+                model: Some("claude-opus-4.1".to_string()),
+                effort: None,
+                autopilot: None,
+                from: Some(aterm_session::SessionId::new(parent)),
+            })
+        );
+        assert_eq!(
+            agent_of(&format!(
+                "agent=agy model=gemini-2.5-pro- from={parent} len=3"
+            )),
+            Some(AgentSpec::Worker {
+                agent: aterm_phase::Program::Agy,
+                model: Some("gemini-2.5-pro-".to_string()),
+                effort: None,
+                autopilot: None,
+                from: Some(aterm_session::SessionId::new(parent)),
+            })
+        );
+    }
     let longest = "M".repeat(64);
     assert_eq!(
         agent_of(&format!("model={longest} agent=claude len=1 split=v")),
@@ -181,7 +187,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
     ] {
         assert_eq!(
             agent_of(&format!(
-                "agent={} model=m-1 autopilot=cruise from=s-ab12 len=1",
+                "agent={} model=m-1 autopilot=cruise from=s-0123456789abcdef0123 len=1",
                 program.name()
             )),
             Some(AgentSpec::Worker {
@@ -189,7 +195,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
                 model: Some("m-1".to_string()),
                 effort: None,
                 autopilot: Some(alab_policy::config::Autopilot::Cruise),
-                from: Some(aterm_session::SessionId::new("s-ab12")),
+                from: Some(aterm_session::SessionId::new("s-0123456789abcdef0123")),
             }),
             "a worker of {program:?}"
         );
@@ -200,12 +206,16 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         "agent=generic",
         "agent=Claude",
         "model=opus",
-        "from=s-ab12",
+        "from=s-0123456789abcdef0123",
         "len=4",
         "agent=claude model=",
         "agent=claude from=",
         "agent=claude from=ctl",
         "agent=claude from=s-xyz",
+        "agent=claude from=s-ab12 len=1",
+        "agent=claude from=s-0123456789ABCDEF0123 len=1",
+        "agent=claude from=tqn5r6e014u len=1",
+        "agent=claude from=../manager len=1",
         "agent=claude model=a/b",
         "agent=claude model=a$b",
         "agent=claude model=a\u{e9}",
@@ -215,7 +225,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         "agent=claude autopilot=land autopilot=cruise len=1",
         "autopilot=land",
         too_long.as_str(),
-        "agent=claude connected=controlled place=tab of=s-a",
+        "agent=claude connected=controlled place=tab of=tab12000000",
         "agent=codex-old len=1",
         "agent=muse model=a/b len=1",
         "agent=muse model=-x len=1",
@@ -223,7 +233,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         "agent=Grok len=1",
         "agent=grok len=1",
         "agent=kimi len=1",
-        "connected=controlled place=tab of=s-a len=3",
+        "connected=controlled place=tab of=tab12000000 len=3",
     ] {
         assert!(parse_spawn_args(bad).is_err(), "{bad}");
     }
@@ -253,15 +263,31 @@ fn program_parses_as_a_program_worker_and_a_spawn_naming_none_is_refused() {
         }) => Some((run, from)),
         _ => None,
     };
+    for parent in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert_eq!(
+            program(&format!(
+                "program=/bin/sh arg=-c arg=echo%20it%27s%20done from={parent} len=9"
+            )),
+            Some((
+                ProgramRun {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), "echo it's done".to_string()],
+                },
+                Some(aterm_session::SessionId::new(parent)),
+            ))
+        );
+    }
     assert_eq!(
-        program("program=/bin/sh arg=-c arg=echo%20it%27s%20done from=s-ab12 len=9"),
-        Some((
-            ProgramRun {
-                program: "/bin/sh".to_string(),
-                args: vec!["-c".to_string(), "echo it's done".to_string()],
-            },
-            Some(aterm_session::SessionId::new("s-ab12")),
-        ))
+        program("program=/bin/sh from=s-0123456789abcdef0123 len=9").map(|(_, from)| from),
+        Some(Some(aterm_session::SessionId::new(
+            "s-0123456789abcdef0123"
+        ))),
+        "a legacy tab's exact ID"
+    );
+    assert_eq!(
+        program("program=/bin/sh from=s-ab12 len=9"),
+        None,
+        "a loose `s-` word is no session ID"
     );
     assert_eq!(
         program("cwd=/w program=/opt/my%20tools/run arg= len=1"),
@@ -287,6 +313,7 @@ fn program_parses_as_a_program_worker_and_a_spawn_naming_none_is_refused() {
         "program=sh agent=claude len=1",
         "program=sh model=m len=1",
         "program=sh autopilot=land len=1",
+        "program=sh from=s-ab12 len=1",
         "agent=claude arg=x len=1",
     ] {
         assert!(parse_spawn_args(bad).is_err(), "{bad}");

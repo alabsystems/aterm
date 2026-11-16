@@ -269,7 +269,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     assert_eq!(model_init, [0; 11], "sanity: Init is the all-zero state");
 
     let drag = |app: &mut App, from: (u16, u16), to: (u16, u16)| {
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.last_mouse_cell = from;
         }
         app.begin_selection(wid, SelectionType::Simple);
@@ -332,7 +332,7 @@ fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     *validated += 1;
 
     let prev = next;
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_cell = (2, 0);
     }
     ev.step("UserClear", || {

@@ -532,6 +532,12 @@ pub struct Journal {
     /// absent otherwise, as `windows`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_sha256: Option<String>,
+    /// The pull lane's record of the reservation's Windows zip
+    /// ([`crate::buildplan::windows_pull::Pull`]): the request written when the build was
+    /// reserved, and what step 7 decided. It belongs to one reservation: one of another build
+    /// or commit is stale. Absent where the lane asked nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_pull: Option<crate::buildplan::windows_pull::Pull>,
     /// Facts only this journal holds for R: [`COMMIT_GATES`], [`FIXTURES_STAGED`], `after-cut`, `tap-aligned`, `site-deferred`, `check`.
     #[serde(default)]
     pub done: Vec<String>,
@@ -645,6 +651,25 @@ impl Journal {
         }
         crate::durable::write_atomic_durable(path, text.as_bytes(), 0o600)
             .map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// The pull lane's record of the journal's reservation; `None` without one, or where the
+    /// record is another reservation's.
+    #[must_use]
+    pub fn reserved_pull(&self) -> Option<&crate::buildplan::windows_pull::Pull> {
+        let reserved = self.reserved.as_ref()?;
+        self.windows_pull
+            .as_ref()
+            .filter(|pull| pull.of(reserved.build, &reserved.commit))
+    }
+
+    /// The directory of the Windows pair the pull lane admitted for the journal's reservation:
+    /// what the cut declares `--windows-artifacts` with `--windows-attested`.
+    #[must_use]
+    pub fn pulled_windows(&self) -> Option<PathBuf> {
+        self.reserved_pull()
+            .filter(|pull| pull.admitted.is_some())
+            .and_then(|pull| pull.directory.clone())
     }
 
     /// The line R heads: the one journaled, else (a journal written before lines) a line at R
@@ -1608,8 +1633,9 @@ impl Discarded {
 
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
-    /// State the selected base's B8 evidence without steering selection or refusing a cut.
-    fn main_lane(&mut self, _base: &str) -> Option<String> {
+    /// State the follower's status on the selected base without steering selection or
+    /// refusing a cut.
+    fn follower(&mut self, _base: &str) -> Option<String> {
         None
     }
     /// Best-effort preparation for the next cut, after this run's windowed checks ended.
@@ -1907,15 +1933,48 @@ pub trait Backend {
     fn ask(&mut self, words: &AskWords) -> Result<String, String>;
     fn resolve(&mut self, key: &str) -> Result<String, String>;
     fn withdraw(&mut self, key: &str) -> Result<String, String>;
-    /// Open the repair worker of a real cut's red, once per failing input hash, in the release
-    /// clone, its sid kept in the release directory's [`aterm_release::repair::RECORD_FILE`]
-    /// ([`aterm_release::repair::open`]): the lines the cut says of it.
+    /// Return the repair context of a real cut's red to its caller. An explicit release pump
+    /// instead owns an independent worker whose sid is kept in the release directory's
+    /// [`aterm_release::repair::RECORD_FILE`] ([`aterm_release::repair::open`]). The returned
+    /// lines precede the cut's original refusal; repair changes no gate or exit code.
     fn repair(&mut self, failure: &aterm_release::repair::Failure) -> Vec<String>;
     /// One non-waiting look at the bundle build's exact slice-memory plans, through the same
     /// retained book, capacity ledger and machine reader as qualify.
     fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String>;
     fn origin_tail(&mut self) -> Option<u64>;
     fn reserve(&mut self, c: &Candidate) -> Result<Reservation, Refusal>;
+    /// The pull lane's configuration in the release commit `commit`'s `publish/config.sh`
+    /// ([`crate::buildplan::windows_pull::Config::read`]); off where it cannot be read.
+    fn windows_pull_config(&mut self, _commit: &str) -> crate::buildplan::windows_pull::Config {
+        crate::buildplan::windows_pull::Config::OFF
+    }
+    /// Asks origin's Windows builder for the zip of release `version` build `build` at the
+    /// release commit `commit`, at `now` ([`crate::buildplan::windows_pull::write_request`]):
+    /// the request commit origin's request ref names.
+    /// # Errors
+    /// Why the request could not be written.
+    fn windows_request(
+        &mut self,
+        _version: &str,
+        _build: u64,
+        _commit: &str,
+        _now: u64,
+    ) -> Result<String, String> {
+        Err("this backend writes no Windows build request".into())
+    }
+    /// What origin holds for the pull `ask`, judged on `day` (`YYYY-MM-DD`, the day an
+    /// attestation is or was admitted): its handoff, put back together in the release directory
+    /// and admitted or refused, else the builder's heartbeat
+    /// ([`crate::buildplan::windows_pull::look`]).
+    /// # Errors
+    /// Origin could not be read.
+    fn windows_look(
+        &mut self,
+        _ask: &crate::buildplan::windows_pull::Ask,
+        _day: &str,
+    ) -> Result<crate::buildplan::windows_pull::Found, String> {
+        Err("this backend reads no Windows handoff".into())
+    }
     /// What the reservation's release commit would roll from `c`, computed from the same texts
     /// [`Backend::reserve`] commits: the dry run's words for it.
     fn preview_roll(&mut self, c: &Candidate) -> Result<String, Refusal>;
@@ -2065,6 +2124,9 @@ struct Run<'b> {
     linux: LinuxDecl,
     windows: Option<PathBuf>,
     windows_sha256: Option<String>,
+    /// `windows` is the pair the pull lane brought ([`Journal::windows_pull`]), bound by its
+    /// attestation: the cut is told `--windows-attested`.
+    windows_attested: bool,
     planned: Vec<Step>,
     est: BTreeMap<String, u64>,
     plan_secs: u64,
@@ -2129,6 +2191,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions) -> Outcome {
         linux: LinuxDecl::default(),
         windows: None,
         windows_sha256: None,
+        windows_attested: false,
         planned: Vec::new(),
         est: BTreeMap::new(),
         plan_secs: 0,
@@ -2844,8 +2907,8 @@ impl Run<'_> {
                 log.display()
             ));
         }
-        // A real run's refusal ends here, once. A red of a gate or build opens its repair
-        // worker; whatever that says, this refusal is the run's end.
+        // A real run's refusal ends here, once. A gate or build red hands repair to its
+        // caller, or to an explicit pump's worker; repair changes no refusal or exit.
         if !self.dry
             && !r.could_not_run
             && let Some(gate) = r.failing.clone()
@@ -2864,7 +2927,7 @@ impl Run<'_> {
                 trustc: prover.map_or_else(|| "?".into(), |p| p.commit.clone()),
                 at: now,
                 // An --open-next judges main's tip, another commit at every try: its red is
-                // keyed by the version it opens after, so one red opens one worker.
+                // keyed by the version it opens after, so a pump can reuse its recorded worker.
                 opening: self
                     .opts
                     .open_next
@@ -4253,6 +4316,19 @@ impl Run<'_> {
                 "create the handoff directory (docs/RELEASING.md § Windows release handoff), \
                  or drop --windows-artifacts to ship no Windows zip",
             ))?;
+        }
+        // With none carried by hand, the pair the pull lane admitted for the reservation, as
+        // step 7 declared it: a run that resumes past step 7 declares it to the cut the same.
+        if self.windows.is_none()
+            && self.windows_sha256.is_none()
+            && let Some(pulled) = self
+                .journal
+                .as_ref()
+                .filter(|j| j.commit == r)
+                .and_then(Journal::pulled_windows)
+        {
+            self.windows = Some(pulled);
+            self.windows_attested = true;
         }
 
         let v = self.version();
@@ -5788,7 +5864,7 @@ impl Run<'_> {
             cand.version = self.b.version_at(&cand.commit).unwrap_or_default();
         }
         self.cand = Some(cand.clone());
-        if let Some(evidence) = self.b.main_lane(&cand.commit) {
+        if let Some(evidence) = self.b.follower(&cand.commit) {
             self.b.say(&evidence);
         }
         let (r, v) = (cand.commit.clone(), cand.version.clone());
@@ -6281,7 +6357,7 @@ impl Run<'_> {
             trustc: prover.commit.clone(),
             started: self.b.now(),
             linux: self.linux.clone(),
-            windows: self.windows.clone(),
+            windows: self.carried_windows(),
             windows_sha256: self.windows_sha256.clone(),
             done: vec![PENDING_LINE.into()],
             asks,
@@ -6486,8 +6562,9 @@ impl Run<'_> {
                 bumped,
                 started,
                 linux: self.linux.clone(),
-                windows: self.windows.clone(),
+                windows: self.carried_windows(),
                 windows_sha256: self.windows_sha256.clone(),
+                windows_pull: None,
                 done: if selecting && !line.hops.is_empty() {
                     vec![PENDING_LINE.into()]
                 } else {
@@ -6508,7 +6585,8 @@ impl Run<'_> {
             if self.linux.declared() {
                 j.linux = self.linux.clone();
             }
-            if self.windows.is_some() {
+            // As `carried_windows`, by field: `j` holds the journal.
+            if self.windows.is_some() && !self.windows_attested {
                 j.windows.clone_from(&self.windows);
             }
             if self.windows_sha256.is_some() {
@@ -7296,6 +7374,10 @@ impl Run<'_> {
             Some(_) => Some(self.reserved_for_build(c)?),
             None => self.reservation(),
         };
+        // The Windows builder works on the reservation while this Mac builds and verifies it.
+        if let Some(r) = &reserved {
+            self.windows_ask(&c.version, r)?;
+        }
         // A new reservation sets the old bundle aside, so the plan is asked again.
         let (mut plan, done) = self.qualify_plan();
         if plan.branches().is_empty() {
@@ -8078,7 +8160,7 @@ impl Run<'_> {
         {
             out.push(Refusal::new(
                 format!("only {free} GiB free — the cut needs {CUT_GIB}"),
-                "free space, then re-run",
+                "re-run; nothing was changed",
             ));
         }
         let tag = format!("v{}", c.version);
@@ -8690,17 +8772,214 @@ impl Run<'_> {
         args
     }
 
-    /// The `ship cut` flags of the Windows declaration: none when the release made none, and
-    /// the zip's digest when the person named it.
+    /// The Windows handoff directory a person declared (`--windows-artifacts`, this run's or
+    /// the journal's): what the journal keeps as the line's declaration. The pair the pull lane
+    /// brought belongs to one reservation and is journaled with it
+    /// ([`Journal::windows_pull`]), never here.
+    fn carried_windows(&self) -> Option<PathBuf> {
+        self.windows.clone().filter(|_| !self.windows_attested)
+    }
+
+    /// The `ship cut` flags of the Windows declaration: none when the release made none, the
+    /// zip's digest when the person named it, and `--windows-attested` for the pair the pull
+    /// lane brought.
     fn windows_args(&self) -> Vec<String> {
         let Some(dir) = &self.windows else {
             return Vec::new();
         };
         let mut args = vec!["--windows-artifacts".to_string(), dir.display().to_string()];
-        if let Some(sha256) = &self.windows_sha256 {
+        if self.windows_attested {
+            args.push("--windows-attested".to_string());
+        } else if let Some(sha256) = &self.windows_sha256 {
             args.extend(["--windows-sha256".to_string(), sha256.clone()]);
         }
         args
+    }
+
+    /// The pull lane's request for `r`, the reservation of release `version`, where the release
+    /// commit's `publish/config.sh` turns the lane on and no Windows pair is declared by hand
+    /// (docs/RELEASING.md § Windows release handoff, *The pull lane*): written once for the
+    /// reservation, and again on a later run while it could not be and step 7 has not decided.
+    /// Journaled either way; a request that cannot be written never refuses the release, and
+    /// step 7 then goes on without a Windows zip.
+    fn windows_ask(&mut self, version: &str, r: &Reservation) -> Flow {
+        if self.dry || (self.windows.is_some() && !self.windows_attested) {
+            return Ok(());
+        }
+        let current = self
+            .journal
+            .as_ref()
+            .and_then(|j| j.windows_pull.as_ref())
+            .filter(|pull| pull.of(r.build, &r.commit));
+        if current.is_some_and(|pull| pull.decided() || pull.request.is_some()) {
+            return Ok(());
+        }
+        if !self.b.windows_pull_config(&r.commit).on {
+            return Ok(());
+        }
+        let now = self.b.now();
+        let mut pull = crate::buildplan::windows_pull::Pull::new(r.build, &r.commit, now);
+        // A line carrying `--fix` hops asks as any line does: its head is recorded in main's
+        // history before the build is reserved (`ledger::reserve` holds the release commit's
+        // parent on origin/main), which is what a builder holds it to.
+        self.windows_request_into(&mut pull, version, r);
+        if let Some(j) = self.journal.as_mut() {
+            j.windows_pull = Some(pull);
+        }
+        self.save_journal()
+    }
+
+    /// Writes the request of `pull`'s reservation `r` (release `version`) into `pull`: the
+    /// request commit, or why it could not be written.
+    fn windows_request_into(
+        &mut self,
+        pull: &mut crate::buildplan::windows_pull::Pull,
+        version: &str,
+        r: &Reservation,
+    ) {
+        match self
+            .b
+            .windows_request(version, r.build, &r.commit, pull.requested_at)
+        {
+            Ok(oid) => {
+                self.say(&format!(
+                    "        windows: asked origin's Windows builder for build {} ({} at {})",
+                    r.build,
+                    aterm_winship::pull::REQUEST_REF,
+                    short(&oid)
+                ));
+                pull.request = Some(oid);
+            }
+            Err(why) => {
+                self.say(&format!(
+                    "        windows: the request for a Windows zip could not be written ({why}); \
+                     this release goes on, Mac-only unless a later run writes it"
+                ));
+                pull.unrequested = Some(why);
+            }
+        }
+    }
+
+    /// Step 7's pull decision, before anything signs: the Windows pair the pull lane brought
+    /// for the reservation, admitted and declared (`--windows-attested`), with the UTC day it was
+    /// admitted on journaled (`admitted_on`, which every later check of its attestation is
+    /// judged on); or a wait, ending the run COULD NOT RUN (exit 3) while a builder C pins is
+    /// serving and has not passed the request over, or origin could not be read, and the wait
+    /// from the request has not run out, so the pump runs it again on the same reservation; or,
+    /// journaled and said, no Windows zip (no builder serving, the wait run out, a handoff
+    /// refused). A decision stands for the reservation; an admitted pair whose folder something
+    /// emptied is put back together from origin's handoff on its admission day, else decided
+    /// again. A pair declared by hand, or no lane, decides nothing.
+    fn windows_pull(&mut self) -> Flow {
+        use crate::buildplan::windows_pull::{Ask, Decision, decide, lacks};
+        if self.windows.is_some() && !self.windows_attested {
+            return Ok(());
+        }
+        // A pulled pair is the reservation's: what this run loaded is decided again below for
+        // the reservation that stands now.
+        self.windows = None;
+        self.windows_attested = false;
+        let Some(r) = self.reservation() else {
+            return Ok(());
+        };
+        let version = self.version();
+        self.windows_ask(&version, &r)?;
+        let Some(mut pull) = self.r_journal().and_then(Journal::reserved_pull).cloned() else {
+            return Ok(());
+        };
+        if pull.decided() {
+            let (Some(builder), Some(directory)) = (&pull.admitted, &pull.directory) else {
+                self.say(&format!(
+                    "        windows: none in this release — {}",
+                    pull.skipped.as_deref().unwrap_or("decided earlier")
+                ));
+                return Ok(());
+            };
+            let lacking = lacks(directory, &version);
+            if lacking.is_empty() {
+                self.say(&format!(
+                    "        windows: the pair builder {builder} handed off, admitted for build \
+                     {} ({})",
+                    r.build,
+                    directory.display()
+                ));
+                self.windows = Some(directory.clone());
+                self.windows_attested = true;
+                return Ok(());
+            }
+            // Something removed the pair from the release's own folder: it is put back
+            // together from origin's handoff as it was admitted, judged on the day it was, or
+            // the release decides again for the reservation.
+            self.say(&format!(
+                "        windows: the pair builder {builder} handed off is no longer whole in {} \
+                 (it lacks {}); putting it back together from origin's handoff",
+                directory.display(),
+                lacking.join(", ")
+            ));
+            pull.admitted = None;
+            pull.directory = None;
+        }
+        let config = self.b.windows_pull_config(&r.commit);
+        let ask = Ask {
+            version,
+            build: r.build,
+            commit: r.commit.clone(),
+        };
+        let now = self.b.now();
+        // An attestation's expiry is judged on the day it was first admitted, else today.
+        let day = pull
+            .admitted_on
+            .clone()
+            .unwrap_or_else(|| aterm_winship::pull::date_of(now));
+        let found = self.b.windows_look(&ask, &day);
+        match decide(found, now, &pull, &config) {
+            Decision::Admit(pulled) => {
+                self.say(&format!(
+                    "        windows: admitted the pair builder {} handed off for build {} \
+                     (SHA-256 {}, attested by its pinned key {} on {day}); the cut declares it \
+                     --windows-attested",
+                    pulled.builder,
+                    r.build,
+                    pulled.sha256,
+                    short(&pulled.public_key)
+                ));
+                pull.admitted = Some(pulled.builder);
+                pull.directory = Some(pulled.directory.clone());
+                pull.admitted_on = Some(day);
+                self.windows = Some(pulled.directory);
+                self.windows_attested = true;
+            }
+            Decision::Wait { until, why } => {
+                let at = self.b.hms(until);
+                return self.refuse(
+                    Refusal::new(
+                        format!("waiting for this release's Windows zip: {why}"),
+                        format!(
+                            "{RELEASE_COMMAND} again (the pump does): it admits the handoff once \
+                             it is on origin, and from {at} goes on without a Windows zip \
+                             (publish/config.sh's {} from the request)",
+                            crate::buildplan::windows_pull::WAIT_KEY
+                        ),
+                    )
+                    .could_not_run(),
+                );
+            }
+            Decision::Skip { why, loud } => {
+                if loud {
+                    self.say(&format!(
+                        "        windows: REFUSED, BAD SIGNATURE — {why}; this release ships no \
+                         Windows zip"
+                    ));
+                } else {
+                    self.say(&format!("        windows: none in this release — {why}"));
+                }
+                pull.skipped = Some(why);
+            }
+        }
+        if let Some(j) = self.journal.as_mut() {
+            j.windows_pull = Some(pull);
+        }
+        self.save_journal()
     }
 
     /// Step 7: R's source published by `pub publish` and R's verified bundle signed, notarized
@@ -8724,6 +9003,16 @@ impl Run<'_> {
         let sign = self.sign_args();
         if self.dry {
             let line = self.provision(true)?;
+            if self.windows.is_none()
+                && let Some(r) = self.reservation()
+                && self.b.windows_pull_config(&r.commit).on
+            {
+                self.say(&format!(
+                    "        windows: would admit the Windows pair a pinned builder handed off on \
+                     origin for build {}, wait while one is serving, else go on without one",
+                    r.build
+                ));
+            }
             let then = format!(
                 "targo --unverified ship {} (R's verified bundle copied, signed, notarized and \
                  packaged privately under its reservation; nothing claimed)",
@@ -8749,6 +9038,8 @@ impl Run<'_> {
             return Ok(());
         }
         self.records_stand("the cut would refuse after the publish")?;
+        self.windows_pull()?;
+        let sign = self.sign_args();
         if let Err(why) = self.b.fleet_audit() {
             return self.refuse(
                 Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),

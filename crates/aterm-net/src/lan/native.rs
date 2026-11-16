@@ -7,7 +7,6 @@ use std::{
     io,
     net::{SocketAddr, TcpListener, TcpStream},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
-    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -141,6 +140,8 @@ impl RouteChanges {
                 .ok()
                 .filter(|room| *room > 0)
                 .ok_or_else(|| refuse("invalid route notification receive room"))?;
+            #[cfg(any(test, debug_assertions))]
+            super::ROUTE_CHANGES_OPENED.set(super::ROUTE_CHANGES_OPENED.get() + 1);
             Ok(Self { socket, room })
         }
     }
@@ -464,7 +465,13 @@ pub(super) fn restrict_hops(stream: &TcpStream) -> io::Result<()> {
     }
 }
 
+/// The sequence number of this process's next netlink route query. A netlink reply goes to the
+/// asking socket alone; Darwin's lookups, whose answers can reach every routing socket of the
+/// process, are numbered by aterm-uds's one writer of lookups instead
+/// (`aterm_uds::network::lookup_write`).
+#[cfg(target_os = "linux")]
 fn sequence() -> io::Result<u32> {
+    use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(1);
     NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)

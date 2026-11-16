@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use aterm_models_session::claimed_box_steps_model;
 use aterm_slog::{
-    ActWord, Actor, Binding, Claimed, ClaimedBox, ClaimedReport, Close, Conf, Fields, Key, Kind,
+    ActWord, Actor, Binding, ClaimEdge, ClaimedBox, ClaimedReport, Close, Conf, Fields, Key, Kind,
     Log, Mark, Node, Op, Out, Src, StepOut, TurnTracker, Verdict,
 };
 use aterm_spec::derive::Model;
@@ -80,7 +80,7 @@ impl World {
         let mut log = Log::new(1);
         let run = agent_session(&mut log, 0);
         let mut tr = TurnTracker::new(run);
-        let _ = tr.claim(&mut log, Claimed::Working, at(1));
+        let _ = tr.claim_edge(&mut log, ClaimEdge::Began, at(1), &mut || true);
         let turn = tr.turn().expect("the claim's turn");
         World {
             log,
@@ -195,7 +195,9 @@ impl World {
                     boxed: (rep > 0).then_some(ClaimedBox::Approval),
                     began: BEGAN[rep],
                 };
-                let _ = self.tr.claim(&mut self.log, Claimed::Working, now);
+                let _ = self
+                    .tr
+                    .claim_edge(&mut self.log, ClaimEdge::Resumed, now, &mut || true);
                 let _ = self.tr.claim_box(&mut self.log, report, now);
                 if let Some((n, ..)) = self.tr.claim_view().held
                     && !self.steps.iter().any(|(s, _)| *s == n)
@@ -208,7 +210,9 @@ impl World {
                 }
             }
             "TurnEnd" => {
-                let _ = self.tr.claim(&mut self.log, Claimed::Rested, now);
+                let _ = self
+                    .tr
+                    .claim_edge(&mut self.log, ClaimEdge::Rested, now, &mut || true);
                 let rested = ClaimedReport {
                     boxed: None,
                     began: 13,

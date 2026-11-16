@@ -1878,6 +1878,9 @@ impl Hearing {
         if due {
             self.kept = Some(now);
             refresh(paths, bootstrap, &mut self.ledger, now_ms);
+            // Table checkpoints (tracker LT-B10B) wait on the same reports: none is signed while
+            // a member's build cannot read one, and each table gains at most one per tick.
+            crate::att::checkpoint::sign_due(paths, &self.ledger, now_ms);
         }
         // A write that fails is tried again at the next change or [`KEEP`], not every tick.
         self.changed = false;
@@ -2437,6 +2440,13 @@ fn broker_answers() -> std::result::Result<(), &'static str> {
             Err(LanError::Unavailable(Unavailable::NotInstalled)) => {
                 Err("Waits for the LAN broker, which setup's Mac password installs")
             }
+            Err(LanError::Unavailable(Unavailable::NotRunning)) => {
+                Err("Waits for the LAN broker, which setup's Mac password starts")
+            }
+            Err(LanError::Unavailable(Unavailable::SwitchedOff)) => Err(
+                "Waits for the LAN broker, whose job is switched off in launchd (aterm's \
+                 background item in Login Items)",
+            ),
             Err(LanError::Unavailable(Unavailable::Outdated { .. })) => {
                 Err("Waits for the LAN broker to be renewed for this aterm")
             }

@@ -10,9 +10,13 @@
 
 use super::{HANG, Lab, Mac, incarnation, lab_of, lock, seating};
 use crate::logs::{MESH_DIR, MeshLog, Standings};
+use crate::overlay::{WAKE_REPROVE_WITHIN, Woke};
 use crate::presence::{
-    Build, EVERY, Event, Facts, Held, Presence, PresenceConfig, Refusal, STALE_ROWS_UP, Standing,
+    Build, EVERY, Event, Facts, Held, KEEP_ADVANCES_ON_WAKE, Presence, PresenceConfig, Refusal,
+    STALE_ROWS_UP, Standing,
 };
+use crate::relay;
+use aterm_net::fleet::link::LinkClock as _;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -263,6 +267,125 @@ fn a_mac_that_stops_pushing_goes_from_up_to_last_seen_with_no_probe() {
     );
 }
 
+/// What A reads of every seat right after it hands its mesh `why` ([`crate::Waker::woke`]),
+/// once three Macs read each other up: A's two links each re-prove within
+/// [`WAKE_REPROVE_WITHIN`] of the wake (the links' clock has not moved when both answers are
+/// counted, and the links stay open once that deadline passes), A's overlay kicks every relay,
+/// and the standings A reads of each seat at once. Then a fresh round of rows arrives and A
+/// reads every seat up again.
+/// Answers the wall time of the last rows before the event, and what A read.
+fn wake_on_a(why: Woke, keep_advances: bool) -> (u64, Vec<Option<Standing>>) {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 3);
+    let all: Vec<&str> = macs.iter().map(|mac| mac.principal.as_str()).collect();
+    let ps: Vec<Present> = macs.iter().map(present).collect();
+    let readers: Vec<&Present> = ps.iter().collect();
+    let before = round(&lab, &readers, &all);
+    let (a, pa) = (&macs[0], &ps[0]);
+    for mac in &macs {
+        assert_eq!(
+            pa.standing(mac),
+            Some(Standing::Up),
+            "{} up before",
+            mac.principal
+        );
+    }
+    let run = a.run.as_ref().expect("A runs");
+    let links = run.table.links();
+    assert_eq!(links.len(), 2, "A links B and C");
+    let asked: Vec<(u64, u64)> = links.iter().map(|link| link.reproofs()).collect();
+    let mark = a.seen.mark();
+    let woke_at = lab.clock.now();
+    KEEP_ADVANCES_ON_WAKE.with(|on| on.set(keep_advances));
+    let waker = run.attached.as_ref().expect("A's overlay").waker();
+    assert_eq!(waker.woke(why), Some(2), "both links are asked to re-prove");
+    KEEP_ADVANCES_ON_WAKE.with(|on| on.set(false));
+    let read: Vec<Option<Standing>> = macs.iter().map(|mac| pa.standing(mac)).collect();
+    let deadline = Instant::now() + HANG;
+    for (link, (sent, proven)) in links.iter().zip(&asked) {
+        while link.reproofs() != (sent + 1, proven + 1) {
+            assert!(
+                Instant::now() < deadline,
+                "A's link to {:?} re-proved {:?} within the hang detector",
+                link.peer().node,
+                link.reproofs()
+            );
+            aterm_uds::deadline::poll_yield();
+        }
+    }
+    assert_eq!(
+        lab.clock.now(),
+        woke_at,
+        "every answer was counted before the links' clock moved: within the deadline"
+    );
+    lab.clock.advance(WAKE_REPROVE_WITHIN);
+    run.table.tick();
+    for link in &links {
+        assert_eq!(
+            link.closed(),
+            None,
+            "a link that answered stays past the deadline"
+        );
+    }
+    let wake_seen = format!("{why:?} on {}", a.principal);
+    a.seen.until(&wake_seen, |events| {
+        let since = events.get(mark..).unwrap_or_default();
+        since.contains(&relay::Event::Woke { why, links: 2 })
+            && since.iter().any(|event| {
+                matches!(event, relay::Event::Kicked { relays } if *relays == 2 * MeshLog::ALL.len())
+            })
+    });
+    // A fresh row of each Mac arrives, and A reads every seat up again.
+    let after = round(&lab, &readers, &all);
+    assert!(after > before);
+    for mac in &macs {
+        assert_eq!(
+            pa.standing(mac),
+            Some(Standing::Up),
+            "{} up after a fresh row",
+            mac.principal
+        );
+    }
+    drop(ps);
+    (before, read)
+}
+
+/// LT-B1 (W5-sleep-wake-netchange, DVC-mesh-1, DVC-mesh-2): after an injected wake, and after an
+/// injected network path change, every link of the Mac that woke re-proves within
+/// [`WAKE_REPROVE_WITHIN`], its relays are kicked, and no seat reads up there, this Mac's own
+/// included, until a fresh row of it arrives; each then reads silent since the row before the
+/// event. The links' clock stood still in sleep, so without the reset every seat that advanced
+/// just before the sleep would read up for the rest of its 90 seconds however long the sleep.
+/// NEGATIVE CONTROL (`KEEP_ADVANCES_ON_WAKE`): with the wake leaving every advance standing, the
+/// Mac that woke reads every seat up with no fresh row
+/// ([`with_advances_kept_a_wake_leaves_every_seat_up`]); run with
+/// `ATERM_TEST_NEGATIVE_CONTROL=keep-advances-on-wake` this test fails:
+/// `assertion `left == right` failed: Wake: A reads silent until a fresh row; left: Some(Up),
+/// right: Some(Silent { last_seen_ms: Some(1793836830000) })`.
+#[test]
+fn wake_event_reproves_links_and_resets_presence() {
+    for why in [Woke::Wake, Woke::PathChanged] {
+        let (before, read) = wake_on_a(why, false);
+        let last_seen_ms = Some(before);
+        for (seat, standing) in ["A", "B", "C"].iter().zip(read) {
+            assert_eq!(
+                standing,
+                Some(Standing::Silent { last_seen_ms }),
+                "{why:?}: {seat} reads silent until a fresh row"
+            );
+        }
+    }
+}
+
+/// NEGATIVE CONTROL of [`wake_event_reproves_links_and_resets_presence`]
+/// (`KEEP_ADVANCES_ON_WAKE`): a wake that leaves each seat's advance standing leaves every seat
+/// up on the Mac that woke, on rows from before it.
+#[test]
+fn with_advances_kept_a_wake_leaves_every_seat_up() {
+    let (_, read) = wake_on_a(Woke::Wake, true);
+    assert_eq!(read, vec![Some(Standing::Up); 3]);
+}
+
 /// §11 C3, held topics: a Mac whose row names a topic its sessions hold is a holder on every
 /// other Mac, which pushes its topic broadcasts there (`Mesh::holders`, read by the mail links'
 /// pass); once its row names none it is no holder. A Mac is never its own holder.
@@ -322,7 +445,7 @@ fn a_reader_asks_the_node_for_every_seat_and_its_needs_row() {
     let needs = |word: &str| NeedsRow {
         at: t,
         needs: vec![NeedEntry {
-            sid: Sid::parse("s-0123456789abcdef0123").expect("a sid"),
+            sid: Sid::from_bits(1),
             word: Word::new(word).expect("a word"),
             harness: true,
             worker_of: None,
@@ -416,6 +539,96 @@ fn a_reader_asks_the_node_for_every_seat_and_its_needs_row() {
         "a stopped presence serves no view"
     );
     drop(pb);
+}
+
+/// FL-117: the node reads every seat's quota rows as the view judges a `now` row, by Mac, CLI and
+/// account: B's row, its lift with it, once the relay carried it to A, and A's own; it starts
+/// nothing and dials no other Mac.
+/// NEGATIVE CONTROL: what B also published and no quota row of this build is (an agy home's row,
+/// a body naming another account than its subject, a version-1 quota row an older build wrote)
+/// is left out.
+#[test]
+fn the_view_reads_every_seats_quota_rows_by_their_origin() {
+    use aterm_metrics::row::{AgyRow, Label, Lift, QuotaRow, Word};
+    use aterm_metrics::subject::{AccountKey, Cli, HomeKey, Node};
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let all = [a.principal.as_str(), &b.principal];
+    let pa = present(a);
+    let pb = present(b);
+    let t = wall(&lab) / 1000;
+    let key = |hex: &str| AccountKey::parse(&format!("ac-00000000000000{hex}")).expect("a key");
+    let row = |account: AccountKey, lifts: Vec<Lift>| QuotaRow {
+        at: t,
+        cli: Cli::Claude,
+        account,
+        label: Label::new("pool-a").expect("a label"),
+        condition: Word::new("usable").expect("a word"),
+        enrolled: true,
+        pct5: Some(20),
+        pct7: None,
+        five_hour_reset: Some(t + 3600),
+        week_reset: None,
+        walled_until: None,
+        last_used: None,
+        signin: None,
+        last_start: None,
+        last_end: None,
+        sessions_7d: 0,
+        plan: None,
+        lifts,
+    };
+    let lift = Lift {
+        window: Word::new("five_hour").expect("a word"),
+        at: t - 5,
+        reset: Some(t + 3600),
+    };
+    let (a_node, b_node) = (
+        Node::parse(&a.principal).expect("a node"),
+        Node::parse(&b.principal).expect("a node"),
+    );
+    let publish = |mac: &Mac, subject: String, body: &[u8]| {
+        mac.mesh()
+            .publish(MeshLog::Metrics, &subject, body)
+            .expect("the row is published");
+    };
+    let b_row = row(key("a1"), vec![lift]);
+    let subject = |node: Node, account: AccountKey| {
+        aterm_metrics::subject::Subject::quota(node, Cli::Claude, account)
+            .expect("an account CLI")
+            .to_string()
+    };
+    publish(b, subject(b_node, key("a1")), &b_row.encode());
+    publish(
+        b,
+        subject(b_node, key("b2")),
+        &row(key("a1"), Vec::new()).encode(),
+    );
+    let mut older = row(key("c3"), Vec::new()).encode();
+    older.pop();
+    older[1] = 1;
+    publish(b, subject(b_node, key("c3")), &older);
+    let agy = AgyRow {
+        at: t,
+        home: HomeKey::Home,
+        groups: Vec::new(),
+    };
+    publish(b, agy.subject(b_node).to_string(), &agy.encode());
+    let a_row = row(key("a1"), Vec::new());
+    publish(a, subject(a_node, key("a1")), &a_row.encode());
+    // B's presence row of this round follows its rows on the relay to A.
+    round(&lab, &[&pa, &pb], &all);
+    let rows = crate::view::quota_rows(a.mesh(), HANG).expect("A reads its log");
+    assert_eq!(
+        rows,
+        std::collections::BTreeMap::from([
+            ((a_node, Cli::Claude, key("a1")), a_row),
+            ((b_node, Cli::Claude, key("a1")), b_row),
+        ]),
+        "each seat's quota rows, and nothing else B published"
+    );
+    drop((pa, pb));
 }
 
 /// §10 "Presence": a restarted Mac's first row wins at once on every other Mac. Its number is in

@@ -42,6 +42,55 @@ pub fn mem(bytes: u64) -> String {
     }
 }
 
+/// Swap usage with a measured zero kept distinct from an unread measurement.
+#[must_use]
+pub fn swap_used(used: Option<u64>) -> String {
+    match used {
+        Some(0) => "swap 0".into(),
+        Some(bytes) => format!("swap {}", mem(bytes)),
+        None => "swap unknown".into(),
+    }
+}
+
+/// A physical page class's visible name; only a proved exact partition names its residual VM space.
+#[must_use]
+pub fn memory_class_name(
+    kind: crate::model::MemoryClassKind,
+    partition: crate::model::MemoryPartition,
+) -> &'static str {
+    use crate::model::{MemoryClassKind, MemoryPartition};
+    match kind {
+        MemoryClassKind::App => "app",
+        MemoryClassKind::Wired => "wired",
+        MemoryClassKind::Compressed => "compressed",
+        MemoryClassKind::Cache => "file cache",
+        MemoryClassKind::Free => "free",
+        MemoryClassKind::Residual if partition == MemoryPartition::Exact => "not in VM",
+        MemoryClassKind::Residual => "unclassified",
+    }
+}
+
+/// Why the physical classes do, or do not, supply a proportionate chart.
+#[must_use]
+pub fn memory_classes_status(classes: &crate::model::PhysicalMemoryClasses, used: u64) -> String {
+    use crate::model::MemoryPartition;
+    match classes.partition {
+        MemoryPartition::Exact => format!(
+            "{} of {} GiB in use",
+            gib_figure(used),
+            gib_total(classes.total),
+        ),
+        MemoryPartition::Inexact => "measured classes may overlap".into(),
+        MemoryPartition::Incomplete => "compressed memory not read".into(),
+        MemoryPartition::Overfull => {
+            let excess = u64::try_from(classes.excess)
+                .map_or_else(|_| format!("{:.1} GiB", classes.excess as f64 / GIB), mem);
+            format!("classes exceed physical total by {excess}")
+        }
+        MemoryPartition::NoCapacity => "physical capacity not read".into(),
+    }
+}
+
 /// Format bytes as `GiB` to one decimal place without a unit suffix; a nonzero amount that rounds to `0.0` is `<0.1`.
 #[must_use]
 pub fn gib_figure(bytes: u64) -> String {
@@ -1569,12 +1618,7 @@ fn memory_details(snap: &Snapshot) -> Vec<Clause> {
             )],
         ));
     }
-    let swap = if m.swap_used == 0 {
-        "swap 0".into()
-    } else {
-        format!("swap {}", mem(m.swap_used))
-    };
-    out.push(Clause::new(3, vec![swap]));
+    out.push(Clause::new(3, vec![swap_used(m.swap_used)]));
     out
 }
 

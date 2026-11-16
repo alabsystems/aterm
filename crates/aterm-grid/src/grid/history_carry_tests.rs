@@ -234,6 +234,26 @@ fn a_continued_numbering_reserves_only_the_shortfall() {
 }
 
 #[test]
+fn a_reserve_moves_the_renumber_epoch_only_when_it_moves_a_key() {
+    let mut grid = tiered(4, 20);
+    write_lines(&mut grid, "carried", 0, 6);
+    grid.continue_absolute_numbering(1_000);
+    let epoch = grid.history_renumber_epoch();
+    let _ = grid.reserve_older_history_keys(0);
+    let _ = grid.reserve_older_history_keys(grid.oldest_absolute_row());
+    assert_eq!(
+        grid.history_renumber_epoch(),
+        epoch,
+        "a reserve the keys below the oldest line already cover renumbers nothing"
+    );
+    let _ = grid.reserve_older_history_keys(grid.oldest_absolute_row() + 5);
+    assert!(
+        grid.history_renumber_epoch() > epoch,
+        "a reserve that raises the counter renumbers every row"
+    );
+}
+
+#[test]
 fn an_unreserved_import_raises_the_counter_and_says_it_renumbered() {
     let mut grid = tiered(4, 20);
     write_lines(&mut grid, "carried", 0, 6);

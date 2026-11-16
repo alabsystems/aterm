@@ -31,7 +31,7 @@ impl Drop for Here {
     }
 }
 
-const BY: &str = "fleet:87be5228:s-0123456789abcdef0123";
+const BY: &str = "fleet:87be5228:tqn5r6e0148";
 const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
 /// Another Mac whose node id begins as [`NODE`]'s does: its drive's actor token is the same.
 const TWIN: &str = "87be5228ffffffffffffffffffffffff";
@@ -178,7 +178,7 @@ fn a_drive_turn_attaches_to_its_request_and_a_foreign_drive_does_not() {
     // all type into the tab, and none of it attaches.
     for stranger in [
         fleet(
-            "fleet:c0ffee00:s-0123456789abcdef0123",
+            "fleet:c0ffee00:tqn5r6e0148",
             "c0ffee00c0ffee00c0ffee00c0ffee00",
         ),
         fleet("fleet:87be5228:-", NODE),
@@ -572,7 +572,7 @@ fn listed_counts_unreviewed_newest_first_with_the_fallback_why() {
         from: From {
             node: String::new(),
             host: "this-mac".to_owned(),
-            by: "s-0123456789abcdef0123".to_owned(),
+            by: "t0123456789".to_owned(),
             program: Some("claude".to_owned()),
             model: None,
             account: None,

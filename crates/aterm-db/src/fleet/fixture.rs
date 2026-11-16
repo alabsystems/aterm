@@ -19,8 +19,9 @@ use super::read::{
     Access, AccountWord, AgentSeen, Answer, Answered, Harness, Latest, Limits, Load, Look,
     MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
 };
-use crate::alab::journal::event::{Event, SIGNIN_IN};
+use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
+use crate::alab::sighted::{Obs, ObsState};
 use crate::alab::view::{Account, LabView, Machine, MachineNickname, Preference};
 use crate::typed::keys;
 use aterm_digest::Sha256;
@@ -53,6 +54,9 @@ pub const AGENTS: usize = 150;
 pub const AGENTS_UNRESOLVED: usize = 6;
 /// The label of the one machine that answers and that the registry does not name.
 pub const UNREGISTERED_LABEL: &str = "m300";
+/// The Commons uuid of a Mac no machine row binds (a retired one), whose first 8 digits, the
+/// name a fact gives such a Mac, are all decimal: a name that reads as a number.
+pub const RETIRED_UUID: &str = "13000000a1b2c3d4e5f60718293a4b5c";
 
 /// The dev seam that holds the fleet tables to this fixture's lab in place of this Mac's: debug
 /// and dev-seams builds only, for `lab instance` and the galleries, which hold no registry and
@@ -316,8 +320,14 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 login: Some(address.clone()),
                 identity: None,
                 status: Some(status.to_owned()),
+                // The registry states a plan, by its plan row's key, for the active accounts
+                // alone, as a person kept it.
                 plan: (status == "active")
-                    .then(|| if i % 3 == 0 { "max" } else { "pro" }.to_owned()),
+                    .then(|| keys::provider_of_realm(realm))
+                    .flatten()
+                    .map(|provider| {
+                        format!("{provider}-{}", if i % 3 == 0 { "max" } else { "pro" })
+                    }),
                 region: None,
                 flow: None,
                 browser: None,
@@ -378,6 +388,51 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 "w": "7d", "u": now_s + 7_200,
             }));
         }
+        // Two readings in five carry the plan the CLI reported: for some accounts the registry
+        // states none, for some the one it states, for some another.
+        if r % 5 < 2 {
+            log(json!({
+                "a": account.pk.as_str(), "c": cli, "k": "plan-seen", "src": "cli-output",
+                "t": t, "plan": if r % 2 == 0 { "max" } else { "pro" },
+            }));
+        }
+        // One account in three runs in a tab on its Mac, sighted twenty minutes ago; for some
+        // of them no Mac states a sign-in word, so the sighting is all that was observed.
+        if r % 3 == 0 {
+            log(json!({
+                "a": account.pk.as_str(), "c": cli, "k": "seen", "src": "profile",
+                "t": now_s.saturating_sub(1_200 + span(r) * 30), "x": format!("{r:08x}"),
+            }));
+        }
+        // One in seven was found by another Mac's sweep days ago: a login place and no tab.
+        if r % 7 == 3 {
+            let other = &bound[(r + 1) % bound.len()];
+            if let Some(event) = Event::from_value(&json!({
+                "a": account.pk.as_str(), "c": cli, "k": "seen", "src": "profile",
+                "t": now_s.saturating_sub(3 * 86_400 + span(r) * 600),
+            })) {
+                events.push((other.hex.clone(), event));
+            }
+        }
+        // One in eleven was found, nine days ago, by the sweep of a Mac retired since.
+        if r % 11 == 5
+            && let Some(event) = Event::from_value(&json!({
+                "a": account.pk.as_str(), "c": cli, "k": "seen", "src": "profile",
+                "t": now_s.saturating_sub(9 * 86_400 + span(r) * 600),
+            }))
+        {
+            events.push((RETIRED_UUID.to_owned(), event));
+        }
+        // One in ten has a registry row from a third Mac that says two tabs run it.
+        if r % 10 == 7 {
+            lab.account_obs.push(Obs {
+                account: account.pk.clone(),
+                uuid: bound[(r + 2) % bound.len()].hex.clone(),
+                at_ms: now_ms.saturating_sub(900_000),
+                state: ObsState::Running,
+                tabs: 2,
+            });
+        }
         seen_rows.push((r, i));
     }
     let mut seen = Seen::of_events(&events, now_s);
@@ -394,6 +449,17 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 SignedIn {
                     state: SIGNIN_IN,
                     t: now_s.saturating_sub(86_400),
+                    cli: harness_of(account.realm, 0).0.word().to_owned(),
+                },
+            );
+        }
+        // One account in eight was signed in on its Mac and is not now: its login ended.
+        if r % 8 == 2 {
+            seen.signins.entry(account.pk.clone()).or_default().insert(
+                by.hex.clone(),
+                SignedIn {
+                    state: SIGNIN_ENDED,
+                    t: now_s.saturating_sub(43_200),
                     cli: harness_of(account.realm, 0).0.word().to_owned(),
                 },
             );

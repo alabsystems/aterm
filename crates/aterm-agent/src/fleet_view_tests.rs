@@ -179,6 +179,242 @@ fn proved_surveys_supply_current_metrics_without_relabelling_unknown_seats() {
     assert_eq!(json["seats"][0]["sessions"], Value::Null);
 }
 
+/// THE FLEET VIEW PRINTS EACH SEAT'S TOTAL, FREE AND BUILD BYTES: a member whose survey says its
+/// home volume's size, free space and build output shows them under TOTAL_MB, FREE_MB and
+/// BUILD_MB, the build output with `+` where its sizing was cut short and that sizing's age at
+/// the member's answer, told on the member's own clock: `(2 h)` whether that clock runs 3 h
+/// behind this Mac's or 3 h ahead, `(0 s)` for a sizing that clock puts after the answer, and no
+/// age from an answer that says no time. `aterm fleet --json` gives each figure under its key,
+/// with the answer's own time (`said_at_ms`). A survey from an aterm older than the keys shows
+/// `-` and null for each, never 0; a measured 0 is `0`; a seat with no survey shows `-`.
+/// NEGATIVE CONTROL: with the total cell read from the free space, TOTAL_MB says 128000; with
+/// the partial word dropped, BUILD_MB says `84992 (2 h)`; with the age told on this Mac's clock
+/// (the observation's `at_ms`), the member 3 h behind says `(5 h)` and the one 3 h ahead `(0 s)`;
+/// with an unknown figure written through `unwrap_or(0)`, the older survey's TOTAL_MB says 0 and
+/// its JSON 0.
+#[test]
+fn the_fleet_view_prints_each_seats_total_free_and_build_bytes() {
+    // The member's clock runs 3 h behind this Mac's, and it sized its build output 2 h before it
+    // answered.
+    const SAID_AT: u64 = NOW - 10_800_000;
+    const SIZED_AT: u64 = SAID_AT - 7_200_000;
+    let surveyed = |tokens: &str| {
+        let (fleet, book, mut read) = survey_fixture();
+        let lines = read.peers[0].answer.as_mut().expect("the fixture's answer");
+        let with = lines[0].replacen(
+            " home_free_mb=128000 ",
+            &format!(" home_free_mb=128000{tokens} "),
+            1,
+        );
+        assert_ne!(with, lines[0], "{tokens}");
+        lines[0] = with;
+        observe(fleet, &book, Ok(&read), NOW, true)
+    };
+    // The cell of `label`'s row under `column`, placed by the head's own columns.
+    let cell = |text: &str, label: &str, column: &str| -> String {
+        let head = text
+            .lines()
+            .find(|line| line.starts_with("LABEL "))
+            .expect("the head");
+        let row = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{label} ")))
+            .unwrap_or_else(|| panic!("{label}'s row: {text}"));
+        let from = head
+            .find(&format!("  {column} "))
+            .unwrap_or_else(|| panic!("{column}: {head}"))
+            + 2;
+        let named = from + column.len();
+        let to = head[named..]
+            .find(|c: char| c != ' ')
+            .map_or(head.len(), |gap| named + gap);
+        row.get(from..to.min(row.len()))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+
+    // m5's BUILD_MB cell where its answer's header adds `tokens`.
+    let build_cell = |tokens: &str| cell(&render(&surveyed(tokens), Some(NOW)), "m5", "BUILD_MB");
+
+    let fleet = surveyed(&format!(
+        " at_ms={SAID_AT} home_total_mb=953000 home_build_mb=84992 \
+         home_build_at_ms={SIZED_AT} home_build_partial=1"
+    ));
+    let text = render(&fleet, Some(NOW));
+    assert_eq!(
+        ["TOTAL_MB", "FREE_MB", "BUILD_MB"].map(|column| cell(&text, "m5", column)),
+        ["953000", "128000", "84992+ (2 h)"],
+        "{text}"
+    );
+    assert_eq!(
+        ["TOTAL_MB", "FREE_MB", "BUILD_MB"].map(|column| cell(&text, "m1", column)),
+        ["-", "-", "-"],
+        "a seat with no survey: {text}"
+    );
+    let json = to_json(&fleet);
+    let row = &json["seats"][4];
+    assert_eq!(row["label"], Value::from("m5"));
+    assert_eq!(row["observed_at_ms"], Value::from(NOW));
+    assert_eq!(row["said_at_ms"], Value::from(SAID_AT));
+    assert_eq!(row["home_total_mb"], Value::from(953_000_u64));
+    assert_eq!(row["home_free_mb"], Value::from(128_000_u64));
+    assert_eq!(row["home_build_mb"], Value::from(84_992_u64));
+    assert_eq!(row["home_build_at_ms"], Value::from(SIZED_AT));
+    assert_eq!(row["home_build_partial"], Value::from(true));
+
+    // A member 3 h ahead of this Mac: the same age, on its own clock.
+    let ahead = NOW + 10_800_000;
+    assert_eq!(
+        build_cell(&format!(
+            " at_ms={ahead} home_build_mb=84992 home_build_at_ms={} home_build_partial=1",
+            ahead - 7_200_000
+        )),
+        "84992+ (2 h)"
+    );
+    // A sizing its own clock puts after its answer (a clock set back since): 0 s, never
+    // negative.
+    assert_eq!(
+        build_cell(&format!(
+            " at_ms={SAID_AT} home_build_mb=84992 home_build_at_ms={} home_build_partial=1",
+            SAID_AT + 5_000
+        )),
+        "84992+ (0 s)"
+    );
+    // An answer that says no time: the figure, and no age told on another clock.
+    let untimed = format!(" home_build_mb=84992 home_build_at_ms={SIZED_AT} home_build_partial=1");
+    assert_eq!(build_cell(&untimed), "84992+");
+    assert_eq!(
+        to_json(&surveyed(&untimed))["seats"][4]["said_at_ms"],
+        Value::Null
+    );
+
+    // An aterm older than the keys: unknown, never 0.
+    let (fleet, book, read) = survey_fixture();
+    let fleet = observe(fleet, &book, Ok(&read), NOW, true);
+    let text = render(&fleet, Some(NOW));
+    assert_eq!(
+        ["TOTAL_MB", "FREE_MB", "BUILD_MB"].map(|column| cell(&text, "m5", column)),
+        ["-", "128000", "-"],
+        "{text}"
+    );
+    let json = to_json(&fleet);
+    let row = &json["seats"][4];
+    for key in [
+        "home_total_mb",
+        "home_build_mb",
+        "home_build_at_ms",
+        "home_build_partial",
+    ] {
+        assert_eq!(row[key], Value::Null, "{key}");
+    }
+    assert_eq!(row["home_free_mb"], Value::from(128_000_u64));
+
+    // A measured 0, from a sizing that ran whole.
+    let fleet = surveyed(&format!(
+        " at_ms={SAID_AT} home_total_mb=953000 home_build_mb=0 home_build_at_ms={SIZED_AT} \
+         home_build_partial=0"
+    ));
+    assert_eq!(
+        cell(&render(&fleet, Some(NOW)), "m5", "BUILD_MB"),
+        "0 (2 h)"
+    );
+    let json = to_json(&fleet);
+    assert_eq!(json["seats"][4]["home_build_mb"], Value::from(0_u64));
+    assert_eq!(json["seats"][4]["home_build_partial"], Value::from(false));
+}
+
+/// THE FLEET VIEW NAMES EACH SEAT'S FULLEST STORE: a member whose survey says which of the
+/// stores aterm keeps there is nearest the bound it refuses writes at shows that store's fixed
+/// word and its share under STORE, between BUILD_MB and SESSIONS, and `aterm fleet --json`
+/// gives them as `store_worst` and `store_worst_pct`. A survey that says none (an aterm older
+/// than the keys, or no such store sized) and a seat with no survey show `-` and null, never 0%.
+/// NEGATIVE CONTROL: with the cell left out of the row, the head has no STORE column and a Mac
+/// whose vault log is at 83 % of its bound reads like every other in `aterm fleet`.
+#[test]
+fn the_fleet_view_names_each_seats_fullest_store_and_its_share() {
+    let surveyed = |tokens: &str| {
+        let (fleet, book, mut read) = survey_fixture();
+        let lines = read.peers[0].answer.as_mut().expect("the fixture's answer");
+        let with = lines[0].replacen(
+            " home_free_mb=128000 ",
+            &format!(" home_free_mb=128000{tokens} "),
+            1,
+        );
+        assert_ne!(with, lines[0], "{tokens}");
+        lines[0] = with;
+        observe(fleet, &book, Ok(&read), NOW, true)
+    };
+    // The words of `label`'s row between the head's STORE and SESSIONS columns.
+    let store_cell = |text: &str, label: &str| -> String {
+        let head = text
+            .lines()
+            .find(|line| line.starts_with("LABEL "))
+            .expect("the head");
+        let row = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{label} ")))
+            .unwrap_or_else(|| panic!("{label}'s row: {text}"));
+        let from = head.find("  STORE ").expect("the STORE column") + 2;
+        let to = head.find("  SESSIONS").expect("the SESSIONS column");
+        assert!(head.find("  BUILD_MB ").is_some_and(|build| build < from));
+        row.get(from..to.min(row.len()))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let fleet = surveyed(" store_worst=vault-records store_worst_pct=83");
+    let text = render(&fleet, Some(NOW));
+    assert_eq!(store_cell(&text, "m5"), "vault-records 83%", "{text}");
+    assert_eq!(
+        store_cell(&text, "m1"),
+        "-",
+        "a seat with no survey: {text}"
+    );
+    let json = to_json(&fleet);
+    assert_eq!(json["seats"][4]["label"], Value::from("m5"));
+    assert_eq!(
+        json["seats"][4]["store_worst"],
+        Value::from("vault-records")
+    );
+    assert_eq!(json["seats"][4]["store_worst_pct"], Value::from(83_u64));
+    assert_eq!(json["seats"][0]["store_worst"], Value::Null);
+
+    // A store past its bound says so, and a measured 0 is 0.
+    for (pct, said) in [(104_u64, "journal-outbox 104%"), (0, "journal-outbox 0%")] {
+        let fleet = surveyed(&format!(
+            " store_worst=journal-outbox store_worst_pct={pct}"
+        ));
+        assert_eq!(store_cell(&render(&fleet, Some(NOW)), "m5"), said);
+        assert_eq!(
+            to_json(&fleet)["seats"][4]["store_worst_pct"],
+            Value::from(pct)
+        );
+    }
+    // None said, one key alone, or a name that is no fixed word: unknown, never 0%.
+    for tokens in [
+        "",
+        " store_worst=- store_worst_pct=-",
+        " store_worst=vault-records",
+        " store_worst=a%40b.example store_worst_pct=83",
+    ] {
+        let fleet = if tokens.is_empty() {
+            let (fleet, book, read) = survey_fixture();
+            observe(fleet, &book, Ok(&read), NOW, true)
+        } else {
+            surveyed(tokens)
+        };
+        assert_eq!(
+            store_cell(&render(&fleet, Some(NOW)), "m5"),
+            "-",
+            "{tokens}"
+        );
+        let json = to_json(&fleet);
+        assert_eq!(json["seats"][4]["store_worst"], Value::Null, "{tokens}");
+        assert_eq!(json["seats"][4]["store_worst_pct"], Value::Null, "{tokens}");
+    }
+}
+
 #[test]
 fn surveys_require_full_bound_keys_consistent_nodes_and_complete_facts() {
     for fault in [

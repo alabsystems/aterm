@@ -14,7 +14,7 @@ use crate::{
     Result,
     control::{Endpoint, Failure, Repair, Side},
 };
-use aterm_net::lan::{Cancellation, Connection, Heard, Listener, Multicast, Scope};
+use aterm_net::lan::{Cancellation, Connection, Heard, Multicast, RecheckedListener, Scope};
 use aterm_secrets::commons::hearing::Said;
 use aterm_uds::ready::Doorbell;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -340,7 +340,11 @@ pub(crate) fn test_worker(
 
 struct Link {
     source: IpAddr,
-    listener: Option<Listener>,
+    /// Bound for an owner that waits on no change of route or interface
+    /// ([`RecheckedListener`]): each turn rechecks it ([`Transport::turn`]), and the serving loop
+    /// waits on none ([`Transport::waits_on`]), so it opens no routing socket that nobody here
+    /// would read.
+    listener: Option<RecheckedListener>,
     hints: Multicast,
     /// An isolated attachment's stand-in for a network that delivers this link's sends (tests):
     /// while it reads false, its beacon fails as a send to an unreachable network does
@@ -733,7 +737,7 @@ impl Transport {
             {
                 None
             } else {
-                match Listener::bind(*address, self.scope) {
+                match RecheckedListener::bind(*address, self.scope) {
                     Ok(listener) => Some(listener),
                     Err(error) => {
                         self.fail_link(address.ip(), "listener bind", error);
@@ -1052,8 +1056,10 @@ impl Transport {
     /// its incoming rounds leave room for one more, as [`Self::turn`] accepts only then (a
     /// connection it cannot take yet waits for a round's end, which rings). No multicast socket
     /// is among them: a beacon wakes nothing, and waits in its socket for the next hearing turn
-    /// ([`Self::turn`]), the loop's polled round (`super::POLL`) at the latest. `None` without a
-    /// doorbell: nothing would wake the loop for a round's end, so it keeps its tick.
+    /// ([`Self::turn`]), the loop's polled round (`super::POLL`) at the latest. Nor is any change
+    /// of route or interface: the listeners open none to wait on ([`Link::listener`]), and each
+    /// turn rechecks them. `None` without a doorbell: nothing would wake the loop for a round's
+    /// end, so it keeps its tick.
     pub(super) fn waits_on(&self) -> Option<Vec<BorrowedFd<'_>>> {
         let bell = self.doorbell.as_ref()?;
         let accepts = self.endpoint.is_some()

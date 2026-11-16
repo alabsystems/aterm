@@ -2011,9 +2011,10 @@ impl App {
     /// Paint the open menu into `wid`'s frame scratch, or close it if its anchor or focus moved.
     pub(crate) fn splice_autopilot_menu(&mut self, wid: WindowId) {
         let rect = self.paint_autopilot_menu(wid);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if let Some(rect) = rect {
             ws.pet_chrome
                 .note_overlay(rect.row, rect.col, rect.h, rect.w);
@@ -2106,7 +2107,8 @@ impl App {
         });
         // The frame's cell, as the pointer's: the laid grid's where there is one.
         let cell = laid.map_or((cw, ch), |grid| grid.cell());
-        let ws = self.windows.get_mut(&wid)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid)?;
+        let ws = &mut **route_guard_ws;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
         // Outside the frame's rounded corners the pane's own ground shows.
         let mut painted = painted;

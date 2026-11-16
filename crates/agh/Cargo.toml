@@ -45,6 +45,9 @@ aterm-uds = { workspace = true }
 # dirs (config, state, home), channel::PUBLIC_OWNER (the release floor), rfc3339.
 aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
+# The object-id shape a landing trailer's commits take (`object_id`), which `git::advertised_refs`
+# holds each advertised ref's object id to. Std only.
+aterm-land-trailer = { workspace = true }
 # THE effect seam (`fx`): every clock read, sleep, GitHub round trip and stdout write crosses
 # its EffectSeam, so a run is taped (--record) and replayed offline (--replay); design §21.
 # Zero dependencies; a path dependency, as aterm-agent's astream crates are.

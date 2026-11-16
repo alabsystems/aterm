@@ -414,6 +414,7 @@ fn alab_holder_hint(seq: u64, label: &str) -> crate::discover::DiscoveredVault {
             seq,
             head: [0x11; 32],
             label: Some(label.to_owned()),
+            rec: None,
         }),
     }
 }
@@ -1121,6 +1122,7 @@ fn dead_source() -> DeadSource {
             seq,
             head: [0xab; 32],
             label: None,
+            rec: None,
         })
     };
     DeadSource {
@@ -2739,6 +2741,7 @@ fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
             seq: 3,
             head: [0x22; 32],
             label: Some("m5".to_owned()),
+            rec: None,
         }),
     }];
     assert_eq!(s1.pull_from_peers(&browsed), 1);
@@ -3145,6 +3148,7 @@ fn a_server_never_stores_an_envelope_the_pin_refuses() {
             seq: 9,
             head: [0xee; 32],
             label: Some("m99".to_owned()),
+            rec: None,
         }),
     }];
     assert_eq!(s_honest.pull_from_peers(&forger_peer), 0);
@@ -4564,9 +4568,9 @@ fn unequal_partition_recovers(reader: PartitionReader) {
     ));
     assert_eq!(load_state(&b3).unwrap().membership, Stored::In);
     for host in [&b1, &b2, &b3] {
-        assert_eq!(crate::client::stored(&host, "f8-a-1").unwrap(), b"from-a-1");
-        assert_eq!(crate::client::stored(&host, "f8-a-2").unwrap(), b"from-a-2");
-        assert_eq!(crate::client::stored(&host, "f8-b-1").unwrap(), b"from-b-1");
+        assert_eq!(crate::client::stored(host, "f8-a-1").unwrap(), b"from-a-1");
+        assert_eq!(crate::client::stored(host, "f8-a-2").unwrap(), b"from-a-2");
+        assert_eq!(crate::client::stored(host, "f8-b-1").unwrap(), b"from-b-1");
     }
 
     s1.stop();
@@ -4885,6 +4889,97 @@ fn merge_diverged_heads_cascades_cross_branch_revoke_to_deny_lists_pool_and_leas
         "revoked holder's lease must be expired across branch merge"
     );
 
+    s1.stop();
+    s2.stop();
+}
+
+/// The vault text's 64 KiB door is not asked of a merge of heads. A fleet configuration value
+/// over it that one published head holds (an older build wrote it) and the other lacks is
+/// carried into the merged text as it is: no author changed it, and a merge that refused it
+/// would leave a lab with two heads and no way to publish over them.
+///
+/// CONTROL, in the test: the head the merge starts from lacks the entry, and an author's set
+/// of that value into its text is refused.
+#[test]
+fn vault_fill_door_carries_a_large_value_a_merged_head_holds() {
+    const NAME: &str = "lab-inventory.json";
+    // Every server it reads is its own on loopback, which answers.
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let s1 = start_loopback_server(&root.path().join("s1"));
+    let s2 = start_loopback_server(&root.path().join("s2"));
+    let url1 = format!("http://{}/v1/{}", s1.addr, crate::ALAB_VAULT);
+    let url2 = format!("http://{}/v1/{}", s2.addr, crate::ALAB_VAULT);
+    let st1 = Paths::for_home(&root.path().join("st1"));
+    let st2 = Paths::for_home(&root.path().join("st2"));
+    test_create_unbound(&st1, &url1, None, Some("m1")).expect("create alab vault");
+    let st2_rec = machine_identity(&st2).unwrap().recipient().to_bech32();
+    {
+        let opened = admin_open(&st1).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.add_machine("m2", &st2_rec).unwrap();
+        doc.add_admin("m2").unwrap();
+        admin_publish(&st1, &opened, &doc).unwrap();
+    }
+    let pre_split = std::fs::read(st1.cache_file()).unwrap();
+    transport::publish(&Source::Url(url2.clone()), &pre_split).unwrap();
+    let pin = config(&st1).unwrap().unwrap().signer.unwrap();
+    join_host(
+        &st2,
+        &format!("{url2}#{}", crate::b64::encode_padded(&pin)),
+        "m2",
+    );
+
+    // Island 1 (s1, higher seq): two small edits.
+    for round in 0..2_u8 {
+        let a1 = admin_open(&st1).unwrap();
+        let mut d1 = a1.doc.clone();
+        d1.set_entry(&Audience::Everyone, "note", &[b'a' + round])
+            .unwrap();
+        admin_publish(&st1, &a1, &d1).unwrap();
+    }
+    // Island 2 (s2, lower seq): the large value, as a build before the door published it.
+    let large = vec![b'L'; 300 * 1024];
+    {
+        let a2 = admin_open(&st2).unwrap();
+        let mut d2 = a2.doc.clone();
+        d2.hold_entry_with(&Audience::Everyone, NAME, &large, false, None)
+            .unwrap();
+        admin_publish(&st2, &a2, &d2).unwrap();
+    }
+
+    let heads = read_server_heads(&st1, &[url1, url2]).unwrap();
+    assert_eq!(heads.len(), 2);
+    let lacks: Vec<&ObservedHead> = heads
+        .iter()
+        .filter(|head| head.doc.entry(&Audience::Everyone, NAME).is_none())
+        .collect();
+    assert_eq!(lacks.len(), 1, "CONTROL: one head lacks the entry");
+    assert!(
+        lacks[0]
+            .doc
+            .clone()
+            .set_entry(&Audience::Everyone, NAME, &large)
+            .is_err(),
+        "CONTROL: an author's set of it is refused"
+    );
+    let merged = merge_diverged_heads(&heads).expect("the merge carries what a head holds");
+    assert_eq!(
+        merged
+            .doc
+            .entry(&Audience::Everyone, NAME)
+            .map(|entry| entry.value.as_slice()),
+        Some(large.as_slice()),
+        "the merged text holds the large value"
+    );
+    assert_eq!(
+        merged
+            .doc
+            .entry(&Audience::Everyone, "note")
+            .map(|entry| entry.value.as_slice()),
+        Some(b"b".as_slice()),
+        "beside the other head's edit"
+    );
     s1.stop();
     s2.stop();
 }

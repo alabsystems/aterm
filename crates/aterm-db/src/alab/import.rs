@@ -786,6 +786,17 @@ pub struct Planned {
     pub step: Step,
 }
 
+/// The collection a plan writes `column` through, of `newest` (the planner's, the registry's
+/// newest) and `form` (the generation planned against's): the generation's own where it holds
+/// the column as a list or a set, a form a generation sets apart (LT-15B), and otherwise the
+/// newest, whose values [`lower`] turns into a sealed generation's form.
+fn writing<'c>(form: &'c Collection, newest: &'c Collection, column: &str) -> &'c Collection {
+    let collection_form = form
+        .column(column)
+        .is_some_and(|c| matches!(c.ty, crate::typed::Ty::List(..) | crate::typed::Ty::Set(_)));
+    if collection_form { form } else { newest }
+}
+
 /// What the import would write.
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
@@ -800,6 +811,23 @@ pub struct Plan {
     pub findings: Vec<Finding>,
     pub counts: BTreeMap<&'static str, Count>,
     pub planned: Vec<Planned>,
+    /// The generation planned against, whose collections type `planned`'s values; `None` only
+    /// for a plan no planner made.
+    pub table: Option<&'static Table>,
+}
+
+impl Plan {
+    /// The type of `collection.column` as `planned` holds its values ([`writing`]).
+    #[must_use]
+    pub fn ty(&self, collection: &str, column: &str) -> Option<crate::typed::Ty> {
+        let newest = super::registry::GENERATIONS[super::registry::GENERATIONS.len() - 1]
+            .collection(collection)?;
+        let form = self
+            .table
+            .and_then(|table| table.collection(collection))
+            .unwrap_or(newest);
+        writing(form, newest, column).column(column).map(|c| c.ty)
+    }
 }
 
 /// Which machines that no row answers a plan births a row for. The roster an import reads is
@@ -1188,7 +1216,9 @@ struct SecretWant {
 struct RowWant {
     values: BTreeMap<&'static str, Want>,
     secrets: BTreeMap<&'static str, SecretWant>,
-    elements: BTreeMap<&'static str, BTreeMap<String, Coord>>,
+    /// Set members by column and element key: `true` for a set of words or keys, the member's
+    /// text for a text set ([`cell::element`]).
+    elements: BTreeMap<&'static str, BTreeMap<String, (Value, Coord)>>,
     /// The coordinate that created the row: its `src`, and its writes' source.
     src: Option<Coord>,
     notes: Vec<Coord>,
@@ -1196,6 +1226,9 @@ struct RowWant {
 
 struct Planner<'a> {
     input: &'a Input<'a>,
+    /// The generation planned against: each collection's columns, and the version a write
+    /// stamps, as that generation declares them ([`Planner::form`]).
+    table: &'static Table,
     /// The generation planned against, where it holds its secrets and numbers sealed.
     sealed: Option<Sealed<'a>>,
     /// Whether a phone row's sealed number did not open here ([`lifted`]): whether the registry
@@ -1383,7 +1416,16 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
 pub fn plan(input: &Input<'_>, view: &crate::att::View) -> Result<Plan> {
-    plan_with(input, None, false, |collection| view.project(collection))
+    plan_with(input, generation(view), None, false, |collection| {
+        view.project(collection)
+    })
+}
+
+/// The generation `view` read, which a plan against it writes: the newest where the view names
+/// none (one a test built by hand).
+fn generation(view: &crate::att::View) -> &'static Table {
+    view.table
+        .unwrap_or(super::registry::GENERATIONS[super::registry::GENERATIONS.len() - 1])
 }
 
 /// [`plan`] over a generation that holds its secrets and phone numbers as sealed tokens
@@ -1397,13 +1439,19 @@ pub fn plan(input: &Input<'_>, view: &crate::att::View) -> Result<Plan> {
 /// does not open with the key this Mac holds; or a number cannot be sealed.
 pub fn plan_sealed(input: &Input<'_>, view: &crate::att::View, sealed: Sealed<'_>) -> Result<Plan> {
     let (phones, unopened) = lifted(&view.cells, sealed);
-    let mut plan = plan_with(input, Some(sealed), unopened, |collection| {
-        if collection.name == PHONE.name {
-            cell::project(collection, &phones)
-        } else {
-            view.project(collection)
-        }
-    })?;
+    let mut plan = plan_with(
+        input,
+        generation(view),
+        Some(sealed),
+        unopened,
+        |collection| {
+            if collection.name == PHONE.name {
+                cell::project(collection, &phones)
+            } else {
+                view.project(collection)
+            }
+        },
+    )?;
     lower(&mut plan, sealed)?;
     Ok(plan)
 }
@@ -1502,11 +1550,15 @@ fn lower(plan: &mut Plan, sealed: Sealed<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Plan a diagnostic preview where no registry is held; this never authorizes a write. `sealed`
-/// is the generation the plan would be written into where that one holds sealed tokens, with a
-/// sealer that seals nothing; `None` plans against the store.
-pub(crate) fn plan_unheld(input: &Input<'_>, sealed: Option<Sealed<'_>>) -> Result<Plan> {
-    let mut plan = plan_with(input, sealed, false, |collection| {
+/// Plan a diagnostic preview where no registry is held; this never authorizes a write. `table`
+/// is the generation the plan would be written into, and `sealed` names it with a sealer that
+/// seals nothing where it holds sealed tokens; `None` plans against the store.
+pub(crate) fn plan_unheld(
+    input: &Input<'_>,
+    table: &'static Table,
+    sealed: Option<Sealed<'_>>,
+) -> Result<Plan> {
+    let mut plan = plan_with(input, table, sealed, false, |collection| {
         cell::project(collection, &Cells::new())
     })?;
     if let Some(sealed) = sealed {
@@ -1517,13 +1569,27 @@ pub(crate) fn plan_unheld(input: &Input<'_>, sealed: Option<Sealed<'_>>) -> Resu
 
 #[cfg(test)]
 pub(crate) fn plan_cells(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
-    plan_with(input, None, false, |collection| {
-        cell::project(collection, cells)
+    plan_cells_at(input, &super::registry::REGISTRY_4, cells)
+}
+
+/// [`plan_cells`] against the generation `table`, `cells` read as that generation holds them.
+#[cfg(test)]
+pub(crate) fn plan_cells_at(
+    input: &Input<'_>,
+    table: &'static Table,
+    cells: &Cells,
+) -> Result<Plan> {
+    plan_with(input, table, None, false, |collection| {
+        cell::project(
+            table.collection(collection.name).unwrap_or(collection),
+            cells,
+        )
     })
 }
 
 fn plan_with(
     input: &Input<'_>,
+    table: &'static Table,
     sealed: Option<Sealed<'_>>,
     unopened_numbers: bool,
     mut project: impl FnMut(&'static Collection) -> Projection,
@@ -1542,7 +1608,7 @@ fn plan_with(
     .collect();
     let mut names_reached = BTreeMap::new();
     loop {
-        let mut planner = Planner::new(input, current.clone(), names_reached);
+        let mut planner = Planner::new(input, table, current.clone(), names_reached);
         planner.sealed = sealed;
         planner.unopened_numbers = unopened_numbers;
         let mut order: Vec<usize> = (0..input.sheets.len()).collect();
@@ -1568,12 +1634,14 @@ fn plan_with(
 impl<'a> Planner<'a> {
     fn new(
         input: &'a Input<'a>,
+        table: &'static Table,
         current: BTreeMap<&'static str, Projection>,
         names_reached: BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
         let address_index = AddressIndex::of(&current[ADDRESS.name]);
         Self {
             input,
+            table,
             sealed: None,
             unopened_numbers: false,
             current,
@@ -1685,6 +1753,7 @@ impl Planner<'_> {
         }
     }
 
+    /// Want the word or key `elem` a member of the set `collection.pk.col`, from `at`.
     fn element(
         &mut self,
         collection: &'static Collection,
@@ -1693,14 +1762,91 @@ impl Planner<'_> {
         elem: &str,
         at: &Coord,
     ) {
-        let elements = self
-            .row(collection, pk, at)
+        self.member(collection, pk, col, elem.to_owned(), Value::Bool(true), at);
+    }
+
+    fn member(
+        &mut self,
+        collection: &'static Collection,
+        pk: &str,
+        col: &'static str,
+        elem: String,
+        x: Value,
+        at: &Coord,
+    ) {
+        self.row(collection, pk, at)
             .elements
             .entry(col)
-            .or_default();
-        if !elements.contains_key(elem) {
-            elements.insert(elem.to_owned(), at.clone());
+            .or_default()
+            .entry(elem)
+            .or_insert_with(|| (x, at.clone()));
+    }
+
+    /// `collection` as the generation planned against declares it.
+    fn form(&self, collection: &'static Collection) -> &'static Collection {
+        self.table.collection(collection.name).unwrap_or(collection)
+    }
+
+    /// Whether the generation planned against holds `collection.col` as a text set (LT-15B).
+    fn text_set(&self, collection: &'static Collection, col: &str) -> bool {
+        self.form(collection)
+            .column(col)
+            .is_some_and(|column| column.ty.text_set().is_some())
+    }
+
+    /// Want `texts` in the free-text column `collection.pk.col` from `at`, as the generation
+    /// planned against holds that column: each text a member of its own in a text set, else the
+    /// column's one list, of which a text beyond the list's maximum is refused by coordinate.
+    /// A text no member can hold is refused the same way.
+    fn texts(
+        &mut self,
+        collection: &'static Collection,
+        pk: &str,
+        col: &'static str,
+        mut texts: Vec<String>,
+        at: &Coord,
+    ) {
+        let Some(column) = self.form(collection).column(col) else {
+            return;
+        };
+        if let crate::typed::Ty::List(_, max) = column.ty {
+            if texts.len() > max {
+                self.refused(collection, pk, col, at.clone());
+                texts.truncate(max);
+            }
+            self.want(collection, pk, col, json!(texts), at);
+            return;
         }
+        for text in &texts {
+            match cell::element(column, text) {
+                Ok((elem, x)) => self.member(collection, pk, col, elem, x, at),
+                Err(_) => self.refused(collection, pk, col, at.clone()),
+            }
+        }
+    }
+
+    /// The texts this plan wants in `collection.pk.col`, in either form.
+    fn wanted_texts(&self, collection: &'static str, pk: &str, col: &str) -> Vec<String> {
+        let Some(row) = self.row_get(collection, pk) else {
+            return Vec::new();
+        };
+        let mut texts: Vec<String> = row
+            .values
+            .get(col)
+            .and_then(|want| want.x.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        texts.extend(
+            row.elements
+                .get(col)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .filter_map(|(x, _)| x.as_str().map(str::to_owned)),
+        );
+        texts
     }
 
     fn note(&mut self, collection: &'static Collection, pk: &str, at: &Coord) {
@@ -3015,14 +3161,7 @@ impl Planner<'_> {
             if !extra_nick_aliases.is_empty()
                 && let Some(at) = nick_at
             {
-                extra_nick_aliases.truncate(8);
-                self.want(
-                    &MACHINE,
-                    &pk,
-                    "nickname_aliases",
-                    json!(extra_nick_aliases),
-                    &at,
-                );
+                self.texts(&MACHINE, &pk, "nickname_aliases", extra_nick_aliases, &at);
             }
             if let Some(col) = notes
                 && let Some(val) = cells.get(col).map(|c| c.trim()).filter(|c| !c.is_empty())
@@ -3224,6 +3363,7 @@ impl Planner<'_> {
     fn finish(self) -> Result<Plan> {
         let Self {
             input,
+            table,
             sealed,
             current,
             mut rows,
@@ -3241,6 +3381,7 @@ impl Planner<'_> {
         } = self;
         let mut plan = Plan {
             findings: findings.into_iter().collect(),
+            table: Some(table),
             ..Plan::default()
         };
         let collections = [&ADDRESS, &ACCOUNT, &MACHINE, &PREFERENCE, &MAILBOX, &PHONE];
@@ -3318,6 +3459,8 @@ impl Planner<'_> {
             let Some(collection) = collections.iter().copied().find(|c| c.name == name) else {
                 continue;
             };
+            // The collection as the generation planned against declares it.
+            let form = table.collection(name).unwrap_or(collection);
             for (pk, want) in table_rows {
                 let (row_sheet, row_source) = want
                     .src
@@ -3424,10 +3567,10 @@ impl Planner<'_> {
                         Decided::Write => {
                             count.cells += 1;
                             touched_rows.insert((cell_sheet, name, pk.clone()));
-                            let value =
-                                CellValue::imported(collection.version, x.clone(), cell_source);
+                            let writer = writing(form, collection, column);
+                            let value = CellValue::imported(writer.version, x.clone(), cell_source);
                             changes.push(cell::change(
-                                collection,
+                                writer,
                                 CellKey {
                                     pk,
                                     col: column,
@@ -3504,7 +3647,7 @@ impl Planner<'_> {
                     )?;
                 }
                 for (&column, elems) in &want.elements {
-                    for (elem, at) in elems {
+                    for (elem, (x, at)) in elems {
                         let field = current_row
                             .and_then(|r| r.fields.get(column))
                             .and_then(|f| match f {
@@ -3515,7 +3658,7 @@ impl Planner<'_> {
                             &mut changes,
                             column,
                             Some(elem),
-                            Value::Bool(true),
+                            x.clone(),
                             at.sheet,
                             &at.source,
                             field,
@@ -3711,6 +3854,58 @@ impl Planner<'_> {
                                                 Value::Bool(false),
                                             ));
                                         }
+                                    }
+                                }
+                            }
+                            // A text set's member an earlier import wrote that no source states
+                            // now. Where the source that wrote it restates the set this run without
+                            // it, its own earlier word goes (the source dropped the member); where
+                            // that source does not state the set, a member a replica's dump wrote is
+                            // reported and kept, as its list was, and any other stands: another
+                            // source's members never take one back.
+                            Field::Set(elements)
+                                if form
+                                    .column(column)
+                                    .is_some_and(|c| c.ty.text_set().is_some()) =>
+                            {
+                                let Some(set) = form.column(column) else {
+                                    continue;
+                                };
+                                let stated = want.elements.get(column.as_str());
+                                for (elem, field) in elements {
+                                    if !field.value().is_some_and(|x| cell::adds(set, elem, x))
+                                        || !retractable(field, sources, &read)
+                                        || stated.is_some_and(|elems| elems.contains_key(elem))
+                                    {
+                                        continue;
+                                    }
+                                    let Some((ret_sheet, ret_source)) = retract_source(field)
+                                    else {
+                                        continue;
+                                    };
+                                    let restated = stated.is_some_and(|elems| {
+                                        elems.values().any(|(_, at)| at.sheet == ret_sheet)
+                                    });
+                                    if restated && own(Some(field), ret_sheet) {
+                                        step(
+                                            &mut changes,
+                                            column,
+                                            Some(elem),
+                                            Value::Bool(false),
+                                            ret_sheet,
+                                            &ret_source,
+                                            Some(field),
+                                            &mut plan,
+                                        )?;
+                                    } else if restated
+                                        || (REPORT_VALUES.contains(&(name, column.as_str()))
+                                            && from_dump(field))
+                                    {
+                                        withdrawn.push((
+                                            ret_sheet,
+                                            format!("{column}.{elem}"),
+                                            Value::Bool(false),
+                                        ));
                                     }
                                 }
                             }

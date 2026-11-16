@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The main lane's append-only, compare-and-swap Git journal, which also files `verify land`'s
+//! The append-only, compare-and-swap Git journal the main lane's controllers filed their verdicts
+//! in (`verdicts/`; `verify watch` is now the follower, which posts a commit status and writes
+//! here no more, though a controller installed before it may), which also files `verify land`'s
 //! records under [`LAND`]: its per-check verdict records ([`crate::land_record`]) and, under
 //! [`RUNS`], its run records ([`crate::land_run`]), one store with a retention per kind. No
 //! verdict is a gate: nothing reads a land record to decide a landing yet, and nothing refuses a
@@ -127,9 +129,9 @@ fn capture_until(
     input: Option<&[u8]>,
     until: std::time::Instant,
 ) -> Result<std::process::Output, String> {
-    if std::time::Instant::now() >= until {
-        return Err("journal operation exhausted its deadline".into());
-    }
+    let started = std::time::Instant::now();
+    let remaining = until.saturating_duration_since(started);
+    let failure = |error: std::io::Error| capture_failure(error, started, remaining);
     #[cfg(unix)]
     if INTERRUPTIBLE.get() {
         let watch = aterm_toolchain::interrupt::Watch::enter();
@@ -140,7 +142,7 @@ fn capture_until(
             512 * 1024 * 1024,
             || watch.caught().is_some(),
         )
-        .map_err(|e| e.to_string())?
+        .map_err(failure)?
         .ok_or_else(|| "journal renewal interrupted by controller signal".into());
     }
     aterm_uds::deadline::output_with_input_until(
@@ -149,7 +151,25 @@ fn capture_until(
         until,
         512 * 1024 * 1024,
     )
-    .map_err(|e| e.to_string())
+    .map_err(failure)
+}
+
+fn capture_failure(
+    error: std::io::Error,
+    started: std::time::Instant,
+    remaining: std::time::Duration,
+) -> String {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        // This is the whole call, including retirement; the owned-input error retains the
+        // completion facts observed at the deadline before cleanup can change them.
+        format!(
+            "{error}; return_elapsed_ms={} inherited_remaining_ms={}",
+            started.elapsed().as_millis(),
+            remaining.as_millis(),
+        )
+    } else {
+        error.to_string()
+    }
 }
 
 pub fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<String, String> {
@@ -182,6 +202,32 @@ pub fn head(
     remote: &str,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
+    head_in(root, remote, until, ReadContext::Read)
+}
+
+#[derive(Clone, Copy)]
+enum ReadContext {
+    Read,
+    AppendHead,
+    AfterPushFailure,
+}
+
+impl ReadContext {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Read => "journal-read",
+            Self::AppendHead => "journal-append-head",
+            Self::AfterPushFailure => "journal-after-push-failure",
+        }
+    }
+}
+
+fn head_in(
+    root: &Path,
+    remote: &str,
+    until: std::time::Instant,
+    context: ReadContext,
+) -> Result<Option<String>, String> {
     let git = |root: &Path| command(root, &[]);
     let run = |tool, args: &[std::ffi::OsString]| {
         capture_until(
@@ -191,7 +237,17 @@ pub fn head(
         )
         .map_err(|why| format!("{tool:?} journal transport: {why}"))
     };
-    crate::remote::Remote::open(root, remote, &run)?.fetch(REF)
+    read_head(root, remote, context, &run)
+}
+
+fn read_head(
+    root: &Path,
+    remote: &str,
+    context: ReadContext,
+    run: &crate::remote::Runner<'_>,
+) -> Result<Option<String>, String> {
+    (|| crate::remote::Remote::open(root, remote, run)?.fetch(REF))()
+        .map_err(|why| format!("{}: {why}", context.word()))
 }
 
 pub fn records(
@@ -758,7 +814,8 @@ fn append_with(
 /// head, a normal fast-forward that is the compare-and-swap: the commit, or `None` where a
 /// competing append moved the journal first.
 /// # Errors
-/// A git step failed, or the push was refused while the journal stayed at `parent`.
+/// A local object or remote step failed, or the push was refused while the journal stayed at
+/// `parent`.
 fn publish(
     root: &Path,
     remote: &str,
@@ -767,28 +824,66 @@ fn publish(
     message: &str,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
+    let started = std::time::Instant::now();
+    let timed = |why| {
+        format!(
+            "{why}; journal_publish_elapsed_ms={}",
+            started.elapsed().as_millis()
+        )
+    };
     let mut commit = command(root, &["commit-tree", tree, "-m", message]);
     if let Some(parent) = parent {
         commit.args(["-p", parent]);
     }
-    let sha = output_until(&mut commit, None, until)?.trim().to_owned();
-    let pushed = capture_until(
-        &mut command(
-            root,
-            &["push", "--porcelain", remote, &format!("{sha}:{REF}")],
-        ),
-        None,
-        until,
-    )?;
-    if pushed.status.success() {
-        return Ok(Some(sha));
-    }
+    let sha = output_until(&mut commit, None, until)
+        .map_err(timed)?
+        .trim()
+        .to_owned();
+    let git = |root: &Path| command(root, &[]);
+    let run = |tool, args: &[std::ffi::OsString]| {
+        capture_until(
+            &mut crate::remote::command(root, &git, tool, args)?,
+            None,
+            until,
+        )
+        .map_err(|why| format!("{tool:?} journal transport: {why}"))
+    };
+    push_journal(root, remote, parent, &sha, &run).map_err(timed)
+}
+
+fn push_journal(
+    root: &Path,
+    name: &str,
+    parent: Option<&str>,
+    sha: &str,
+    run: &crate::remote::Runner<'_>,
+) -> Result<Option<String>, String> {
+    let context = |why| {
+        format!(
+            "{why}; journal_ref={REF} journal_before={} journal_after={sha}",
+            parent.unwrap_or("missing")
+        )
+    };
+    let remote = crate::remote::Remote::open(root, name, run).map_err(context)?;
+    let why = match remote.push(REF, parent, sha).map_err(context)? {
+        crate::remote::Pushed::Done => return Ok(Some(sha.to_owned())),
+        crate::remote::Pushed::Rejected(why) => why,
+        crate::remote::Pushed::Blocked { why, .. } | crate::remote::Pushed::Unsent(why) => {
+            return Err(context(why));
+        }
+    };
     // A race is retryable only when the remote actually moved. Authentication/network failures
     // remain errors, rather than turning into a tight retry loop.
-    if head(root, remote, until)?.as_deref() != parent {
+    let head = remote.fetch(REF).map_err(|read| {
+        context(format!(
+            "{why}; {}: {read}",
+            ReadContext::AfterPushFailure.word()
+        ))
+    })?;
+    if head.as_deref() != parent {
         return Ok(None);
     }
-    Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+    Err(context(why))
 }
 
 /// The directory of `verify land`'s verdict records ([`crate::land_record`]), beside `verdicts/`:
@@ -1239,12 +1334,27 @@ pub fn append_land(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
+    let started = std::time::Instant::now();
+    let mut attempt = 0_u64;
     loop {
-        let parent = head(root, remote, until)?;
+        attempt = attempt.saturating_add(1);
+        let attempt_started = std::time::Instant::now();
+        let parent = head_in(root, remote, until, ReadContext::AppendHead);
+        let head_ms = attempt_started.elapsed().as_millis();
+        let timed = |why| {
+            format!(
+                "{why}; journal_append_elapsed_ms={} journal_attempt={} \
+                 journal_attempt_elapsed_ms={} journal_head_elapsed_ms={head_ms}",
+                started.elapsed().as_millis(),
+                attempt,
+                attempt_started.elapsed().as_millis(),
+            )
+        };
+        let parent = parent.map_err(timed)?;
         if records.is_empty() {
             return Ok(parent);
         }
-        match land_append(root, remote, parent.as_deref(), records, now, until)? {
+        match land_append(root, remote, parent.as_deref(), records, now, until).map_err(timed)? {
             Appended::Holds(head) => return Ok(Some(head)),
             Appended::Raced => {}
         }

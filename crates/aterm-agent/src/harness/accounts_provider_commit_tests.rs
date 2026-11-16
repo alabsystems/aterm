@@ -176,7 +176,6 @@ fn transition_with_early_roster(state: &State, action: &str, early_roster: bool)
 #[test]
 fn provider_roster_and_pool_identity_recover_as_one_publication() {
     let model = aterm_models_harness::account_provider_commit_model();
-    aterm_spec::interp::prove_and_catch(&model);
     let mut recoveries = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

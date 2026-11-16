@@ -9,9 +9,10 @@ use astream_wire::summary::{MetricName, Summary, Window, WindowLen};
 
 use crate::merge::{Counters, OfferError, Offered, Replica, Snapshots, Usage};
 use crate::row::{
-    AGENTS_LISTED_MAX, AGY_GROUPS_MAX, ActivityRow, AgentEntry, AgyGroup, AgyRow, HeldEntry, Label,
-    ManagerEntry, NEEDS_MAX, NeedEntry, NeedsRow, PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row,
-    RowError, SignIn, TabId, UNREAD_MAX, UnreadRow, WindowRecord, Word,
+    AGENTS_LISTED_MAX, AGY_GROUPS_MAX, ActivityRow, AgentEntry, AgyGroup, AgyRow, HeldEntry,
+    LIFTS_MAX, Label, Lift, ManagerEntry, NEEDS_MAX, NeedEntry, NeedsRow, PCT_MAX, PlaceRow,
+    QUOTA_VERSION, QuotaRow, REMAINING_MAX, Row, RowError, SignIn, TabId, UNREAD_MAX, UnreadRow,
+    VERSION, WindowRecord, Word,
 };
 use crate::rules;
 use crate::subject::{
@@ -96,6 +97,7 @@ fn quota_row(at: u64, pct7: Option<u16>, week_reset: Option<u64>) -> QuotaRow {
         last_end: None,
         sessions_7d: 3,
         plan: Some(word("max")),
+        lifts: Vec::new(),
     }
 }
 
@@ -434,6 +436,18 @@ fn every_row() -> Vec<(Subject, Row)> {
     let n = node(9);
     let mut quota = quota_row(1_793_000_000, Some(64), Some(1_793_300_000));
     quota.five_hour_reset = Some(1_793_010_000);
+    quota.lifts = vec![
+        Lift {
+            window: word("five_hour"),
+            at: 1_792_999_000,
+            reset: Some(1_793_010_000),
+        },
+        Lift {
+            window: word("seven_day"),
+            at: 1_792_999_000,
+            reset: Some(1_793_300_000),
+        },
+    ];
     let mut bare = quota_row(5, None, None);
     bare.signin = None;
     bare.plan = None;
@@ -442,6 +456,11 @@ fn every_row() -> Vec<(Subject, Row)> {
     bare.pct5 = None;
     bare.walled_until = Some(u64::MAX);
     bare.cli = Cli::Kimi;
+    bare.lifts = vec![Lift {
+        window: word("seven_day"),
+        at: 4,
+        reset: None,
+    }];
     let agy = AgyRow {
         at: 1_793_000_100,
         home: HomeKey::Hashed(7),
@@ -538,12 +557,191 @@ fn every_row_reads_back_as_itself_at_its_subject() {
     }
 }
 
+/// A QUOTA ROW CARRIES ITS ACCOUNT'S LIFTS (FL-117) AND READS BACK WITH THEM: the newest of
+/// each window, each its window, when its proof was served and the reset the wall named, or none,
+/// in one spelling after the plan (a count, then each lift), under the quota row's own version 2.
+/// One read can lift the five-hour and the weekly wall at once, and both are carried, at one time.
+/// A row with no lift, and the row that ends an account, read back with none; a list past
+/// [`LIFTS_MAX`] is written to its bound.
+/// NEGATIVE CONTROL: the same value as a build before the lift wrote it (version 1, no lifts
+/// field) is refused, not read as a row with no lift; so is a lift cut short, a count past the
+/// bound, and a window outside the word grammar.
+#[test]
+fn a_quota_row_carries_a_lift_and_reads_back() {
+    let mut row = quota_row(300, Some(5), None);
+    let subject = row.subject(node(1)).expect("claude");
+    let without = row.encode();
+    assert_eq!(without.last(), Some(&0), "no lift: its count alone");
+    assert_eq!(
+        Row::decode_at(&subject, &without),
+        Ok(Row::Quota(row.clone()))
+    );
+    let lift = |window: &str, reset: Option<u64>| Lift {
+        window: word(window),
+        at: 290,
+        reset,
+    };
+    row.lifts = vec![lift("five_hour", Some(400)), lift("seven_day", Some(9_000))];
+    let bytes = row.encode();
+    assert_eq!(&bytes[..2], &[b'Q', QUOTA_VERSION]);
+    assert_eq!(QUOTA_VERSION, 2, "the quota row's version moved alone");
+    // After the plan: the count, then each lift's window, `at` (290 is [0xa2, 0x02]) and its
+    // reset's tag and value (400 is [0x90, 0x03], 9000 is [0xa8, 0x46]).
+    let head = without.len() - 1;
+    assert_eq!(
+        bytes[..head],
+        without[..head],
+        "the row before the lifts is as it was"
+    );
+    let tail = [
+        &[2, 9][..],
+        b"five_hour",
+        &[0xa2, 0x02, 1, 0x90, 0x03, 9],
+        b"seven_day",
+        &[0xa2, 0x02, 1, 0xa8, 0x46],
+    ]
+    .concat();
+    assert_eq!(&bytes[head..], &tail[..], "the lifts' one spelling");
+    assert_eq!(
+        Row::decode_at(&subject, &bytes),
+        Ok(Row::Quota(row.clone()))
+    );
+    let unnamed = QuotaRow {
+        lifts: vec![lift("seven_day", None)],
+        ..row.clone()
+    };
+    assert_eq!(QuotaRow::decode(&unnamed.encode()), Ok(unnamed.clone()));
+    let ended = unnamed.ended(301);
+    assert_eq!(ended.lifts, [], "an ended account's row lifts nothing");
+    assert_eq!(QuotaRow::decode(&ended.encode()), Ok(ended));
+    let many = QuotaRow {
+        lifts: (0..=LIFTS_MAX)
+            .map(|n| lift(&format!("w{n}"), None))
+            .collect(),
+        ..row.clone()
+    };
+    let read = QuotaRow::decode(&many.encode()).expect("a full list reads");
+    assert_eq!(
+        read.lifts[..],
+        many.lifts[..LIFTS_MAX],
+        "its first, to the bound"
+    );
+
+    // NEGATIVE CONTROL. A build before the lift wrote this value as `without` less its count,
+    // under version 1.
+    let mut older = without[..head].to_vec();
+    older[1] = 1;
+    assert_eq!(QuotaRow::decode(&older), Err(RowError::Version(1)));
+    for cut in [head + 1, head + 2, head + 13, bytes.len() - 1] {
+        assert_eq!(
+            QuotaRow::decode(&bytes[..cut]),
+            Err(RowError::Truncated),
+            "the lifts cut at {cut}"
+        );
+    }
+    let mut over = without.clone();
+    over[head] = u8::try_from(LIFTS_MAX + 1).expect("a small count");
+    assert_eq!(QuotaRow::decode(&over), Err(RowError::TooMany("lifts")));
+    let mut spoken = bytes.clone();
+    spoken[head + 2] = b'F';
+    assert_eq!(
+        QuotaRow::decode(&spoken),
+        Err(RowError::Text("a lift's window"))
+    );
+}
+
+/// A MIXED FLEET READS THIS MAC'S NEEDS AND ACTIVITY ROWS AS BEFORE: a version is per kind
+/// ([`crate::row::version`]), so only the quota row moved. Each needs and activity row is, byte
+/// for byte, what the build before the lift wrote for the same value (measured at 20058a4bcfd),
+/// and that build's strict reader takes exactly what it writes, so a Mac still on it reads them.
+/// It refuses this Mac's quota rows as `Version(2)`, and it reads no other Mac's quota row.
+/// NEGATIVE CONTROL: the same needs and activity rows under the quota row's version, as one
+/// version for every kind would have written them, are refused by a version-1 reader, which
+/// `aterm_mesh::view` then leaves out: an older Mac's Fleet glance would have lost this Mac.
+#[test]
+fn an_older_build_still_reads_this_macs_needs_and_activity_rows() {
+    let tab = |n: u8| format!("t000000000{n}").into_bytes();
+    let goldens: [(&str, Vec<u8>); 4] = [
+        (
+            "needs",
+            [
+                &[78, 1, 77, 1, 11][..],
+                &tab(1),
+                &[8],
+                b"approval",
+                &[1, 1, 11],
+                &tab(2),
+                &[1, 70, 1, 11],
+                &tab(3),
+                &[6],
+                b"person",
+                &[1, 18],
+                b"n-0800000000000000",
+                &[0, 1, 11],
+                &tab(2),
+                &[4],
+            ]
+            .concat(),
+        ),
+        ("needs", vec![78, 1, 0, 0, 0, 0]),
+        (
+            "activity",
+            [
+                &[84, 1, 136, 134, 252, 214, 6, 1, 1, 0, 1, 0, 3, 11][..],
+                &tab(4),
+                &[4],
+                b"busy",
+                &[0, 11],
+                &tab(5),
+                &[6],
+                b"walled",
+                &[1, 12],
+                b"usage-weekly",
+                &[11],
+                &tab(6),
+                &[4],
+                b"idle",
+                &[0],
+            ]
+            .concat(),
+        ),
+        ("activity", vec![84, 1, 0, 0, 0, 0, 0, 0, 0]),
+    ];
+    let written: Vec<(Subject, Vec<u8>)> = every_row()
+        .into_iter()
+        .filter(|(_, row)| matches!(row, Row::Needs(_) | Row::Activity(_)))
+        .map(|(subject, row)| (subject, row.encode()))
+        .collect();
+    assert_eq!(written.len(), goldens.len());
+    for ((subject, bytes), (what, golden)) in written.iter().zip(&goldens) {
+        assert!(subject.to_string().ends_with(what), "{subject}");
+        assert_eq!(
+            bytes, golden,
+            "{subject}: the spelling an older build reads"
+        );
+        assert_eq!(bytes[1], VERSION);
+        assert!(Row::decode_at(subject, bytes).is_ok(), "{subject}");
+        let mut bumped = bytes.clone();
+        bumped[1] = QUOTA_VERSION;
+        assert_eq!(
+            Row::decode_at(subject, &bumped),
+            Err(RowError::Version(QUOTA_VERSION)),
+            "NEGATIVE CONTROL: {subject} under one version for every kind"
+        );
+    }
+    let quota = quota_row(300, Some(5), None).encode();
+    assert_eq!(
+        quota[1], QUOTA_VERSION,
+        "an older build refuses this one alone"
+    );
+}
+
 /// A body built by hand, field by field, for what the encoder never writes.
 struct Body(Vec<u8>);
 
 impl Body {
     fn new(kind: u8) -> Body {
-        Body(vec![kind, crate::row::VERSION])
+        Body(vec![kind, crate::row::version(kind)])
     }
 
     fn varint(mut self, mut v: u64) -> Body {
@@ -641,10 +839,11 @@ fn the_decoder_refuses_everything_the_encoder_does_not_write() {
     };
     assert_eq!(over_pct(1), Err(RowError::Bound("the 5-hour percent")));
     assert_eq!(over_pct(3), Err(RowError::Bound("the week percent")));
-    // Sessions in 7 days, a 32-bit count, sits before the plan (`1`, `3`, `max`).
+    // Sessions in 7 days, a 32-bit count, sits before the plan (`1`, `3`, `max`) and the lifts'
+    // count (`0`).
     let mut sessions = good.clone();
-    let s_at = sessions.len() - 6;
-    assert_eq!(&sessions[s_at..], &[3, 1, 3, b'm', b'a', b'x']);
+    let s_at = sessions.len() - 7;
+    assert_eq!(&sessions[s_at..], &[3, 1, 3, b'm', b'a', b'x', 0]);
     sessions.splice(s_at..=s_at, [0x80, 0x80, 0x80, 0x80, 0x10]); // 2^32
     assert_eq!(
         QuotaRow::decode(&sessions),

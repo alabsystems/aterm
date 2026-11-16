@@ -179,23 +179,31 @@ fn offered(fact: &Fact) -> String {
     )
 }
 
-/// `write` under the session's standing proven claim ([`crate::control::self_claim_write`])
-/// where its holder is a codex-alab one ([`crate::self_claim::holder_pid`]); `None` otherwise,
-/// with nothing written. A contract-3 rostered harness's claim is refused until its own
-/// amendment: aterm's loop on such a tab resumes when that claim ends and never reads this
-/// account, so serving it would tell an episode twice.
+/// `write` under the session's standing proven claim ([`crate::control::self_claim_write`], its
+/// `state` duty) where its holder is a codex-alab one ([`crate::self_claim::holder_pid`]); `None`
+/// otherwise, with nothing written. A scoped claim (contract 3 or 4) is refused here even where
+/// it holds `state`: the facts this verb offers and books are codex-alab's account episodes,
+/// read from its session ledger's self-claim rows, which no other harness writes; aterm's loop
+/// on a scoped tab resumes when that claim ends and never reads this account, so serving it
+/// would tell an episode twice. A harness's own facts arrive on its stream (HX-15).
 fn as_claim<T>(
     ctx: &crate::SessionCtx,
     conn: Option<u64>,
     prove: &dyn Fn(&str) -> Option<Proven>,
     write: impl FnOnce(&mut SessionMeta, &Proven) -> T,
 ) -> Option<(String, T)> {
-    let (holder, out) = crate::control::self_claim_write(ctx, conn, prove, |meta, proven| {
-        let codex = meta
-            .live_claim(crate::metrics::now_us())
-            .is_some_and(|claim| crate::self_claim::holder_pid(&claim.holder).is_some());
-        codex.then(|| write(meta, proven))
-    })?;
+    let (holder, out) = crate::control::self_claim_write(
+        ctx,
+        conn,
+        aterm_agent::harness::contract::Scope::State,
+        prove,
+        |meta, proven| {
+            let codex = meta
+                .live_claim(crate::metrics::now_us())
+                .is_some_and(|claim| crate::self_claim::holder_pid(&claim.holder).is_some());
+            codex.then(|| write(meta, proven))
+        },
+    )?;
     Some((holder, out?))
 }
 

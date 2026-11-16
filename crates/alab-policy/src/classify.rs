@@ -3555,6 +3555,7 @@ const ATERM_CTL_READ: &[&str] = &[
     "timeline",
     "log",
     "brief",
+    "described",
     "resizes",
     "history",
     "result",

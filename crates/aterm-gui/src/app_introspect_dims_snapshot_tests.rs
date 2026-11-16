@@ -24,7 +24,7 @@ fn detached_dims_reports_the_scale_its_own_geometry_came_from() {
     let wid = WindowId(0);
     let metrics = crate::MetricsView::for_scale(2.0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.scale = 2.0;
         ws.metrics = metrics;
     }
@@ -129,7 +129,7 @@ fn panes_reports_a_co_viewed_sessions_shared_grid_in_every_viewer() {
         .expect("share session 0 into a second window");
     assert_eq!(app.pool.views(0), Some(2));
     {
-        let ws = app.windows.get_mut(&big).expect("the second window");
+        let mut ws = app.windows.get_mut(&big).expect("the second window");
         ws.rows = 60;
         ws.cols = 200;
     }
@@ -246,7 +246,7 @@ fn dims_snapshot_tracks_live_zoom_and_raw_surface_remainder() {
     );
     // A grid the surface does not hold (as before its window re-grids): the frame overhangs
     // the raw surface and dims crops it.
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = 24;
         ws.cols = 80;
     }
@@ -304,7 +304,8 @@ fn presented_seq_moves_only_with_the_windows_own_present_that_reached_glass() {
         "a dropped present drew nothing: {dropped:?} against the grid's {echoed}"
     );
 
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+    let ws = &mut **field_guard_ws;
     let fired = match ws.present_retry.deadline {
         Some(deadline) => crate::service_due_presentation_clocks(
             false,
@@ -317,6 +318,7 @@ fn presented_seq_moves_only_with_the_windows_own_present_that_reached_glass() {
         None => ws.present_retry.on_external_stimulus(),
     };
     assert!(fired, "the retry fires");
+    drop(field_guard_ws);
     app.redraw_window(wid);
     assert_eq!(surface(&mut app).commits(), 2, "the retry presented");
     assert_eq!(presented(&app), Some(echoed), "the retry drew the echo");

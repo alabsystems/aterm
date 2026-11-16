@@ -184,6 +184,7 @@ fn seat_query(caret: (u16, u16), cols: usize) -> SeatQuery {
         rest: footprint(caret, u16::try_from(cols).expect("fixture cols")),
         lead_px: LEAD_PX,
         held_sky: false,
+        stride: 1,
     }
 }
 

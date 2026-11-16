@@ -295,7 +295,7 @@ fn a_gateway_the_arp_dump_leaves_out_is_looked_up_on_its_own_interface() {
 fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     let gw = Ipv4Addr::new(192, 168, 1, 1);
     let mac = [0x90, 0x41, 0xb2, 0x78, 0x5a, 0x9e];
-    let request = route_get_request(gw.into(), 9, Some(8), RTM_GET_SILENT);
+    let request = route_get_request(gw.into(), Some(8));
     let field = |message: &[u8], offset: usize| {
         i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
     };
@@ -305,7 +305,7 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     assert_eq!(u16::from_ne_bytes([request[at], request[at + 1]]), 8);
     assert_eq!(
         field(
-            &route_get_request(gw.into(), 9, None, RTM_GET_SILENT),
+            &route_get_request(gw.into(), None),
             std::mem::offset_of!(RtMsghdr, rtm_flags)
         ) & RTF_IFSCOPE,
         0,
@@ -375,7 +375,7 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
 #[test]
 fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
     let to = Ipv4Addr::new(224, 0, 0, 251);
-    let request = route_get_request(to.into(), 7, None, RTM_GET_SILENT);
+    let request = route_get_request(to.into(), None);
     let field = |message: &[u8], offset: usize| {
         i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
     };
@@ -385,25 +385,20 @@ fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
         request.len()
     );
     assert_eq!(request[std::mem::offset_of!(RtMsghdr, rtm_version)], 5);
-    assert_eq!(
-        request[std::mem::offset_of!(RtMsghdr, rtm_type)],
-        RTM_GET_SILENT
-    );
-    let plain = route_get_request(to.into(), 7, None, RTM_GET);
-    assert_eq!(plain[std::mem::offset_of!(RtMsghdr, rtm_type)], RTM_GET);
-    let kind = std::mem::offset_of!(RtMsghdr, rtm_type);
-    assert_eq!(
-        (&plain[..kind], &plain[kind + 1..]),
-        (&request[..kind], &request[kind + 1..]),
-        "the two lookups differ in their type alone"
-    );
     let addrs = field(&request, std::mem::offset_of!(RtMsghdr, rtm_addrs));
     assert_eq!(
         addrs,
         RTA_DST | RTA_IFP,
         "the interface's slot asks for its address"
     );
-    assert_eq!(field(&request, std::mem::offset_of!(RtMsghdr, rtm_seq)), 7);
+    assert_eq!(
+        (
+            request[std::mem::offset_of!(RtMsghdr, rtm_type)],
+            field(&request, std::mem::offset_of!(RtMsghdr, rtm_seq))
+        ),
+        (0, 0),
+        "no type or number until `lookup_write` writes it"
+    );
     let block = &request[header..];
     assert_eq!(
         sockaddr_ipv4(route_sockaddr(block, addrs, RTA_DST)),
@@ -517,8 +512,7 @@ fn the_route_lookup_gives_the_address_a_connected_socket_takes() {
         let asked = route_get_as(
             to.into(),
             None,
-            route_get_sequence(),
-            |write| write(kind),
+            |request, write| lookup_write_as(kind == RTM_GET, request, write),
             route_get_answer,
         );
         assert_eq!(

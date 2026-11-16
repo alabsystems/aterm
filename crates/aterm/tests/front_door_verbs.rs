@@ -187,7 +187,7 @@ fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
         );
     }
     for (program, args) in [(alias.as_path(), &[file][..]), (aterm, &["edit", file])] {
-        let (code, text) = run(program, args, Some("s-1"));
+        let (code, text) = run(program, args, Some("t0000000001"));
         assert_eq!(code, Some(2), "{program:?} {args:?}: {text}");
         assert!(
             text.starts_with("amacs: no terminal to edit in"),
@@ -383,7 +383,7 @@ fn drive_reaches_this_images_own_control_client() {
     let out = isolated(&mut aterm_cmd(), root.path())
         .args(["drive", "--sock"])
         .arg(&sock)
-        .args(["phase", "@s-1"])
+        .args(["phase", "@t0000000001"])
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .output()

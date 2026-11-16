@@ -404,6 +404,42 @@ impl HarnessIdentity {
     }
 }
 
+/// The `[harness]` table of a harness checkout's `alab-harness.toml`
+/// ([`atpkg::harness_record::DECLARATION_FILE`]), checked strictly: it names this program and
+/// its one tool, which is all the pack exposes. `None` for a checkout with no such file: its
+/// builds keep the registry's seed row, if they have one.
+fn harness_declaration(
+    checkout: &Path,
+    program: &str,
+    h: &crate::programs::Harness,
+    exposes: &[String],
+) -> Result<Option<aterm_toml::Value>> {
+    let path = checkout.join(atpkg::harness_record::DECLARATION_FILE);
+    let bytes = match crate::identity::read_regular_bytes(
+        &path,
+        atpkg::harness_record::MAX_DECLARATION_BYTES as u64,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(format!("read {}", path.display()), &e)),
+    };
+    let text = String::from_utf8(bytes)
+        .map_err(|_| Error::refused(format!("{} is not UTF-8", path.display())))?;
+    let table = atpkg::harness_record::harness_table_of(&text).map_err(Error::refused)?;
+    let declared = atpkg::harness_record::Declaration::from_table(&table, true)
+        .map_err(|e| Error::refused(format!("{}: {e}", path.display())))?;
+    if declared.id != program || declared.tool != h.tool || exposes != [h.tool.to_string()] {
+        return Err(Error::refused(format!(
+            "{} declares {} with tool {}, but this pack is {program} exposing [{}]",
+            path.display(),
+            declared.id,
+            declared.tool,
+            exposes.join(", ")
+        )));
+    }
+    Ok(Some(table))
+}
+
 /// A harness build's checked metadata and identity, from `checkout` at `build`: refused unless
 /// the checkout is pristine ([`crate::git::is_pristine`]), its `HEAD` is on `main` of
 /// `<owner>/<repo>` (the staging owner's repo) as `host` serves it, as codex's package source
@@ -1309,6 +1345,10 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         build: build_number,
         exposes: sel.exposes.clone(),
         shim_env: Vec::new(),
+        harness: match def.harness() {
+            Some(h) => harness_declaration(&request.checkout, program, &h, &sel.exposes)?,
+            None => None,
+        },
     };
     let row = Row {
         triple: request.triple,

@@ -167,6 +167,11 @@ impl RelaunchEpoch {
     }
 }
 
+/// A session's metadata mutex, ranked after the fabric's Inbox ([`crate::fabric::lock_rank`]).
+pub(crate) type MetaLock = crate::fabric::lock_rank::MetaLock<SessionMeta>;
+/// A held [`MetaLock`].
+pub(crate) type MetaGuard<'a> = crate::fabric::lock_rank::MetaGuard<'a, SessionMeta>;
+
 /// The user-settable per-session metadata (`meta set`/`meta unset`).
 #[derive(Default, Clone, Debug)]
 pub(crate) struct SessionMeta {
@@ -512,8 +517,9 @@ impl SessionMeta {
             .filter(|claim| claim.expires_us.is_none_or(|at| at > now_us))
     }
 
-    /// The live claim's proven contract v3 scope at `now_us` ([`SupervisorClaim::scoped`]):
-    /// a rostered harness's claim, with the versions it announced.
+    /// The live claim's proven scoped claim at `now_us` ([`SupervisorClaim::scoped`]): a
+    /// registered harness's contract 3 or 4 claim, with the versions it announced and the child
+    /// aterm kept for it.
     #[must_use]
     pub(crate) fn live_scoped(&self, now_us: u64) -> Option<&crate::harness_claim::Scoped> {
         self.live_claim(now_us)
@@ -543,12 +549,9 @@ impl SessionMeta {
         let claim = self.live_claim(now_us);
         SupervisorAuthority {
             holder: claim.map(|c| c.holder.clone()),
-            contract: claim.and_then(|c| {
-                if c.scoped.is_some() {
-                    Some(3)
-                } else {
-                    c.proven.as_ref().map(|_| 2)
-                }
+            contract: claim.and_then(|c| match &c.scoped {
+                Some(scoped) => u8::try_from(scoped.claim.contract).ok(),
+                None => c.proven.as_ref().map(|_| 2),
             }),
             identity: claim.and_then(|c| c.identity().cloned()),
             conn: claim.and_then(|c| c.conn),
@@ -855,7 +858,7 @@ impl SessionMeta {
     #[must_use]
     pub(crate) fn self_held(&self, now_us: u64) -> Option<aterm_agent::harness::acts::HeldBy> {
         let (told, arm) = self.claim_held.as_ref()?;
-        (self.live_claim(now_us)?.act_proof() == Some(told)).then_some(*arm)
+        (self.live_claim(now_us)?.identity() == Some(told)).then_some(*arm)
     }
 
     /// Keep `held` as the stop the proven claim `proven` told (`None`: its typing goes on):
@@ -879,7 +882,7 @@ impl SessionMeta {
     #[must_use]
     pub(crate) fn self_land(&self, now_us: u64) -> Option<crate::harness_glass::HeldGlass> {
         let (told, hold) = self.claim_land.as_ref()?;
-        (self.live_claim(now_us)?.act_proof() == Some(told)).then_some(*hold)
+        (self.live_claim(now_us)?.identity() == Some(told)).then_some(*hold)
     }
 
     /// Keep `held` as the Land hold the proven claim `proven` told (`None`: it holds no landing),
@@ -1048,7 +1051,7 @@ impl SessionMeta {
 
     /// Whether the live claim at `now_us` is a proven codex-alab self-claim (contract v2,
     /// [`crate::self_claim`]): the agent supervises itself, so what acts for that self-claim acts.
-    /// A proven contract v3 claim is not one ([`Self::live_scoped`]).
+    /// A proven scoped claim (contract 3 or 4) is not one ([`Self::live_scoped`]).
     #[must_use]
     pub(crate) fn supervisor_proven(&self, now_us: u64) -> bool {
         self.live_claim(now_us)
@@ -1447,7 +1450,7 @@ pub(crate) struct SupervisorClaim {
     pub(crate) expires_us: Option<u64>,
     /// A proven codex-alab self-claim (contract v2).
     pub(crate) proven: Option<crate::self_claim::Proven>,
-    /// A proven rostered harness's scoped claim (contract v3); never set with `proven`.
+    /// A proven registered harness's scoped claim (contract 3 or 4); never set with `proven`.
     pub(crate) scoped: Option<crate::harness_claim::Scoped>,
 }
 
@@ -1529,7 +1532,7 @@ impl SupervisorAuthority {
         self.holder.as_deref()
     }
 
-    /// The proven claim's contract (2 or 3), absent for an unproven claim or no live claim.
+    /// The proven claim's contract (2, 3 or 4), absent for an unproven claim or no live claim.
     #[must_use]
     pub(crate) const fn contract(&self) -> Option<u8> {
         self.contract
@@ -1754,7 +1757,7 @@ impl SupervisorInputFence {
                 return Err(SCOPED_INPUT_DENIED.to_string());
             }
         } else {
-            if authority.contract() != Some(3)
+            if !matches!(authority.contract(), Some(3 | 4))
                 || authority.holder() != Some(request.holder.as_str())
                 || !authority.scopes().is_some_and(|s| s.contains(request.duty))
                 || caller.connection.is_none()
@@ -1982,7 +1985,8 @@ impl SupervisorInputBatch {
 }
 
 impl SupervisorClaim {
-    /// The process a proof of this claim named, a v2 self-claim's or a v3 scoped claim's.
+    /// The process a proof of this claim named, the contract 2 self-claim's or a scoped claim's
+    /// (contract 3 or 4).
     #[must_use]
     pub(crate) fn identity(&self) -> Option<&crate::self_claim::Proven> {
         self.proven
@@ -1996,19 +2000,41 @@ impl SupervisorClaim {
         self.identity().is_some()
     }
 
-    /// THE PROOF UNDER WHICH THIS CLAIM WRITES ITS OWN ACTS, stop, Land hold and NEEDS YOU (`meta
-    /// set harness_act`, `harness_held`, `harness_land`, `harness_needs`, `harness_activity`): a
-    /// proven claim's [`Self::identity`] where it [takes](Self::takes) `turn-end`, the duty those
-    /// writes report on. codex-alab's v2 self-claim takes every duty, so its proof is the one it
-    /// always was; a proven v3 claim's is its scoped proof only where its scope names `turn-end`
-    /// (`relaunch,upgrade` writes none); an unproven claim has none. The writers admit under it
-    /// (`control_session::self_claim_write`, `cmd_meta_harness_act_with_clock`) and the readers
-    /// read what it told ([`SessionMeta::self_held`], [`SessionMeta::self_land`],
-    /// [`SessionMeta::self_needs`]), so a write is read exactly where it was admitted.
+    /// THE PROOF UNDER WHICH THIS CLAIM WRITES WHAT REPORTS ON `turn-end` ([`Self::act_proof_for`]
+    /// that duty): its stop, Land hold and NEEDS YOU (`meta set harness_held`, `harness_land`,
+    /// `harness_needs`), the `meta prepare harness_act` lease and an act whose duty is `turn-end`.
+    /// codex-alab's contract 2 self-claim takes every duty, so its proof is the one it always was;
+    /// a proven scoped claim's (contract 3 or 4) is its scoped proof only where its scope takes
+    /// `turn-end`; an unproven claim has none. Every other write is admitted under the proof for
+    /// the duty it reports on (`control_session::self_claim_write`,
+    /// `cmd_meta_harness_act_with_clock`: `harness_activity` under `state`, an act under its
+    /// `acts::act_scope`). What was told under this proof is kept only while the standing claim
+    /// writes under it again (`SessionMeta::set_supervisor` lets a stop, a Land hold and a NEEDS
+    /// YOU set go when a claim drops `turn-end`); [`SessionMeta::self_needs`] and
+    /// [`SessionMeta::say_needs_entry`] read through it, and [`SessionMeta::self_held`] and
+    /// [`SessionMeta::self_land`] read what the standing claim's [`Self::identity`] told, so a
+    /// write is read exactly where it was admitted.
     #[must_use]
     pub(crate) fn act_proof(&self) -> Option<&crate::self_claim::Proven> {
-        self.identity()
-            .filter(|_| self.takes(aterm_agent::harness::contract::Scope::TurnEnd))
+        self.act_proof_for(Some(aterm_agent::harness::contract::Scope::TurnEnd))
+    }
+
+    /// THE PROOF UNDER WHICH THIS CLAIM WRITES AN ACT THAT REPORTS ON `duty` (HX-06, one accessor
+    /// for both writers): codex-alab's proven contract 2 self-claim writes every act, `duty` or
+    /// none; a proven scoped claim (contract 3 or 4) writes one whose duty it
+    /// [takes](Self::takes), and none whose act no duty names (`duty` `None`); an unproven claim
+    /// writes nothing. Nothing admits on the v2 proof's presence alone ([`Self::proven`] stays
+    /// codex-alab's: its admission as Codex, its record copies, the crash rule, the wall answer).
+    #[must_use]
+    pub(crate) fn act_proof_for(
+        &self,
+        duty: Option<aterm_agent::harness::contract::Scope>,
+    ) -> Option<&crate::self_claim::Proven> {
+        let proven = self.identity()?;
+        if self.proven.is_some() {
+            return Some(proven);
+        }
+        duty.filter(|duty| self.takes(*duty)).map(|_| proven)
     }
 
     /// Whether `next` is this claim again with only its `ttl=` lease moved: the same holder,
@@ -2029,8 +2055,9 @@ impl SupervisorClaim {
     }
 
     /// Whether the claim takes `duty` on its session (`docs/DESIGN-harness-repos-2026-10-24.md`
-    /// §8.1 item 4, §8.3): a rostered harness's scoped claim (contract v3, [`Self::scoped`]) takes
-    /// exactly the duties its scope names, and aterm keeps every other one; every other claim
+    /// §8.1 item 4, §8.3): a registered harness's scoped claim (contract 3 or 4,
+    /// [`Self::scoped`]) takes exactly the duties its scope names (under contract 4, its grant),
+    /// and aterm keeps every other one; every other claim
     /// (codex-alab's v2 self-claim, any foreign holder's) takes them all, as it always has.
     #[must_use]
     pub(crate) fn takes(&self, duty: aterm_agent::harness::contract::Scope) -> bool {
@@ -2153,7 +2180,19 @@ pub(crate) enum MetaEdit<'a> {
 pub(crate) enum MetaWriteError {
     Empty,
     ForbiddenFormatting,
-    TooLong { cap: usize },
+    TooLong {
+        cap: usize,
+    },
+    /// A title whose percent-encoding is over `cap` bytes: its claim's text is never cut.
+    TooLongEncoded {
+        cap: usize,
+    },
+    /// A title from anyone but a person that reads whole as a credential.
+    Credential,
+    /// The title's author is short of a mark token for this long.
+    Busy {
+        retry_ms: u64,
+    },
     NotAQuestionsPolicy,
     NotAnAutopilot,
     HungUp,
@@ -2214,6 +2253,9 @@ fn try_apply_meta_value(
 ) -> Result<bool, MetaWriteError> {
     if field == MetaField::Autopilot {
         return Ok(apply_autopilot(ctx, value, None, by, None).moved);
+    }
+    if field == MetaField::Title {
+        return title::apply_title_claim(ctx, value, by);
     }
     #[cfg(all(test, unix))]
     if matches!(field, MetaField::Attention | MetaField::Description) {
@@ -3115,7 +3157,7 @@ impl FencedWrite {
         ctx: &crate::SessionCtx,
         fence: &SupervisorInputFence,
         now_us: u64,
-        meta: std::sync::MutexGuard<'_, SessionMeta>,
+        meta: MetaGuard<'_>,
         nonparking: bool,
     ) -> Result<Self, String> {
         if let Some(refusal) = fence.refusal(ctx, &meta, now_us) {
@@ -3238,6 +3280,29 @@ pub(crate) fn close_claim_connection(ctx: &crate::SessionCtx, conn: u64, now_us:
         record_attention(ctx, &meta, aterm_slog::Actor::Aterm);
     }
     lapsed.any() || held
+}
+
+/// Release the session's claim only while it is still the very scoped claim `scoped` (a claim
+/// whose proof no longer stands, [`crate::harness_claim::reprove`]).
+pub(crate) fn publish_release_scoped(
+    ctx: &crate::SessionCtx,
+    scoped: &crate::harness_claim::Scoped,
+    now_us: u64,
+    by: aterm_slog::Actor,
+) -> SupervisorTransition<bool> {
+    release_supervisor_if(ctx, now_us, by, |claim| {
+        claim.scoped.as_ref() == Some(scoped)
+    })
+}
+
+/// Hand back what closed control connection `conn` held on `ctx`: its live claim and its
+/// claimant binding. True when either moved. The control EOF does this at once unless a native
+/// operation kept the claim ([`crate::native_act::retain_exec_claim`]); that operation does it
+/// when its custody ends.
+pub(crate) fn release_closed_connection(ctx: &crate::SessionCtx, conn: u64, now_us: u64) -> bool {
+    let released =
+        publish_release_supervisor(ctx, Some(conn), now_us, aterm_slog::Actor::Aterm).published();
+    close_claim_connection(ctx, conn, now_us) || released
 }
 
 /// `meta unset supervisor holder=<h>`.
@@ -3378,7 +3443,7 @@ pub(crate) fn parse_carried_attention(
 /// Put back the claim and escalations a seamless update carried onto an adopted session's fresh
 /// meta.
 pub(crate) fn seed_carried_claims(
-    meta: &std::sync::Mutex<SessionMeta>,
+    meta: &MetaLock,
     timeline: &std::sync::Mutex<SessionTimeline>,
     supervisor: Option<&str>,
     attention_owners: &[String],
@@ -3860,6 +3925,9 @@ pub(crate) struct SessionTimeline {
     /// Where the agent in group `.0` works, as the harness host last read it ([`Self::set_work`]).
     work: Option<(i32, aterm_agent::harness::work_record::WorkRecord)>,
     program_shown: Option<ShownProgram>,
+    /// Another program's report shown beside it (`ProgramApp::Other`), with no episode and no
+    /// report sequence (both 0): only the words read it ([`Self::program_said`]).
+    program_other: Option<ShownProgram>,
     program_episodes: u64,
     /// The ledger instant ([`now_ms`]) the program's own report last moved
     /// ([`Self::note_program_state`]), where [`Self::ab_word`] reads its word from.
@@ -4368,14 +4436,38 @@ impl SessionTimeline {
         self.record(PROGRAM_STATE);
     }
 
-    /// The edges of the program's turns no shown move claims
-    /// ([`crate::program_state::ProgramStateGate::observe_fed`]), into the log's claimed turns at
-    /// their own times ([`crate::session_log::SessionLog::observe_program_edges`]): no episode,
-    /// shown report or `program-state` row moves, and the watchers are rung when a turn record
-    /// was written, so `await log close=turn` hears it on this wake.
-    pub(crate) fn note_program_edges(&mut self, fed: &[crate::program_state::FedEdge]) {
+    /// A move of another program's report shown (`ProgramApp::Other`,
+    /// [`crate::program_state::ProgramStateGate::observe_other`]): kept for the words alone, it
+    /// writes no mark, episode or row and moves nothing [`Self::note_program_state`] moves.
+    pub(crate) fn note_other_program(
+        &mut self,
+        other: Option<aterm_core::terminal::program_state::ProgramState>,
+    ) {
+        self.program_other = other.map(|state| ShownProgram::now(state, 0, 0));
+    }
+
+    /// THE EDGES OF THE PROGRAM'S TURNS PAST THE MOVE (`read`, the sweep's
+    /// [`crate::session_log::ProgramRead`]), after the block read, the bucket's tick and the
+    /// foreground move, into the log's claimed turns at their own times
+    /// ([`crate::session_log::SessionLog::feed_front`]), judged by the program in front now (a
+    /// group with no name yet holds them): no episode, shown report or `program-state` row moves,
+    /// and the watchers are rung when a turn record was written, so `await log close=turn` hears
+    /// it on this wake.
+    pub(crate) fn feed_program_turns(&mut self, read: &mut crate::session_log::ProgramRead) {
+        use crate::session_log::Front;
+        let front = match self.agent.program.as_deref() {
+            None => Front::Unnamed,
+            Some(name) => {
+                let codex = crate::program_state::honoured_for(
+                    Some(name),
+                    Some(aterm_core::terminal::program_state::ProgramApp::Codex),
+                    true, // The job flag is read only for Other; this judgement names Codex.
+                );
+                if codex { Front::Codex } else { Front::Other }
+            }
+        };
         let at = self.slog.now();
-        if self.slog.observe_program_edges(fed, at) {
+        if self.slog.feed_front(read, front, at) {
             self.ring();
         }
     }
@@ -5436,7 +5528,11 @@ impl SessionTimeline {
         self.slog.note_root(pgid);
     }
 
-    /// The status sweep's session-log step, in one order under one hold of this lock.
+    /// The session-log step with no turn edges read ([`Self::sweep_slog_turns`]), as a restore's
+    /// adoption sweep takes it: a restored engine's ring holds no `clear` and at most the resumed
+    /// entry of a report restored in a turn (turns are never carried), so the next status sweep's
+    /// first reading feeds it to the program then in front.
+    #[cfg(any(unix, test))]
     pub(crate) fn sweep_slog(
         &mut self,
         blocks: &crate::session_log::BlockRead,
@@ -5444,7 +5540,49 @@ impl SessionTimeline {
         root: i32,
         pgid: i32,
     ) -> Option<i32> {
+        let mut none = crate::session_log::ProgramRead::default();
+        self.sweep_slog_turns(blocks, seen, root, pgid, &mut none)
+    }
+
+    /// The status sweep's session-log step, in one order under one hold of this lock: on a
+    /// foreground move, the program's turn edges before the leaving program's `clear` first
+    /// ([`crate::session_log::SessionLog::feed_leaving`]), judged by the name of the group that
+    /// left (the root shell, or none, is no codex), before the block read can close its run; then
+    /// the block read and the move. The edges past them wait in `program` for
+    /// [`Self::feed_program_turns`].
+    pub(crate) fn sweep_slog_turns(
+        &mut self,
+        blocks: &crate::session_log::BlockRead,
+        seen: bool,
+        root: i32,
+        pgid: i32,
+        program: &mut crate::session_log::ProgramRead,
+    ) -> Option<i32> {
+        use crate::session_log::Leaving;
         let at = self.slog.now();
+        if pgid > 0 && pgid != self.agent.program_pgid {
+            let left = self.agent.program_pgid;
+            let leaving = match self.agent.program.as_deref() {
+                _ if left <= 0 || left == root => Leaving::Nothing,
+                None => Leaving::MaybeCodex,
+                Some(name) => {
+                    if crate::program_state::honoured_for(
+                        Some(name),
+                        Some(aterm_core::terminal::program_state::ProgramApp::Codex),
+                        true, // The job flag is read only for Other; this is Codex.
+                    ) {
+                        Leaving::MaybeCodex
+                    } else {
+                        Leaving::Other
+                    }
+                }
+            };
+            // A turn record the move's edges wrote is heard on this wake, as the front's are
+            // ([`Self::feed_program_turns`]).
+            if self.slog.feed_leaving(program, leaving, at) {
+                self.ring();
+            }
+        }
         self.slog
             .shell_blocks(blocks, (pgid > 0).then_some(pgid), at);
         if seen {
@@ -6147,12 +6285,22 @@ impl SessionTimeline {
         self.program_shown
     }
 
+    /// What the words say the program in front says about itself: [`Self::program_shown`], else
+    /// another program's report ([`Self::note_other_program`]). Only the words read it
+    /// ([`crate::program_state::survey_word`]); nothing that decides does.
+    pub(crate) const fn program_said(&self) -> Option<ShownProgram> {
+        match self.program_shown {
+            Some(shown) => Some(shown),
+            None => self.program_other,
+        }
+    }
+
     /// The agent word a surface shows and how long it has held, in ms: the reader's, or where the
     /// reader names no state (`unknown`, codex's) and the program says itself (OSC 7501), the
     /// program's word ([`crate::program_state::survey_word`]) and its report's age. Render-time
     /// only: `agent=` stays the reader's.
     pub(crate) fn shown_agent_word(&self) -> (&'static str, u64) {
-        match self.program_shown.filter(|_| self.agent.word == "unknown") {
+        match self.program_said().filter(|_| self.agent.word == "unknown") {
             Some(shown) => (
                 crate::program_state::survey_word(shown.state),
                 shown.age_ms(),
@@ -6864,6 +7012,9 @@ pub(crate) fn clamp_payload(s: String) -> Arc<str> {
     }
     Arc::from(&s[..end])
 }
+
+#[path = "session_timeline_title.rs"]
+mod title;
 
 #[cfg(test)]
 #[path = "session_timeline_tests.rs"]

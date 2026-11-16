@@ -115,7 +115,7 @@ fn placement_matches_all_cursor_choices_and_frame_end_obstructions() {
                     for (mask, row) in [(1, 0), (2, usize::from(app.windows[&wid].rows - 1))] {
                         if obstruction & mask != 0 {
                             super::super::claim_chrome_rows(
-                                app.windows.get_mut(&wid).unwrap(),
+                                &mut app.windows.get_mut(&wid).unwrap(),
                                 row..row + 1,
                             );
                         }

@@ -813,6 +813,9 @@ impl App {
                 let uri = self.document_store.canonical_uri(document)?.to_string();
                 Some(restore::NativeTabRestore::Editor { uri })
             }
+            // Tables is restored from its leaf alone ([`App::view_restore_descriptor`]): a
+            // build from before the page reads a leaf it does not know as a Recovery tab, and
+            // a kind it does not know here as a layout it cannot read at all.
             crate::native_app::AppKind::Markdown
             | crate::native_app::AppKind::Recovery
             | crate::native_app::AppKind::Workers
@@ -1054,39 +1057,49 @@ impl App {
         }
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
-                let ((cwd, title), user_meta, (sid, lineage, log_ep), claim, task, session_held) =
-                    self.pool
-                        .get(terminal.session)
-                        .map(|s| {
-                            let cwd_and_title = Self::session_cwd_and_title(s);
-                            let user_meta = s
-                                .ctx
-                                .meta
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .sanitized();
-                            let (lineage, log_ep) = {
-                                let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                                (tl.slog().lineage(), tl.slog().log().ep())
-                            };
-                            let sid = s.ctx.self_id.as_str();
-                            let ids = (
-                                restore::carried_sid(sid).then(|| sid.to_string()),
-                                lineage
-                                    .filter(|l| {
-                                        l.as_str() != sid && restore::carried_sid(l.as_str())
-                                    })
-                                    .map(|l| l.as_str().to_string()),
-                                Some(log_ep),
-                            );
-                            let claim = crate::harness_host::credit_claim::claim_worker(&s.ctx);
-                            let task = worker
-                                .then(|| crate::task_record::restore_row(&s.ctx))
-                                .flatten();
-                            let session_held = cfg!(unix) && !carry_drafts && Self::session_held(s);
-                            (cwd_and_title, user_meta, ids, claim, task, session_held)
-                        })
-                        .unwrap_or_default();
+                let (
+                    (cwd, title),
+                    user_meta,
+                    (sid, lineage, opened_ms, log_ep),
+                    claim,
+                    task,
+                    session_held,
+                ) = self
+                    .pool
+                    .get(terminal.session)
+                    .map(|s| {
+                        let cwd_and_title = Self::session_cwd_and_title(s);
+                        let user_meta = s
+                            .ctx
+                            .meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .sanitized();
+                        let (lineage, opened_ms, log_ep) = {
+                            let tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                            (
+                                tl.slog().lineage(),
+                                tl.slog().opened_ms(),
+                                tl.slog().log().ep(),
+                            )
+                        };
+                        let sid = s.ctx.self_id.as_str();
+                        let ids = (
+                            restore::carried_sid(sid).then(|| sid.to_string()),
+                            lineage
+                                .filter(|l| l.as_str() != sid && restore::carried_sid(l.as_str()))
+                                .map(|l| l.as_str().to_string()),
+                            opened_ms,
+                            Some(log_ep),
+                        );
+                        let claim = crate::harness_host::credit_claim::claim_worker(&s.ctx);
+                        let task = worker
+                            .then(|| crate::task_record::restore_row(&s.ctx))
+                            .flatten();
+                        let session_held = cfg!(unix) && !carry_drafts && Self::session_held(s);
+                        (cwd_and_title, user_meta, ids, claim, task, session_held)
+                    })
+                    .unwrap_or_default();
                 let store_sid = (carry_drafts || session_held)
                     .then(|| self.session_sid(terminal.session))
                     .flatten();
@@ -1140,6 +1153,7 @@ impl App {
                     held,
                     sid,
                     lineage,
+                    opened_ms,
                     log_ep,
                     holds: Vec::new(),
                     claim_ended: claim.as_ref().is_some_and(|&(_, ended)| ended),
@@ -1192,6 +1206,10 @@ impl App {
                         crate::native_app::AppKind::SystemState,
                         crate::native_app::AppViewState::SystemState(_),
                     ) => restore::NativeLeafRestore::system_state(),
+                    (
+                        crate::native_app::AppKind::Tables,
+                        crate::native_app::AppViewState::Tables(_),
+                    ) => restore::NativeLeafRestore::tables(),
                     (
                         crate::native_app::AppKind::Settings,
                         crate::native_app::AppViewState::Settings(settings),
@@ -1744,7 +1762,8 @@ impl App {
         for wid in windows {
             let fullscreen = self.carried_fullscreen_owed(wid);
             if fullscreen || self.restore_size_unlanded(wid) {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.restore_regrid_owed = Some(RestoreRegridOwed {
                         closed: now,
                         since: now,
@@ -1806,7 +1825,8 @@ impl App {
         }
         let capped = now.saturating_duration_since(owed.closed) >= RESTORE_SHOW_CAP;
         if !capped && owed.fullscreen && self.carried_fullscreen_owed(wid) {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.restore_regrid_owed = Some(RestoreRegridOwed { since: now, ..owed });
             }
             return;
@@ -1821,7 +1841,8 @@ impl App {
 
     /// Lay out every tab of window `wid` once and drop what the restore noted of its show.
     pub(crate) fn settle_restore_regrid(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.restore_regrid_owed = None;
             ws.restore_maximize_asked = false;
         }
@@ -2260,9 +2281,10 @@ impl App {
                 )
             })
         };
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         let tabs = window.tab_set.tabs();
         let present = filling
             .placed
@@ -2303,6 +2325,7 @@ impl App {
         }
         window.tabs = TabIndex::new(front_at.unwrap_or(0), window.layouts.len());
         filling.placed.push((index, id));
+        drop(route_guard_window);
         if front == front_before {
             self.refresh_tab_chrome_windows(vec![wid]);
         } else {
@@ -2413,7 +2436,8 @@ impl App {
                 Some(tree)
             });
         let keeps_bootstrap = tab.root.any_leaf(&mut |view| *view == anchor.view);
-        let window = self.windows.get_mut(&wid).expect("graft window");
+        let mut route_guard_window = self.windows.get_mut(&wid).expect("graft window");
+        let window = &mut **route_guard_window;
         let at = window
             .tab_set
             .tabs()
@@ -2448,6 +2472,7 @@ impl App {
             .unwrap_or(0);
         window.tabs = TabIndex::new(active, window.layouts.len());
         filling.placed.push((index, anchor.tab));
+        drop(route_guard_window);
         if !keeps_bootstrap {
             let session = self
                 .view_store
@@ -3041,7 +3066,8 @@ impl App {
             let show = wl.show;
             let wid = self.create_native_restore_window(wl.rows, wl.cols);
             self.frontmost_window = previous_front;
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 let frame = crate::app_window::CarriedFrame::of(&wl);
                 ws.take_carried_frame(frame.map(|frame| frame.inner_px));
                 ws.restore_maximize_asked = maximized == Some(true);
@@ -3114,7 +3140,8 @@ impl App {
             }
             return std::ops::ControlFlow::Break(());
         };
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.restore_maximize_asked = maximized == Some(true);
         }
         if !cfg!(windows)
@@ -3256,7 +3283,8 @@ impl App {
             .expect("restored orphan tab identity space");
         self.pool_insert(session);
         let behind = self.is_developer_tools_session(id);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let front = ws.tab_set.active_id().filter(|_| behind);
             crate::app_tabs::land_terminal_tab(ws, &self.view_store, tree, tab)
                 .expect("fresh restored tab id");
@@ -3365,7 +3393,8 @@ impl App {
         // In the order `push` seats them, so `layouts` stays in canonical order even where a
         // folded manifest put a shown tab behind a parked one.
         built.sort_by_key(|(tab, _): &(crate::tab_model::Tab, _)| tab.parked);
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             for (tab, layout) in built {
                 if let Some(layout) = layout {
                     window.layouts.push(layout);
@@ -3495,11 +3524,12 @@ impl App {
         wid: WindowId,
         retain_terminal: bool,
     ) -> Option<(crate::tab_model::ViewId, u64)> {
-        let old_tabs = self.windows.get_mut(&wid).map(|window| {
+        let old_tabs = self.windows.get_mut(&wid).map(|mut window| {
+            let window = &mut **window;
             let old = std::mem::take(&mut window.tab_set);
             window.layouts.clear();
             window.tabs = TabIndex::new(0, 0);
-            window.front_content = None;
+            window.routing.set_front(None);
             window.bind_trail_admission_source();
             window.active_terminal = None;
             window.window_focus = crate::front_content::WindowFocus::Host;
@@ -3972,6 +4002,9 @@ impl App {
             );
         }
         Self::seed_restored_user_meta(&session, leaf);
+        // Before registration, so the log's open keeps the leaf's first open: under its own sid
+        // the pane is the same session, and under a minted one it stands in for the leaf's.
+        self.carry_restored_lineage(leaf, FillingShell::Unregistered(&session));
         let view = self
             .view_store
             .insert_terminal(id)
@@ -4539,28 +4572,29 @@ impl App {
             leaf.sid.as_deref() == Some(s.ctx.self_id.as_str())
                 || (leaf.local_id.is_some() && s.handoff_local_id == leaf.local_id)
         };
+        // The same session (a seamless update's handed-over shell, or a cold restore's shell
+        // under the leaf's own tab ID) takes the leaf's lineage and first open with no record; a
+        // new shell standing in for the leaf's session records that it does.
+        let seed = |s: &crate::Session| {
+            let mut tl = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            tl.slog_mut().seed_lineage(leaf.lineage.as_deref());
+            tl.slog_mut().seed_opened(leaf.opened_ms);
+        };
         if named(shell) {
-            shell
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .slog_mut()
-                .seed_lineage(leaf.lineage.as_deref());
+            seed(shell);
         } else if shell.handoff_local_id.is_none() {
-            let _ = note_restored(shell, leaf.sid.as_deref(), leaf.lineage.as_deref());
+            let _ = note_restored(
+                shell,
+                leaf.sid.as_deref(),
+                leaf.lineage.as_deref(),
+                leaf.opened_ms,
+            );
         } else if let Some(other) = leaf
             .local_id
             .and_then(|l| self.adopted_session(l))
             .and_then(|s| self.pool.get(s))
         {
-            other
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .slog_mut()
-                .seed_lineage(leaf.lineage.as_deref());
+            seed(other);
         }
     }
 
@@ -4613,6 +4647,9 @@ impl App {
             "system-state" => {
                 self.stage_system_state_tab(target)
                     .map_err(|why| format!("System State could not be reopened: {why:?}"))?;
+            }
+            "tables" => {
+                self.stage_tables_tab(target, None)?;
             }
             "settings" => {
                 let route = descriptor
@@ -5201,7 +5238,8 @@ impl App {
             }
         };
         if mark.tabs.contains(&tab_id) {
-            if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
                 restore_front(window);
             }
             self.resync_after_restore_candidate(wid);
@@ -5210,6 +5248,7 @@ impl App {
         let tab = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| {
                 let tab = window.tab_set.remove(tab_id)?;
                 restore_front(window);
@@ -5357,7 +5396,7 @@ impl App {
         debug_assert!(reusable.is_none());
         let id = tab.id;
         let terminal = layout.is_some();
-        let window = self
+        let mut window = self
             .windows
             .get_mut(&wid)
             .ok_or_else(|| "closed-tab target window disappeared".to_string())?;
@@ -5396,6 +5435,7 @@ impl App {
         let switched = window.tab_set.switch_to(id);
         debug_assert!(switched);
         // A split's leaves were made at the whole window's grid.
+        drop(window);
         self.resize_panes(wid);
         self.resync_active_or_window(wid);
         debug_assert!(
@@ -5409,7 +5449,8 @@ impl App {
     fn remove_restore_bootstrap_terminals(&mut self, wid: WindowId) {
         let mut removed_tabs = Vec::new();
         let mut sessions = Vec::new();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let tab_ids: Vec<_> = ws
                 .tab_set
                 .tabs()
@@ -5442,7 +5483,14 @@ impl App {
     }
 }
 
-fn note_restored(session: &crate::Session, prev: Option<&str>, lineage: Option<&str>) -> bool {
+/// `session`, a restore's new shell, stands in for `prev`, whose chain of restores began at
+/// `lineage` and first opened at `opened_ms` (`SessionLog::seed_opened`).
+fn note_restored(
+    session: &crate::Session,
+    prev: Option<&str>,
+    lineage: Option<&str>,
+    opened_ms: Option<u64>,
+) -> bool {
     let mut tl = session
         .ctx
         .timeline
@@ -5450,6 +5498,7 @@ fn note_restored(session: &crate::Session, prev: Option<&str>, lineage: Option<&
         .unwrap_or_else(|p| p.into_inner());
     let at = tl.slog().now();
     tl.slog_mut().note_restored(prev, lineage, at);
+    tl.slog_mut().seed_opened(opened_ms);
     tl.slog_take_wake()
 }
 

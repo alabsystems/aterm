@@ -6291,6 +6291,7 @@ fn a_window_kept_on_another_log_is_dropped() {
             LogWitness {
                 high: 0,
                 id: Some(id),
+                met: None,
             }
             .render()
         });
@@ -6985,6 +6986,317 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
             );
         }
         bridge.close_subscriptions();
+    }
+}
+
+/// **A LOG THE BROKER RE-MINTED KEEPING ITS RECORDS NEVER SETTLES A POST ON AN EARLIER ONE OF
+/// THE SAME WORDS** (critic review F1, 2026-11-13). `s-a` posts `ok` to `s-b`, which lands and is
+/// retired. Its second `ok` is reserved at the head past the first, journaled in flight or not,
+/// and the bridge stops before it publishes. The broker stops, and its log's identity sidecar is
+/// left unreadable (rot, or another build's format: astream's `logid::settle` meets
+/// `Prior::Unreadable` and mints a fresh id) or gone (`Prior::Absent`, which derives one from the
+/// records kept); the broker opens again with every record kept, under another id at generation 0
+/// told with an empty lineage, as it opens an empty log. The next attach meets that log at the
+/// head it reads (`state::Met`), which the bus-log witness names, and the replay (an entry in
+/// flight: `Bridge::read_back_from`) or the drain's retry at the pin (a pin alone:
+/// `StateDir::publication_offset_resets`) reads the post back from there, finds none, and
+/// publishes the second `ok`: `s-b` is handed `ok` twice, and each post retires where it landed.
+/// NEGATIVE CONTROL (`Mutant::ReadBackFromTheLogsStart`, ATERM-KI-1111-4's rule): read back from
+/// 0, the post is settled on the first `ok`'s record and never published, and aterm is told it
+/// landed there.
+#[cfg(unix)]
+#[test]
+fn a_log_reminted_keeping_its_records_never_settles_a_post_on_an_earlier_one_of_the_same_words() {
+    #[derive(Clone, Copy, Debug)]
+    enum Sidecar {
+        Unreadable,
+        Gone,
+    }
+    for (sidecar, journaled, control) in [
+        (Sidecar::Unreadable, true, false),
+        (Sidecar::Gone, true, false),
+        (Sidecar::Unreadable, false, false),
+        (Sidecar::Unreadable, true, true),
+        (Sidecar::Unreadable, false, true),
+    ] {
+        let arm = format!("{sidecar:?} journaled={journaled} control={control}");
+        let sessions = [(1, "ta000000000"), (2, "tb000000000")];
+        let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+        let state = first.state.root().to_path_buf();
+        let (a, broker, server) = serve_log(&lane, "remint");
+        first.cfg.broker = a.clone();
+        assert!(first.attach_broker(), "{arm}: the first attach");
+        lane.retire_from_outbox();
+        let post =
+            |id: u64| format!("post sid=ta000000000 id={id} to=@tb000000000 kind=note len=2\nok");
+        *lane.outbox.lock().unwrap() = Some(post(1));
+        first.drain_outbox();
+        assert_eq!(
+            first.state.post_pin("ta000000000", 1).unwrap(),
+            None,
+            "{arm}: post 1 retired"
+        );
+        let face = format!("/f/f/in/{0}/tb000000000/{0}/note", first.node);
+        let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+        let [(on_bus, subject, bytes)] = <[_; 1]>::try_from(rows).expect("post 1 on the bus once");
+        let was = first.conn.as_ref().and_then(|c| c.seen_log_identity());
+        let head = on_bus + 1;
+        let next = PublishPin {
+            seq: first.next_seq().unwrap(),
+            via_key: false,
+            identity: Some(publication_identity(&subject, &bytes)),
+            original: None,
+            original_off: None,
+            owner: Some(2),
+            at: Some(head),
+        };
+        first.state.set_post_pin("ta000000000", 2, &next).unwrap();
+        if journaled {
+            first
+                .state
+                .set_in_flight(&InFlight {
+                    pin: next.clone(),
+                    subject: subject.clone(),
+                    body: bytes.clone(),
+                    log: was,
+                    at: Some(head),
+                })
+                .unwrap();
+        }
+        first.close_subscriptions();
+        drop(first);
+
+        drop(server);
+        drop(broker);
+        let path = lane.dir.path().join("remint.log");
+        let id = astream_broker::identity_path(&path);
+        match sidecar {
+            Sidecar::Unreadable => std::fs::write(&id, b"not an identity").unwrap(),
+            Sidecar::Gone => std::fs::remove_file(&id).unwrap(),
+        }
+        let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let broker = loop {
+            match crate::test_broker(&path) {
+                Ok(broker) => break broker,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && Instant::now() < give_up =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{arm}: the log did not open again: {e}"),
+            }
+        };
+        let _ = std::fs::remove_file(&a);
+        let _server = broker.serve(std::path::Path::new(&a)).unwrap();
+
+        let (second, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+        bridge.cfg.broker = a;
+        if control {
+            bridge.fx =
+                crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadBackFromTheLogsStart);
+        }
+        second.retire_from_outbox();
+        *second.outbox.lock().unwrap() = Some(post(2));
+        assert!(
+            bridge.attach_broker(),
+            "{arm}: the attach to the re-minted log"
+        );
+        let conn = bridge.conn.as_ref().unwrap();
+        let now = conn.seen_log_identity().expect("an identity");
+        assert!(
+            was.is_some_and(|was| was.id != now.id) && now.generation == 0,
+            "{arm}: the broker gave the log another id: {was:?} -> {now}"
+        );
+        assert_eq!(
+            conn.log_lineage().map(|lineage| lineage.steps().len()),
+            Some(0),
+            "{arm}: told with a lineage, as an empty log's open tells it"
+        );
+        let met = StateDir::open(&state)
+            .unwrap()
+            .log_witness()
+            .and_then(|witness| witness.met)
+            .expect("the witness names where the node met the log");
+        assert!(
+            met.log == now && met.head > on_bus,
+            "{arm}: met above post 1's record: {met:?}"
+        );
+        bridge.drain_outbox();
+        let (rows, _) = bridge.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+        let copies: Vec<u64> = rows.iter().map(|(off, _, _)| *off).collect();
+        assert_eq!(
+            copies.first(),
+            Some(&on_bus),
+            "{arm}: post 1's record kept where it was"
+        );
+        let retired: Vec<String> = second
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("outbox sent ta000000000 2 "))
+            .cloned()
+            .collect();
+        assert_eq!(retired.len(), 1, "{arm}: post 2 retired: {retired:?}");
+        if control {
+            assert_eq!(
+                copies,
+                vec![on_bus],
+                "CONTROL {arm}: post 2 settled on post 1's record, never published"
+            );
+            assert!(
+                retired[0].contains(&format!("off={on_bus}")),
+                "CONTROL {arm}: aterm told post 2 landed at post 1's record: {retired:?}"
+            );
+        } else {
+            assert_eq!(
+                copies.len(),
+                2,
+                "{arm}: post 1 and post 2, each once: {copies:?}"
+            );
+            assert!(
+                copies[1] >= met.head && retired[0].contains(&format!("off={}", copies[1])),
+                "{arm}: post 2 retired where it landed, not on post 1's record: {retired:?} \
+                 {copies:?}"
+            );
+        }
+        bridge.close_subscriptions();
+    }
+}
+
+/// **AN ATTACH THAT RE-BASES ONTO ANOTHER LOG HAS WHERE IT MET THAT LOG ON THE MEDIA BEFORE ITS
+/// REPLAY PUBLISHES THERE** (critic review F1, `Bridge::save_log_witness`): every copy a replay
+/// published on a log since the node met it lies at or above the head it met the log at
+/// (`state::Met`), the floor a read back of a post kept on an earlier log starts at
+/// (`Met::floor`). `s-a`'s second post is in flight on log A when the bridge, its state dir now
+/// on a simulated device with every file as it stood on the media, attaches to log B, which
+/// continues none of A: the attach re-bases its witness onto B, met at B's head, and its replay
+/// publishes the post there. Whatever image a power cut then leaves of the state dir, the next
+/// bridge's attach to B stands met at or below that copy. NEGATIVE CONTROL
+/// (`Mutant::RebaseWitnessUnflushed`, every build before critic review F1): the re-base written
+/// as any other witness is, some cut brings back A's witness, and the next attach meets B again
+/// at its head, above the copy, where a read back of that post no longer finds it.
+#[cfg(unix)]
+#[test]
+fn a_rebase_onto_another_log_stays_met_below_the_replays_copy_through_a_power_cut() {
+    use crate::sim::{bus, device::Device};
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
+    for control in [false, true] {
+        let mut rose = 0;
+        for seed in 1..=12u64 {
+            let arm = format!("seed {seed} control={control}");
+            let (lane, mut first) = FakeVerbLane::bridge(&sessions);
+            if control {
+                first.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::RebaseWitnessUnflushed);
+            }
+            let root = first.state.root().to_path_buf();
+            let (a, _broker_a, _server_a) = serve_log(&lane, "rebase-a");
+            first.cfg.broker = a;
+            assert!(first.attach_broker(), "{arm}: the attach to log A");
+            lane.retire_from_outbox();
+            *lane.outbox.lock().unwrap() =
+                Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=2\nok".to_string());
+            first.drain_outbox();
+            let face = format!("/f/f/in/{0}/tb000000000/{0}/note", first.node);
+            let (rows, _) = first.conn_now().unwrap().fetch(0, &face, 8).unwrap();
+            let [(on_a, subject, bytes)] = <[_; 1]>::try_from(rows).expect("post 1 on log A once");
+            let was = first.conn.as_ref().and_then(|c| c.seen_log_identity());
+            let (mut words, _) = Body::decode(&bytes);
+            words.text = "in flight".into();
+            let body = words.encode();
+            let identity = publication_identity(&subject, &body);
+            let pin = PublishPin {
+                seq: first.next_seq().unwrap(),
+                via_key: false,
+                identity: Some(identity.clone()),
+                original: None,
+                original_off: None,
+                owner: Some(2),
+                at: Some(on_a + 1),
+            };
+            first.state.set_post_pin("ta000000000", 2, &pin).unwrap();
+            first
+                .state
+                .set_in_flight(&InFlight {
+                    pin,
+                    subject: subject.clone(),
+                    body,
+                    log: was,
+                    at: Some(on_a + 1),
+                })
+                .unwrap();
+
+            first.close_subscriptions();
+            first.conn = None;
+            let (b, _broker_b, _server_b) = serve_log(&lane, "rebase-b");
+            first.cfg.broker = b.clone();
+            let (mut padding, _) = first.connect().unwrap();
+            for seq in 1..=4 {
+                padding.publish(92, seq, "/f/f/x/padding", b"v=1").unwrap();
+            }
+            drop(padding);
+            let device = Device::new(&root);
+            device.seed_as_it_stands(&root);
+            let core = crate::sim::Core::new(
+                seed,
+                bus::Broker::new(bus::Tier::Strict, bus::Escalation::aterm()),
+                device,
+            );
+            first
+                .state
+                .write_through(crate::fx::Disk::Sim(crate::sim::Process::new(
+                    std::sync::Arc::clone(&core),
+                    1,
+                )));
+            assert!(first.attach_broker(), "{arm}: the attach to log B");
+            let now = first
+                .conn
+                .as_ref()
+                .and_then(|c| c.seen_log_identity())
+                .expect("log B's identity");
+            assert_ne!(was, Some(now), "{arm}: B is another log");
+            let met = first.bus_met.expect("the attach met log B");
+            assert_eq!(met.log, now, "{arm}: met on B");
+            let (rows, _) = first.conn_now().unwrap().fetch(0, &subject, 8).unwrap();
+            let copies: Vec<u64> = rows
+                .iter()
+                .filter(|(_, face, b)| publication_identity(face, b) == identity)
+                .map(|(off, _, _)| *off)
+                .collect();
+            let [copy] = <[u64; 1]>::try_from(copies.clone()).unwrap_or_else(|_| {
+                panic!("{arm}: the replay published the post on B once: {copies:?}")
+            });
+            assert!(
+                copy >= met.head,
+                "{arm}: the replay's copy at {copy}, at or above the meeting at {}",
+                met.head
+            );
+            drop(first);
+            core.device.power_cut(&mut crate::sim::Rng::new(seed));
+
+            let (_second, mut next) = FakeVerbLane::bridge_with_state(&sessions, Some(&root));
+            next.cfg.broker = b;
+            assert!(next.attach_broker(), "{arm}: the attach after the cut");
+            let met = next.bus_met.expect("the next attach stands met on B");
+            assert_eq!(met.log, now, "{arm}: met on B after the cut");
+            if met.head > copy {
+                assert!(
+                    control,
+                    "{arm}: a cut put the meeting at {} above the replay's copy at {copy}",
+                    met.head
+                );
+                rose += 1;
+            }
+            next.close_subscriptions();
+        }
+        if control {
+            assert!(
+                rose > 0,
+                "CONTROL: no cut took back a re-base written as any other witness is"
+            );
+        }
     }
 }
 
@@ -10695,6 +11007,7 @@ fn a_known_log_identity_that_rewinds_is_refused_before_any_clock_mutation() {
     let witnessed = LogWitness {
         high: 20,
         id: Some(log),
+        met: None,
     };
     bridge.state.set_log_witness(&witnessed).unwrap();
     bridge.log_witness = witnessed;

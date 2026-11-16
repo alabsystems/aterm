@@ -552,8 +552,9 @@ fn a_glide_across_a_rewrap_lands_on_its_target_not_the_sum_of_its_ticks() {
     app.tick_scroll_glide(wid, end - Duration::from_millis(150));
     let mid = crate::term_lock(&term).grid().display_offset();
     assert!((4..9).contains(&mid), "fixture: mid-ease ({mid})");
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.cols = cols - 10;
+    drop(ws);
     app.resize_panes(wid);
     assert!(
         app.windows[&wid].scroll_glide.is_none(),

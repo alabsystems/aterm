@@ -274,9 +274,10 @@ fn receipt() -> InitialSetupApplyReceipt {
 
 fn page(app: &mut App) -> (WindowId, AppInstanceId, ViewId) {
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     let (instance, view) = app.active_native_view(wid).unwrap();
     // The worker's first read names the plan in force (§3.5).
@@ -2941,7 +2942,7 @@ mod observation_start {
             ..InitialSetupHandlers::inert_for_test()
         });
         let (wid, instance, view) = page(&mut app);
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 90;
         window.cols = 160;
         let mut saved = Plan {
@@ -2949,6 +2950,7 @@ mod observation_start {
             vault_url: "http://saved.invalid:7484/v1/team".into(),
         };
         saved.selection.set(Setting::Dock, true);
+        drop(window);
         fresh(
             &mut app,
             SetupStatus {
@@ -3248,12 +3250,13 @@ mod observation_start {
         app.perf_flip_at = Some(Instant::now());
         app.perf_shed_dwell = Duration::MAX;
         app.sync_chrome_fonts();
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 14;
         window.cols = 100;
         window.present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
         });
+        drop(window);
         app.window_focus_event(wid, true);
         tick(&mut app, Instant::now());
         assert_eq!(reads().as_slice(), std::slice::from_ref(&saved));
@@ -4353,7 +4356,7 @@ fn an_offer_clears_a_remembered_control_in_every_linked_view() {
     let (_, second) = app.active_native_view(wid).unwrap();
     assert_ne!(first, second);
     for view in [first, second] {
-        let state = app.native_runtime.view_state_mut(view).unwrap();
+        let mut state = app.native_runtime.view_state_mut(view).unwrap();
         state.common_mut().last_focus = Some(UiKey::new("system-state/vault/join"));
         state.common_mut().focus_visible = true;
     }
@@ -4955,9 +4958,10 @@ fn a_pointer_click_on_a_group_choice_takes_effect() {
     use crate::app_mouse::{NativePointerTarget, PointerAction};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 60;
     window.cols = 120;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.publish_system_state(SetupStatus {
         plan: Some(Plan::default()),
@@ -4996,10 +5000,11 @@ fn idle_ticks_keep_the_shown_frame() {
     use crate::app_mouse::{NativePointerTarget, PointerAction, WheelUnit};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 60;
     window.cols = 120;
     window.os_window_for_test = true;
+    drop(window);
     app.user_input_recent = |_| true;
     assert!(app.open_system_state_tab());
     let (_, view) = app.active_native_view(wid).unwrap();
@@ -5707,9 +5712,10 @@ fn observes(calls: &[String]) -> usize {
 fn a_page_opened_before_the_plan_reads_at_the_first_tick_that_knows_it() {
     let mut app = App::headless_for_test();
     app.set_system_state_handlers_for_test(handlers());
-    let window = app.windows.get_mut(&WindowId(0)).unwrap();
+    let mut window = app.windows.get_mut(&WindowId(0)).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     let start = Instant::now();
     app.system_state_host.next_status = Some(start + Duration::from_secs(3600));
@@ -6133,9 +6139,10 @@ fn only_a_persons_install_asks_for_the_command_line_tools_tab() {
     for client in [true, false] {
         let mut app = App::headless_for_test();
         let (wid, _, _) = page(&mut app);
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.os_window_for_test = true;
         window.focused = true;
+        drop(window);
         assert!(app.commit_glassless_native_frame(wid));
         assert!(app.system_state_frontmost_in(wid));
         app.headless = false;
@@ -6253,9 +6260,10 @@ fn a_page_opened_by_hand_reads_the_status_once() {
     let mut app = App::headless_for_test();
     app.set_system_state_handlers_for_test(handlers());
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     let now = Instant::now();
     app.tick_system_state(now);

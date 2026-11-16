@@ -92,14 +92,14 @@ fn two_window_capture_rebinds_unequal_complete_render_contexts() {
         "the regression must exercise genuinely unequal render contexts"
     );
     {
-        let window = app.windows.get_mut(&first).unwrap();
+        let mut window = app.windows.get_mut(&first).unwrap();
         window.scale = 1.0;
         window.metrics = first_metrics;
         window.blink_phase = false;
         window.focused = false;
     }
     {
-        let window = app.windows.get_mut(&second).unwrap();
+        let mut window = app.windows.get_mut(&second).unwrap();
         window.scale = 2.0;
         window.metrics = second_metrics;
         window.blink_phase = true;

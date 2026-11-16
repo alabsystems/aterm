@@ -1382,6 +1382,175 @@ impl EffectsPipeline {
             .emit_on(pet, cells, fallback, &mut self.decos, free, window)
     }
 
+    /// THE GLIDE RISES WITH ITS LAST STRIDE STEP INTO THE WALL. Held at the wall, its seat ahead
+    /// gives way to the sky seat as the caret types on into it, a rise of a row and the caret's
+    /// ring (39 px at a 26 px row): longer than its stride, so it flew there, and the flight's
+    /// middle frame was one more look for every pixel it crossed, past the flash law where the
+    /// glide's breath had already turned them (`lab trail-film --scene wrapped`, 3 pet pixels
+    /// over main's). Where the next stride step would not take its rest a whole stride on (`rest`
+    /// for the caret `cell`, against the rest a stride on), the seat ahead `seat` is lifted by
+    /// what the rise to a box clear of the caret's row and its ring of `gap` px has over a stride
+    /// (no more than a stride), with the step that took it there: a move it takes at once with a
+    /// step it makes anyway, and the rise left to the sky seat is a step too. Where that rise is
+    /// a step already, the lifted box would meet a letter or the caret's ring, or the seat is not
+    /// the rest itself on the caret's row, `None`.
+    fn wall_rise<F>(
+        &self,
+        (cell, rest): ((u16, u16), crate::word_decorations::CatFootprint),
+        (geom, look, frame): (
+            EffectGeom,
+            crate::kitty_registry::KittyLook,
+            crate::kitty_cursor::CatFrame,
+        ),
+        (seat, gap): (&crate::rainbow_kitty::companion::Seat, i32),
+        ink: &F,
+    ) -> Option<crate::rainbow_kitty::companion::Seat>
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        use crate::rainbow_kitty::companion;
+        #[cfg(any(test, debug_assertions))]
+        if companion::WALL_RISE_OFF.with(std::cell::Cell::get) {
+            return None;
+        }
+        let stride = WordDecorations::kitty_cursor_stride(frame.body);
+        if stride <= 1
+            || seat.lift_rows != 0
+            || seat.over_ink
+            || (seat.x, seat.y) != (rest.x, rest.y)
+        {
+            return None;
+        }
+        let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+        let stride_px = i32::from(stride) * cw;
+        let on = cell.1.saturating_add(stride);
+        if on < geom.cols {
+            let ahead =
+                self.decos
+                    .kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
+                        geom,
+                        cursor: (cell.0, on),
+                        look,
+                        body: frame.body,
+                        bob: frame.bob,
+                        lift: 0.0,
+                    })?;
+            if ahead.x - rest.x >= stride_px {
+                return None;
+            }
+        }
+        // The sky seat the wall then takes stands clear of the caret's row and its ring: rise now
+        // by what that rise has over a stride, and a pixel of breath at either end, so the rest
+        // of it is a step, and no further, so the fewest pixels see the glide in both places.
+        let sky_y = i32::from(cell.0) * ch - i32::from(seat.h) - gap;
+        let up = (seat.y - sky_y - stride_px + 2).min(stride_px);
+        if up <= 0 {
+            return None;
+        }
+        let mut risen = *seat;
+        risen.y = risen.y.checked_sub(up).filter(|&y| y >= 0)?;
+        risen.drop_px -= up;
+        companion::box_clear(
+            (risen.x, risen.y, i32::from(risen.w), i32::from(risen.h)),
+            cell,
+            (cw, ch, geom.rows, geom.cols),
+            gap,
+            ink,
+        )
+        .then_some(risen)
+    }
+
+    /// THE GLIDE HELD UP BY THE WALL STAYS UP. Lifted over the letters of the rows above the
+    /// caret's as it nears the wall (a shell's page over its last row), the glide came down to its
+    /// row's seat where those letters end, more than a stride, and rose again a stride later to
+    /// the sky seat the wall gave it: down 48 px and up 27 px in 100 ms at full alpha
+    /// (`lab trail-film --scene wall-72`). Where the row's `seat` for the caret `cell` lies below
+    /// where the frame before on this row landed it and its seat a stride on stands higher than
+    /// this one, it stays at that height, or comes down no lower than that seat a stride on, where
+    /// that is clear of the letters and of this caret's ring of `gap` px. Elsewhere `None`.
+    fn wall_held_up<F>(
+        &self,
+        cell: (u16, u16),
+        (geom, look, frame): (
+            EffectGeom,
+            crate::kitty_registry::KittyLook,
+            crate::kitty_cursor::CatFrame,
+        ),
+        (seat, gap): (&crate::rainbow_kitty::companion::Seat, i32),
+        ink: &F,
+    ) -> Option<crate::rainbow_kitty::companion::Seat>
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        use crate::rainbow_kitty::companion::{self, SeatQuery};
+        #[cfg(any(test, debug_assertions))]
+        if companion::WALL_HOLD_OFF.with(std::cell::Cell::get) {
+            return None;
+        }
+        let stride = WordDecorations::kitty_cursor_stride(frame.body);
+        let (cw, ch) = (i32::from(geom.cell_w), i32::from(geom.cell_h));
+        let up_y = match self.flying_seat_y {
+            Some((row, y)) if row == cell.0 => y,
+            _ => return None,
+        };
+        // Coming down from the seat it stood at by more than a pixel.
+        if stride <= 1 || seat.lift_rows != 0 || seat.y - up_y <= 1 {
+            return None;
+        }
+        let on = (cell.0, cell.1.saturating_add(stride));
+        if on.1 >= geom.cols {
+            return None;
+        }
+        let rest =
+            self.decos
+                .kitty_cursor_footprint(crate::word_decorations::KittyCursorLayout {
+                    geom,
+                    cursor: on,
+                    look,
+                    body: frame.body,
+                    bob: frame.bob,
+                    lift: 0.0,
+                })?;
+        let next = companion::placement(
+            on,
+            &SeatQuery {
+                geom: Geom {
+                    cw: usize::from(geom.cell_w),
+                    ch: usize::from(geom.cell_h),
+                    rows: usize::from(geom.rows),
+                    cols: usize::from(geom.cols),
+                    origin_x: 0,
+                    origin_y: 0,
+                    win_w: 0,
+                    win_h: 0,
+                    head: 0,
+                },
+                rest,
+                lead_px: WordDecorations::kitty_cursor_lead_px(geom.cell_w),
+                held_sky: false,
+                stride,
+            },
+            ink,
+        );
+        if next.over_ink || next.y >= seat.y {
+            return None;
+        }
+        // At the height it stood at, else as low as the seat a stride on.
+        [up_y, next.y.max(up_y)].into_iter().find_map(|y| {
+            let mut held = *seat;
+            held.drop_px += y - seat.y;
+            held.y = y;
+            companion::box_clear(
+                (held.x, held.y, i32::from(held.w), i32::from(held.h)),
+                cell,
+                (cw, ch, geom.rows, geom.cols),
+                gap,
+                ink,
+            )
+            .then_some(held)
+        })
+    }
+
     /// The flying head's route (`RAINBOW-KITTY-V2.md` §7.2, D13).
     #[inline]
     pub fn route_flying_head(
@@ -1446,6 +1615,9 @@ impl EffectsPipeline {
             self.flying_sky_row = None;
             self.flying_fit = companion::HeadFit::WHOLE;
             self.flying_fit_goal = None;
+            self.flying_take_off = None;
+            self.flying_leaves = false;
+            self.flying_seat_y = None;
             return FlyingSeat::default();
         };
         let look = cat_frame.render_look();
@@ -1464,6 +1636,11 @@ impl EffectsPipeline {
             return FlyingSeat::default();
         };
         let ink = |row: u16, col: u16| companion::cell_ink(cells, row, col, geom.cols);
+        // The glide steps its stride in every seat, behind the caret and fitted to its row as
+        // ahead of it ([`crate::word_decorations::GLIDE_STRIDE`]).
+        let stride = WordDecorations::kitty_cursor_stride(cat_frame.body);
+        // The glide rises off the caret's row by the wall rather than shrink there.
+        let rises = matches!(cat_frame.body, crate::kitty_cursor::CursorBody::Glide(_));
         let seat = companion::placement(
             cell,
             &SeatQuery {
@@ -1481,6 +1658,7 @@ impl EffectsPipeline {
                 rest,
                 lead_px: WordDecorations::kitty_cursor_lead_px(geom.cell_w),
                 held_sky: self.flying_sky_row == Some(cell.0),
+                stride,
             },
             ink,
         );
@@ -1491,19 +1669,15 @@ impl EffectsPipeline {
         let gap = (WordDecorations::kitty_cursor_lead_px(geom.cell_w)
             / crate::word_decorations::HEAD_CARET_GAP_DEN)
             .max(1);
-        let floor = self.decos.kitty_cursor_fit_floor(
-            crate::word_decorations::KittyCursorLayout {
-                geom,
-                cursor: cell,
-                look,
-                body: cat_frame.body,
-                bob: cat_frame.bob,
-                lift: 0.0,
-            },
+        let fit_seat = companion::head_fit_seat(
+            cell,
             rest,
+            (cw, ch, geom.rows, geom.cols),
+            (gap, stride, rises),
+            &ink,
         );
-        let fit_seat =
-            companion::head_fit_seat(cell, rest, (cw, ch, geom.cols), (gap, floor), &ink);
+        let leaves = matches!(fit_seat, Some(companion::HeadFitSeat::Leave));
+        let fit_seat = fit_seat.and_then(companion::HeadFitSeat::fit);
         let whole_clear = !seat.over_ink
             && companion::box_clear(
                 (seat.x, seat.y, i32::from(seat.w), i32::from(seat.h)),
@@ -1512,17 +1686,104 @@ impl EffectsPipeline {
                 gap,
                 &ink,
             );
+        // On its last stride step into the wall it rises with that step, so the rise to the sky
+        // seat the wall then takes is short enough to take at once.
+        let seat = match self.wall_rise((cell, rest), (geom, look, *cat_frame), (&seat, gap), &ink)
+        {
+            Some(risen) if whole_clear && rises => risen,
+            _ => seat,
+        };
+        let seat = match self.wall_held_up(cell, (geom, look, *cat_frame), (&seat, gap), &ink) {
+            Some(held) if whole_clear && rises => held,
+            _ => seat,
+        };
+        // No seat holds it, whole or fitted: it leaves the wall ([`Self::prepare_flying_head`]).
+        self.flying_leaves = leaves && !whole_clear;
         self.flying_fit_goal = fit_seat.map(|(goal, _)| (goal, now, animate));
+        // Risen off the caret's row by the wall: it goes out from its row's seat for this caret,
+        // a stride on from where it was drawn, never from that place, which the caret has typed
+        // into.
+        self.flying_take_off = fit_seat
+            .filter(|&(_, rect)| companion::fit_row(rect, ch) != cell.0)
+            .map(|(goal, _)| {
+                companion::fitted_head(cell, rest, goal, (cw, ch, geom.cols), (gap, stride), 0).rect
+            })
+            .filter(|&rect| {
+                companion::box_clear(rect, cell, (cw, ch, geom.rows, geom.cols), 0, &ink)
+            })
+            .map(|(x, y, _, _)| (x, y));
+        // A head coming on glass where no whole seat clears, even kept off the letters, is fitted
+        // on its first frame, not from the frame after it was drawn whole over them
+        // (`lab trail-film --scene last-row`: its first frame lay on the row above's letters).
+        // So is a glide about to fly to such a seat (a program's lines under it, a prompt drawn
+        // far down): its flight carries its size there step by step, and its take-off frame drew
+        // the whole landing over the letters there.
+        #[cfg(any(test, debug_assertions))]
+        let fits_late = companion::FIT_LATE.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let fits_late = false;
+        let flies = rises
+            && self.decos.kitty_cursor_flies_to(
+                now,
+                (seat.x, seat.y),
+                (i32::from(stride) * cw, ch / 4),
+            );
+        if !fits_late
+            && !self.flying_fit.fitted()
+            && !whole_clear
+            && (!self.decos.kitty_cursor_on_glass(now) || flies)
+            && let Some((goal, _)) = fit_seat
+        {
+            let facing_left = self.companions.cursor_cat.placement_frame(now).facing_left;
+            let mut pose = cat_frame.pose;
+            if geom.cell_w > 0 {
+                let lead_cells = seat.x.saturating_sub(rest.x) as f32 / f32::from(geom.cell_w);
+                pose.lead += if facing_left { -lead_cells } else { lead_cells };
+            }
+            let whole = crate::word_decorations::KittyCursorFrame {
+                geom,
+                cursor: cell,
+                look,
+                body: cat_frame.body,
+                colors: crate::cat_baker::CatColorKey::default(),
+                bob: cat_frame.bob,
+                lift: seat.lift(geom.cell_h),
+                alpha: u8::MAX,
+                pose,
+                sing: 0.0,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            };
+            let kept_clear = self
+                .decos
+                .kitty_cursor_kept_off(&whole, ink, false)
+                .and_then(crate::word_decorations::KittyCursorPlacement::drawn_footprint)
+                .is_some_and(|r| {
+                    companion::box_clear(
+                        (r.x, r.y, i32::from(r.w), i32::from(r.h)),
+                        cell,
+                        (cw, ch, geom.rows, geom.cols),
+                        0,
+                        &ink,
+                    )
+                });
+            if !kept_clear {
+                self.flying_fit.aim(goal, now, false);
+            }
+        }
         match fit_seat {
-            Some((goal, (x, _, w, _))) if self.flying_fit.fitted() && !whole_clear => {
+            Some((goal, rect @ (x, _, w, _))) if self.flying_fit.fitted() && !whole_clear => {
                 // Less room past the caret takes the fit down at once: eased, the wider box
                 // stood over the caret's cell for the ease's frames, a key at a time by the wall.
                 let now_w = (f32::from(rest.w) * self.flying_fit.at(now)).round() as i32;
                 let caret_right = (i32::from(cell.1) + 1).saturating_mul(cw);
-                let over_caret = x + w - now_w < caret_right;
+                let over_caret =
+                    companion::fit_row(rect, ch) == cell.0 && x + w - now_w < caret_right;
                 self.flying_fit.aim(goal, now, animate && !over_caret);
             }
-            _ if self.flying_fit.fitted() => self.flying_fit.aim(1.0, now, animate),
+            // Leaving the wall, it keeps the size it leaves at.
+            _ if self.flying_fit.fitted() && !self.flying_leaves => {
+                self.flying_fit.aim(1.0, now, animate);
+            }
             _ => {}
         }
         let fit = self.flying_fit.at(now);
@@ -1531,11 +1792,20 @@ impl EffectsPipeline {
             // margin's rise back off, and the pose's lead carries it from its whole box's middle
             // to its place.
             let bob_px = (cat_frame.bob * f32::from(geom.cell_h)).round() as i32;
+            // On the row its seat stands on: the caret's, or a blank one above it by the wall.
+            let row = fit_seat.map_or(cell.0, |(_, rect)| companion::fit_row(rect, ch));
             let companion::FittedHead {
                 rect: (x, y, w, h),
                 lift,
                 lead_px,
-            } = companion::fitted_head(cell, rest, fit, (cw, ch, geom.cols), gap, bob_px);
+            } = companion::fitted_head(
+                (row, cell.1),
+                rest,
+                fit,
+                (cw, ch, geom.cols),
+                (gap, stride),
+                bob_px,
+            );
             if geom.cell_w > 0 {
                 let facing_left = self.companions.cursor_cat.placement_frame(now).facing_left;
                 let lead_cells = lead_px as f32 / f32::from(geom.cell_w);
@@ -1616,11 +1886,12 @@ impl EffectsPipeline {
             placement.keep_fitted_off_letters(layout.geom, layout.cursor, ink);
         } else {
             placement.keep_off_letters(layout.geom, layout.cursor, ink);
-            // The whole head nothing cleared: fit it, from the next frame. Not for its way across
-            // a wrap, which passes over letters on its way to a seat that may well clear.
+            // The whole head nothing cleared at its landing: fit it, from the next frame. Not for
+            // its way across a wrap, which passes over letters on its way to a seat that may well
+            // clear, nor for its place on a flight, which is laid off them.
             if !placement.in_motion()
                 && let (Some(rect), Some((goal, now, animate))) =
-                    (placement.drawn_footprint(), self.flying_fit_goal)
+                    (placement.landing_footprint(), self.flying_fit_goal)
                 && !crate::rainbow_kitty::companion::box_clear(
                     (rect.x, rect.y, i32::from(rect.w), i32::from(rect.h)),
                     layout.cursor,
@@ -1637,6 +1908,25 @@ impl EffectsPipeline {
                 self.flying_fit.aim(goal, now, animate);
             }
         }
+        // Off a wall that holds no seat for it, held where it was, and back once one does.
+        self.decos
+            .veil_kitty_cursor(&mut placement, motion.sampled_at, self.flying_leaves);
+        if self.flying_leaves {
+            self.flying_seat_y = None;
+            return Some(placement);
+        }
+        // A move past the glide's stride is flown, never drawn whole at its end on its own frame,
+        // and the glide's every flight is laid over these letters, off them and the caret, and
+        // stepped at its stride.
+        self.decos.fly_kitty_glide(
+            &mut placement,
+            (layout, crate::word_decorations::FLIGHT_FRAME),
+            self.flying_take_off,
+            ink,
+        );
+        self.flying_seat_y = placement
+            .landing_footprint()
+            .map(|rect| (layout.cursor.0, rect.y));
         Some(placement)
     }
 

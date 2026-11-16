@@ -64,7 +64,23 @@ impl Spool {
 
     /// This user's spool: `<aterm state>/alab/`.
     pub fn local() -> Option<Self> {
-        aterm_types::dirs::state_dir().map(|state| Self::at(state.join("alab")))
+        aterm_types::dirs::state_dir().map(|state| Self::under(&state))
+    }
+
+    /// The spool of the aterm state folder `state`: `<state>/alab/`.
+    pub fn under(state: &Path) -> Self {
+        Self::at(state.join("alab"))
+    }
+
+    /// The outbox's file ([`OUTBOX`]), which holds at most [`MAX_SPOOL`].
+    pub fn outbox_file(&self) -> PathBuf {
+        self.dir.join(OUTBOX)
+    }
+
+    /// The heard archive's folder and the most bytes it is held to: what the flusher's
+    /// archive writes and prunes (`super::heard`).
+    pub fn heard_archive(&self) -> (PathBuf, u64) {
+        (self.dir.join(super::heard::HEARD), super::heard::HEARD_MAX)
     }
 
     /// The folder it lives in.

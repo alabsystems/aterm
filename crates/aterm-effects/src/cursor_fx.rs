@@ -1415,6 +1415,7 @@ impl CursorFx {
             || self.beamrod.is_active()
             || self.comet.is_active()
             || self.phaser.is_active()
+            || self.glow.thin_caret_releasing()
     }
 
     /// A body that still owes frames but not the frame cadence, once its fingerprint stops moving
@@ -1953,9 +1954,10 @@ impl CursorFx {
         // A focused block caret fills its cell; a bar, an underline or an unfocused outline
         // leaves its cell's ground beside a neighbour's letter.
         let caret_block = f.focused && is_block(f.cursor_style);
+        let caret_thin = thin_bar(f.cursor_style).filter(|_| f.focused);
         let guarded = self.glow.guard_letters(
             &mut self.glow_scratch,
-            (cur, caret_block),
+            (cur, caret_block, caret_thin),
             (geom, glow_cfg),
             (&self.trail_scratch, trail_cfg.color),
         );
@@ -2013,9 +2015,9 @@ impl CursorFx {
         // it (looks8 WIDEN move-up: the `!` read 1.00:1).
         let bolt_down = bolt_cursor && self.glow.caret_bolt_stands_down(cur);
         let glow_fp = glow_fp ^ u64::from(bolt_fill.unwrap_or(0)).rotate_left(59);
-        // A bar or underline caret reads against the light of its own cell (a trail cell's
-        // blend under it, the lights over it): where its colour at its lightest (dark) or
-        // darkest (paper) cannot, that light is held there
+        // A bar or underline caret reads against the light of its own cell and the light
+        // beside its line (each cell's trail blend, the lights over them): where its colour at
+        // its lightest (dark) or darkest (paper) cannot, the light that fails is held there
         // (`CursorGlow::hold_light_for_thin_caret`); its colour is lifted below.
         let thin = match (cur, f.focused, thin_bar(f.cursor_style)) {
             (Some(cell), true, Some(bar)) => Some(crate::cursor_glow::ThinCaret {
@@ -2040,11 +2042,16 @@ impl CursorFx {
                 _ => caret.page,
             }
         });
+        let trail_cells: &[TrailCell] = if trail_cfg.enabled {
+            &self.trail_scratch
+        } else {
+            &[]
+        };
         let held = self.glow.hold_light_for_thin_caret(
             &mut self.glow_scratch,
             thin.zip(under),
-            geom,
-            glow_cfg.style,
+            (geom, glow_cfg.style, f.now),
+            (trail_cells, trail_cfg.color),
         );
         let glow_fp = glow_fp ^ held.rotate_left(29);
         let momentum_fill = match (momentum_frame.fill, sparkle_paper_gold) {
@@ -2110,7 +2117,7 @@ impl CursorFx {
         // The thin caret's colour, lifted in lightness to read against its cell's light.
         let thin_fill = self
             .glow
-            .thin_caret_fill(block_fill.map_or(f.live_cursor, |owned| owned.fill));
+            .thin_caret_fill(block_fill.map_or(f.live_cursor, |owned| owned.fill), f.now);
         let glow_fp = match thin_fill {
             Some(fill) => glow_fp.rotate_left(11) ^ (u64::from(fill) | (1 << 33)),
             None => glow_fp,

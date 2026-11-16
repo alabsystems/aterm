@@ -75,7 +75,7 @@ aterm-codec = { workspace = true }
 # shared /tmp can be pre-created by another user).
 aterm-tempfile = { workspace = true }
 # The seal a generated file carries (`seal::line`, `stamp`, `check`): `adopt` writes trust.lock.
-aterm-census = { workspace = true }
+aterm-seal = { workspace = true }
 
 [dev-dependencies]
 # The loopback GitHub the read contract drives AghHost and RestHost against.

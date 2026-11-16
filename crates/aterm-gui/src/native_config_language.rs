@@ -1065,7 +1065,7 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "sys.stats_bars",
-        "Stats bars: under the titlebar, in the bottom padding, or off",
+        "Stats bars: the deck where a window shows System Resources, the sill, or off",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: STATS_BARS_FORMS,
         }),
@@ -3567,8 +3567,22 @@ fn reader_accepted_paths() -> &'static BTreeSet<String> {
                 .map(|key| format!("disk.{key}")),
         );
         paths.extend(amacs::config::KEYS.iter().map(|key| format!("amacs.{key}")));
+        // The harness registry's keys (`atpkg::config::load_harness`): the development-link
+        // list, the words given to links, and the shells' strip list.
+        paths.insert(format!(
+            "harness.{}",
+            aterm_agent::supervise::config::REGISTRY_DEV
+        ));
+        paths.insert("shell_env_strip".to_string());
+        paths.insert(registry_lead_path());
         paths
     })
+}
+
+/// `harness.lead`: the harness registry's map of agent words to the link that leads each
+/// (`atpkg::config::load_harness`), whose keys are words the person writes.
+fn registry_lead_path() -> String {
+    format!("harness.{}", aterm_agent::supervise::config::REGISTRY_LEAD)
 }
 
 #[derive(Clone, Copy)]
@@ -4292,6 +4306,10 @@ fn warn_unknown_item(
         // Dynamic map keys are authored names. Flexible values have no stable
         // descendant schema outside the explicitly registered structured-list
         // records handled above.
+        return;
+    }
+    if path == registry_lead_path() {
+        // A word map the registry reads: its keys are the person's agent words.
         return;
     }
     if let Some(table) = item.as_table_like() {
@@ -5856,7 +5874,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · on (the default): a record of what each session did under the logs folder's `session-log/`: each command's program name (`detail=`: the wrapper's own name when the wrapper's flags are not known, and for a listed tool one known subcommand word; only a program that ran or a shell builtin is named, so a word that ran nothing, such as a secret typed at a prompt, is never kept) and the foreground program's name (`prog=`), outcomes and durations, agent turns and their tools' names, the session's folder (`cwd=`), its meta values (an attention text only as a fingerprint), mail's sender, recipient and offsets; never a command's other arguments, an OSC title, a mail's body or an agent's transcript text · files 0600 in a 0700 folder, the oldest deleted first to keep its own near 64 MiB and 2048 files (files a running instance still writes can hold it above that), so `aterm ctl @<sid> log` and `aterm ctl @<sid> brief` answer for a session from an earlier run or a crash · off: aterm keeps no journal, creates no file and deletes nothing · read at launch; follows restore_session; a window's only · macOS and Linux"
         }
         "sys.stats_bars" => {
-            " · default deck: a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so · sill: thin lanes in the window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
+            " · default deck: in each window that shows System Resources, a table under the titlebar with one row per resource, CPU, GPU, memory, disk, network and processes, plus the cores: each row's multi-scale heat strip, the widest thing on the row (blocks of 1 s, 10 s, 1 min, 10 min and 1 h, up to 6 h where the strip has the room, 4 h, 6 min or 1 min on a narrower one, cold to hot, 0 to 100% of that resource's max, the live now cell at the left in the strip's own colours, older and wider cells to its right, hollow cells where nothing was read, plus gap and crash/sleep markers), its % now, a Global ⊇ aterm ⊇ Tab bar on its capacity keyed once over the bars, and at the bar's end, where it fits, this Mac's amount in the row's unit with the row's maximum, else the machine's maxima in the key (aterm's and the tab's amounts are in the close-up); Folded, or Full where `stats_deck_size` says so; every other window shows the sill; the first window aterm opens shows System Resources, and View ▸ Show System Resources Here gives it to a window or takes it away · sill: thin lanes in every window's bottom padding, which takes no terminal row (needs 8 pt of padding) · off: no bars, and the terminal gets the Deck's rows back · rest the pointer on a row, or press ⌘I, for the close-up · View ▸ Stats Bars picks one · read live"
         }
         "sys.stats_deck_size" => {
             " · default auto: the Deck stays Folded, two blocks of four rows in 62 pt, however tall the window · full: always Full, a header line and a row per resource in about 100 pt, which takes whole terminal rows · folded: always Folded · decided when a window opens, resizes, changes display or the font changes, never by what the deck shows · View ▸ Deck Size picks one · read live"

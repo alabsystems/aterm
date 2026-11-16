@@ -65,7 +65,7 @@ fn native_front_freezes_active_rain_and_parks_its_deadline() {
     let model = rain_front_scheduler_model();
     let mut state = model.init_state();
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window");
         ws.fx.build_rain(rain_cfg());
         ws.next_rain_tick = Some(deadline);
         assert!(ws.matrix_rain_frame_period().is_some());

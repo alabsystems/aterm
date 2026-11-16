@@ -695,12 +695,13 @@ pub(crate) fn resolve_all(_instances: &[String], _budget: Duration) -> Vec<Disco
     Vec::new()
 }
 
-/// Resolve each `alab-secrets` holder of `instances` within `budget` without collapsing
-/// equal-URL collisions (`DESIGN-fluid-swarm` §4.1 F7: two holders after a heal both resolve
-/// `alab-secrets.local:7484`, distinguished by `label=` in their TXT); an exact repeat is kept
-/// once.
+/// Resolve each of `instances` within `budget` without collapsing equal-URL instances: two
+/// holders after a heal both resolve `alab-secrets.local:7484`, distinguished by `label=` in
+/// their TXT (`DESIGN-fluid-swarm` §4.1 F7), and a vault server's round gates its pulls on each
+/// instance's TXT, so one instance must not replace another's TXT ([`crate::server::VaultTxt`]:
+/// an instance only adds to what its endpoints are pulled for). An exact repeat is kept once.
 #[cfg(all(target_os = "macos", not(test)))]
-fn resolve_alab_holders(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
+fn resolve_instances(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
     let mut out = Vec::new();
     for item in resolve_each_vault(instances, budget, |event| {
         resolved_vault(event, crate::ALAB_VAULT)
@@ -713,7 +714,7 @@ fn resolve_alab_holders(instances: &[String], budget: Duration) -> Vec<Discovere
 }
 
 #[cfg(any(test, not(target_os = "macos")))]
-fn resolve_alab_holders(_instances: &[String], _budget: Duration) -> Vec<DiscoveredVault> {
+fn resolve_instances(_instances: &[String], _budget: Duration) -> Vec<DiscoveredVault> {
     Vec::new()
 }
 
@@ -982,6 +983,17 @@ impl Watch {
         self.watched.begin(ago);
     }
 
+    /// Forget that this process advertises `name`: its `Add` rows wake the watch again, as any
+    /// peer's do. A vault server holds `alab-secrets` only while it holds the name, and the
+    /// holder another server's browse hears then is a peer.
+    pub fn forget_own(&self, name: &str) {
+        self.watched
+            .own
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|own| !own.eq_ignore_ascii_case(name));
+    }
+
     /// Record an instance name advertised by this process so its own `Add` rows do not wake it.
     pub fn note_own(&self, name: &str) {
         if name.is_empty() {
@@ -1056,7 +1068,8 @@ impl Watch {
     /// Resolve peer instances heard now (excluding this server's own primary instance names), at
     /// most [`MAX_CANDIDATES`] ([`rotated`]: each call takes the next of them), within `budget`
     /// (`DESIGN-fluid-swarm` §4.1 F6): how many names it handed its resolver, and what they
-    /// resolved to. A watch of another service than `_alab-vault._tcp` resolves none.
+    /// resolved to, one entry for each instance however many share a URL (an exact repeat once).
+    /// A watch of another service than `_alab-vault._tcp` resolves none.
     #[must_use]
     pub fn peer_vaults(&self, budget: Duration) -> (usize, Vec<DiscoveredVault>) {
         if !self.watched.is_vault() {
@@ -1070,7 +1083,7 @@ impl Watch {
         if let Some(resolve) = &self.watched.resolve_vaults {
             return (names.len(), resolve(&names, budget));
         }
-        (names.len(), resolve_all(&names, budget))
+        (names.len(), resolve_instances(&names, budget))
     }
 
     /// The instances [`Watch::peer_vaults`] resolves now.
@@ -1109,7 +1122,7 @@ impl Watch {
         if let Some(resolve) = &self.watched.resolve_vaults {
             return (names.len(), resolve(&names, budget));
         }
-        (names.len(), resolve_alab_holders(&names, budget))
+        (names.len(), resolve_instances(&names, budget))
     }
 
     fn holder_names(&self) -> Vec<String> {

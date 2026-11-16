@@ -8324,8 +8324,13 @@ fn invalid_kitty_source_fails_closed_instead_of_using_builtin_art() {
 /// off the caret's cell and every lettered cell, pushed ahead with air
 /// between it and the caret or lifted clear, and the follower carries on
 /// from where it was drawn. Control: `HEAD_KEEPS_OFF_OFF` draws it where
-/// the follower put it, over the caret (for the glide, with the follower it
-/// does not have brought back by `GLIDE_FOLLOWS`).
+/// the follower put it, over the caret. The glide has no follower (it is
+/// drawn at its rest, `GLIDE_FOLLOWS`), so it is held to the law with the
+/// follower brought back too, which the keep-off alone must hold off, and its
+/// control is that run with the keep-off off; as it ships, its rest is off
+/// the caret by construction (read off the caret's column rounded up to its
+/// stride), so with the keep-off off it lies on nothing in this burst, and the
+/// margin below is where its keep-off bites.
 #[test]
 fn the_flying_head_keeps_off_the_caret_and_the_letters() {
     // Held for the head and for the flier's glide (its footprint is its ink box).
@@ -8355,12 +8360,10 @@ fn the_flying_head_keeps_off_the_caret_and_the_letters() {
             }
             hits
         };
-        // The glide has no follower (it is drawn at its rest, `GLIDE_FOLLOWS`), so its control
-        // brings the follower back as well: the keep-off is what holds a trailed body off.
         let glide = body != crate::kitty_cursor::CursorBody::Head;
-        let run = |keep: bool| {
+        let run = |follows: bool, keep: bool| {
             HEAD_KEEPS_OFF_OFF.with(|c| c.set(!keep));
-            GLIDE_FOLLOWS.with(|c| c.set(glide && !keep));
+            GLIDE_FOLLOWS.with(|c| c.set(follows));
             let mut wd = WordDecorations::default();
             // A burst: the caret steps a cell every 16 ms from column 4 to 9.
             let mut worst = Vec::new();
@@ -8402,18 +8405,33 @@ fn the_flying_head_keeps_off_the_caret_and_the_letters() {
             GLIDE_FOLLOWS.with(|c| c.set(false));
             (worst, gaps)
         };
-        let (kept, gaps) = run(true);
-        assert!(kept.is_empty(), "the head lay on {kept:?}");
         let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
-        assert!(
-            gaps.iter().all(|&d| d >= gap),
-            "air between the caret and the head: {gaps:?} (at least {gap})"
-        );
-        let (trailed, _) = run(false);
+        // As it ships, and for the glide with a follower trailing it too: the keep-off holds it.
+        let cases: &[bool] = if glide { &[false, true] } else { &[false] };
+        for &follows in cases {
+            let (kept, gaps) = run(follows, true);
+            assert!(
+                kept.is_empty(),
+                "the head lay on {kept:?} (follower {follows})"
+            );
+            assert!(
+                gaps.iter().all(|&d| d >= gap),
+                "air between the caret and the head: {gaps:?} (at least {gap}, follower {follows})"
+            );
+        }
+        let (trailed, _) = run(true, false);
         assert!(
             !trailed.is_empty(),
             "control: the follower trails the head into the caret"
         );
+        if glide {
+            let (bare, _) = run(false, false);
+            assert!(
+                bare.is_empty(),
+                "the glide's rest lay on {bare:?} with no keep-off: its stride no longer rounds it \
+                 up past the caret"
+            );
+        }
 
         // The right margin: no room ahead, so the head is lifted clear of the
         // caret's row; the follower's state moves with it.

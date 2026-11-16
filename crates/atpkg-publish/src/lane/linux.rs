@@ -1563,7 +1563,7 @@ impl Run<'_> {
                 let bytes =
                     crate::identity::read_regular_bytes(&path, crate::identity::MAX_META_BYTES)
                         .map_err(|e| Error::io(format!("read {}", path.display()), &e))?;
-                Ok((bytes, manifest))
+                Ok((bytes, *manifest))
             }
             Fetched::Absent(why) | Fetched::Unreachable(why) | Fetched::Invalid(why) => {
                 Err(Error::refused(format!(

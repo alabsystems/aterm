@@ -576,6 +576,7 @@ pub fn stage(
     let hooks = crate::install::StageHooks {
         pre_swap: Some(&verify),
         sidecars: Some(&sidecars),
+        records: &[],
         ..crate::install::StageHooks::NONE
     };
     let root = crate::install::stage_local_binary(&parent, &artifact, input, &dir, &hooks)

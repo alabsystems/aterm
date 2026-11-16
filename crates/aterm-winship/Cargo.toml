@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "aterm-winship — the Windows owner loop: smoke a packaged build headless in an isolated environment, build and stage origin/main, schedule that daily, and build a release cut's Windows zip and the receipt the release cutter admits (dev tool, never shipped)"
+description = "aterm-winship — the Windows owner loop: smoke a packaged build headless in an isolated environment, build and stage origin/main, schedule that daily, build a release cut's Windows zip and the receipt the release cutter admits, and serve the pump's requests for one through the dev repository, signed by a pinned builder key (dev tool, never shipped)"
 
 [[bin]]
 name = "aterm-winship"
@@ -45,6 +45,13 @@ aterm-toolchain = { workspace = true }
 # (aterm-release derives its own records the same way).
 serde = { workspace = true, features = ["derive"] }
 aterm-toml = { workspace = true }
+# The pull lane's attestation (`attest`): the builder's Ed25519 key made and used to sign by
+# ring with its default features (the RNG for keygen; a dev tool, never shipped, and the
+# cutter that links it already unifies them through atpkg-keys), and every signature checked
+# by astream's strict verify, which refuses the small-order keys ring alone takes
+# (clippy.toml: strict Ed25519). The cutter verifies through this same code.
+ring = { workspace = true, features = ["default"] }
+astream-aead = { path = "../../vendor/astream/crates/astream-aead", default-features = false, features = ["signature"] }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }

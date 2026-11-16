@@ -846,11 +846,13 @@ impl App {
             view.picked = Some((grid_row, col));
         }
         let drag_pane = self.focused_pane_rect_with_plan(wid, frame_plan);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.staged_drag_pane = Some(drag_pane);
         }
         self.begin_selection(wid, aterm_core::selection::SelectionType::Simple);
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.staged_drag_pane = None;
         }
         self.request_redraw_all_windows();
@@ -1166,9 +1168,10 @@ impl App {
     /// Pause window `wid`'s running hosted effects while its focused pane is rewound and resume them once it is not, keeping the head Rewind paused at so a pause made since (a repair, `aos pause`) is left as it is.
     pub(crate) fn rewind_reconcile_effects(&mut self, wid: WindowId) {
         let rewound = self.rewound_front(wid).is_some();
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let lane = ws.effect_present_interval();
         if rewound {
             // A key held for its echo cannot be proven against a rewound pane: the recording stops
@@ -1212,7 +1215,8 @@ impl App {
 
     /// Drop every window's link hover, which was probed against a live screen.
     fn forget_hover(&mut self) {
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             ws.link_hover = None;
             ws.hover_memo = None;
         }

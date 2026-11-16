@@ -4,8 +4,8 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, SessionSlot,
-    StatusObserver, StatusPolicy,
+    PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, StatusObserver,
+    StatusPolicy,
 };
 use crate::presence::Cursor;
 use crate::{App, WindowId};
@@ -33,13 +33,8 @@ fn a_late_program_answer_owns_one_observation_wake() {
     let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.insert(
-        id,
-        SessionSlot {
-            next_due: t0 + floor,
-            ..SessionSlot::new(policy, t0)
-        },
-    );
+    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.reschedule(id, t0 + floor);
     observer.agent_observe(
         id,
         generation,
@@ -51,7 +46,8 @@ fn a_late_program_answer_owns_one_observation_wake() {
         "",
         t0,
     );
-    observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, t0 + floor * 2);
     observer.agent_observe(
         id,
         generation,
@@ -841,7 +837,7 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let _ = obs.observe(1, &ev, t1);
     assert!(!obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, false, t1));
     let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, "", t1);
-    let due = obs.sessions[&1].next_due;
+    let due = obs.sessions.get(&1).unwrap().next_due;
     assert!(
         obs.next_wake().is_none_or(|w| w > due),
         "NEGATIVE CONTROL: nothing owes a look at {due:?} yet"
@@ -871,10 +867,13 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let t3 = t2 + interval;
     let _ = obs.observe(1, &ev, t3);
     let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, "", t3);
-    let due = obs.sessions[&1].next_due;
+    let due = obs.sessions.get(&1).unwrap().next_due;
     assert!(obs.next_wake().is_none_or(|w| w > due), "settled again");
     obs.note_skipped(1, t3);
-    assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
+    assert_eq!(
+        obs.next_wake(),
+        Some(obs.sessions.get(&1).unwrap().next_due)
+    );
 }
 
 /// Continuous output pushes the owed look forward until output pauses.
@@ -921,7 +920,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     for _ in 0..12 {
         at += gap;
         obs.note_output(1, at);
-        if obs.sessions[&1].next_due <= at {
+        if obs.sessions.get(&1).unwrap().next_due <= at {
             let _ = obs.observe(1, &ev, at);
             let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, "", at);
             looks += 1;
@@ -940,7 +939,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
     let last = at + gap;
     obs.note_output(1, last);
     assert!(
-        obs.sessions[&1].next_due > last,
+        obs.sessions.get(&1).unwrap().next_due > last,
         "fixture: not due at the burst"
     );
     assert_eq!(obs.next_wake(), Some(last + interval));
@@ -1266,14 +1265,25 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
 fn the_status_record_counts_the_history_an_update_could_not_carry() {
     use crate::handoff_history::{ImportReport, record_reports};
     let (mut app, sid) = app_with_stub();
+    let opened = app
+        .pool
+        .get(sid)
+        .unwrap()
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .slog()
+        .opened_ms()
+        .expect("the stub's log opened");
     let record = app.session_status_record(sid).expect("live");
     assert!(
-        record.contains(
+        record.contains(&format!(
             " history_lost=0 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 \
-             log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
-        ),
+             log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- opened_ms={opened} rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+        )),
         "{record}"
     );
     let whole = [ImportReport {
@@ -1311,12 +1321,12 @@ fn the_status_record_counts_the_history_an_update_could_not_carry() {
     app.settle_handoff_history(&failed);
     let record = app.session_status_record(sid).expect("live");
     assert!(
-        record.contains(
+        record.contains(&format!(
             " history_lost=1234 journal=off journal_off=keeper-off integration_rev=- born=cold render=ok \
              resizes=0 flaps=0 land_at=- task=- pause=- land_held=- land_nudges=- land_since=- \
              held=- waiting=- land_asked=- landed_head=- landed_on=- landed_leg=- landed_repo=- end=- end_seen=- end_cheered=- done_unseen=0 goal=- task_state=- task_rev=0 \
-             log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
-        ),
+             log_seq=2 log_ep=1 log_base=1 run=- turn=- step=- need=- need_since_ms=- opened_ms={opened} rollout=- rollout_asks=0 log_journal=off log_journal_why=- exec_watch=none exec_watch_why=- editing=0 editor=- bells=0 bells_sounded=0 last_bell=- gen="
+        )),
         "{record}"
     );
     assert!(app.has_live_message("Couldn't carry all scrollback"));
@@ -1391,13 +1401,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.insert(
-        id,
-        SessionSlot {
-            next_due: t0 + floor,
-            ..SessionSlot::new(policy, t0)
-        },
-    );
+    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.reschedule(id, t0 + floor);
 
     assert!(observer.program_due(id, true, None, generation, t0));
     observer.note_program_request(id, pgid, t0);
@@ -1422,7 +1427,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert_eq!(observer.next_wake(), Some(t0 + floor));
 
-    observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, t0 + floor * 2);
     observer.agent_observe(
         id,
         generation,
@@ -1454,7 +1460,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         modeled["attempts"]
     );
 
-    observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, first_retry + floor);
     observer.agent_observe(
         id,
         generation,
@@ -1467,7 +1474,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         first_retry,
     );
     assert_eq!(observer.next_wake(), Some(first_retry + floor));
-    observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor * 2;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, first_retry + floor * 2);
     observer.agent_observe(
         id,
         generation,
@@ -1497,7 +1505,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     observer.note_program_request(id, pgid, second_retry);
     assert!(model.fire("Retry", &mut modeled));
     assert_eq!(observer.agents[&id].resolve_attempts, 3);
-    observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, second_retry + floor);
     observer.agent_observe(
         id,
         generation,
@@ -1509,7 +1518,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         "",
         second_retry,
     );
-    observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor * 2;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, second_retry + floor * 2);
     observer.agent_observe(
         id,
         generation,
@@ -1583,7 +1593,8 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         "",
         exec_at,
     );
-    observer.sessions.get_mut(&id).unwrap().next_due = exec_at + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, exec_at + floor);
     assert_eq!(
         observer.next_wake(),
         Some(exec_at + Duration::from_millis(250))
@@ -1682,13 +1693,8 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     let later = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.insert(
-        id,
-        SessionSlot {
-            next_due: t0 + floor,
-            ..SessionSlot::new(policy, t0)
-        },
-    );
+    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.reschedule(id, t0 + floor);
 
     observer.note_program_request(id, pgid, t0);
     assert!(model.fire("Start", &mut modeled));
@@ -1748,7 +1754,8 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         "",
         first_confirm,
     );
-    observer.sessions.get_mut(&id).unwrap().next_due = first_confirm + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, first_confirm + floor);
     observer.agent_observe(
         id,
         first,
@@ -1781,9 +1788,11 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     let old_move =
         aterm_spec::interp::with_buggy(&model, 1).successors("MoveNamed", &before_move)[0].clone();
     assert_eq!(old_move["confirm_armed"], 0, "old guard loses this frame");
-    observer.sessions.get_mut(&id).unwrap().next_due = moved_at + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, moved_at + floor);
     assert_eq!(observer.next_wake(), Some(moved_at + floor));
-    observer.sessions.get_mut(&id).unwrap().next_due = moved_at + floor * 2;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, moved_at + floor * 2);
     observer.agent_observe(
         id,
         later,
@@ -1824,7 +1833,8 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         "",
         later_confirm,
     );
-    observer.sessions.get_mut(&id).unwrap().next_due = later_confirm + floor;
+    assert!(observer.knows(id));
+    observer.sessions.reschedule(id, later_confirm + floor);
     assert_eq!(observer.next_wake(), Some(later_confirm + floor));
     let named = observer.agent_observe(
         id,
@@ -2236,6 +2246,7 @@ fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
             start: "stand-in".to_string(),
         },
         claim,
+        child: None,
     };
     let now_us = crate::metrics::now_us();
     assert!(
@@ -2764,13 +2775,8 @@ fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
     let still = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.insert(
-        id,
-        SessionSlot {
-            next_due: t0 + floor,
-            ..SessionSlot::new(policy, t0)
-        },
-    );
+    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.reschedule(id, t0 + floor);
     let rows = || Some(vec!["atpkg: waiting for memory".into()]);
     observer.note_program_request(id, pgid, t0);
     for (at, resolving) in [(t0, true), (t0 + floor, false)] {
@@ -2847,14 +2853,14 @@ fn caret_of(rows: &[String]) -> Cursor {
     Cursor::At(rows.iter().rposition(|r| r.starts_with('\u{276f}')))
 }
 
-/// One read of `rows` under `title` at `at`, as session 1 of `obs` under `program`: the word it
-/// publishes, `None` where it publishes nothing.
-fn read_titled(
+/// One read of `rows` under `title` (a bare title, or the run signs with a report) at `at`, as
+/// session 1 of `obs` under `program`: the word it publishes, `None` where it publishes nothing.
+fn read_titled<'a>(
     obs: &mut StatusObserver,
     seq: u64,
     rows: &[String],
     program: &str,
-    title: &str,
+    title: impl Into<crate::presence::RunSigns<'a>>,
     at: Instant,
 ) -> Option<&'static str> {
     let generation = crate::control::ScreenGen { epoch: 0, seq };
@@ -2922,6 +2928,70 @@ fn a_reply_drawn_under_a_status_line_is_published_busy_while_its_title_runs() {
     assert!(obs.agents[&1].rest_at.is_none(), "the settle is over");
 }
 
+/// With its query answered Claude Code's title carries no glyph, and its program-status report is
+/// what the verdict reads a reply under a status line busy by: `working` holds the half-drawn
+/// frames busy (2.1.323's and 2.1.311's), and `done`, written before the frame that draws the
+/// last line, opens the rest settle as the title's rest did: a read between the two publishes
+/// nothing, and the finished frame publishes idle at once. The control: the glyphless title with
+/// no report publishes idle mid-reply.
+#[test]
+fn a_reply_drawn_under_a_status_line_is_published_busy_while_its_report_runs() {
+    use crate::presence::RunSigns;
+    let [mid, held, done] = statusline_frames();
+    let answered = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::STATUSLINE_MIDREPLY_ANSWERED_2_1_323,
+    );
+    let signs = |report| RunSigns {
+        title: "Claude Code",
+        report,
+    };
+    let working = signs(Some("state=working:app=claude-code"));
+    let ended = signs(Some("state=done:app=claude-code"));
+    let step = super::AGENT_MIN_INTERVAL + Duration::from_millis(50);
+    let t0 = Instant::now();
+    for rows in [&answered, &mid] {
+        let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+        assert_eq!(
+            read_titled(&mut obs, 1, rows, "claude", signs(None), t0),
+            Some("idle"),
+            "CONTROL: no report under a glyphless title says nothing"
+        );
+        let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+        assert_eq!(
+            read_titled(&mut obs, 1, rows, "claude", working, t0),
+            Some("busy")
+        );
+    }
+    let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+    assert_eq!(
+        read_titled(&mut obs, 1, &mid, "claude", working, t0),
+        Some("busy")
+    );
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", working, t0 + step),
+        Some("busy")
+    );
+    let rest = t0 + step * 2;
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", ended, rest),
+        None,
+        "a read just after `done`, its last line not yet drawn, publishes nothing"
+    );
+    assert_eq!(
+        read_titled(
+            &mut obs,
+            3,
+            &done,
+            "claude",
+            ended,
+            rest + Duration::from_millis(23)
+        ),
+        Some("idle"),
+        "the finished frame publishes at once: its done row is the end drawn"
+    );
+    assert!(obs.agents[&1].rest_at.is_none(), "the settle is over");
+}
+
 /// Never stuck busy: a title that rests with no later frame publishes the screen's idle once the
 /// settle is spent, and the watch owes the read that does it: a title-only move and the settle's
 /// instant each want a read though neither the screen nor the cursor moved.
@@ -2933,8 +3003,7 @@ fn a_title_at_rest_with_no_later_frame_is_published_idle_by_the_settle() {
     let g = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let program = Some("claude".to_string());
     let t0 = Instant::now();
-    obs.sessions
-        .insert(1, SessionSlot::new(StatusPolicy::default(), t0));
+    obs.sessions.ensure(1, StatusPolicy::default(), t0);
     assert_eq!(
         read_titled(&mut obs, 2, &held, "claude", "◑ Claude Code", t0),
         Some("busy")
@@ -3139,13 +3208,8 @@ fn a_kimi_box_awaiting_its_record_is_read_again_until_it_stops_asking() {
         let t0 = Instant::now();
         let policy = StatusPolicy::default();
         let mut obs = StatusObserver::new(policy, floor);
-        obs.sessions.insert(
-            id,
-            SessionSlot {
-                next_due: t0,
-                ..SessionSlot::new(policy, t0)
-            },
-        );
+        obs.sessions.ensure(id, policy, t0);
+        obs.sessions.reschedule(id, t0);
         let observe = |obs: &mut StatusObserver, at: Instant| {
             obs.agent_observe(
                 id,
@@ -3675,13 +3739,8 @@ fn a_kimi_tabs_unread_input_is_looked_at_again() {
     ] {
         let policy = StatusPolicy::default();
         let mut obs = StatusObserver::new(policy, floor);
-        obs.sessions.insert(
-            id,
-            SessionSlot {
-                next_due: t0 + floor,
-                ..SessionSlot::new(policy, t0)
-            },
-        );
+        obs.sessions.ensure(id, policy, t0);
+        obs.sessions.reschedule(id, t0 + floor);
         let observe = |obs: &mut StatusObserver, rows: Option<Vec<String>>, at| {
             let _ = obs.agent_observe(
                 id,
@@ -3696,7 +3755,8 @@ fn a_kimi_tabs_unread_input_is_looked_at_again() {
             );
         };
         observe(&mut obs, Some(rows), t0);
-        obs.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+        assert!(obs.knows(id));
+        obs.sessions.reschedule(id, t0 + floor * 2);
         observe(&mut obs, None, t0 + floor);
         obs.note_input(id, InputLook::for_testing(1, 1, true), 100);
         assert_eq!(

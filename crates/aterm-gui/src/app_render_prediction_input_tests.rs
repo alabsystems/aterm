@@ -69,13 +69,16 @@ fn prime_slow_echoes(app: &mut App) -> Instant {
     let mut at = crate::app_input::past_timeline_start();
     for ch in ['a', 'b'] {
         let (cursor, coords, grid) = sample(app);
-        let predictor = &mut app.windows.get_mut(&WID).expect("window").predictor;
+        let mut predictor_guard = app.windows.get_mut(&WID).expect("window");
+        let predictor = &mut predictor_guard.predictor;
         predictor.set_mode(crate::predict::PredictMode::Adaptive);
         assert!(predictor.predict_char_in_grid(ch, cursor, coords, grid, at));
+        drop(predictor_guard);
         feed(app, &ch.to_string());
         at += RTT;
         let (echoed, coords, _) = sample(app);
-        let predictor = &mut app.windows.get_mut(&WID).expect("window").predictor;
+        let mut predictor_guard = app.windows.get_mut(&WID).expect("window");
+        let predictor = &mut predictor_guard.predictor;
         predictor.reconcile(Some(echoed), coords, false, at, |row, col| {
             ((row, col) == cursor).then_some(ch)
         });

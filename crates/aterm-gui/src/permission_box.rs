@@ -558,7 +558,7 @@ impl App {
         if self
             .windows
             .get_mut(&wid)
-            .is_some_and(|ws| ws.claude_lights.light_just_pressed(session, at))
+            .is_some_and(|mut ws| ws.claude_lights.light_just_pressed(session, at))
         {
             return true;
         }

@@ -89,7 +89,14 @@ fn transition_with(
             target.text().as_bytes(),
         )
         .unwrap();
-        client::admin_publish_conditional_until(&f.lab.paths[0], &admin, &doc, deadline()).unwrap();
+        client::admin_publish_conditional_until(
+            &f.lab.paths[0],
+            &admin,
+            &doc,
+            deadline(),
+            client::Author::Person,
+        )
+        .unwrap();
         stored = 1;
     } else {
         let result = broker.publish_refresh_until(old.id, base, &target, &admin, deadline());

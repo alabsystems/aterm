@@ -45,7 +45,7 @@ impl Inputs {
                 graph: Key {
                     query: ContextQuery {
                         binding: JobBinding {
-                            session: "s-0000000000000000abcd".into(),
+                            session: "t000000abcd".into(),
                             root_attempt: [1; 16],
                             capability: [9; 32],
                         },

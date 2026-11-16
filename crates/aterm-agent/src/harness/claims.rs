@@ -1926,19 +1926,44 @@ fn scope(home: &std::path::Path, cli: Cli, act: Act<'_>) -> Option<Scope> {
     if !CLAIMED_CLIS.contains(&cli) {
         return None;
     }
-    if crate::vault_entry::read_text(
+    if pool_held(home) {
+        return Some(Scope::Every);
+    }
+    let named = super::alab_roster::current().is_some_and(|lab| homes_named(&lab, cli));
+    let releases = !matches!(act, Act::Claim(_)) && activity::kept(home);
+    (named || releases).then_some(Scope::Homes)
+}
+
+/// Whether this Mac's store under `home` holds a readable `ai-pool.toml`, where claims cover every
+/// account ([`Scope::Every`]).
+fn pool_held(home: &std::path::Path) -> bool {
+    crate::vault_entry::read_text(
         home,
         super::ai_pool::AI_POOL_FILE,
         super::ai_pool::MAX_POOL_BYTES,
     )
     .text()
     .is_some()
-    {
-        return Some(Scope::Every);
+}
+
+/// Whether this Mac's claims cover `row`'s account of `cli` under `home` with a claim of its own
+/// ([`Scope`]): every account where this Mac's store holds a readable `ai-pool.toml`
+/// ([`Scope::Every`], [`pool_held`]), else one the lab this process holds names this Mac a home
+/// of (a [`Scope::Homes`] claim; [`homes_named`] reads the same lab). A row only its vault token runs here, whose login no sign-in made on this Mac,
+/// runs here only where this holds (FL-135): this Mac's recorded claim is all that keeps a second
+/// Mac off that account, and under [`Scope::Homes`] a borrowed account is never claimed.
+#[must_use]
+pub fn covers(home: &std::path::Path, cli: Cli, row: &accounts::Row) -> bool {
+    if !CLAIMED_CLIS.contains(&cli) {
+        return false;
     }
-    let named = super::alab_roster::current().is_some_and(|lab| homes_named(&lab, cli));
-    let releases = !matches!(act, Act::Claim(_)) && activity::kept(home);
-    (named || releases).then_some(Scope::Homes)
+    pool_held(home)
+        || super::alab_roster::current().is_some_and(|lab| {
+            lab.me.as_ref().is_some_and(|me| {
+                lab.account_of(cli, row)
+                    .is_some_and(|account| account.preferred_on(&me.key).is_some())
+            })
+        })
 }
 
 /// Whether `lab` names a home of one of `cli`'s accounts: a Mac that prefers it, this Mac (the

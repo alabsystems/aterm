@@ -722,7 +722,7 @@ impl SetByWords {
 
 /// A fleet drive's actor token (`fleet:<node head>:<sid|->`, [`aterm_slog::Actor::fleet_drive`]) in
 /// a person's words: `over the fleet from m9`, the Mac by the name `fleet_name` gives its node
-/// head, else `node <head>`, and `(session s-0123)` after it where the drive named its session.
+/// head, else `node <head>`, and `(session tqn5r)` after it where the drive named its session.
 fn fleet_words(token: &str, fleet_name: impl FnOnce(&str) -> Option<String>) -> String {
     let rest = token
         .strip_prefix(aterm_slog::FLEET_ACTOR_PREFIX)

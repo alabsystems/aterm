@@ -345,7 +345,7 @@ pub(crate) fn build_vtebench(vte_dir: &Path) -> Result<PathBuf, Halt> {
             built.status
         )));
     }
-    crate::perf::bench_build::built_executable(
+    crate::perf::driver::built_executable(
         &String::from_utf8_lossy(&built.stdout),
         "vtebench",
         "bin",

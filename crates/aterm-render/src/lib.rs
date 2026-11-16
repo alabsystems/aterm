@@ -5656,11 +5656,21 @@ pub fn checked_frame_size_px(
     Ok((w, h))
 }
 
-/// Where the (grid + `2·pad`) frame's leading edge sits inside a raw-window surface of `dst_px`, for one axis.
+/// Where the frame's leading edge sits when centred in the surface past `inset`.
 #[inline]
 #[must_use]
-pub const fn band_offset(dst_px: usize, src_px: usize) -> i64 {
-    (dst_px as i64 - src_px as i64).div_euclid(2)
+pub const fn band_offset(dst_px: usize, src_px: usize, inset: SideInsetPx) -> i64 {
+    inset.0 as i64 + (dst_px.saturating_sub(inset.0) as i64 - src_px as i64).div_euclid(2)
+}
+
+/// Leading surface columns reserved beside the frame, in device pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideInsetPx(pub usize);
+
+/// The leading frame offset past a side inset.
+#[must_use]
+pub const fn band_offset_after(dst_px: usize, src_px: usize, inset: SideInsetPx) -> i64 {
+    band_offset(dst_px, src_px, inset)
 }
 
 /// The vertical placement policy.
@@ -5670,7 +5680,7 @@ pub const fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
     if cfg!(target_os = "linux") {
         0
     } else {
-        band_offset(dst_px, src_px)
+        band_offset(dst_px, src_px, SideInsetPx(0))
     }
 }
 
@@ -5724,9 +5734,15 @@ impl AxisPlacement {
 /// Where a `src_w`×`src_h` frame lands in a `dst_w`×`dst_h` surface.
 #[inline]
 #[must_use]
-pub fn frame_placement(dst_w: usize, dst_h: usize, src_w: usize, src_h: usize) -> FramePlacement {
+pub fn frame_placement(
+    dst_w: usize,
+    dst_h: usize,
+    src_w: usize,
+    src_h: usize,
+    inset: SideInsetPx,
+) -> FramePlacement {
     FramePlacement {
-        x: AxisPlacement::at(band_offset(dst_w, src_w), dst_w, src_w),
+        x: AxisPlacement::at(band_offset_after(dst_w, src_w, inset), dst_w, src_w),
         y: AxisPlacement::at(band_offset_y(dst_h, src_h), dst_h, src_h),
     }
 }
@@ -5769,7 +5785,7 @@ impl FramePlacement {
 /// Place the rendered frame (`src`, `src_w`×`src_h`, packed `0x00RRGGBB`) into a raw-window-sized destination (`dst_w`×`dst_h`) at its [`frame_placement`], painting the surrounding remainder bands `band_rgb`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "a destination surface + a source frame + the present flags is irreducibly 9 scalars; a struct would only relocate the list"
+    reason = "source and destination geometry, the side inset, present flags and chrome rows form one placement request"
 )]
 pub fn place_frame_bands(
     dst: &mut [u32],
@@ -5778,13 +5794,14 @@ pub fn place_frame_bands(
     src: &[u32],
     src_w: usize,
     src_h: usize,
+    inset: SideInsetPx,
     invert: bool,
     band_rgb: u32,
     edge_rows: std::ops::Range<usize>,
 ) {
     let band = band_rgb & 0x00ff_ffff;
     let xor = if invert { 0x00ff_ffff } else { 0 };
-    let place = frame_placement(dst_w, dst_h, src_w, src_h);
+    let place = frame_placement(dst_w, dst_h, src_w, src_h, inset);
     let x0 = place.x.band_before;
     let x1 = x0 + place.x.visible;
     let sx0 = place.x.crop_before;
@@ -5822,9 +5839,10 @@ pub fn continue_chrome_edges(
     dst_h: usize,
     src_w: usize,
     src_h: usize,
+    inset: SideInsetPx,
     edge_rows: std::ops::Range<usize>,
 ) {
-    let place = frame_placement(dst_w, dst_h, src_w, src_h);
+    let place = frame_placement(dst_w, dst_h, src_w, src_h, inset);
     let x0 = place.x.band_before;
     let x1 = x0 + place.x.visible;
     if x1 <= x0 || (x0 == 0 && x1 == dst_w) {

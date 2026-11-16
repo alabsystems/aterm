@@ -22,16 +22,14 @@ impl Grid {
     }
 
     /// Raise the counter to the retained total (`visible_rows + scrollback_lines()`)
-    /// where it is below, and bump `history_renumber_epoch`: the floor
-    /// [`Self::continue_absolute_numbering`] keeps for a restore, kept for every
+    /// where it is below, which bumps `history_renumber_epoch` ([`Self::renumber_rows`]): the
+    /// floor [`Self::continue_absolute_numbering`] keeps for a restore, kept for every
     /// rewrap and scrollback attach.
     pub(crate) fn cover_retained_rows(&mut self) {
         let retained =
             u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
         if self.storage.absolute_row_counter < retained {
             self.renumber_rows(retained);
-            self.storage.history_renumber_epoch =
-                self.storage.history_renumber_epoch.saturating_add(1);
             self.invalidate_host_coordinates();
         }
     }

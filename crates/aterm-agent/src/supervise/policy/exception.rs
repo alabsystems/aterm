@@ -160,7 +160,7 @@ impl Exception {
         Self {
             kind: ExceptionKind::Stalled,
             when: Urgency::Later,
-            why: "the screen reads busy, Claude's title says idle, and nothing here explains it"
+            why: "the screen reads busy, Claude's run sign says idle, and nothing here explains it"
                 .to_string(),
             action: "Open the tab and type keep going".to_string(),
             clears: "the screen moving on, or the agent working",

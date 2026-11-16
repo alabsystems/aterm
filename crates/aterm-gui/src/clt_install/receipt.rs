@@ -54,33 +54,13 @@ fn nameable(build: &str) -> bool {
 fn claim_line(claimed: Option<&aterm_types::clt_mark::Claim>) -> Option<String> {
     match claimed {
         None => Some(UNCLAIMED.to_owned()),
-        Some(claim) if !nameable(&claim.asker.build) => None,
-        Some(claim) => Some(format!(
-            "claimed {} {} {} {} {}",
-            claim.asker.build, claim.asker.pid, claim.asker.birth, claim.at, claim.n
-        )),
+        Some(claim) => claim.receipt_line(),
     }
 }
 
 /// A receipt's whole text: `v3`, the child's identity, and its claim line ([`claim_line`]).
 fn receipt_text(sid: &str, pid: i32, birth: u64, claim: &str) -> String {
     format!("v3\n{sid}\n{pid}\n{birth}\n{claim}\n")
-}
-
-/// The claim a receipt's `claimed …` line names ([`claim_line`]); `None` for any other text.
-fn parse_claim(line: &str) -> Option<aterm_types::clt_mark::Claim> {
-    let mut words = line.strip_prefix("claimed ")?.split(' ');
-    let build = words.next()?.to_owned();
-    let pid = words.next()?.parse().ok()?;
-    let birth = words.next()?.parse().ok()?;
-    let at = words.next()?.parse().ok()?;
-    let n = words.next()?.parse().ok()?;
-    let claim = aterm_types::clt_mark::Claim {
-        asker: aterm_types::clt_mark::Asker { build, pid, birth },
-        at,
-        n,
-    };
-    (words.next().is_none() && claim_line(Some(&claim)).as_deref() == Some(line)).then_some(claim)
 }
 
 impl Receipt {
@@ -132,7 +112,7 @@ impl Receipt {
         {
             let claimed = match claim {
                 UNCLAIMED => None,
-                claim => Some(parse_claim(claim)?),
+                claim => Some(aterm_types::clt_mark::Claim::from_receipt_line(claim)?),
             };
             return Self::for_child(mark, sid, pid, birth, claimed.as_ref())
                 .filter(|receipt| receipt.text == text);

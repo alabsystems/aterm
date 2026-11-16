@@ -6,26 +6,35 @@
 //! handed. Every pass runs on the test's thread inside `provider_read::captured`, which sees each
 //! provider read that thread asks for.
 
-use super::{EVERY_ROW, Homes, Log, Places, Publisher, Report};
+use super::{EVERY_ROW, Homes, LiftWatch, Log, Places, Publisher, Report};
+use crate::quota_lifts::{Peers, Reader};
 use aterm_agent::harness::disk::discover::Running;
 use aterm_agent::harness::{accounts, claude_homes, provider_read, usage::rfc3339_utc};
 use aterm_metrics::row::{
-    ACTIVITY_REFRESH_S, ActivityRow, ManagerEntry, NeedEntry, NeedsRow, Row, Sid, Word,
+    ACTIVITY_REFRESH_S, ActivityRow, Lift, ManagerEntry, NeedEntry, NeedsRow, QuotaRow, Row, Sid,
+    Word,
 };
-use aterm_metrics::subject::{Class, Cli, Metric, Node, Now, Subject, Width};
+use aterm_metrics::subject::{AccountKey, Class, Cli, Metric, Node, Now, Subject, Width};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 const NODE_KEY: [u8; 32] = [7; 32];
 const POOL_A: &str = "ac-00000000000000a1";
 const POOL_B: &str = "ac-00000000000000b2";
 
+/// The hang detector of a wait for something that must happen.
+const HANG: Duration = Duration::from_secs(60);
+
 /// A log that keeps every record it is handed, in order.
 struct Kept {
     node: Node,
     records: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Rung at each record kept.
+    moved: Condvar,
 }
 
 impl Kept {
@@ -33,7 +42,45 @@ impl Kept {
         Self {
             node: Node::of_key(&NODE_KEY),
             records: Mutex::new(Vec::new()),
+            moved: Condvar::new(),
         }
+    }
+
+    /// Wait until `find` finds what it looks for in the records from the `from`-th on.
+    fn until<T>(
+        &self,
+        what: &str,
+        from: usize,
+        find: impl Fn(&[(Subject, Row)]) -> Option<T>,
+    ) -> T {
+        let deadline = Instant::now() + HANG;
+        loop {
+            if let Some(found) = find(&self.since(from)) {
+                return found;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "{what}: not within the hang detector");
+            let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(
+                self.moved
+                    .wait_timeout(records, left.min(Duration::from_secs(1)))
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        }
+    }
+
+    /// Every Mac's newest quota row it keeps, by Mac, CLI and account: what a node's origin-judged
+    /// read of its log hands the reader of its peers' lifts.
+    fn quota(&self) -> BTreeMap<(Node, Cli, AccountKey), QuotaRow> {
+        self.since(0)
+            .into_iter()
+            .filter_map(|(subject, row)| match (subject, row) {
+                (Subject::Quota { node, cli, account }, Row::Quota(row)) => {
+                    Some(((node, cli, account), row))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn len(&self) -> usize {
@@ -63,11 +110,197 @@ impl Log for Kept {
             .lock()
             .expect("the records")
             .push((subject.to_owned(), body.to_vec()));
+        self.moved.notify_all();
         Ok(())
     }
 
     fn published(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
         Ok(self.records.lock().expect("the records").clone())
+    }
+}
+
+impl Peers for Kept {
+    fn rows(&self) -> io::Result<BTreeMap<(Node, Cli, AccountKey), QuotaRow>> {
+        Ok(self.quota())
+    }
+}
+
+/// Another Mac's seat on a [`Kept`] log: it publishes as `node` on the same records.
+struct Seat<'a> {
+    node: Node,
+    log: &'a Kept,
+}
+
+impl Log for Seat<'_> {
+    fn node(&self) -> Node {
+        self.node
+    }
+
+    fn publish(&self, subject: &str, body: &[u8]) -> io::Result<()> {
+        self.log.publish(subject, body)
+    }
+
+    fn published(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
+        self.log.published()
+    }
+}
+
+/// What a watch's tell found of `pool-a` on the Claude store as it told: its five-hour wall on
+/// record, and a lift of this Mac's own ([`accounts::Account::newest_lifts`]); or that the store
+/// did not read, as while a commit is under way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Saw {
+    wall: bool,
+    lift: bool,
+    unread: bool,
+}
+
+impl Saw {
+    /// What the Claude store under `harness` holds of `pool-a` at `now`. A tell can come between
+    /// a commit's state file and its receipt, while the store refuses to read: that is no wall
+    /// and no lift yet.
+    fn of(harness: &Path, now: i64) -> Saw {
+        let Ok((state, _)) = accounts::Store::at(harness).load(now) else {
+            return Saw {
+                unread: true,
+                ..Saw::default()
+            };
+        };
+        state
+            .accounts
+            .get("pool-a")
+            .map_or_else(Saw::default, |a| Saw {
+                wall: a.walls.contains_key(accounts::SESSION_LIMIT),
+                lift: !a.newest_lifts(&state.machine).is_empty(),
+                unread: false,
+            })
+    }
+}
+
+/// What each tell of a watch saw, in order, rung at each.
+#[derive(Default)]
+struct Told {
+    saw: Mutex<Vec<Saw>>,
+    moved: Condvar,
+}
+
+impl Told {
+    fn note(&self, saw: Saw) {
+        self.saw
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(saw);
+        self.moved.notify_all();
+    }
+
+    /// Wait until `find` finds what it looks for in the tells so far; the count of them then.
+    fn until(&self, what: &str, find: impl Fn(&[Saw]) -> bool) -> usize {
+        let deadline = Instant::now() + HANG;
+        let mut saw = self.saw.lock().unwrap_or_else(PoisonError::into_inner);
+        while !find(&saw) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "{what}: the watch told {saw:?}");
+            saw = self
+                .moved
+                .wait_timeout(saw, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        saw.len()
+    }
+}
+
+/// A log that holds its caller at its `at`-th look at its node until released: the publisher's
+/// look between a snapshot and that snapshot's publish.
+struct Held<'a> {
+    log: &'a Kept,
+    at: usize,
+    looks: Mutex<usize>,
+    /// Arrived at that look, and released from it.
+    gate: Mutex<(bool, bool)>,
+    moved: Condvar,
+}
+
+impl<'a> Held<'a> {
+    fn new(log: &'a Kept, at: usize) -> Self {
+        Self {
+            log,
+            at,
+            looks: Mutex::new(0),
+            gate: Mutex::new((false, false)),
+            moved: Condvar::new(),
+        }
+    }
+
+    /// Wait until `ready` holds of the gate, within the hang detector.
+    fn wait(&self, what: &str, ready: impl Fn(&(bool, bool)) -> bool) {
+        let deadline = Instant::now() + HANG;
+        let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        while !ready(&gate) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "{what}: not within the hang detector");
+            gate = self
+                .moved
+                .wait_timeout(gate, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn release(&self) {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.moved.notify_all();
+    }
+}
+
+impl Log for Held<'_> {
+    fn node(&self) -> Node {
+        let look = {
+            let mut looks = self.looks.lock().unwrap_or_else(PoisonError::into_inner);
+            *looks += 1;
+            *looks
+        };
+        if look == self.at {
+            self.gate.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
+            self.moved.notify_all();
+            self.wait("the release", |gate| gate.1);
+        }
+        self.log.node
+    }
+
+    fn publish(&self, subject: &str, body: &[u8]) -> io::Result<()> {
+        self.log.publish(subject, body)
+    }
+
+    fn published(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
+        self.log.published()
+    }
+}
+
+/// A log that cannot be read back, or refuses each publish, while told to.
+struct Flaky<'a> {
+    log: &'a Kept,
+    unread: AtomicBool,
+    refuse: AtomicBool,
+}
+
+impl Log for Flaky<'_> {
+    fn node(&self) -> Node {
+        self.log.node
+    }
+
+    fn publish(&self, subject: &str, body: &[u8]) -> io::Result<()> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(io::Error::other("refused"));
+        }
+        self.log.publish(subject, body)
+    }
+
+    fn published(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
+        if self.unread.load(Ordering::SeqCst) {
+            return Err(io::Error::other("unread"));
+        }
+        self.log.published()
     }
 }
 
@@ -80,10 +313,14 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let dir = aterm_tempfile::TempDir::new().expect("a scratch dir");
         // Half a minute into the current minute, so a message at `now - 5` is in the open one.
         let real = i64::try_from(aterm_time::unix_secs().expect("the clock")).expect("a time");
-        let now = real - real.rem_euclid(60) + 30;
+        Self::at(real - real.rem_euclid(60) + 30)
+    }
+
+    /// A scratch state whose clock reads `now`.
+    fn at(now: i64) -> Self {
+        let dir = aterm_tempfile::TempDir::new().expect("a scratch dir");
         let scratch = Self { dir, now };
         scratch.roster(&["pool-a", "pool-b"]);
         scratch.sample("pool-a", 40, now - 60);
@@ -167,6 +404,40 @@ impl Scratch {
         let pk = if label == "pool-a" { POOL_A } else { POOL_B };
         state.accounts.entry(label.to_owned()).or_default().pk = Some(pk.to_owned());
         store.save(&state).expect("the accounts store saves");
+    }
+
+    /// Note a five-hour wall on `label` until `reset`, observed at `at`, through the store.
+    fn wall(&self, label: &str, reset: i64, at: i64) {
+        let events = accounts::Store::at(&self.harness())
+            .transact(self.now, &mut None, |state| {
+                Ok(accounts::note_wall(
+                    state,
+                    label,
+                    accounts::SESSION_LIMIT,
+                    Some(reset),
+                    at,
+                    at,
+                ))
+            })
+            .expect("the wall is recorded");
+        assert_eq!(events.len(), 1, "{events:?}");
+    }
+
+    /// Lift `label`'s walls at `at` by a read at `read` that shows its five-hour window with room
+    /// ([`accounts::note_room`]), through the store.
+    fn room(&self, label: &str, read: i64, at: i64) {
+        let sample = accounts::Sample {
+            session_pct: Some(20),
+            session_read_at: Some(read),
+            at: read,
+            ..accounts::Sample::default()
+        };
+        let events = accounts::Store::at(&self.harness())
+            .transact(self.now, &mut None, |state| {
+                Ok(accounts::note_room(state, label, &sample, at))
+            })
+            .expect("the lift is recorded");
+        assert_eq!(events.len(), 1, "{events:?}");
     }
 
     fn places(&self) -> Places {
@@ -534,7 +805,7 @@ fn a_late_sample_republishes_its_window_at_the_next_revision_across_a_restart() 
 }
 
 fn sid(n: u8) -> Sid {
-    Sid::parse(&format!("s-{n:020x}")).expect("a sid")
+    Sid::from_bits(u64::from(n))
 }
 
 /// A needs change a window pushes publishes the Mac's one `now/needs` row, joined over its
@@ -1232,5 +1503,352 @@ fn a_short_run_in_a_home_its_launch_noted_is_folded() {
         minute(false),
         [(1, 3 + 10)],
         "with no note the run is missed"
+    );
+}
+
+/// A LIFT IS PUBLISHED WHEN IT IS WRITTEN, NOT AT THE NEXT PASS (FL-117): the node service's watch
+/// of the accounts stores ([`LiftWatch`]) hears the write of a wall this Mac lifted and publishes
+/// the account's quota row carrying the lift (its window, when its proof was served, and the reset
+/// the wall named), with no pass between and no provider read. The wall's own write, which lifts
+/// nothing, publishes nothing, and so does the watch's first look at each store; each is checked
+/// once the tell that found that write (or every first look) has run.
+/// NEGATIVE CONTROL: with the journal off (`[alab] journal = false`) the tell that found the
+/// lift's write publishes nothing; the next pass with the journal on publishes the lift then.
+#[test]
+fn a_lift_is_published_when_it_is_written_not_at_the_next_pass() {
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let run = |publishing: bool| {
+        let scratch = Scratch::new();
+        let now = scratch.now;
+        let reset = now + 2 * 3600;
+        let publisher = Arc::new(Publisher::new(scratch.places()));
+        let log = Arc::new(Kept::new());
+        pass(&publisher, &log, now);
+        let before = log.len();
+        let told = Arc::new(Told::default());
+        let files = publisher.watched_files();
+        let looks = files.len();
+        let watch = LiftWatch::start(files, {
+            let (publisher, log) = (Arc::clone(&publisher), Arc::clone(&log));
+            let (told, reads) = (Arc::clone(&told), Arc::clone(&reads));
+            let harness = scratch.harness();
+            move || {
+                let saw = Saw::of(&harness, now);
+                let at = u64::try_from(now).expect("a time");
+                let (_, asked) = provider_read::captured(|| {
+                    publisher.lifted(Some(&*log as &dyn Log), at, publishing)
+                });
+                reads
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(asked);
+                told.note(saw);
+            }
+        })
+        .expect("the watch starts");
+        let n = told.until("every store's first look", |saw| saw.len() >= looks);
+        assert_eq!(log.len(), before, "the first look found no lift");
+
+        scratch.wall("pool-a", reset, now - 50);
+        told.until("the tell that found the wall", |saw| {
+            saw[n..].iter().any(|saw| saw.wall)
+        });
+        assert_eq!(
+            log.len(),
+            before,
+            "a wall is no lift: {:?}",
+            log.since(before)
+        );
+
+        let n = told.until("the tells so far", |_| true);
+        scratch.room("pool-a", now - 30, now - 20);
+        let want = Lift {
+            window: Word::new(accounts::SESSION_LIMIT).expect("a word"),
+            at: u64::try_from(now - 30).expect("a time"),
+            reset: Some(u64::try_from(reset).expect("a time")),
+        };
+        let pool_a = |rows: &[(Subject, Row)]| {
+            quota_rows(rows)
+                .into_iter()
+                .find(|q| q.label.as_str() == "pool-a" && !q.lifts.is_empty())
+                .cloned()
+        };
+        if publishing {
+            let row = log.until("the lift's quota row", before, pool_a);
+            assert_eq!(row.lifts, [want], "the read's time is the proof's: {row:?}");
+            let moved = log.since(before);
+            assert!(
+                moved.iter().all(|(_, row)| matches!(
+                    row,
+                    Row::Quota(q) if q.label.as_str() == "pool-a"
+                )),
+                "only the lifted account's row: {moved:?}"
+            );
+        } else {
+            told.until("the tell that found the lift", |saw| {
+                saw[n..].iter().any(|saw| saw.lift)
+            });
+            assert_eq!(
+                log.len(),
+                before,
+                "the journal is off: {:?}",
+                log.since(before)
+            );
+            pass(&publisher, &log, now);
+            let row = pool_a(&log.since(before)).expect("the next pass publishes the lift");
+            assert_eq!(row.lifts, [want], "{row:?}");
+        }
+        drop(watch);
+    };
+    run(true);
+    run(false);
+    let reads = reads.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(reads.is_empty(), "the watch asked a provider: {reads:?}");
+}
+
+/// A LIFT WHOSE TELL FOUND ITS COMMIT UNDER WAY IS PUBLISHED AT THE RECEIPT'S TELL (FL-117): a
+/// commit installs the state file while its receipt is pending, when the store does not read
+/// ([`accounts::Store::load`] refuses an interrupted sync), and completes the receipt last. The
+/// watch tells at the state file's write; held there, the commit lets that tell find the store
+/// unread, and the publisher publishes nothing then. Once the receipt completes, its own write's
+/// tell ([`Publisher::watched_files`]) publishes the lift, with no pass between.
+/// NEGATIVE CONTROL: the tell that found the commit under way published nothing, and so did the
+/// wall's own commit, which lifts nothing.
+#[test]
+fn a_lift_whose_tell_found_its_commit_under_way_is_published_at_the_receipts_tell() {
+    let scratch = Scratch::new();
+    let now = scratch.now;
+    let reset = now + 2 * 3600;
+    let publisher = Arc::new(Publisher::new(scratch.places()));
+    let log = Arc::new(Kept::new());
+    scratch.wall("pool-a", reset, now - 50);
+    pass(&publisher, &log, now);
+    let before = log.len();
+    let told = Arc::new(Told::default());
+    let files = publisher.watched_files();
+    let looks = files.len();
+    let watch = LiftWatch::start(files, {
+        let (publisher, log, told) = (Arc::clone(&publisher), Arc::clone(&log), Arc::clone(&told));
+        let harness = scratch.harness();
+        move || {
+            let saw = Saw::of(&harness, now);
+            let at = u64::try_from(now).expect("a time");
+            publisher.lifted(Some(&*log as &dyn Log), at, true);
+            told.note(saw);
+        }
+    })
+    .expect("the watch starts");
+    let n = told.until("every store's first look", |saw| saw.len() >= looks);
+    assert_eq!(
+        log.len(),
+        before,
+        "the wall is no lift: {:?}",
+        log.since(before)
+    );
+
+    let held = {
+        let (told, log) = (Arc::clone(&told), Arc::clone(&log));
+        move || {
+            told.until("a tell that found the commit under way", |saw| {
+                saw[n..].iter().any(|saw| saw.unread)
+            });
+            assert_eq!(
+                log.len(),
+                before,
+                "a store that does not read publishes nothing: {:?}",
+                log.since(before)
+            );
+        }
+    };
+    accounts::paused_before_receipt_for_test(held, || {
+        scratch.room("pool-a", now - 30, now - 20);
+    });
+    let row = log.until("the lift's quota row", before, |rows| {
+        quota_rows(rows)
+            .into_iter()
+            .find(|q| q.label.as_str() == "pool-a" && !q.lifts.is_empty())
+            .cloned()
+    });
+    let want = Lift {
+        window: Word::new(accounts::SESSION_LIMIT).expect("a word"),
+        at: u64::try_from(now - 30).expect("a time"),
+        reset: Some(u64::try_from(reset).expect("a time")),
+    };
+    assert_eq!(row.lifts, [want], "{row:?}");
+    drop(watch);
+}
+
+/// A PASS AND A LIFT'S PUBLISH TAKE TURNS, AND A LIFT NOT PUBLISHED GOES AGAIN (FL-117): a pass
+/// holds the publisher's turn from its snapshot through its publish, and so does a lift's publish
+/// ([`Publisher::lifted`]), so a pass whose snapshot was taken before a lift never publishes its
+/// older quota row over the lift's. A lift whose log could not be read back, or refused its row,
+/// counts as unpublished: the next write's tell publishes it, with no pass between.
+/// NEGATIVE CONTROL: between publishes the turn is free, and once the lift is on the log the next
+/// tell publishes nothing.
+#[test]
+fn a_pass_and_a_lifts_publish_take_turns_and_one_not_published_goes_again() {
+    let scratch = Scratch::new();
+    let now = scratch.now;
+    let at = u64::try_from(now).expect("a time");
+    let reset = now + 2 * 3600;
+    let publisher = Publisher::new(scratch.places());
+    let log = Kept::new();
+    let held_at_its_publish = |lift: bool| {
+        // A look at the node for the snapshot, then the publish's own: the second is between.
+        let held = Held::new(&log, 2);
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                if lift {
+                    publisher.lifted(Some(&held as &dyn Log), at, true)
+                } else {
+                    publisher.pass(Some(&held as &dyn Log), at, true)
+                }
+            });
+            held.wait("the snapshot", |gate| gate.0);
+            let busy = publisher.turn.try_lock().is_err();
+            held.release();
+            let report = run.join().expect("the publish");
+            assert!(
+                busy,
+                "a {} between its snapshot and its publish holds the turn",
+                if lift { "lift's publish" } else { "pass" }
+            );
+            assert!(report.rows > 0, "{report:?}");
+        });
+        assert!(publisher.turn.try_lock().is_ok(), "the turn is free again");
+    };
+    held_at_its_publish(false);
+    scratch.wall("pool-a", reset, now - 50);
+    scratch.room("pool-a", now - 30, now - 20);
+    held_at_its_publish(true);
+    assert!(
+        quota_rows(&log.since(0))
+            .into_iter()
+            .any(|q| q.label.as_str() == "pool-a" && !q.lifts.is_empty()),
+        "the lift is on the log"
+    );
+
+    let other = Kept::new();
+    let flaky = Flaky {
+        log: &other,
+        unread: AtomicBool::new(true),
+        refuse: AtomicBool::new(false),
+    };
+    let fresh = Publisher::new(scratch.places());
+    let report = fresh.lifted(Some(&flaky as &dyn Log), at, true);
+    assert!(report.unread, "{report:?}");
+    flaky.unread.store(false, Ordering::SeqCst);
+    flaky.refuse.store(true, Ordering::SeqCst);
+    let report = fresh.lifted(Some(&flaky as &dyn Log), at, true);
+    assert!(report.refused.is_some(), "tried again: {report:?}");
+    assert_eq!(other.len(), 0);
+    flaky.refuse.store(false, Ordering::SeqCst);
+    let report = fresh.lifted(Some(&flaky as &dyn Log), at, true);
+    assert!(report.rows > 0, "tried again and published: {report:?}");
+    assert!(
+        quota_rows(&other.since(0))
+            .into_iter()
+            .any(|q| q.label.as_str() == "pool-a" && !q.lifts.is_empty()),
+        "the lift is on the log"
+    );
+    let n = other.len();
+    assert_eq!(
+        fresh.lifted(Some(&flaky as &dyn Log), at, true),
+        Report::default()
+    );
+    assert_eq!(other.len(), n, "a lift on the log is not published again");
+}
+
+/// A PEER'S LIFT ON THE LOG LIFTS THIS MAC'S WALL WITH NO PROVIDER READ (FL-117): Mac A lifts an
+/// account's five-hour wall and its pass publishes the lift in the account's quota row; Mac B,
+/// walled on the same account before that lift and with the same reset, reads A's row off the log
+/// ([`Reader`]) and lifts its own wall by one wall row that names A, asking no provider, while its
+/// own rows are passed over. B's quota row then carries no lift (the lift is A's to tell), the
+/// same row read again lifts nothing, and with no wall standing the log is not read at all.
+/// NEGATIVE CONTROL: before A's lift is on the log, B's read finds its wall standing, reads the
+/// log and lifts nothing.
+#[test]
+fn a_peer_lift_on_the_log_lifts_this_macs_wall_with_no_provider_read() {
+    let a = Scratch::new();
+    let now = a.now;
+    let b = Scratch::at(now);
+    let reset = now + 2 * 3600;
+    let at = u64::try_from(now).expect("a time");
+    let log = Kept::new();
+    let seat_b = Seat {
+        node: Node::of_key(&[8; 32]),
+        log: &log,
+    };
+    a.wall("pool-a", reset, now - 50);
+    b.wall("pool-a", reset, now - 45);
+    let publisher_a = Publisher::new(a.places());
+    let publisher_b = Publisher::new(b.places());
+    let pass_b = || {
+        let (_, reads) =
+            provider_read::captured(|| publisher_b.pass(Some(&seat_b as &dyn Log), at, true));
+        assert!(reads.is_empty(), "a pass asked a provider: {reads:?}");
+    };
+    let reader = Reader::new(Some(b.harness()), Some(b.path("home")));
+    let read = || {
+        let (read, reads) = provider_read::captured(|| reader.read(&log, seat_b.node, &|| now));
+        assert!(
+            reads.is_empty(),
+            "a read of the peers asked a provider: {reads:?}"
+        );
+        (read.looked, read.lifted, read.failed)
+    };
+    let b_store = accounts::Store::at(&b.harness());
+    let b_state = || b_store.load(now).expect("B's store").0;
+    pass(&publisher_a, &log, now);
+    pass_b();
+
+    // NEGATIVE CONTROL: no lift on the log yet.
+    assert_eq!(read(), (true, 0, None));
+    assert!(b_state().accounts["pool-a"].limited_until(now).is_some());
+
+    a.room("pool-a", now - 30, now - 20);
+    pass(&publisher_a, &log, now);
+    let a_lift = log
+        .quota()
+        .into_iter()
+        .find(|((node, _, account), _)| *node == log.node && account.to_string() == POOL_A)
+        .map(|(_, row)| row.lifts)
+        .unwrap_or_default();
+    assert_eq!(a_lift.len(), 1, "A's row carries its lift: {a_lift:?}");
+
+    assert_eq!(read(), (true, 1, None), "B lifts its wall");
+    let state = b_state();
+    let account = &state.accounts["pool-a"];
+    assert_eq!(account.limited_until(now), None, "the wall is lifted");
+    let wall = &account.walls[accounts::SESSION_LIMIT];
+    assert!(wall.cleared, "{wall:?}");
+    assert_eq!(
+        (wall.by.clone(), wall.until),
+        (log.node.to_string(), Some(reset))
+    );
+    let row = b_store.tail(1).expect("B's ledger");
+    assert_eq!(row.len(), 1);
+    assert_eq!(
+        (row[0].kind, row[0].account.as_str()),
+        (accounts::Kind::Wall, "pool-a")
+    );
+    assert!(
+        row[0].why.contains(accounts::WALL_LIFTED) && row[0].why.contains(&log.node.to_string()),
+        "{}",
+        row[0].why
+    );
+
+    pass_b();
+    let b_row = log
+        .quota()
+        .into_iter()
+        .find(|((node, _, account), _)| *node == seat_b.node && account.to_string() == POOL_A)
+        .map(|(_, row)| row)
+        .expect("B's row");
+    assert_eq!(b_row.lifts, [], "A's lift is A's to tell");
+    assert_eq!(
+        read(),
+        (false, 0, None),
+        "no wall stands, so the log is not read"
     );
 }

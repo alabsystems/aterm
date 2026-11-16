@@ -4,7 +4,7 @@
 //! Unchanged-title PTY output beside native typing, on two explicitly identified builds.
 //! All acceptance checks precede CSV publication; raw observations survive a refused take.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -18,7 +18,11 @@ usage: lab title-drift --a PATH --a-source SHA40 --a-sha256 SHA64 --a-build-reco
        --b PATH --b-source SHA40 --b-sha256 SHA64 --b-build-record JSONL --out NEW_DIR [OPTIONS]
 
 Opens fresh private native aterm windows, serially in A B B A order for each case.
-Cases 1 and 30 are primary; 200 is scaling stress; split is one window with two panes.
+Cases 1 and 30 are tab controls; 200 is tab stress; split is one window with two panes.
+Real OS-window cases windows1,windows2,windows8 share a two-tab output/typing window;
+each additional OS window has 30 unrelated raw-cat tabs. They use distinct sizing evidence.
+Every logical window must bind to a distinct observed native key window before/after.
+All terminal geometry, render and resize receipts are checked outside the CPU interval.
 The numbered case has an output window and N unrelated tabs in a second window, whose
 front tab receives native typing. The source PTY runs a gated Rust output producer; all
 other tabs run raw, echoing cats. Two persistent control connections observe the source
@@ -31,7 +35,8 @@ The source's title never changes. No screenshot or video runs during measurement
   --block-bytes N         override the profile's block size (64..65536)
   --output-interval-ms N  override the profile's output gap
   --key-interval-ms N     native key gap (default 40)
-  --cases 1,30,200,split  selected cases, in that order (default all)
+  --cases LIST           1,30,200,split,windows1,windows2,windows8
+                         default: 1,30,200,split (real-window cases are explicit)
   --quads N              ABBA repetitions per case (default 3)
   --comparison-memory-record PATH  Frozen component peak evidence (required)
   --memory-bindings      Print exact case/workload/build evidence keys; start nothing
@@ -59,6 +64,8 @@ drain; it excludes the producer process's own CPU and all setup.
 
 Only a fully accepted run emits accepted.csv and CSV on stdout: per-take whole-app CPU/byte,
 n_input and input p50/p95/p99 (never an average p99), with exact workload/provenance fields.
+Global n_present/present p50/p95/p99 are diagnostic and not source-specific; a hidden output
+tab/window does not establish output-to-glass latency. Native typing retains input quantiles.
 Raw per-take diagnostics are retained on refusal; no accepted CSV is then emitted. Binary
 digests and timing evidence are printed to stderr. Timings have no pass/fail threshold.
 The background output window may be occluded: this measures its output/title handling, not
@@ -97,6 +104,21 @@ pub(crate) struct Build {
 enum Case {
     Tabs(usize),
     Split,
+    Windows(WindowTopology),
+}
+
+/// Real OS-window scaling: a fixed two-tab workload plus unrelated 30-tab windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowTopology {
+    windows: usize,
+}
+
+impl WindowTopology {
+    const IDLE_TABS: usize = 30;
+
+    fn sessions(self) -> usize {
+        2 + (self.windows - 1) * Self::IDLE_TABS
+    }
 }
 
 impl Case {
@@ -104,6 +126,36 @@ impl Case {
         match self {
             Self::Tabs(n) => n.to_string(),
             Self::Split => "split".into(),
+            Self::Windows(topology) => format!("windows{}", topology.windows),
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "1" => Ok(Self::Tabs(1)),
+            "30" => Ok(Self::Tabs(30)),
+            "200" => Ok(Self::Tabs(200)),
+            "split" => Ok(Self::Split),
+            "windows1" => Ok(Self::Windows(WindowTopology { windows: 1 })),
+            "windows2" => Ok(Self::Windows(WindowTopology { windows: 2 })),
+            "windows8" => Ok(Self::Windows(WindowTopology { windows: 8 })),
+            _ => Err("--cases accepts 1,30,200,split,windows1,windows2,windows8".into()),
+        }
+    }
+
+    fn receipt(self) -> aterm_json::Value {
+        use aterm_json::json;
+        match self {
+            Self::Windows(topology) => json!({"schema":"title_window_topology_v1",
+                "kind":"cohosted_output_typing", "os_windows":topology.windows,
+                "workload_window_tabs":2, "unrelated_windows":topology.windows - 1,
+                "tabs_per_unrelated_window":WindowTopology::IDLE_TABS,
+                "terminal_sessions":topology.sessions()}),
+            Self::Tabs(n) => json!({"schema":"title_window_topology_v1",
+                "kind":"separate_output_typing", "os_windows":2,
+                "output_window_tabs":1, "typing_window_tabs":n, "terminal_sessions":n + 1}),
+            Self::Split => json!({"schema":"title_window_topology_v1",
+                "kind":"split", "os_windows":1, "tabs":1, "terminal_sessions":2}),
         }
     }
 }
@@ -265,13 +317,7 @@ fn parse(args: &[String], purpose: Purpose) -> Result<Options, Fail> {
     let cases = take_value(&mut args, "--cases")?
         .unwrap_or_else(|| "1,30,200,split".into())
         .split(',')
-        .map(|s| match s {
-            "1" => Ok(Case::Tabs(1)),
-            "30" => Ok(Case::Tabs(30)),
-            "200" => Ok(Case::Tabs(200)),
-            "split" => Ok(Case::Split),
-            _ => Err(Fail::usage("--cases accepts 1,30,200,split")),
-        })
+        .map(|s| Case::parse(s).map_err(Fail::usage))
         .collect::<Result<Vec<_>, _>>()?;
     if cases
         .iter()
@@ -466,6 +512,7 @@ struct Targets {
     typing: Session,
     rows: Vec<Session>,
     native_window: String,
+    native_windows: BTreeMap<String, String>,
     topology: Topology,
 }
 
@@ -597,7 +644,14 @@ fn topology(
         .window
         .parse::<u64>()
         .map_err(|_| "typing window invalid")?;
-    let expected_windows = if case == Case::Split { 1 } else { 2 };
+    let expected_windows = match case {
+        Case::Split => 1,
+        Case::Tabs(_) => 2,
+        Case::Windows(t) => t.windows,
+    };
+    if matches!(case, Case::Windows(_)) && source_window != typing_window {
+        return Err("workload tabs must share the first OS window".into());
+    }
     if windows.len() != expected_windows {
         return Err("unexpected number of windows".into());
     }
@@ -608,13 +662,22 @@ fn topology(
     let mut typing_placed = false;
     for window in &windows {
         if !window_ids.insert(window.id)
-            || ![source_window, typing_window].contains(&window.id)
+            || !rows
+                .iter()
+                .any(|r| r.window.parse::<u64>() == Ok(window.id))
             || window.focused != (window.id == typing_window)
         {
             return Err("wrong or duplicate focused window".into());
         }
         let expected_tabs = match case {
             Case::Split => 1,
+            Case::Windows(_) => {
+                if window.id == source_window {
+                    2
+                } else {
+                    WindowTopology::IDLE_TABS
+                }
+            }
             Case::Tabs(n) => {
                 if window.id == source_window {
                     1
@@ -676,6 +739,9 @@ fn topology(
                 {
                     return Err("leaf identity/session does not match the roster".into());
                 }
+                if matches!(case, Case::Windows(_)) && leaf.session == source.local && tab.active {
+                    return Err("source must stay behind the typing tab".into());
+                }
                 if leaf.session == source.local && window.id != source_window {
                     return Err("source leaf moved windows".into());
                 }
@@ -690,6 +756,57 @@ fn topology(
         return Err("source or focused typing leaf missing from topology".into());
     }
     Ok(Topology(windows))
+}
+
+/// Observe each real key window once outside measurement, then restore the typing tab.
+/// Distinct logical roots must not alias one native window. No native APIs run in tests.
+fn native_windows(
+    wire: &mut Wire,
+    rows: &[Session],
+    typing: &Session,
+    raw: &mut Raw,
+    phase: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut observed = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.active) {
+        if observed.contains_key(&row.window) {
+            continue;
+        }
+        let reply = raise_for_setup(wire, row)?;
+        raw.note(&format!("{phase}_{}", row.window), &reply);
+        let native = fields(&reply)
+            .get("window")
+            .cloned()
+            .ok_or("native window missing")?;
+        observed.insert(row.window.clone(), native);
+    }
+    validate_native_windows(rows, &observed)?;
+    raw.note(
+        &format!("{phase}_restore_typing"),
+        raise_for_setup(wire, typing)?,
+    );
+    Ok(observed)
+}
+
+fn validate_native_windows(
+    rows: &[Session],
+    observed: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let logical: BTreeSet<_> = rows.iter().map(|row| row.window.clone()).collect();
+    let native = observed
+        .values()
+        .map(|id| {
+            id.parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or("invalid native window identity")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if observed.keys().cloned().collect::<BTreeSet<_>>() != logical || native.len() != logical.len()
+    {
+        return Err("logical OS windows lack distinct positive native identities".into());
+    }
+    Ok(())
 }
 
 fn read_topology(
@@ -729,12 +846,8 @@ fn setup_roster_ready(
             .any(|row| row.sid == typing.sid && row.active)
 }
 
-fn setup(
-    wire: &mut Wire,
-    case: Case,
-    files: &producer::Files,
-    raw: &mut Raw,
-) -> Result<Targets, String> {
+/// Create the canonical session/window topology before starting any workload process.
+fn place_sessions(wire: &mut Wire, case: Case) -> Result<(Session, Session, Vec<Session>), String> {
     let source = await_roster(wire, 1)?.remove(0);
     match case {
         Case::Tabs(_) => {
@@ -742,6 +855,9 @@ fn setup(
         }
         Case::Split => {
             ask(wire, "spawn split=v")?;
+        }
+        Case::Windows(_) => {
+            ask(wire, &format!("spawn window={} raise=false", source.window))?;
         }
     }
     let initial = await_roster(wire, 2)?;
@@ -757,24 +873,60 @@ fn setup(
         for _ in 1..n {
             ask(wire, &format!("spawn window={} raise=false", typing.window))?;
         }
+    } else if let Case::Windows(t) = case {
+        if source.window != typing.window {
+            return Err("workload tabs did not share one window".into());
+        }
+        let mut total = 2;
+        for _ in 1..t.windows {
+            let before = await_roster(wire, total)?;
+            ask(wire, "invoke NewWindow")?;
+            let after = await_roster(wire, total + 1)?;
+            let idle = after
+                .iter()
+                .find(|row| !before.iter().any(|old| old.sid == row.sid))
+                .ok_or("new unrelated window has no session")?;
+            if before.iter().any(|old| old.window == idle.window) {
+                return Err("NewWindow reused an existing OS window".into());
+            }
+            for _ in 1..WindowTopology::IDLE_TABS {
+                ask(wire, &format!("spawn window={} raise=false", idle.window))?;
+            }
+            total += WindowTopology::IDLE_TABS;
+        }
     } else if source.window != typing.window {
         return Err("split moved to another window".into());
     }
     let n = match case {
         Case::Tabs(n) => n + 1,
         Case::Split => 2,
+        Case::Windows(t) => t.sessions(),
     };
     let rows = await_roster(wire, n)?;
-    let expected_source = if case == Case::Split { 2 } else { 1 };
+    let expected_source = if matches!(case, Case::Split | Case::Windows(_)) {
+        2
+    } else {
+        1
+    };
     let expected_typing = match case {
         Case::Tabs(n) => n,
-        Case::Split => 2,
+        Case::Split | Case::Windows(_) => 2,
     };
     if rows.iter().filter(|s| s.window == source.window).count() != expected_source
         || rows.iter().filter(|s| s.window == typing.window).count() != expected_typing
     {
         return Err("session counts do not match the requested window topology".into());
     }
+    Ok((source, typing, rows))
+}
+
+fn setup(
+    wire: &mut Wire,
+    case: Case,
+    files: &producer::Files,
+    raw: &mut Raw,
+) -> Result<Targets, String> {
+    let (source, typing, rows) = place_sessions(wire, case)?;
     let lab = std::fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let producer_program = lab
@@ -814,6 +966,7 @@ fn setup(
         }
         nap(Duration::from_millis(100))?;
     };
+    let native_windows = native_windows(wire, &current, &typing, raw, "native_windows_setup")?;
     let topology = read_topology(
         wire,
         case,
@@ -840,6 +993,7 @@ fn setup(
         typing,
         rows: current,
         native_window,
+        native_windows,
         topology,
     })
 }
@@ -1174,11 +1328,37 @@ pub(crate) fn metrics(reply: &str, keys: u64) -> Result<Metrics, String> {
     Ok(m)
 }
 
+/// Global presentation observations are diagnostics, not source-specific visible output.
+fn present_metrics(reply: &str) -> Result<Metrics, String> {
+    let f = fields(reply);
+    let n = f
+        .get("n_present")
+        .and_then(|n| n.parse().ok())
+        .ok_or("missing n_present")?;
+    let number = |key: &str| {
+        f.get(key)
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .ok_or_else(|| format!("missing finite {key}"))
+    };
+    let m = Metrics {
+        n,
+        p50: number("present_p50_ms")?,
+        p95: number("present_p95_ms")?,
+        p99: number("present_p99_ms")?,
+    };
+    if m.p50 > m.p95 || m.p95 > m.p99 {
+        return Err("present percentile ordering is invalid".into());
+    }
+    Ok(m)
+}
+
 struct Taken {
     cpu_ns: u64,
     elapsed_ns: u128,
     bytes: u64,
     metrics: Metrics,
+    present: Metrics,
     key_start_ns: u64,
     key_end_ns: u64,
     first_output_ns: u64,
@@ -1262,8 +1442,7 @@ struct PreparedFixture {
     typing: Wire,
     source: Wire,
     t: Targets,
-    before_source: Snapshot,
-    before_typing: Snapshot,
+    before: Vec<Snapshot>,
 }
 
 fn prepare_fixture(
@@ -1288,8 +1467,18 @@ fn prepare_fixture(
     await_text(&mut source, &t.source.sid, "", true)?;
     await_text(&mut typing, &t.typing.sid, "", true)?;
     nap(Duration::from_millis(500))?;
-    let before_source = snapshot(&mut source, &t.source.sid, "source_before", raw)?;
-    let before_typing = snapshot(&mut typing, &t.typing.sid, "typing_before", raw)?;
+    let before = t
+        .rows
+        .iter()
+        .map(|row| {
+            snapshot(
+                &mut source,
+                &row.sid,
+                &format!("session_{}_before", row.local),
+                raw,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     validate_roster(&t.rows, &roster(&mut typing)?, &t.typing)?;
     if read_topology(
         &mut typing,
@@ -1311,8 +1500,7 @@ fn prepare_fixture(
         typing,
         source,
         t,
-        before_source,
-        before_typing,
+        before,
     })
 }
 
@@ -1329,8 +1517,7 @@ fn exercise_fixture(
         mut typing,
         mut source,
         t,
-        before_source,
-        before_typing,
+        before,
     } = prepared;
     let (identity, cpu_before) = cpu(inst, build, None, raw, "before")?;
     let start = Instant::now();
@@ -1373,6 +1560,7 @@ fn exercise_fixture(
     let metric_reply = ask(&mut typing, "metrics percentiles")?;
     raw.note("metrics", &metric_reply);
     let measured = metrics(&metric_reply, work.keys())?;
+    let present = present_metrics(&metric_reply)?;
     let (_, cpu_after) = cpu(inst, build, Some(identity), raw, "after")?;
     let elapsed_ns = start.elapsed().as_nanos();
     let cpu_ns = cpu_after
@@ -1412,16 +1600,27 @@ fn exercise_fixture(
     {
         return Err("window/tab/view topology changed during measurement".into());
     }
-    let after_source = snapshot(&mut source, &t.source.sid, "source_after", raw)?;
-    let after_typing = snapshot(&mut typing, &t.typing.sid, "typing_after", raw)?;
-    stable_snapshot(&before_source, &after_source)?;
-    stable_snapshot(&before_typing, &after_typing)?;
+    if native_windows(&mut typing, &t.rows, &t.typing, raw, "native_windows_after")?
+        != t.native_windows
+    {
+        return Err("native OS-window identities changed".into());
+    }
+    for (row, before) in t.rows.iter().zip(&before) {
+        let after = snapshot(
+            &mut source,
+            &row.sid,
+            &format!("session_{}_after", row.local),
+            raw,
+        )?;
+        stable_snapshot(before, &after)?;
+    }
     digest(build, raw, "completion")?;
     Ok(Taken {
         cpu_ns,
         elapsed_ns,
         bytes: work.blocks() * u64::try_from(work.block_bytes).unwrap_or(0),
         metrics: measured,
+        present,
         key_start_ns,
         key_end_ns,
         first_output_ns,
@@ -1561,6 +1760,7 @@ fn csv_row(
         quad.to_string(),
         arm.to_string(),
         case.label(),
+        csv_field(&case.receipt().to_string()),
         csv_field(&build.path.to_string_lossy()),
         build.source.clone(),
         build.digest.clone(),
@@ -1580,6 +1780,10 @@ fn csv_row(
         t.metrics.p50.to_string(),
         t.metrics.p95.to_string(),
         t.metrics.p99.to_string(),
+        t.present.n.to_string(),
+        t.present.p50.to_string(),
+        t.present.p95.to_string(),
+        t.present.p99.to_string(),
         t.first_output_ns.to_string(),
         t.last_output_ns.to_string(),
         t.key_start_ns.to_string(),
@@ -1599,7 +1803,13 @@ fn experiment_binding(
     crate::timing_comparison::Experiment::freeze(
         &o.builds,
         case.label(),
-        format!("work={:?} cases={:?} keep={}", o.work, o.cases, o.keep),
+        format!(
+            "topology={} work={:?} cases={:?} keep={}",
+            case.receipt(),
+            o.work,
+            o.cases,
+            o.keep
+        ),
         o.quads,
     )
 }
@@ -1620,7 +1830,12 @@ pub fn cmd(args: &[String]) -> Res {
         .collect::<Result<Vec<_>, _>>()?;
     if o.memory_bindings {
         for (case, experiment) in o.cases.iter().zip(&experiments) {
-            println!("case={} experiment_sha256={}", case.label(), experiment.key);
+            println!(
+                "case={} experiment_sha256={} topology={}",
+                case.label(),
+                experiment.key,
+                case.receipt()
+            );
         }
         return Ok(0);
     }
@@ -1637,7 +1852,7 @@ pub fn cmd(args: &[String]) -> Res {
         .collect::<Result<Vec<_>, _>>()?;
     stop::install();
     std::fs::create_dir(&o.out).map_err(|e| Fail::exit(3, format!("new output directory: {e}")))?;
-    let mut csv = "take,quad,arm,case,binary_path,declared_source_sha,binary_sha256,trusted_build_record_sha256,profile,duration_ms,typing_ms,block_bytes,output_interval_ms,key_interval_ms,blocks,output_bytes,app_cpu_ns,app_cpu_ns_per_byte,elapsed_ns,n_input,input_p50_ms,input_p95_ms,input_p99_ms,first_output_monotonic_ns,last_output_monotonic_ns,key_rpc_start_monotonic_ns,key_rpc_end_monotonic_ns,source_cast_retained_corpus_bytes,source_cast_events,source_cast_span_ms,source_cast_truncated\n".to_owned();
+    let mut csv = "take,quad,arm,case,topology_json,binary_path,declared_source_sha,binary_sha256,trusted_build_record_sha256,profile,duration_ms,typing_ms,block_bytes,output_interval_ms,key_interval_ms,blocks,output_bytes,app_cpu_ns,app_cpu_ns_per_byte,elapsed_ns,n_input,input_p50_ms,input_p95_ms,input_p99_ms,n_present,present_p50_ms,present_p95_ms,present_p99_ms,first_output_monotonic_ns,last_output_monotonic_ns,key_rpc_start_monotonic_ns,key_rpc_end_monotonic_ns,source_cast_retained_corpus_bytes,source_cast_events,source_cast_span_ms,source_cast_truncated\n".to_owned();
     let mut index = 0;
     for ((case, memory), experiment) in o.cases.iter().zip(&memories).zip(&experiments) {
         for quad in 1..=o.quads {
@@ -1656,6 +1871,7 @@ pub fn cmd(args: &[String]) -> Res {
                         o.work
                     ),
                 );
+                raw.note("topology_configuration", case.receipt());
                 raw.note("memory_record_sha256", &memory.digest);
                 raw.note("memory_record", &memory.record);
                 for (component, evidence) in &memory.evidence {

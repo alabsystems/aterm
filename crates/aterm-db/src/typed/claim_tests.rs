@@ -705,12 +705,14 @@ fn the_importer_adopts_the_canonical_node_holder() {
         }
     }
     let view = crate::typed::View {
+        table: None,
         cells: cells(&[&a, &b]),
         causal: index,
         ops: vec![a, b],
         quota: Default::default(),
         owned: Default::default(),
         complete: true,
+        awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
     };
     let macs = [KnownMac {
@@ -781,12 +783,14 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
     );
     let held = cells(&[&first, &second]);
     let view = crate::typed::View {
+        table: None,
         cells: held.clone(),
         causal: target.clone(),
         ops: vec![first.clone(), second.clone()],
         quota: Default::default(),
         owned: Default::default(),
         complete: true,
+        awaiting: crate::typed::Awaiting::NONE,
         refused: Vec::new(),
     };
     let empty = crate::typed::owned::OwnedRead::default();
@@ -1184,4 +1188,85 @@ fn a_new_claim_after_a_carry_does_not_outrank_its_observed_incumbent() {
         after.rows["mc-0000000000000003"].get("label"),
         Some(&json!("m7"))
     );
+}
+
+/// A registry 0.199.0 rolled carries every Mac's lifecycle with no proof of its period. A claim
+/// written in the new generation after that carry has its whole history there and keeps its
+/// tenure: a carried Mac set to the label and node of a Mac born after the roll, by a write that
+/// observes that birth, takes a clash label and no node, and the newer Mac keeps both, though
+/// the carried Mac's write has the lower digest. The next roll, which carries the claims with
+/// their periods and the lifecycle still with none, keeps that election. A lifecycle carried with
+/// a proof that contradicts itself (`false`) is no carry without a proof: it names no period, so
+/// the carried Mac's claims stay unknown and the clash withholds the label and the node from both.
+/// NEGATIVE CONTROL: with `Activity::read` giving a lifecycle carried with no proof no period
+/// (`None`, as 804b63029c7 did), both Macs lose the label and the node; with it naming a period
+/// for a contradicted proof too, the carried Mac's claim is judged as though it were proved.
+#[test]
+fn a_claim_written_after_a_lifecycle_carried_with_no_proof_keeps_its_tenure() {
+    let (x, y) = ("mc-0000000000000001", "mc-0000000000000002");
+    let birth = |id: u8, pk: &str, label: &str, node: &str, parents: &[u8], index: &mut Index| {
+        let mut born = operation(id, pk, "label", label, parents, index);
+        for (column, value) in [("node", node), ("row", "live")] {
+            born.changes.push(Change {
+                collection: MACHINE.name.into(),
+                key: format!("{pk}.{column}"),
+                value: Some(CellValue::automatic(MACHINE.version, json!(value)).encode()),
+            });
+        }
+        born
+    };
+    let mut source = Index::new(8);
+    let carried = cells(&[&birth(60, x, "m3", "00000000000000a3", &[], &mut source)]);
+    let lifecycle = (MACHINE.name.into(), format!("{x}.row"));
+    // The roll, with the lifecycle's proof `evidence` gives (none, as 0.199.0's), then the newer
+    // Mac's birth and the carried Mac's relabel that observes it.
+    let rolled = |evidence: Option<&CarriedClaims>| {
+        let mut index = Index::new(8);
+        let roll = carried_operation(100, &carried, evidence, &mut index);
+        let newer = birth(20, y, "m9", "00000000000000b9", &[100], &mut index);
+        let mut relabel = operation(5, x, "label", "m9", &[20], &mut index);
+        relabel.changes.push(Change {
+            collection: MACHINE.name.into(),
+            key: format!("{x}.node"),
+            value: Some(CellValue::automatic(MACHINE.version, json!("00000000000000b9")).encode()),
+        });
+        let mut raw = cells(&[&roll, &newer]);
+        raw.extend(cells(&[&relabel]));
+        (raw, [roll, newer, relabel], index)
+    };
+    let (raw, ops, index) = rolled(None);
+    let operations = [&ops[0], &ops[1], &ops[2]];
+    let elected = |read: &cell::Projection| {
+        assert_eq!(read.rows[y].get("label"), Some(&json!("m9")));
+        assert_eq!(read.rows[y].get("node"), Some(&json!("00000000000000b9")));
+        let clash = read.rows[x].get("label").and_then(Value::as_str).unwrap();
+        assert!(clash.starts_with("m9-"), "{clash}");
+        assert_eq!(read.rows[x].get("node"), None);
+    };
+    elected(&project(&MACHINE, &raw, operations.into_iter(), &index));
+
+    let normalized = interpreted_cells(&MACHINE, &raw, operations.into_iter(), &index);
+    let evidence = snapshot(&MACHINE, &normalized, operations.into_iter(), &index).unwrap();
+    assert_eq!(
+        evidence[&lifecycle][&[60; 32]],
+        Value::Null,
+        "the next roll still carries no proof of the lifecycle's period"
+    );
+    let mut next = Index::new(8);
+    let rerolled = carried_operation(200, &normalized, Some(&evidence), &mut next);
+    elected(&project(
+        &MACHINE,
+        &cells(&[&rerolled]),
+        [&rerolled].into_iter(),
+        &next,
+    ));
+
+    let contradicted =
+        CarriedClaims::from([(lifecycle, BTreeMap::from([([60; 32], Value::Bool(false))]))]);
+    let (raw, ops, index) = rolled(Some(&contradicted));
+    let read = project(&MACHINE, &raw, ops.iter(), &index);
+    for pk in [x, y] {
+        assert_eq!(read.rows[pk].get("label"), None, "{pk}");
+        assert_eq!(read.rows[pk].get("node"), None, "{pk}");
+    }
 }

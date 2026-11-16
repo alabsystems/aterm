@@ -34,11 +34,16 @@ use aterm_types::MutexExt as _;
 use crate::tab_model::TabId;
 
 mod scopes;
+mod stores;
 
 pub(crate) use scopes::{
-    CwdReport, DeckWindow, GlanceBudget, Live, LiveFrom, Membership, PaneFacts, Pool, ScopeFigure,
-    Standing, clamp, deck_asks, live_dir, own_folders, own_paths, pool_key, scope_figure,
+    CwdReport, DeckWindow, GlanceBudget, Live, LiveFrom, Membership, OwnDirs, PaneFacts, Pool,
+    ScopeFigure, Standing, clamp, deck_asks, live_dir, own_folders, own_paths, pool_key,
+    scope_figure,
 };
+#[cfg(all(test, unix))]
+pub(crate) use stores::STORE_HISTORY_FILE;
+pub(crate) use stores::{StoreAsk, StoreBytes, StoreRead, StoreSeen, history_key, read_history};
 
 /// How long one read keeps its scope demanded.
 pub(crate) const DEMAND_TTL: Duration = Duration::from_secs(60);
@@ -185,6 +190,10 @@ pub(crate) struct Facts {
     pub(crate) opt_in: Vec<PathBuf>,
     /// aterm's own folders ([`own_folders`]).
     pub(crate) own: Vec<PathBuf>,
+    /// The stores aterm keeps, each sized from the walk of the root around it.
+    pub(crate) stores: Vec<StoreAsk>,
+    /// The state folder the stores' history is kept in; none keeps it for the run only.
+    pub(crate) store_history: Option<PathBuf>,
 }
 
 impl Facts {
@@ -590,6 +599,8 @@ pub(crate) struct Published {
     pub(crate) discovered: BTreeSet<DiskScope>,
     /// Whether paths nest ignoring ASCII case (APFS).
     pub(crate) fold_case: bool,
+    /// Each store aterm keeps, by its asked path, as the walk around it last read it.
+    pub(crate) stores: BTreeMap<PathBuf, StoreRead>,
 }
 
 impl Published {
@@ -1416,6 +1427,10 @@ struct Engine {
     dirty: bool,
     /// The board last stored: a publication equal to it is not stored again.
     last: Option<Arc<Published>>,
+    /// Each store's last reading, by its asked path ([`Self::read_stores`]).
+    stores: BTreeMap<PathBuf, StoreRead>,
+    /// The history of those readings.
+    store_keep: stores::StoreKeep,
     /// Sleeps and walk starts, for [`Probe`].
     #[cfg(test)]
     tally: (u64, u64),
@@ -1467,6 +1482,8 @@ impl Engine {
             active: None,
             dirty: false,
             last: None,
+            stores: BTreeMap::new(),
+            store_keep: stores::StoreKeep::default(),
             #[cfg(test)]
             tally: (0, 0),
         }
@@ -2066,6 +2083,49 @@ impl Engine {
             self.kept.trees.remove(&p);
             self.kept.history.remove(&p);
         }
+        // A store's reading goes with the last kept walk that holds it.
+        let fold = self.fold();
+        let trees = &self.kept.trees;
+        let before = self.stores.len();
+        self.stores.retain(|path, _| {
+            canonical(path).is_some_and(|c| trees.keys().any(|root| within(&c, root, fold)))
+        });
+        self.dirty |= self.stores.len() != before;
+    }
+
+    /// Read every asked store the finished walk of `root` holds from its `tree`, and take the
+    /// readings into the stores' history. No walk is made for a store: one is sized whenever a
+    /// demanded scope walks the root around it.
+    fn read_stores(&mut self, root: &Path, tree: &Tree, at: Instant) {
+        let fold = self.fold();
+        let mut seen: Vec<(PathBuf, StoreSeen)> = self
+            .facts
+            .stores
+            .iter()
+            .filter_map(|ask| {
+                let path = canonical(&ask.path)?;
+                let seen = stores::read_store(&path, ask.each_child, root, tree, fold, &|p| {
+                    std::fs::symlink_metadata(p)
+                })?;
+                Some((ask.path.clone(), seen))
+            })
+            .collect();
+        if seen.is_empty() {
+            return;
+        }
+        let unix_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut noted: Vec<(&Path, &mut StoreSeen)> = seen
+            .iter_mut()
+            .map(|(path, seen)| (path.as_path(), seen))
+            .collect();
+        self.store_keep
+            .note(self.facts.store_history.as_deref(), &mut noted, at, unix_s);
+        for (path, seen) in seen {
+            self.stores.insert(path, StoreRead { at, seen });
+        }
+        self.dirty = true;
     }
 
     fn rederive_nested(&mut self, now: Instant) {
@@ -2389,6 +2449,7 @@ impl Engine {
             ..RootRecord::queued(a.path.clone())
         });
         self.kept.trees.insert(a.path.clone(), Arc::clone(&tree));
+        self.read_stores(&a.path, &tree, at);
         let records = &self.records;
         self.kept.history.retain(|p, _| records.contains_key(p));
         self.rederive_nested(at);
@@ -2482,6 +2543,7 @@ impl Engine {
                 _ => BTreeSet::new(),
             },
             fold_case: self.fold(),
+            stores: self.stores.clone(),
         }
     }
 
@@ -3291,16 +3353,16 @@ impl crate::App {
         }
         self.diskwalk.reports.extend(read);
         self.diskwalk.reports.retain(|k, _| seen.contains(k));
-        let home = aterm_types::dirs::home_dir();
-        let own = own_paths(
-            home.as_deref(),
-            aterm_types::dirs::state_dir(),
-            cfg!(target_os = "macos"),
-        );
+        let dirs = OwnDirs::live();
+        let own = own_paths(&dirs, cfg!(target_os = "macos"));
+        let stores = crate::disk_stores::asks(&crate::disk_stores::specs(&dirs));
+        let home = dirs.home;
         Facts {
             panes,
             tabs,
             opt_in: self.config.sys_disk_roots(home.as_deref()),
+            store_history: dirs.state,
+            stores,
             home,
             overrides: self
                 .config

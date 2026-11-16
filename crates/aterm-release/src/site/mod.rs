@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship site`: synchronizes alab.systems (`/terminal`, `/install.sh`, `/releases`) on release.
+//! `ship site`: synchronizes alab.systems (`/terminal`, `/install.sh`, `/get-aterm.ps1`,
+//! `/releases`) on release.
 mod diff;
 pub mod engine;
 pub mod hosting;
@@ -69,13 +70,14 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// Site-relative paths written by the sync.
-pub const OWNED_FILES: [&str; 9] = [
+pub const OWNED_FILES: [&str; 10] = [
     "public/index.html",
     "public/aterm.html",
     "public/terminal.html",
     "public/releases.html",
     "public/assets/releases.css",
     "public/install.sh",
+    "public/get-aterm.ps1",
     "public/sitemap.xml",
     "public/assets/term/engine.js",
     "public/assets/term/ENGINE_SOURCE",
@@ -110,6 +112,70 @@ pub fn installer(clone: &Path, slug: &str) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+/// Repository-relative path of the Windows installer served at `/get-aterm.ps1`
+/// (`irm https://alab.systems/get-aterm.ps1 | iex`).
+pub const WINDOWS_INSTALLER_SOURCE: &str = aterm_bootstrap_verify::pin::WINDOWS_SCRIPT;
+
+/// Reads and validates the public commit's Windows installer for `/get-aterm.ps1`: `None`
+/// while its release verifier pin is empty. Such a script refuses before it downloads anything
+/// (PowerShell has no Ed25519 to check a release with), so the site serves nothing rather than a
+/// command that can only fail, and a copy it served before goes.
+///
+/// # Errors
+/// Returns an error if the script is not readable bounded UTF-8 regular text, if any of its
+/// `[string]$Repo` defaults (the script's and its install function's) names another repository
+/// than `slug` or it declares none, if its verifier pin is not one `WindowsPin::read` accepts,
+/// or if a set pin names another repository's verifier.
+pub fn windows_installer(clone: &Path, slug: &str) -> Result<Option<String>, String> {
+    let text = crate::durable::read_regular_text(
+        &clone.join(WINDOWS_INSTALLER_SOURCE),
+        MAX_SITE_FILE_BYTES,
+    )
+    .map_err(|e| {
+        format!(
+            "the public commit has no readable {WINDOWS_INSTALLER_SOURCE} to serve as \
+             /get-aterm.ps1 ({e})"
+        )
+    })?;
+    let default = format!("[string]$Repo = \"{slug}\"");
+    let defaults: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix("[string]$Repo")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+        .collect();
+    if defaults.is_empty()
+        || defaults
+            .iter()
+            .any(|line| line.strip_suffix(',').unwrap_or(line) != default)
+    {
+        return Err(format!(
+            "the public commit's {WINDOWS_INSTALLER_SOURCE} does not declare {default} as its \
+             every -Repo default: piped from alab.systems it would install from another \
+             repository than the one the site links"
+        ));
+    }
+    let pin = aterm_bootstrap_verify::pin::WindowsPin::read(&text).map_err(|e| {
+        format!(
+            "the public commit's {WINDOWS_INSTALLER_SOURCE} carries no readable release \
+             verifier pin: {e}"
+        )
+    })?;
+    if pin.is_empty() {
+        return Ok(None);
+    }
+    if pin.repo != slug {
+        return Err(format!(
+            "the public commit's {WINDOWS_INSTALLER_SOURCE} pins the release verifier of {}, \
+             not of {slug}: piped from alab.systems it would run another repository's verifier",
+            pin.repo
+        ));
+    }
+    Ok(Some(text))
 }
 
 /// Git pathspec for the engine's hash-named wasm pair.
@@ -595,7 +661,8 @@ pub enum Refusal {
     Release,
     /// A site page or sitemap is missing or malformed.
     Page,
-    /// The public commit's installer is missing or invalid.
+    /// One of the public commit's installers (`/install.sh`, `/get-aterm.ps1`) is missing or
+    /// invalid.
     Installer,
     /// The sync commit did not capture all owned files.
     Uncaptured,
@@ -732,6 +799,20 @@ impl Git<'_> {
 
     fn ok(&self, dir: &Path, args: &[&str]) -> bool {
         self.run(dir, args).is_ok_and(|o| o.status.success())
+    }
+
+    fn staged_is_clean(&self, dir: &Path) -> Result<bool, String> {
+        let answer = self
+            .run(dir, &["diff", "--cached", "--quiet"])
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        match answer.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => Err(format!(
+                "git diff --cached --quiet exited {code:?}: {}",
+                String::from_utf8_lossy(&answer.stderr).trim()
+            )),
+        }
     }
 
     /// stdout when git succeeds, else its last stderr line.
@@ -875,6 +956,36 @@ fn say(out: &mut dyn Write, line: &str) {
 
 fn read_text(path: &Path) -> Option<String> {
     crate::durable::read_regular_text(path, MAX_SITE_FILE_BYTES).ok()
+}
+
+fn recovery_record(path: &Path, kind: &str) -> Result<Option<String>, Failure> {
+    match crate::durable::read_regular_text(path, MAX_SITE_FILE_BYTES) {
+        Ok(text) if !text.trim().is_empty() => Ok(Some(text.trim().to_owned())),
+        Ok(_) => fail(
+            Refusal::Io,
+            format!("{kind} record {} is empty", path.display()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => fail(
+            Refusal::Io,
+            format!("cannot read {kind} in {}: {e}", path.display()),
+        ),
+    }
+}
+
+fn retire_recovery_record(path: &Path, kind: &str) -> Result<(), Failure> {
+    let removed = match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    };
+    removed
+        .and_then(|()| crate::durable::sync_dir(path.parent().unwrap_or_else(|| Path::new("."))))
+        .map_err(|error| {
+            refusal(
+                Refusal::Io,
+                format!("cannot retire {kind} record {}: {error}", path.display()),
+            )
+        })
 }
 
 fn signed_artifact_layout(env: &Env) -> Option<atpkg::Layout> {
@@ -1026,32 +1137,45 @@ fn steps(
             )
         })?;
     let owed_mark = git_dir.join(OWED_MARK);
+    let owed = recovery_record(&owed_mark, "pending deployment")?.unwrap_or_default();
     let in_flight = git_dir.join(IN_FLIGHT_MARK);
-    let branch = git
-        .line(&site_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .unwrap_or_else(|| "main".into());
-    let unpushed_owned = || -> String {
+    let branch_ref = git
+        .out(&site_root, &["symbolic-ref", "--quiet", "HEAD"])
+        .map_err(|e| child_failed("git symbolic-ref", e))?
+        .trim()
+        .to_owned();
+    let branch = branch_ref
+        .strip_prefix("refs/heads/")
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            refusal(
+                Refusal::NotACheckout,
+                "the site checkout's HEAD does not name a branch",
+            )
+        })?;
+    let unpushed_owned = || -> Result<String, Failure> {
         let upstream = format!("refs/remotes/origin/{branch}");
-        if !git.ok(
-            &site_root,
-            &[
-                "rev-parse",
-                "--quiet",
-                "--verify",
-                &format!("{upstream}^{{commit}}"),
-            ],
-        ) {
-            return String::new();
-        }
-        let range = format!("{upstream}..HEAD");
+        let tip = git
+            .out(
+                &site_root,
+                &[
+                    "rev-parse",
+                    "--quiet",
+                    "--verify",
+                    &format!("{upstream}^{{commit}}"),
+                ],
+            )
+            .map_err(|e| child_failed("git rev-parse", e))?;
+        let range = format!("{}..HEAD", tip.trim());
         let mut args = vec!["log", "--format=%h", range.as_str(), "--"];
         args.extend(OWNED_FILES);
         args.push(OWNED_GLOB);
-        git.out(&site_dir, &args)
-            .unwrap_or_default()
+        Ok(git
+            .out(&site_dir, &args)
+            .map_err(|e| child_failed("git log", e))?
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" "))
     };
     let mut owned: Vec<&str> = vec!["status", "--porcelain", "--"];
     owned.extend(OWNED_FILES);
@@ -1060,9 +1184,8 @@ fn steps(
         .out(&site_dir, &owned)
         .map_err(|e| child_failed("git status", e))?;
     if !dirty.trim().is_empty() {
-        let owed = read_text(&owed_mark).is_some_and(|m| !m.trim().is_empty())
-            || !unpushed_owned().is_empty();
-        let in_flight_exists = in_flight.is_file();
+        let owed = !owed.is_empty() || !unpushed_owned()?.is_empty();
+        let in_flight_exists = recovery_record(&in_flight, "in-flight sync")?.is_some();
         if !in_flight_exists || owed || dry {
             let (kind, why) = if !in_flight_exists {
                 (Refusal::DirtyOwned, "commit or stash them first")
@@ -1090,13 +1213,31 @@ fn steps(
         }
         halt(launch, "the interrupted sync's files were put back")?;
         let put_back = || -> Result<String, String> {
-            let mut diff: Vec<&str> = vec!["diff", "--name-only", "--relative", "HEAD", "--"];
-            diff.extend(OWNED_FILES);
-            diff.push(OWNED_GLOB);
-            let changed = git.out(&site_dir, &diff)?;
-            let changed: Vec<&str> = changed.lines().filter(|l| !l.is_empty()).collect();
+            let mut changed = String::new();
+            // A worktree matching HEAD can still hide a changed index. Read both,
+            // with renames expanded so restoration includes each old and new path.
+            for cached in [false, true] {
+                let mut diff = vec!["diff", "--name-only", "-z", "--relative", "--no-renames"];
+                if cached {
+                    diff.push("--cached");
+                }
+                diff.extend(["HEAD", "--"]);
+                diff.extend(OWNED_FILES);
+                diff.push(OWNED_GLOB);
+                changed.push_str(&git.out(&site_dir, &diff)?);
+            }
+            let mut changed: Vec<&str> = changed.split('\0').filter(|p| !p.is_empty()).collect();
+            changed.sort_unstable();
+            changed.dedup();
             if !changed.is_empty() {
-                let mut restore = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+                let mut restore = vec![
+                    "--literal-pathspecs",
+                    "restore",
+                    "--source=HEAD",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                ];
                 restore.extend(&changed);
                 git.out(&site_dir, &restore)?;
             }
@@ -1125,9 +1266,12 @@ fn steps(
                 dirty.trim_end()
             ),
         );
-        let _ = std::fs::remove_file(&in_flight);
+        retire_recovery_record(&in_flight, "in-flight sync")?;
     }
-    if !git.ok(&site_root, &["diff", "--cached", "--quiet"]) {
+    if !git
+        .staged_is_clean(&site_root)
+        .map_err(|e| child_failed("git diff", e))?
+    {
         return fail(
             Refusal::StagedUnrelated,
             format!(
@@ -1330,7 +1474,12 @@ fn steps(
             format!("clone is not at {commit} (refusing to build from a different tree)"),
         );
     }
-    if git.line(&clone, &["status", "--porcelain"]).is_some() {
+    if !git
+        .out(&clone, &["status", "--porcelain"])
+        .map_err(|e| child_failed("git status", e))?
+        .trim()
+        .is_empty()
+    {
         return fail(Refusal::Commit, "fresh clone is dirty (?)");
     }
     say(out, &format!("clone is at {commit}"));
@@ -1552,6 +1701,30 @@ fn steps(
         ),
     );
     planned.insert("public/install.sh", served);
+    // No entry while the script's verifier pin is empty: the sync then removes a copy the site
+    // served before, and the live check holds the site to serving none.
+    match windows_installer(&clone, slug).map_err(|e| refusal(Refusal::Installer, e))? {
+        Some(served) => {
+            say(
+                out,
+                &format!(
+                    "windows installer: /get-aterm.ps1 = {WINDOWS_INSTALLER_SOURCE} @ {} ({} \
+                     bytes; piped to iex, it installs from {slug})",
+                    short(&commit),
+                    served.len()
+                ),
+            );
+            planned.insert("public/get-aterm.ps1", served);
+        }
+        None => say(
+            out,
+            &format!(
+                "windows installer: {WINDOWS_INSTALLER_SOURCE} @ {} pins no release verifier \
+                 yet, so it could only refuse — /get-aterm.ps1 is not served",
+                short(&commit)
+            ),
+        ),
+    }
 
     // The /terminal engine — the sync's first write into the checkout, so a real run marks
     // itself in flight first (until its commit) — is built here (engine.rs) on the wasm32
@@ -1646,10 +1819,14 @@ fn steps(
         "public/releases.html",
         "public/assets/releases.css",
         "public/install.sh",
+        "public/get-aterm.ps1",
     ] {
         existing.insert(rel, read_text(&site_dir.join(rel)));
     }
-    let differs = |rel: &str, new: &str| existing.get(rel).and_then(Option::as_deref) != Some(new);
+    // A file the plan holds no entry for is one the sync removes.
+    let differs = |rel: &str| {
+        existing.get(rel).and_then(Option::as_deref) != planned.get(rel).map(String::as_str)
+    };
     let mut changed: Vec<&str> = Vec::new();
     let mut touch: Vec<&str> = Vec::new();
     for (rel, path) in [
@@ -1658,7 +1835,7 @@ fn steps(
         ("public/terminal.html", "/terminal"),
         ("public/releases.html", "/releases"),
     ] {
-        if differs(rel, &planned[rel]) {
+        if differs(rel) {
             changed.push(rel);
             touch.push(path);
         }
@@ -1666,8 +1843,15 @@ fn steps(
     if engine_changed {
         touch.push("/terminal");
     }
-    for rel in ["public/assets/releases.css", "public/install.sh"] {
-        if differs(rel, &planned[rel]) {
+    for rel in [
+        "public/assets/releases.css",
+        "public/install.sh",
+        "public/get-aterm.ps1",
+    ] {
+        // Whatever is at a path the plan leaves out goes, readable as text or not.
+        let removed =
+            !planned.contains_key(rel) && std::fs::symlink_metadata(site_dir.join(rel)).is_ok();
+        if removed || differs(rel) {
             changed.push(rel);
         }
     }
@@ -1700,10 +1884,15 @@ fn steps(
                 &format!("dry run: would update: {}", changed.join(" ")),
             );
             for rel in &changed {
-                let new = &planned[rel];
-                match existing.get(rel).and_then(Option::as_deref) {
-                    None => say(out, &format!("  {rel}: new file ({} bytes)", new.len())),
-                    Some(old) => {
+                match (
+                    existing.get(rel).and_then(Option::as_deref),
+                    planned.get(rel),
+                ) {
+                    (_, None) => say(out, &format!("  {rel}: removed")),
+                    (None, Some(new)) => {
+                        say(out, &format!("  {rel}: new file ({} bytes)", new.len()));
+                    }
+                    (Some(old), Some(new)) => {
                         for line in diff::unified(rel, old, new).iter().take(40) {
                             let _ = writeln!(out, "  {line}");
                         }
@@ -1718,11 +1907,15 @@ fn steps(
                  nothing changed",
             );
         } else {
-            let overlay: BTreeMap<String, Vec<u8>> = changed
+            let overlay: BTreeMap<String, Option<Vec<u8>>> = changed
                 .iter()
                 .filter_map(|rel| {
-                    rel.strip_prefix("public/")
-                        .map(|p| (p.to_string(), planned[rel].clone().into_bytes()))
+                    rel.strip_prefix("public/").map(|p| {
+                        (
+                            p.to_string(),
+                            planned.get(rel).map(|text| text.clone().into_bytes()),
+                        )
+                    })
                 })
                 .collect();
             let plan = hosting::Plan::of(&site_dir, &hosting, hosting_site.clone(), &overlay)
@@ -1760,6 +1953,19 @@ fn steps(
                 ),
             );
         }
+        let Some(text) = planned.get(rel) else {
+            std::fs::remove_file(&path).map_err(|e| {
+                refusal(
+                    Refusal::Io,
+                    format!("cannot remove {}: {e}", path.display()),
+                )
+            })?;
+            say(
+                out,
+                &format!("removed {rel}: the public commit gives it nothing to serve"),
+            );
+            continue;
+        };
         let write_page = || -> std::io::Result<()> {
             use std::io::Write as _;
             if let Some(parent) = path.parent() {
@@ -1789,7 +1995,7 @@ fn steps(
                 }
             }
             f.set_len(0)?;
-            f.write_all(planned[rel].as_bytes())
+            f.write_all(text.as_bytes())
         };
         write_page()
             .map_err(|e| refusal(Refusal::Io, format!("cannot write {}: {e}", path.display())))?;
@@ -1823,7 +2029,9 @@ fn steps(
             format!("staging the files this sync owns failed:\n{e}"),
         )
     })?;
-    let mut nothing = git.ok(&site_dir, &["diff", "--cached", "--quiet"]);
+    let mut nothing = git
+        .staged_is_clean(&site_dir)
+        .map_err(|e| child_failed("git diff", e))?;
     if nothing {
         say(
             out,
@@ -1869,16 +2077,10 @@ fn steps(
         git.out(&site_dir, &refs)
             .map_err(|e| child_failed("git commit", format!("the site commit failed: {e}")))?;
         say(out, &format!("committed: {subject}"));
-        if let Some(head) = git.line(&site_dir, &["rev-parse", "HEAD"]) {
-            let _ = crate::durable::write_fresh(&owed_mark, format!("{head}\n"));
-        }
     }
-    let _ = std::fs::remove_file(&in_flight);
+    retire_recovery_record(&in_flight, "in-flight sync")?;
 
-    let unpushed = unpushed_owned();
-    let owed = read_text(&owed_mark)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let unpushed = unpushed_owned()?;
     let mut owed_only = false;
     if nothing && unpushed.is_empty() && (!owed.is_empty() || opts.redeploy) && !no_deploy {
         if owed.is_empty() {
@@ -1901,7 +2103,40 @@ fn steps(
         owed_only = true;
         nothing = false;
     }
+    let require_captured = || -> Result<(), Failure> {
+        let leftover = git
+            .out(&site_dir, &owned)
+            .map_err(|e| child_failed("git status", e))?;
+        if !leftover.trim().is_empty() {
+            return fail(
+                Refusal::Uncaptured,
+                format!(
+                    "the sync commit did not capture everything this sync owns, so publishing \
+                     cannot proceed:\n{}",
+                    leftover.trim_end()
+                ),
+            );
+        }
+        Ok(())
+    };
     if !nothing || !unpushed.is_empty() {
+        let head = git
+            .out(&site_dir, &["rev-parse", "HEAD"])
+            .map_err(|e| child_failed("git rev-parse", e))?;
+        crate::durable::write_atomic_durable(
+            &owed_mark,
+            format!("{}\n", head.trim()).as_bytes(),
+            0o600,
+        )
+        .map_err(|e| {
+            refusal(
+                Refusal::Io,
+                format!(
+                    "cannot record pending deployment in {}: {e}",
+                    owed_mark.display()
+                ),
+            )
+        })?;
         if nothing {
             say(
                 out,
@@ -1928,7 +2163,7 @@ fn steps(
                 "--autostash",
                 "--quiet",
                 "origin",
-                &branch,
+                &branch_ref,
             ],
         ) {
             let _ = git.run(&site_root, &["rebase", "--abort"]);
@@ -1938,19 +2173,20 @@ fn steps(
                 format!(
                     "pull --rebase from origin {branch} failed (above) — the site commit is on THIS \
                  MACHINE ONLY and NOTHING WAS DEPLOYED. Resolve the pull by hand, and do not push: \
-                 (cd {} && git pull --rebase origin {branch}); then re-run targo --unverified ship \
+                 (cd {} && git pull --rebase origin {branch_ref}); then re-run targo --unverified ship \
                  site --latest, which pushes the commit and deploys it",
                     site_root.display()
                 ),
             ));
         }
-        let pushed = if owed_only && unpushed_owned().is_empty() {
+        require_captured()?;
+        let pushed = if owed_only && unpushed_owned()?.is_empty() {
             None
         } else {
             halt(launch, "the push")?;
             Some(git.out(
                 &site_root,
-                &["push", "--quiet", "origin", &format!("HEAD:{branch}")],
+                &["push", "--quiet", "origin", &format!("HEAD:{branch_ref}")],
             ))
         };
         if pushed.is_none() {
@@ -1974,25 +2210,16 @@ fn steps(
     }
 
     halt(launch, "the deploy")?;
-    let leftover = git.out(&site_dir, &owned).unwrap_or_default();
-    if !leftover.trim().is_empty() {
-        return fail(
-            Refusal::Uncaptured,
-            format!(
-                "the sync commit did not capture everything this sync owns, so deploying would \
-             publish bytes the site repo does not have:\n{}",
-                leftover.trim_end()
-            ),
-        );
-    }
+    require_captured()?;
     let committed_engine = || {
-        git.line(&public, &["show", "HEAD:./assets/term/ENGINE_SOURCE"])
-            .unwrap_or_default()
+        git.out(&public, &["show", "HEAD:./assets/term/ENGINE_SOURCE"])
+            .map(|text| text.trim().to_string())
+            .map_err(|e| child_failed("git show", e))
     };
     let tree_engine = read_text(&mark)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let head_engine = committed_engine();
+    let head_engine = committed_engine()?;
     if !tree_engine.is_empty() && tree_engine != head_engine {
         let head = if head_engine.is_empty() {
             "nothing"
@@ -2071,7 +2298,6 @@ fn steps(
         match world.deploy(&plan, &key, &message, out) {
             Ok(released) => {
                 deployed = true;
-                let _ = std::fs::remove_file(&owed_mark);
                 say(
                     out,
                     &format!(
@@ -2080,6 +2306,7 @@ fn steps(
                         released.release, released.version, released.uploaded, released.files
                     ),
                 );
+                retire_recovery_record(&owed_mark, "pending deployment")?;
             }
             Err(failed @ hosting::Failed::Credential(_)) => return not_deployed(out, &failed),
             Err(failed @ hosting::Failed::NotReleased { .. }) => {
@@ -2129,12 +2356,12 @@ fn steps(
                 );
                 said = differences.into_iter().map(Disagreement::Page).collect();
                 if said.is_empty() {
-                    let committed = committed_engine();
+                    let committed = committed_engine()?;
                     let served = live
                         .get("ENGINE_SOURCE")
                         .map(|s| s.trim().to_string())
                         .unwrap_or_default();
-                    if !committed.is_empty() && !served.is_empty() && committed != served {
+                    if committed != served {
                         said.push(Disagreement::EngineNotCommitted { served, committed });
                     } else {
                         verified = true;
@@ -2151,7 +2378,7 @@ fn steps(
             let _ = writeln!(
                 out,
                 "  verify: live site matches the checkout (engine pair, download links, platform \
-                 attributes, /releases, /install.sh)"
+                 attributes, /releases, /install.sh, /get-aterm.ps1)"
             );
             say(out, &format!("live: {url} matches the checkout"));
         } else if !fetched {
@@ -2234,7 +2461,9 @@ fn is_public_release_clone(url: &str, slug: &str) -> bool {
         && aterm_update_core::git_https::is_anonymous_https_url(url)
 }
 
-/// The live copies the comparison reads, or `None` when one could not be fetched.
+/// The live copies the comparison reads, or `None` when one could not be fetched. The two
+/// installers are read where the site serves them; one it does not serve is absent from the
+/// map, which the comparison weighs against the checkout's copy (`pages::compare`).
 fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str, String>> {
     let mut live = BTreeMap::new();
     for (path, name) in [
@@ -2248,8 +2477,10 @@ fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str,
         let bytes = world.live(&format!("{url}{path}")).ok()?;
         live.insert(name, String::from_utf8_lossy(&bytes).into_owned());
     }
-    if let Ok(bytes) = world.live(&format!("{url}/install.sh")) {
-        live.insert("install.sh", String::from_utf8_lossy(&bytes).into_owned());
+    for name in ["install.sh", "get-aterm.ps1"] {
+        if let Ok(bytes) = world.live(&format!("{url}/{name}")) {
+            live.insert(name, String::from_utf8_lossy(&bytes).into_owned());
+        }
     }
     Some(live)
 }

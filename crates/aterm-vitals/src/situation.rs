@@ -11,7 +11,8 @@
 //!
 //! The network place is not here: it is [`crate::model::Snapshot::place`], netplace's own place,
 //! which the situation points at rather than copies (A4 §12.5). Low Power Mode is not here either:
-//! it is [`crate::model::Thermal::low_power`].
+//! it is [`crate::model::Thermal::low_power`]. The strip's history of the situation is its
+//! [`Span`]s: each stay with the place's kind, the power source and the lid.
 //!
 //! Every value says when it is not a reading ([`Reading::Unread`], [`Reading::Unsupported`]);
 //! none stands in a zero. What a machine lacks (a desktop's lid, battery or built-in panel) is
@@ -229,6 +230,110 @@ impl Situation {
             (Reading::Unsupported, _) | (_, Reading::Unsupported) => Reading::Unsupported,
             _ => Reading::Unread,
         }
+    }
+}
+
+/// What a situation span keeps of one reading (A4 §8's lane): the network place's kind, the
+/// power source and the lid. A value no reader gave is `None`, and draws blank.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stay {
+    /// netplace's kind for the place ([`crate::model::PlaceView::kind`]): `lan`, `hotspot`,
+    /// `cellular`, `vpn` or `offline`. `None` while netplace has none yet (it is checking) or
+    /// the host read no place.
+    pub place: Option<crate::model::PlaceKind>,
+    /// What powers the machine.
+    pub power: Option<PowerSource>,
+    /// The lid ([`Lid::None`] on a machine with none).
+    pub lid: Option<Lid>,
+}
+
+impl Stay {
+    /// The stay a reading of `place` and `situation` is in.
+    #[must_use]
+    pub fn of(place: Option<crate::model::PlaceKind>, situation: &Situation) -> Self {
+        Self {
+            place: place.filter(|k| *k != crate::model::PlaceKind::Checking),
+            power: situation.power.read().map(|p| p.source),
+            lid: situation.lid.read().map(|l| l.lid),
+        }
+    }
+
+    /// Whether no reader gave any of it: such a reading is in no stay.
+    #[must_use]
+    pub const fn is_unread(&self) -> bool {
+        self.place.is_none() && self.power.is_none() && self.lid.is_none()
+    }
+}
+
+/// One stay of the machine's situation, `[start_ms, end_ms)` in unix ms: the readings over which
+/// its place, power source and lid read the same, one after another with no gap. The strip keeps
+/// six hours of them, as it keeps its gaps and events, and draws the Machine row's lane from
+/// them (A4 §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    /// The first reading in it; where it follows another stay with no gap, that stay's end.
+    pub start_ms: i64,
+    /// The newest reading in it.
+    pub end_ms: i64,
+    /// What read the same throughout.
+    pub stay: Stay,
+}
+
+impl Span {
+    /// Puts `span` into `spans`, oldest first, keeping at most `cap`: every span that starts at
+    /// or after it goes (it replaces the one it continues, and a clock stepped back leaves none
+    /// ahead of it), and the one before it ends no later than it starts. A span of one reading
+    /// that nothing joined covers no time, so it gives way to the span put after it: readings
+    /// that come apart, as a hidden deck's do, never spend the list. A span that ends before it
+    /// starts is not put.
+    pub fn put(spans: &mut Vec<Self>, span: Self, cap: usize) {
+        if span.end_ms < span.start_ms {
+            return;
+        }
+        spans.retain(|s| s.start_ms < span.start_ms);
+        if spans
+            .last()
+            .is_some_and(|last| last.start_ms == last.end_ms)
+        {
+            spans.pop();
+        }
+        if let Some(last) = spans.last_mut() {
+            last.end_ms = last.end_ms.min(span.start_ms);
+        }
+        spans.push(span);
+        let extra = spans.len().saturating_sub(cap);
+        spans.drain(..extra);
+    }
+
+    /// Takes a reading at `at_ms` in `stay` into `spans` ([`Self::put`]). `joins` is the wall
+    /// clock of the reading before it where this one follows it with no gap (no sleep, pause or
+    /// clock step between them): the stay that held through that reading goes on, or ends there
+    /// and the new one starts. Any other reading starts a span of its own, which stays only
+    /// once a reading joins it, and an unread stay none.
+    pub fn note(spans: &mut Vec<Self>, at_ms: i64, stay: Stay, joins: Option<i64>, cap: usize) {
+        if stay.is_unread() {
+            return;
+        }
+        let held = spans
+            .last()
+            .zip(joins)
+            .filter(|(last, prev)| last.end_ms == *prev && at_ms >= *prev)
+            .map(|(last, prev)| {
+                if last.stay == stay {
+                    last.start_ms
+                } else {
+                    prev
+                }
+            });
+        Self::put(
+            spans,
+            Self {
+                start_ms: held.unwrap_or(at_ms),
+                end_ms: at_ms,
+                stay,
+            },
+            cap,
+        );
     }
 }
 

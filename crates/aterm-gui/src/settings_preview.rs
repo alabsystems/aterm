@@ -5397,7 +5397,10 @@ impl CursorScene {
             // preview frame keeps its sprite layers (identity damage repaints
             // nothing for them). Boxed, as `PLAYER` is: inline it was 3.6 KB of
             // every thread's TLS.
-            static COMPANIONS: std::cell::RefCell<Option<Box<(u64, WordDecorations, SpriteLayers)>>> =
+            // With them, the scene's clock: an instant its phases count from, and the phase
+            // last drawn, so the flier's placement state (its flights) runs on in order and is
+            // forgotten where the phase goes back or jumps.
+            static COMPANIONS: std::cell::RefCell<Option<Box<CompanionSlot>>> =
                 const { std::cell::RefCell::new(None) };
         }
         COMPANIONS.with_borrow_mut(|slot| {
@@ -5416,9 +5419,12 @@ impl CursorScene {
                     key,
                     decorations,
                     SpriteLayers::new(WORD_SPRITE_SALT),
+                    SceneClock::new(),
                 )));
             }
-            let (_, decorations, layers) = slot.as_deref_mut()?;
+            let (_, decorations, layers, clock) = slot.as_deref_mut()?;
+            let at = clock.at(self.phase_ms, decorations);
+            let mark = decorations.kitty_cursor_placement_mark();
             let mut sprites = Vec::new();
             let shown_rows = self.card_rows.map_or(rows, |card| {
                 u16::try_from(card).unwrap_or(u16::MAX).min(rows)
@@ -5427,13 +5433,15 @@ impl CursorScene {
             let ink = (geom, colors);
             let mut emit = |fit: f32, sprites: &mut Vec<FreeSprite>| {
                 for _ in 0..3 {
+                    // Each draw of this frame from the placement state it began with.
+                    decorations.restore_kitty_cursor_placement(mark);
                     decorations.begin_host_frame();
                     self.emit_companion(
                         decorations,
                         ink,
                         caret,
                         (pet, floor),
-                        flight,
+                        (flight, at),
                         fit,
                         sprites,
                     );
@@ -5472,7 +5480,10 @@ impl CursorScene {
         ),
         caret: (u16, u16),
         (pet, floor): (&PetCue<'_>, i32),
-        flight: Option<aterm_effects::kitty_cursor::CatFrame>,
+        (flight, at): (
+            Option<aterm_effects::kitty_cursor::CatFrame>,
+            std::time::Instant,
+        ),
         fit: f32,
         sprites: &mut Vec<aterm_render::sprites::FreeSprite>,
     ) {
@@ -5596,13 +5607,22 @@ impl CursorScene {
                 // (`EffectsPipeline::route_flying_head`): its rest ahead of the
                 // caret where the caret's row is blank there, else behind the
                 // caret or a row up, off the letters (`rainbow_kitty::companion::
-                // placement`). The scene's cat faces the way it types.
+                // placement`). The scene's cat faces the way it types. Its flights
+                // and its way off a wall are the terminal's own
+                // (`WordDecorations::fly_kitty_glide`, `veil_kitty_cursor`); the
+                // route's rise with the last stride step into the wall, its held
+                // sky row and its fit on the frame it comes on glass are not here:
+                // the scene's command ends far from the wall, under blank rows.
                 let ink = |row: u16, col: u16| {
                     (row < geom.rows && col < geom.cols)
                         .then(|| pet.letters.lettered(usize::from(row), usize::from(col)))
                 };
                 let mut lift = 0.0;
                 let base_pose = pose;
+                // The glide's stride in every seat, as the terminal's
+                // (`WordDecorations::kitty_cursor_stride`).
+                let stride =
+                    aterm_effects::word_decorations::WordDecorations::kitty_cursor_stride(body);
                 let rest = decorations.kitty_cursor_footprint(
                     aterm_effects::word_decorations::KittyCursorLayout {
                         geom,
@@ -5633,6 +5653,7 @@ impl CursorScene {
                             rest,
                             lead_px: aterm_effects::word_decorations::WordDecorations::kitty_cursor_lead_px(cell_w),
                             held_sky: false,
+                            stride,
                         },
                         ink,
                     );
@@ -5661,7 +5682,7 @@ impl CursorScene {
                 // Judged on the posed body, as the terminal's head is: a stretch grows it about
                 // its centre, back toward the caret.
                 let mut drawn = decorations
-                    .kitty_cursor_kept_off(&whole, ink, false)
+                    .kitty_cursor_kept_off_at(&whole, ink, false, at)
                     .map(|placement| (whole, placement));
                 // No whole seat clears: fitted to the caret's row as the terminal fits it
                 // (`EffectsPipeline::route_flying_head`, `companion::HeadFit`).
@@ -5671,7 +5692,7 @@ impl CursorScene {
                 ) / aterm_effects::word_decorations::HEAD_CARET_GAP_DEN)
                     .max(1);
                 let blocked = drawn
-                    .and_then(|(_, placement)| placement.drawn_footprint())
+                    .and_then(|(_, placement)| placement.landing_footprint())
                     .is_some_and(|r| {
                         !aterm_effects::rainbow_kitty::companion::box_clear(
                             (r.x, r.y, i32::from(r.w), i32::from(r.h)),
@@ -5681,39 +5702,38 @@ impl CursorScene {
                             &ink,
                         )
                     });
-                if blocked
-                    && let Some(rest) = rest
-                    && let Some((goal, _)) = aterm_effects::rainbow_kitty::companion::head_fit_seat(
+                let fit_seat = rest.filter(|_| blocked).and_then(|rest| {
+                    aterm_effects::rainbow_kitty::companion::head_fit_seat(
                         caret,
                         rest,
-                        (cw, ch, geom.cols),
+                        (cw, ch, geom.rows, geom.cols),
                         (
                             gap,
-                            decorations.kitty_cursor_fit_floor(
-                                aterm_effects::word_decorations::KittyCursorLayout {
-                                    geom,
-                                    cursor: caret,
-                                    look,
-                                    body,
-                                    bob,
-                                    lift: 0.0,
-                                },
-                                rest,
-                            ),
+                            stride,
+                            matches!(body, aterm_effects::kitty_cursor::CursorBody::Glide(_)),
                         ),
                         &ink,
                     )
+                });
+                let leaves = matches!(
+                    fit_seat,
+                    Some(aterm_effects::rainbow_kitty::companion::HeadFitSeat::Leave)
+                );
+                if let Some(rest) = rest
+                    && let Some((goal, seat_rect)) =
+                        fit_seat.and_then(aterm_effects::rainbow_kitty::companion::HeadFitSeat::fit)
                 {
                     // The terminal's own fitted geometry (`companion::fitted_head`), at the
-                    // goal: the preview has no ease.
+                    // goal, on the row its seat stands on: the preview has no ease.
+                    let row = aterm_effects::rainbow_kitty::companion::fit_row(seat_rect, ch);
                     let aterm_effects::rainbow_kitty::companion::FittedHead {
                         lift, lead_px, ..
                     } = aterm_effects::rainbow_kitty::companion::fitted_head(
-                        caret,
+                        (row, caret.1),
                         rest,
                         goal,
                         (cw, ch, geom.cols),
-                        gap,
+                        (gap, stride),
                         (bob * f32::from(cell_h)).round() as i32,
                     );
                     let fitted = KittyCursorFrame {
@@ -5728,16 +5748,87 @@ impl CursorScene {
                         },
                         ..whole
                     };
-                    if let Some(placement) = decorations.kitty_cursor_kept_off(&fitted, ink, true) {
+                    if let Some(placement) =
+                        decorations.kitty_cursor_kept_off_at(&fitted, ink, true, at)
+                    {
                         drawn = Some((fitted, placement));
                     }
                 }
-                if let Some((frame, placement)) = drawn {
+                if let Some((frame, mut placement)) = drawn {
+                    // The terminal's own way off a wall with no seat, its moves' flights and
+                    // their steps (`EffectsPipeline::prepare_flying_head`): the scene's Tab
+                    // completion is flown, not drawn whole at its end on its frame.
+                    decorations.veil_kitty_cursor(&mut placement, at, leaves);
+                    if !leaves {
+                        // A step each frame the scene draws, a motion step apart.
+                        decorations.fly_kitty_glide(
+                            &mut placement,
+                            (
+                                aterm_effects::word_decorations::KittyCursorLayout {
+                                    geom,
+                                    cursor: caret,
+                                    look: frame.look,
+                                    body: frame.body,
+                                    bob: frame.bob,
+                                    lift: frame.lift,
+                                },
+                                std::time::Duration::from_millis(MOTION_STEP_MS),
+                            ),
+                            None,
+                            ink,
+                        );
+                    }
                     let _ = decorations.kitty_cursor_at_placement(frame, placement, sprites);
                 }
             }
             SceneCompanion::None => {}
         }
+    }
+}
+
+/// The cursor scene's companion: its asset's fingerprint, its decorations, its layer publisher
+/// and its clock.
+type CompanionSlot = (
+    u64,
+    aterm_effects::word_decorations::WordDecorations,
+    aterm_render::sprites::SpriteLayers,
+    SceneClock,
+);
+
+/// The cursor scene's clock for the flier's placement state: phases count from one instant, and
+/// a phase drawn out of order (the loop's restart, a scrub, a still frame shown again) forgets
+/// the placements before it, so a flight only ever runs forward through frames shown in turn.
+struct SceneClock {
+    zero: std::time::Instant,
+    last: Option<u64>,
+}
+
+impl SceneClock {
+    /// No more than a few of the preview's motion steps between frames shown in turn.
+    const IN_TURN_MS: u64 = 4 * MOTION_STEP_MS;
+
+    fn new() -> Self {
+        Self {
+            zero: std::time::Instant::now(),
+            last: None,
+        }
+    }
+
+    /// The instant of `phase_ms`, `decorations`' placements forgotten where it is not the next
+    /// frame shown in turn.
+    fn at(
+        &mut self,
+        phase_ms: u64,
+        decorations: &mut aterm_effects::word_decorations::WordDecorations,
+    ) -> std::time::Instant {
+        let in_turn = self
+            .last
+            .is_some_and(|last| phase_ms >= last && phase_ms - last <= Self::IN_TURN_MS);
+        if !in_turn {
+            decorations.forget_kitty_cursor_placement();
+        }
+        self.last = Some(phase_ms);
+        self.zero + std::time::Duration::from_millis(phase_ms)
     }
 }
 

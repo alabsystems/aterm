@@ -85,7 +85,7 @@ fn lost_attachment_ack_forwards_actual_lifecycle_without_fabricated_attached() {
     use aterm_types::resource_subgroup as subgroup;
     let deadline = || Instant::now() + EXCHANGE;
     let binding = |n| admission::Binding {
-        session: "s-0000000000000000ab12".into(),
+        session: "t000000ab12".into(),
         attempt: [n; 16],
     };
     let root = binding(1);

@@ -15,7 +15,9 @@
 //! across a read.
 
 use super::{
-    MACHINES, publish, seam,
+    MACHINES,
+    limits::{self, Limit, Reading, Seats},
+    publish, seam,
     tests::{NOW, SEAT, Stand, publish_pass},
     write,
 };
@@ -52,7 +54,54 @@ struct Walk {
     answered: i64,
     opens: i64,
     authored: i64,
+    /// The rotation area's readings, this Mac's and the peer's, as their `ai/usage` rows say.
+    here: Option<Reading>,
+    there: Option<Reading>,
+    /// The fold of both readings in each Mac's order: this Mac's, then the peer's.
+    folds: Option<(Limit, Limit)>,
 }
+
+/// The rotation walk's account, and its two week instances: the model's `1` and `2`.
+const ROTATED: &str = "ac-00000000000000a1";
+const OLD_WEEK: u64 = NOW + 86_400_000;
+const NEW_WEEK: u64 = OLD_WEEK + 7 * 86_400_000;
+
+/// One Mac's reading of the walk's account, as its `ai/usage` row would say it: the model's
+/// week `week` and percent `percent`, read at `read_at` by that Mac's clock.
+fn reading(uuid: &str, week: i64, percent: i64, read_at: u64) -> Reading {
+    let reset = if week == 2 { NEW_WEEK } else { OLD_WEEK };
+    let mut row = aterm_file::Row {
+        pk: format!("{ROTATED}.{uuid}"),
+        live: true,
+        ..aterm_file::Row::default()
+    };
+    for (column, value) in [
+        ("account", json!(ROTATED)),
+        ("w7d", json!(percent * 100)),
+        ("w7d_reset", json!(reset)),
+        ("wall", json!("none")),
+        ("read_at", json!(read_at)),
+    ] {
+        row.values.insert(column.to_owned(), value);
+    }
+    Reading::of_row(&row).expect("a usage row's key")
+}
+
+/// The model's week and percent of one fold of the walk's account.
+fn folded(limit: &Limit) -> (i64, i64) {
+    let (percent, reset) = limit.windows[1];
+    let week = match reset {
+        Some(NEW_WEEK) => 2,
+        Some(OLD_WEEK) => 1,
+        other => panic!("a fold names a reset no reading stated: {other:?}"),
+    };
+    (week, percent.map_or(0, |p| (p / 100) as i64))
+}
+
+/// Two uuids of two Macs: this one's and the peer's. The peer's clock reads an hour behind
+/// this Mac's, so a fold ordered by clock would take this Mac's reading on both.
+const HERE: &str = "0000000000000000000000000000000a";
+const THERE: &str = "0000000000000000000000000000000b";
 
 impl Walk {
     fn new() -> Self {
@@ -70,6 +119,9 @@ impl Walk {
             answered: 0,
             opens: 0,
             authored: 0,
+            here: None,
+            there: None,
+            folds: None,
         }
     }
 
@@ -207,6 +259,23 @@ impl Walk {
                     .evidence
                     .step("Hold", || publish_pass(stand.paths(), &stand.config));
             }
+            "ChooseRotation" => self.area = 5,
+            // A Mac's reading is the environment: each states its own row.
+            "HereOldWeek" => self.here = Some(reading(HERE, 1, 2, NOW)),
+            "HereNewWeek" => self.here = Some(reading(HERE, 2, 1, NOW)),
+            "PeerOldWeek" => self.there = Some(reading(THERE, 1, 1, NOW - 3_600_000)),
+            "PeerNewWeek" => self.there = Some(reading(THERE, 2, 2, NOW - 3_600_000)),
+            "Fold" => {
+                let (here, there) = (self.here.clone().unwrap(), self.there.clone().unwrap());
+                // Each Mac holds the same two rows, in the order its replica read them.
+                let folds = self.evidence.step("Fold", || {
+                    (
+                        limits::fold(&[here.clone(), there.clone()], &Seats::default()),
+                        limits::fold(&[there, here], &Seats::default()),
+                    )
+                });
+                self.folds = Some((folds.0[ROTATED].clone(), folds.1[ROTATED].clone()));
+            }
             other => panic!("the walk has no step {other}"),
         }
     }
@@ -254,6 +323,26 @@ impl Walk {
             state.insert("reads", self.reads);
             state.insert("answered", self.answered);
             state.insert("opens", self.opens);
+        }
+        if self.area == 5 {
+            let mine = |reading: &Option<Reading>| {
+                reading.as_ref().map_or((0, 0), |reading| {
+                    let (percent, reset) = reading.windows[1];
+                    let week = i64::from(reset == Some(NEW_WEEK)) + 1;
+                    (week, percent.map_or(0, |p| (p / 100) as i64))
+                })
+            };
+            let ((ra, pa), (rb, pb)) = (mine(&self.here), mine(&self.there));
+            for (name, value) in [("ra", ra), ("pa", pa), ("rb", rb), ("pb", pb)] {
+                state.insert(name, value);
+            }
+            if let Some((one, two)) = &self.folds {
+                let ((fr1, fp1), (fr2, fp2)) = (folded(one), folded(two));
+                state.insert("folded", 1);
+                for (name, value) in [("fr1", fr1), ("fp1", fp1), ("fr2", fr2), ("fp2", fp2)] {
+                    state.insert(name, value);
+                }
+            }
         }
         if self.area == 2 {
             let outbox = file.outbox();
@@ -361,6 +450,12 @@ pub(crate) fn read_transition(path: &[&'static str], action: &'static str) -> St
     write_transition(path, action)
 }
 
+/// The `SharedFile` projection of `action` from the state `path` reaches, in the rotation area:
+/// what the anchor on `limits::fold` names.
+pub(crate) fn rotation_transition(path: &[&'static str], action: &'static str) -> State {
+    write_transition(path, action)
+}
+
 /// The shared files' code refines its model along the reading and the writing walks: a read
 /// before anything is materialized, after a pass, after a record arrived, and under a fence; a
 /// write accepted, signed and done, twice over; a write whose register a peer moved, held; and
@@ -370,11 +465,14 @@ pub(crate) fn read_transition(path: &[&'static str], action: &'static str) -> St
 /// NEGATIVE CONTROL: with the publisher ignoring what the intent's author saw
 /// (`publish::seam::ignore_expected`), the pass signs over the peer's candidate. The stores
 /// then say `recs == 1 && lost == 1`, a state the model has no `Sign` step to (its `Sign` is
-/// not enabled while a peer's candidate stands) and that breaks `PublishObservedOnly`.
+/// not enabled while a peer's candidate stands) and that breaks `PublishObservedOnly`. With the
+/// fold taking the reading whose Mac's clock read last (`limits::seam::fold_by_clock`, the
+/// model's `ClockOrdersReadings`), this Mac's old week wins over the peer's new one on both
+/// Macs: `fr1 == fr2 == 1`, a state the model has no `Fold` step to.
 #[test]
 fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
     let model = aterm_models_db::shared_file_model();
-    let paths: [&[&'static str]; 8] = [
+    let paths: [&[&'static str]; 12] = [
         &["ChooseRead", "Read"],
         &["ChooseRead", "Materialize", "Read"],
         &["ChooseRead", "Grow", "Materialize", "Read"],
@@ -391,6 +489,10 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
         ],
         &["ChooseWrite", "Accept", "PeerWrite", "Hold"],
         &["ChooseWrite", "Fence", "Accept"],
+        &["ChooseRotation", "HereOldWeek", "PeerNewWeek", "Fold"],
+        &["ChooseRotation", "HereNewWeek", "PeerOldWeek", "Fold"],
+        &["ChooseRotation", "HereOldWeek", "PeerOldWeek", "Fold"],
+        &["ChooseRotation", "PeerNewWeek", "HereNewWeek", "Fold"],
     ];
     let mut evidence = StepEvidence::new("SharedFile");
     for path in paths {
@@ -423,7 +525,15 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
     assert!(audit.is_complete(), "{audit:#?}");
     assert_eq!(
         audit.actions.iter().copied().collect::<Vec<_>>(),
-        ["Accept", "Done", "Hold", "Materialize", "Read", "Sign"]
+        [
+            "Accept",
+            "Done",
+            "Fold",
+            "Hold",
+            "Materialize",
+            "Read",
+            "Sign"
+        ]
     );
 
     let (mut walk, state) = run(&model, &["ChooseWrite", "Accept", "PeerWrite"]);
@@ -439,6 +549,25 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
     );
     assert!(!model.successors("Sign", &state).contains(&blind));
     assert!(!model.check_invariant("PublishObservedOnly", &blind));
+
+    // The fold takes the peer's new week on both Macs, though this Mac's clock read last.
+    let fold = rotation_transition(&["ChooseRotation", "HereOldWeek", "PeerNewWeek"], "Fold");
+    assert_eq!(
+        (fold["fr1"], fold["fp1"], fold["fr2"], fold["fp2"]),
+        (2, 2, 2, 2)
+    );
+    let (mut walk, state) = run(&model, &["ChooseRotation", "HereOldWeek", "PeerNewWeek"]);
+    let by_clock = {
+        let _clock = limits::seam::fold_by_clock();
+        walk.apply("Fold");
+        walk.state(&state)
+    };
+    assert_eq!(
+        (by_clock["fr1"], by_clock["fr2"]),
+        (1, 1),
+        "the negative control must take the reading its clock read last"
+    );
+    assert!(!model.successors("Fold", &state).contains(&by_clock));
     // The same walk with the comparison on holds the intent instead.
     let held = write_transition(&["ChooseWrite", "Accept", "PeerWrite"], "Hold");
     assert_eq!((held["h"], held["recs"], held["lost"]), (1, 0, 0));

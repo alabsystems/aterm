@@ -248,7 +248,7 @@ fn cmd_w_mixed_leaf_preserves_settings_draft_and_surfaces_exact_recovery() {
             (front, session)
         });
         let owner = front.map_or(wid, |(front, _)| front);
-        for (&id, window) in &mut app.windows {
+        for (&id, mut window) in &mut app.windows {
             window.focused = id == owner;
         }
         let front_tabs = front.map(|(front, _)| app.windows[&front].tab_set.tabs().to_vec());
@@ -467,7 +467,7 @@ fn closing_a_background_settings_tab_leaves_the_front_unless_its_close_asks() {
 fn closing_split_settings_from_behind_leaves_its_terminals_failure_unseen() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.os_window_for_test = true;
         ws.focused = true;
     }
@@ -684,7 +684,7 @@ fn background_whole_tab_and_settings_control_close_focus_blocker_and_recovery() 
             (front, session)
         });
         let owner = front.map_or(wid, |(front, _)| front);
-        for (&id, window) in &mut app.windows {
+        for (&id, mut window) in &mut app.windows {
             window.focused = id == owner;
         }
         let front_tabs = front.map(|(front, _)| app.windows[&front].tab_set.tabs().to_vec());
@@ -1188,7 +1188,7 @@ fn heterogeneous_split_runtime_paints_sizes_routes_and_drags_every_leaf() {
 
     let first = plan.leaf(first_native).expect("first native");
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.last_mouse_window_cell = (
             (first.rect.origin.y + first.rect.size.height * 0.5) as u16,
             (first.rect.origin.x + first.rect.size.width * 0.5) as u16,
@@ -1201,7 +1201,7 @@ fn heterogeneous_split_runtime_paints_sizes_routes_and_drags_every_leaf() {
     let before = app.active_visible_leaf_plan(wid).unwrap();
     let divider = before.dividers.first().expect("root divider").clone();
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.last_mouse_window_cell = (
             (divider.rect.origin.y + divider.rect.size.height * 0.5) as u16,
             (divider.rect.origin.x + divider.rect.size.width * 0.5) as u16,
@@ -1209,7 +1209,7 @@ fn heterogeneous_split_runtime_paints_sizes_routes_and_drags_every_leaf() {
     }
     assert!(app.begin_divider_drag(wid));
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.last_mouse_window_cell.1 = window.cols / 3;
     }
     app.drag_divider(wid);
@@ -1861,7 +1861,7 @@ fn whole_mixed_tab_close_and_reopen_preserves_one_tab_record_and_topology() {
 fn a_reopened_mixed_tab_stages_without_fronting_a_later_tab() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.os_window_for_test = true;
         ws.focused = true;
     }

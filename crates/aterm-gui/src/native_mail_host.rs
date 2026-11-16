@@ -35,9 +35,10 @@ impl crate::App {
         let Ok((tab, view)) = placed else {
             return false;
         };
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if !window.tab_set.switch_to(tab)
             || !window
                 .tab_set
@@ -48,6 +49,7 @@ impl crate::App {
         }
         crate::app_tabs::cancel_pending_close(window);
         window.last_present = None;
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.sync_active_session();
         self.request_redraw_all_windows();
@@ -91,7 +93,8 @@ impl crate::App {
 
     pub(crate) fn on_mail_changed(&mut self) {
         if self.native_runtime.poll_mail() {
-            for window in self.windows.values_mut() {
+            for mut route_guard_window in self.windows.values_mut() {
+                let window = &mut **route_guard_window;
                 window.last_present = None;
             }
             self.request_redraw_all_windows();

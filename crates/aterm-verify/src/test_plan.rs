@@ -68,7 +68,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The initial libtest width, retained after history arrives unless the ceiling, number of
 /// cases or measured CPU demand requires a narrower run.
@@ -357,11 +357,38 @@ pub struct Dispatcher {
     held_bytes: u64,
     halted: bool,
     generation: u64,
+    /// How many looks at the queue the dispatch has begun ([`Self::begin_look`]).
+    looks: u64,
+    /// Its last look that started nothing ([`Self::looked`]).
+    looked: Option<Looked>,
+}
+
+/// ONE LOOK of a dispatch at its queue ([`Dispatcher::begin_look`]): the generation it looked at
+/// and its number among the dispatch's looks, which no other look of the dispatch has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Look {
+    /// The dispatcher's generation the look read: it changes whenever a dispatch transition
+    /// can invalidate an external rejection probe.
+    pub(crate) generation: u64,
+    /// Its number among the dispatch's looks.
+    pub(crate) seq: u64,
+}
+
+/// A dispatch's last look that started nothing ([`Dispatcher::looked`]).
+#[derive(Clone, Copy, Debug)]
+struct Looked {
+    /// The generation it looked at.
+    generation: u64,
+    /// When its pass ended.
+    at: Instant,
+    /// How long after `at` the next look at that generation is due.
+    again: Duration,
 }
 
 impl PartialEq for Dispatcher {
     fn eq(&self, other: &Self) -> bool {
-        // An observation generation does not change the dispatcher's semantic state.
+        // An observation generation, and when the dispatch looked, do not change the
+        // dispatcher's semantic state.
         self.share == other.share
             && self.memory == other.memory
             && self.order == other.order
@@ -420,6 +447,8 @@ impl Dispatcher {
             held_bytes: 0,
             halted: false,
             generation: 0,
+            looks: 0,
+            looked: None,
         }
     }
 
@@ -485,9 +514,59 @@ impl Dispatcher {
         Some(b)
     }
 
-    /// Changes whenever a dispatch transition can invalidate an external rejection probe.
+    /// Changes whenever a dispatch transition can invalidate an external rejection probe
+    /// ([`Self::begin_look`] carries it).
+    #[cfg(test)]
     pub(crate) const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// THE LOOK IS PACED PER DISPATCH, NOT PER WORKER: whether a look at the queue is due at
+    /// `at` (`None`), or how long until one is. A look is due once the dispatch has made none
+    /// that started nothing, once its generation changed since that look (a binary started, a
+    /// charge was limited, a binary finished, the dispatch halted), and once that look's
+    /// interval has passed since its pass ended ([`Self::looked`]). So however many workers ask,
+    /// a dispatch whose generation stands still looks once per interval.
+    pub(crate) fn look_due(&self, at: Instant) -> Option<Duration> {
+        let last = self
+            .looked
+            .as_ref()
+            .filter(|last| last.generation == self.generation)?;
+        last.at
+            .checked_add(last.again)
+            .and_then(|due| due.checked_duration_since(at))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Something no generation counts changed (tokens put back in the release's pool): the next
+    /// look is due at once.
+    pub(crate) const fn look_now(&mut self) {
+        self.looked = None;
+    }
+
+    /// How many looks this dispatch began ([`Self::begin_look`]).
+    #[cfg(test)]
+    pub(crate) const fn looks(&self) -> u64 {
+        self.looks
+    }
+
+    /// Begin a look at the queue: its identity, a number no other look of the dispatch has.
+    pub(crate) const fn begin_look(&mut self) -> Look {
+        self.looks = self.looks.wrapping_add(1);
+        Look {
+            generation: self.generation,
+            seq: self.looks,
+        }
+    }
+
+    /// `look` started nothing and its pass ended at `at`: the next look at the same generation
+    /// is due `again` after it ([`Self::look_due`]).
+    pub(crate) const fn looked(&mut self, look: Look, at: Instant, again: Duration) {
+        self.looked = Some(Looked {
+            generation: look.generation,
+            at,
+            again,
+        });
     }
 
     /// Return the ungranted part of a running binary's core charge. Its memory stays held.
@@ -561,6 +640,22 @@ impl Dispatcher {
     #[must_use]
     pub fn waiting(&self) -> bool {
         !self.halted && self.next < self.order.len()
+    }
+
+    /// The binaries not yet started, in the plan's order: none once the run halted.
+    pub fn queued(&self) -> impl Iterator<Item = &Planned> + '_ {
+        self.order
+            .iter()
+            .filter(|b| !self.halted && self.phase[b.index] == Phase::Queued)
+    }
+
+    /// The binaries started and not ended, by index.
+    pub fn running(&self) -> impl Iterator<Item = usize> + '_ {
+        self.phase
+            .iter()
+            .enumerate()
+            .filter(|(_, phase)| **phase == Phase::Running)
+            .map(|(index, _)| index)
     }
 
     /// Where binary `index` is.

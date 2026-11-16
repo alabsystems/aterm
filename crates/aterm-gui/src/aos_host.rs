@@ -535,7 +535,8 @@ impl App {
             return Err(AosRefusal::SecureEntry);
         }
         let build = aterm_stamp::build_id();
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         refute_hold(ws, now);
         // A run proven under the last recording corroborates nothing in this one, and its grant
         // ends with it.
@@ -550,6 +551,7 @@ impl App {
         let momentum = &mut ws.fx.cursor_mut().momentum;
         momentum.aos_attach(now, code, &build, ws.aos.attaches);
         let status = momentum.aos_status();
+        drop(route_guard_ws);
         self.aos_reconcile(id);
         Ok((id, status))
     }
@@ -557,7 +559,8 @@ impl App {
     /// Pauses the front window's glow at `now` and returns the expected head.
     pub(crate) fn aos_pause_at(&mut self, now: Instant) -> Result<(WindowId, Head), AosRefusal> {
         let id = self.aos_front()?;
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         let lane = ws.effect_present_interval();
         let head = ws.fx.cursor_mut().momentum.aos_pause(now, lane)?;
         Ok((id, head))
@@ -579,7 +582,8 @@ impl App {
     ) -> Result<Repaired, AosRefusal> {
         let started = Instant::now();
         let id = self.aos_front()?;
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         if ws.aos.repairing.is_some() {
             return Err(AosRefusal::Repairing);
         }
@@ -595,6 +599,7 @@ impl App {
                 {
                     ws.aos.published = None;
                 }
+                drop(route_guard_ws);
                 self.aos_reconcile(id);
                 Ok(Repaired {
                     window: id,
@@ -660,6 +665,7 @@ impl App {
                         if let Some(p) = self
                             .windows
                             .get_mut(&id)
+                            .as_deref_mut()
                             .and_then(|ws| ws.aos.repairing.as_mut())
                         {
                             p.main = started.elapsed();
@@ -687,9 +693,10 @@ impl App {
             Ok(id) => id,
             Err(refusal) => return Err((reply, refusal)),
         };
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return Err((reply, AosRefusal::NoWindow));
         };
+        let ws = &mut **route_guard_ws;
         if ws.aos.repairing.is_some() {
             return Err((reply, AosRefusal::Repairing));
         }
@@ -735,9 +742,10 @@ impl App {
         prepared: Result<PreparedRepair, String>,
     ) {
         let started = Instant::now();
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some(pending) = ws.aos.repairing.take_if(|p| p.token == token) else {
             return;
         };
@@ -767,6 +775,7 @@ impl App {
                 Err(refusal)
             }
         };
+        drop(route_guard_ws);
         self.aos_reconcile(id);
         let _ = pending.reply.send(
             answer
@@ -802,7 +811,8 @@ impl App {
     where
         P: Fn(Worked) + Clone + Send + 'static,
     {
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.aos.hold.is_some() {
                 let frame = ws.effect_present_interval();
                 if !ws.fx.cursor().momentum.aos_holding() {
@@ -832,13 +842,15 @@ impl App {
             .map(|(id, _)| *id)
             .collect();
         for id in due {
-            let Some(ws) = self.windows.get_mut(&id) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
                 continue;
             };
+            let ws = &mut **route_guard_ws;
             let mut segments = std::mem::take(&mut ws.aos.orphans);
             segments.extend(ws.fx.cursor_mut().momentum.aos_take_retired());
             let Some(post) = post.clone() else {
                 let judged = segments.into_iter().map(Segment::judge).collect();
+                drop(route_guard_ws);
                 self.aos_watch_fold(id, judged);
                 continue;
             };
@@ -862,6 +874,7 @@ impl App {
                         .into_iter()
                         .map(|s| s.unjudged(WATCHER_DID_NOT_RUN))
                         .collect();
+                    drop(route_guard_ws);
                     self.aos_watch_fold(id, judged);
                 }
             }
@@ -870,9 +883,10 @@ impl App {
 
     /// Adds window `id`'s judged segments to its timeline, keeping each failing one as a fault (the oldest dropped past [`KEPT_CAP`]); no alert is raised.
     pub(crate) fn aos_watch_fold(&mut self, id: WindowId, judged: Vec<SegmentJudgement>) {
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let aos = &mut ws.aos;
         aos.watching = false;
         for j in judged {
@@ -961,20 +975,23 @@ impl App {
     /// Stops recording every window's glow for privacy (`why` names the no-echo key or Secure Keyboard Entry), each detach a timeline row whose recording's retired segments go to the watcher.
     pub(crate) fn aos_privacy_detach_all(&mut self, why: &'static str) {
         let now = Instant::now();
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             privacy_detach(ws, why, now);
         }
     }
 
     /// Settles window `id`'s hold on its frame at `now`, before the frame ticks the glow: the window's live front terminal read under a lock it does not wait for (never the shown view, nor a rewound pane's), else no view ([`echo::settle_hold`]).
     pub(crate) fn aos_settle_hold(&mut self, id: WindowId, now: Instant) {
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let Some(hold) = ws.aos.hold.take() else {
             return;
         };
         let mut view = std::mem::take(&mut ws.aos.view);
+        drop(route_guard_ws);
         let read = self
             .front_terminal(id)
             .filter(|front| !self.pool.is_rewound(front.session))
@@ -984,9 +1001,10 @@ impl App {
                 Some(())
             })
             .is_some();
-        let Some(ws) = self.windows.get_mut(&id) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&id) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         ws.aos.hold = Some(hold);
         echo::settle_hold(ws, read.then_some(&view), now);
         ws.aos.view = view;
@@ -1011,7 +1029,8 @@ impl App {
         now: Instant,
     ) -> Result<PlanPublished, AosRefusal> {
         let id = self.aos_front()?;
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         let lane = ws.effect_present_interval();
         let momentum = &mut ws.fx.cursor_mut().momentum;
         let paused_first = momentum.aos_attached() && !momentum.aos_paused();
@@ -1025,6 +1044,7 @@ impl App {
                     revision: published.revision().0,
                     bundle: published.bundle().clone(),
                 });
+                drop(route_guard_ws);
                 self.aos_reconcile(id);
                 Ok(PlanPublished {
                     window: id,
@@ -1044,7 +1064,8 @@ impl App {
     /// Rejects a pending update and resumes the previous code over queued inputs.
     pub(crate) fn aos_resume_now(&mut self) -> Result<Resumed, AosRefusal> {
         let id = self.aos_front()?;
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         let momentum = &mut ws.fx.cursor_mut().momentum;
         if !momentum.aos_attached() {
             return Err(PublishRefusal::NotAttached.into());
@@ -1053,6 +1074,7 @@ impl App {
             return Err(PublishRefusal::NotPaused.into());
         }
         let delivered = momentum.aos_resume();
+        drop(route_guard_ws);
         self.aos_reconcile(id);
         Ok(Resumed {
             window: id,
@@ -1066,7 +1088,8 @@ impl App {
         now: Instant,
     ) -> Result<(WindowId, MomentumAosStatus), AosRefusal> {
         let id = self.aos_front()?;
-        let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let mut route_guard_ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
+        let ws = &mut **route_guard_ws;
         let momentum = &mut ws.fx.cursor_mut().momentum;
         if !momentum.aos_attached() {
             return Err(PublishRefusal::NotAttached.into());
@@ -1083,6 +1106,7 @@ impl App {
         {
             ws.aos.published = None;
         }
+        drop(route_guard_ws);
         self.aos_reconcile(id);
         Ok((id, status))
     }
@@ -1227,7 +1251,8 @@ impl App {
             .pool
             .get(session)
             .and_then(|s| front_group(&s.ctx.sink));
-        let ws = self.windows.get_mut(&wid).ok_or(UNSEEN_GONE)?;
+        let mut route_guard_ws = self.windows.get_mut(&wid).ok_or(UNSEEN_GONE)?;
+        let ws = &mut **route_guard_ws;
         let momentum = &ws.fx.cursor().momentum;
         if !momentum.aos_attached() || ws.aos.epoch.is_none() || ws.aos.attaches != attach {
             return Err(UNSEEN_GONE);
@@ -1253,6 +1278,7 @@ impl App {
             on: true,
             why: UNSEEN_BY_PERSON,
         });
+        drop(route_guard_ws);
         self.aos_reconcile(wid);
         Ok(())
     }
@@ -1270,9 +1296,10 @@ impl App {
         )
     )]
     pub(crate) fn aos_unseen_stop(&mut self, wid: WindowId, now: Instant) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws.aos.hold.is_some() {
             private_key(ws, RAW_KEY, now);
             return;
@@ -1287,6 +1314,7 @@ impl App {
                 why: UNSEEN_BY_PERSON,
             });
         }
+        drop(route_guard_ws);
         self.aos_reconcile(wid);
     }
 

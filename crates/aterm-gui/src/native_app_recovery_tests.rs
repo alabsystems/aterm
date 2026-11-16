@@ -661,8 +661,11 @@ fn an_entrys_open_original_follows_its_link() {
         ("recovery/open-original", AppKind::Editor),
         ("recovery/retry", AppKind::Markdown),
     ] {
-        if let Some(AppViewState::Recovery(view)) = runtime.view_state_mut(view_id) {
-            view.pending = None;
+        {
+            let mut state = runtime.view_state_mut(view_id);
+            if let Some(AppViewState::Recovery(view)) = state.as_deref_mut() {
+                view.pending = None;
+            }
         }
         let report = runtime
             .dispatch(

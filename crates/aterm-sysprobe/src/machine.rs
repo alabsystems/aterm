@@ -502,10 +502,10 @@ pub struct MemoryDetail {
     pub app: u64,
     /// Shared memory (`Shmem`) in bytes (Linux only).
     pub shared: Option<u64>,
-    /// Swap or pagefile bytes in use.
-    pub swap_used: u64,
-    /// Total allocated swap or pagefile bytes.
-    pub swap_total: u64,
+    /// Swap or pagefile bytes in use; `None` where the measurement was not read.
+    pub swap_used: Option<u64>,
+    /// Total allocated swap or pagefile bytes; `None` where the measurement was not read.
+    pub swap_total: Option<u64>,
     /// Commit charge and limit (Linux and Windows).
     pub commit: Option<Commit>,
     /// Kernel memory pressure level (macOS `memory_pressure`, Linux PSI held to `MemAvailable`,
@@ -625,7 +625,6 @@ pub(crate) fn memory_detail_of(
     pressure: Option<MemoryLevel>,
 ) -> MemoryDetail {
     let b = |pages: u64| pages.saturating_mul(page_bytes);
-    let (swap_used, swap_total) = swap.unwrap_or((0, 0));
     let mut detail = MemoryDetail {
         total,
         available: 0,
@@ -640,8 +639,8 @@ pub(crate) fn memory_detail_of(
         file_backed: b(p.external),
         app: b(p.internal.saturating_sub(p.purgeable)),
         shared: None,
-        swap_used,
-        swap_total,
+        swap_used: swap.map(|(used, _)| used),
+        swap_total: swap.map(|(_, total)| total),
         commit: None,
         pressure,
         exact: true,
@@ -1161,10 +1160,11 @@ impl LinkKind {
     }
 }
 
-/// Cumulative single-direction interface counters since interface creation.
+/// Raw single-direction interface counters; [`LinkReading::byte_counter`] states whether
+/// bytes are cumulative or a modulo residue. Packets, errors and drops keep their OS meaning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LinkCounters {
-    /// Bytes.
+    /// Raw bytes; inspect [`LinkReading::byte_counter`] before taking a delta or a total.
     pub bytes: u64,
     /// Packets.
     pub packets: u64,
@@ -1174,7 +1174,20 @@ pub struct LinkCounters {
     pub drops: u64,
 }
 
-/// Point-in-time state and cumulative traffic counters for one network interface.
+/// The byte counter's effective representation, independently of its ABI field width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkByteCounter {
+    /// The reader did not establish the counter's representation.
+    #[default]
+    Unknown,
+    /// Cumulative unsigned 64-bit bytes.
+    Cumulative64,
+    /// Non-platform Darwin `NET_RT_IFLIST2`: floor to 1024 bytes then truncate to
+    /// unsigned 32 bits. Packet counters remain unsigned 64-bit.
+    DarwinModulo32,
+}
+
+/// Point-in-time state and raw traffic counters for one network interface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkReading {
     /// Its name (`en0`, `wlan0`; on Windows its alias, `Wi-Fi`, `Ethernet 2`).
@@ -1192,6 +1205,8 @@ pub struct LinkReading {
     /// Driver-reported link rate in bits per second, if known (Windows: the receive link speed,
     /// else the transmit one).
     pub rate_bps: Option<u64>,
+    /// Source and effective width/quantization of the byte counters.
+    pub byte_counter: LinkByteCounter,
     /// Received.
     pub rx: LinkCounters,
     /// Sent.

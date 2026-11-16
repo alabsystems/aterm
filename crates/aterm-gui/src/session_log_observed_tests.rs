@@ -1267,7 +1267,11 @@ fn the_fabric_verbs_mark_the_log_and_wake_its_watchers() {
     );
     let _ = crate::fabric::cmd_deliver_waking(&store, &line, &wake);
     let rx = parked_log_await(&h, &store, "mail");
-    let post = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=ask --wait=0 SENTINEL-POST", None);
+    let post = crate::fabric::cmd_post(
+        &h.ctx,
+        "to=@tpeer000001 kind=ask --wait=0 SENTINEL-POST",
+        None,
+    );
     assert!(super::overlap_tests::queued(&post, 1), "{post}");
     let reply = returned(&rx, "post");
     assert!(reply.contains(" mark - mail dir=out kind=ask "), "{reply}");
@@ -1348,7 +1352,7 @@ fn a_post_the_bridge_retires_is_logged_with_the_reason_its_client_was_told() {
     for (id, why) in (1u64..).zip(&told) {
         let post = crate::fabric::cmd_post(
             &h.ctx,
-            "to=@s-0123456789abcdef0123@n-00000000000000b1 kind=task --wait=0 QZP6WORD",
+            "to=@tqn5r6e0148@n-00000000000000b1 kind=task --wait=0 QZP6WORD",
             None,
         );
         assert!(super::overlap_tests::queued(&post, id), "{post}");
@@ -1425,7 +1429,7 @@ fn aterms_own_retirements_are_logged_by_aterm_with_their_reason() {
     use aterm_types::fabric_grammar::DeadReason;
     crate::fabric::with_link_reset(|| {
         let (old, _) = fabric_rig(24);
-        let post = crate::fabric::cmd_post(&old.ctx, "to=@s-peer kind=note QZP6WORD1", None);
+        let post = crate::fabric::cmd_post(&old.ctx, "to=@tpeer000001 kind=note QZP6WORD1", None);
         assert_eq!(post, "OK 1\n");
         let mut roomy = crate::fabric::CARRY_MAIL_BYTES;
         let mut carry = old.ctx.fabric.handoff_carry(&mut roomy);
@@ -1455,9 +1459,10 @@ fn aterms_own_retirements_are_logged_by_aterm_with_their_reason() {
             )
         };
         assert_eq!(tell("aa"), "OK\n");
-        let ask = format!("{sid} off=7 from=s-peer@n-lab kind=ask trust=agent text=old");
+        let ask = format!("{sid} off=7 from=tpeer000001@n-lab kind=ask trust=agent text=old");
         assert_eq!(crate::fabric::cmd_deliver(&store, &ask), "OK 1\n");
-        let reply = crate::fabric::cmd_post(&h.ctx, "to=@s-peer kind=answer re=7 QZP6WORD2", None);
+        let reply =
+            crate::fabric::cmd_post(&h.ctx, "to=@tpeer000001 kind=answer re=7 QZP6WORD2", None);
         assert_eq!(reply, "OK 1\n");
         let rx = parked_log_await(&h, &store, "mail-landed");
         assert_eq!(tell("bb"), "OK forgot=1\n");

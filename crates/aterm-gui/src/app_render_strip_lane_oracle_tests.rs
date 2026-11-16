@@ -38,7 +38,7 @@ fn fixture() -> (App, WindowId, usize, usize) {
         let t = term_lock(&terminal);
         (usize::from(t.rows()), usize::from(t.cols()))
     };
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = u16::try_from(rows).expect("fixture rows");
         ws.cols = u16::try_from(cols).expect("fixture cols");
         ws.input_scratch = RenderInput::empty();
@@ -93,7 +93,8 @@ fn unsplice_and_refill(
         .expect("front terminal")
         .term
         .clone();
-    let ws = app.windows.get_mut(&wid).expect("fixture window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("fixture window");
+    let ws = &mut **field_guard_ws;
     let unspliced = unsplice
         && chrome > 0
         && ws
@@ -823,7 +824,8 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
 
     term_lock(&terminal).process(b"\x1b[1;1Hcontent2");
     {
-        let ws = app.windows.get_mut(&wid).expect("fixture window");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("fixture window");
+        let ws = &mut **field_guard_ws;
         let unspliced = ws
             .input_scratch
             .undo_host_row_prepend(rows, &mut ws.strip_row_pool, 1);
@@ -854,7 +856,7 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         "the stamp gate accepted a frame whose cells a host had overwritten"
     );
 
-    let ws = app.windows.get_mut(&wid).expect("fixture window");
+    let mut ws = app.windows.get_mut(&wid).expect("fixture window");
     let mut pool = Vec::new();
     assert!(
         !ws.input_scratch.undo_host_row_prepend(rows, &mut pool, 1),

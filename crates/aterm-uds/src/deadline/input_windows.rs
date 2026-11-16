@@ -11,6 +11,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, Ra
 use std::process::{ExitStatus, Output};
 use std::time::{Duration, Instant};
 
+use super::{OwnedInputTimeout, OwnedInputTimeoutStage};
 use crate::secret::Secret;
 use crate::spawnfd::{Child, Command, Stdio};
 
@@ -27,10 +28,6 @@ const ERROR_NO_DATA: i32 = 232;
 const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
 const ERROR_PIPE_CONNECTED: i32 = 535;
 const WAIT_TIMEOUT: u32 = 258;
-
-fn timeout() -> io::Error {
-    io::Error::new(io::ErrorKind::TimedOut, "helper exchange deadline elapsed")
-}
 
 fn handle(raw: RawHandle) -> io::Result<OwnedHandle> {
     if raw.is_null() || raw as isize == -1 {
@@ -330,7 +327,7 @@ struct Scope {
 }
 
 impl Scope {
-    fn retire(&mut self) -> io::Result<()> {
+    fn retire(&mut self, observed: OwnedInputTimeout) -> io::Result<()> {
         self.job.terminate()?;
         self.cleanup_started = true;
         let by = super::saturating_after(Instant::now(), CLEANUP);
@@ -341,10 +338,11 @@ impl Scope {
                 return Ok(());
             }
             if Instant::now() >= by {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "helper job did not retire",
-                ));
+                return Err(OwnedInputTimeout {
+                    stage: OwnedInputTimeoutStage::Retirement,
+                    ..observed
+                }
+                .into_io_error());
             }
             std::thread::sleep(STEP);
         }
@@ -439,7 +437,7 @@ pub(super) fn output_with_input_until(
     max_output: usize,
 ) -> io::Result<Output> {
     if super::deadline_now() >= deadline {
-        return Err(timeout());
+        return Err(OwnedInputTimeout::before_start().into_io_error());
     }
     let job = Job::new()?;
     let (stdin, child_stdin) = pipe(true)?;
@@ -464,6 +462,8 @@ pub(super) fn output_with_input_until(
         retired: false,
         cleanup_started: false,
     };
+    let input_len = input.len();
+    let mut observed = OwnedInputTimeout::spawned(Some(input_len));
     // These bindings drop before Scope on every setup error, scrubbing unsent input and
     // closing the parent pipe endpoints before the job's cleanup grace.
     let mut input = Some(input);
@@ -471,7 +471,7 @@ pub(super) fn output_with_input_until(
     let (mut stdout, mut stderr) = (Some(stdout), Some(stderr));
     scope.job.assign(&scope.child)?;
     if super::deadline_now() >= deadline {
-        return Err(timeout());
+        return Err(observed.into_io_error());
     }
     resume(&scope.child)?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -480,10 +480,14 @@ pub(super) fn output_with_input_until(
     let result = (|| {
         loop {
             if super::deadline_now() >= deadline {
-                return Err(timeout());
+                return Err(observed.into_io_error());
             }
             let mut progressed = drain(&mut stdout, &mut out, max_output)?;
+            observed.stdout_bytes_observed = out.len();
+            observed.stdout_eof = stdout.is_none();
             progressed |= drain(&mut stderr, &mut err, max_output)?;
+            observed.stderr_bytes_observed = err.len();
+            observed.stderr_eof = stderr.is_none();
             if let (Some(secret), Some(writer)) = (input.as_ref(), stdin.as_mut()) {
                 let left = &secret.expose()[sent..];
                 match writer.write(&left[..left.len().min(8192)]) {
@@ -507,12 +511,15 @@ pub(super) fn output_with_input_until(
                     Err(error) => return Err(error),
                 }
             }
+            observed.observe_stdin(Some(input_len), sent, input.is_some());
             if status.is_none()
                 && let Some(exited) = scope.child.try_wait()?
             {
                 status = Some(exited);
                 stdin = None;
                 input = None;
+                observed.natural_exit_observed = true;
+                observed.observe_stdin(Some(input_len), sent, false);
                 scope.job.terminate()?;
             }
             if let Some(status) = status
@@ -535,7 +542,7 @@ pub(super) fn output_with_input_until(
     drop(stdin);
     drop(stdout);
     drop(stderr);
-    let retired = scope.retire();
+    let retired = scope.retire(observed);
     match (result, retired) {
         (Ok(output), Ok(())) => Ok(output),
         (Err(error), _) | (_, Err(error)) => Err(error),

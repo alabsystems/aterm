@@ -6,7 +6,8 @@
 //! example each, the rules it must not miss, and where each deeper topic is; each section
 //! ([`SECTIONS`]) holds one part of the rest. A fact another page owns is pointed to there: the
 //! ELSEWHERE rows are the topic index's own lines ([`super::index_line`]), and the variables aterm
-//! strips are the spawner's list ([`aterm_types::domain::ENV_DENY_PREFIXES`]).
+//! strips are the spawner's list: aterm.toml's `shell_env_strip` or
+//! [`aterm_types::domain::DEFAULT_ENV_STRIP`], plus each harness's additions.
 
 use std::fmt::Write as _;
 
@@ -208,7 +209,7 @@ fn rules() -> String {
          frees build caches nobody uses. A build folder you delete by hand may be one another\n    \
          session's build is using (`aterm help sys wait`).\n",
     );
-    let prefixes = aterm_types::domain::ENV_DENY_PREFIXES;
+    let prefixes = aterm_types::domain::DEFAULT_ENV_STRIP;
     let mut stripped = String::new();
     for (i, prefix) in prefixes.iter().enumerate() {
         let joint = match i {
@@ -220,7 +221,8 @@ fn rules() -> String {
     }
     s.push_str(&bullet(&format!(
         "aterm strips {stripped} from the shells it spawns, so an outer agent's variables never \
-         reach yours: re-export what a tool needs."
+         reach yours: re-export what a tool needs. aterm.toml's `shell_env_strip` replaces that \
+         list and an installed harness adds to it (`aterm harness ls`)."
     )));
     s
 }

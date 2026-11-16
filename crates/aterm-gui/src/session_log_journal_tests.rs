@@ -1051,6 +1051,144 @@ fn the_content_tier_never_reaches_the_journal() {
     assert!(leaked.contains("SECRET-TITLE-42"));
 }
 
+/// A session the rig's writer journals whose timeline a control context writes, so a test
+/// drives the verbs' own write paths into the journal.
+fn add_with_ctx(rig: &Rig, sid: &str, local: u64) -> crate::session_store::SessionHandle {
+    let h = crate::session_store::test_handle(local);
+    *h.ctx.timeline.lock().expect("tl") = SessionTimeline::for_test();
+    with_log(&h.ctx.timeline, |log| {
+        log.open_session(
+            Kind::Spawn,
+            Src::Aterm,
+            Conf::Exact,
+            Actor::Nobody,
+            Fields::new(),
+            at(0),
+        )
+        .expect("opens");
+    });
+    rig.sessions
+        .list
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((
+            ShortId::new(sid).expect("a sid"),
+            Arc::clone(&h.ctx.timeline),
+        ));
+    h
+}
+
+/// A credential in a description never reaches the journal's bytes, by either write path: a
+/// `mark … desc` and a `meta set title` from a control client are journaled redacted, and a
+/// value that is nothing but a credential (a sensitive phrase, or a bare token) is refused
+/// before any record exists, so the journal holds no claim that is only a redaction notice.
+///
+/// CONTROL: the same titles typed by a person, in another session of the same pass, are
+/// journaled as typed, so the journal does hold a description's text and the redaction is
+/// the write's, by author.
+#[test]
+fn a_planted_credential_in_a_description_never_reaches_the_journal() {
+    use crate::session_timeline::{MetaEdit, MetaField, write_session_meta};
+    let rig = Rig::new();
+    let key = format!("sk-proj-{}", "a1B2c3D4".repeat(4));
+    let driven = add_with_ctx(&rig, "s-desc-driven", 1);
+    let typed = add_with_ctx(&rig, "s-desc-typed", 2);
+
+    let (reply, _) = crate::session_log::cmd_mark(
+        &driven.ctx,
+        Actor::Ctl,
+        true,
+        &format!("- desc field=description value=deploy%20with%20{key}%20now"),
+    );
+    assert!(reply.starts_with("OK seq="), "{reply}");
+    assert_eq!(
+        write_session_meta(
+            &driven.ctx,
+            MetaField::Title,
+            MetaEdit::Set(&format!("use {key} here")),
+            Actor::Ctl,
+        ),
+        Ok(true)
+    );
+    let (reply, _) = crate::session_log::cmd_mark(
+        &driven.ctx,
+        Actor::Harness,
+        true,
+        &format!("- desc field=stage value=password%20{key}"),
+    );
+    assert_eq!(reply, "ERR mark: value reads as a credential\n");
+    let hex = "ab12".repeat(16);
+    let pat = format!("ghp_{}", "0123456789abcdefghij");
+    let (reply, _) = crate::session_log::cmd_mark(
+        &driven.ctx,
+        Actor::Ctl,
+        true,
+        &format!("- desc field=stage value={hex}"),
+    );
+    assert_eq!(reply, "ERR mark: value reads as a credential\n");
+    assert_eq!(
+        write_session_meta(
+            &driven.ctx,
+            MetaField::Title,
+            MetaEdit::Set(&pat),
+            Actor::Ctl,
+        ),
+        Err(crate::session_timeline::MetaWriteError::Credential)
+    );
+    assert_eq!(
+        write_session_meta(
+            &typed.ctx,
+            MetaField::Title,
+            MetaEdit::Set(&format!("use {key} here")),
+            Actor::Human,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        write_session_meta(
+            &typed.ctx,
+            MetaField::Title,
+            MetaEdit::Set(&pat),
+            Actor::Human,
+        ),
+        Ok(true)
+    );
+
+    let mut w = rig.writer();
+    w.pass();
+    let bytes = String::from_utf8(rig.fs.all_bytes()).expect("ascii");
+    assert!(
+        bytes.contains("desc field=description value=deploy%20with%20[redacted]%20now by=ctl")
+            && bytes.contains("desc field=title value=use%20[redacted]%20here by=ctl")
+            && bytes.contains("meta field=title value=use%20[redacted]%20here by=ctl"),
+        "the driven session's claims are journaled, redacted: {bytes}"
+    );
+    assert!(
+        !bytes.contains("field=stage") && !bytes.contains("password"),
+        "a refused value wrote no record: {bytes}"
+    );
+    assert!(
+        !bytes.contains(&hex) && !bytes.contains("value=[redacted] "),
+        "a refused bare token wrote neither itself nor its notice: {bytes}"
+    );
+    assert!(
+        bytes.contains(&format!(
+            "desc field=title value=use%20{key}%20here by=human"
+        )) && bytes.contains(&format!("desc field=title value={pat} by=human")),
+        "a person's text is journaled as typed: {bytes}"
+    );
+    assert_eq!(
+        bytes.matches(pat.as_str()).count(),
+        2,
+        "the bare token is in the person's two records and nowhere else: {bytes}"
+    );
+    assert_eq!(
+        bytes.matches("a1B2c3D4").count(),
+        2 * 4,
+        "the credential is in the person's two records and nowhere else: {bytes}"
+    );
+}
+
 #[test]
 fn an_update_hands_off_at_the_fence_and_the_successor_goes_on() {
     for cut in [false, true] {

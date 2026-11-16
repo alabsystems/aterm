@@ -682,44 +682,91 @@ fn silent_refused(error: &std::io::Error) -> bool {
     )
 }
 
-/// Write one route lookup, heard by its asker alone where the kernel allows: `write(kind)`
-/// writes the lookup to a routing socket as message type `kind`, [`RTM_GET_SILENT`] first. Where
-/// the kernel refuses that type ([`silent_refused`]) the same lookup is written once more as
-/// [`RTM_GET`], and where the kernel takes that one, every later lookup of this process starts
-/// there: one latch for the process, which aterm-net's lookups share by writing through here. A
-/// lookup the kernel refuses in both types was refused for what it asks, so it latches nothing.
-/// The answer to either type is an [`RTM_GET`] message with the asker's pid and sequence.
+/// Write `request`, one route lookup (an `rt_msghdr` and its addresses, built with no message
+/// type or number of its own: [`route_get_request`], aterm-net's lookup), as this process's next
+/// lookup, and return the number it was asked as. This is the one place a lookup of the process
+/// gets its number and its type. It sets `request`'s `rtm_seq` to the next number of the
+/// process's one counter ([`lookup_sequence`]), and `write` writes it to a routing socket as
+/// message type [`RTM_GET_SILENT`] first, heard by its asker alone where the kernel allows. Where
+/// the kernel refuses that type ([`silent_refused`]) the same lookup, under the same number, is
+/// written once more as [`RTM_GET`], and where the kernel takes that one, every later lookup of
+/// this process starts there: one latch for the process. A lookup the kernel refuses in both
+/// types was refused for what it asks, so it latches nothing. aterm-net's lookups write through
+/// here too, so no two lookups of the process share a number: the answer to either type is an
+/// [`RTM_GET`] message with the asker's pid and this number, by which its reader knows it even
+/// where it reaches every routing socket of a process fallen back to [`RTM_GET`].
 ///
 /// # Errors
 ///
-/// The error of the last `write` made: the first where it failed for anything but the type, or
-/// the process had already fallen back to [`RTM_GET`]; else the second.
+/// `InvalidInput` where `request` is shorter than an `rt_msghdr`, written nowhere; else the error
+/// of the last `write` made: the first where it failed for anything but the type, or the process
+/// had already fallen back to [`RTM_GET`]; else the second.
 #[cfg(target_os = "macos")]
-pub fn lookup_write(write: impl FnMut(u8) -> std::io::Result<()>) -> std::io::Result<()> {
+pub fn lookup_write(
+    request: &mut [u8],
+    write: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<i32> {
     static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    lookup_write_latched(&REFUSED, write)
+    lookup_write_latched(&REFUSED, request, write)
+}
+
+/// [`lookup_write`] in a process whose latch stands at `fallen_back`, for this one lookup alone:
+/// a test's ask as [`RTM_GET`] where `fallen_back`, else as [`RTM_GET_SILENT`] (and, on a kernel
+/// that refuses that type, [`RTM_GET`] after it), numbered from the process's one counter. The
+/// process's own latch stays as it is.
+///
+/// # Errors
+///
+/// As [`lookup_write`].
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+pub fn lookup_write_as(
+    fallen_back: bool,
+    request: &mut [u8],
+    write: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<i32> {
+    lookup_write_latched(
+        &std::sync::atomic::AtomicBool::new(fallen_back),
+        request,
+        write,
+    )
 }
 
 /// [`lookup_write`] over the latch `refused`, which a test supplies in place of the process's.
 #[cfg(target_os = "macos")]
 fn lookup_write_latched(
     refused: &std::sync::atomic::AtomicBool,
-    mut write: impl FnMut(u8) -> std::io::Result<()>,
-) -> std::io::Result<()> {
+    request: &mut [u8],
+    mut write: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<i32> {
     use std::sync::atomic::Ordering::Relaxed;
-    if refused.load(Relaxed) {
-        return write(RTM_GET);
+    if request.len() < std::mem::size_of::<RtMsghdr>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a route lookup shorter than its rt_msghdr",
+        ));
     }
-    match write(RTM_GET_SILENT) {
-        Err(error) if silent_refused(&error) => {
-            let plain = write(RTM_GET);
-            if !plain.as_ref().is_err_and(silent_refused) {
-                refused.store(true, Relaxed);
+    let sequence = lookup_sequence();
+    let at = std::mem::offset_of!(RtMsghdr, rtm_seq);
+    request[at..at + 4].copy_from_slice(&sequence.to_ne_bytes());
+    let mut write_as = |kind: u8| {
+        request[std::mem::offset_of!(RtMsghdr, rtm_type)] = kind;
+        write(request)
+    };
+    let written = if refused.load(Relaxed) {
+        write_as(RTM_GET)
+    } else {
+        match write_as(RTM_GET_SILENT) {
+            Err(error) if silent_refused(&error) => {
+                let plain = write_as(RTM_GET);
+                if !plain.as_ref().is_err_and(silent_refused) {
+                    refused.store(true, Relaxed);
+                }
+                plain
             }
-            plain
+            written => written,
         }
-        written => written,
-    }
+    };
+    written.map(|()| sequence)
 }
 
 /// A routing socket that hears the messages of address family `family` (0 for every family), as
@@ -744,10 +791,11 @@ fn routing_socket(family: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> 
     })
 }
 
-/// The sequence number of this process's next lookup ([`route_get`]): no two share one, so an
-/// answer names its lookup.
+/// The number of this process's next route lookup, which [`lookup_write`] alone draws and writes
+/// into the lookup: one counter for the process, so no two of its lookups share a number until
+/// 2^32 of them wrap it.
 #[cfg(target_os = "macos")]
-fn route_get_sequence() -> i32 {
+fn lookup_sequence() -> i32 {
     static SEQUENCE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     SEQUENCE
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -755,9 +803,9 @@ fn route_get_sequence() -> i32 {
 }
 
 /// Write one lookup of `to` ([`route_get_request`], scoped to the interface whose index is `on`
-/// where one is named) to a fresh routing socket, heard by this socket alone where the kernel
-/// allows ([`lookup_write`]), and read the kernel's answer: what `read` makes of the first
-/// message that answers this process's lookup (its pid and sequence).
+/// where one is named) to a fresh routing socket through [`lookup_write`], which numbers it and
+/// has it heard by this socket alone where the kernel allows, and read the kernel's answer: what
+/// `read` makes of the first message that answers this process's lookup (its pid and number).
 ///
 /// # Errors
 ///
@@ -771,24 +819,19 @@ fn route_get<T>(
     on: Option<u16>,
     read: impl Fn(&[u8], i32, i32) -> Option<Result<T, i32>>,
 ) -> std::io::Result<T> {
-    route_get_as(
-        to,
-        on,
-        route_get_sequence(),
-        |write| lookup_write(write),
-        read,
-    )
+    route_get_as(to, on, |request, write| lookup_write(request, write), read)
 }
 
-/// [`route_get`] as lookup `sequence`, written the way `send` says: `send` is handed the writer
-/// of this lookup in a message type of its choosing, which [`route_get`] gives to
-/// [`lookup_write`] and a test calls with one type, or through a stand-in kernel's refusal.
+/// [`route_get`], its lookup sent the way `send` says: `send` is handed the lookup, with no type
+/// or number yet, and the writer of bytes to this lookup's socket, and returns the number the
+/// lookup was written as, which the answer is read by. [`route_get`] gives both to
+/// [`lookup_write`]; a test gives them to `lookup_write_as`, or to [`lookup_write_latched`]
+/// through a stand-in kernel's refusal.
 #[cfg(target_os = "macos")]
 fn route_get_as<T>(
     to: IpAddr,
     on: Option<u16>,
-    sequence: i32,
-    send: impl FnOnce(&mut dyn FnMut(u8) -> std::io::Result<()>) -> std::io::Result<()>,
+    send: impl FnOnce(&mut [u8], &mut dyn FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<i32>,
     read: impl Fn(&[u8], i32, i32) -> Option<Result<T, i32>>,
 ) -> std::io::Result<T> {
     let pid = i32::try_from(std::process::id()).map_err(std::io::Error::other)?;
@@ -799,12 +842,12 @@ fn route_get_as<T>(
         IpAddr::V6(_) => libc::AF_INET6,
     })?;
     let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    send(&mut |kind| {
-        let request = route_get_request(to, sequence, on, kind);
-        // SAFETY: `request` is live and readable for its whole length.
-        let wrote = unsafe { libc::write(raw, request.as_ptr().cast(), request.len()) };
+    let mut request = route_get_request(to, on);
+    let sequence = send(request.as_mut_slice(), &mut |bytes: &[u8]| {
+        // SAFETY: `bytes` is live and readable for its whole length.
+        let wrote = unsafe { libc::write(raw, bytes.as_ptr().cast(), bytes.len()) };
         match usize::try_from(wrote) {
-            Ok(wrote) if wrote == request.len() => Ok(()),
+            Ok(wrote) if wrote == bytes.len() => Ok(()),
             Ok(_) => Err(std::io::ErrorKind::WriteZero.into()),
             Err(_) => Err(std::io::Error::last_os_error()),
         }
@@ -844,15 +887,15 @@ fn route_get_as<T>(
     }
 }
 
-/// The lookup [`route_get`] writes for `to` as `sequence`, in message type `kind`
-/// ([`RTM_GET_SILENT`] or [`RTM_GET`]): the head, `to` as the destination (a `sockaddr_in` or a
+/// The lookup [`route_get`] writes for `to`, with no message type or number yet, which
+/// [`lookup_write`] sets as it writes it: the head, `to` as the destination (a `sockaddr_in` or a
 /// `sockaddr_in6`), and an empty link-layer sockaddr in the interface's slot, which asks the
 /// kernel to name the route's interface and its address in the answer, as `route -n get` asks.
 /// With `on`, the lookup is scoped to the interface of that index (`RTF_IFSCOPE` and
 /// `rtm_index`), as `route -n get -ifscope` asks: two networks whose gateways share an address
 /// keep one entry each.
 #[cfg(target_os = "macos")]
-fn route_get_request(to: IpAddr, sequence: i32, on: Option<u16>, kind: u8) -> Vec<u8> {
+fn route_get_request(to: IpAddr, on: Option<u16>) -> Vec<u8> {
     let header = std::mem::size_of::<RtMsghdr>();
     let mut destination = match to {
         IpAddr::V4(to) => {
@@ -877,7 +920,6 @@ fn route_get_request(to: IpAddr, sequence: i32, on: Option<u16>, kind: u8) -> Ve
     let length = (header + destination.len() + interface.len()) as u16;
     message[0..2].copy_from_slice(&length.to_ne_bytes());
     message[std::mem::offset_of!(RtMsghdr, rtm_version)] = RTM_VERSION;
-    message[std::mem::offset_of!(RtMsghdr, rtm_type)] = kind;
     let mut put = |offset: usize, value: i32| {
         message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     };
@@ -887,7 +929,6 @@ fn route_get_request(to: IpAddr, sequence: i32, on: Option<u16>, kind: u8) -> Ve
         RTF_UP | RTF_HOST | scope,
     );
     put(std::mem::offset_of!(RtMsghdr, rtm_addrs), RTA_DST | RTA_IFP);
-    put(std::mem::offset_of!(RtMsghdr, rtm_seq), sequence);
     if let Some(index) = on {
         let at = std::mem::offset_of!(RtMsghdr, rtm_index);
         message[at..at + 2].copy_from_slice(&index.to_ne_bytes());
@@ -903,11 +944,12 @@ fn route_get_request(to: IpAddr, sequence: i32, on: Option<u16>, kind: u8) -> Ve
 type RouteFound<'a> = (&'a [u8], &'a [u8]);
 
 /// The answer one message a routing socket read is to the lookup process `pid` wrote as
-/// `sequence` ([`route_get_request`]): `None` when it answers something else (another process's
-/// lookup, another of this one's, a change of a route), else `Some(Ok((head, block)))`, the
-/// found route's head (a [`RtMsghdr`]'s bytes) and its address block, or `Some(Err(errno))`
-/// where the kernel refused the lookup (`rtm_errno`: `ESRCH` where it found no route). The
-/// answer to either type of lookup is an [`RTM_GET`] message.
+/// `sequence` ([`lookup_write`]): `None` when it answers something else (another process's
+/// lookup, another of this process's, aterm-net's included, which [`lookup_write`] numbers
+/// apart, a change of a route), else `Some(Ok((head, block)))`, the found route's head (a
+/// [`RtMsghdr`]'s bytes) and its address block, or `Some(Err(errno))` where the kernel refused
+/// the lookup (`rtm_errno`: `ESRCH` where it found no route). The answer to either type of
+/// lookup is an [`RTM_GET`] message.
 #[cfg(target_os = "macos")]
 fn route_get_reply(message: &[u8], pid: i32, sequence: i32) -> Option<Result<RouteFound<'_>, i32>> {
     let header = std::mem::size_of::<RtMsghdr>();

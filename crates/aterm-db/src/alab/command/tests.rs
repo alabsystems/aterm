@@ -2160,6 +2160,9 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
         to: None,
         tab: None,
         harness: None,
+        op: None,
+        via: None,
+        program: None,
     };
     let spool = Spool::at(scratch.path().join("alab"));
     spool.append(&base).unwrap();
@@ -3389,8 +3392,16 @@ fn a_mailbox_file_imports_and_reports_its_coverage() {
     let view = Registry::at(paths.clone()).view().unwrap();
     let ann = keys::mailbox_pk(&keys::address_pk("ann@example.invalid").unwrap()).unwrap();
     assert_eq!(
-        view.project(&MAILBOX).rows[&ann].get("receives_domains"),
-        Some(&json!(["pm.example"]))
+        view.table.map(|table| table.role),
+        Some(crate::alab::registry::REGISTRY_4.role)
+    );
+    assert_eq!(
+        crate::typed::cell::settled_texts(
+            view.project(&MAILBOX).rows[&ann]
+                .fields
+                .get("receives_domains")
+        ),
+        ["pm.example"]
     );
     let again = go(&["import", "--mailbox-toml", path, "--apply"]).unwrap();
     assert_eq!(again["records"].as_u64(), Some(0), "{again}");

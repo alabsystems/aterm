@@ -3,6 +3,20 @@
 
 use super::*;
 
+/// A bot protection this process met under `key` and has not recorded
+/// ([`AutoRenewGuard::unrecorded_checks`]), for a test of a guard's holds alone.
+pub(super) fn a_check_met(key: &str) -> PendingCheck {
+    PendingCheck {
+        roster_path: PathBuf::new(),
+        row: accounts::Row {
+            label: key.to_owned(),
+            ..accounts::Row::default()
+        },
+        generation: None,
+        at: 0,
+    }
+}
+
 #[test]
 fn no_route_backoff_has_a_deadline_without_an_active_worker() {
     let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
@@ -156,7 +170,9 @@ fn published_login_clears_only_its_attributed_holds() {
             // Keys need not equal the account label; each domain has its own owner.
             state.last_attempt.insert("key".into(), clock);
             state.parked.insert("key".into(), clock);
-            state.bot_checked.insert("key".into(), clock);
+            state
+                .unrecorded_checks
+                .insert("key".into(), a_check_met("key"));
             state.ladder.failed("key", "inputs", clock);
             if let Some(owner) = owner(activity) {
                 state.activity_owners.insert("key".into(), owner);
@@ -179,13 +195,18 @@ fn published_login_clears_only_its_attributed_holds() {
                 u32::from(activity == "local" || ladder == "local")
             );
             let state = guard.lock().unwrap();
-            for held in [&state.last_attempt, &state.parked, &state.bot_checked] {
+            for held in [&state.last_attempt, &state.parked] {
                 assert_eq!(
                     held.contains_key("key"),
                     activity != "local",
                     "{activity}/{ladder}"
                 );
             }
+            assert_eq!(
+                state.unrecorded_checks.contains_key("key"),
+                activity != "local",
+                "a login made for the row ends the check it met: {activity}/{ladder}"
+            );
             assert_eq!(
                 state.activity_owners.contains_key("key"),
                 !matches!(activity, "local" | "unattributed"),

@@ -3,12 +3,13 @@
 
 use super::*;
 
-/// Every rostered harness is a subject, named once; Muse is played; the windows hold the
+/// Every seed row of the harness registry is a subject, named once; Muse is played; the windows hold the
 /// harness's own clocks.
 #[test]
 fn the_subjects_cover_the_roster_and_size_their_windows_from_the_harness() {
-    for row in aterm_agent::harness::contract::ROSTER {
-        assert!(subject(row.id).is_some(), "{} is rostered", row.id);
+    let seeds = aterm_agent::harness::registry::Registry::load_from(None, &Default::default());
+    for row in seeds.rows() {
+        assert!(subject(row.id).is_some(), "{} is a seed row", row.id);
     }
     let ids: Vec<&str> = SUBJECTS.iter().map(|s| s.id).collect();
     let mut sorted = ids.clone();

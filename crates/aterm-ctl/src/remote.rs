@@ -647,9 +647,8 @@ pub fn lifts_there(node: &str) -> String {
     )
 }
 
-/// Refuse a leading selector that names a session of THIS Mac, or none by
-/// its sid: over the fleet a session is `@s-<hex>`, as `survey --host`
-/// shows it.
+/// Refuse a leading selector that does not name one session by its full ID.
+/// Current tab IDs and exact legacy IDs are accepted, as `survey --host` reports them.
 fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
     let Some(selector) = parts.first().filter(|p| p.starts_with('@')) else {
         return Ok(());
@@ -659,8 +658,8 @@ fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
         return Ok(());
     }
     Err(refused(format!(
-        "over the fleet a session is named by its sid (@s-…, as `aterm ctl survey --host <h>` \
-         shows it): `{}` names a session of this Mac, or several",
+        "`{}` does not name one remote session; use its full ID from \
+         `aterm ctl survey --host <h>` (for example `@tqn5r6e0148`)",
         aterm_codec::tty::one_line(selector, 40)
     )))
 }
@@ -917,7 +916,8 @@ fn any_target_sid<'a>(
         }
     }
     Err(refused(
-        "`--host any` follows a worker by its `@s-<hex>` sid (or `hold s-<hex> on|off`)",
+        "`--host any` follows a worker by its tab ID, `@tqn5r6e0148` or a legacy tab's `@s-` ID \
+         (or `hold <id> on|off`)",
     ))
 }
 

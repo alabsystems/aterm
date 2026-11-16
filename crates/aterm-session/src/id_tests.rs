@@ -34,7 +34,7 @@ fn a_minted_sid_parses_and_a_chosen_name_does_not() {
     for chosen in ["s-1", "s-boss", "tqn5r6e014", "Tqn5r6e0148", "worker"] {
         assert_eq!(SessionId::parse(chosen), None, "NEGATIVE CONTROL: {chosen}");
     }
-    // The two crates' readers give one answer.
+    // Local sessions and requester metadata share the exact canonical-or-legacy grammar.
     for s in [
         "s-0123456789abcdef0123",
         "tqn5r6e0148",
@@ -44,10 +44,19 @@ fn a_minted_sid_parses_and_a_chosen_name_does_not() {
     ] {
         assert_eq!(
             is_minted_sid(s),
+            aterm_types::control_request::Sid::parse(s).is_some(),
+            "{s}"
+        );
+        assert_eq!(
             aterm_types::control_verbs::is_minted_sid(s),
+            is_minted_sid(s),
             "{s}"
         );
     }
+    assert!(
+        aterm_types::tab_id::TabId::parse("s-0123456789abcdef0123").is_none(),
+        "a local legacy session is still no canonical tab ID"
+    );
 }
 
 #[test]

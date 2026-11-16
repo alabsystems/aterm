@@ -75,7 +75,7 @@ fn summoned(arm: Arm) -> (App, Instant, i32) {
     app.recompute_sparkle();
     let _ = app.sparkle.take();
     {
-        let ws = app.windows.get_mut(&WID).expect("window");
+        let mut ws = app.windows.get_mut(&WID).expect("window");
         ws.present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
         });

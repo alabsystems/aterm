@@ -438,6 +438,30 @@ const WORKERS_ICON: &[TabIconPrimitive] = &[
     },
 ];
 
+/// A sheet: its frame, two row rules and the rule after its key column.
+const TABLES_ICON: &[TabIconPrimitive] = &[
+    TabIconPrimitive::RoundedRect {
+        rect: [1.5, 2.5, 13.0, 11.0],
+        radius: 1.5,
+        width: 1.2,
+    },
+    TabIconPrimitive::Line {
+        from: [1.5, 6.2],
+        to: [14.5, 6.2],
+        width: 1.1,
+    },
+    TabIconPrimitive::Line {
+        from: [1.5, 9.85],
+        to: [14.5, 9.85],
+        width: 1.1,
+    },
+    TabIconPrimitive::Line {
+        from: [6.25, 2.5],
+        to: [6.25, 13.5],
+        width: 1.1,
+    },
+];
+
 const RECOVERY_ICON: &[TabIconPrimitive] = &[
     TabIconPrimitive::RoundedRect {
         rect: [2.0, 1.5, 12.0, 13.0],
@@ -483,6 +507,7 @@ pub(crate) const fn tab_icon_primitives(kind: TabIconKind) -> &'static [TabIconP
         TabIconKind::Editor => EDITOR_ICON,
         TabIconKind::Recovery => RECOVERY_ICON,
         TabIconKind::Workers => WORKERS_ICON,
+        TabIconKind::Tables => TABLES_ICON,
     }
 }
 

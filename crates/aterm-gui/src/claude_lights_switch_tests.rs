@@ -341,10 +341,8 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
         "agy with harness on records Cruise"
     );
     {
-        let s = app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
+        let mut payload_guard_s = app.windows.get_mut(&wid).expect("window");
+        let s = payload_guard_s
             .claude_lights
             .sessions
             .get_mut(&session)
@@ -733,8 +731,10 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
         drawn(&app, BandIcon::DottedRing, "turning on, spliced again");
     }
     let row = switch(&app, wid).expect("the switch").frame_row;
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+    let ws = &mut **field_guard_ws;
     crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+    drop(field_guard_ws);
     assert_eq!(drawn_marks(&app, wid, row), [], "the strip takes it back");
     frame(&mut app, wid);
     set_program(&app, session, None);
@@ -838,8 +838,10 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
                 "{mode:?}: splice {k} allocated {allocations}"
             );
         }
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+        let ws = &mut **field_guard_ws;
         crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
+        drop(field_guard_ws);
         assert_eq!(drawn(&app), [], "{mode:?}: the strip takes them back");
     }
     assert!(app.set_session_autopilot(
@@ -855,7 +857,8 @@ fn line_ds_marks_are_drawn_as_the_switchs_are() {
 fn the_glass_draws_its_marks_by_the_character_alone() {
     let (mut app, wid, _session, _reader, _host) = claude_pane(120);
     let rule = footer_row(&app, wid);
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+    let ws = &mut **field_guard_ws;
     crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
     let blank = aterm_core::terminal::RenderCell {
         ch: ' ',
@@ -878,6 +881,7 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
     ws.claude_card
         .paint_marks(&mut ws.input_scratch, rule, 4, &cells);
     let icon = |col: u16, icon| ChromeIcon { col, icon };
+    drop(field_guard_ws);
     assert_eq!(
         drawn_marks(&app, wid, rule),
         [

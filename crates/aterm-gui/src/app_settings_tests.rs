@@ -182,7 +182,8 @@ fn unchanged_settings_font_delivery_does_no_catalog_copy_or_topology_work() {
             ))),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(second) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(second);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(state.session_runtime, Some(expected_runtime));
@@ -200,9 +201,11 @@ fn unchanged_settings_font_delivery_does_no_catalog_copy_or_topology_work() {
         installed: vec!["New mono".into()],
         ..(*families).clone()
     });
+    drop(route_native_guard);
     app.publish_settings_font_families(Arc::clone(&changed));
     for view in [first, second] {
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert!(
@@ -247,7 +250,8 @@ fn unchanged_settings_font_delivery_does_no_catalog_copy_or_topology_work() {
             .is_empty()
     );
     for view in [first, second] {
-        let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert!(!state.replace_drawn_faces(Some(drawn.clone())));
@@ -296,7 +300,8 @@ fn unchanged_settings_font_delivery_does_no_catalog_copy_or_topology_work() {
             ))),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(state.session_runtime, Some(changed_runtime));
@@ -566,7 +571,8 @@ fn activate_word_decoration(app: &mut App, now: Instant) {
         .term
         .clone();
     {
-        let ws = app.windows.get_mut(&wid).expect("window 0");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("window 0");
+        let ws = &mut **field_guard_ws;
         ws.pending_deco_birth = Some(now);
         let mut term = crate::term_lock(&terminal);
         term.process(b"\r\nhello kitty friend");
@@ -581,7 +587,7 @@ fn activate_dependent(app: &mut App, effect: CursorDependent, now: Instant) {
         activate_word_decoration(app, now);
     } else {
         activate_non_word_dependent(
-            app.windows.get_mut(&crate::WindowId(0)).expect("window 0"),
+            &mut app.windows.get_mut(&crate::WindowId(0)).expect("window 0"),
             effect,
             now,
         );
@@ -596,7 +602,7 @@ fn activate_all_terminal_dependents(app: &mut App, now: Instant) {
         }
         activate_dependent(app, effect, now);
     }
-    let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
     ws.next_trail_tick = Some(now + Duration::from_millis(16));
     ws.last_trail_fire = Some(now);
     ws.note_deco_animating(now);
@@ -633,7 +639,7 @@ fn every_cursor_dependent_uses_the_shared_frame_cadence_set() {
         let mut app = App::headless_for_test();
         let now = Instant::now();
         activate_dependent(&mut app, effect, now);
-        let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
+        let mut ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
         if matches!(effect, CursorDependent::WordDecoration) {
             ws.fx.companions_mut().cursor_cat = crate::kitty_cursor::CursorCat::default();
         }
@@ -1136,15 +1142,16 @@ fn a_confirmed_warm_up_that_starts_nothing_says_why() {
     let wid = crate::WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
     let (_, view) = app.active_native_view(wid).expect("Settings view");
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("a Settings view");
     };
     state.record_consent_warmup_for_test();
+    drop(route_native_guard);
     app.sync_settings_consent_posture();
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("a Settings view");
     };
@@ -1169,19 +1176,21 @@ fn a_confirmed_debugger_change_on_a_headless_instance_starts_nothing_and_says_wh
     let wid = crate::WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
     let (_, view) = app.active_native_view(wid).expect("Settings view");
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("a Settings view");
     };
     state.record_debugger_change_for_test(DebuggerChange::On);
+    drop(route_native_guard);
     app.sync_settings_consent_posture();
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
     else {
         panic!("a Settings view");
     };
     assert_eq!(state.take_debugger_change_request(), None, "drained");
+    drop(route_native_guard);
     let facts = app.debugger_access_facts();
     assert_eq!(
         facts.refusal,
@@ -1409,8 +1418,9 @@ fn the_developer_tools_cards_press_is_the_one_hand_over() {
         )
         .unwrap();
         app.sync_settings_consent_posture();
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("a Settings view");
         };
@@ -1511,8 +1521,9 @@ fn a_cards_press_that_waits_for_spctl_hears_how_the_page_came_out() {
         .unwrap();
         app.sync_settings_consent_posture();
         let feedback = |app: &mut App| {
+            let mut route_native_guard = app.native_runtime.view_state_mut(view);
             let Some(crate::native_app::AppViewState::Settings(state)) =
-                app.native_runtime.view_state_mut(view)
+                route_native_guard.as_deref_mut()
             else {
                 panic!("a Settings view");
             };
@@ -2046,8 +2057,9 @@ fn the_park_drains_every_settings_view_and_shares_the_decline_record() {
         (first, crate::native_settings::SettingsRoute::Security),
         (second, crate::native_settings::SettingsRoute::Appearance),
     ] {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("a Settings view");
         };
@@ -2068,8 +2080,9 @@ fn the_park_drains_every_settings_view_and_shares_the_decline_record() {
         "the park settles every yes it takes up"
     );
     for view in [first, second] {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("a Settings view");
         };
@@ -2590,7 +2603,7 @@ fn accessibility_action_supersedes_pending_cursor_candidate() {
     let mut glow = Vec::new();
     let mut trail = Vec::new();
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.fx
             .cursor_mut()
             .glow
@@ -2617,7 +2630,7 @@ fn accessibility_action_supersedes_pending_cursor_candidate() {
             data: None,
         }),
     });
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     assert!(!ws.fx.cursor_mut().glow.move_licensed(now));
     assert!(!ws.fx.cursor_mut().trail.move_licensed(now));
     let moved = now + Duration::from_millis(1);

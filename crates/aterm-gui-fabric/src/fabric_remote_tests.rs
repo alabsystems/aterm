@@ -289,7 +289,10 @@ fn a_drives_requester_is_kept_apart_from_its_driver_for_the_guard() {
 }
 
 /// A REQUESTER'S SID SHAPE IS THE ONE ATERM MINTS: `aterm_types`' copy of the check answers as
-/// `aterm_session::is_minted_sid` does, for a minted id and for each near miss.
+/// `aterm_session::is_minted_sid` does, for a minted id and for each near miss, and for the exact
+/// `s-` and 20 lower-case hex digits a tab opened before the `t` form keeps, which both take.
+/// NEGATIVE CONTROLS: the loose `s-` forms 1853feba2aa retired (a short hex run, a name), and a
+/// legacy ID upper case, a digit short or long, or with a letter outside hex, which neither takes.
 #[test]
 fn requester_sid_shape_matches_minted_sid() {
     let minted = SessionId::generate();
@@ -310,6 +313,18 @@ fn requester_sid_shape_matches_minted_sid() {
     cases.push(minted.as_str()[..last].to_owned());
     cases.push(format!("{}0", minted.as_str()));
     cases.extend(["", "s-", "t0000007725", "worker"].map(str::to_owned));
+    let legacy = "s-0123456789abcdef0123";
+    let retired = [
+        "s-7725",
+        "s-worker",
+        "S-0123456789abcdef0123",
+        "s-0123456789ABCDEF0123",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789abcdef012g",
+    ];
+    cases.push(legacy.to_owned());
+    cases.extend(retired.map(str::to_owned));
     for case in &cases {
         assert_eq!(
             aterm_types::control_verbs::is_minted_sid(case),
@@ -318,4 +333,14 @@ fn requester_sid_shape_matches_minted_sid() {
         );
     }
     assert!(aterm_types::control_verbs::is_minted_sid(minted.as_str()));
+    assert!(
+        aterm_types::control_verbs::is_minted_sid(legacy),
+        "a legacy tab's exact ID"
+    );
+    for word in retired {
+        assert!(
+            !aterm_types::control_verbs::is_minted_sid(word),
+            "CONTROL: {word:?}"
+        );
+    }
 }

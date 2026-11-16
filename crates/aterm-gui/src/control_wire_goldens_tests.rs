@@ -141,7 +141,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     crate::harness_policy_verb::record_policy_move(&ctx.timeline, 2);
     let reply = crate::fabric::cmd_deliver_waking(
         &store,
-        &format!("{sid} off=40 from=s-a kind=ask trust=agent text=SENTINEL"),
+        &format!("{sid} off=40 from=t0000000001 kind=ask trust=agent text=SENTINEL"),
         &wake,
     );
     assert_eq!(reply, "OK 1\n", "the delivery");
@@ -149,7 +149,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     assert!(reply.starts_with("OK seen=1"), "{reply}");
     let reply = crate::fabric::cmd_post(
         &ctx,
-        "to=@s-b kind=answer re=1 --wait=0 SENTINEL-ANSWER",
+        "to=@t0000000002 kind=answer re=1 --wait=0 SENTINEL-ANSWER",
         None,
     );
     assert!(
@@ -215,9 +215,9 @@ const TIMELINE_GOLDEN: &str = concat!(
     "event 13 t=* kind=harness-act act=approve holder=codex-alab\n",
     "event 14 t=* kind=program-state state=- kind=-\n",
     "event 15 t=* kind=harness-policy gen=2\n",
-    "event 16 t=* kind=inbox 1 from=s-a kind=ask off=40\n",
-    "event 17 t=* kind=inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=s-a\n",
-    "event 18 t=* kind=post 1 to=@s-b kind=answer re=1\n",
+    "event 16 t=* kind=inbox 1 from=t0000000001 kind=ask off=40\n",
+    "event 17 t=* kind=inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=t0000000001\n",
+    "event 18 t=* kind=post 1 to=@t0000000002 kind=answer re=1\n",
     "event 19 t=* kind=post-landed 1 off=41\n",
     "event 20 t=* kind=hold 1 reason=owner origin=local hold_origin=local\n",
     "event 21 t=* kind=fetch off=40\n",

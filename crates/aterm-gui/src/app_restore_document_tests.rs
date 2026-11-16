@@ -139,9 +139,15 @@ fn a_config_restore_ensures_the_file_in_its_worker_and_enables_the_installed_doc
     };
     let instance = native.instance;
     assert!(app.native_runtime.config_editor_enabled(instance));
+    // The binding names the file as its `file://` URI does, which on Windows drops the
+    // verbatim prefix (`\\?\`) `canonicalize` gives `path`.
+    let named = path
+        .to_str()
+        .and_then(|path| path.strip_prefix(r"\\?\"))
+        .map_or_else(|| path.clone(), std::path::PathBuf::from);
     assert_eq!(
         app.native_config_service.bound_logical_path(),
-        Some(path.as_path())
+        Some(named.as_path())
     );
 }
 

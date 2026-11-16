@@ -14,13 +14,13 @@ use super::read::{
     word,
 };
 use super::rows::{
-    self, AccountRef, Cell, EvidenceHow, Reach, Row, UNREGISTERED, Via, WindowState,
+    self, AccountRef, Cell, EvidenceHow, ObservedState, Reach, Row, UNREGISTERED, Via, WindowState,
 };
 use super::{
     Folder, HELD_FLEET_UNREAD, HELD_NO_HISTORY, HELD_PARTIAL, HELD_READ_FAILED, HELD_STALE,
     HELD_UNOBSERVED, Reading,
 };
-use crate::alab::journal::event::SIGNIN_IN;
+use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN, SIGNIN_OUT};
 use crate::alab::journal::place::{Placed, Why};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
 use crate::alab::view::{Account, LabView, Machine, MachineNickname, Preference};
@@ -37,6 +37,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const NOW: u64 = 1_800_000_000_000;
 /// A Commons uuid of a test's own.
 const UUID: &str = "000102030405060708090a0b0c0d0e0f";
+/// A second one, for a second machine.
+const UUID_2: &str = "101112131415161718191a1b1c1d1e1f";
+/// One no machine row binds.
+const UUID_UNBOUND: &str = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+/// A third, for a second seat of a machine.
+const UUID_3: &str = "202122232425262728292a2b2c2d2e2f";
 
 /// The machines columns that hold what a machine was observed to do: unread unless read.
 const OBSERVED: &[&str] = &[
@@ -937,6 +943,21 @@ fn every_schema_is_well_formed_and_every_fixture_cell_is_of_its_columns_type() {
     assert!(check(&tables.machines) > fixture::MACHINES * 5);
     assert!(check(&tables.accounts) > fixture::ACCOUNTS * 5);
     assert!(check(&tables.agents) > fixture::AGENTS * 5);
+    // The fixture's lab holds the name the guards of free text refuse: a Mac no machine row
+    // binds is named by 8 digits of its uuid, and one such run is all decimal, which reads as
+    // a phone number. It is a machine's name, and its cells admit it.
+    // NEGATIVE CONTROL: with those cells typed as free text (as before), the check above fails
+    // `accounts.seen_on holds [… {"at":1799206200000,"machine":"13000000","tabs":0}]`.
+    let digits = &fixture::RETIRED_UUID[..8];
+    assert!(digits.bytes().all(|b| b.is_ascii_digit()), "{digits}");
+    assert!(!cell::admissible(
+        &crate::typed::Ty::Text(32),
+        &Value::from(digits)
+    ));
+    for named in ["seen_on", "last_seen_by", "observed_by"] {
+        let spec = format!("{named}={digits}");
+        assert!(kept(&tables, "accounts", &[&spec]) > 0, "{spec}");
+    }
 
     // The schema verb prints one line a column, and each relation alone.
     let all = print_schema(None, false).expect("schemas print");
@@ -1384,8 +1405,23 @@ fn the_registry_reader_starts_on_the_first_ask_for_the_tables() {
         1,
         "the first ask starts it, once"
     );
-    // This process's own folder is made without one running: making it folds nothing either.
-    assert_eq!(super::folder().tables().revision, 0);
+    // This process's own folder is made without its fold thread, which its first ask starts.
+    // Nothing else in this binary makes or asks it.
+    let made = super::folder();
+    assert!(
+        !made.folding.load(Ordering::Acquire),
+        "making this process's folder started its fold thread"
+    );
+    let _ = made.tables();
+    assert!(
+        !made.folding.load(Ordering::Acquire),
+        "a waiting read started this process's fold thread"
+    );
+    let _ = made.try_tables();
+    assert!(
+        made.folding.load(Ordering::Acquire),
+        "CONTROL: the first ask starts this process's fold thread"
+    );
 }
 
 /// One turn of the fold thread folds when an offer changed an input or when the instant the
@@ -2703,5 +2739,775 @@ fn an_older_row_is_in_a_turn_where_its_agents_own_word_opens_one() {
     ];
     for (n, (state, row, work)) in cases.into_iter().enumerate() {
         assert_eq!(Work::of(state, &row), work, "{n}: {state:?} {row:?}");
+    }
+}
+
+/// The journal event `value` is, as the Mac of Commons uuid `uuid` logged it.
+fn logged(uuid: &str, value: Value) -> (String, Event) {
+    (
+        uuid.to_owned(),
+        Event::from_value(&value).expect("an event of the journal's vocabulary"),
+    )
+}
+
+/// A lab of m3 (bound to [`UUID`]) and m22 (bound to [`UUID_2`]) with the Claude accounts
+/// `claude-<letter>` of `letters`, in that order, and their keys.
+fn lab_with_accounts(letters: &[&str]) -> (LabView, Vec<String>) {
+    let mut lab = lab_of(&["m3", "m22"]);
+    lab.bound.insert(UUID.to_owned(), keys::machine_pk("m3"));
+    lab.bound.insert(UUID_2.to_owned(), keys::machine_pk("m22"));
+    let mut pks = Vec::new();
+    for letter in letters {
+        let mut row = account(
+            "claude",
+            &format!("{letter}@lab.example"),
+            &format!("claude-{letter}"),
+        );
+        row.status = Some("pending".to_owned());
+        pks.push(row.pk.clone());
+        lab.accounts.insert(row.pk.clone(), row);
+    }
+    (lab, pks)
+}
+
+/// A PLAN IS THE REGISTRY'S WHERE THE REGISTRY STATES ONE, ELSE THE NEWEST A MAC OBSERVED, AND
+/// THE ROW SAYS WHICH: `plan_source` is `set` or `observed`, the observed plan stands in its own
+/// columns with when it was read and the machine that read it, and where a stated plan and an
+/// observed one differ both are shown and `plan_mismatch` says so. The stated plan is a
+/// person's: no observation is written over it.
+/// NEGATIVE CONTROLS: with the fold taking `account.plan` alone (as before), the row nobody
+/// stated a plan for shows none: `left: None right: Some("anthropic-max")`; with the observed
+/// plan standing over the stated one, the differing row reads `left: Some("anthropic-max")
+/// right: Some("anthropic-pro")`.
+#[test]
+fn a_plan_is_the_registrys_where_stated_else_the_newest_observed_and_a_mismatch_shows_both() {
+    let now_s = NOW / 1_000;
+    let (mut lab, pks) = lab_with_accounts(&["a", "b", "c", "d", "e"]);
+    for (pk, plan) in [
+        (0, "anthropic-max"),
+        (2, "anthropic-pro"),
+        (3, "anthropic-max"),
+    ] {
+        if let Some(row) = lab.accounts.get_mut(&pks[pk]) {
+            row.plan = Some(plan.to_owned());
+        }
+    }
+    let plan_seen = |uuid: &str, pk: &str, plan: &str, ago: u64| {
+        logged(
+            uuid,
+            aterm_json::json!({"a": pk, "c": "claude", "k": "plan-seen", "src": "cli-output",
+                "t": now_s - ago, "plan": plan}),
+        )
+    };
+    // b: two Macs saw two plans, the newer logged first. c: a Mac no machine row binds saw
+    // another plan than the stated one. d: a Mac saw the stated one.
+    let seen = Seen::of_events(
+        &[
+            plan_seen(UUID_2, &pks[1], "max", 50),
+            plan_seen(UUID, &pks[1], "pro", 100),
+            plan_seen(UUID_UNBOUND, &pks[2], "max", 30),
+            plan_seen(UUID, &pks[3], "max", 10),
+        ],
+        now_s,
+    );
+    let inputs = Inputs {
+        lab: live(lab.clone(), NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    };
+    let tables = tables(&inputs);
+    let [stated, observed, differs, agrees, neither] = &tables.accounts[..] else {
+        panic!("five accounts: {}", tables.accounts.len());
+    };
+    let plan = |row: &rows::AccountRow| {
+        [
+            shown_of(row, "plan"),
+            shown_of(row, "plan_source"),
+            shown_of(row, "plan_observed"),
+            shown_of(row, "plan_by"),
+            shown_of(row, "plan_mismatch"),
+        ]
+    };
+    assert_eq!(plan(stated), ["anthropic-max", "set", "?", "?", "?"]);
+    assert_eq!(cell_of(stated, "plan_at"), Cell::Unread);
+    // The newest observation stands, whoever made it, with its time and its Mac.
+    assert_eq!(observed.plan.as_deref(), Some("anthropic-max"));
+    assert_eq!(
+        plan(observed),
+        ["anthropic-max", "observed", "anthropic-max", "m22", "?"]
+    );
+    assert_eq!(
+        cell_of(observed, "plan_at"),
+        Cell::Value(Value::from((now_s - 50) * 1_000))
+    );
+    // A stated plan stands beside an observed one that differs: both, and the mismatch.
+    assert_eq!(differs.plan.as_deref(), Some("anthropic-pro"));
+    assert_eq!(
+        plan(differs),
+        ["anthropic-pro", "set", "anthropic-max", "f0f1f2f3", "true"]
+    );
+    assert_eq!(
+        plan(agrees),
+        ["anthropic-max", "set", "anthropic-max", "m3", "false"]
+    );
+    assert_eq!(plan(neither), ["?", "?", "?", "?", "?"]);
+    assert_eq!(kept(&tables, "accounts", &["plan_mismatch=true"]), 1);
+    assert_eq!(kept(&tables, "accounts", &["plan_source=observed"]), 1);
+    assert_eq!(kept(&tables, "accounts", &["plan_by=m22"]), 1);
+
+    // The JSON carries the same cells, and a plan nobody observed is null there.
+    let json = json_rows(&print(&tables, "accounts", &[], true).expect("print").text);
+    assert_eq!(json[1]["plan"], Value::from("anthropic-max"));
+    assert_eq!(json[1]["plan_source"], Value::from("observed"));
+    assert_eq!(json[1]["plan_at"], Value::from((now_s - 50) * 1_000));
+    assert_eq!(json[1]["plan_by"], Value::from("m22"));
+    assert_eq!(json[2]["plan_mismatch"], Value::Bool(true));
+    assert_eq!(json[0]["plan_observed"], Value::Null);
+    assert_eq!(json[4]["plan_source"], Value::Null);
+
+    // Control: with no journal read, what the registry states still stands and nothing is
+    // observed.
+    let unread = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        ..Inputs::default()
+    });
+    assert_eq!(
+        plan(&unread.accounts[0]),
+        ["anthropic-max", "set", "?", "?", "?"]
+    );
+    assert_eq!(plan(&unread.accounts[1]), ["?", "?", "?", "?", "?"]);
+
+    // The fixture holds all three cases: a plan only observed, one observed as stated and one
+    // observed otherwise.
+    let (_, fixture) = fixture_tables();
+    assert!(kept(&fixture, "accounts", &["plan_source=observed"]) > 0);
+    assert!(kept(&fixture, "accounts", &["plan_mismatch=true"]) > 0);
+    assert!(kept(&fixture, "accounts", &["plan_mismatch=false"]) > 0);
+}
+
+/// One Mac's sign-in word for an account, as the journal's read holds it.
+fn sign(seen: &mut Seen, pk: &str, uuid: &str, state: &'static str, t: u64) {
+    seen.signins.entry(pk.to_owned()).or_default().insert(
+        uuid.to_owned(),
+        SignedIn {
+            state,
+            t,
+            cli: "claude".to_owned(),
+        },
+    );
+}
+
+/// WHAT THE FLEET OBSERVED OF AN ACCOUNT STANDS BESIDE THE STATUS THE REGISTRY STATES, AND
+/// NEVER REPLACES IT: `observed` is derived each fold from the evidence (signed in on any Mac
+/// is `signed-in`; a Mac's word that is not `in`, with no `in` anywhere, is `signed-out`; a
+/// place with no word is `place-only`; nothing is `never-seen`), with since when the newest
+/// evidence holds and the Mac it is of, while `status` stays the registry's word: a pending
+/// row a Mac is signed in to still says `pending`, and a paused one still says `paused`.
+/// NEGATIVE CONTROLS: with `observed_state` not reading the words that are not `in`, the
+/// signed-out row reads `left: ["pending", "place-only", "m3"] right: ["pending",
+/// "signed-out", "m22"]`; with the fold giving an
+/// observed sign-in as the row's status, the first row reads `left: Some("active") right:
+/// Some("pending")`.
+#[test]
+fn what_was_observed_of_an_account_stands_beside_its_status_and_never_replaces_it() {
+    let now_s = NOW / 1_000;
+    let (mut lab, pks) = lab_with_accounts(&["a", "b", "c", "d", "e", "f"]);
+    if let Some(row) = lab.accounts.get_mut(&pks[4]) {
+        row.status = Some("paused".to_owned());
+    }
+    let mut seen = Seen::of_events(&[], now_s);
+    // a: two Macs are signed in, m22 the later. b: one Mac's login ended and another signed
+    // out later, and the first still holds a place. c: a place and no word. d: nothing.
+    // e: paused by a person, and a Mac is signed in. f: only a Mac no machine row binds.
+    sign(&mut seen, &pks[0], UUID, SIGNIN_IN, now_s - 200);
+    sign(&mut seen, &pks[0], UUID_2, SIGNIN_IN, now_s - 100);
+    sign(&mut seen, &pks[1], UUID, SIGNIN_ENDED, now_s - 300);
+    sign(&mut seen, &pks[1], UUID_2, SIGNIN_OUT, now_s - 50);
+    for pk in [&pks[1], &pks[2]] {
+        seen.places.rows.push(Placed {
+            uuid: UUID.to_owned(),
+            account: pk.clone(),
+            why: Why::Fill,
+            since: now_s - 60,
+            until: now_s + 60,
+        });
+    }
+    sign(&mut seen, &pks[4], UUID, SIGNIN_IN, now_s - 10);
+    sign(&mut seen, &pks[5], UUID_UNBOUND, SIGNIN_IN, now_s - 10);
+    let inputs = Inputs {
+        lab: live(lab.clone(), NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    };
+    let folded = fold(&inputs, NOW);
+    let tables = &folded.tables;
+    let observed = |row: &rows::AccountRow| {
+        [
+            shown_of(row, "status"),
+            shown_of(row, "observed"),
+            shown_of(row, "observed_by"),
+        ]
+    };
+    let at = |row: &rows::AccountRow| cell_of(row, "observed_at");
+    let ms = |ago: u64| Cell::Value(Value::from((now_s - ago) * 1_000));
+    let rows = &tables.accounts;
+    assert_eq!(rows[0].status, Some("pending"));
+    assert_eq!(observed(&rows[0]), ["pending", "signed-in", "m22"]);
+    assert_eq!(at(&rows[0]), ms(100));
+    assert_eq!(observed(&rows[1]), ["pending", "signed-out", "m22"]);
+    assert_eq!(at(&rows[1]), ms(50));
+    assert_eq!(observed(&rows[2]), ["pending", "place-only", "m3"]);
+    assert_eq!(at(&rows[2]), ms(60));
+    // Nothing seen is known: no evidence to date, which is empty and not unread.
+    assert_eq!(observed(&rows[3]), ["pending", "never-seen", ""]);
+    assert_eq!(at(&rows[3]), Cell::Empty);
+    // A person's hold stands whatever a Mac observed, and the observation is beside it.
+    assert_eq!(observed(&rows[4]), ["paused", "signed-in", "m3"]);
+    // A Mac no live machine row binds is no Mac of the lab: its word places nothing.
+    assert_eq!(observed(&rows[5]), ["pending", "never-seen", ""]);
+    assert_eq!(rows[5].active.as_deref(), Some(&[][..]));
+    assert_eq!(kept(tables, "accounts", &["status=pending"]), 5);
+    assert_eq!(kept(tables, "accounts", &["observed=signed-in"]), 2);
+    assert_eq!(
+        kept(
+            tables,
+            "accounts",
+            &["status=pending", "observed=signed-in"]
+        ),
+        1
+    );
+    let json = json_rows(&print(tables, "accounts", &[], true).expect("print").text);
+    assert_eq!(json[0]["status"], Value::from("pending"));
+    assert_eq!(json[0]["observed"], Value::from("signed-in"));
+    assert_eq!(json[0]["observed_at"], Value::from((now_s - 100) * 1_000));
+    assert_eq!(json[0]["observed_by"], Value::from("m22"));
+    assert_eq!(json[3]["observed_at"], Value::Null);
+
+    // A place ends at the instant the fold names, and what was observed changes then and not
+    // before: the place-only row has never been seen signed in, and now is on no Mac.
+    let ends = (now_s + 60) * 1_000;
+    assert_eq!(folded.next_change_ms, Some(ends));
+    assert_eq!(fold(&inputs, ends - 1).tables, *tables);
+    let after = fold(&inputs, ends).tables;
+    assert_eq!(after.accounts[2].observed, Some(ObservedState::NeverSeen));
+    assert_eq!(after.accounts[1].observed, Some(ObservedState::SignedOut));
+
+    // Control: with no journal read, no Mac's word was read, and what was observed is unread,
+    // not never-seen.
+    let unread = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        ..Inputs::default()
+    });
+    assert_eq!(observed(&unread.accounts[0]), ["pending", "?", "?"]);
+    assert_eq!(at(&unread.accounts[0]), Cell::Unread);
+
+    // The fixture's lab holds the case this column is for: accounts the registry still calls
+    // pending that a Mac is signed in to; and every state.
+    let (_, fixture) = fixture_tables();
+    assert!(
+        kept(
+            &fixture,
+            "accounts",
+            &["status=pending", "observed=signed-in"]
+        ) > 0
+    );
+    for state in ObservedState::WORDS {
+        assert!(
+            kept(&fixture, "accounts", &[&format!("observed={state}")]) > 0,
+            "{state}"
+        );
+    }
+}
+
+/// AN ACCOUNT ROW SAYS WHEN IT WAS LAST SEEN AND ON WHICH MACS: every Mac whose login files
+/// name it (its `account-obs` row, a tab's `seen`, the machine sweep's `seen`), each with its
+/// own newest sighting and the tabs that run it now, a Mac no machine row binds by the first 8
+/// digits of its uuid. A sighting nobody noted a sign-in for is what was observed (`seen`). A
+/// time is never after its read, a record dated past the clock-skew bound ahead of its read
+/// is no sighting at all, a tab count lapses at the instant the fold names, and where the
+/// sightings were read and none names the account the cells are empty, not unread.
+/// NEGATIVE CONTROLS: with the fold listing only the Macs a tab runs it on (as the registry
+/// view's `seen_on` does), the first row's `seen_on` lacks its third item, the sweep's Mac
+/// `f0f1f2f3`; with a sighting's time not held to its read, `the clock ahead` fails `left:
+/// Value(Number(Number(Unsigned(1800000300000)))) right:
+/// Value(Number(Number(Unsigned(1800000000000))))`; with the fold not offering a sighting's
+/// lapse to `next`, the instant reads `left: None right: Some(1800006600001)`; with the
+/// sightings' fold believing a record however far ahead of its read it is dated, `a day
+/// ahead` fails `left: Value(Number(Number(Unsigned(1800000000000)))) right: Empty`.
+#[test]
+fn an_account_says_when_it_was_last_seen_and_on_which_macs() {
+    use crate::alab::sighted::{Obs, ObsState, SEEN_LIVE_MS};
+    use aterm_json::json;
+    let now_s = NOW / 1_000;
+    let (mut lab, pks) = lab_with_accounts(&["a", "b", "c", "d", "e"]);
+    let obs = |pk: &str, uuid: &str, at_ms: u64, tabs: u64| Obs {
+        account: pk.to_owned(),
+        uuid: uuid.to_owned(),
+        at_ms,
+        state: if tabs > 0 {
+            ObsState::Running
+        } else {
+            ObsState::Idle
+        },
+        tabs,
+    };
+    // a: m3's row says two tabs run it; a tab on m22 was seen later; a Mac no machine row
+    // binds found its login place two days ago. b: only that Mac's sweep. c: nothing.
+    // d: m3's row is dated five minutes ahead of this Mac's clock, inside the clock-skew
+    // bound. e: m3's row says two tabs run it, a day ahead.
+    lab.account_obs = vec![
+        obs(&pks[0], UUID, NOW - 600_000, 2),
+        obs(&pks[3], UUID, NOW + 300_000, 0),
+        obs(&pks[4], UUID, NOW + 86_400_000, 2),
+    ];
+    let seen_at = |pk: &str, ago_s: u64, tab: Option<&str>| {
+        let mut value = json!({
+            "a": pk, "c": "claude", "k": "seen", "src": "profile", "t": now_s - ago_s,
+        });
+        if let (Some(tab), Some(members)) = (tab, value.as_object_mut()) {
+            members.insert("x".to_owned(), Value::from(tab));
+        }
+        value
+    };
+    let seen = Seen::of_events(
+        &[
+            logged(UUID_2, seen_at(&pks[0], 300, Some("0000aaaa"))),
+            logged(UUID_UNBOUND, seen_at(&pks[0], 172_800, None)),
+            logged(UUID_UNBOUND, seen_at(&pks[1], 172_800, None)),
+        ],
+        now_s,
+    );
+    let inputs = Inputs {
+        lab: live(lab.clone(), NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    };
+    let folded = fold(&inputs, NOW);
+    let tables = &folded.tables;
+    let rows = &tables.accounts;
+    let time = |at_ms: u64| Cell::Value(Value::from(at_ms));
+    let on = |machine: &str, tabs: u64, at_ms: u64| json!({"machine": machine, "tabs": tabs, "at": at_ms});
+    let days_ago = NOW - 172_800_000;
+    assert_eq!(cell_of(&rows[0], "last_seen"), time(NOW - 300_000));
+    assert_eq!(
+        cell_of(&rows[0], "seen_on"),
+        Cell::Value(Value::Array(vec![
+            on("m3", 2, NOW - 600_000),
+            on("m22", 1, NOW - 300_000),
+            on("f0f1f2f3", 0, days_ago),
+        ]))
+    );
+    // No Mac states a sign-in word for it: what was observed is that it was seen, last on m22.
+    assert_eq!(shown_of(&rows[0], "observed"), "seen");
+    assert_eq!(shown_of(&rows[0], "observed_by"), "m22");
+    assert_eq!(cell_of(&rows[0], "observed_at"), time(NOW - 300_000));
+    assert_eq!(cell_of(&rows[1], "last_seen"), time(days_ago));
+    assert_eq!(
+        cell_of(&rows[1], "seen_on"),
+        Cell::Value(Value::Array(vec![on("f0f1f2f3", 0, days_ago)]))
+    );
+    assert_eq!(shown_of(&rows[1], "observed_by"), "f0f1f2f3");
+    // Read, and nothing names it: empty and not unread.
+    assert_eq!(cell_of(&rows[2], "last_seen"), Cell::Empty);
+    assert_eq!(
+        cell_of(&rows[2], "seen_on"),
+        Cell::Value(Value::Array(vec![]))
+    );
+    assert_eq!(shown_of(&rows[2], "observed"), "never-seen");
+    // A row dated ahead of its read was seen no later than it was read.
+    assert_eq!(cell_of(&rows[3], "last_seen"), time(NOW), "the clock ahead");
+    assert_eq!(shown_of(&rows[3], "last_seen_by"), "m3");
+    // One dated past the clock-skew bound ahead was written by a clock split from this one: it
+    // is no sighting, it runs no tab, and the Mac is not the one that saw the account last.
+    assert_eq!(cell_of(&rows[4], "last_seen"), Cell::Empty, "a day ahead");
+    assert_eq!(
+        cell_of(&rows[4], "seen_on"),
+        Cell::Value(Value::Array(vec![]))
+    );
+    assert_eq!(shown_of(&rows[4], "observed"), "never-seen");
+    assert_eq!(kept(tables, "accounts", &["seen_on=m22"]), 1);
+    assert_eq!(kept(tables, "accounts", &["seen_on=f0f1f2f3"]), 2);
+    let json = json_rows(&print(tables, "accounts", &[], true).expect("print").text);
+    assert_eq!(json[0]["last_seen"], Value::from(NOW - 300_000));
+    assert_eq!(json[0]["seen_on"][1], on("m22", 1, NOW - 300_000));
+    assert_eq!(json[2]["last_seen"], Value::Null);
+
+    // A sighting keeps a tab running for two hours: m3's row lapses first, at the instant the
+    // fold names and not a millisecond before, and m3 stays listed with its sighting.
+    let lapses = NOW - 600_000 + SEEN_LIVE_MS + 1;
+    assert_eq!(folded.next_change_ms, Some(lapses));
+    assert_eq!(fold(&inputs, lapses - 1).tables, *tables);
+    let after = fold(&inputs, lapses);
+    assert_eq!(
+        cell_of(&after.tables.accounts[0], "seen_on"),
+        Cell::Value(Value::Array(vec![
+            on("m3", 0, NOW - 600_000),
+            on("m22", 1, NOW - 300_000),
+            on("f0f1f2f3", 0, days_ago),
+        ]))
+    );
+    assert_eq!(after.next_change_ms, Some(NOW - 300_000 + SEEN_LIVE_MS + 1));
+
+    // A sign-in word says more than a login file: with m22 signed out of it, m22's sighting
+    // is no evidence of a login, and the other Macs' sightings still are.
+    let mut worded = Seen::of_events(
+        &[logged(UUID_2, seen_at(&pks[0], 300, Some("0000aaaa")))],
+        now_s,
+    );
+    sign(&mut worded, &pks[0], UUID_2, SIGNIN_OUT, now_s - 100);
+    let mut only = lab.clone();
+    only.account_obs.clear();
+    let out = self::tables(&Inputs {
+        lab: live(only, NOW),
+        journal: live(worded, NOW),
+        ..Inputs::default()
+    });
+    assert_eq!(shown_of(&out.accounts[0], "observed"), "signed-out");
+    assert_eq!(cell_of(&out.accounts[0], "last_seen"), time(NOW - 300_000));
+
+    // Control: with no journal read the `seen` events were not read. A registry row still
+    // dates the account it names; for an account no row names, where it was seen is unread.
+    let unread = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        ..Inputs::default()
+    });
+    assert_eq!(
+        cell_of(&unread.accounts[0], "seen_on"),
+        Cell::Value(Value::Array(vec![on("m3", 2, NOW - 600_000)]))
+    );
+    assert_eq!(cell_of(&unread.accounts[2], "last_seen"), Cell::Unread);
+    assert_eq!(cell_of(&unread.accounts[2], "seen_on"), Cell::Unread);
+
+    // The fixture's lab holds sightings by a tab, by the sweep and by a registry row.
+    let (_, fixture) = fixture_tables();
+    let seen_on = |row: &rows::AccountRow| row.seen_on.clone().unwrap_or_default();
+    let listed: Vec<_> = fixture.accounts.iter().map(seen_on).collect();
+    assert!(listed.iter().any(|macs| macs.len() > 1));
+    assert!(listed.iter().flatten().any(|on| on.tabs == 2));
+    assert!(listed.iter().flatten().any(|on| on.tabs == 0));
+    assert!(
+        fixture
+            .accounts
+            .iter()
+            .any(|row| row.seen_on == Some(Vec::new()))
+    );
+}
+
+/// A MAC THAT SAYS ITS LOGIN OF AN ACCOUNT ENDED IS NOT ONE THAT ONLY SIGHTED IT, WHATEVER
+/// BECAME OF THE MAC: its word (a sign-in word that is not `in`, or its registry row saying
+/// `signed-out`) stands over the login file it still holds, for a Mac a live machine row
+/// binds, for one retired since, and for a machine whose word and sighting came from two of
+/// its seats. `last_seen` and `seen_on` still say when and where the file was sighted. The
+/// `in` of a retired Mac signs nothing in, so its sighting is what it says; another Mac's
+/// sighting still stands; and a `seen` logged after a row said `signed-out` is a login that
+/// is back.
+/// NEGATIVE CONTROLS: with a sighting withheld only for a Mac a live machine row binds, and
+/// only such a Mac's word read as signed out (as before), the first row reads `left: ["seen",
+/// "f0f1f2f3"] right: ["signed-out", "f0f1f2f3"]`; with a word withholding only its own
+/// uuid's sighting, `two seats of one machine` fails `left: ["seen", "m3"] right:
+/// ["signed-out", "m3"]`; with the sightings' fold dating a sighting from a row that says
+/// `signed-out`, `the row's word` fails `left: ["seen", "m3"] right: ["signed-out", "m3"]`.
+#[test]
+fn a_macs_word_that_its_login_ended_stands_over_its_own_sighting_bound_or_not() {
+    use crate::alab::sighted::{Obs, ObsState};
+    use aterm_json::json;
+    let now_s = NOW / 1_000;
+    let (mut lab, pks) = lab_with_accounts(&["a", "b", "c", "d", "e", "f", "g"]);
+    // m3 was enrolled twice: two Commons uuids are seats of its one machine row.
+    lab.bound.insert(UUID_3.to_owned(), keys::machine_pk("m3"));
+    let swept = |uuid: &str, pk: &str, ago_s: u64| {
+        logged(
+            uuid,
+            json!({"a": pk, "c": "claude", "k": "seen", "src": "profile", "t": now_s - ago_s}),
+        )
+    };
+    let signed_out = |pk: &str, ago_ms: u64| Obs {
+        account: pk.to_owned(),
+        uuid: UUID.to_owned(),
+        at_ms: NOW - ago_ms,
+        state: ObsState::SignedOut,
+        tabs: 0,
+    };
+    // f: m3's row says it signed out after it last sighted the login. g: m3 sighted the login
+    // again after its row said so.
+    lab.account_obs = vec![signed_out(&pks[5], 100_000), signed_out(&pks[6], 600_000)];
+    let mut seen = Seen::of_events(
+        &[
+            swept(UUID_UNBOUND, &pks[0], 1_000),
+            swept(UUID_UNBOUND, &pks[1], 1_000),
+            swept(UUID_3, &pks[2], 50),
+            swept(UUID_2, &pks[4], 700),
+            swept(UUID, &pks[5], 1_000),
+            swept(UUID, &pks[6], 60),
+        ],
+        now_s,
+    );
+    // a: a Mac sighted the login, signed out of it, and was retired. b: a retired Mac's last
+    // word was `in`. c: m3's first seat signed out, and its second seat still finds the file.
+    // d: a retired Mac signed out, and nothing sighted it. e: a retired Mac signed out, and
+    // m22, which states nothing, sighted it.
+    sign(&mut seen, &pks[0], UUID_UNBOUND, SIGNIN_OUT, now_s - 100);
+    sign(&mut seen, &pks[1], UUID_UNBOUND, SIGNIN_IN, now_s - 100);
+    sign(&mut seen, &pks[2], UUID, SIGNIN_OUT, now_s - 500);
+    sign(&mut seen, &pks[3], UUID_UNBOUND, SIGNIN_ENDED, now_s - 100);
+    sign(&mut seen, &pks[4], UUID_UNBOUND, SIGNIN_OUT, now_s - 100);
+    let tables = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    });
+    let rows = &tables.accounts;
+    let observed =
+        |row: &rows::AccountRow| [shown_of(row, "observed"), shown_of(row, "observed_by")];
+    let at = |row: &rows::AccountRow| cell_of(row, "observed_at");
+    let ms = |ago_s: u64| Cell::Value(Value::from((now_s - ago_s) * 1_000));
+    assert_eq!(observed(&rows[0]), ["signed-out", "f0f1f2f3"]);
+    assert_eq!(at(&rows[0]), ms(100));
+    // Where its file was sighted is still a fact of the row.
+    assert_eq!(cell_of(&rows[0], "last_seen"), ms(1_000));
+    assert_eq!(shown_of(&rows[0], "last_seen_by"), "f0f1f2f3");
+    assert_eq!(kept(&tables, "accounts", &["seen_on=f0f1f2f3"]), 2);
+    // A retired Mac's `in` signs nothing in: the file it sighted is all it says.
+    assert_eq!(observed(&rows[1]), ["seen", "f0f1f2f3"]);
+    assert_eq!(at(&rows[1]), ms(1_000));
+    assert_eq!(rows[1].active.as_deref(), Some(&[][..]));
+    assert_eq!(
+        observed(&rows[2]),
+        ["signed-out", "m3"],
+        "two seats of one machine"
+    );
+    assert_eq!(at(&rows[2]), ms(500));
+    assert_eq!(cell_of(&rows[2], "last_seen"), ms(50));
+    // A word with no sighting is still a Mac's word: signed out, not never seen.
+    assert_eq!(observed(&rows[3]), ["signed-out", "f0f1f2f3"]);
+    assert_eq!(cell_of(&rows[3], "last_seen"), Cell::Empty);
+    // Another Mac's sighting is not withheld by this Mac's word.
+    assert_eq!(observed(&rows[4]), ["seen", "m22"]);
+    assert_eq!(at(&rows[4]), ms(700));
+    // A registry row that says `signed-out` is no sighting and is its Mac's word.
+    assert_eq!(observed(&rows[5]), ["signed-out", "m3"], "the row's word");
+    assert_eq!(at(&rows[5]), ms(100));
+    assert_eq!(cell_of(&rows[5], "last_seen"), ms(1_000));
+    // A sighting after the row said so is a login that is back.
+    assert_eq!(observed(&rows[6]), ["seen", "m3"]);
+    assert_eq!(at(&rows[6]), ms(60));
+}
+
+/// `seen_on` LISTS AT MOST ITS BOUND OF MACS, THE ONES THAT SIGHTED THE ACCOUNT LAST: with
+/// more Macs than the bound, the oldest sightings are the ones left out, whatever the Macs'
+/// names, the list is of its column's type, and `last_seen` is the newest of them all.
+/// NEGATIVE CONTROLS: with the list cut before it is ordered by time, it holds a Mac that
+/// sighted the account among the oldest: `left: 9 right: 0`; with no cut, `left: 75 right:
+/// 64`.
+#[test]
+fn seen_on_lists_the_macs_that_sighted_an_account_last_up_to_its_bound() {
+    use crate::alab::sighted::{Obs, ObsState};
+    const MACS: u64 = 75;
+    let (mut lab, pks) = lab_with_accounts(&["a"]);
+    // Each Mac's sighting is `age(i)` minutes old, in an order that is not the names': the
+    // newest is Mac 0's, and the 11 oldest are spread over the names.
+    let name = |i: u64| format!("a{i:07x}");
+    let age = |i: u64| (i * 7) % MACS + 1;
+    lab.account_obs = (0..MACS)
+        .map(|i| Obs {
+            account: pks[0].clone(),
+            uuid: format!("{}{:024x}", name(i), 0),
+            at_ms: NOW - age(i) * 60_000,
+            state: ObsState::Idle,
+            tabs: 0,
+        })
+        .collect();
+    let tables = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        journal: live(Seen::of_events(&[], NOW / 1_000), NOW),
+        ..Inputs::default()
+    });
+    let row = &tables.accounts[0];
+    let listed = row.seen_on.as_deref().expect("the sightings were read");
+    let max = u64::try_from(rows::SEEN_ON_MAX).expect("a small bound");
+    assert_eq!(listed.len(), rows::SEEN_ON_MAX);
+    let old = listed
+        .iter()
+        .filter(|on| on.at_ms < NOW - max * 60_000)
+        .count();
+    assert_eq!(old, 0);
+    // Every Mac that sighted it within the bound's newest is listed, by name.
+    let newest: Vec<String> = (0..MACS).filter(|i| age(*i) <= max).map(name).collect();
+    let names: Vec<&str> = listed.iter().map(|on| on.on.as_str()).collect();
+    assert_eq!(names, newest);
+    assert_eq!(
+        cell_of(row, "last_seen"),
+        Cell::Value(Value::from(NOW - 60_000))
+    );
+    assert_eq!(shown_of(row, "last_seen_by"), name(0));
+    let schema = rows::AccountRow::SCHEMA;
+    let column = schema.position("seen_on").expect("a column");
+    let Cell::Value(cell) = cell_of(row, "seen_on") else {
+        panic!("the list is read");
+    };
+    assert!(cell::admissible(&schema.columns[column].column.ty, &cell));
+}
+
+/// The accounts relation's facts: each a column a machine observed, with the column that says
+/// when it was read and the one that says which machine read it.
+const ACCOUNT_FACTS: &[(&str, &str, &str)] = &[
+    ("w5h_reset", "w5h_at", "w5h_by"),
+    ("w7d_reset", "w7d_at", "w7d_by"),
+    ("wall_until", "wall_at", "wall_by"),
+    ("last_use", "last_use", "last_use_on"),
+    ("plan_observed", "plan_at", "plan_by"),
+    ("observed", "observed_at", "observed_by"),
+    ("last_seen", "last_seen", "last_seen_by"),
+];
+
+/// EVERY FACT OF AN ACCOUNT ROW SAYS WHEN IT WAS READ AND WHICH MAC READ IT, IN ONE SHAPE: a
+/// `<fact>_at` time and a `<fact>_by` machine name beside it, read together or not at all, the
+/// Mac named by its label, else its machine key, else the first 8 digits of its uuid, and the
+/// time never after the journal's read. Where a fact is known to be nothing (no limit
+/// stands), its provenance is empty; where nobody read it, unread.
+/// NEGATIVE CONTROLS: with the fold crediting each window to the row's newest read (as
+/// `read_by` does), `w5h_at` of the first row reads `left:
+/// Value(Number(Number(Unsigned(1799999700000)))) right:
+/// Value(Number(Number(Unsigned(1799999100000))))`; with a reset-passed window dated only by
+/// a figure, `the reset's read` fails `left: Unread`.
+#[test]
+fn every_fact_of_an_account_says_when_it_was_read_and_by_which_mac() {
+    let now_s = NOW / 1_000;
+    let (lab, pks) = lab_with_accounts(&["a", "b", "c", "d"]);
+    let quota = |pk: &str, window: &str, t: u64, reset: u64| {
+        aterm_json::json!({
+            "a": pk, "c": "claude", "k": "quota", "src": "statusline", "t": t, "w": window,
+            "p": 400, "r": reset, "rr": "minute",
+        })
+    };
+    let seen = Seen::of_events(
+        &[
+            // a: m3 read its 5-hour window, m22 its 7-day one later, and a Mac no machine row
+            // binds hit a wall.
+            logged(UUID, quota(&pks[0], "5h", now_s - 900, now_s + 3_600)),
+            logged(UUID_2, quota(&pks[0], "7d", now_s - 300, now_s + 86_400)),
+            logged(
+                UUID_UNBOUND,
+                aterm_json::json!({
+                    "a": pks[0].as_str(), "c": "claude", "k": "wall", "src": "cli-output",
+                    "t": now_s - 120, "w": "7d", "u": now_s + 7_200,
+                }),
+            ),
+            // b: m22 read a 5-hour window whose reset has passed since.
+            logged(UUID_2, quota(&pks[1], "5h", now_s - 7_200, now_s - 60)),
+            // c: the journal knows it (a 7-day reading) and no limit stands.
+            logged(UUID, quota(&pks[2], "7d", now_s - 600, now_s + 86_400)),
+        ],
+        now_s,
+    );
+    let tables = self::tables(&Inputs {
+        lab: live(lab, NOW),
+        journal: live(seen, NOW),
+        ..Inputs::default()
+    });
+    let rows = &tables.accounts;
+    let of = |row: &rows::AccountRow, columns: [&str; 2]| columns.map(|c| shown_of(row, c));
+    let ms = |ago: u64| Cell::Value(Value::from((now_s - ago) * 1_000));
+    assert_eq!(cell_of(&rows[0], "w5h_at"), ms(900));
+    assert_eq!(shown_of(&rows[0], "w5h_by"), "m3");
+    assert_eq!(cell_of(&rows[0], "w7d_at"), ms(300));
+    assert_eq!(shown_of(&rows[0], "w7d_by"), "m22");
+    assert_eq!(shown_of(&rows[0], "walled"), "true");
+    assert_eq!(cell_of(&rows[0], "wall_at"), ms(120));
+    assert_eq!(shown_of(&rows[0], "wall_by"), "f0f1f2f3");
+    // The row's one `read_by` still names the Mac of the newest window read.
+    assert_eq!(shown_of(&rows[0], "read_by"), "m22");
+    // A window whose reset passed prints that reset: the read that named it dates it.
+    assert_eq!(shown_of(&rows[1], "w5h_state"), "reset-passed");
+    assert_eq!(shown_of(&rows[1], "w5h_used_x10"), "?");
+    assert_eq!(cell_of(&rows[1], "w5h_at"), ms(7_200), "the reset's read");
+    assert_eq!(shown_of(&rows[1], "w5h_by"), "m22");
+    assert_eq!(of(&rows[1], ["w7d_at", "w7d_by"]), ["?", "?"]);
+    // No limit stands, and that is known: nothing to date, which is empty and not unread.
+    assert_eq!(shown_of(&rows[2], "walled"), "false");
+    assert_eq!(cell_of(&rows[2], "wall_at"), Cell::Empty);
+    assert_eq!(cell_of(&rows[2], "wall_by"), Cell::Empty);
+    // The journal says nothing of d: every fact of it is unread, and so is who read it.
+    for (_, at, by) in ACCOUNT_FACTS.iter().filter(|(fact, ..)| {
+        // What was observed and where it was seen are known to be nothing once the journal
+        // was read (`never-seen`, no sighting).
+        !["observed", "last_seen"].contains(fact)
+    }) {
+        assert_eq!(cell_of(&rows[3], at), Cell::Unread, "{at}");
+        assert_eq!(cell_of(&rows[3], by), Cell::Unread, "{by}");
+    }
+    let json = json_rows(&print(&tables, "accounts", &[], true).expect("print").text);
+    assert_eq!(json[0]["w5h_by"], Value::from("m3"));
+    assert_eq!(json[0]["wall_at"], Value::from((now_s - 120) * 1_000));
+    assert_eq!(json[0]["wall_by"], Value::from("f0f1f2f3"));
+    assert_eq!(json[2]["wall_by"], Value::Null);
+    assert_eq!(kept(&tables, "accounts", &["w5h_by=m22"]), 1);
+
+    // One shape, in the schema and in every row of the fixture's lab: a time and a machine
+    // name, read together, and no fact dated after its read.
+    let schema = rows::AccountRow::SCHEMA;
+    for (fact, at, by) in ACCOUNT_FACTS {
+        for column in [fact, at, by] {
+            assert!(schema.position(column).is_some(), "{column}");
+        }
+        let ty = |column: &str| {
+            let at = schema.position(column).expect("a column");
+            &schema.columns[at].column.ty
+        };
+        assert!(matches!(ty(at), crate::typed::Ty::Time), "{at}");
+        assert!(matches!(ty(by), crate::typed::Ty::Key), "{by}");
+    }
+    let (_, fixture) = fixture_tables();
+    let mut read = [0_usize; ACCOUNT_FACTS.len()];
+    for row in &fixture.accounts {
+        for (n, (fact, at, by)) in ACCOUNT_FACTS.iter().enumerate() {
+            let (at, by) = (cell_of(row, at), cell_of(row, by));
+            match (&at, &by) {
+                (Cell::Value(at), Cell::Value(by)) => {
+                    read[n] += 1;
+                    assert!(at.as_u64().is_some_and(|at| at <= NOW), "{fact}: {at:?}");
+                    assert!(by.as_str().is_some_and(|by| !by.is_empty()), "{fact}");
+                }
+                (Cell::Unread, Cell::Unread) | (Cell::Empty, Cell::Empty) => {}
+                _ => panic!("{fact} of {}: {at:?} by {by:?}", row.account),
+            }
+        }
+    }
+    assert!(read.iter().all(|read| *read > 0), "{read:?}");
+}
+
+/// NO ACCOUNT ROW HOLDS AN ADDRESS OUTSIDE ITS `login` COLUMN: who read a fact is a machine's
+/// label, key or uuid digits, an observed plan a plan row's key, a sighting a machine and a
+/// time. Checked over the fixture's lab in both printings.
+/// NEGATIVE CONTROL: with `last_seen_by` printing the row's login, the scan fails naming
+/// `last_seen_by`; and the `login` column itself does hold addresses, so the scan sees them.
+#[test]
+fn no_account_fact_or_its_provenance_holds_an_address() {
+    let (_, tables) = fixture_tables();
+    let schema = rows::AccountRow::SCHEMA;
+    let login = schema.position("login").expect("the login column");
+    let printed = print(&tables, "accounts", &[], false).expect("print").text;
+    let grid = grid_of(&printed);
+    assert_eq!(grid.len(), fixture::ACCOUNTS + 1);
+    let mut addresses = 0;
+    for line in &grid[1..] {
+        assert_eq!(line.len(), schema.columns.len());
+        for (at, cell) in line.iter().enumerate() {
+            if at == login {
+                addresses += usize::from(cell.contains('@'));
+            } else {
+                assert!(!cell.contains('@'), "{}", schema.columns[at].column.name);
+            }
+        }
+    }
+    assert!(addresses > 0, "the control: a login is an address");
+    for row in json_rows(&print(&tables, "accounts", &[], true).expect("print").text) {
+        let members = row.as_object().expect("a row is an object");
+        assert_eq!(members.len(), schema.columns.len());
+        for (name, value) in members {
+            if name != "login" {
+                assert!(!value.to_string().contains('@'), "{name}");
+            }
+        }
     }
 }

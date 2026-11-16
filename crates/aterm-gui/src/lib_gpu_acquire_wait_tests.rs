@@ -166,7 +166,7 @@ fn gpu_acquire_pending_preserves_dirty_levels_without_timer_retries() {
 #[test]
 fn gpu_acquire_window_completion_keeps_input_until_real_present() {
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+    let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
     let key = {
         let mut term = ws.front_terminal().unwrap().term.lock().unwrap();
         super::early_out_tests::frame_key(&mut term, true, false, None)
@@ -234,7 +234,7 @@ fn gpu_acquire_wait_survives_real_input_rearming_and_later_input() {
         .unwrap()
         .on_gpu_acquire_pending(17);
     let _ = app.input(wid, press(), Source::Human);
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     assert!(
         ws.gpu_acquire_wait.waiting_for(Some(17)),
         "input may rearm failures, but cannot take a worker's pending drawable"
@@ -245,8 +245,9 @@ fn gpu_acquire_wait_survives_real_input_rearming_and_later_input() {
     );
     assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || {}));
     ws.on_present_succeeded();
+    drop(ws);
     let _ = app.input(wid, press(), Source::Human);
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     assert!(ws.input_hot);
     ws.on_gpu_acquire_pending(17);
     assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || {}));
@@ -259,7 +260,7 @@ fn gpu_acquire_wait_survives_real_input_rearming_and_later_input() {
 #[test]
 fn gpu_acquire_occluded_completion_parks_without_failure_fuel() {
     let mut app = App::headless_for_test();
-    let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+    let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
     ws.content_pending = true;
     ws.redraw_pending = true;
     ws.on_gpu_acquire_pending(17);

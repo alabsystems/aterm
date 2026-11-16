@@ -45,6 +45,8 @@ struct Gaps {
     descenders: usize,
     /// Vivid pixels of the line's rows under cells with no such ink.
     line: usize,
+    /// All the pixels of the line's rows under those cells: [`Gaps::line`] were every one vivid.
+    room: usize,
     /// Vivid pixels of the line's rows in a descender's columns and its ring.
     in_gaps: usize,
     /// Vivid pixels of the line's rows in the ring before the caret's cell.
@@ -117,7 +119,10 @@ fn gaps(style: &str, look: Look, caret: &[u8]) -> Gaps {
                     descenders += 1;
                     out.in_gaps += vivid(lo - RING, hi + RING + 1);
                 }
-                _ => out.line += vivid(x0, x0 + cw),
+                _ => {
+                    out.line += vivid(x0, x0 + cw);
+                    out.room += cw * line_rows.len();
+                }
             }
         }
         let caret_x = k.left + k.caret.1 * cw;
@@ -130,8 +135,10 @@ fn gaps(style: &str, look: Look, caret: &[u8]) -> Gaps {
 
 /// At a shell's prompt on the last row of a full page, on GitHub Light and on a dark page, with
 /// a bar and with an underline caret, in the flagship and in the underline's body: the vivid
-/// line lies under the typed words, and no vivid pixel of the trail lies in the line's rows
-/// within the judge's ring of a descender's ink or of the caret's cell.
+/// line lies under the typed words (on over half its rows' pixels under the cells with no
+/// descender, a share of the face's own cells, so a narrower face's line counts as SF Mono's
+/// does), and no vivid pixel of the trail lies in the line's rows within the judge's ring of a
+/// descender's ink or of the caret's cell.
 ///
 /// Negative control: with the underline's body laid whole
 /// (`ribbon::with_body_band_whole`), as it was, GitHub Light's film holds its band's vivid
@@ -176,10 +183,11 @@ fn the_line_under_typed_words_leaves_its_gaps_empty() {
             read.descenders
         );
         assert!(
-            read.line > 1_000 * read.frames,
-            "{theme}, {caret} caret: only {} vivid px under the typed words in {} frames, so \
-             there is no line to part",
+            2 * read.line > read.room,
+            "{theme}, {caret} caret: only {} vivid px of the line's {} under the typed words in \
+             {} frames, so there is no line to part",
             read.line,
+            read.room,
             read.frames
         );
         assert_eq!(

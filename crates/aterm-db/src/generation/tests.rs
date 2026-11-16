@@ -1122,13 +1122,26 @@ fn recovered_credential_into_logical_home(preposted: bool) {
         1
     );
     client::sync(&original, None).unwrap();
+    // The logical home reads the value in place from its store, and the holder's other entry
+    // stays the holder's. Nothing is written under either home.
     assert_eq!(
-        fsx::read_private(&original.home.join(".secrets/recovered_password"), 1024)
+        client::read_in_place(&original, "recovered_password")
             .unwrap()
             .unwrap()
             .as_slice(),
         b"scratch-recovered-password"
     );
+    assert!(
+        client::read_in_place(&original, "holder-only")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client::read_in_place(&next, "recovered_password")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!original.home.join(".secrets/recovered_password").exists());
     assert!(!original.home.join(".secrets/holder-only").exists());
     assert!(!next.home.join(".secrets/recovered_password").exists());
     let published = client::admin_open(&original).unwrap();
@@ -1163,6 +1176,13 @@ fn recovered_credential_into_logical_home(preposted: bool) {
         claims_before
     );
     assert_eq!(files(&original.dir.join("commons/tables")), records_before);
+    // The successor custody, synced to the same version, reads neither entry. Its sync comes
+    // last: everything above ran with that copy as the import left it.
+    client::sync(&next, None).unwrap();
+    for name in ["recovered_password", "holder-only"] {
+        assert_eq!(client::read_in_place(&next, name).unwrap(), None, "{name}");
+    }
+    assert!(!next.home.join(".secrets").exists());
 }
 
 #[test]
@@ -2790,7 +2810,8 @@ impl Shelf {
     }
 
     /// Every file's pass ended in `word` (`why`), every file's status says the same, and what
-    /// each pass did to its snapshot is `recorded`.
+    /// each pass did to its snapshot is `recorded`: a ring file's, where only the registry's
+    /// records arrived, may be its word recorded over the snapshot it has.
     #[track_caller]
     fn all(
         &self,
@@ -2800,9 +2821,25 @@ impl Shelf {
         recorded: aterm_file::Recorded,
     ) {
         assert_eq!(outcomes.len(), crate::file::FILES.len());
-        for outcome in outcomes {
+        for (file, outcome) in crate::file::FILES.iter().zip(outcomes) {
+            assert_eq!(outcome.name, file.file());
+            // This walk's records are the registry's: no record reaches the journal ring, so
+            // a pass that projects the registry's new records records a ring file's (and the
+            // view's) word over the snapshot it has, at the same home. Everything else (a
+            // pass at a new home, a pass kept behind, the state word) is every file's alike.
+            let ring_kept = file.table().is_none()
+                && recorded == aterm_file::Recorded::Recorded { replaced: true }
+                && outcome.recorded == Some(aterm_file::Recorded::Recorded { replaced: false });
             assert_eq!(
-                (outcome.word, outcome.why, outcome.recorded),
+                (
+                    outcome.word,
+                    outcome.why,
+                    if ring_kept {
+                        Some(recorded)
+                    } else {
+                        outcome.recorded
+                    }
+                ),
                 (word, why, Some(recorded)),
                 "{}: {:?}",
                 outcome.name,
@@ -3420,7 +3457,7 @@ fn a_fenced_homes_displaced_table_is_read_from_its_witnessed_prefix() {
 /// on `Lost::Witness`, the read beside the malformed witness answers. With
 /// `Custody::current_claim` not asking `Preserving::stands`, the reads that rewrote the
 /// selection answer. With `Preserving::of` not comparing the selection's writer, its lab or its
-/// completion, the matching read after the rewrite answers. With `Directory::observe_displaced`
+/// completion, the matching read after the rewrite answers. With `Directory::observe_held`
 /// not returning a busy held read as busy, the read whose selection moved inside the open is a
 /// refusal of the binding.
 #[test]
@@ -3819,8 +3856,8 @@ fn a_fenced_home_whose_every_table_is_displaced_still_reads_its_declared_table()
 
 /// The gate of a held read (SF-13) judges no currency; the open it gates does, and keeps busy.
 /// A vault writer that takes the home's state lock as the account catalog's read reaches that
-/// gate (the ordinary observation of the displaced table has refused and no recovery replica
-/// has answered, both with no writer there) leaves the gate's answer what it was, and the read
+/// gate (the ordinary observation of the displaced table has refused with no writer there, and
+/// the table has no recovery replica) leaves the gate's answer what it was, and the read
 /// is busy, which a reader observes again: the held open takes no source read of the vault
 /// under the writer. Asked directly under that writer, the gate still answers. The home's access
 /// is log-backed, as a Mac's is since F18, so a judgment of its currency reads the vault.
@@ -3830,7 +3867,7 @@ fn a_fenced_home_whose_every_table_is_displaced_still_reads_its_declared_table()
 /// NEGATIVE CONTROL: with `Preserving::of` reaching the lab through `Session::control_context`,
 /// the read under the writer refuses in the binding's words, "Commons membership changed during
 /// endpoint setup" beside them, which is not busy; and the gate asked directly refuses so too.
-/// With `Directory::observe_displaced` not returning a busy held read as busy, the read is the
+/// With `Directory::observe_held` not returning a busy held read as busy, the read is the
 /// binding's refusal with the busy open's words beside it.
 #[test]
 fn a_vault_writer_at_a_held_reads_gate_is_busy_not_a_refusal() {
@@ -3878,19 +3915,22 @@ fn a_vault_writer_at_a_held_reads_gate_is_busy_not_a_refusal() {
     assert_eq!(held().unwrap(), Some(1));
 }
 
-/// Where a recovery replica of a displaced table is enrolled, it answers the held read (SF-13)
-/// as it answers every reader, and a moment in which that replica is busy is busy for the held
-/// read, which observes again: the displaced primary does not answer in the replica's place. A
-/// replica that refuses otherwise answers nothing, and there the held read answers the primary
-/// from its witnessed prefix. A strict reader, in the replica's busy moment, refuses with the
-/// binding's words as it did before SF-13.
-/// NEGATIVE CONTROL: with `Directory::observe_table_if_exists_as` not returning a busy recovery
-/// observation where `held`, the held read beside the busy replica answers the displaced
-/// primary; with it returning one to every reader (`held &&` dropped), the strict read there is
-/// busy; with it returning every refusal of the replica where `held`, the held read beside the
-/// replica that refuses otherwise refuses too.
+/// Where a recovery replica of a displaced table is enrolled, the held read (SF-13) is of both,
+/// as a read of a bound table is: the displaced primary's witnessed prefix combined with the
+/// replica, never either one alone as the whole table, here a replica enrolled after the
+/// primary's one record and holding none of it. A moment in which that replica is busy is busy
+/// for the held read, which observes again; a replica that refuses otherwise refuses the held
+/// read too, its words beside the binding's. A strict reader, which cannot read the prefix,
+/// answers from the replica alone where it answers and refuses with the binding's words in
+/// either of its other moments, as it did before SF-13.
+/// NEGATIVE CONTROL: with `Directory::observe_held` answering the replica alone where it
+/// answers (as 12c0d2b66c0 did), the held read and the account catalog's read hold no record;
+/// with it not returning the replica's busy observation as busy, the held read beside the busy
+/// replica is a refusal; with it answering the prefix alone beside a replica that refuses (as
+/// 12c0d2b66c0 did), the held read there answers. With `Directory::observe_table_if_exists_as`
+/// giving a strict read the held one, the strict reads answer the record.
 #[test]
-fn a_held_read_is_busy_while_the_recovery_replica_that_answers_it_is() {
+fn a_held_read_is_of_the_displaced_prefix_and_the_recovery_replica_together() {
     use crate::table::store::with_open_hook;
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
     let original = lab.paths[0].clone();
@@ -3912,14 +3952,29 @@ fn a_held_read_is_busy_while_the_recovery_replica_that_answers_it_is() {
     let binding = Store::observe(&session, &primary, moved).err().unwrap();
     assert!(!binding.is_busy(), "{binding}");
     let binding = binding.to_string();
+    // CONTROL: the replica alone holds none of the table's one record; the prefix holds it.
+    let alone = directory
+        .recovery()
+        .observe_store_if_exists(&session, moved);
+    assert_eq!(rows(&session, &alone.unwrap().unwrap(), moved).unwrap(), 0);
+    let gate = Preserving::of(&session).unwrap().unwrap();
+    let prefix = Store::observe_displaced(&session, moved, gate)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows(&session, &prefix, moved).unwrap(), 1);
+    drop(prefix);
 
-    // The replica answers the held read and the strict one alike.
-    for answered in [
-        directory.observe_held_table(&session, moved).unwrap(),
-        directory.observe_table(&session, moved).unwrap(),
-    ] {
-        assert!(answered.is_recovery() && !answered.is_displaced());
-    }
+    // The replica answers: the held read is of both, the strict one of the replica alone.
+    let held = directory.observe_held_table(&session, moved).unwrap();
+    assert!(held.is_recovery() && !held.is_displaced());
+    assert_eq!(rows(&session, &held, moved).unwrap(), 1);
+    drop(held);
+    let strict = directory.observe_table(&session, moved).unwrap();
+    assert_eq!(rows(&session, &strict, moved).unwrap(), 0);
+    drop((strict, session));
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+    assert_eq!(observe_strictly(&original).unwrap(), Some(0));
+    let session = Session::observe(&bootstrap).unwrap();
 
     // The replica is busy: every open of it that reaches its journal says so.
     let opens = std::rc::Rc::new(std::cell::Cell::new(0_usize));
@@ -3946,15 +4001,130 @@ fn a_held_read_is_busy_while_the_recovery_replica_that_answers_it_is() {
     assert!(!strict.is_busy(), "{strict}");
     assert_eq!(strict.to_string(), binding);
 
-    // The replica refuses otherwise: it answers nothing, and the held read answers the primary.
-    let held = with_open_hook(
-        &replica,
-        || Err(Error::new("the replica refuses")),
-        || directory.observe_held_table(&session, moved),
-    )
-    .unwrap();
-    assert!(held.is_displaced() && held.is_primary_at(&primary));
+    // The replica refuses otherwise: the held read refuses too, the replica's words beside the
+    // binding's, since the displaced primary's prefix is not the whole table; and a strict read
+    // refuses in the binding's words alone, as it did before SF-13.
+    let refusing = |read: &dyn Fn() -> Result<Store>| {
+        let counted = opens.clone();
+        with_open_hook(
+            &replica,
+            move || {
+                counted.set(counted.get() + 1);
+                Err(Error::new("the replica refuses"))
+            },
+            read,
+        )
+    };
+    let held = refusing(&|| directory.observe_held_table(&session, moved));
+    assert_eq!(opens.get(), 3, "CONTROL: the replica's open was reached");
+    let held = held
+        .err()
+        .expect("the displaced primary answered as the whole table beside a replica that refuses");
+    assert!(!held.is_busy(), "{held}");
+    let held = held.to_string();
+    assert!(
+        held.strip_suffix(&binding).is_some_and(|replica| {
+            replica.contains("its recovery replica") && replica.contains("the replica refuses")
+        }),
+        "{held}"
+    );
+    let strict = refusing(&|| directory.observe_table(&session, moved));
+    assert_eq!(opens.get(), 4, "CONTROL: the replica's open was reached");
+    assert_eq!(strict.err().unwrap().to_string(), binding);
+    // CONTROL: the same replica, reading again, answers the held read with the prefix's record.
+    let held = directory.observe_held_table(&session, moved).unwrap();
     assert_eq!(rows(&session, &held, moved).unwrap(), 1);
+}
+
+/// A displaced catalog (SF-13) is read from its witnessed prefix alone, as a bound catalog is:
+/// neither is combined with a recovery catalog, so a recovery catalog that refuses keeps
+/// neither from answering, and one that reads does not answer in the prefix's place. A strict
+/// read, which cannot read the prefix, answers from the recovery catalog alone where it reads
+/// and refuses in the binding's words where it does not, as before SF-13.
+/// NEGATIVE CONTROL: with `Directory::observe_held` combining a displaced catalog as it does
+/// an application table (the catalog-scope arm dropped), the held read beside the recovery
+/// catalog that refuses refuses; with it answering the strict read's recovery catalog first
+/// where one reads (as 12c0d2b66c0 did), the held read there is the recovery catalog.
+#[test]
+fn a_displaced_catalog_is_read_as_a_bound_one_beside_its_recovery_catalog() {
+    use crate::table::store::with_open_hook;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let _ = data(&lab);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&original, bootstrap.trust());
+    let catalog = directory.catalog_scope();
+    {
+        let session = Session::open(&bootstrap).unwrap();
+        assert!(
+            directory
+                .recovery()
+                .enroll(&session, catalog)
+                .unwrap()
+                .is_recovery()
+        );
+    }
+    let recovery = directory.recovery().path(catalog).unwrap();
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let refusing = |read: &dyn Fn() -> Result<Store>| {
+        let counted = opens.clone();
+        with_open_hook(
+            &recovery,
+            move || {
+                counted.set(counted.get() + 1);
+                Err(Error::new("the recovery catalog refuses"))
+            },
+            read,
+        )
+    };
+    let shape = |store: Store| (store.is_recovery(), store.is_displaced());
+    // CONTROL: a bound catalog is answered alone, its recovery catalog unread, by either read.
+    let session = Session::observe(&bootstrap).unwrap();
+    for read in [
+        refusing(&|| directory.observe_table(&session, catalog)),
+        refusing(&|| directory.observe_held_table(&session, catalog)),
+    ] {
+        assert_eq!(read.map(shape).unwrap(), (false, false));
+    }
+    assert_eq!(opens.get(), 0);
+    drop(session);
+
+    displace(&original, catalog);
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    let session = Session::observe(&bootstrap).unwrap();
+    let binding = Store::observe(&session, &directory.path(catalog).unwrap(), catalog)
+        .err()
+        .unwrap()
+        .to_string();
+
+    // Beside a recovery catalog that refuses, the held read answers the prefix alone, and the
+    // strict read refuses in the binding's words.
+    let held = refusing(&|| directory.observe_held_table(&session, catalog));
+    assert_eq!(held.map(shape).unwrap(), (false, true));
+    assert_eq!(opens.get(), 0, "the held read opened the recovery catalog");
+    let strict = refusing(&|| directory.observe_table(&session, catalog));
+    assert_eq!(
+        opens.get(),
+        1,
+        "CONTROL: the strict read reached the recovery catalog"
+    );
+    assert_eq!(strict.err().unwrap().to_string(), binding);
+    // Beside one that reads, the held read is still the prefix; the strict read is that
+    // recovery catalog.
+    let held = directory.observe_held_table(&session, catalog);
+    assert_eq!(held.map(shape).unwrap(), (false, true));
+    let strict = directory.observe_table(&session, catalog);
+    assert_eq!(strict.map(shape).unwrap(), (true, false));
+    drop(session);
+    // The account catalog's read finds its declared table through the displaced catalog.
+    let read = with_open_hook(
+        &recovery,
+        || Err(Error::new("the recovery catalog refuses")),
+        || observe_here(&original, rows),
+    );
+    assert_eq!(read.unwrap(), Some(1));
 }
 
 /// A fenced home that lost its selection record holds no read of a displaced table (SF-13),

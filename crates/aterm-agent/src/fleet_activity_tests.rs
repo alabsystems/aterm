@@ -7,7 +7,7 @@ use aterm_types::fleet_activity::Way;
 
 const A: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const B: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
-const SID: &str = "s-0123456789abcdef0123";
+const SID: &str = "t00000000aa";
 
 /// 2026-11-12T10:00:00Z, in Unix milliseconds.
 const NOW: u64 = 1_794_477_600_000;

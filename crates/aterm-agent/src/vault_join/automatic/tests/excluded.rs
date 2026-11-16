@@ -202,6 +202,7 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
 
     let fresh = Paths::for_home(&root.path().join("fresh"));
     client::machine_identity(&fresh).unwrap();
+    assert!(client::read_in_place(&fresh, "shared").unwrap().is_none());
     let device = Device::open(&fresh).unwrap().unwrap();
     let node = aterm_net::fleet::NodeIdentity::from_seed(&"31".repeat(16), &[31; 32]).unwrap();
     let proof_address = hints[0].address;
@@ -243,8 +244,11 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
         client::Membership::In { .. }
     ));
     assert_eq!(
-        crate::vault_entry::read_text(&fresh.home, "shared", 1 << 20).text(),
-        Some("everyone")
+        client::read_in_place(&fresh, "shared")
+            .unwrap()
+            .expect("the admitted member reads the shared entry from its verified store")
+            .as_slice(),
+        b"everyone"
     );
     let actor = device
         .request(trust.network, trust.authority)

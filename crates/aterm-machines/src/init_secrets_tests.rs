@@ -9,7 +9,7 @@ use crate::port::{Cmd, Fake, Ran, RunFailed, Secret, Stat};
 use aterm_secrets::age::Recipient;
 use aterm_secrets::client::{Config, Probed};
 use aterm_uds::{AcceptWait, AcceptedMode};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 /// The row's words without a LAN broker ([`Scripted::broker_absent`]): the broker's own,
 /// not installed.
@@ -1059,8 +1059,42 @@ fn settle_keeps_the_observed_source_but_accepts_its_trusted_pin_successor() {
     }
 }
 
+/// Every file under `home` outside the vault's own folder `vault`, with its bytes. Symlinks are
+/// recorded by their target and never followed.
+fn files_outside_the_vault(home: &Path, vault: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut folders = vec![home.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.starts_with(vault) {
+                continue;
+            }
+            let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_dir() {
+                folders.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path).unwrap();
+                files.insert(path, target.into_os_string().into_encoded_bytes());
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                files.insert(path, bytes);
+            }
+        }
+    }
+    files
+}
+
+/// A configured Mac whose verified copy of the vault is gone settles by fetching it again, and
+/// the guarded apply checks setup's withdrawal once the vault's real HTTP response is in:
+/// withdrawn, it leaves the vault's state and cache as they were; not withdrawn, it keeps the
+/// fetched copy and reads the entry from it in place. Either way it writes, moves and removes
+/// nothing under the home outside the vault's own folder, and leaves the owner's backup under
+/// `~/.secrets` as it was.
+/// NEGATIVE CONTROL (2026-11-14): with the scripted sync also writing the entry to
+/// `~/.secrets/settle-fixture`, as a sync before f581bd69910 did, the settled case fails.
 #[test]
-fn configured_settle_rechecks_after_the_real_http_response_before_materializing() {
+fn configured_settle_rechecks_after_the_real_http_response_and_writes_no_file_under_the_home() {
     use std::io::{BufRead, Write};
     for withdraw in [false, true] {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -1106,8 +1140,13 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
         )
         .unwrap();
         // The store this Mac reads in place lost its verified copy: the one local fault a
-        // settle still repairs, now that the vault writes no file under the home.
+        // settle still repairs, now that the vault writes no file under the home. The vault is
+        // not ready, so the settle syncs.
         std::fs::remove_file(&cache_file).unwrap();
+        let backup = aterm_types::vault_entry::plain_entry_path(&paths.home, "settle-fixture");
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(&backup, b"the owner's backup").unwrap();
+        let home_files = files_outside_the_vault(&paths.home, &paths.dir);
         let state = std::fs::read(&state_file).unwrap();
         let ops = Scripted::new(vec![Ok(aterm_secrets::client::status(&paths).unwrap())]);
         *ops.local_home.lock().unwrap() = Some(paths.home.clone());
@@ -1121,6 +1160,7 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
         let stopped = AtomicBool::new(false);
         std::thread::scope(|scope| {
             let stopped = &stopped;
+            let bytes = &bytes;
             scope.spawn(move || {
                 let (stream, _) =
                     aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking)
@@ -1147,7 +1187,7 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
                     bytes.len()
                 )
                 .unwrap();
-                stream.write_all(&bytes).unwrap();
+                stream.write_all(bytes).unwrap();
             });
             let current = || {
                 if stopped.load(Ordering::SeqCst) {
@@ -1161,6 +1201,11 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
         });
         assert_eq!(*ops.syncs.lock().unwrap(), 1);
         assert!(ops.joins().is_empty());
+        assert_eq!(
+            files_outside_the_vault(&paths.home, &paths.dir),
+            home_files,
+            "withdraw={withdraw}: a file under the home changed"
+        );
         if withdraw {
             assert_eq!(std::fs::read(&state_file).unwrap(), state);
             assert!(!cache_file.exists());
@@ -1173,8 +1218,19 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
                 b"fixture-value"
             );
             assert!(aterm_secrets::client::materialization_ready(&paths).unwrap());
+            assert_eq!(std::fs::read(&cache_file).unwrap(), bytes);
+            let configured = aterm_secrets::client::config(&paths).unwrap().unwrap();
+            let entry =
+                aterm_secrets::client::read_verified_entry(&paths, &configured, "settle-fixture")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(entry.value().as_slice(), b"fixture-value");
         }
-        assert!(!paths.home.join(".secrets").exists());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"the owner's backup",
+            "withdraw={withdraw}: the owner's backup changed"
+        );
     }
 }
 

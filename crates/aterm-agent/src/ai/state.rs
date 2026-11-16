@@ -213,38 +213,51 @@ pub fn bar(f: &Facts) -> Option<Bar> {
     })
 }
 
-/// Why aterm's own sign-in of `f`'s row is left to the window's upkeep now, where it is: a run
-/// with nobody at this Mac starts none, so an agent's or a script's run, however often it is
-/// repeated, loads no vendor sign-in page the upkeep holds back (design R-13). That is a
-/// failed sign-in of the row on record, which the upkeep's ladder retries on its own backoff and
-/// whenever what it reads changes, or Cloudflare's bot check met within the upkeep's hold
-/// ([`crate::harness::accounts_sync::PERSON_BACKOFF_SECS`]).
+/// Why aterm's own sign-in of `f`'s row is left to the window's upkeep now, or to a person, where
+/// it is: a run with nobody at this Mac starts none, so an agent's or a script's run, however
+/// often it is repeated, loads no vendor sign-in page the upkeep holds back (design R-13). A row
+/// of any CLI a bot protection stopped (Cloudflare's check, a block page, a human check:
+/// [`super::facts::CliAccounts::check_at`], [`super::facts::Tried::for_a_person`]) is retried by
+/// nothing, on any clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): the words name
+/// the person's step instead. Any other failed sign-in of the row on record is one the upkeep's
+/// ladder retries on its own backoff and whenever what it reads changes.
 #[must_use]
 pub fn held(f: &Facts, now: i64) -> Option<String> {
-    let hold = crate::harness::accounts_sync::PERSON_BACKOFF_SECS;
-    if let Some(at) = f
-        .login_pool()
-        .and_then(|p| p.bot_check_at)
-        .filter(|at| now.saturating_sub(*at) < hold)
+    if let Some(p) = f.login_pool()
+        && let Some(at) = p.check_at
+        && let Some(cli) = crate::harness::accounts::Cli::parse(f.connector.id)
+        && let Some((label, _)) = p.sign_in_target(cli)
     {
         return Some(format!(
-            "its last sign-in met Cloudflare's bot check {} ago, which aterm never tries to \
-             pass; the window's upkeep tries again after {}",
+            "its last sign-in met a bot protection {} ago, which aterm never tries to pass; \
+             nothing signs it in again with nobody at this Mac: a person runs `{}` in a terminal \
+             on this Mac",
             span(now.saturating_sub(at)),
-            when(at.saturating_add(hold))
+            crate::harness::cli::left_step(cli, label)
         ));
     }
-    let failed = f
+    let tried = f
         .accounts
         .as_ref()
         .and_then(|a| a.tried.as_ref())
         .or_else(|| f.login_pool().and_then(|p| p.tried.as_ref()))
-        .is_some_and(|t| matches!(t.outcome, "failed" | "blocked"));
-    if !failed {
-        return None;
+        .filter(|t| matches!(t.outcome, "failed" | "blocked"))?;
+    let words = tried_words(f, now)?;
+    // A Claude row a bot protection stopped is tried again by nothing with nobody here, on any
+    // clock (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3): it waits for a person.
+    if tried.for_a_person
+        && let Some(a) = f.accounts.as_ref()
+    {
+        let label = a.next_sign_in.as_deref().unwrap_or(&a.label);
+        return Some(format!(
+            "{words}; nothing signs it in again with nobody at this Mac: a person runs `{}` in a \
+             terminal on this Mac",
+            Step::Renew(Cli::Claude, label.to_owned())
+        ));
     }
-    tried_words(f, now)
-        .map(|words| format!("{words}; the window's upkeep retries it on its own backoff"))
+    Some(format!(
+        "{words}; the window's upkeep retries it on its own backoff"
+    ))
 }
 
 /// What aterm's own sign-in of `f`'s row last came to, where it failed and stands on record:

@@ -1236,7 +1236,8 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
     let before = engine_text(&app, session);
     frame(&mut app, wid);
     let vendor = {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+        let ws = &mut **field_guard_ws;
         assert!(crate::claude_footer::undo(
             &mut ws.claude_footer_undo,
             &mut ws.input_scratch
@@ -1248,7 +1249,8 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
     assert!(card_drew(&app, wid));
     assert_ne!(app.windows[&wid].input_scratch.cells, vendor, "the line");
     assert_eq!(engine_text(&app, session), before, "the terminal's text");
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+    let ws = &mut **field_guard_ws;
     let ours = ws.claude_card.painted.layers.clone();
     assert_eq!(ours.len(), 2, "the card's two layers");
     assert!(ours.iter().all(|l| ws.input_scratch.fx_layers.contains(l)));
@@ -2488,7 +2490,7 @@ fn the_layers_meet_the_renderers_pixel_spaces() {
     }
     app.tab_strip_rows = 0;
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.metrics.pad = 12;
         ws.metrics.pad_top = 8;
     }
@@ -4016,11 +4018,15 @@ fn the_kept_layout_follows_the_cells() {
     app.splice_tab_strip(wid);
     assert_eq!(pass_cost(&mut app, wid).layouts, 1);
     assert_eq!(card_pic(&app, wid), first, "the first scene again");
-    app.windows.get_mut(&wid).unwrap().search = Some(Default::default());
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .routing
+        .set_search(Some(Default::default()));
     for i in 0..3 {
         assert_eq!(pass_cost(&mut app, wid).layouts, 1, "find bar up, pass {i}");
     }
-    app.windows.get_mut(&wid).unwrap().search = None;
+    app.windows.get_mut(&wid).unwrap().routing.set_search(None);
     assert_eq!(
         pass_cost(&mut app, wid).layouts,
         1,

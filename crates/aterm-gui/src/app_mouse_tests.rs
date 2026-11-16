@@ -75,6 +75,7 @@ fn a_glassless_mixed_tab_s_native_leaf_takes_the_pointer() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.tab_set.active_mut())
             .is_some_and(|tab| tab.set_focus(native_view)),
         "the native leaf is live"
@@ -413,7 +414,7 @@ fn settings_sized_in(
     let wid = crate::WindowId(0);
     let (cell_w, cell_h) = app.win_cell_size(wid);
     let pad = app.win_pad(wid);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = u16::try_from((width - pad * 2) / cell_w.max(1)).unwrap();
         window.rows = u16::try_from((height - pad * 2) / cell_h.max(1)).unwrap();
     }
@@ -1343,10 +1344,12 @@ fn pane_header_focuses_native_leaf_and_does_not_scroll_its_content() {
         app.active_native_view(wid).map(|(_, view)| view),
         Some(native)
     );
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(native) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(native);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     settings.scroll_page_to(1);
+    drop(route_native_guard);
     app.on_cursor_moved(wid, header.0, header.1);
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
@@ -1464,6 +1467,7 @@ fn prepare_presented_native(
     assert!(app.prepare_native_input_scratch(wid));
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.leaf_render_cache.get_mut(&view))
         .and_then(|cache| cache.native.as_mut())
         .expect("retained native raster")
@@ -1786,12 +1790,14 @@ fn palette_over_native_tab_swallows_pointer_before_underlying_hit_test() {
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     let (_, view) = app.active_native_view(wid).expect("Settings active");
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings state");
     };
     settings.search_input = crate::native_text_input::TextInputState::new("écho".to_string());
     settings.search_input.set_selection(2, 2);
     settings.set_search("écho".to_string());
+    drop(route_native_guard);
     assert!(app.prepare_native_input_scratch(wid));
     app.windows
         .get_mut(&wid)
@@ -1883,7 +1889,8 @@ fn settings_text_pointer_click_drag_and_shift_click_use_shipping_reducer_path() 
     let woman_start = suffix_start + "Aé".len();
     let woman_end = woman_start + "👩‍💻".len();
     let e_start = suffix_start + "A".len();
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings state");
     };
     settings.search_input = TextInputState::new(text.clone());
@@ -1891,6 +1898,7 @@ fn settings_text_pointer_click_drag_and_shift_click_use_shipping_reducer_path() 
     settings.common.last_focus = Some(UiKey::new("settings/search"));
 
     let key = UiKey::new("settings/search");
+    drop(route_native_guard);
     let (press_x, press_y) = native_text_boundary_point(&mut app, wid, &key, woman_start);
     app.on_cursor_moved(wid, press_x, press_y);
     assert!(app.windows[&wid].native_text_cursor);
@@ -1958,7 +1966,8 @@ fn settings_color_field_padding_and_swatch_clamp_to_committed_edges() {
     let (_, view) = app.active_native_view(wid).expect("Settings active");
     let field_key = crate::prefs::EDIT_FOREGROUND;
     let value = "#123456";
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings state");
     };
     settings.search_input = TextInputState::new("foreground".to_string());
@@ -1973,6 +1982,7 @@ fn settings_color_field_padding_and_swatch_clamp_to_committed_edges() {
         .seed = Some(value.to_string());
 
     let key = UiKey::new(format!("settings/control/{field_key}"));
+    drop(route_native_guard);
     let edge_point = |app: &mut App, trailing: bool| {
         let compiled = presented_native_ui(app, wid);
         let paint = compiled
@@ -2047,7 +2057,8 @@ fn settings_text_release_rejects_a_detached_native_view() {
     let wid = WindowId(0);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     let (_, view) = app.active_native_view(wid).expect("Settings active");
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings state");
     };
     settings.search_input = TextInputState::new("écho".to_string());
@@ -2055,6 +2066,7 @@ fn settings_text_release_rejects_a_detached_native_view() {
     settings.common.last_focus = Some(UiKey::new("settings/search"));
 
     let key = UiKey::new("settings/search");
+    drop(route_native_guard);
     let (x, y) = native_text_boundary_point(&mut app, wid, &key, 2);
     app.on_cursor_moved(wid, x, y);
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -2092,12 +2104,13 @@ fn text_field_pointer_payload_does_not_replace_button_slider_or_document_paths()
         }),
     )
     .unwrap();
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(settings_view)
-    else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(settings_view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("Settings state");
     };
     settings.scroll_page_to(0);
 
+    drop(route_native_guard);
     let compiled = presented_native_ui(&mut app, wid);
     let route_button = compiled
         .hits
@@ -2133,8 +2146,8 @@ fn text_field_pointer_payload_does_not_replace_button_slider_or_document_paths()
     );
 
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
-    let Some(AppViewState::Settings(settings)) = app.native_runtime.view_state_mut(settings_view)
-    else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(settings_view);
+    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
         panic!("same singleton Settings view");
     };
     settings
@@ -2148,13 +2161,14 @@ fn text_field_pointer_payload_does_not_replace_button_slider_or_document_paths()
     settings.set_search("font size".to_string());
     let slider_key = UiKey::new(format!("settings/control/{}", crate::prefs::EDIT_FONT_PX));
     let mut found = None;
+    drop(route_native_guard);
     for scroll in 0..8 {
-        let Some(AppViewState::Settings(settings)) =
-            app.native_runtime.view_state_mut(settings_view)
-        else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(settings_view);
+        let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         settings.scroll_page_to(scroll);
+        drop(route_native_guard);
         let compiled = presented_native_ui(&mut app, wid);
         if let Some(index) = compiled
             .paint
@@ -2614,9 +2628,10 @@ fn terminal_palette_pointer_strips_frame_remainder_and_top_origin_once() {
     app.backend.set_pad(12);
     app.backend.set_pad_top(4);
     app.backend.set_head(3);
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.metrics.pad = 12;
         ws.metrics.pad_top = 4;
+        ws.metrics.head = 3;
         ws.input_scratch.cells = vec![Vec::new(); 24];
     }
     app.palette_enter();
@@ -2706,7 +2721,7 @@ fn a_retina_pointer_lands_on_a_palette_row_past_a_device_pixel_cap() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.cols = 400;
         ws.scale = 2.0;
         ws.input_scratch.cells = vec![Vec::new(); 50];
@@ -3763,9 +3778,9 @@ fn a_click_on_the_pet_pets_and_never_starts_a_selection() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let (x0, x1, y0, y1) = {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let pet = crate::app_render::pet_owner_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::StaticCapture,
             aterm_effects::kitty_pet::PetSense {
                 caret_drawn: true,
@@ -4270,7 +4285,7 @@ fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
         app.strip_col_at(wid, grid.0, grid.1).is_none(),
         "fixture point must be off the strip"
     );
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_cursor_px = grid;
         ws.last_mouse_window_cell = (5, 10);
     }
@@ -4291,12 +4306,12 @@ fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
     assert_eq!(state(&app), (false, true), "tracking off = I-beam again");
 
     let _sid = app.split_active_stub_tab(wid);
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 40);
     }
     app.update_hover_cursor(wid);
     assert_eq!(state(&app), (true, true), "divider = resize encoding");
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 10);
     }
     app.update_hover_cursor(wid);
@@ -4310,7 +4325,7 @@ fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
             app.strip_col_at(wid, strip_pt.0, strip_pt.1).is_some(),
             "fixture point must be ON the strip"
         );
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.last_cursor_px = strip_pt;
             ws.pointer_position_known = true;
         }
@@ -4324,7 +4339,7 @@ fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
     }
     app.tab_strip_rows = 0;
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_cursor_px = grid;
         ws.last_mouse_window_cell = (5, 10);
     }
@@ -4361,7 +4376,7 @@ fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
             "tracking resolves to the arrow while the mutex is busy"
         );
         held.process(b"\x1b[?1000l");
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.last_cursor_px = (grid.0 + cw as f64 * 2.0, grid.1);
             ws.last_mouse_window_cell = (5, 12);
         }
@@ -5057,9 +5072,10 @@ fn a_selection_on_a_double_width_line_takes_the_characters_under_the_pointer() {
         Some("HE"),
         "precondition: a selection to extend"
     );
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     ws.last_mouse_cell = (0, 9);
     ws.last_mouse_side = SelectionSide::Left;
+    drop(ws);
     app.shift_extend_press(wid, std::time::Instant::now());
     assert_eq!(
         term_lock(&term).selection_to_string().as_deref(),
@@ -5569,7 +5585,7 @@ fn selection_autoscroll_disarms_when_the_front_terminal_is_gone() {
     let mut native = App::headless_for_test();
     assert!(native.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     {
-        let window = native.windows.get_mut(&wid).expect("headless window");
+        let mut window = native.windows.get_mut(&wid).expect("headless window");
         window.selecting = true;
         window.next_autoscroll = Some(Instant::now());
     }
@@ -5756,8 +5772,11 @@ fn find_bar_shields_native_hover_and_routes_click_when_native_view_is_active() {
     let term_row = frame_row.saturating_sub(usize::from(app.chrome_rows(wid)));
     let cols = usize::from(app.windows[&wid].cols);
     let laid = app.glass_grid(wid);
-    app.windows.get_mut(&wid).expect("window").search =
-        Some(crate::app_search::SearchState::default());
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .routing
+        .set_search(Some(crate::app_search::SearchState::default()));
     app.windows.get_mut(&wid).expect("window").find_bar_hit = Some(FindBarHit {
         row: term_row,
         case_cols: Some(0..cols),

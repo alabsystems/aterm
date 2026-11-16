@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn assignment_status_keeps_unknown_cancellation_distinct_from_an_assignment() {
-    let session = SessionBinding {
+    let mut session = SessionBinding {
         sid: "t000fjxtvre".into(),
         process_pid: 42,
         process_birth: "2026-11-06 12:00:00 UTC".into(),
@@ -21,17 +21,32 @@ fn assignment_status_keeps_unknown_cancellation_distinct_from_an_assignment() {
         selection_mode: None,
         reason: Some(Reason::Cancelled),
     };
-    let line = status.encode(&session).unwrap();
-    let body = line
-        .strip_prefix("OK codex-accounts-change assignment ")
-        .unwrap()
-        .trim_end();
-    let value: aterm_json::Value = aterm_json::from_str(body).unwrap();
-    assert_eq!(value["selection_mode"], aterm_json::Value::Null);
-    assert_eq!(value["assignment_generation"], aterm_json::Value::Null);
-    assert_eq!(value["native_intent"], value["operation"]);
-    assert!(value.get("path").is_none());
-    assert!(value.get("digest").is_none());
+    for sid in ["t000fjxtvre", "s-0123456789abcdef0123"] {
+        session.sid = sid.into();
+        let line = status.encode(&session).unwrap();
+        let body = line
+            .strip_prefix("OK codex-accounts-change assignment ")
+            .unwrap()
+            .trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(body).unwrap();
+        assert_eq!(value["session"]["sid"].as_str(), Some(sid));
+        assert_eq!(value["selection_mode"], aterm_json::Value::Null);
+        assert_eq!(value["assignment_generation"], aterm_json::Value::Null);
+        assert_eq!(value["native_intent"], value["operation"]);
+        assert!(value.get("path").is_none());
+        assert!(value.get("digest").is_none());
+    }
+    let valid = session.sid.clone();
+    for sid in [
+        "../../escape",
+        "s-1",
+        "s-0123456789ABCDEF0123",
+        "t000000000u",
+    ] {
+        session.sid = sid.into();
+        assert!(status.encode(&session).is_none());
+    }
+    session.sid = valid;
     status.target_ref = Some("b".repeat(64));
     assert!(
         status.encode(&session).is_none(),

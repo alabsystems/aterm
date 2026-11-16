@@ -154,7 +154,8 @@ pub fn patterns(patterns: &[String]) -> Result<Vec<Pattern>, String> {
 
 /// Every file under `public` that `ignore` leaves, by its path under `public/`, sorted, with
 /// its bytes: `overlay`'s for a path it names (a dry run's planned content, which the
-/// listing also gains where the file does not exist yet), else the file's own.
+/// listing also gains where the file does not exist yet), else the file's own. A path the
+/// overlay names with `None` (a dry run's planned removal) is left out.
 /// # Errors
 /// A directory or file that cannot be read; a symbolic link, or anything else that is not a
 /// regular file or directory (a deploy never follows a link out of `public/`); a name that is
@@ -163,7 +164,7 @@ pub fn patterns(patterns: &[String]) -> Result<Vec<Pattern>, String> {
 pub fn list(
     public: &Path,
     ignore: &[Pattern],
-    overlay: &BTreeMap<String, Vec<u8>>,
+    overlay: &BTreeMap<String, Option<Vec<u8>>>,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let root_meta = std::fs::symlink_metadata(public)
         .map_err(|e| format!("cannot list {}: {e}", public.display()))?;
@@ -214,7 +215,8 @@ pub fn list(
             let path = at.join(name);
             if kind.is_file() {
                 let bytes = match overlay.get(&rel) {
-                    Some(bytes) => {
+                    Some(None) => continue,
+                    Some(Some(bytes)) => {
                         if super::key::holds_a_private_key(bytes) {
                             return Err(format!(
                                 "{} is a private key (a JSON key with a private_key, such as the \
@@ -250,6 +252,9 @@ pub fn list(
         }
     }
     for (rel, bytes) in overlay {
+        let Some(bytes) = bytes else {
+            continue;
+        };
         if !found.contains_key(rel) && !ignored(rel) {
             if super::key::holds_a_private_key(bytes) {
                 return Err(format!(

@@ -95,9 +95,9 @@ impl Kernel for SourceKernel {
         Process::observe(pid).map(|process| process.parent)
     }
 
-    fn terminal(&self, pid: u32) -> Option<(u32, String)> {
+    fn terminal(&self, pid: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
         // Only terminal ownership is injected; parent/group/session/image are real.
-        (pid == self.process.pid).then_some((self.shell.pid, "aterm-fixture".into()))
+        Ok((pid == self.process.pid).then_some((self.shell.pid, "aterm-fixture".into())))
     }
 
     fn process_start(&self, pid: u32) -> Option<String> {

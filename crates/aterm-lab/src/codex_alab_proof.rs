@@ -4452,6 +4452,15 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         }
         Err(Unready::Stopped(stopped)) => return Err(stopped.into()),
     };
+    println!(
+        "legs (one instance, each a tab; the model answers by the leg its prompt names and the act aterm's words name)"
+    );
+    let first = proof.spawn_leg("first", "Say hello and finish.", "", Folder::Scratch, None)?;
+    // Check the package's basic claim before starting the other sessions.
+    if proof.claim(&first)?.is_none() {
+        proof.diagnose(&[&first]);
+        return Ok(());
+    }
     let manager = {
         let spawned = proof
             .inst
@@ -4469,10 +4478,6 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
         ),
         manager.is_some(),
     );
-    println!(
-        "legs (one instance, each a tab; the model answers by the leg its prompt names and the act aterm's words name)"
-    );
-    let first = proof.spawn_leg("first", "Say hello and finish.", "", Folder::Scratch, None)?;
     let land = proof.open_leg("land")?;
     let reland = proof.open_leg("reland")?;
     let repo = proof.spawn_leg(

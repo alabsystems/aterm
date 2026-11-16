@@ -164,8 +164,13 @@ pub struct Record {
     pub accounting: Accounting,
     /// The holder's pid.
     pub pid: u32,
-    /// When the claim was made, unix ms: waiters are served in this order.
+    /// Its PLACE in the queue, unix ms: waiters are served in this order. When the claim was
+    /// made, or, for an entry at a place ([`crate::admit::Place`]), when the first record at
+    /// that place was. It is no measure of this record's wait: [`Self::laid_ms`] is.
     pub start_ms: u64,
+    /// When this record was laid, unix ms, where that is after its place ([`Self::start_ms`]):
+    /// an entry at a place an earlier record of its process holds. `None`: laid at its place.
+    pub laid_at: Option<u64>,
     /// The holder's own count of its claims, which orders two made in one millisecond.
     pub seq: u64,
     /// The checkout the holder runs for: its need's ([`Need::checkout`]), else its working directory's enclosing git checkout.
@@ -194,6 +199,17 @@ impl Record {
     #[must_use]
     pub const fn order(&self) -> (u64, u32, u64) {
         (self.start_ms, self.pid, self.seq)
+    }
+
+    /// When this record was laid, unix ms: what its wait and its hold are counted from. Its
+    /// place ([`Self::start_ms`]) except for an entry at a place, which keeps an earlier
+    /// record's order and is as old as its own laying.
+    #[must_use]
+    pub const fn laid_ms(&self) -> u64 {
+        match self.laid_at {
+            Some(laid) => laid,
+            None => self.start_ms,
+        }
     }
 
     /// The file stem every file of this claim carries.
@@ -235,6 +251,9 @@ impl Record {
         o.insert("v".to_owned(), Value::from(1u64));
         o.insert("pid".to_owned(), Value::from(self.pid));
         o.insert("start_ms".to_owned(), Value::from(self.start_ms));
+        if let Some(laid) = self.laid_at.filter(|laid| *laid > self.start_ms) {
+            o.insert("laid_ms".to_owned(), Value::from(laid));
+        }
         o.insert("seq".to_owned(), Value::from(self.seq));
         o.insert("checkout".to_owned(), Value::from(cut(&self.checkout)));
         o.insert("what".to_owned(), Value::from(cut(&self.need.what)));
@@ -635,6 +654,8 @@ impl Record {
             },
             pid: u32::try_from(num(&head, "pid")?).ok()?,
             start_ms,
+            // A laying before its place is none: the place is the earliest any record of it was.
+            laid_at: num(&head, "laid_ms").filter(|laid| *laid > start_ms),
             seq: num(&head, "seq")?,
             checkout: head
                 .get("checkout")
@@ -1189,6 +1210,11 @@ impl Drop for Laid {
     }
 }
 
+/// Each ledger's tries of its admissions' lock by this process ([`Ledger::turn_tries`]).
+#[cfg(any(test, debug_assertions))]
+static TURN_TRIES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// The admissions' lock, held while one waiter reads the ledger and decides; its holder's pid lies before the locked range, for a waiter kept out to name.
 #[derive(Debug)]
 pub struct Turn {
@@ -1497,8 +1523,29 @@ impl Ledger {
         self.try_turn()
     }
 
+    /// TEST SEAM: how many times this process has tried the admissions' lock of this ledger
+    /// ([`Self::try_turn`]), taken or not: a test of what a look touches counts them.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn turn_tries(&self) -> u64 {
+        TURN_TRIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.dir)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Take the admissions' lock if nobody holds it, leaving this process's pid in it; `Err(holder)` while another waiter holds it (its pid, where it wrote one). The pid is written only where the file does not already say it ([`names_holder`]): a waiter takes the lock at every look, and the one that held it last is most often the one that takes it again.
     pub(crate) fn try_turn(&self) -> io::Result<Result<Turn, Option<u32>>> {
+        #[cfg(any(test, debug_assertions))]
+        {
+            *TURN_TRIES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(self.dir.clone())
+                .or_default() += 1;
+        }
         self.check_mode()?;
         #[cfg(unix)]
         if let Mode::Cohort(namespace) = &self.mode {
@@ -1528,11 +1575,54 @@ impl Ledger {
         self.lay_accounted(need, start_ms, Accounting::Holder)
     }
 
+    /// [`Self::lay`] at the place `place_ms` an earlier record of this process holds
+    /// ([`crate::admit::Place`]), laid at `laid_ms`: the record is ordered by the place and
+    /// its wait and hold count from its laying ([`Record::laid_ms`]). A cohort ledger keeps no
+    /// places, so its caller lays there at now.
+    pub(crate) fn lay_placed(
+        &self,
+        need: &Need,
+        place_ms: u64,
+        laid_ms: u64,
+    ) -> io::Result<(Record, Laid)> {
+        self.lay_record(
+            need,
+            place_ms,
+            Some(laid_ms).filter(|laid| *laid > place_ms),
+            Accounting::Holder,
+            std::process::id(),
+        )
+    }
+
+    /// TEST SEAM: [`Self::lay`] of a record that names `pid` as its holder and `start_ms` as
+    /// its place: what another process's claim, laid then, is to this process's looks. This
+    /// process keeps its lock, so it reads as live for as long as its [`Laid`] is kept.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn lay_stand_in(
+        &self,
+        need: &Need,
+        start_ms: u64,
+        pid: u32,
+    ) -> io::Result<(Record, Laid)> {
+        self.lay_record(need, start_ms, None, Accounting::Holder, pid)
+    }
+
     pub(crate) fn lay_accounted(
         &self,
         need: &Need,
         start_ms: u64,
         accounting: Accounting,
+    ) -> io::Result<(Record, Laid)> {
+        self.lay_record(need, start_ms, None, accounting, std::process::id())
+    }
+
+    fn lay_record(
+        &self,
+        need: &Need,
+        start_ms: u64,
+        laid_at: Option<u64>,
+        accounting: Accounting,
+        pid: u32,
     ) -> io::Result<(Record, Laid)> {
         self.check_mode()?;
         if accounting == Accounting::CohortOwned && !self.cohort_aware()? {
@@ -1551,8 +1641,9 @@ impl Ledger {
         need.lead_reservation = None;
         let record = Record {
             accounting,
-            pid: std::process::id(),
+            pid,
             start_ms,
+            laid_at,
             seq: next_seq(),
             checkout: need.checkout.take().unwrap_or_else(checkout_of_cwd),
             need,

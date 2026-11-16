@@ -224,6 +224,17 @@ impl EntryClass {
     }
 }
 
+/// Whether the entry `name` is fleet configuration: one of [`FLEET_CONFIGURATION`]'s names, a
+/// pooled CLI's fleet file, a native pool's allocation, or any other plain name with a
+/// configuration suffix. No vault text gives such a name a new value over
+/// [`crate::text::MAX_CONFIGURATION_VALUE`]: configuration is no secret, it is rewritten far more
+/// often than one, and the 299 KB repository inventory that filled a lab's log was fleet
+/// configuration.
+#[must_use]
+pub fn fleet_configuration(name: &str) -> bool {
+    of(name) == EntryClass::Held(Held::FleetConfiguration)
+}
+
 /// The class of the entry `name`.
 #[must_use]
 pub fn of(name: &str) -> EntryClass {

@@ -138,7 +138,8 @@ impl App {
         if engine_changed || theme_changed || own_applies > 0 {
             self.sparkle_dirty = true;
             self.rain_dirty = true;
-            for ws in self.windows.values_mut() {
+            for mut route_guard_ws in self.windows.values_mut() {
+                let ws = &mut **route_guard_ws;
                 ws.fx.companion_mut().invalidate_colors();
             }
         }

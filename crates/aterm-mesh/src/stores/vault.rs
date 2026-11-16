@@ -182,8 +182,12 @@ impl Stores for VaultStores {
         self.db.takes(table).map_err(|e| io_of(&e))
     }
 
-    fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>> {
+    fn table_inventory(&self, table: Digest) -> io::Result<Option<aterm_db::replica::Snapshot>> {
         self.db.table_inventory(table).map_err(|e| io_of(&e))
+    }
+
+    fn table_order(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Digest>> {
+        self.db.table_order(table, ids).map_err(|e| io_of(&e))
     }
 
     fn table_wires(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {

@@ -45,6 +45,22 @@ fn on_lane<T>(generation: BridgeGeneration, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Tell `sid`'s post `post` that it landed at `off`, once its poster's thread has queued it. A
+/// hang detector: a post the door refused is never queued, and this fails then, where a bare
+/// loop would poll for ever.
+#[track_caller]
+fn land_once_queued(store: &Store, sid: &str, post: u64, off: u64) {
+    let landed = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::ZERO,
+        || (cmd_deliver(store, &format!("{sid} landed={post} off={off}")) == "OK\n").then_some(()),
+    );
+    assert!(
+        landed.is_some(),
+        "post {post} never reached the outbox to land at {off}"
+    );
+}
+
 pub(super) fn registered_as(store: &Store, local_id: u64) -> (String, std::sync::Arc<SessionCtx>) {
     let h = test_handle(local_id);
     let sid = h.sid.as_str().to_string();
@@ -379,6 +395,44 @@ fn seeding_holds_preserves_the_release_clock_until_the_whole_hold_clears() {
     assert!(held_again.is_held());
     assert_eq!(held_again.released_at(), Some(release_time));
     assert!(!held_again.agrees_unheld(released));
+}
+
+/// `holds()` and `hold()` read the copy every seed, set and lift stores under the Inbox: after
+/// each change it agrees with the Inbox's own read of the holds, and it is read beneath a
+/// session's metadata, where an Inbox read is the reversed order (`crate::lock_rank`).
+#[test]
+fn holds_follow_every_hold_change_and_read_beneath_metadata() {
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    let meta = crate::lock_rank::MetaLock::new(());
+    let agrees = || {
+        let held = ctx.fabric.hold().is_some();
+        assert_eq!(ctx.fabric.holds().is_held(), held);
+        assert_eq!(
+            ctx.fabric.hold_observation().is_held(),
+            held,
+            "the Inbox's own holds"
+        );
+        held
+    };
+    assert!(!agrees());
+    ctx.fabric
+        .seed_holds(parse_holds(["local carried"]), &ctx.timeline);
+    assert!(agrees());
+    let guard = meta.lock().unwrap();
+    assert_eq!(
+        ctx.fabric.hold().map(|hold| hold.reason),
+        Some("carried".to_string()),
+        "a read beneath metadata takes no Inbox"
+    );
+    assert!(ctx.fabric.holds().has("local"));
+    drop(guard);
+    assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+    assert!(!agrees());
+    assert!(owner_hold(&store, &format!("{sid} on reason=wait")).starts_with("OK"));
+    assert!(agrees());
+    assert!(apply_hold_for_test(&ctx, None));
+    assert!(!agrees());
 }
 
 #[test]
@@ -3711,14 +3765,19 @@ fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() 
                 )
             })
         };
-        loop {
-            let reply = cmd_outbox_sent(&store, &format!("{sid} 3 off=42 dup=1"));
-            if reply == "OK\n" {
-                break;
-            }
-            assert_eq!(reply, "ERR no such post\n");
-            aterm_uds::deadline::poll_yield();
-        }
+        let retired = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::ZERO,
+            || {
+                let reply = cmd_outbox_sent(&store, &format!("{sid} 3 off=42 dup=1"));
+                if reply == "OK\n" {
+                    return Some(());
+                }
+                assert_eq!(reply, "ERR no such post\n");
+                None
+            },
+        );
+        assert!(retired.is_some(), "post 3 never reached the outbox");
         assert_eq!(
             poster.join().expect("the poster finished"),
             "OK 3 off=42 dup=1\n",
@@ -3958,12 +4017,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 )
             })
         };
-        loop {
-            if cmd_deliver(&store, &format!("{sid} landed=1 off=42")) == "OK\n" {
-                break;
-            }
-            aterm_uds::deadline::poll_yield();
-        }
+        land_once_queued(&store, &sid, 1, 42);
         assert_eq!(
             cmd_deliver(
                 &store,
@@ -3988,12 +4042,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 )
             })
         };
-        loop {
-            if cmd_deliver(&store, &format!("{sid} landed=2 off=43")) == "OK\n" {
-                break;
-            }
-            aterm_uds::deadline::poll_yield();
-        }
+        land_once_queued(&store, &sid, 2, 43);
         assert_eq!(
             cmd_deliver(
                 &store,
@@ -4017,12 +4066,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 )
             })
         };
-        loop {
-            if cmd_deliver(&store, &format!("{sid} landed=3 off=44")) == "OK\n" {
-                break;
-            }
-            aterm_uds::deadline::poll_yield();
-        }
+        land_once_queued(&store, &sid, 3, 44);
         assert_eq!(
             poster.join().expect("the poster finished"),
             "ERR timeout id=3 off=44\n"
@@ -4038,12 +4082,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 )
             })
         };
-        loop {
-            if cmd_deliver(&store, &format!("{sid} landed=4 off=45")) == "OK\n" {
-                break;
-            }
-            aterm_uds::deadline::poll_yield();
-        }
+        land_once_queued(&store, &sid, 4, 45);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(
             cmd_deliver(
@@ -4067,12 +4106,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 )
             })
         };
-        loop {
-            if cmd_deliver(&store, &format!("{sid} landed=5 off=46")) == "OK\n" {
-                break;
-            }
-            aterm_uds::deadline::poll_yield();
-        }
+        land_once_queued(&store, &sid, 5, 46);
         let started = std::time::Instant::now();
         assert_eq!(
             poster.join().expect("the poster finished"),

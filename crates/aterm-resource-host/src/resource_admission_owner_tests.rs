@@ -209,7 +209,7 @@ fn loan_bookkeeping_does_not_resurrect_a_native_terminal_phase() {
     }
     let world = World::new();
     let binding = Binding {
-        session: "s-000000000000000000ab".into(),
+        session: "t00000000ab".into(),
         attempt: [17; 16],
     };
     world.owner.journal.create(&binding).unwrap();
@@ -645,7 +645,7 @@ fn queue_owned(
     attempt: [u8; 16],
 ) -> (Binding, CohortClosureRef, CtlStream) {
     let binding = Binding {
-        session: "s-0000000000000000acde".into(),
+        session: "t000000acde".into(),
         attempt,
     };
     let (host, client) = CtlStream::pair().unwrap();
@@ -1578,7 +1578,7 @@ fn known_member_attempt_never_receives_a_new_no_child_refusal() {
     use aterm_types::resource_subgroup::{Capability, CpuDelegation, GnuTransport, Request};
     let mut world = World::new();
     let binding = Binding {
-        session: "s-0000000000000000acde".into(),
+        session: "t000000acde".into(),
         attempt: [92; 16],
     };
     world.owner.journal.create(&binding).unwrap();

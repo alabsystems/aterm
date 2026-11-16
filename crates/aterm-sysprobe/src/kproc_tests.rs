@@ -271,20 +271,9 @@ mod live {
             .expect("spawn bash")
     }
 
-    fn past_what_the_kernel_hands_over(pid: u32) -> bool {
-        crate::procargs::read(pid).is_err() && record(pid).is_some_and(|r| !r.zombie)
-    }
-
-    /// Whether `ps` printed `pid`'s kernel name in parentheses, its word for a process whose
-    /// arguments it could not read, while the process lives with arguments this crate reads: a
-    /// `ps` whose own read failed (another program's process caught at its exec on a loaded Mac)
-    /// is no oracle for that row. A fixture is never excused: each must be compared, and the
-    /// zombie's row, which both print in parentheses, does not differ.
-    fn ps_read_no_arguments(pid: u32, ps_comm: &str) -> bool {
-        record(pid).is_some_and(|r| !r.zombie && ps_comm == format!("({})", r.comm))
-            && crate::procargs::read(pid).is_ok()
-    }
-
+    /// Compare stable processes this test owns: its own image, two shells blocked on their
+    /// input pipes, and an unreaped zombie. Unrelated processes may exec or rewrite arguments
+    /// between the four `ps` calls even when our readings before and after happen to match.
     #[test]
     fn the_comm_and_args_columns_are_the_ones_ps_prints() {
         type Columns = (String, String, String, String);
@@ -298,68 +287,52 @@ mod live {
         until(bytes.id(), "the shell's exec", |r| {
             r.comm == "bash" && ps_comm(r, Locale::C) == "raw"
         });
-        // SAFETY: `geteuid` reads this process's effective uid.
-        let me = unsafe { libc::geteuid() };
+        let fixtures = [std::process::id(), odd.id(), dead.id(), bytes.id()];
+        let selected = std::iter::once(1)
+            .chain(fixtures)
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let read = || -> BTreeMap<u32, Columns> {
-            records()
-                .expect("records")
-                .iter()
-                .filter(|r| r.uid == me)
-                .map(|r| {
+            fixtures
+                .into_iter()
+                .map(|pid| {
+                    let r = record(pid).expect("the fixture is held until the oracle reads it");
                     let columns = (
-                        ps_comm(r, Locale::C),
-                        ps_args(r, Locale::C),
-                        ps_comm(r, Locale::Utf8),
-                        ps_args(r, Locale::Utf8),
+                        ps_comm(&r, Locale::C),
+                        ps_args(&r, Locale::C),
+                        ps_comm(&r, Locale::Utf8),
+                        ps_args(&r, Locale::Utf8),
                     );
                     (r.pid, columns)
                 })
                 .collect()
         };
         let a = read();
-        let comm = column("C", &["-A", "-o", "pid=,comm="]);
-        let args = column("C", &["-A", "-ww", "-o", "pid=,args="]);
-        let comm_utf8 = column("C.UTF-8", &["-A", "-o", "pid=,comm="]);
-        let args_utf8 = column("C.UTF-8", &["-A", "-ww", "-o", "pid=,args="]);
+        let comm = column("C", &["-p", &selected, "-o", "pid=,comm="]);
+        let args = column("C", &["-p", &selected, "-ww", "-o", "pid=,args="]);
+        let comm_utf8 = column("C.UTF-8", &["-p", &selected, "-o", "pid=,comm="]);
+        let args_utf8 = column("C.UTF-8", &["-p", &selected, "-ww", "-o", "pid=,args="]);
         let b = read();
-        let fixtures = [std::process::id(), odd.id(), dead.id(), bytes.id()];
         for shell in [&mut odd, &mut bytes] {
             drop(shell.stdin.take());
             let _ = shell.wait();
         }
         end(dead);
-        let mut compared = BTreeSet::new();
-        for (pid, mine) in &a {
-            if b.get(pid) != Some(mine) {
-                continue;
-            }
-            let oracle = (
-                comm.get(pid),
-                args.get(pid),
-                comm_utf8.get(pid),
-                args_utf8.get(pid),
-            );
-            let (Some(c), Some(g), Some(cu), Some(gu)) = oracle else {
-                continue;
-            };
-            let differs = (&mine.0, &mine.1, &mine.2, &mine.3) != (c, g, cu, gu);
-            if differs && (past_what_the_kernel_hands_over(*pid) || ps_read_no_arguments(*pid, c)) {
-                continue;
-            }
-            assert_eq!(&mine.0, c, "comm of {pid}");
-            assert_eq!(&mine.1, g, "args of {pid}");
-            assert_eq!(&mine.2, cu, "comm of {pid}, UTF-8");
-            assert_eq!(&mine.3, gu, "args of {pid}, UTF-8");
-            compared.insert(*pid);
-        }
         for pid in fixtures {
-            assert!(
-                compared.contains(&pid),
-                "fixture {pid} compared: {:?} {:?} {:?} {:?}",
-                a.get(&pid),
-                b.get(&pid),
-                comm.get(&pid),
-                args.get(&pid)
+            let mine = &a[&pid];
+            assert_eq!(b.get(&pid), Some(mine), "fixture {pid} stayed unchanged");
+            assert_eq!(Some(&mine.0), comm.get(&pid), "comm of fixture {pid}");
+            assert_eq!(Some(&mine.1), args.get(&pid), "args of fixture {pid}");
+            assert_eq!(
+                Some(&mine.2),
+                comm_utf8.get(&pid),
+                "comm of fixture {pid}, UTF-8"
+            );
+            assert_eq!(
+                Some(&mine.3),
+                args_utf8.get(&pid),
+                "args of fixture {pid}, UTF-8"
             );
         }
         let odd_args = &a[&fixtures[1]];
@@ -389,12 +362,6 @@ mod live {
             (Some(&named.0), Some(&named.1)),
             (comm.get(&1), args.get(&1)),
             "launchd's comm and args"
-        );
-        assert!(
-            compared.len() * 2 >= a.len(),
-            "{} of {} rows compared",
-            compared.len(),
-            a.len()
         );
     }
 
@@ -541,5 +508,58 @@ mod gated {
         drop(closed);
         assert_eq!(LANE.ask_within((), MUST_HAPPEN).answer(), Some(Some(2)));
         assert_eq!(GATE.in_kernel(), 0, "the answered read left the gate");
+    }
+}
+
+/// LS-15: A NAME NOT READ IS NO NAME. Where the kernel reads a process's arguments and its
+/// `KERN_PROCARGS2` read fails (a loaded host, a process mid-exec), `ps` prints the placeholder
+/// `(comm)`: [`crate::kproc::comm_read`] answers none there, so no caller takes `(aterm)` for a
+/// program that is not aterm. CONTROLS: the same record with its arguments read is named by its
+/// `argv[0]`, another user's (whose arguments are never read) by what `ps` prints for it, and a
+/// zombie by `<defunct>`, as [`crate::kproc::ps_comm`] names each.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_name_whose_arguments_were_not_read_is_not_read() {
+    use crate::kproc::{DEFUNCT, Locale, Record, comm_read_by};
+    // SAFETY: `geteuid` reads this process's effective uid.
+    let me = unsafe { libc::geteuid() };
+    let record = |uid: u32, zombie: bool| Record {
+        pid: 4_242,
+        ppid: 1,
+        pgid: 4_242,
+        tpgid: 0,
+        tty: None,
+        uid,
+        comm: "aterm".into(),
+        start_s: 0,
+        start_us: 0,
+        zombie,
+    };
+    let mine = record(me, false);
+    assert_eq!(comm_read_by(&mine, Locale::C, |_| None), None);
+    assert_eq!(
+        crate::kproc::unread(&mine, Locale::C),
+        "(aterm)",
+        "what ps prints for it is the placeholder, never a read name"
+    );
+    let words = |_| {
+        Some(vec![
+            b"/Applications/aterm.app/Contents/MacOS/aterm".to_vec(),
+        ])
+    };
+    assert_eq!(
+        comm_read_by(&mine, Locale::C, words).as_deref(),
+        Some("/Applications/aterm.app/Contents/MacOS/aterm")
+    );
+    assert_eq!(
+        comm_read_by(&record(me, true), Locale::C, |_| None).as_deref(),
+        Some(DEFUNCT)
+    );
+    if me != 0 {
+        let theirs = record(me.wrapping_add(1), false);
+        assert!(
+            comm_read_by(&theirs, Locale::C, |_| None).is_some(),
+            "another user's arguments are never asked: ps names it as it can"
+        );
     }
 }

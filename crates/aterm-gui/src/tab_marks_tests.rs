@@ -191,13 +191,14 @@ fn a_requests_why_is_recorded_in_its_tabs_open() {
 /// A FLEET DRIVE'S SPAWN NAMES ITS REQUESTER ON ITS TAB'S OPEN (ATERM-KI-1109-3): the drive by its
 /// node and the requesting session (`by=fleet:<head>:<sid>`), and the requester's program, model
 /// and account (`agent=`, `model=`, `account=`) beside the `why_text=` its line gave.
-/// NEGATIVE CONTROLS: a requester that names none of them adds none, and an open no drive asked
-/// names no requester at all.
+/// NEGATIVE CONTROLS: a requester that names none of them adds none, one whose `sid=` is a loose
+/// `s-` word names no session (`by=fleet:<head>:-`), and an open no drive asked names no
+/// requester at all.
 #[test]
 fn drive_spawn_open_records_requester() {
     use aterm_types::control_verbs::Requester;
     let mut app = App::headless_for_test();
-    let sid = "s-0123456789abcdef0123";
+    let sid = "tqn5r6e0148";
     let node = "87be5228".repeat(4);
     let requester = Requester::of(
         Some(sid),
@@ -235,11 +236,25 @@ fn drive_spawn_open_records_requester() {
         );
         parked_worker(&mut app)
     };
+    let (_, loose) = {
+        let requester = Requester::of(Some("s-5e55"), None, None, None);
+        let _act = ActScope::asking(
+            ExitActor::fleet_drive(&node, requester.sid()),
+            "spawn",
+            Some("check the m72 disk"),
+            Some(requester),
+        );
+        parked_worker(&mut app)
+    };
     let (_, local) = {
         let _act = ActScope::asking(ExitActor::Ctl, "spawn", Some("check the m72 disk"), None);
         parked_worker(&mut app)
     };
-    for (ctx, by) in [(unnamed, "fleet:87be5228:-"), (local, "ctl")] {
+    for (ctx, by) in [
+        (unnamed, "fleet:87be5228:-"),
+        (loose, "fleet:87be5228:-"),
+        (local, "ctl"),
+    ] {
         let opened = tab_lines(&ctx);
         assert_eq!(field(&opened[0], "by"), Some(by), "{opened:?}");
         for key in ["agent", "model", "account"] {
@@ -334,19 +349,14 @@ fn an_unstarted_workers_close_says_unstarted_and_an_opens_reason_never_closes() 
 fn a_control_clients_close_names_it_as_the_exit_ledger_does() {
     let mut app = App::headless_for_test();
     let (driven, driven_ctx) = person_tab(&mut app);
-    let word = "fleet:n-m9:s-0123456789abcdef0123";
+    let word = "fleet:n-m9:tqn5r6e0148";
     let by = {
         let _drive = crate::fabric::DrivingAs::requested(
             crate::fabric::Driver {
                 node: "n-m9".to_string(),
                 host: "m9".to_string(),
             },
-            aterm_types::control_verbs::Requester::of(
-                Some("s-0123456789abcdef0123"),
-                None,
-                None,
-                None,
-            ),
+            aterm_types::control_verbs::Requester::of(Some("tqn5r6e0148"), None, None, None),
         );
         crate::control::caller_actor_of(crate::control::Scope::Owner, None, &app.store)
     };

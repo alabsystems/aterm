@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStringExt as _;
 
 const LIMIT: usize = 16 * 1024 * 1024;
 pub(crate) struct Settings {
-    pub arguments: Vec<String>,
+    pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
 }
 impl Settings {
@@ -64,7 +64,7 @@ impl Settings {
         }
         let mut arguments = Vec::new();
         for _ in 0..count {
-            arguments.push(String::from_utf8(word(&mut body)?).map_err(|_| invalid())?);
+            arguments.push(OsString::from_vec(word(&mut body)?));
         }
         let count = number(&mut body)?;
         if count > body.len() / 8 {

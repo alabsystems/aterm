@@ -570,6 +570,65 @@ pub fn read_volume(path: &Path) -> Option<Volume> {
     })
 }
 
+/// ONE VOLUME BESIDE ITS EMERGENCY LINE ([`read_lined`]): what is free on it, bytes and inodes,
+/// and the lines the window's disk watch holds it to where it is near enough to the emergency
+/// line ([`crate::floor::Lines::emergency`], [`crate::floor::Lines::files_emergency`]) for them
+/// to matter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lined {
+    /// Where it is mounted.
+    pub mount: PathBuf,
+    /// Bytes an unprivileged writer may still write (`f_bavail`).
+    pub free: u64,
+    /// Free inodes, where the filesystem tracks them (`None` on Windows).
+    pub files_free: Option<u64>,
+    /// The lines the watch holds it to ([`crate::floor::Watch::lines`]); `None` where it is
+    /// above every emergency line it could have, so they were not read.
+    pub lines: Option<crate::floor::Lines>,
+}
+
+/// The volume holding `path` beside its emergency line, read as [`read_volume`] places it
+/// (a nonexistent path by its nearest existing ancestor), and judged by [`lined`]: its free
+/// bytes and inodes, and the watch's lines for it ([`crate::floor::Watch::kept`]) only where it
+/// is near enough to an emergency line for them to matter, so a volume clear of every line costs
+/// one volume read and no file of the watch's. `None` where the volume could not be read.
+#[must_use]
+pub fn read_lined(path: &Path) -> Option<Lined> {
+    let v = volume_of(path, &volumes::table()).ok()?;
+    let lines = || {
+        let now_s = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
+        crate::floor::Watch::kept().lines(&v.key.spelled(), v.total, now_s)
+    };
+    Some(lined(v.mount, v.free, v.files_free, lines))
+}
+
+/// ONE VOLUME BESIDE ITS EMERGENCY LINE, FROM WHAT WAS READ OF IT: mounted at `mount`, with
+/// `free` bytes and `files_free` inodes free, and its lines (`lines`, called at most once) read
+/// only where it has fewer bytes free than any emergency line can be
+/// ([`crate::floor::EMERGENCY_FREE_GIB`], and at most
+/// [`crate::floor::EMERGENCY_FREE_SHARE_MAX_GIB`]) or fewer inodes free than
+/// [`crate::floor::EMERGENCY_FILES_FREE`]: a volume clear of both is never below its line, so
+/// its lines are not read and [`Lined::lines`] is `None`.
+#[must_use]
+pub fn lined(
+    mount: PathBuf,
+    free: u64,
+    files_free: Option<u64>,
+    lines: impl FnOnce() -> crate::floor::Lines,
+) -> Lined {
+    use crate::floor::{EMERGENCY_FILES_FREE, EMERGENCY_FREE_GIB, EMERGENCY_FREE_SHARE_MAX_GIB};
+    let most = EMERGENCY_FREE_SHARE_MAX_GIB
+        .max(EMERGENCY_FREE_GIB)
+        .saturating_mul(GIB);
+    let near = free < most || files_free.is_some_and(|f| f < EMERGENCY_FILES_FREE);
+    Lined {
+        mount,
+        free,
+        files_free,
+        lines: near.then(lines),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Whether the platform's error boxes were off while [`volume_of`] placed a local volume.
@@ -609,8 +668,8 @@ impl Machine for Live {
             wired: available.and(detail.map(|d| d.wired)),
             available,
             physical,
-            swap_used: detail.map(|d| d.swap_used),
-            swap_total: detail.map(|d| d.swap_total),
+            swap_used: detail.and_then(|d| d.swap_used),
+            swap_total: detail.and_then(|d| d.swap_total),
             volume,
             pressure: detail.and_then(|d| d.pressure),
             // On Windows only where this process already reads the GPU (a quiet claim's look

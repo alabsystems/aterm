@@ -780,8 +780,8 @@ fn read_body(filed: &Filed, bytes: &[u8]) -> Result<Read, String> {
             filed.day
         ));
     }
-    if !aterm_types::land_trailer::object_id(&record.base)
-        || !aterm_types::land_trailer::object_id(&record.commit)
+    if !aterm_land_trailer::object_id(&record.base)
+        || !aterm_land_trailer::object_id(&record.commit)
     {
         return Err("its base or its commit is not an object id".to_owned());
     }

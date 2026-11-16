@@ -116,15 +116,6 @@ impl TestCpuSurface {
             Self::Platform(_) => None,
         }
     }
-
-    /// Mutable twin of [`Self::scripted`].
-    #[cfg(test)]
-    pub(crate) fn scripted_mut(&mut self) -> Option<&mut ScriptedPresenter> {
-        match self {
-            Self::Scripted(s) => Some(s),
-            Self::Platform(_) => None,
-        }
-    }
 }
 
 /// The error of either backend, carried as its message.

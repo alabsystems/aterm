@@ -16,7 +16,7 @@ use crate::mac_component::{capture, copy_image, fail, json_file, save, unavailab
 use crate::util::shell_quote as q;
 use crate::{Fail, Res, stop};
 
-const USAGE: &str = "mac codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF] [--kind source|retained] [--replacement-package DIR]\n\
+const USAGE: &str = "mac codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF] [--kind source|retained|retained-distinct|retained-resources] [--replacement-package DIR]\n\
   Run the debug SDK's existing native source component wholly inside a disposable SIP-on\n\
   macOS guest. Preserve its IP and real-home guards and require no pre-existing Codex process.\n\
   Copy and verify the exact host, lab, package metadata and SDK image; retain input hashes,\n\
@@ -38,6 +38,8 @@ struct Ask {
     record: PathBuf,
     image: String,
     retained: bool,
+    distinct: bool,
+    resources: bool,
 }
 
 fn parse(args: &[String]) -> Result<Ask, Fail> {
@@ -64,7 +66,13 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
                 record = Some(PathBuf::from(crate::paths::from_caller(value)))
             }
             "--image" if image.is_none() && !value.is_empty() => image = Some(value.clone()),
-            "--kind" if kind.is_none() && matches!(value.as_str(), "source" | "retained") => {
+            "--kind"
+                if kind.is_none()
+                    && matches!(
+                        value.as_str(),
+                        "source" | "retained" | "retained-distinct" | "retained-resources"
+                    ) =>
+            {
                 kind = Some(value.clone())
             }
             _ => {
@@ -75,12 +83,21 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
         }
         at += 2;
     }
-    let retained = kind.as_deref() == Some("retained");
+    let distinct = kind.as_deref() == Some("retained-distinct");
+    let resources = kind.as_deref() == Some("retained-resources");
+    let retained = kind.as_deref() == Some("retained") || distinct || resources;
+    if (distinct || resources) && replacement.is_some() {
+        return Err(Fail::usage(
+            "distinct intents qualify one image without replacement",
+        ));
+    }
     if replacement.is_some() && !retained {
         return Err(Fail::usage("replacement package requires --kind retained"));
     }
     Ok(Ask {
         retained,
+        distinct,
+        resources,
         replacement,
         aterm: aterm.ok_or_else(|| Fail::usage(USAGE))?,
         package: package.ok_or_else(|| Fail::usage(USAGE))?,
@@ -163,7 +180,7 @@ fn inputs(ask: &Ask, share: &Path) -> Result<Value, Fail> {
         "component_transport_ceiling_seconds":COMPONENT.as_secs(),
         "guest_compilation":false,"host_app_execution":false,"qualification_only":true,
         "runtime_activation":false,"inner_home_and_ip_guards_preserved":true,
-        "qualification_kind": if ask.retained { "retained" } else { "source" }}))
+        "qualification_kind": if ask.resources { "retained-resources" } else if ask.distinct { "retained-distinct" } else if ask.retained { "retained" } else { "source" }}))
 }
 
 fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
@@ -246,7 +263,11 @@ fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
             "guest has an unavailable or non-empty Codex consumer census",
         ));
     }
-    let retained_argument = if ask.retained {
+    let retained_argument = if ask.resources {
+        "--retained-service --app-resources"
+    } else if ask.distinct {
+        "--retained-service --distinct-intents"
+    } else if ask.retained {
         "--retained-service"
     } else {
         ""

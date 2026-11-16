@@ -3824,11 +3824,12 @@ pub(crate) const REMOVED_FEATURES: &[RemovedFeature] = &[
     RemovedFeature {
         table: "operator",
         what: "Embedded operator removed",
-        instead: "a manager session replaced the embedded operator",
-        said: "[operator] starts nothing now. A manager session replaced the embedded \
-               operator: it reads every session with aterm ctl survey and starts workers \
-               with aterm ctl @self spawn agent=claude",
-        replaced_by: "a manager session, which `aterm help workers` describes,",
+        instead: "use native subagents for delegation and aterm ctl survey for existing sessions",
+        said: "[operator] starts nothing now. Use your harness's native subagents for \
+               delegation and its own shell/background tools for commands and scripts. \
+               Inspect existing sessions with aterm ctl survey. New sessions need an explicit \
+               request or a concrete need native tools cannot meet (aterm help workers)",
+        replaced_by: "native delegation with `aterm ctl survey` for existing sessions",
         left: None,
     },
 ];

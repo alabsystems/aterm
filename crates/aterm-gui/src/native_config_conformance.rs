@@ -744,7 +744,7 @@ fn installed_custom_kitty_projection(
     let (cell_w, cell_h) = app
         .spawn_cell_px(wid)
         .expect("headless renderer has admitted cell metrics");
-    let ws = app.windows.get_mut(&wid).expect("headless window");
+    let mut ws = app.windows.get_mut(&wid).expect("headless window");
     let geom = aterm_effects::word_decorations::EffectGeom {
         cell_w,
         cell_h,
@@ -1165,7 +1165,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert!(!model.check_invariant("ViewsNeverAhead", &unadmitted));
 
     {
-        let window = app.windows.get_mut(&wid).expect("headless window");
+        let mut window = app.windows.get_mut(&wid).expect("headless window");
         window.installed_config_assets = None;
         window
             .fx

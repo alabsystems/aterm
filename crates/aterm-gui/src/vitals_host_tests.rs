@@ -1155,8 +1155,8 @@ fn this_macs_memory() -> aterm_sysprobe::MemoryDetail {
         purgeable: Some(35_622 * PAGE),
         file_backed: 957_096 * PAGE,
         app: (621_365 - 35_622) * PAGE,
-        swap_used: 311 << 20,
-        swap_total: 2 << 30,
+        swap_used: Some(311 << 20),
+        swap_total: Some(2 << 30),
         exact: true,
         counters: Some(aterm_sysprobe::VmCounters {
             swapin_bytes: 572_488 * PAGE,
@@ -1184,7 +1184,7 @@ fn mem_sample_keeps_every_class_and_its_ram_classes_sum_to_total() {
     );
     assert_eq!(
         (m.cached, m.free, m.swap_used),
-        ((957_096 + 35_622) * PAGE, 8_603 * PAGE, 311 << 20)
+        ((957_096 + 35_622) * PAGE, 8_603 * PAGE, Some(311 << 20))
     );
     assert!(m.exact);
     assert_eq!(m.counters.map(|c| c.page_bytes), Some(PAGE));
@@ -1479,6 +1479,7 @@ fn the_new_readings_reach_the_model() {
 
     let link = |name: &str, kind, up| aterm_sysprobe::LinkReading {
         name: name.into(),
+        byte_counter: aterm_sysprobe::LinkByteCounter::Cumulative64,
         kind,
         up,
         rate_bps: Some(183_000_000),
@@ -1497,6 +1498,7 @@ fn the_new_readings_reach_the_model() {
     assert_eq!(
         wifi,
         LinkSample {
+            byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
             name: "en0".into(),
             kind: LinkKind::Wifi,
             up: true,
@@ -1974,6 +1976,8 @@ fn the_fullest_peaks_file_fits_its_bound() {
         tokens: widest(),
         mem_churn: widest(),
         proc_starts: widest(),
+        compute_w: widest(),
+        work_per_joule: widest(),
         disks: (0..aterm_vitals::units::DISK_DEVICES_KEPT as u64)
             .map(|n| aterm_vitals::DiskPeaks {
                 id: format!("{:016x}", u64::MAX - n),
@@ -1982,7 +1986,13 @@ fn the_fullest_peaks_file_fits_its_bound() {
             })
             .collect(),
     };
+    assert_eq!(
+        fullest.to_pairs().len(),
+        Peaks::NAMES.len() + 2 * aterm_vitals::units::DISK_DEVICES_KEPT,
+        "every row: the heat chain's two among the fixed ones"
+    );
     let text = peaks_json(&fullest).expect("text");
+    eprintln!("the fullest peaks file is {} bytes", text.len());
     assert!(
         text.len() as u64 * 100 <= PEAKS_MAX_BYTES * 85,
         "{} bytes over 85 % of the {PEAKS_MAX_BYTES}-byte bound, past which a file reads as no \
@@ -2191,6 +2201,556 @@ fn read_of(h: &FreeHistory, now_ms: i64) -> Vec<u64> {
     h.window(now_ms).into_iter().flatten().collect()
 }
 
+/// DC-09c: the three-week free history keeps a file of its own beside the day's, written as the
+/// day's is (once [`PEAKS_EVERY`] has passed, and at once at the thread's stop; an unchanged
+/// series not again), and restoring only the 3 weeks ending now. A damaged file, one of another
+/// schema (the day's own among them) or one over the bound restores an empty series, and three
+/// weeks of the widest rows on the widest mount point fit in 75 % of the bound. Negative
+/// controls: the day's file beside it is neither written nor read by the weeks' file (its keep
+/// leaves it as it was, and the day's file read as weeks restores nothing); a file within the
+/// bound restores.
+#[test]
+fn the_three_week_free_history_round_trips_through_its_file() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(WEEKS_FILE);
+    let day_path = dir.path().join(FREE_FILE);
+    let at0: i64 = 1_791_936_000_000;
+    let hour = 3_600_000;
+    let now = at0 + 30 * hour;
+    let reopen = |now_ms| WeeksFile::open(Some(path.clone()), Instant::now(), now_ms).1;
+    let t0 = Instant::now();
+    let (mut file, restored) = WeeksFile::open(Some(path.clone()), t0, now);
+    assert_eq!(restored, FreeWeeks::default(), "no file, no history");
+
+    let mut weeks = FreeWeeks::new();
+    let mut day = FreeHistory::new();
+    for m in 0..30 * 6 {
+        let t = aterm_vitals::Taken::at(at0 + 300_000 + m * 600_000, 600_000);
+        let free = 412_345_678_901 - m as u64 * 1_000_000;
+        weeks.note_on(FREE_MOUNT, FREE_SIZE, t, free);
+        day.note_on(FREE_MOUNT, FREE_SIZE, t, free);
+    }
+    let day_text = free_json(&day).expect("the day");
+    std::fs::write(&day_path, &day_text).expect("the day's file");
+    file.keep(&weeks, t0 + PEAKS_EVERY / 2, false);
+    assert!(!path.exists(), "within ten minutes of the start: not yet");
+    file.keep(&weeks, t0 + PEAKS_EVERY, false);
+    let back = reopen(now);
+    assert_eq!(
+        back.buckets(now),
+        weeks.buckets(now),
+        "the file gives the hours back"
+    );
+    assert_eq!(back.saved(), weeks.saved());
+    assert_eq!(
+        back.saved().map(|s| s.rows.len()),
+        Some(30),
+        "an hour a row"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&day_path).expect("the day's file"),
+        day_text,
+        "control: the day's file is its own"
+    );
+    // The day's file restores the 24 hours ending now: its oldest bucket, 30 hours back, is cut.
+    assert_eq!(
+        FreeFile::open(Some(day_path.clone()), t0, now)
+            .1
+            .buckets(now),
+        day.buckets(now),
+        "control: the day reads back as it was"
+    );
+
+    let mut more = weeks.clone();
+    more.note_on(
+        FREE_MOUNT,
+        FREE_SIZE,
+        aterm_vitals::Taken::at(now + hour, 600_000),
+        1,
+    );
+    file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, false);
+    assert_eq!(
+        reopen(now + hour).saved(),
+        weeks.saved(),
+        "within ten minutes of the last write"
+    );
+    file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, true);
+    assert_eq!(
+        reopen(now + hour).saved(),
+        more.saved(),
+        "the thread's stop writes at once"
+    );
+    std::fs::write(&path, "kept").expect("a stand-in");
+    file.keep(&more, t0 + 10 * PEAKS_EVERY, true);
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("readable"),
+        "kept",
+        "an unchanged history is not written"
+    );
+
+    let text = weeks_json(&more).expect("text");
+    std::fs::write(&path, &text).expect("the history");
+    assert_eq!(
+        reopen(now + 22 * 24 * hour),
+        FreeWeeks::default(),
+        "three weeks and more after the last write"
+    );
+    for damaged in [
+        "kept",
+        "{",
+        "",
+        r#"{"schema":0,"mount":"/","total":1,"buckets":[[1791936000000,3600000,1,0,5.0,5.0,5.0]]}"#,
+        r#"{"schema":1,"mount":"/","total":1,"buckets":[[1791936000000,3600000,1,0,"5",5.0,5.0]]}"#,
+        day_text.as_str(),
+    ] {
+        std::fs::write(&path, damaged).expect("a damaged file");
+        assert_eq!(reopen(now), FreeWeeks::default(), "{damaged}");
+    }
+    std::fs::write(
+        &path,
+        format!("{text}{}", " ".repeat(WEEKS_MAX_BYTES as usize)),
+    )
+    .expect("big");
+    assert_eq!(reopen(now), FreeWeeks::default(), "a file over the bound");
+    std::fs::write(&path, &text).expect("small");
+    assert_eq!(
+        reopen(now + hour).saved(),
+        more.saved(),
+        "control: within the bound"
+    );
+    assert_eq!(WeeksFile::open(None, t0, now).1, FreeWeeks::default());
+
+    let first = i64::MIN / hour * hour;
+    let widest = SavedFree {
+        volume: VolumeId {
+            mount: "\u{1}".repeat(1024),
+            total: u64::MAX,
+        },
+        rows: (0..aterm_vitals::history::WEEK_BUCKETS as i64)
+            .map(|k| {
+                (
+                    first + k * hour,
+                    aterm_vitals::Agg {
+                        tau_ms: u32::MAX,
+                        n: u16::MAX,
+                        over_ms: u32::MAX,
+                        mean: -f64::MAX,
+                        min: -f64::MAX,
+                        max: -f64::MIN_POSITIVE,
+                    },
+                )
+            })
+            .collect(),
+    };
+    let full = FreeWeeks::restored(&widest, first + 503 * hour);
+    assert_eq!(full.saved(), Some(widest), "three full weeks");
+    let wide = weeks_json(&full).expect("text");
+    assert!(
+        wide.len() as u64 * 100 <= WEEKS_MAX_BYTES * 75,
+        "three weeks of the widest rows fit in 75 % of the read bound: {}",
+        wide.len()
+    );
+}
+
+/// One disk journal row of `body` at `at_s`, its `ts` spelled as the writers spell it.
+fn journal_row(at_s: i64, body: &str) -> String {
+    format!(
+        "{{\"ts\":\"{}\",{body}}}",
+        aterm_agent::harness::usage::rfc3339_utc(at_s)
+    )
+}
+
+/// The disk journal's tail ([`DeedTail`]) is read on the probe thread at its pace and only once
+/// the file changed: never while every window is hidden, at once when one shows, not again while
+/// the file stays as it was (however long), a change waiting out [`DEEDS_EVERY`] with a Disk lens
+/// open and [`DEEDS_IDLE_EVERY`] with none; a journal that goes lists nothing. Its deeds are
+/// those of the 3 weeks ending at the moment asked, with no read; and a read takes the file's
+/// last [`DEEDS_READ_BYTES`] alone, so a removal before a longer line is neither a deed nor a
+/// removal. CONTROLS: each wait ends in the read that follows it (with the lens open at
+/// `DEEDS_EVERY`; a fresh reader of the bounded file), so dropping the hidden test, the change
+/// test or a pace, or reading the whole file, fails it.
+#[test]
+fn the_journal_tail_is_read_when_it_changed_at_its_pace_and_never_while_hidden() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(aterm_agent::harness::cli::DISK_LEDGER);
+    let hour_ms = 1_792_000_800_000_i64;
+    let now_ms = hour_ms + 42 * 60_000;
+    let now_s = now_ms / 1000;
+    let report = journal_row(now_s - 60, r#""kind":"report","free_bytes":890000000000"#);
+    let removed = journal_row(
+        now_s - 30,
+        r#""kind":"removed","path":"/u/old","freed_bytes":2000000000"#,
+    );
+    std::fs::write(&path, format!("{report}\n")).expect("the journal writes");
+    let mut tail = DeedTail::new(Some(path.clone()));
+    let t0 = Instant::now();
+
+    tail.refresh(true, true, t0, now_ms);
+    assert_eq!(tail.read_at, None, "never read while every window hides");
+    assert!(tail.rows.is_empty());
+    tail.refresh(false, false, t0, now_ms);
+    assert_eq!(tail.read_at, Some(t0), "read once a window shows");
+    assert_eq!(tail.rows.len(), 1, "{:?}", tail.rows);
+    tail.refresh(true, false, t0 + DEEDS_IDLE_EVERY, now_ms);
+    assert_eq!(tail.read_at, Some(t0), "an unchanged file is not read");
+
+    std::fs::write(&path, format!("{report}\n{removed}\n")).expect("the journal grows");
+    let early = t0 + DEEDS_EVERY - Duration::from_millis(1);
+    tail.refresh(true, false, early, now_ms);
+    assert_eq!(
+        tail.read_at,
+        Some(t0),
+        "a change waits out DEEDS_EVERY with a lens open"
+    );
+    tail.refresh(false, false, t0 + DEEDS_EVERY, now_ms);
+    assert_eq!(tail.read_at, Some(t0), "and DEEDS_IDLE_EVERY with none");
+    tail.refresh(true, false, t0 + DEEDS_EVERY, now_ms);
+    assert_eq!(tail.read_at, Some(t0 + DEEDS_EVERY), "CONTROL: then read");
+    assert_eq!(tail.rows.len(), 2, "{:?}", tail.rows);
+    assert_eq!(tail.removals, [(hour_ms, 2_000_000_000)]);
+
+    let (deeds, removals) = tail.facts(&[], &[], now_ms + DEEDS_REACH_MS - 40_000);
+    let kinds: Vec<&DeedKind> = deeds.iter().map(|d| &d.kind).collect();
+    assert_eq!(
+        kinds,
+        [&DeedKind::Removed("u/old".into())],
+        "the deeds of the 3 weeks ending then, the older one gone"
+    );
+    assert_eq!(removals, tail.removals, "the chart keeps its own span");
+    assert_eq!(tail.read_at, Some(t0 + DEEDS_EVERY), "and nothing was read");
+
+    std::fs::remove_file(&path).expect("the journal goes");
+    tail.refresh(false, false, t0 + DEEDS_EVERY, now_ms);
+    assert!(
+        tail.rows.is_empty() && tail.removals.is_empty(),
+        "a journal that goes lists nothing"
+    );
+
+    let bound = usize::try_from(DEEDS_READ_BYTES).expect("a bound in memory");
+    let long = "x".repeat(bound + 10);
+    std::fs::write(&path, format!("{removed}\n{long}\n{report}\n")).expect("the journal writes");
+    let mut bounded = DeedTail::new(Some(path.clone()));
+    bounded.refresh(true, false, t0, now_ms);
+    let kinds: Vec<&DeedKind> = bounded.rows.iter().map(|(_, d)| &d.kind).collect();
+    assert_eq!(kinds, [&DeedKind::Checked], "the tail's rows alone");
+    assert!(
+        bounded.removals.is_empty(),
+        "a removal before the bound is out of reach"
+    );
+}
+
+#[test]
+fn journal_read_failures_keep_facts_and_retry_the_same_file_metadata() {
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let path = dir.path().join(aterm_agent::harness::cli::DISK_LEDGER);
+    let hour_ms = 1_792_000_800_000_i64;
+    let now_ms = hour_ms + 42 * 60_000;
+    let removed = journal_row(
+        now_ms / 1000 - 60,
+        r#""kind":"removed","path":"/u/old","freed_bytes":2000000000"#,
+    );
+    std::fs::write(&path, format!("{removed}\n")).expect("the journal writes");
+    let mut tail = DeedTail::new(Some(path));
+    let t0 = Instant::now();
+    tail.refresh(true, false, t0, now_ms);
+    let rows = tail.rows.clone();
+    let removals = tail.removals.clone();
+    let seen = tail.seen.expect("successful file marker");
+    assert_eq!(removals, [(hour_ms, 2_000_000_000)]);
+
+    tail.refresh_with(
+        true,
+        false,
+        t0 + DEEDS_EVERY,
+        now_ms,
+        |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        |_| panic!("failed metadata must not read the tail"),
+    );
+    assert_eq!((&tail.rows, &tail.removals), (&rows, &removals));
+    assert_eq!(tail.seen, Some(seen));
+    assert_eq!(tail.read_at, Some(t0));
+
+    let changed = (seen.0 + 1, seen.1);
+    let failed_at = t0 + DEEDS_EVERY;
+    tail.refresh_with(true, false, failed_at, now_ms, |_| Ok(changed), |_| None);
+    assert_eq!((&tail.rows, &tail.removals), (&rows, &removals));
+    assert_eq!(tail.seen, Some(seen), "a failed read commits no new marker");
+    assert_eq!(tail.read_at, Some(failed_at));
+    tail.refresh_with(
+        true,
+        false,
+        failed_at + DEEDS_EVERY - Duration::from_millis(1),
+        now_ms,
+        |_| Ok(changed),
+        |_| panic!("a retry keeps the tail reader's cadence"),
+    );
+
+    let report = journal_row(
+        now_ms / 1000 - 30,
+        r#""kind":"report","free_bytes":900000000000"#,
+    );
+    let retry_at = failed_at + DEEDS_EVERY;
+    tail.refresh_with(
+        true,
+        false,
+        retry_at,
+        now_ms,
+        |_| Ok(changed),
+        |_| Some(format!("{removed}\n{report}\n")),
+    );
+    assert_eq!(
+        tail.seen,
+        Some(changed),
+        "unchanged metadata is retried after failure"
+    );
+    assert_eq!(tail.rows.len(), 2);
+    assert_eq!(tail.removals, removals);
+
+    tail.refresh_with(
+        true,
+        false,
+        retry_at + DEEDS_EVERY,
+        now_ms,
+        |_| Ok((0, seen.1)),
+        |_| Some(String::new()),
+    );
+    assert!(
+        tail.rows.is_empty() && tail.removals.is_empty(),
+        "a successfully read empty journal clears its old facts"
+    );
+    assert_eq!(tail.seen, Some((0, seen.1)));
+}
+
+/// Each journal row reads as its writer in `aterm_agent::harness` wrote it ([`deed_read`]), the
+/// rows made by the writers themselves: what it records, its bytes, the free space it read,
+/// whether the chart marks it a removal, and whose it is (its session). A `stopped` row (its
+/// writer needs a pass's stop) and DC-02a's `worktree` rows are spelled by hand as their writers
+/// spell them. Read as a tail ([`deeds_of`]): a build cache's sweep intent is closed by its
+/// outcome under its stage's path, a `disk-free` and a worktree intent by their outcome, and a
+/// list that is full takes no older row into its last deed while it counts every removal.
+/// CONTROLS: a sweep intent with no outcome after it is listed (`began removing`); a `stopped`
+/// row's released bytes, a free-space ask's freed bytes and a refusal are no removal; closing a
+/// sweep by its path, or merging into the last deed after the list filled, fails it.
+#[test]
+fn each_journal_row_reads_as_its_writer_wrote_it() {
+    use aterm_agent::harness::disk::{self, Level, SweepAction, ask, poke};
+    use atpkg::build_cache::Unused;
+    let hour_ms = 1_792_000_800_000_i64;
+    let t = hour_ms / 1000 + 42 * 60;
+    let read = |line: &str| {
+        let row: aterm_json::Value = aterm_json::from_str(line).expect("a row");
+        let word = |k: &str| {
+            row.get(k)
+                .and_then(aterm_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let kind = word("kind").expect("a kind");
+        let got = deed_read(&kind, word("action").as_deref(), &row);
+        let sid = word("sid").unwrap_or_default();
+        (got.kind, got.bytes, got.free, got.removal, sid)
+    };
+    let room = 2_000_000_000_u64;
+    let host = ask::HostId {
+        pid: 7,
+        start: String::new(),
+    };
+
+    let screen = poke::Cause::Screen {
+        sid: "S1".into(),
+        code: "ENOSPC".into(),
+    };
+    assert_eq!(
+        read(&disk::poke_row(t, &screen, Some(room), Level::Emergency)),
+        (DeedKind::RanShort, None, Some(room), false, "S1".to_owned()),
+        "a poke's session ran short"
+    );
+    let write = poke::Cause::Write("the strip".into());
+    assert_eq!(
+        read(&disk::poke_row(t, &write, Some(room), Level::Emergency)).4,
+        "",
+        "aterm's own write ran short"
+    );
+
+    let freed = ask::Said::Freed {
+        sid: "S2".into(),
+        freed: 3_000_000_000,
+    };
+    assert_eq!(
+        read(&ask::row(t, "/", &freed, Level::Short, room, &host)),
+        (
+            DeedKind::Asked("freed".into()),
+            Some(3_000_000_000),
+            Some(room),
+            false,
+            "S2".to_owned()
+        ),
+        "the session freed space when asked: its subject, and no removal of the software's"
+    );
+    let asked = ask::Said::Asked {
+        pick: ask::Pick {
+            host: host.clone(),
+            sid: "S3".into(),
+        },
+        until_ms: 0,
+        rose: 0,
+    };
+    assert_eq!(
+        read(&ask::row(t, "/", &asked, Level::Short, room, &host)),
+        (
+            DeedKind::Asked("asked".into()),
+            None,
+            Some(room),
+            false,
+            "S3".to_owned()
+        )
+    );
+    let ended = ask::Said::Ended { asks: 2 };
+    assert_eq!(
+        read(&ask::row(t, "/", &ended, Level::Ok, room, &host)),
+        (
+            DeedKind::Asked("ended".into()),
+            None,
+            Some(room),
+            false,
+            String::new()
+        ),
+        "an ask of no session is aterm's"
+    );
+    assert_eq!(
+        read(&ask::step_row(t, "S4", "/", "wait:fence", &host)),
+        (
+            DeedKind::Asked("step wait".into()),
+            None,
+            None,
+            false,
+            "S4".to_owned()
+        ),
+        "a turn-break step by its word, its reason left"
+    );
+
+    let pip = Path::new("/Users//me/Library/Caches/pip");
+    let cache = || "Caches/pip".to_owned();
+    for (action, bytes, kind, removal) in [
+        ("removed", 700_000_000, DeedKind::Removed(cache()), true),
+        ("failed", 1_000_000, DeedKind::CouldNotRemove(cache()), true),
+        ("refused", 500_000_000, DeedKind::Refused(cache()), false),
+    ] {
+        assert_eq!(
+            read(&disk::free::row(t, "S5", pip, action, Some(bytes), "x")),
+            (kind, Some(bytes), None, removal, "S5".to_owned()),
+            "disk-free {action}"
+        );
+    }
+    assert_eq!(
+        read(&disk::reserve_row(t, "released", Some(4_000_000_000), "x")),
+        (
+            DeedKind::ReserveReleased,
+            Some(4_000_000_000),
+            None,
+            true,
+            String::new()
+        )
+    );
+    assert!(
+        !read(&disk::reserve_row(t, "written", Some(4_000_000_000), "x")).3,
+        "a reserve written is no removal"
+    );
+
+    let builds = || crate::disk_board::BUILD_CACHES.to_owned();
+    let leaf = Path::new("/c/build/a");
+    let stage = Path::new("/c/.ubd/stage/a");
+    let idle = Unused::Idle {
+        idle: Duration::from_secs(86_400),
+    };
+    let sweep = |action, why| disk::sweep_row(t, leaf, action, 5_000_000_000, why);
+    assert_eq!(
+        read(&sweep(SweepAction::Removed, idle)),
+        (
+            DeedKind::Removed(builds()),
+            Some(5_000_000_000),
+            None,
+            true,
+            String::new()
+        )
+    );
+    assert_eq!(
+        read(&sweep(SweepAction::Kept, Unused::Unfinished)),
+        (DeedKind::Kept(builds()), None, None, false, String::new())
+    );
+    let stopped = journal_row(
+        t,
+        concat!(
+            r#""sid":"","kind":"stopped","class":"cargo-targets","free_bytes":2000000000,"#,
+            r#""released_bytes":5000000000"#
+        ),
+    );
+    assert_eq!(
+        read(&stopped),
+        (DeedKind::Stopped, None, Some(room), false, String::new()),
+        "a stop's released bytes repeat its pass's removals"
+    );
+
+    let listed = |rows: &[String]| {
+        let (deeds, _) = deeds_of(&rows.join("\n"), (t + 60) * 1000);
+        deeds.into_iter().map(|(_, d)| d.kind).collect::<Vec<_>>()
+    };
+    let revoked = Unused::Revoked {
+        freed: 5_000_000_000,
+    };
+    assert_eq!(
+        listed(&[
+            disk::sweep_row(t, leaf, SweepAction::Removing, 5_000_000_000, idle),
+            disk::sweep_row(t + 1, stage, SweepAction::Removed, 5_000_000_000, revoked),
+            disk::sweep_row(t + 2, leaf, SweepAction::Removing, 1_000_000_000, idle),
+        ]),
+        [DeedKind::Began(builds()), DeedKind::Removed(builds())],
+        "a sweep's outcome under its stage's path closes its intent; CONTROL: the last stays open"
+    );
+    assert_eq!(
+        listed(&[
+            disk::free::row(t, "S5", pip, "removing", None, "x"),
+            disk::free::row(t + 1, "S5", pip, "removed", Some(700_000_000), "x"),
+            journal_row(
+                t + 2,
+                r#""kind":"worktree","action":"removing","path":"/u/wt/a","bytes":3400000000"#,
+            ),
+            journal_row(
+                t + 3,
+                r#""kind":"worktree","action":"removed","path":"/u/wt/a","freed_bytes":3400000000"#,
+            ),
+        ]),
+        [
+            DeedKind::Removed("worktree a".into()),
+            DeedKind::Removed(cache()),
+        ],
+        "an intent its outcome closed is not listed"
+    );
+
+    // Eight deeds that fill the list, newest first: a removal of /u/a and a check, in turn; then
+    // a removal of /u/z the list has no room for, and a check that would join the eighth deed.
+    let checked = r#""kind":"report","free_bytes":1"#;
+    let a = r#""kind":"removed","path":"/u/a","freed_bytes":1000000000"#;
+    let z = r#""kind":"removed","path":"/u/z","freed_bytes":2000000000"#;
+    let bodies = [checked, z, checked, a, checked, a, checked, a, checked, a];
+    let rows: Vec<String> = bodies
+        .iter()
+        .zip(0_i64..)
+        .map(|(body, i)| journal_row(t - 600 + 10 * i, body))
+        .collect();
+    let (deeds, removals) = deeds_of(&rows.join("\n"), (t + 60) * 1000);
+    assert_eq!(deeds.len(), DEEDS_KEPT);
+    assert_eq!(
+        deeds.last().map(|(_, d)| (&d.kind, d.n)),
+        Some((&DeedKind::Checked, 1)),
+        "a full list takes no older row into its last deed"
+    );
+    assert_eq!(
+        removals,
+        [(hour_ms, 6_000_000_000)],
+        "and counts every removal, the one it had no room for too"
+    );
+}
+
 struct Fills {
     vitals: aterm_vitals::Vitals,
 }
@@ -2218,14 +2778,15 @@ impl Source for Fills {
 fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
     let path = dir.path().join(FREE_FILE);
+    let weeks_path = dir.path().join(WEEKS_FILE);
     let mut earlier = FreeHistory::new();
-    earlier.note_on(
-        FREE_MOUNT,
-        FREE_SIZE,
-        aterm_vitals::Taken::at(unix_ms_now() - 3_600_000, 1_000),
-        9_000,
-    );
+    let mut earlier_weeks = FreeWeeks::new();
+    let then = aterm_vitals::Taken::at(unix_ms_now() - 3_600_000, 1_000);
+    earlier.note_on(FREE_MOUNT, FREE_SIZE, then, 9_000);
+    earlier_weeks.note_on(FREE_MOUNT, FREE_SIZE, then, 9_000);
     std::fs::write(&path, free_json(&earlier).expect("text")).expect("an earlier run's file");
+    std::fs::write(&weeks_path, weeks_json(&earlier_weeks).expect("text"))
+        .expect("an earlier run's three weeks");
     let mut host = VitalsHost::default();
     host.start(
         || Fills {
@@ -2243,6 +2804,9 @@ fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
     let now = unix_ms_now();
     let kept = FreeFile::open(Some(path), Instant::now(), now).1;
     assert_eq!(read_of(&kept, now), [9_000, 7_000], "an hour ago, then now");
+    let kept_weeks = WeeksFile::open(Some(weeks_path), Instant::now(), now).1;
+    let weeks_read: Vec<u64> = kept_weeks.window(now).into_iter().flatten().collect();
+    assert_eq!(weeks_read, [9_000, 7_000], "the three weeks read on too");
 }
 
 /// A source that says what the thread handed it of the host's tellings: each `note_told`, and the
@@ -2736,7 +3300,7 @@ fn every_pane_counts_and_the_plan_is_the_frontmost_windows() {
     let s1 = app.next_session_id;
     let w1 = app.insert_logical_window(crate::stub_session(s1), 24, 80);
     publish(&app, s1, "s-other", Some(plan("bbbbbbbb-0000", 610)), read);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.focused = false;
     }
 
@@ -3875,7 +4439,7 @@ fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
     let _bars = crate::stats_deck::tests::attach_stats();
     let mut app = crate::App::headless_for_test();
     let rx = with_reader(&mut app, &BOARD);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.occluded = true;
     }
     let kinds = |rx: &Receiver<Msg>| -> Vec<bool> {
@@ -8868,5 +9432,73 @@ fn the_entry_names_up_to_three_sources_and_clears_when_none_is_eligible() {
     assert!(
         app.messages.digest().entries.iter().all(|e| e.key != key),
         "cleared once none is eligible"
+    );
+}
+
+/// A window without the System Resources band shows the Sill and counts as shown, so the one
+/// reading stream keeps its pace whether or not the band's window is in view: with the band's
+/// window occluded and the Sill's focused it reads whole every second, unfocused every five
+/// seconds, and only with both occluded the machine counters alone every ten. CONTROL: counting
+/// only the windows that carry the band reads Hidden while the Sill's window is in view.
+#[cfg(unix)]
+#[test]
+fn a_sill_window_in_view_keeps_the_reading_pace_while_the_band_window_is_occluded() {
+    use crate::stats_band::tests::{TwoWindows, two_windows};
+    use crate::stats_deck::StatsBars;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let TwoWindows {
+        mut app,
+        first,
+        second,
+        attached: _attached,
+    } = two_windows();
+    let rx = with_reader(&mut app, &BOARD);
+    assert_eq!(app.window_bars(first), StatsBars::Deck, "PRECONDITION");
+    assert_eq!(app.window_bars(second), StatsBars::Sill, "PRECONDITION");
+    {
+        // An occluded window is not the key window.
+        let mut band = app.windows.get_mut(&first).expect("window");
+        band.occluded = true;
+        band.focused = false;
+    }
+    app.frontmost_window = Some(second);
+    app.windows.get_mut(&second).expect("window").focused = true;
+
+    assert_eq!(app.vitals_audience(), Audience::Shown);
+    assert_eq!(
+        app.vitals_audience().cadence(false),
+        Some((FOCUSED_PERIOD, false)),
+        "1 s, whole readings"
+    );
+    let t0 = Instant::now();
+    app.service_vitals(t0);
+    let read = read_req(&rx, "the Sill window's reading");
+    assert_eq!((read.cadence_ms, read.machine_only), (1000, false));
+    assert_eq!(app.vitals_deadline(), Some(t0 + FOCUSED_PERIOD));
+    // CONTROL: were only the band's windows counted, nothing would be in view.
+    let band_in_view = app
+        .windows
+        .iter()
+        .any(|(wid, ws)| app.window_bars(*wid) == StatsBars::Deck && !ws.occluded);
+    assert_eq!(
+        Audience::of(band_in_view, true, true),
+        Audience::Hidden,
+        "CONTROL: a Sill window that does not count as shown"
+    );
+
+    app.windows.get_mut(&second).expect("window").focused = false;
+    assert_eq!(app.vitals_audience(), Audience::Background);
+    assert_eq!(
+        app.vitals_audience().cadence(false),
+        Some((BACKGROUND_PERIOD, false)),
+        "5 s, whole readings"
+    );
+
+    app.windows.get_mut(&second).expect("window").occluded = true;
+    assert_eq!(app.vitals_audience(), Audience::Hidden);
+    assert_eq!(
+        app.vitals_audience().cadence(false),
+        Some((HIDDEN_PERIOD, true)),
+        "10 s, the machine counters alone"
     );
 }

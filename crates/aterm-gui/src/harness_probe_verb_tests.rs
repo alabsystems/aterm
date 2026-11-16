@@ -6,10 +6,15 @@
 //! line reads nothing.
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::PathBuf;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use aterm_agent::harness::relaunch::Snapshot;
-use aterm_agent::harness::repo_work::{RepoRead, Used};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use aterm_agent::harness::repo_work::RepoRead;
+use aterm_agent::harness::repo_work::Used;
 
 use super::*;
 use crate::session_timeline::{claim_supervisor_as, claim_supervisor_scoped, release_supervisor};
@@ -30,6 +35,7 @@ fn me() -> String {
 
 /// `git <args>` in `dir`, hermetic (no system or global configuration, a fixed author), within
 /// the hang detector.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
@@ -59,6 +65,7 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// A repository at `<root>/work` with one commit pushed to a bare `origin` at
 /// `<root>/remote.git`'s `main`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn pushed_repo(root: &Path) -> PathBuf {
     let work = root.join("work");
     let bare = root.join("remote.git");
@@ -151,6 +158,7 @@ impl Fx {
     }
 
     /// What the window harness's own probe reads of `dir` under this home and state root.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn in_process(&self, dir: &Path) -> RepoRead {
         crate::harness_host::session_repo_work_under(
             dir,
@@ -411,6 +419,7 @@ fn tabs_kept(probes: &Probes) -> usize {
 
 /// `PROBE` asked on the claim's connection with the subject `dir` (as the window harness's
 /// snapshot names it) and a wait of `wait`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn probe_within(fx: &Fx, dir: &Path, wait: std::time::Duration) -> String {
     cmd(
         fx.ctx(),
@@ -430,6 +439,7 @@ fn probe_within(fx: &Fx, dir: &Path, wait: std::time::Duration) -> String {
 
 /// Begins, on tab `sid`'s reads of the subject `dir` in `probes`, a read that goes on until the
 /// returned sender sends (or drops), then answers the folder `held` gone, begun at 7 ms.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn hold_read(probes: &Probes, sid: &str, dir: &Path) -> std::sync::mpsc::Sender<()> {
     let (go, gate) = std::sync::mpsc::channel::<()>();
     let probing = probes.of(sid, &at(dir));
@@ -541,6 +551,7 @@ fn the_reads_keep_the_tabs_asked_about_last() {
 
 /// A published snapshot of `sid`'s agent `pid` born `start`, working in `cwd`, with no
 /// conversation (a codex-alab's run, whose transcript nothing reads).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn snapshot_of(sid: &str, pid: u32, start: &str, cwd: &Path, codex: &Path) -> Snapshot {
     Snapshot {
         lifetime: None,
@@ -572,8 +583,10 @@ fn snapshot_of(sid: &str, pid: u32, start: &str, cwd: &Path, codex: &Path) -> Sn
 }
 
 /// Takes `sid`'s published snapshot down when dropped.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct Unpublish<'a>(&'a str);
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for Unpublish<'_> {
     fn drop(&mut self) {
         crate::harness_host::publish_snapshot_for_test(self.0, None);

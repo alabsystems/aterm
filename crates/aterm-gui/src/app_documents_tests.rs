@@ -751,7 +751,8 @@ fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
             .directory(source_document)
             .unwrap()
             .point_for(Some(&link_uri));
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(source) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(source);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             panic!("directory view")
         };
         state.buffer.as_mut().unwrap().selections =
@@ -763,6 +764,7 @@ fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
                 text: None,
             })
         };
+        drop(route_native_guard);
         app.with_controller_mark(true, |app| {
             app.dispatch_native_view_event(wid, source, enter())
         })
@@ -1127,12 +1129,14 @@ fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_cl
         .directory(document)
         .unwrap()
         .point_for(Some(&target));
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("editor")
     };
     state.buffer.as_mut().unwrap().selections = vec![crate::native_editor::Selection::caret(point)];
 
     fs::write(path.join("a.txt"), "a").unwrap();
+    drop(route_native_guard);
     app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
         .unwrap();
     assert_eq!(app.active_native_view(wid).unwrap().1, view);
@@ -1207,7 +1211,8 @@ fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_cl
     assert!(state.status.is_some());
 
     let origin = app.document_store.snapshot(document).unwrap().text.len();
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("editor")
     };
     state.buffer.as_mut().unwrap().minibuffer = crate::native_editor::Minibuffer::Search {
@@ -1216,6 +1221,7 @@ fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_cl
     };
     fs::remove_file(path.join("a.txt")).unwrap();
     fs::remove_file(path.join("c.txt")).unwrap();
+    drop(route_native_guard);
     app.execute_editor_effect(view, EditorEffect::RefreshDirectory { document })
         .unwrap();
     let crate::native_editor::Minibuffer::Search { origin, .. } =
@@ -1226,11 +1232,13 @@ fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_cl
     let refreshed = app.document_store.snapshot(document).unwrap();
     assert!(*origin <= refreshed.text.len());
     assert!(refreshed.text.is_char_boundary(*origin));
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("editor")
     };
     state.buffer.as_mut().unwrap().clear_minibuffer();
 
+    drop(route_native_guard);
     let ticket = app.mint_document_admission(wid, key.clone());
     app.native_documents
         .admissions
@@ -1811,15 +1819,16 @@ fn focused_config_completion_enter_and_space_activate_its_semantic_button() {
         let context = app
             .editor_config_completion_context(instance, view)
             .expect("exact rendered completion context");
-        let state = app
+        let mut view_guard = app
             .native_runtime
             .view_state_mut(view)
             .expect("config editor view state");
-        state.common_mut().last_focus = Some(focus);
-        let AppViewState::Editor(state) = state else {
+        view_guard.common_mut().last_focus = Some(focus);
+        let AppViewState::Editor(state) = &mut *view_guard else {
             panic!("config editor view state");
         };
         state.config_completion_interaction = Some(context);
+        drop(view_guard);
 
         drive_native(&mut app, key(Key::Named(named_key), Modifiers::empty()));
         assert_eq!(
@@ -2916,7 +2925,8 @@ fn caret_only_context_change_resets_stale_completion_selection_for_paint_and_inp
         .document_store
         .snapshot(app.native_runtime.document_id(instance).unwrap())
         .unwrap();
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("config editor view");
     };
     state.config_completion_interaction = Some(stale);
@@ -2929,6 +2939,7 @@ fn caret_only_context_change_resets_stale_completion_selection_for_paint_and_inp
             .pointer_select(&snapshot.text, 0, false, 4),
         "the fixture changes only the caret"
     );
+    drop(route_native_guard);
     let current = app
         .editor_config_completion_context(instance, view)
         .unwrap();
@@ -3703,10 +3714,12 @@ fn f8_cycles_offscreen_problems_and_keeps_the_full_semantic_message() {
         // Keep a valid scrolled viewport whose caret is outside it: refusing
         // a document gesture must not reveal that caret behind the prompt.
         let offscreen = source.match_indices("# spacer\n").nth(250).unwrap().0;
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             panic!("Manual remains attached");
         };
         state.buffer.as_mut().unwrap().viewport_anchor = offscreen;
+        drop(route_native_guard);
         assert!(editor_buffer(&app, view).primary_selection().head < offscreen);
         let retained = position(&app);
         for previous in [false, true] {
@@ -3815,8 +3828,9 @@ fn ordinary_editor_buffer_enter_still_inserts_a_newline() {
     let document = app.native_runtime.document_id(instance).unwrap();
     app.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::MoveLineEnd))
         .unwrap();
-    let state = app.native_runtime.view_state_mut(view).unwrap();
+    let mut state = app.native_runtime.view_state_mut(view).unwrap();
     state.common_mut().last_focus = Some(crate::native_ui::UiKey::new("editor/buffer"));
+    drop(state);
 
     drive_native(
         &mut app,
@@ -3842,12 +3856,14 @@ fn editor_set_selection_replaces_the_primary_without_mutating_document() {
     let (instance, view) = app.active_native_view(wid).unwrap();
     let document = app.native_runtime.document_id(instance).unwrap();
     let before = app.document_store.snapshot(document).unwrap();
-    let AppViewState::Editor(state) = app.native_runtime.view_state_mut(view).unwrap() else {
+    let mut guard = app.native_runtime.view_state_mut(view).unwrap();
+    let AppViewState::Editor(state) = &mut *guard else {
         panic!("editor view");
     };
     let buffer = state.buffer.as_mut().unwrap();
     buffer.selections = vec![Selection::caret(0), Selection::caret(before.text.len())];
     buffer.primary = 1;
+    drop(guard);
 
     app.dispatch_native_event(wid, AppEvent::EditorSetSelection { anchor: 1, head: 3 })
         .unwrap();
@@ -5444,7 +5460,8 @@ fn a_reload_from_disk_keeps_the_caret_mark_and_scroll_on_their_text() {
     );
     let line_start = |text: &str, key: &str| text.find(key).unwrap();
     let place = |app: &mut App, view: crate::tab_model::ViewId| {
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             panic!("expected editor view");
         };
         let buffer = state.buffer.as_mut().expect("attached editor buffer");
@@ -5701,7 +5718,8 @@ fn a_watched_file_rewritten_under_a_clean_buffer_reloads_in_place() {
 
     let caret = base.find("line 12").unwrap() + 3;
     {
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(views.1) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(views.1);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             panic!("expected editor view");
         };
         let buffer = state.buffer.as_mut().expect("attached editor buffer");

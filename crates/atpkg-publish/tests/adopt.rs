@@ -299,8 +299,8 @@ fn a_compiler_move_that_breaks_the_key_commits_nothing_until_the_fix_is_on_the_b
     let text = show(&f.repo, "adopt/trust-200:trust.lock");
     assert!(
         matches!(
-            aterm_census::seal::check(&text),
-            aterm_census::seal::Seal::Holds { line: 1 }
+            aterm_seal::check(&text),
+            aterm_seal::Seal::Holds { line: 1 }
         ),
         "{text}"
     );

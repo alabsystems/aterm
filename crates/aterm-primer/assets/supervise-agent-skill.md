@@ -91,8 +91,9 @@ second wait beside it.
 Its exit wakes you and prints `@<sid> rev=<n> state=<s> agent=<word> program_state=<w|->
 attention=<pct|-> result_bytes=<n> [conclusion=<finished|failed>] [why=<word>]` per worker as
 soon as one is `done`, `failed`, `exited`, `stalled` or needs attention (`all` waits for all of them; `state=closed` if its tab closed; exit 124
-with `OK timeout` on stderr after 60 min or `timeout=<ms>`). `program_state=` is a codex's
-or Grok Build's own report (a claim, `-` for every other agent); it never wakes the wait.
+with `OK timeout` on stderr after 60 min or `timeout=<ms>`). `program_state=` is a codex's,
+Grok Build's or Claude Code's own report (a claim, `-` for every other agent); it never wakes
+the wait.
 
 `await task` answers only on news after its starting rev (defaulting to each worker's
 current rev, where an already-`done` worker is not news). Always pass `since=0` on the

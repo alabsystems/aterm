@@ -407,24 +407,28 @@ fn a_stage_refused_before_the_swap_leaves_the_installed_build_intact() {
     let watched = StageHooks {
         pre_swap: Some(&watch),
         sidecars: None,
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
     let gate = StageHooks {
         pre_swap: Some(&refuse),
         sidecars: None,
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
     let render = StageHooks {
         pre_swap: None,
         sidecars: Some(&unrenderable),
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
     let suffix = StageHooks {
         pre_swap: None,
         sidecars: Some(&bogus_suffix),
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
@@ -1275,6 +1279,7 @@ fn a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755() {
         let hooks = StageHooks {
             pre_swap: Some(&gate),
             sidecars: None,
+            records: &[],
             aliases: &[],
             npm_package: None,
         };
@@ -2075,6 +2080,7 @@ fn the_staging_scratch_is_private_until_the_swap_and_the_build_is_0755() {
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: None,
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
@@ -2095,6 +2101,7 @@ fn a_failed_sidecar_folder_flush_leaves_the_build_unmarked() {
     let sidecars = |root: &str| Ok(vendor_record(root));
     let hooks = StageHooks {
         sidecars: Some(&sidecars),
+        records: &[],
         ..StageHooks::NONE
     };
     {
@@ -2145,6 +2152,7 @@ fn hooks_run_before_the_swap_and_sidecars_land_before_the_marker() {
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: Some(&sidecars),
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
@@ -2199,6 +2207,7 @@ fn stage_from_tree_lays_only_a_tree_that_folds_to_its_source_root() {
     let hooks = StageHooks {
         pre_swap: Some(&demote),
         sidecars: None,
+        records: &[],
         aliases: &[("codex-old", "codex")],
         npm_package: None,
     };
@@ -2259,6 +2268,7 @@ fn a_stage_stopped_between_swap_and_marker_leaves_no_complete_build() {
     let hooks = StageHooks {
         pre_swap: None,
         sidecars: Some(&sidecars),
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
@@ -2467,6 +2477,7 @@ fn the_stage_lays_its_aliases_before_the_gate_and_folds_them_into_its_root() {
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: Some(&sidecars),
+        records: &[],
         aliases: &[("ay-old", "ay")],
         npm_package: None,
     };

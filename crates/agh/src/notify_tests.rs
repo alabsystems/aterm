@@ -4,6 +4,28 @@
 
 use super::{Notice, Posted, Slug};
 
+/// Notification routing preserves the exact local parent session and refuses malformed IDs
+/// before any socket lookup or post.
+#[test]
+fn notification_routing_uses_the_exact_local_parent_session() {
+    use super::SessionNotifier;
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let env = crate::identity::MapEnv::new().with("ATERM_PARENT_SESSION_ID", sid);
+        assert_eq!(SessionNotifier::from_env(&env).sid, Ok(sid.to_owned()));
+    }
+    for sid in [
+        "tqn5r6e014",
+        "tqn5r6e014u",
+        "TQN5R6E0148",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+        "../session",
+    ] {
+        let env = crate::identity::MapEnv::new().with("ATERM_PARENT_SESSION_ID", sid);
+        assert_eq!(SessionNotifier::from_env(&env).sid, Err("no-session"));
+    }
+}
+
 /// Under a tape, `settled` emits only a line `sendable` answers `Ok`, so a body over the
 /// broker's 4 KiB limit is emitted nowhere, taped or not.
 #[test]

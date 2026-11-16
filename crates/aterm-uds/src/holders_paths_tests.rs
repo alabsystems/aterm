@@ -8,6 +8,73 @@ use std::time::{Duration, Instant};
 
 const HANG: Duration = Duration::from_secs(60);
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_mapping_probe_does_not_hide_a_real_descriptor_user() {
+    use super::super::Failed;
+    use std::os::fd::AsRawFd as _;
+
+    let world = aterm_tempfile::tempdir().expect("private descriptor fixture");
+    let dir = world.path().canonicalize().expect("canonical fixture");
+    let path = dir.join("held task output");
+    std::fs::write(&path, b"inert task output\n").expect("task output");
+    let held = std::fs::File::open(&path).expect("held descriptor");
+    let pid = std::process::id();
+    let dirs = std::slice::from_ref(&dir);
+    let super::Exe::At(exe) = super::exe_of(pid) else {
+        panic!("this process has a named executable");
+    };
+    let failures = [Failed::Closed, Failed::Dead, Failed::Refused, Failed::Other];
+    let found = failures.map(|failed| {
+        super::scan_with(&[pid], dirs, &[], |pid, dirs| {
+            super::mac::uses_with_mappings(pid, dirs, |_, _| Err(failed))
+        })
+        .expect("the actual scan fold")
+    });
+    let both_failed =
+        super::super::hook::refusing(pid, &[held.as_raw_fd()], super::super::hook::ALWAYS, || {
+            super::mac::uses_with_mappings(pid, dirs, |_, _| Err(Failed::Closed))
+        });
+    let exited = super::mac::uses_with_mappings(pid, dirs, |_, _| Err(Failed::Exited));
+    drop(held);
+    let unknown =
+        failures.map(|failed| super::mac::uses_with_mappings(pid, dirs, |_, _| Err(failed)));
+    let clear = super::mac::uses_with_mappings(pid, dirs, |_, _| Ok(None));
+
+    for mut found in found {
+        assert_eq!(
+            found.users,
+            [super::PathUse {
+                pid,
+                how: "fd",
+                path: path.clone(),
+            }]
+        );
+        assert_eq!(found.scanned, 1, "two independent facts about one process");
+        found
+            .users
+            .retain(|user| user.pid != pid || user.how != "fd");
+        assert!(found.users.is_empty(), "the cleaner ignores its own guard");
+        assert_eq!(
+            found.unreadable,
+            [(pid, Some(exe.clone()))],
+            "filtering a use cannot make an incomplete scan clear"
+        );
+    }
+    for (failed, unknown) in failures.into_iter().zip(unknown) {
+        assert!(
+            matches!(unknown, Err((actual, _)) if actual == failed),
+            "without the descriptor the original uncertainty stays: {unknown:?}"
+        );
+    }
+    assert!(
+        matches!(both_failed, Err((Failed::Closed, _))),
+        "a refused descriptor cannot clear the original mapping failure: {both_failed:?}"
+    );
+    assert!(matches!(exited, Err((Failed::Exited, _))), "{exited:?}");
+    assert!(matches!(clear, Ok(None)), "clear probes: {clear:?}");
+}
+
 struct MappedFile {
     address: *mut libc::c_void,
     len: usize,
@@ -202,6 +269,8 @@ const FORK_UNDER_A_TRANSLATOR: &str = "the kernel names the translator as the ex
 
 #[test]
 fn a_fork_of_this_process_that_has_not_execd_is_skipped_with_it() {
+    use std::os::fd::AsRawFd as _;
+
     unsafe extern "C" {
         fn fork() -> i32;
         fn pause() -> i32;
@@ -211,7 +280,8 @@ fn a_fork_of_this_process_that_has_not_execd_is_skipped_with_it() {
     }
     let dir = fresh("fork");
     let held = std::fs::File::open(&dir).expect("a handle on the directory");
-    // SAFETY: the child only calls async-signal-safe `pause`/`_exit`.
+    let handing = crate::spawn_lock::handing(&[held.as_raw_fd()]);
+    // SAFETY: the handoff gate covers fork; the child only calls async-signal-safe pause/_exit.
     let child = unsafe { fork() };
     if child == 0 {
         // SAFETY: as above.
@@ -220,11 +290,22 @@ fn a_fork_of_this_process_that_has_not_execd_is_skipped_with_it() {
             _exit(0)
         }
     }
+    drop(handing);
     assert!(child > 0, "fork");
     let me = std::process::id();
     let child_pid = u32::try_from(child).expect("pid");
     let skipped = scan_path_users(std::slice::from_ref(&dir), &[me]).expect("scan");
     let unskipped = scan_path_users(std::slice::from_ref(&dir), &[]).expect("scan");
+    #[cfg(target_vendor = "apple")]
+    let partial = super::scan_with(
+        &[child_pid],
+        std::slice::from_ref(&dir),
+        &[me],
+        |pid, dirs| {
+            super::mac::uses_with_mappings(pid, dirs, |_, _| Err(super::super::Failed::Refused))
+        },
+    )
+    .expect("a partial scan of the live unexeced fork");
     // SAFETY: our own child; SIGKILL, then reaped.
     unsafe {
         kill(child, 9);
@@ -250,6 +331,11 @@ fn a_fork_of_this_process_that_has_not_execd_is_skipped_with_it() {
         unskipped.users.iter().any(|u| u.pid == child_pid),
         "{:?}",
         unskipped.users
+    );
+    #[cfg(target_vendor = "apple")]
+    assert!(
+        partial.unreadable.iter().any(|(pid, _)| *pid == child_pid),
+        "suppressing a pre-exec use must preserve the independent unknown: {partial:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

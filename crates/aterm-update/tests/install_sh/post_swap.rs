@@ -25,14 +25,25 @@ fn post_swap_signal_ends_the_child_group_before_exit_cleanup() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
-    let child = scratch.stand_in("post-swap-child", r#"#!/bin/sh
+    lib.env(
+        "RECEIPT_MOVE",
+        s(&aterm_uds::deadline::stand_in(std::path::Path::new(
+            "/bin/mv",
+        ))),
+    );
+    let child = scratch.stand_in(
+        "post-swap-child",
+        r#"#!/bin/sh
 [ -z "$TARGET" ] || [ "$2" = "$TARGET" ] || exit 0
 # A descendant waits for cleanup, then proves it survived if its group was not killed.
-/bin/sh -c 'trap "" HUP; : >"$CUT_DONE.ready"; while [ ! -f "$CUT_DONE" ]; do /bin/sleep 0.01; done; echo survived >"$CUT_DONE.survived"' &
+/bin/sh -c 'trap "" HUP; : >"$CUT_DONE.ready"; while [ ! -f "$CUT_DONE" ]; do /bin/sleep 0.01; done;
+echo survived >"$CUT_DONE.survived.tmp";
+"$RECEIPT_MOVE" "$CUT_DONE.survived.tmp" "$CUT_DONE.survived"' &
 while [ ! -f "$CUT_DONE.ready" ]; do /bin/sleep 0.01; done
 kill -s "$SIG" "$PPID"
 wait
-"#);
+"#,
+    );
     lib.step(format!(
         "ln -s {} \"$TMPDIR/child.sh\" && ln -s {} \"$TMPDIR/driver\"",
         q(s(&child)),

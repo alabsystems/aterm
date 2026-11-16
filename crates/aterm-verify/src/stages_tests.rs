@@ -878,6 +878,7 @@ fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
 }
 
 /// The compile lines of `call` (`<step>/<label>`) in a rendered report.
+#[cfg(unix)]
 fn compile_lines<'a>(block: &'a str, call: &str) -> Vec<&'a str> {
     let head = format!("  compile {call}: ");
     block.lines().filter(|l| l.starts_with(&head)).collect()
@@ -1223,23 +1224,30 @@ fn the_measuring_stage_does_not_run_behind_the_failed_compile_that_builds_its_be
 }
 
 #[test]
-fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
+fn the_measuring_stage_hands_paint_and_spin_the_private_admitted_bundle() {
     let c = ctx(Scope::workspace());
     let artifact = crate::MeasureArtifact::unnamed("/release/aterm.app");
+    // Command construction is offline here; the production callback receives this view only
+    // after the private image's three entry points proved their immutable facts.
+    let admitted = crate::AdmittedArtifact {
+        source: &artifact,
+        app: std::path::Path::new("/retained/admitted.app"),
+    };
     let env_of = |cmd: &Cmd, key: &str| {
         cmd.envs
             .iter()
             .find(|(k, _)| k.to_str() == Some(key))
             .map(|(_, v)| PathBuf::from(v))
     };
-    let (_, run) = measuring_cmd(&c, &artifact, measuring_args());
+    let (_, run) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release));
     let (_, prebuild) = measuring_targo(&c, measure_prebuild_args());
     for var in ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"] {
         assert_eq!(
             env_of(&run, var),
-            Some(PathBuf::from("/release/aterm.app/Contents/MacOS/aterm")),
+            Some(PathBuf::from("/retained/admitted.app/Contents/MacOS/aterm")),
             "{var}"
         );
+        assert_ne!(env_of(&run, var), Some(artifact.bin("aterm")), "{var}");
         assert_eq!(
             env_of(&prebuild, var),
             None,
@@ -1252,7 +1260,7 @@ fn the_measuring_stage_hands_paint_and_spin_the_bundle_it_was_handed() {
         "windows by default"
     );
     let quiet = ctx(Scope::workspace()).with_no_windows(true);
-    let (_, quiet_run) = measuring_cmd(&quiet, &artifact, measuring_args());
+    let (_, quiet_run) = measuring_cmd(&quiet, &admitted, measuring_args(Profile::Release));
     assert_eq!(
         env_of(&quiet_run, "ATERM_MEASURE_NO_WINDOWS"),
         Some(PathBuf::from("1")),
@@ -2039,7 +2047,7 @@ fn every_argv_reaches_its_whole_selection() {
             assert!(lint[..sep].contains(c), "{c}: {lint:?}");
         }
     }
-    for argv in [measuring_args(), measure_prebuild_args()] {
+    for argv in [measuring_args(Profile::Release), measure_prebuild_args()] {
         assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
     }
     let g = tippy_gated_args(&Scope::workspace(), &fixture_gated()).expect("gated");
@@ -2290,7 +2298,11 @@ fn compile_only_children_yield_and_children_that_run_code_do_not() {
         assert!(compile.demoted, "targo test --no-run");
         assert!(!run.demoted, "targo test --tests runs code");
         let artifact = crate::MeasureArtifact::unnamed("/release/aterm.app");
-        let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
+        let admitted = crate::AdmittedArtifact {
+            source: &artifact,
+            app: std::path::Path::new("/retained/admitted.app"),
+        };
+        let (_, measuring) = measuring_cmd(&c, &admitted, measuring_args(Profile::Release));
         assert!(
             !measuring.demoted,
             "the measuring benches run the paint, spin, aos, rewind and size guards"
@@ -2928,7 +2940,9 @@ fn a_refusal_its_selection_keeps_reading_outlives_the_records_churn() {
 /// `atpkg::build_cache::stale::USED`): from its child's messages, the unit of a test it built in
 /// the build directory, the unit of a bin a test needs, which cargo named by its copy in the
 /// target alone, and the unit of a build script it ran, with the package it built tests of.
-/// NEGATIVE CONTROL: a compile whose child reported nothing keeps no record.
+/// NEGATIVE CONTROLS: a compile whose child reported nothing keeps no record; and a cut of a
+/// shaped compile (a call that is not its closing one) notes all its child reported and passes,
+/// but closes nothing, so the run keeps no record (closing the note on a cut's success fails it).
 #[cfg(unix)]
 #[test]
 fn the_test_compile_notes_what_it_used_and_closes_the_note() {
@@ -2981,7 +2995,9 @@ fn the_test_compile_notes_what_it_used_and_closes_the_note() {
         &targo,
         &format!("/bin/cat '{}'", tmp.join("wire").display()),
     );
-    let compiled = |wire: &str| {
+    // The test compile, whole, or where `cut` the first of a shaped compile's two calls, a cut
+    // over one crate, which closes nothing.
+    let compiled = |wire: &str, cut: bool| {
         std::fs::write(tmp.join("wire"), wire).expect("the wire");
         let mut c = Ctx::new(
             tmp.clone(),
@@ -2995,7 +3011,23 @@ fn the_test_compile_notes_what_it_used_and_closes_the_note() {
         .with_checkers_in_tests(true);
         c.tools.targo = targo.clone();
         c.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
-        let spec = crate::plan::declared(&c.scope).remove(0);
+        let declared = crate::plan::declared(&c.scope).remove(0);
+        let spec = if cut {
+            crate::plan::StageSpec {
+                part: Some(crate::shape::Part {
+                    piece: crate::shape::Piece::of(&["atpkg".to_owned()], false),
+                    index: 0,
+                    of: 2,
+                    after: Vec::new(),
+                    said: String::new(),
+                    planned: None,
+                    refused: Vec::new(),
+                }),
+                ..declared
+            }
+        } else {
+            declared
+        };
         let mut r = Report::new(spec.title.clone());
         test_compile(&c, &spec, &mut r);
         assert!(
@@ -3006,11 +3038,29 @@ fn the_test_compile_notes_what_it_used_and_closes_the_note() {
         c
     };
     let record = leaf.join(atpkg::build_cache::stale::USED);
-    let c = compiled("");
+    let c = compiled("", false);
     assert!(crate::disk::keep_used(&c).is_empty(), "it reported nothing");
     assert!(!record.exists());
 
-    let c = compiled(&wire);
+    let c = compiled(&wire, true);
+    assert!(
+        c.shape_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .used
+            .get(&crate::disk::Dir::Main)
+            .is_some_and(|noted| {
+                !noted.closed && !noted.failed && !noted.used.profiles.is_empty()
+            }),
+        "the cut noted what it used, and passed"
+    );
+    assert!(
+        crate::disk::keep_used(&c).is_empty(),
+        "a cut never closes the note"
+    );
+    assert!(!record.exists());
+
+    let c = compiled(&wire, false);
     let said = crate::disk::keep_used(&c);
     assert_eq!(said.len(), 1, "{said:?}");
     assert_eq!(
@@ -3902,6 +3952,7 @@ fn measured_result(
 
 fn measured_subject(own: bool) -> Subject {
     Subject {
+        profile: Profile::Release,
         name: "aterm 0.137.0 (22cb722a2ec9) at /Applications/aterm.app".into(),
         head: Some("215fb53331abd9acb2a33e7d7a21d1fa3c2bd8f2".into()),
         own,
@@ -3923,6 +3974,91 @@ fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome,
     let mut r = Report::new("measuring");
     decide_measuring_child(&mut r, &run, "measuring matrices", subject);
     r.outcomes().map(|(o, l)| (o, l.to_string())).collect()
+}
+
+#[test]
+fn debug_measurements_name_shipping_size_as_inapplicable_and_keep_runtime_failures() {
+    let runtime_targets = ["paint", "spin", "aos", "rewind"];
+    let runtime: String = runtime_targets
+        .into_iter()
+        .map(|target| measured_result(target, 1, 1, 0, 0))
+        .collect();
+    let release = measured_subject(true);
+    let mut debug = measured_subject(true);
+    debug.profile = Profile::Debug;
+    let rows = decide_measured(true, runtime.clone(), &debug);
+    assert_eq!(rows.iter().filter(|(o, _)| *o == Outcome::Skip).count(), 1);
+    assert!(rows.iter().any(|(o, _)| *o == Outcome::Ok));
+    assert!(
+        !rows.iter().any(|(o, _)| matches!(o, Outcome::Fail(_))),
+        "{rows:?}"
+    );
+    let debug_args = measuring_args(Profile::Debug);
+    assert_eq!(
+        debug_args
+            .windows(2)
+            .filter(|pair| pair[0] == "--bench")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>(),
+        runtime_targets
+    );
+    let release_args = measuring_args(Profile::Release);
+    assert!(
+        release_args
+            .windows(2)
+            .any(|pair| pair == ["--bench", "size"])
+    );
+
+    // The same four successful runtime reports cannot qualify a release without size evidence.
+    let rows = decide_measured(true, runtime.clone(), &release);
+    assert!(
+        rows.iter()
+            .any(|(o, label)| *o == Outcome::Fail(Severity::CouldNotRun) && label.contains("size")),
+        "{rows:?}"
+    );
+    for missing in runtime_targets {
+        let incomplete = runtime_targets
+            .into_iter()
+            .filter(|target| *target != missing)
+            .map(|target| measured_result(target, 1, 1, 0, 0))
+            .collect();
+        let rows = decide_measured(true, incomplete, &debug);
+        assert!(
+            rows.iter()
+                .any(|(o, _)| *o == Outcome::Fail(Severity::CouldNotRun)),
+            "missing {missing}: {rows:?}"
+        );
+    }
+    let oversized = runtime + &measured_result("size", 1, 0, 1, 0);
+    let rows = decide_measured(false, oversized, &release);
+    assert!(
+        rows.iter()
+            .any(|(o, _)| *o == Outcome::Fail(Severity::GateFailed)),
+        "{rows:?}"
+    );
+    for subject in [&debug, &release] {
+        let mut failed: String = runtime_targets
+            .into_iter()
+            .map(|target| {
+                measured_result(
+                    target,
+                    1,
+                    usize::from(target != "paint"),
+                    usize::from(target == "paint"),
+                    0,
+                )
+            })
+            .collect();
+        if subject.profile == Profile::Release {
+            failed.push_str(&measured_result("size", 1, 1, 0, 0));
+        }
+        let rows = decide_measured(false, failed, subject);
+        assert!(
+            rows.iter()
+                .any(|(o, _)| *o == Outcome::Fail(Severity::GateFailed)),
+            "{rows:?}"
+        );
+    }
 }
 
 #[test]

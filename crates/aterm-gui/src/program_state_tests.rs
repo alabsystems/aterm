@@ -136,174 +136,6 @@ fn a_second_box_between_two_sweeps_is_a_move() {
     assert!(!gate.observe(term.program_state(), true, false, t0));
 }
 
-const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
-/// The wall clock the edge tests' parse batches read, `ms` into the test.
-const WALL0: u64 = 1_760_000_000_000;
-
-/// `bytes` into `term` in one parse batch whose wall clock reads `ms` into the test.
-fn says_at(term: &mut Terminal, bytes: &[u8], ms: u64) {
-    term.process_at(
-        bytes,
-        aterm_core::terminal::ClockReading {
-            wall_ms: Some(WALL0 + ms),
-            ..aterm_core::terminal::ClockReading::now()
-        },
-    );
-}
-
-/// One codex in front's reading, honoured as the sweep judges it (`honoured_for` of the report
-/// standing), with no foreground move.
-fn fed(gate: &mut ProgramStateGate, term: &Terminal, t: Instant) -> (bool, Vec<FedEdge>) {
-    let report = term.program_state();
-    let honoured = honoured_for(Some("codex"), report.state.map(|s| s.app));
-    gate.observe_fed(report, honoured, true, false, t)
-}
-
-/// A TURN BETWEEN TWO READINGS IS FED AND SHOWS NOTHING: a codex `working` at 10 ms and its
-/// `done` at 27 ms, both after a reading of `done`, are fed as that turn's beginning and end at
-/// their batches' wall clocks, while the gate shows no move and counts no turn (the turn
-/// counts are the shown moves'); the next reading feeds them no more. The first reading is a
-/// baseline: the turn before it is fed by none.
-#[test]
-fn a_turn_between_two_readings_is_fed_and_shows_nothing() {
-    let mut term = Terminal::new(24, 80);
-    let mut gate = ProgramStateGate::default();
-    let t0 = Instant::now();
-    says_at(&mut term, WORKING, 0);
-    says_at(&mut term, DONE, 5);
-    assert_eq!(
-        fed(&mut gate, &term, t0),
-        (true, vec![]),
-        "the first reading is a baseline"
-    );
-    says_at(&mut term, WORKING, 10);
-    says_at(&mut term, DONE, 27);
-    assert_eq!(
-        fed(&mut gate, &term, t0),
-        (
-            false,
-            vec![
-                FedEdge::Began(Some(WALL0 + 10)),
-                FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 27)),
-            ]
-        )
-    );
-    assert_eq!((gate.turn_starts(), gate.turn_ends()), (0, 0));
-    assert_eq!(fed(&mut gate, &term, t0), (false, vec![]), "fed once");
-}
-
-/// THE BEGINNING A SHOWN MOVE STARTS IS ITS MARK'S: a `working` shown after `done` feeds
-/// nothing (its mark claims the turn); a `done` and the next `working` read together under a
-/// shown `working` feed the end and that beginning, the gate showing no move; and a turn whole
-/// and the next `working` read together under a shown `done` feed the whole turn, not the
-/// beginning the move shows. Every end is fed, the one a move shows too.
-#[test]
-fn the_begin_a_shown_move_starts_is_the_marks() {
-    let mut term = Terminal::new(24, 80);
-    let mut gate = ProgramStateGate::default();
-    let t0 = Instant::now();
-    says_at(&mut term, DONE, 0);
-    assert_eq!(fed(&mut gate, &term, t0), (true, vec![]));
-    says_at(&mut term, WORKING, 10);
-    assert_eq!(fed(&mut gate, &term, t0), (true, vec![]), "the mark's");
-    assert_eq!(gate.turn_starts(), 1);
-    says_at(&mut term, DONE, 20);
-    says_at(&mut term, WORKING, 30);
-    assert_eq!(
-        fed(&mut gate, &term, t0),
-        (
-            false,
-            vec![
-                FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 20)),
-                FedEdge::Began(Some(WALL0 + 30)),
-            ]
-        ),
-        "no move shows the beginning"
-    );
-    says_at(&mut term, DONE, 40);
-    assert_eq!(
-        fed(&mut gate, &term, t0),
-        (
-            true,
-            vec![FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 40))]
-        ),
-        "a shown end is fed too"
-    );
-    says_at(&mut term, WORKING, 50);
-    says_at(&mut term, DONE, 60);
-    says_at(&mut term, WORKING, 70);
-    assert_eq!(
-        fed(&mut gate, &term, t0),
-        (
-            true,
-            vec![
-                FedEdge::Began(Some(WALL0 + 50)),
-                FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 60)),
-            ]
-        )
-    );
-    assert_eq!(gate.turn_starts(), 2);
-}
-
-/// NONE IS FED ON A MOVE, A FIRST READING, FOR A TURN BEGUN BEFORE A MOVE, OR WITH NO CODEX
-/// IN FRONT: a whole turn read on the gate's first reading or on a foreground move's reading
-/// feeds nothing (unseen output then is not attributable to its writer); after a move, the end
-/// of the turn that was running at it is the run's that left, while a turn begun after the move
-/// is fed; a reading with no codex in front, a Grok Build's own turn under a codex, and a
-/// report whose sequence went back (another engine) feed nothing.
-#[test]
-fn a_move_a_first_reading_and_a_turn_begun_before_a_move_feed_nothing() {
-    let t0 = Instant::now();
-    let none: Vec<FedEdge> = Vec::new();
-    let mut term = Terminal::new(24, 80);
-    let mut gate = ProgramStateGate::default();
-    says_at(&mut term, WORKING, 0);
-    says_at(&mut term, DONE, 5);
-    assert_eq!(fed(&mut gate, &term, t0).1, none, "a first reading");
-    says_at(&mut term, WORKING, 10);
-    says_at(&mut term, DONE, 20);
-    let (_, edges) = gate.observe_fed(term.program_state(), true, true, true, t0);
-    assert_eq!(edges, none, "a move's reading");
-
-    let mut term = Terminal::new(24, 80);
-    let mut gate = ProgramStateGate::default();
-    says_at(&mut term, WORKING, 0);
-    fed(&mut gate, &term, t0);
-    let (_, edges) = gate.observe_fed(term.program_state(), true, true, true, t0);
-    assert_eq!(edges, none);
-    says_at(&mut term, DONE, 30);
-    assert_eq!(
-        fed(&mut gate, &term, t0).1,
-        none,
-        "the turn running at the move is the run's that left"
-    );
-    says_at(&mut term, WORKING, 40);
-    says_at(&mut term, DONE, 50);
-    assert_eq!(
-        fed(&mut gate, &term, t0).1,
-        [
-            FedEdge::Began(Some(WALL0 + 40)),
-            FedEdge::Ended(ProgramStateWord::Done, Some(WALL0 + 50)),
-        ],
-        "CONTROL: a turn begun after the move"
-    );
-    says_at(&mut term, WORKING, 60);
-    says_at(&mut term, DONE, 70);
-    let (_, edges) = gate.observe_fed(term.program_state(), false, false, false, t0);
-    assert_eq!(edges, none, "no codex in front");
-    says_at(
-        &mut term,
-        b"\x1b]7501;state=working:app=grok-build\x1b\\",
-        80,
-    );
-    says_at(&mut term, b"\x1b]7501;state=done:app=grok-build\x1b\\", 90);
-    assert_eq!(fed(&mut gate, &term, t0).1, none, "a Grok Build's turn");
-    let mut other = Terminal::new(24, 80);
-    says_at(&mut other, WORKING, 100);
-    says_at(&mut other, DONE, 110);
-    assert_eq!(fed(&mut gate, &other, t0).1, none, "a sequence gone back");
-}
-
 /// A turn end is `working` then `done`|`idle` as the gate showed them:
 /// not a `done` with no `working` before it, not `working` → `blocked`,
 /// and not a report the gate does not honour.
@@ -392,7 +224,7 @@ fn grok_builds_own_report_is_shown_only_under_a_grok_in_front() {
             seen.push(format!(
                 "{} {}",
                 wire(shown),
-                shown.map_or("-", |(state, _)| row_word(state))
+                shown.map_or_else(|| "-".into(), |(state, _)| row_word(state))
             ));
         }
         seen
@@ -553,7 +385,10 @@ fn a_full_reset_clears_it() {
 /// A REPORT IS HONOURED ONLY UNDER THE PROGRAM IT NAMES: a `codex` report under a codex or a
 /// runtime one runs under, a `grok-build` report under a Grok Build. NEGATIVE CONTROLS: each
 /// app's report under the other program, under a runtime (no Grok Build runs under one), under
-/// a shell or a supervised agent, and under no program.
+/// a shell or a supervised agent, and under no program. Another program's report
+/// (`ProgramApp::Other`) is honoured under a program that is none of the three, leading as a job
+/// or as the session's root (`aterm -e kimi`), never with the session's shell in front or under
+/// one of the three.
 #[test]
 fn a_report_is_honoured_only_under_the_program_it_names() {
     let (codex, grok) = (Some(ProgramApp::Codex), Some(ProgramApp::GrokBuild));
@@ -564,25 +399,57 @@ fn a_report_is_honoured_only_under_the_program_it_names() {
         "/usr/local/bin/node",
         "bun",
     ] {
-        assert!(honoured_for(Some(program), codex), "{program}");
-        assert!(!honoured_for(Some(program), grok), "{program}: not Grok's");
+        assert!(honoured_for(Some(program), codex, true), "{program}");
+        assert!(
+            !honoured_for(Some(program), grok, true),
+            "{program}: not Grok's"
+        );
     }
     for program in ["grok", "/Users//x/.local/share/aterm/agents/grok"] {
-        assert!(honoured_for(Some(program), grok), "{program}");
+        assert!(honoured_for(Some(program), grok, true), "{program}");
         assert!(
-            !honoured_for(Some(program), codex),
+            !honoured_for(Some(program), codex, true),
             "{program}: not codex's"
         );
     }
     for program in ["claude", "muse", "agy", "kimi", "zsh", "-zsh", "vim"] {
-        assert!(!honoured_for(Some(program), codex), "{program}");
-        assert!(!honoured_for(Some(program), grok), "{program}");
+        assert!(!honoured_for(Some(program), codex, true), "{program}");
+        assert!(!honoured_for(Some(program), grok, true), "{program}");
     }
-    assert!(!honoured_for(None, codex));
-    assert!(!honoured_for(None, grok));
+    assert!(!honoured_for(None, codex, true));
+    assert!(!honoured_for(None, grok, true));
     assert!(
-        !honoured_for(Some("codex"), None),
+        !honoured_for(Some("codex"), None, true),
         "no report names no program"
+    );
+    let other =
+        aterm_core::terminal::program_state::AppWord::new("kimi-code").map(ProgramApp::Other);
+    for program in ["kimi", "muse", "agy", "vim", "/opt/x/bin/my-agent", "node"] {
+        assert!(honoured_for(Some(program), other, true), "{program}");
+        assert!(
+            honoured_for(Some(program), other, false),
+            "{program}: the session's root (`aterm -e {program}`)"
+        );
+    }
+    for shell in ["zsh", "-zsh", "bash", "fish"] {
+        assert!(
+            !honoured_for(Some(shell), other, false),
+            "{shell}: the session's shell in front"
+        );
+        assert!(
+            honoured_for(Some(shell), other, true),
+            "{shell}: a shell running as a job (a script, a subshell)"
+        );
+    }
+    for program in ["claude", "codex", "grok"] {
+        assert!(
+            !honoured_for(Some(program), other, true),
+            "{program} reports under its own word"
+        );
+    }
+    assert!(
+        !honoured_for(None, other, true),
+        "no program named in front"
     );
 }
 
@@ -595,6 +462,7 @@ fn the_row_word_names_the_reports_program_and_its_state() {
     };
     assert_eq!(row_word(blocked(ProgramApp::Codex)), "codex blocked");
     assert_eq!(row_word(blocked(ProgramApp::GrokBuild)), "grok blocked");
+    assert_eq!(row_word(blocked(ProgramApp::ClaudeCode)), "claude blocked");
 }
 
 /// THE REAL `status` RECORD AND PRESENCE FACTS of a real session, its real
@@ -659,7 +527,7 @@ fn a_shown_report_is_status_program_state_and_never_agent() {
             .presence_facts(session)
             .and_then(|facts| facts.program)
             .map(|(word, _)| word);
-        assert_eq!(row, codex.then_some("codex working"));
+        assert_eq!(row.as_deref(), codex.then_some("codex working"));
         assert_eq!(field(&record, "last_act").as_deref(), Some("-"));
         app.pool
             .get(session)
@@ -846,12 +714,12 @@ fn claude_reports_are_shown_only_for_claude_and_clear_with_the_root() {
     term.process(b"\x1b]7501;state=working:app=claude-code\x1b\\");
     let report = term.program_state();
     let app = report.state.map(|state| state.app);
-    assert!(honoured_for(Some("claude"), app));
+    assert!(honoured_for(Some("claude"), app, true));
     for other in ["codex", "grok", "node", "bun", "zsh", "muse", "agy", "kimi"] {
-        assert!(!honoured_for(Some(other), app), "{other}");
+        assert!(!honoured_for(Some(other), app, true), "{other}");
     }
-    assert!(!honoured_for(None, app));
-    assert!(gate.observe(report, honoured_for(Some("claude"), app), false, now));
+    assert!(!honoured_for(None, app, true));
+    assert!(gate.observe(report, honoured_for(Some("claude"), app, true), false, now));
     let state = gate.shown().expect("standing Claude report").0;
     assert_eq!(wire(gate.shown()), "working");
     assert_eq!(row_word(state), "claude working");
@@ -859,4 +727,175 @@ fn claude_reports_are_shown_only_for_claude_and_clear_with_the_root() {
     term.process(b"\x1b]7501;state=clear:app=claude-code\x1b\\");
     assert!(gate.observe(term.program_state(), true, false, now));
     assert!(gate.shown().is_none());
+}
+
+/// ANOTHER PROGRAM'S WORD DECIDES NOTHING (HX-15n), through the real sweep
+/// (`App::observe_session_statuses`): a real engine fed `app=kimi-code` reports while a job (a
+/// Kimi Code) leads the terminal says them in the words (the hover's `kimi-code <state>` and the
+/// survey word, `busy`, `question`, `idle`) and moves nothing a decision reads: the engine's known
+/// report and turn count, the gate's shown report (`status program_state=`), the timeline's
+/// shown report (the program-claim need's, the A/B book's and the session log's), its
+/// `program-state` rows, and the gate's turn counts; a Kimi Code that is the session's root
+/// (`aterm -e kimi`) is said the same way. NEGATIVE CONTROLS: codex's own reports under a codex
+/// move every one of them; the same `kimi-code` reports with the session's shell in front are not
+/// even said.
+#[cfg(unix)]
+#[test]
+fn an_osc_7501_app_word_decides_nothing() {
+    use crate::session_timeline::PROGRAM_STATE;
+    const SHELL: i32 = 40_000;
+    const JOB: i32 = 40_001;
+    const K_WORKING: &[u8] = b"\x1b]7501;state=working:app=kimi-code\x1b\\";
+    const K_QUESTION: &[u8] = b"\x1b]7501;state=blocked:app=kimi-code:kind=question\x1b\\";
+    const K_DONE: &[u8] = b"\x1b]7501;state=done:app=kimi-code\x1b\\";
+    const DONE: &[u8] = b"\x1b]7501;state=done:app=codex\x1b\\";
+    /// Each step's `words|decided`, and what the run counted.
+    struct Run {
+        steps: Vec<String>,
+        rows: usize,
+        turns: (u64, u64, u64),
+    }
+    let run = |program: &str, job: bool, stream: &[&[u8]]| -> Run {
+        let mut app = crate::App::headless_for_test();
+        app.session_factory.fg_probe = |master| master;
+        let sid = app.next_session_id;
+        let mut session = crate::stub_session(sid);
+        let front = if job { JOB } else { SHELL };
+        session.master = front;
+        session.pid = SHELL;
+        app.push_stub_tab(crate::WindowId(0), session);
+        let (term, timeline) = {
+            let pooled = app.pool.get(sid).expect("pooled");
+            (
+                std::sync::Arc::clone(&pooled.term),
+                std::sync::Arc::clone(&pooled.ctx.timeline),
+            )
+        };
+        {
+            let mut tl = timeline.lock().unwrap();
+            tl.note_foreground_group(front);
+            tl.set_program(front, Some(program.into()));
+        }
+        let step = std::time::Duration::from_secs(1);
+        let mut t = Instant::now();
+        let mut steps = Vec::new();
+        for bytes in stream {
+            crate::term_lock(&term).process(bytes);
+            let _ = app.observe_session_statuses(t);
+            t += step;
+            let said = app
+                .session_status
+                .program_said(sid)
+                .map_or_else(|| "-".into(), |(state, _)| row_word(state));
+            let tl = timeline.lock().unwrap();
+            let survey = tl
+                .program_said()
+                .map_or("-", |shown| survey_word(shown.state));
+            let engine = crate::term_lock(&term).program_state();
+            steps.push(format!(
+                "{said} {survey}|{} {} {}",
+                wire(app.session_status.program_state(sid)),
+                column(tl.program_shown()),
+                engine.state.map_or_else(|| "-".to_string(), |s| s.wire()),
+            ));
+        }
+        let rows = timeline
+            .lock()
+            .unwrap()
+            .since(None)
+            .filter(|e| e.kind == PROGRAM_STATE)
+            .count();
+        let turns = (
+            crate::term_lock(&term).program_state().turns,
+            app.session_status.program_turn_starts(sid),
+            app.session_status.program_turn_ends(sid),
+        );
+        Run { steps, rows, turns }
+    };
+    let kimi = run(
+        "kimi",
+        true,
+        &[K_WORKING, K_QUESTION, K_WORKING, K_DONE, CLEAR],
+    );
+    assert_eq!(
+        kimi.steps,
+        [
+            "kimi-code working busy|- - -",
+            "kimi-code blocked question|- - -",
+            "kimi-code working busy|- - -",
+            "kimi-code done idle|- - -",
+            "- -|- - -",
+        ],
+        "said in the words, and nothing a decision reads moved"
+    );
+    assert_eq!((kimi.rows, kimi.turns), (0, (0, 0, 0)), "no row, no turn");
+    let codex = run(
+        "codex",
+        true,
+        &[WORKING, BLOCKED_PERMISSION, WORKING, DONE, CLEAR],
+    );
+    assert_eq!(
+        codex.steps,
+        [
+            "codex working busy|working working working",
+            "codex blocked prompt|blocked:permission blocked:permission blocked:permission",
+            "codex working busy|working working working",
+            "codex done idle|done done done",
+            "- -|- - -",
+        ],
+        "CONTROL: codex's reports under a codex move what decides"
+    );
+    assert_eq!(
+        (codex.rows, codex.turns),
+        (5, (1, 1, 1)),
+        "CONTROL: rows and a turn"
+    );
+    let rooted = run("kimi", false, &[K_WORKING, K_DONE]);
+    assert_eq!(
+        rooted.steps,
+        ["kimi-code working busy|- - -", "kimi-code done idle|- - -"],
+        "a Kimi Code the session runs as its root (`aterm -e kimi`) is said"
+    );
+    assert_eq!(
+        (rooted.rows, rooted.turns),
+        (0, (0, 0, 0)),
+        "and decides nothing"
+    );
+    let shell = run("zsh", false, &[K_WORKING, K_DONE]);
+    assert_eq!(
+        shell.steps,
+        ["- -|- - -", "- -|- - -"],
+        "CONTROL: with the session's shell in front another program's report is not said"
+    );
+}
+
+/// ANOTHER PROGRAM'S WORD NEVER STANDS FOR THE NEXT JOB: a report the job that left wrote, which
+/// no sweep read before the foreground move, is not said under the job the move brought; that
+/// job's own next report is. NEGATIVE CONTROL: with no move, the same unread report is said.
+#[test]
+fn another_programs_word_from_before_a_move_is_never_said() {
+    const K_WORKING: &[u8] = b"\x1b]7501;state=working:app=kimi-code\x1b\\";
+    const K_DONE: &[u8] = b"\x1b]7501;state=done:app=kimi-code\x1b\\";
+    let said = |gate: &ProgramStateGate| gate.said().map(|(s, _)| s.wire());
+    for moved in [true, false] {
+        let mut term = Terminal::new(24, 80);
+        let mut gate = ProgramStateGate::default();
+        let t0 = Instant::now();
+        term.process(K_WORKING);
+        assert!(gate.observe_other(term.program_state().other, true, false, t0));
+        term.process(K_DONE);
+        gate.observe_other(term.program_state().other, true, moved, t0);
+        if moved {
+            assert_eq!(said(&gate), None, "the job that left wrote it");
+            term.process(K_WORKING);
+            assert!(gate.observe_other(term.program_state().other, true, false, t0));
+            assert_eq!(
+                said(&gate).as_deref(),
+                Some("working"),
+                "the next job's own"
+            );
+        } else {
+            assert_eq!(said(&gate).as_deref(), Some("done"), "CONTROL: no move");
+        }
+    }
 }

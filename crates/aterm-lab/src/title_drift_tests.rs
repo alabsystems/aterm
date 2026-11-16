@@ -31,7 +31,7 @@ fn native_focus_requires_the_actual_typing_window_and_all_native_facts() {
 fn fixture_focus_waits_for_observed_completion_but_the_measurement_check_does_not() {
     use std::io::{BufRead, BufReader, Write};
 
-    let sid = "s-0123456789abcdef0123";
+    let sid = "t0000000001";
     let typing = Session {
         local: 0,
         sid: sid.into(),
@@ -501,4 +501,176 @@ fn setup_waits_for_actual_producer_metadata_before_freezing_the_roster() {
     assert!(setup_roster_ready(
         &expected, &current, &source, &typing, producer
     ));
+}
+
+/// Independent wire receipts for the cohosted workload and unrelated 30-tab windows.
+fn real_window_receipt(windows: usize) -> (String, Vec<Session>) {
+    let mut text = String::new();
+    let mut rows = Vec::new();
+    let mut session_id = 0;
+    for window in 0..windows {
+        let tabs = if window == 0 { 2 } else { 30 };
+        let active = if window == 0 { 1 } else { 0 };
+        let first = session_id;
+        writeln!(
+            text,
+            "window id={window} focused={} tabs={tabs} active={}",
+            window == 0,
+            first + active + 1
+        )
+        .unwrap();
+        for index in 0..tabs {
+            let chosen = index == active;
+            writeln!(text, "  tab id={} index={} kind=terminal title=\"cat\" state=clean active={chosen} parked=false\n    leaf path=/ view={} focused=true kind=terminal session={session_id}", session_id + 1, index + 1, session_id + 1).unwrap();
+            rows.push(Session {
+                local: session_id as u64,
+                sid: format!("session-{session_id}"),
+                window: window.to_string(),
+                title: "cat".into(),
+                active: chosen,
+                program: "cat".into(),
+                focused: window == 0,
+            });
+            session_id += 1;
+        }
+    }
+    (text, rows)
+}
+
+#[test]
+fn real_window_cases_refuse_tab_counts_as_window_evidence_and_wrong_workload_placement() {
+    for (name, count) in [("windows1", 1), ("windows2", 2), ("windows8", 8)] {
+        let case = Case::parse(name).unwrap();
+        let (text, rows) = real_window_receipt(count);
+        let check = |text: &str, rows: &[Session]| topology(text, case, rows, &rows[0], &rows[1]);
+        assert!(check(&text, &rows).is_ok(), "{name}");
+        assert_eq!(case.receipt()["os_windows"].as_u64(), Some(count as u64));
+        assert_eq!(
+            case.receipt()["terminal_sessions"].as_u64(),
+            Some(rows.len() as u64)
+        );
+        assert!(topology(&text, Case::Tabs(30), &rows, &rows[0], &rows[1]).is_err());
+        assert!(check(&text.replace("tabs=2", "tabs=1"), &rows).is_err());
+        assert!(check(&text.replace("active=2", "active=1"), &rows).is_err());
+        assert!(check(&text.replace("view=2 ", "view=1 "), &rows).is_err());
+        if count > 1 {
+            let (one, one_rows) = real_window_receipt(1);
+            assert!(
+                check(&one, &one_rows).is_err(),
+                "one logical window is not many OS windows"
+            );
+            assert!(check(&text.replace("tabs=30", "tabs=29"), &rows).is_err());
+            let mut moved = rows.clone();
+            moved[2].window = "0".into();
+            assert!(check(&text, &moved).is_err());
+        }
+        let binding = case.receipt().to_string();
+        assert_ne!(binding, Case::Tabs(30).receipt().to_string());
+    }
+    for bad in ["windows0", "windows30", "windows200", "window1"] {
+        assert!(Case::parse(bad).is_err());
+    }
+}
+
+#[test]
+fn every_logical_window_needs_its_own_native_identity_not_a_repeated_focus_receipt() {
+    let (_, rows) = real_window_receipt(8);
+    let good: BTreeMap<_, _> = (0..8)
+        .map(|n| (n.to_string(), (100 + n).to_string()))
+        .collect();
+    validate_native_windows(&rows, &good).unwrap();
+    let mut bad = good.clone();
+    bad.insert("7".into(), "100".into());
+    assert!(validate_native_windows(&rows, &bad).is_err());
+    for value in ["0", "unknown", "00100"] {
+        let mut bad = good.clone();
+        bad.insert("7".into(), value.into());
+        assert!(validate_native_windows(&rows, &bad).is_err());
+    }
+    let mut bad = good.clone();
+    bad.remove("7");
+    assert!(validate_native_windows(&rows, &bad).is_err());
+    let mut bad = good;
+    bad.insert("extra".into(), "108".into());
+    assert!(validate_native_windows(&rows, &bad).is_err());
+}
+
+#[test]
+fn global_present_diagnostics_preserve_counts_without_claiming_hidden_source_latency() {
+    let reply = "OK n_present=17 present_p50_ms=1 present_p95_ms=2 present_p99_ms=3";
+    assert_eq!(present_metrics(reply).unwrap().n, 17);
+    for bad in [
+        reply.replace("n_present=17", ""),
+        reply.replace("present_p95_ms=2", "present_p95_ms=NaN"),
+        reply.replace("present_p99_ms=3", "present_p99_ms=0"),
+    ] {
+        assert!(present_metrics(&bad).is_err());
+    }
+}
+
+#[test]
+fn production_session_placement_creates_real_new_windows_and_keeps_the_workload_cohosted() {
+    use std::io::{BufRead, BufReader, Write};
+    for name in ["windows1", "windows2", "windows8"] {
+        let case = Case::parse(name).unwrap();
+        let (ours, peer) = aterm_uds::CtlStream::pair().unwrap();
+        peer.set_read_timeout(Some(HANG)).unwrap();
+        peer.set_write_timeout(Some(HANG)).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut peer = BufReader::new(peer);
+            // Model the real protocol distinction: spawn adds a tab to its named
+            // existing window; NewWindow creates a distinct window with one tab.
+            let mut windows = vec![vec![0]];
+            let mut next = 1;
+            loop {
+                let mut request = String::new();
+                assert_ne!(peer.read_line(&mut request).unwrap(), 0);
+                let request = request.trim_end();
+                let reply = if request == "sessions" {
+                    let mut reply = format!("OK {next}\n");
+                    for (window, sessions) in windows.iter().enumerate() {
+                        for local in sessions {
+                            writeln!(reply, "{local} {} 0 alive cat window={window} active={} wfocus={} program=cat", aterm_types::tab_id::TabId::from_bits(*local as u64), usize::from(Some(local) == sessions.last()), usize::from(window == 0)).unwrap();
+                        }
+                    }
+                    reply
+                } else if request == "invoke NewWindow" {
+                    windows.push(vec![next]);
+                    next += 1;
+                    "OK created\n".into()
+                } else if let Some(target) = request.strip_prefix("spawn window=") {
+                    let target: usize = target
+                        .strip_suffix(" raise=false")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    windows[target].push(next);
+                    next += 1;
+                    "OK spawned\n".into()
+                } else {
+                    assert_eq!(request, "protocol-end");
+                    peer.get_mut().write_all(b"OK done\n").unwrap();
+                    return windows;
+                };
+                peer.get_mut().write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let mut wire = aterm_agent::RelayClient::new(ours).bounded(HANG);
+        let (source, typing, rows) = place_sessions(&mut wire, case).unwrap();
+        assert_ne!(source.sid, typing.sid);
+        assert_eq!(source.window, typing.window);
+        assert_eq!(source.window, "0");
+        assert_eq!(
+            rows.len() as u64,
+            case.receipt()["terminal_sessions"].as_u64().unwrap()
+        );
+        ask(&mut wire, "protocol-end").unwrap();
+        let observed = server.join().unwrap();
+        assert_eq!(
+            observed.len() as u64,
+            case.receipt()["os_windows"].as_u64().unwrap()
+        );
+        assert_eq!(observed[0], [0, 1]);
+        assert!(observed.iter().skip(1).all(|tabs| tabs.len() == 30));
+    }
 }

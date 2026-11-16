@@ -113,6 +113,29 @@ fn exited_unreaped(pid: i32) -> bool {
     }
 }
 
+/// Whether `pid`'s exit has begun and not finished: on XNU, a record only the zombie lookup finds
+/// whose status is not yet `SZOMB` ([`exited_unreaped`]'s second case). Such a process reads
+/// [`ProcessPresence::Exited`] while its exit still ends its threads, address space and
+/// descriptors, and its parent cannot reap it until the status reads `SZOMB`, so what its end does
+/// is not all there to read yet. The live record is read first: an exit only moves forward, so a
+/// zombie read after it that is already `SZOMB` reads finished. A read that fails says no, and so
+/// does every other platform: Linux shows an exiting process running until its exited row, which
+/// is reapable.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn exit_unfinished(pid: i32) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        short_info(pid, false).is_none()
+            && short_info(pid, true).is_some_and(|info| info.pbsi_status != BsdShortInfo::SZOMB)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Whether `pid` names a live process.
 #[must_use]
 #[cfg(unix)]

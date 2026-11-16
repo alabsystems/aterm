@@ -22,8 +22,11 @@
 //!   `upd` row; and the reader of every Mac's live rows.
 //!
 //! The ring's collections are compiled ATT/1 schemas ([`EV`], [`USE`], [`SUM`], [`RELAY`],
-//! [`PLACE`], [`UPD`]); every row lives at its writer's own Commons machine uuid and is inert at any
-//! other key (`typed::owned`).
+//! [`PLACE`], [`UPD`], [`LOGIN`], [`USAGE`]); every row lives at its writer's own Commons machine
+//! uuid and is inert at any other key (`typed::owned`). `LOGIN` and `USAGE` are the rows of the
+//! shared files `ai/logins` and `ai/usage`, and `EV` the entries of `ai/events`
+//! (`crate::file::types`); an older build reads none of the two new collections and still reads
+//! every other row of a record that carries them.
 
 pub mod event;
 pub mod place;
@@ -205,12 +208,154 @@ crate::att_collection!(
     }
 );
 
+/// The CLI words a `login` row names (`Event::cli`'s words).
+pub const CLIS: &[&str] = &[
+    "claude",
+    "codex",
+    "grok",
+    "kimi",
+    "agy",
+    "muse",
+    "codex-alab",
+];
+
+/// The reading-source words a `usage` row names: [`Source`]'s words a reading carries.
+pub const READING_SOURCES: &[&str] = &[
+    "statusline",
+    "rollout",
+    "session-usage",
+    "cli-output",
+    "signin-flow",
+    "error",
+    "relay",
+    "probe",
+];
+
+crate::att_collection!(
+    /// One login this Mac holds for one account (docs/DESIGN-shared-files-2026-11-11.md §10
+    /// file 3, the shared file `ai/logins`): `<account pk>.<uuid32>`, at most 768 B. Every value
+    /// is a closed word, a count or a time, so it can carry no address, path, URL or secret. The
+    /// times are Unix milliseconds of the writing Mac's clock, an author's claim.
+    pub LOGIN = Collection {
+        name: "login",
+        version: 1,
+        kind: Merge::Owned,
+        writers: Writers::SelfSuffix,
+        prefix: "",
+        derive: Derive::Composite,
+        columns: &[
+            Column::new("n", Ty::Uint).writer(Writer::Mine),
+            Column::new("account", Ty::Ref("account")).writer(Writer::Mine),
+            Column::new("cli", Ty::Enum(CLIS)).writer(Writer::Mine),
+            Column::new("place", Ty::Enum(&["default", "managed"])).writer(Writer::Mine),
+            Column::new(
+                "state",
+                Ty::Enum(&[
+                    "signed-in",
+                    "signed-out",
+                    "ended",
+                    "wrong-account",
+                    "key-only",
+                    "routed",
+                ]),
+            )
+            .writer(Writer::Mine),
+            Column::new("proof", Ty::Enum(&["status", "page", "file", "unchecked"]))
+                .writer(Writer::Mine),
+            Column::new(
+                "src",
+                Ty::Enum(&["profile", "auth-file", "cli-log", "vault-token"]),
+            )
+            .writer(Writer::Mine),
+            Column::new("use", Ty::Enum(&["running", "idle"])).writer(Writer::Mine),
+            Column::new("tabs", Ty::Uint).writer(Writer::Mine),
+            Column::new(
+                "held",
+                Ty::Enum(&["linked", "fill", "borrow", "stranded", "probation"]),
+            )
+            .writer(Writer::Mine),
+            Column::new("since", Ty::Time).writer(Writer::Mine),
+            Column::new("at", Ty::Time).writer(Writer::Mine),
+            Column::new("served_at", Ty::Time).null().writer(Writer::Mine),
+            Column::new("ends_by", Ty::Time).null().writer(Writer::Mine),
+            Column::new("ended_at", Ty::Time).null().writer(Writer::Mine),
+            Column::new(
+                "attempt",
+                Ty::Enum(&["none", "signed-in", "failed", "blocked", "no-route"]),
+            )
+            .writer(Writer::Mine),
+            Column::new("attempt_at", Ty::Time).null().writer(Writer::Mine),
+            Column::new(
+                "attempt_route",
+                Ty::Enum(&["vault", "device", "browser", "window", "mail-code"]),
+            )
+            .null()
+            .writer(Writer::Mine),
+            Column::new("plan", Ty::Text(16)).null().writer(Writer::Mine),
+        ],
+        unique: &[],
+        max_row: caps::LOGIN_ROW,
+    }
+);
+
+crate::att_collection!(
+    /// This Mac's latest reading of one account's limit windows (docs/DESIGN-shared-files-2026-11-11.md
+    /// §10 file 4, the shared file `ai/usage`): `<account or sub-account pk>.<uuid32>`, at most
+    /// 1,024 B. A percent is tenths of a percent used. A reset is the provider's stated instant,
+    /// Unix milliseconds: the one time two Macs' readings are compared by (`ai/limits`), since it
+    /// is the provider's, never a Mac's clock. `read_at` and `at` are the writing Mac's clock, an
+    /// author's claim that orders nothing.
+    pub USAGE = Collection {
+        name: "usage",
+        version: 1,
+        kind: Merge::Owned,
+        writers: Writers::SelfSuffix,
+        prefix: "",
+        derive: Derive::Composite,
+        columns: &[
+            Column::new("n", Ty::Uint).writer(Writer::Mine),
+            Column::new("account", Ty::Ref("account")).writer(Writer::Mine),
+            Column::new("sub", Ty::Hex(12)).null().writer(Writer::Mine),
+            Column::new("w5h", Ty::Uint).null().writer(Writer::Mine),
+            Column::new("w7d", Ty::Uint).null().writer(Writer::Mine),
+            Column::new("w7dm", Ty::Uint).null().writer(Writer::Mine),
+            Column::new("w5h_reset", Ty::Time).null().writer(Writer::Mine),
+            Column::new("w7d_reset", Ty::Time).null().writer(Writer::Mine),
+            Column::new("w7dm_reset", Ty::Time).null().writer(Writer::Mine),
+            Column::new(
+                "wall",
+                Ty::Enum(&["none", "5h", "7d", "7d-model", "credits", "auth"]),
+            )
+            .writer(Writer::Mine),
+            Column::new("wall_until", Ty::Time).null().writer(Writer::Mine),
+            Column::new(
+                "credits",
+                Ty::Int {
+                    min: i64::MIN,
+                    max: i64::MAX,
+                },
+            )
+            .null()
+            .writer(Writer::Mine),
+            Column::new("plan", Ty::Text(16)).null().writer(Writer::Mine),
+            Column::new("src", Ty::Enum(READING_SOURCES)).writer(Writer::Mine),
+            Column::new("read_at", Ty::Time).writer(Writer::Mine),
+            Column::new("at", Ty::Time).writer(Writer::Mine),
+            Column::new("sessions_7d", Ty::Uint).writer(Writer::Mine),
+            Column::new("last_start", Ty::Time).null().writer(Writer::Mine),
+            Column::new("last_end", Ty::Time).null().writer(Writer::Mine),
+        ],
+        unique: &[],
+        max_row: caps::USAGE_ROW,
+    }
+);
+
 /// The journal ring's collections, as one typed table. Its records are automatic by nature;
 /// the ring's fixed shares bound them, not a quota.
 pub const JOURNAL: Table = Table {
     application: APPLICATION,
     role: ROLE,
-    collections: &[&EV, &USE, &SUM, &RELAY, &PLACE, &UPD],
+    collections: &[&EV, &USE, &SUM, &RELAY, &PLACE, &UPD, &LOGIN, &USAGE],
     self_quota: usize::MAX,
     ends: &[],
 };

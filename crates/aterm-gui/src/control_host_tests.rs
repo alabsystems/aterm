@@ -392,3 +392,34 @@ fn an_exited_state_alone_ends_a_parked_wait() {
     );
     wait.join().unwrap();
 }
+
+/// A verb's change to the engine (`mainscreen`) rings the keeper's META pump, since it may move
+/// what a META carries with no output for the PTY reader to see; a read, and a verb for a session
+/// this host does not serve, ring nothing.
+#[cfg(unix)]
+#[test]
+fn a_verbs_engine_change_rings_the_keepers_meta_pump() {
+    let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+    let watchers = Arc::<crate::session_watch::Watchers>::default();
+    let host = GuiHost::new(0, &term, None, &watchers);
+    let rings = crate::keeper_link::rings;
+    let before = rings();
+    assert_eq!(
+        host.with_terminal(0, Terminal::is_alternate_screen),
+        Some(false)
+    );
+    assert_eq!(
+        host.with_terminal_mut(1, |t| t.process(b"\x1b[?1049h")),
+        None
+    );
+    assert_eq!(
+        rings(),
+        before,
+        "a read, and a session not served, ring nothing"
+    );
+    assert_eq!(
+        host.with_terminal_mut(0, |t| t.process(b"\x1b[?1049h")),
+        Some(())
+    );
+    assert_eq!(rings(), before + 1, "an engine change rings once");
+}

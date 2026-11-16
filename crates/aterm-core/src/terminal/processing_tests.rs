@@ -1095,7 +1095,7 @@ fn process_at_is_deterministic_under_injected_clock() {
             term.modes().synchronized_output(),
             bells.load(Ordering::Relaxed),
             marks,
-            term.program_state().turn_edges().collect(),
+            term.program_turns().iter().collect(),
         )
     };
 
@@ -1130,8 +1130,10 @@ fn process_at_is_deterministic_under_injected_clock() {
     assert_eq!(
         turns,
         [ProgramTurn {
+            n: 1,
             app: ProgramApp::Codex,
             began: Some(edge(1, 1_270)),
+            resumed: false,
             ended: Some((ProgramStateWord::Done, edge(2, 1_280))),
         }],
         "OSC 7501 turn edges must carry the injected wall_ms, not host time"

@@ -478,6 +478,9 @@ pub const ANCHORS: &[Anchor] = &[
     // goes to the terminal's tab, and holds the rest glyph under a terminal multiplexer.
     composed("title.running", "◐◑", "2.1.304"),
     composed("title.rest", "✳", "2.1.304"),
+    // The `app` its OSC 7501 program-status reports name (`state=<word>:app=claude-code`,
+    // `crate::phase::report_runs`), which it writes once a terminal answers its `OSC 7501 ; ?`.
+    lit("status.app", "claude-code", "2.1.311"),
     lit("footer.shortcuts", "? for shortcuts", "2.1.283"),
     hint("footer.clear", "esc to clear", "2.1.283"),
     // The prompt-history search's label (Ctrl-R) on a footer row, its query after it; in a narrow

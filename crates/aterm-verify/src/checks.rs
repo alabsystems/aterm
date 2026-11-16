@@ -210,7 +210,7 @@ pub const CHECKS: [Spec; 19] = [
         reach: Reach::Selection,
         needs: &["targo", "ty"],
         also: "",
-        runs: "ATERM_SPEC_CHECKERS=1 reruns compiled tests (main target dir; after test; binaries side by side within the run's CPU share); under release, test asserts the variable itself",
+        runs: "ATERM_SPEC_CHECKERS=1 runs compiled tests (main target dir; binaries side by side within the run's CPU share); shares test's execution when it already enables checkers, otherwise runs after test",
     },
     Spec {
         check: Check::Appkit,
@@ -328,6 +328,17 @@ impl Check {
             .expect("every check is in CHECKS")
     }
 
+    /// The stages that decide this check in the selected run. A checker-enabled test
+    /// execution also decides `checkers`; ordinary tests leave its separate execution intact.
+    #[must_use]
+    pub fn stages(self, checks: &[Check], checkers_in_tests: bool) -> &'static [StageId] {
+        if self == Self::Checkers && checkers_in_tests && checks.contains(&Self::Test) {
+            Self::Test.spec().stages
+        } else {
+            self.spec().stages
+        }
+    }
+
     #[must_use]
     pub fn name(self) -> &'static str {
         self.spec().name
@@ -398,9 +409,12 @@ pub fn lookup(w: &str) -> Option<Word> {
 
 /// The stages a selection of checks plans, each check's in order, without repeats.
 #[must_use]
-pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
+pub fn stages_of(checks: &[Check], checkers_in_tests: bool) -> Vec<StageId> {
     let mut v: Vec<StageId> = Vec::new();
-    for id in checks.iter().flat_map(|c| c.spec().stages) {
+    for id in checks
+        .iter()
+        .flat_map(|c| c.stages(checks, checkers_in_tests))
+    {
         if !v.contains(id) {
             v.push(*id);
         }
@@ -421,10 +435,9 @@ pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
 /// `--test-threads`, `--timeout`, `--admit`, `--log`, `--events`, `--test-seed`) is no part.
 #[must_use]
 pub fn part(check: Check, ctx: &crate::Ctx, base: &str, changed: &str) -> String {
-    let spec = check.spec();
+    let required = check.stages(&ctx.checks, ctx.checkers_in_tests);
     let wanted = crate::plan::wanted(ctx);
-    let stages: Vec<String> = spec
-        .stages
+    let stages: Vec<String> = required
         .iter()
         .filter(|id| wanted.contains(id))
         .map(|id| format!("{id:?}"))
@@ -440,8 +453,8 @@ pub fn part(check: Check, ctx: &crate::Ctx, base: &str, changed: &str) -> String
     let mut flag = |name: &str, on: bool| parts.push(format!("{name}={on}"));
     flag("release", ctx.release);
     flag("fix", ctx.fix);
-    let has = |any: &[StageId]| spec.stages.iter().any(|id| any.contains(id));
-    if spec.stages.iter().any(|id| id.opens_windows()) {
+    let has = |any: &[StageId]| required.iter().any(|id| any.contains(id));
+    if required.iter().any(|id| id.opens_windows()) {
         flag("no_windows", ctx.no_windows);
     }
     if has(&[StageId::TestCompile, StageId::MeasurePrebuild]) {
@@ -570,13 +583,15 @@ pub fn with(wanted: &[Check], check: Check) -> Vec<Check> {
         .collect()
 }
 
-/// The check a stage's rows count toward in this selection.
+/// Every check a stage's rows decide in this selection. Shared execution retains
+/// each check's own verdict, including a compilation failure or an unavailable runtime.
 #[must_use]
-pub fn owner(id: StageId, checks: &[Check]) -> Option<Check> {
+pub fn owners(id: StageId, checks: &[Check], checkers_in_tests: bool) -> Vec<Check> {
     checks
         .iter()
-        .find(|c| c.spec().stages.contains(&id))
+        .filter(|c| c.stages(checks, checkers_in_tests).contains(&id))
         .copied()
+        .collect()
 }
 
 /// The sets a check belongs to, as `list` prints them.

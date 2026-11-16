@@ -472,7 +472,7 @@ fn clean_composed_capture_strips_effect_shape_and_restores_decscusr() {
 }
 
 fn arm_synthetic_typed(app: &mut App, wid: WindowId, now: Instant) {
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
     window.fx.cursor_mut().glow.note_synthetic_typed(now, 1);
     window.fx.cursor_mut().trail.note_synthetic_typed(now);
 }
@@ -505,7 +505,7 @@ fn type_one_licensed_echo(
         )
     };
     {
-        let window = app.windows.get_mut(&wid).expect("test window");
+        let mut window = app.windows.get_mut(&wid).expect("test window");
         assert_eq!(window.fx.cursor_mut().glow.cursor_anchor(), Some(origin));
         assert_eq!(window.fx.cursor_mut().trail.cursor_anchor(), Some(origin));
         window.fx.cursor_mut().glow.note_typed_cells(at, 1);
@@ -520,7 +520,7 @@ fn observe_cat_pulse_route(
     tick: Instant,
     route: &str,
 ) -> (bool, bool, bool, bool) {
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
     let classified = window.fx.cursor_mut().glow.admission_tally().licensed > 0;
     let before_replay = window.fx.companions_mut().cursor_cat.momentum(tick);
     let delivered = before_replay > 0.0;
@@ -697,7 +697,7 @@ fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
     let t0 = Instant::now();
 
     {
-        let window = app.windows.get_mut(&wid).expect("ordinary window");
+        let mut window = app.windows.get_mut(&wid).expect("ordinary window");
         window.focused = true;
         window.poof_row_buf = vec![' '; 80];
     }
@@ -709,7 +709,7 @@ fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
 
     let typed = t0 + Duration::from_millis(1);
     {
-        let window = app.windows.get_mut(&wid).expect("ordinary window");
+        let mut window = app.windows.get_mut(&wid).expect("ordinary window");
         window.fx.cursor_mut().glow.note_typed_cells(typed, 1);
         window.fx.cursor_mut().trail.note_typed(typed);
         window.poof_row_buf[0] = 'x';
@@ -740,7 +740,7 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
         wid,
         ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16))
     ));
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
     assert!(
         !window.fx.cursor().glow_laid().is_empty(),
         "the typed cursor move really spawned the fire whose cue was drained"
@@ -758,13 +758,14 @@ fn mixed_advance_drains_muted_cues_and_retain_does_not_advance() {
     let retained_glow = window.fx.cursor().glow_laid();
     let retained_trail = window.fx.cursor_mut().trail_scratch.clone();
 
+    drop(window);
     assert!(app.composed_cursor_frame(
         wid,
         ComposedCursorFxClock::Retain {
             observed_at: t0 + Duration::from_millis(17),
         },
     ));
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
     assert_eq!(window.fx.cursor().glow_laid(), retained_glow);
     assert_eq!(window.fx.cursor_mut().trail_scratch, retained_trail);
     assert!(
@@ -972,7 +973,7 @@ fn run_alt_reanchor(with_repaint_blink: bool) -> (usize, Option<Instant>) {
     term_lock(&term).process(b"\x1b[?1049h\x1b[6;3H");
     assert!(app.composed_cursor_frame(wid, ComposedCursorFxClock::Advance(t0)));
     {
-        let window = app.windows.get_mut(&wid).expect("test window");
+        let mut window = app.windows.get_mut(&wid).expect("test window");
         window
             .fx
             .cursor_mut()
@@ -1024,7 +1025,7 @@ fn mixed_advance_translates_scroll_anchors() {
         ComposedCursorFxClock::Advance(t0 + Duration::from_millis(8))
     ));
     {
-        let window = app.windows.get_mut(&wid).expect("test window");
+        let mut window = app.windows.get_mut(&wid).expect("test window");
         let authored = t0 + Duration::from_millis(15);
         window.fx.cursor_mut().glow.note_return(authored);
         window.fx.cursor_mut().trail.note_return(authored);
@@ -1889,7 +1890,8 @@ fn headless_split_capture_holds_advance_and_retain_without_ticking_effects() {
         .content_scroll_state()
         .coordinate_generation();
     let predictor_deadline = {
-        let window = app.windows.get_mut(&wid).expect("test window");
+        let mut field_guard_window = app.windows.get_mut(&wid).expect("test window");
+        let window = &mut **field_guard_window;
         window.next_trail_tick = Some(next_trail_tick);
         window.last_trail_fire = Some(last_trail_fire);
         window
@@ -2207,7 +2209,7 @@ fn extracted_composed_style_gate_consumes_pulse_before_route_change() {
         .is_some()
     );
     {
-        let window = app.windows.get_mut(&wid).expect("test window");
+        let mut window = app.windows.get_mut(&wid).expect("test window");
         assert!(window.fx.cursor_mut().glow.admission_tally().licensed > 0);
         assert_eq!(
             window.fx.companions_mut().cursor_cat.momentum(fire_tick),
@@ -2397,7 +2399,7 @@ fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
     };
     park(&mut app);
     App::retire_unfocused_pane_snapshots(
-        app.windows.get_mut(&wid).expect("test window"),
+        &mut app.windows.get_mut(&wid).expect("test window"),
         crate::VisibleContentRoute::Terminal { composed: true },
     );
     assert!(
@@ -2415,7 +2417,7 @@ fn only_the_composed_route_keeps_the_unfocused_pane_snapshots() {
         park(&mut app);
         assert!(!app.windows[&wid].unfocused_pane_scratch.is_empty());
         App::retire_unfocused_pane_snapshots(
-            app.windows.get_mut(&wid).expect("test window"),
+            &mut app.windows.get_mut(&wid).expect("test window"),
             route,
         );
         assert!(
@@ -2442,7 +2444,7 @@ fn duplicate_session_views_keep_focus_and_snapshot_provenance_by_leaf_slot() {
         .expect("second view identity");
     app.pool.attach(0);
     {
-        let ws = app.windows.get_mut(&wid).expect("test window");
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
         assert!(
             ws.tab_set
                 .active_mut()
@@ -2645,7 +2647,7 @@ fn a_capture_clips_its_bloom_as_the_live_frame_does() {
 
 /// Make the mixed fixture's window draw through the real redraw path on a scripted CPU surface.
 fn present_mixed(app: &mut App, wid: WindowId) {
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.focused = true;
     ws.present = Some(crate::PresentTarget::Cpu {
         surface: crate::present::CpuSurface::Scripted(Default::default()),
@@ -2661,13 +2663,8 @@ fn a_mixed_frame_grounds_the_cat_it_does_not_draw() {
     let t0 = Instant::now();
     // Typing at 60 ms summons the cat within 3.6 s (`summon_latency_is_bounded_across_typing_cadences`).
     let summon = |app: &mut App, from: Instant| -> Instant {
-        let cat = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("the window")
-            .fx
-            .companions_mut()
-            .cursor_cat;
+        let mut payload_guard_cat = app.windows.get_mut(&wid).expect("the window");
+        let cat = &mut payload_guard_cat.fx.companions_mut().cursor_cat;
         let mut at = from;
         for _ in 0..160 {
             cat.on_key(at, true);
@@ -2709,13 +2706,8 @@ fn a_celebration_at_a_mixed_tab_runs_out_and_settles() {
     present_mixed(&mut app, wid);
     let t0 = Instant::now();
     {
-        let sing = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("the window")
-            .fx
-            .companions_mut()
-            .kitty_sing;
+        let mut payload_guard_sing = app.windows.get_mut(&wid).expect("the window");
+        let sing = &mut payload_guard_sing.fx.companions_mut().kitty_sing;
         sing.arm_external(t0, session, song_signature('C'), 2, CelebrateOn::Done)
             .expect("armed");
         assert!(sing.note_program_done(t0, session), "PRECONDITION: fired");
@@ -2732,7 +2724,7 @@ fn a_celebration_at_a_mixed_tab_runs_out_and_settles() {
     }
     assert!(played, "a mixed frame played the celebration's bars");
     app.redraw_window_at(wid, end);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     assert_eq!(
         ws.fx
             .companions_mut()
@@ -2766,6 +2758,7 @@ fn a_celebration_waits_out_a_mixed_tab_s_native_focus() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.tab_set.active_mut())
             .is_some_and(|tab| tab.set_focus(native_view)),
         "the native leaf is live"
@@ -2777,13 +2770,8 @@ fn a_celebration_waits_out_a_mixed_tab_s_native_focus() {
     );
     let t0 = Instant::now();
     {
-        let sing = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("the window")
-            .fx
-            .companions_mut()
-            .kitty_sing;
+        let mut payload_guard_sing = app.windows.get_mut(&wid).expect("the window");
+        let sing = &mut payload_guard_sing.fx.companions_mut().kitty_sing;
         sing.arm_external(t0, session, song_signature('C'), 2, CelebrateOn::Done)
             .expect("armed");
         assert!(sing.note_program_done(t0, session), "PRECONDITION: fired");
@@ -2823,7 +2811,7 @@ fn a_mixed_frame_buys_the_pet_no_frames() {
     assert_eq!(route, Heterogeneous, "PRECONDITION: a mixed tab");
     let _ = app.prepare_layout_coordinate_space(wid, route);
     let now = Instant::now();
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.focused = true;
     ws.fx
         .companion_mut()
@@ -2861,7 +2849,7 @@ fn a_mixed_frame_buys_the_pet_no_frames() {
         );
     };
     while t <= now + Duration::from_millis(420) {
-        tick(ws, t);
+        tick(&mut ws, t);
         t += Duration::from_millis(16);
     }
     assert!(
@@ -2876,19 +2864,19 @@ fn a_mixed_frame_buys_the_pet_no_frames() {
         !ws.cursor_dependents_need_frame_cadence(t, true),
         "a walking pet the mixed route never ticks buys no frame cadence"
     );
-    set_route(ws, Terminal { composed: true });
+    set_route(&mut ws, Terminal { composed: true });
     assert!(
         ws.cursor_dependents_need_frame_cadence(t, true),
         "control: under a terminal frame the walking pet buys frame cadence"
     );
-    set_route(ws, Heterogeneous);
+    set_route(&mut ws, Heterogeneous);
 
     while ws.fx.companion().needs_frames() {
         assert!(
             t < now + Duration::from_secs(60),
             "PRECONDITION: the pet settles"
         );
-        tick(ws, t);
+        tick(&mut ws, t);
         t += Duration::from_millis(16);
     }
     assert!(
@@ -2900,7 +2888,7 @@ fn a_mixed_frame_buys_the_pet_no_frames() {
         None,
         "a settled pet the mixed route never ticks buys no effect-lane deadline"
     );
-    set_route(ws, Terminal { composed: true });
+    set_route(&mut ws, Terminal { composed: true });
     assert!(
         ws.plan_terminal_effect_lane(t, true, true).is_some(),
         "control: under a terminal frame its next pose change does"
@@ -2929,15 +2917,11 @@ fn a_mixed_frame_pauses_the_collection_hello_it_does_not_draw() {
     app.redraw_window_at(wid, t0 + Duration::from_millis(16));
     let resume = t0 + Duration::from_secs(10);
     app.redraw_window_at(wid, resume);
-    let cat = &mut app
-        .windows
-        .get_mut(&wid)
-        .expect("the window")
-        .fx
-        .companions_mut()
-        .cursor_cat;
+    let mut payload_guard_cat = app.windows.get_mut(&wid).expect("the window");
+    let cat = &mut payload_guard_cat.fx.companions_mut().cursor_cat;
     cat.set_collection_presentable(resume, true);
     let frame = cat.frame(resume + Duration::from_millis(400));
+    drop(payload_guard_cat);
     assert!(
         frame.discovery,
         "the hello's hold waited out the mixed frames: {frame:?}"
@@ -2962,6 +2946,7 @@ fn a_mixed_tab_s_comets_keep_their_frames_under_native_focus() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.tab_set.active_mut())
             .is_some_and(|tab| tab.set_focus(native_view)),
         "the native leaf is live"
@@ -2990,7 +2975,7 @@ fn a_mixed_tab_s_comets_keep_their_frames_under_native_focus() {
         )
         .is_some()
     );
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     assert!(
         ws.fx.streak_panes().any(|engine| engine.is_active()),
         "PRECONDITION: a comet flies in the terminal leaf"

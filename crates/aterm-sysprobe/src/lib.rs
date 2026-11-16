@@ -82,8 +82,8 @@ pub use procs::{
 pub use caps::{Cap, CapSource, Caps, Why};
 pub use machine::{
     Capacity, Cluster, Commit, CoreTicks, CpuLayout, GpuClient, GpuClients, GpuDriver, GpuReading,
-    LinkCounters, LinkKind, LinkReading, MAX_GPU_CLIENTS, MAX_LINKS, MachineWords, MemoryDetail,
-    Probe, TcpCounts, TcpSummary, Throttle, ThrottleLevel, VmCounters, VolumeReading,
+    LinkByteCounter, LinkCounters, LinkKind, LinkReading, MAX_GPU_CLIENTS, MAX_LINKS, MachineWords,
+    MemoryDetail, Probe, TcpCounts, TcpSummary, Throttle, ThrottleLevel, VmCounters, VolumeReading,
     WorkqueueLimits, capacity, caps, counts_toward_machine, cpu_layout, creator_of, gpu,
     gpu_clients, gpu_driver, gpu_if_read, layout_by_rank, level_names, load_average, machine_words,
     memory_detail, net_links, net_links_into, open_socket_count, tcp_after_publish, tcp_counts,

@@ -3,13 +3,13 @@
 
 //! The one probe thread that reads the machine for the stats Deck, and the loop's side of it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use aterm_agent::harness::footer::FooterFacts;
 use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage};
@@ -19,12 +19,12 @@ use aterm_vitals::Peaks;
 use aterm_vitals::explain::{
     CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
 };
-use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
+use aterm_vitals::history::{FreeHistory, FreeSeries, FreeWeeks, SavedFree, VolumeId};
 use aterm_vitals::model::{
-    AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample,
-    Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcSample, ProcState,
-    Sample, SavedStrip, Snapshot, TabRoot, TabTokens, TaskRoom, Thermal, Throttle, Ticks,
-    VolumeSample,
+    AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DeedBy, DeedKind, DiskDeed,
+    DiskFacts, DiskLevel, GpuSample, Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact,
+    Pressure, ProcSample, ProcState, Sample, SavedStrip, Snapshot, TabRoot, TabTokens, TaskRoom,
+    Thermal, Throttle, Ticks, VolumeSample,
 };
 use aterm_vitals::sys::Machine;
 
@@ -59,6 +59,28 @@ const FREE_MAX_BYTES: u64 = 32 * 1024;
 /// Schema 2: each bucket is a time-weighted [`aterm_vitals::Agg`]. A schema-1 file (least free
 /// and a count) restores nothing.
 const FREE_SCHEMA: u32 = 2;
+/// The disk's three-week free history ([`FreeWeeks`]), kept beside [`FREE_FILE`] in its form, in
+/// a file of its own: a damaged one never costs the day's, and an older aterm ignores it. Its name
+/// carries [`WEEKS_SCHEMA`], so an aterm of another schema sharing the state home keeps its own
+/// file, and neither overwrites the other's three weeks.
+const WEEKS_FILE: &str = "vitals-free-weeks-v1.json";
+/// The bound [`WEEKS_FILE`] is read under: three weeks of the widest hour buckets, on a mount
+/// point of up to 1024 bytes, fit in 75 % of it.
+const WEEKS_MAX_BYTES: u64 = 128 * 1024;
+/// Schema 1: [`FREE_FILE`]'s schema-2 form of hour buckets. A day's file restores nothing here,
+/// and this file nothing there. A new schema names a new [`WEEKS_FILE`].
+const WEEKS_SCHEMA: u32 = 1;
+/// How often the probe thread reads the disk journal's tail again once it changed, while a window
+/// holds a Disk lens open.
+const DEEDS_EVERY: Duration = Duration::from_secs(10);
+/// How often it does while none does: the list is in the Snapshot when a lens opens.
+const DEEDS_IDLE_EVERY: Duration = Duration::from_secs(300);
+/// The most deeds the Disk lens is handed ([`DiskFacts::deeds`]).
+const DEEDS_KEPT: usize = 8;
+/// How far back the journal's walk reads, ms: the three-week chart's span.
+const DEEDS_REACH_MS: i64 = 504 * 3_600_000;
+/// How much of the journal's tail is read: all of it, since `disk` cuts it back past this.
+const DEEDS_READ_BYTES: u64 = aterm_agent::harness::cli::DISK_LEDGER_MAX_BYTES;
 /// The lock beside [`PEAKS_FILE`] whose holder is the one aterm of a state home that writes it and
 /// the strip's checkpoint ([`StripLock`], [`strip::StripStore`]): the strip's base, rewritten at a
 /// start's first reading, hourly and at the thread's stop (clean only at a quit,
@@ -1663,6 +1685,7 @@ fn run(
         shared
     });
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
+    let weeks = peaks.as_deref().map(|p| p.with_file_name(WEEKS_FILE));
     let home = peaks
         .as_deref()
         .and_then(Path::parent)
@@ -1675,6 +1698,8 @@ fn run(
     source.model().restore_peaks(restored);
     let (mut free, kept) = FreeFile::open(free, open_at, open_ms);
     source.model().restore_free_history(kept);
+    let (mut weeks, kept_weeks) = WeeksFile::open(weeks, open_at, open_ms);
+    source.model().restore_free_weeks(kept_weeks);
     let mut strip = restore_strip(
         home.as_deref(),
         open_at,
@@ -1821,6 +1846,7 @@ fn run(
         }
         peaks.keep_owned(source.model().peaks(), kept_at, false, &mut writer);
         free.keep(source.model().free_history(), kept_at, false);
+        weeks.keep(source.model().free_weeks(), kept_at, false);
         strip.keep(source.model(), kept_at, &mut writer);
     }
     let stop_at = Instant::now();
@@ -1830,6 +1856,7 @@ fn run(
     }
     peaks.keep_owned(source.model().peaks(), stop_at, true, &mut writer);
     free.keep(source.model().free_history(), stop_at, true);
+    weeks.keep(source.model().free_weeks(), stop_at, true);
     strip.stop(source.model(), quit, stop_at, &mut writer);
     // The lock goes only after the stop's write, so the aterm that takes it next writes after it.
     drop(writer);
@@ -3132,6 +3159,8 @@ impl WhyFixture {
             note_events: live.note_events.clone(),
             note_gaps: live.note_gaps.clone(),
             situation: live.situation.clone(),
+            place: live.place,
+            stuck_work: live.stuck_work,
             ..scene
         }
     }
@@ -3214,6 +3243,8 @@ pub(crate) struct Reader {
     situation: crate::vitals_situation::SituationReader,
     /// The own-thread D-state census's worker (macOS; inert in a unit test's reader).
     census: crate::vitals_census::CensusLane,
+    /// The disk journal's tail, for the Disk lens's list and chart.
+    journal: DeedTail,
     /// Where the process reads run: a lane, or a unit test's reading thread.
     pub(crate) procs: ProcsRead,
     /// The processes of the last whole sweep that answered: the names a stalled read's pid goes
@@ -3446,6 +3477,13 @@ impl Reader {
             } else {
                 crate::vitals_situation::SituationReader::host()
             },
+            // Where the window's own disk watch writes it ([`crate::harness_host`]'s look).
+            journal: DeedTail::new(if cfg!(test) {
+                None
+            } else {
+                crate::harness_host::harness_state()
+                    .map(|state| state.join(aterm_agent::harness::cli::DISK_LEDGER))
+            }),
             procs: if cfg!(test) {
                 ProcsRead::Inline
             } else {
@@ -3707,6 +3745,7 @@ impl Reader {
         // Preserve the existing core/process capture window: optional native
         // discovery can be slow, so it runs only after those readings finish.
         self.attach_hardware(&mut sample, req);
+        let place = self.situate(&mut sample);
         let scene = self
             .fixture
             .as_mut()
@@ -3736,7 +3775,7 @@ impl Reader {
             self.split.lane = CoalLane::Off;
         }
         let slots = self.set_occupancy_facts(&mut snap);
-        snap.place = crate::net_place::sys_view();
+        snap.place = place;
         snap.slot_tabs = crate::occupancy_host::slot_tabs(
             &slots,
             sample.procs.as_deref(),
@@ -3791,6 +3830,22 @@ impl Reader {
         self.fixture_snapshot(snap)
     }
 
+    /// Hands `sample` what the model keeps of the reading's surroundings in the strip, which it
+    /// reads from neither netplace nor the jobs engine itself: the place's kind, for the
+    /// situation spans, and what the newest jobs pass this reader holds found stuck, for the
+    /// blockage ring (that pass is the one the reading before this published; this reading's
+    /// own runs after its absorb). The place is returned for the Snapshot, so the reading
+    /// publishes the place its span keeps.
+    fn situate(&self, sample: &mut Sample) -> Option<aterm_vitals::PlaceView> {
+        let place = crate::net_place::sys_view();
+        sample.place = place.as_ref().map(|p| p.kind);
+        let at_ms = pass_ms(self.epoch, (self.clock)());
+        sample.stuck_work = self.assessment.reading().jobs.as_deref().map(|view| {
+            aterm_vitals::blockage::StuckWork::of(view, jobs_age_ms(Some(view), at_ms))
+        });
+        place
+    }
+
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
         self.machine_observed_at = Some((self.clock)());
@@ -3801,6 +3856,7 @@ impl Reader {
         sample.machine_only = true;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
+        let place = self.situate(&mut sample);
         let scene = self
             .fixture
             .as_mut()
@@ -3808,7 +3864,7 @@ impl Reader {
             .map(|fixture| fixture.reading(&sample, false));
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         self.set_occupancy_facts(&mut snap);
-        snap.place = crate::net_place::sys_view();
+        snap.place = place;
         let events_before = snap.strip_events.len();
         let assessed = self.assessment.carried();
         snap.jobs_age_ms = jobs_age_ms(
@@ -3888,6 +3944,14 @@ impl Reader {
         let gpu = aterm_sysprobe::gpu();
         let room = aterm_sysprobe::task_tables(self.uid.unwrap_or(0)).with_pids(pids.0, pids.1);
         let capacity = aterm_sysprobe::capacity();
+        self.journal.refresh(
+            req.lenses.contains(&aterm_vitals::Resource::Disk),
+            req.machine_only,
+            Instant::now(),
+            at_unix_ms,
+        );
+        let mut disk = disk_facts(shelf, key.as_ref(), Clock::read, &self.survey, &self.home);
+        (disk.deeds, disk.removals) = self.journal.facts(&req.session_ids, &req.tabs, at_unix_ms);
         let mut sample = Sample {
             hardware: None,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
@@ -3957,13 +4021,7 @@ impl Reader {
             },
             starts: None,
             self_uid: self.uid,
-            disk: Some(disk_facts(
-                shelf,
-                key.as_ref(),
-                Clock::read,
-                &self.survey,
-                &self.home,
-            )),
+            disk: Some(disk),
             tokens: req
                 .tokens
                 .iter()
@@ -3982,6 +4040,10 @@ impl Reader {
             note_gaps: req.note_gaps.clone(),
             block,
             situation: self.situation.read(at_unix_ms),
+            // What a reading takes of its surroundings is handed in once it is whole
+            // ([`Self::situate`]).
+            place: None,
+            stuck_work: None,
         };
         // After the core ticks: Linux's `procs_blocked` comes from their read of `/proc/stat`.
         sample.dstate = dstate_read(&self.probe);
@@ -4214,6 +4276,18 @@ fn link_sample(l: &aterm_sysprobe::LinkReading) -> LinkSample {
     let named = |prefixes: &[&str]| prefixes.iter().any(|p| l.name.starts_with(p));
     LinkSample {
         name: l.name.clone(),
+        index: l.index,
+        byte_counter: match l.byte_counter {
+            aterm_sysprobe::LinkByteCounter::Unknown => {
+                aterm_vitals::net_counter::ByteCounter::Unknown
+            }
+            aterm_sysprobe::LinkByteCounter::Cumulative64 => {
+                aterm_vitals::net_counter::ByteCounter::Cumulative64
+            }
+            aterm_sysprobe::LinkByteCounter::DarwinModulo32 => {
+                aterm_vitals::net_counter::ByteCounter::DarwinModulo32
+            }
+        },
         kind: match l.kind {
             aterm_sysprobe::LinkKind::Wired => LinkKind::Ethernet,
             aterm_sysprobe::LinkKind::Wifi => LinkKind::Wifi,
@@ -4448,6 +4522,8 @@ fn deck_disk(
         hogs_at,
         watch: raw.watch,
         sizing,
+        deeds: Vec::new(),
+        removals: Vec::new(),
     }
 }
 
@@ -4529,6 +4605,8 @@ struct KeptFile<T> {
 type PeakFile = KeptFile<Peaks>;
 /// [`FREE_FILE`].
 type FreeFile = KeptFile<FreeHistory>;
+/// [`WEEKS_FILE`].
+type WeeksFile = KeptFile<FreeWeeks>;
 type CpuReportFile = KeptFile<Option<aterm_vitals::sys::json::Jv>>;
 
 impl<T: Clone + Default + PartialEq> KeptFile<T> {
@@ -4622,6 +4700,22 @@ impl KeptFile<FreeHistory> {
             "the disk's free history",
             free_json,
             |text| free_of(text, now_unix_ms),
+        )
+    }
+}
+
+impl KeptFile<FreeWeeks> {
+    /// The file's history of the 3 weeks ending at `now_unix_ms`; empty when it is missing,
+    /// damaged or of another schema.
+    fn open(path: Option<PathBuf>, now: Instant, now_unix_ms: i64) -> (Self, FreeWeeks) {
+        Self::read(
+            path,
+            now,
+            PEAKS_EVERY,
+            WEEKS_MAX_BYTES,
+            "the disk's three-week history",
+            weeks_json,
+            |text| weeks_of(text, now_unix_ms),
         )
     }
 }
@@ -5059,10 +5153,14 @@ struct FreeDoc {
     buckets: Vec<(i64, u32, u16, u32, f64, f64, f64)>,
 }
 
-fn free_json(history: &FreeHistory) -> Option<String> {
-    let saved = history.saved()?;
+/// A free series as its file holds it ([`FreeDoc`]) at `schema`; `None` with nothing read.
+fn series_json<const M: i64, const N: usize>(
+    series: &FreeSeries<M, N>,
+    schema: u32,
+) -> Option<String> {
+    let saved = series.saved()?;
     let doc = FreeDoc {
-        schema: FREE_SCHEMA,
+        schema,
         mount: saved.volume.mount,
         total: saved.volume.total,
         buckets: saved.rows.iter().map(strip::agg_doc).collect(),
@@ -5070,9 +5168,15 @@ fn free_json(history: &FreeHistory) -> Option<String> {
     aterm_json::to_string(&doc).ok()
 }
 
-fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
+/// The free series a file of `schema` holds, restored at `now_unix_ms`; `None` for a damaged file
+/// or another schema.
+fn series_of<const M: i64, const N: usize>(
+    text: &str,
+    schema: u32,
+    now_unix_ms: i64,
+) -> Option<FreeSeries<M, N>> {
     let doc: FreeDoc = aterm_json::from_str(text).ok()?;
-    (doc.schema == FREE_SCHEMA).then(|| {
+    (doc.schema == schema).then(|| {
         let saved = SavedFree {
             volume: VolumeId {
                 mount: doc.mount,
@@ -5080,8 +5184,386 @@ fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
             },
             rows: doc.buckets.into_iter().map(strip::agg_of).collect(),
         };
-        FreeHistory::restored(&saved, now_unix_ms)
+        FreeSeries::restored(&saved, now_unix_ms)
     })
+}
+
+fn free_json(history: &FreeHistory) -> Option<String> {
+    series_json(history, FREE_SCHEMA)
+}
+
+fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
+    series_of(text, FREE_SCHEMA, now_unix_ms)
+}
+
+fn weeks_json(weeks: &FreeWeeks) -> Option<String> {
+    series_json(weeks, WEEKS_SCHEMA)
+}
+
+fn weeks_of(text: &str, now_unix_ms: i64) -> Option<FreeWeeks> {
+    series_of(text, WEEKS_SCHEMA, now_unix_ms)
+}
+
+/// The disk journal's rows as the Disk lens lists them, each with the session id its row names,
+/// and its removals by hour.
+pub(crate) type JournalDeeds = (Vec<(String, DiskDeed)>, Vec<(i64, u64)>);
+
+/// What the disk journal's `text` (its tail, oldest row first) says the software did in the 3
+/// weeks ending at `now_unix_ms` (`docs/DESIGN-disk-custody-2026-11-12.md` §4): its deeds, newest
+/// first, at most [`DEEDS_KEPT`], each run of adjacent rows of one kind by one session one deed,
+/// with the session's id; and the bytes removed in each hour, oldest first. A line that is not a
+/// row, or has no kind or time, is skipped. An intent a later outcome closed is dropped (the
+/// outcome says it): a build-cache sweep's by count, as `disk::sweep_in_flight` counts them, since
+/// the sweep writes an outcome for each intent but under its stage's path where part of it
+/// stayed; any other kind's by its path. A row of a kind this does not know is a deed of its kind
+/// and action, with its bytes, and never a removal. A row that finds the list full breaks the run
+/// the list ends with, so no older row joins it; removals are counted on. The walk stops at the
+/// first row older than the 3 weeks.
+pub(crate) fn deeds_of(text: &str, now_unix_ms: i64) -> JournalDeeds {
+    use aterm_agent::harness::disk::{SWEEP_ROW_KIND, SweepAction};
+    let edge = now_unix_ms.saturating_sub(DEEDS_REACH_MS);
+    let mut deeds: Vec<(String, DiskDeed)> = Vec::new();
+    let mut full = false;
+    let mut closed: HashSet<String> = HashSet::new();
+    // The sweep outcomes met so far (newest first) that no older sweep intent has taken.
+    let mut sweeps_closing = 0_usize;
+    let mut hours: BTreeMap<i64, u64> = BTreeMap::new();
+    for line in text.lines().rev() {
+        let Ok(row) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let word = |key: &str| row.get(key).and_then(aterm_json::Value::as_str);
+        let Some(kind) = word("kind") else {
+            continue;
+        };
+        let Some(at) = word("ts")
+            .and_then(aterm_types::rfc3339::parse_utc)
+            .map(|s| s.saturating_mul(1_000))
+        else {
+            continue;
+        };
+        if at < edge {
+            break;
+        }
+        let action = word("action");
+        if kind == SWEEP_ROW_KIND {
+            match action.and_then(SweepAction::parse) {
+                Some(a) if a.closes() => sweeps_closing = sweeps_closing.saturating_add(1),
+                Some(_) if sweeps_closing > 0 => {
+                    sweeps_closing = sweeps_closing.saturating_sub(1);
+                    continue;
+                }
+                _ => {}
+            }
+        } else if let Some(path) = word("path") {
+            let outcome = matches!(kind, "removed" | "denial")
+                || matches!(action, Some("removed" | "kept" | "failed" | "refused"));
+            let intent = kind == "removing" || action == Some("removing");
+            if outcome {
+                closed.insert(path.to_owned());
+            } else if intent && closed.contains(path) {
+                continue;
+            }
+        }
+        let read = deed_read(kind, action, &row);
+        if read.removal
+            && let Some(bytes) = read.bytes.filter(|&b| b > 0)
+        {
+            let hour = at.div_euclid(3_600_000).saturating_mul(3_600_000);
+            let sum = hours.entry(hour).or_insert(0);
+            *sum = sum.saturating_add(bytes);
+        }
+        if full {
+            continue;
+        }
+        let sid = word("sid").unwrap_or("");
+        let run = deeds
+            .last_mut()
+            .filter(|(by, deed)| by.as_str() == sid && deed.kind == read.kind);
+        if let Some((_, deed)) = run {
+            deed.n = deed.n.saturating_add(1);
+            deed.bytes = match (deed.bytes, read.bytes) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            };
+            deed.free = deed.free.or(read.free);
+        } else if deeds.len() < DEEDS_KEPT {
+            deeds.push((
+                sid.to_owned(),
+                DiskDeed {
+                    at_unix_ms: at,
+                    n: 1,
+                    kind: read.kind,
+                    by: DeedBy::Aterm,
+                    bytes: read.bytes,
+                    free: read.free,
+                },
+            ));
+        } else {
+            full = true;
+        }
+    }
+    (deeds, hours.into_iter().collect())
+}
+
+/// One journal row as [`deeds_of`] reads it.
+struct DeedRead {
+    kind: DeedKind,
+    bytes: Option<u64>,
+    free: Option<u64>,
+    /// Whether its bytes went off the disk by the software's hand: the chart marks it.
+    removal: bool,
+}
+
+/// How [`deeds_of`] reads a row of `kind` with `action`, as its writer in `aterm_agent::harness`
+/// wrote it. A removal is a `removed` row, a build cache's sweep, a worktree step's or a
+/// `disk-free` row that removed (or failed part-way with bytes gone, the rows
+/// `aterm_agent::harness::disk_free::removed_by` counts), and a released reserve; a `stopped`
+/// row's released bytes repeat its pass's own `removed` rows, and a `free-ask` row's rise in free
+/// space is no removal by the software. A `poke` row's session is the one that ran short of
+/// space, and a `free-ask` row's the one its step concerns (the one asked, chosen or that freed
+/// space), so each row's subject is its session, else aterm.
+fn deed_read(kind: &str, action: Option<&str>, row: &aterm_json::Value) -> DeedRead {
+    let num = |key: &str| row.get(key).and_then(aterm_json::Value::as_u64);
+    let word = |key: &str| row.get(key).and_then(aterm_json::Value::as_str);
+    let what = || deed_what(word("class"), word("path"));
+    let plain = |kind: DeedKind, bytes: Option<u64>, free: Option<u64>| DeedRead {
+        kind,
+        bytes,
+        free,
+        removal: false,
+    };
+    let removed = |kind: DeedKind, bytes: Option<u64>| DeedRead {
+        kind,
+        bytes,
+        free: None,
+        removal: true,
+    };
+    let other = || {
+        let name = action.map_or_else(|| kind.to_owned(), |a| format!("{kind} {a}"));
+        plain(
+            DeedKind::Other(clipped_front(&name, 32)),
+            num("freed_bytes")
+                .or_else(|| num("bytes"))
+                .or_else(|| num("released_bytes")),
+            None,
+        )
+    };
+    let builds = || crate::disk_board::BUILD_CACHES.to_owned();
+    let wt = || format!("worktree {}", path_tail(word("path").unwrap_or(""), 1, 40));
+    match (kind, action) {
+        ("report", _) => plain(DeedKind::Checked, None, num("free_bytes")),
+        ("removing", _) => plain(DeedKind::Began(what()), None, None),
+        ("removed", _) => removed(DeedKind::Removed(what()), num("freed_bytes")),
+        ("denial", _) => {
+            let failed = matches!(word("reason"), Some("remove-failed" | "unjournalled"));
+            let deed = if failed {
+                DeedKind::CouldNotRemove(what())
+            } else {
+                DeedKind::Refused(what())
+            };
+            plain(deed, None, None)
+        }
+        ("stopped", _) => plain(DeedKind::Stopped, None, num("free_bytes")),
+        ("reserve", Some("released")) => removed(DeedKind::ReserveReleased, num("bytes")),
+        ("reserve", Some("written")) => plain(DeedKind::ReserveWritten, num("bytes"), None),
+        ("reserve", Some("refused")) => plain(DeedKind::ReserveRefused, None, None),
+        ("build-cache-sweep", Some("removing")) => plain(DeedKind::Began(builds()), None, None),
+        ("build-cache-sweep", Some("removed")) => {
+            removed(DeedKind::Removed(builds()), num("bytes"))
+        }
+        ("build-cache-sweep", Some("kept")) => plain(DeedKind::Kept(builds()), None, None),
+        ("worktree", Some("removing")) => plain(DeedKind::Began(wt()), None, None),
+        ("worktree", Some("removed")) => removed(DeedKind::Removed(wt()), num("freed_bytes")),
+        ("worktree", Some("kept")) => plain(DeedKind::Kept(wt()), None, None),
+        ("poke", _) => plain(DeedKind::RanShort, None, num("free_bytes")),
+        ("free-ask", _) => {
+            // A turn-break step says its word in `step` (`typed`, `wait:<why>`, …).
+            let said = match word("said") {
+                Some("step") => {
+                    let step = word("step").unwrap_or("");
+                    format!("step {}", step.split_once(':').map_or(step, |(w, _)| w))
+                }
+                said => said.unwrap_or("").to_owned(),
+            };
+            plain(
+                DeedKind::Asked(clipped_front(&said, 24)),
+                num("freed_bytes"),
+                num("free_bytes"),
+            )
+        }
+        ("disk-free", Some("removing")) => plain(DeedKind::Began(what()), None, None),
+        ("disk-free", Some("removed")) => removed(DeedKind::Removed(what()), num("bytes")),
+        ("disk-free", Some("failed")) => removed(DeedKind::CouldNotRemove(what()), num("bytes")),
+        ("disk-free", Some("refused")) => plain(DeedKind::Refused(what()), num("bytes"), None),
+        _ => other(),
+    }
+}
+
+/// What a journal row names: its class's words, else its path's last two components (at most
+/// 48 characters, the end kept), else nothing.
+fn deed_what(class: Option<&str>, path: Option<&str>) -> String {
+    if let Some(class) = class.and_then(aterm_agent::harness::disk::Class::parse) {
+        return crate::disk_board::freed_what(class).to_owned();
+    }
+    path.map_or_else(String::new, |path| path_tail(path, 2, 48))
+}
+
+/// `path`'s last `parts` components joined by `/`, cut to at most `most` characters with its end
+/// kept and `…` opening a cut.
+fn path_tail(path: &str, parts: usize, most: usize) -> String {
+    let named: Vec<_> = Path::new(path)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    let tail = named[named.len().saturating_sub(parts)..].join("/");
+    let n = tail.chars().count();
+    if n <= most {
+        return tail;
+    }
+    std::iter::once('…')
+        .chain(tail.chars().skip(n - most.saturating_sub(1)))
+        .collect()
+}
+
+/// `text` cut to at most `most` characters, its start kept and `…` closing a cut.
+fn clipped_front(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_owned();
+    }
+    text.chars()
+        .take(most.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// [`deeds_of`]'s deeds with their owners: aterm for a row of no session, the tab of a session
+/// that runs here (its pane in `sids`, that pane's tab in `tabs`), else a tab this window set
+/// cannot name. Every non-empty journal sid is an aterm session's (`ATERM_PARENT_SESSION_ID`, a
+/// poke's or an ask's session).
+pub(crate) fn deeds_owned(
+    rows: &[(String, DiskDeed)],
+    sids: &[(u64, String)],
+    tabs: &[TabRoot],
+) -> Vec<DiskDeed> {
+    rows.iter()
+        .map(|(sid, deed)| {
+            let by = if sid.is_empty() {
+                DeedBy::Aterm
+            } else {
+                let tab = |pane: u64| tabs.iter().find(|t| t.key == pane).map_or(pane, |t| t.tab);
+                DeedBy::Tab(
+                    sids.iter()
+                        .find(|(_, s)| s == sid)
+                        .map(|&(pane, _)| tab(pane)),
+                )
+            };
+            DiskDeed { by, ..deed.clone() }
+        })
+        .collect()
+}
+
+/// The disk journal's tail as the probe thread keeps it: read again only once the file changed
+/// (its length or its time), at most every [`DEEDS_EVERY`] while a Disk lens is open and every
+/// [`DEEDS_IDLE_EVERY`] while none is, and never while every window is hidden. Nothing reads it on
+/// the main or paint thread: the lens draws what the Snapshot carries.
+struct DeedTail {
+    /// The journal (`<harness state>/disk.jsonl`); `None` in a unit test's reader.
+    path: Option<PathBuf>,
+    /// The file's length and time when last read.
+    seen: Option<(u64, Option<SystemTime>)>,
+    /// The last tail-read attempt, successful or not: retries use the same cadence.
+    read_at: Option<Instant>,
+    rows: Vec<(String, DiskDeed)>,
+    removals: Vec<(i64, u64)>,
+}
+
+impl DeedTail {
+    const fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            seen: None,
+            read_at: None,
+            rows: Vec::new(),
+            removals: Vec::new(),
+        }
+    }
+
+    /// Reads the journal's tail again at `now` (`now_unix_ms` on the wall clock) if it is due:
+    /// `open` while a window holds a Disk lens open, `hidden` while every window is.
+    fn refresh(&mut self, open: bool, hidden: bool, now: Instant, now_unix_ms: i64) {
+        self.refresh_with(
+            open,
+            hidden,
+            now,
+            now_unix_ms,
+            |path| std::fs::metadata(path).map(|meta| (meta.len(), meta.modified().ok())),
+            |path| aterm_agent::harness::codex_rollout::tail_of(path, DEEDS_READ_BYTES),
+        );
+    }
+
+    /// Commit the file's marker and facts together after a successful read. Transient errors
+    /// retain the last facts, while a known missing file and a successfully read empty file
+    /// clear them. A failed read remains eligible for the next paced attempt at the same marker.
+    fn refresh_with(
+        &mut self,
+        open: bool,
+        hidden: bool,
+        now: Instant,
+        now_unix_ms: i64,
+        metadata: impl FnOnce(&Path) -> std::io::Result<(u64, Option<SystemTime>)>,
+        read: impl FnOnce(&Path) -> Option<String>,
+    ) {
+        if hidden {
+            return;
+        }
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        let mark = match metadata(path) {
+            Ok(mark) => mark,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.seen = None;
+                self.rows.clear();
+                self.removals.clear();
+                return;
+            }
+            Err(_) => return,
+        };
+        let seen = Some(mark);
+        let every = if open { DEEDS_EVERY } else { DEEDS_IDLE_EVERY };
+        let due = self
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every);
+        if seen == self.seen || !due {
+            return;
+        }
+        self.read_at = Some(now);
+        let Some(text) = read(path) else {
+            return;
+        };
+        self.seen = seen;
+        (self.rows, self.removals) = deeds_of(&text, now_unix_ms);
+    }
+
+    /// The deeds of the 3 weeks ending at `now_unix_ms` with their owners among `sids` and `tabs`
+    /// ([`deeds_owned`]), and the removals. A journal that stays unchanged is not read again, so a
+    /// deed leaves the list here once it is older than the 3 weeks; the chart keeps its own span
+    /// of the removals.
+    fn facts(
+        &self,
+        sids: &[(u64, String)],
+        tabs: &[TabRoot],
+        now_unix_ms: i64,
+    ) -> (Vec<DiskDeed>, Vec<(i64, u64)>) {
+        let edge = now_unix_ms.saturating_sub(DEEDS_REACH_MS);
+        let mut deeds = deeds_owned(&self.rows, sids, tabs);
+        deeds.retain(|d| d.at_unix_ms >= edge);
+        (deeds, self.removals.clone())
+    }
 }
 
 impl crate::App {

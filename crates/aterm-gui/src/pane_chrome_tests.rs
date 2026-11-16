@@ -1019,7 +1019,7 @@ fn the_splice_never_doubles_its_quads_or_its_bars() {
     );
     let thumb = bar_layer_id(1, true);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.input_scratch.nova_add = vec![foreign];
         ws.input_scratch.fx_layers = vec![other.clone()];
         ws.pane_overlay.pending = vec![ring];
@@ -1051,7 +1051,7 @@ fn the_splice_never_doubles_its_quads_or_its_bars() {
         "a settled bar splices the same layer"
     );
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.pane_overlay.pending.clear();
         ws.pane_overlay.bars.clear();
         ws.pane_overlay.lay_bars();
@@ -1278,6 +1278,7 @@ fn a_regrid_leaves_the_last_frames_bars_answering_nothing() {
     let set_laid = |app: &mut App, laid| {
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.pane_overlay.inputs.as_mut())
             .expect("laid")
             .laid = laid;

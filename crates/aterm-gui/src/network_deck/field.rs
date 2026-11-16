@@ -22,7 +22,7 @@ use crate::stats_paint::{Hit, HitKind, Painter, panel};
 use crate::widget::{DrawPrim, rgba};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Where seat 0's column starts, pt from the band's left edge (the Local cell sits at 100).
 pub(crate) const SEATS_X_PT: f32 = 124.0;

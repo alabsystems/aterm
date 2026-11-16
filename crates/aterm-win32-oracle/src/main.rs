@@ -21,7 +21,7 @@ use std::process::{ExitCode, Output};
 type Result<T> = std::result::Result<T, String>;
 const VERSION: &str = "0.61.2";
 const TRIPLES: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
-/// The generator each emitted Rust file's seal line names ([`aterm_census::seal`]).
+/// The generator each emitted Rust file's seal line names ([`aterm_seal`]).
 const GENERATOR: &str = "`aterm-win32-oracle gen`";
 const HELP: &str = "\
 aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle
@@ -314,8 +314,8 @@ fn formatted(
                 write_fresh(&p, unsealed).map_err(|e| e.to_string())?;
                 paths.push(p);
             } else {
-                let sealed = aterm_census::seal::stamp(&unsealed)
-                    .map_err(|e| format!("{}: {e}", p.display()))?;
+                let sealed =
+                    aterm_seal::stamp(&unsealed).map_err(|e| format!("{}: {e}", p.display()))?;
                 write_fresh(&p, sealed).map_err(|e| e.to_string())?;
             }
         } else {
@@ -340,13 +340,12 @@ fn formatted(
         }
     }
     for p in &paths {
-        let sealed =
-            aterm_census::seal::stamp(&read(p)?).map_err(|e| format!("{}: {e}", p.display()))?;
+        let sealed = aterm_seal::stamp(&read(p)?).map_err(|e| format!("{}: {e}", p.display()))?;
         write_fresh(p, sealed).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
-/// `text` with the unstamped seal line ([`aterm_census::seal::line`]) after its SPDX line;
+/// `text` with the unstamped seal line ([`aterm_seal::line`]) after its SPDX line;
 /// [`formatted`] stamps it once the file is in its final form.
 fn with_seal_line(rel: &Path, text: &str) -> Result<String> {
     let at = text
@@ -356,7 +355,7 @@ fn with_seal_line(rel: &Path, text: &str) -> Result<String> {
     Ok(format!(
         "{}{}\n{}",
         &text[..at],
-        aterm_census::seal::line("//", GENERATOR),
+        aterm_seal::line("//", GENERATOR),
         &text[at..]
     ))
 }

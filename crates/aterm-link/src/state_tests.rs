@@ -502,7 +502,7 @@ fn a_broadcast_refill_floor_round_trips_and_goes_with_its_cursors_and_its_log() 
     );
 
     st.set_topic_floors("s-y", &floors).expect("write");
-    st.forget_log_offsets(100, None, None, None, None)
+    st.forget_log_offsets(100, None, None, None)
         .expect("re-base");
     assert!(
         st.topic_floors("s-y").unwrap().is_empty(),
@@ -2250,20 +2250,19 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     };
     st.set_in_flight(&note).unwrap();
     assert_eq!(
-        st.forget_log_offsets(100, None, Some(b), None, None)
-            .unwrap(),
+        st.forget_log_offsets(100, Some(b), None, None).unwrap(),
         vec![(1, face.to_string())]
     );
     let kept = vec![(2, entry(2, None)), (3, entry(3, Some(b))), (4, note)];
     assert_eq!(st.in_flight().unwrap(), kept);
     assert!(
-        st.forget_log_offsets(100, None, Some(b), None, None)
+        st.forget_log_offsets(100, Some(b), None, None)
             .unwrap()
             .is_empty(),
         "idempotent"
     );
     assert!(
-        st.forget_log_offsets(7, None, None, None, None)
+        st.forget_log_offsets(7, None, None, None)
             .unwrap()
             .is_empty(),
         "no identity proves no mismatch"
@@ -2274,7 +2273,7 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     assert_eq!(
         StateDir::open(&dir)
             .unwrap()
-            .forget_log_offsets(7, None, Some(b), None, None)
+            .forget_log_offsets(7, Some(b), None, None)
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidData
@@ -2289,7 +2288,7 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     assert_eq!(
         StateDir::open(&dir)
             .unwrap()
-            .forget_log_offsets(7, None, Some(b), None, None)
+            .forget_log_offsets(7, Some(b), None, None)
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidData,
@@ -2380,8 +2379,7 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     let st = StateDir::open(&dir).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(12, None, Some(new), Some(5), None)
-            .unwrap(),
+        st.forget_log_offsets(12, Some(new), Some(5), None).unwrap(),
         vec![answer(2)],
         "only the in-flight reply to a record the loss took goes"
     );
@@ -2428,14 +2426,14 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     };
     clamped(&st);
     assert!(
-        st.forget_log_offsets(12, None, Some(new), Some(5), None)
+        st.forget_log_offsets(12, Some(new), Some(5), None)
             .unwrap()
             .is_empty(),
         "idempotent"
     );
     clamped(&st);
     st.set_topics("s-z", &cursors(&[("d", 30)])).unwrap();
-    st.forget_log_offsets(12, None, Some(new), Some(40), None)
+    st.forget_log_offsets(12, Some(new), Some(40), None)
         .unwrap();
     assert_eq!(st.topics("s-z"), cursors(&[("d", 12)]));
 
@@ -2443,8 +2441,7 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     let st = StateDir::open(&twin).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(12, None, Some(new), None, None)
-            .unwrap(),
+        st.forget_log_offsets(12, Some(new), None, None).unwrap(),
         vec![answer(1), answer(2)]
     );
     assert_eq!((st.seen_off("s-low"), st.seen_off("s-high")), (None, None));
@@ -2498,11 +2495,12 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let keep_below = LogWitness {
         high: 150,
         id: Some(log(1)),
+        met: None,
     }
     .continues(Some(log(2)), Some(&lineage));
     assert_eq!(keep_below, Some(138), "the newest move's fork");
     assert_eq!(
-        st.forget_log_offsets(150, None, Some(log(2)), keep_below, Some(&lineage))
+        st.forget_log_offsets(150, Some(log(2)), keep_below, Some(&lineage))
             .unwrap(),
         vec![ack(2), ack(4)],
         "generation 0's reply at 41 and generation 1's at 138 go"
@@ -2525,7 +2523,7 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let st = StateDir::open(&twin).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(150, None, Some(log(2)), keep_below, None)
+        st.forget_log_offsets(150, Some(log(2)), keep_below, None)
             .unwrap(),
         vec![ack(4)]
     );
@@ -2533,47 +2531,60 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let _ = std::fs::remove_dir_all(&twin);
 }
 
-/// **A PIN'S HEAD READS ANOTHER LOG FROM ITS START, AND NOTHING ELSE THAT CONTINUES NONE**
-/// (ATERM-KI-1111-4 hostile review): on another id told with its lineage every record landed
-/// after the pin, so the head comes down to 0 and the retry reads the log back from its start.
-/// A log that keeps the id and continues nothing (a restored or shortened copy) or one told
-/// without lineage may hold an earlier identical record, which a read back from 0 would settle
-/// the pin on, so the post would never be published: there the head is taken out, and the
-/// retry publishes unread, as before.
+/// **ON A LOG THAT CONTINUES NONE A PIN'S HEAD GOES TO THE HEAD THE ATTACH READ; ON A MOVE, DOWN
+/// TO ITS FORK** (critic review F1, 2026-11-13): another id told with a lineage, the same id
+/// continuing nothing and another id told without one are alike, since astream gives a log that
+/// kept its records another id too (a fresh one where its identity sidecar does not read, one
+/// derived from its records where the sidecar is gone), and nothing says what lies below the
+/// attach's head there: a read back from 0 met the sender's earlier post of the same words. Here
+/// the attach read 50, above the pin's 40, as on a log renamed with its records; a move that
+/// continues to 30 brings the head down to 30, and
+/// one that continues to 45 leaves it at 40. NEGATIVE CONTROLS: ATERM-KI-1111-4's rule puts it at
+/// 0 on a log that continues none (`heads_from_the_logs_start`), and every build before that
+/// rule took it out (`pin_head_gone_on_another_log`); neither touches a move's.
 #[test]
-fn a_pins_head_reads_back_from_0_only_on_another_log() {
-    let log = |id: u8, generation| astream_broker::LogIdentity {
-        id: [id; 16],
-        generation,
+fn a_pins_head_on_a_log_that_continues_none_goes_to_the_head_the_attach_read() {
+    let now = astream_broker::LogIdentity {
+        id: [2; 16],
+        generation: 0,
     };
-    let none = astream_broker::Lineage::from_steps(&[]).expect("an empty lineage");
     let headed = PublishPin {
         at: Some(40),
         ..in_flight_entry(7).pin
     };
-    for (what, was, now, lineage, want) in [
-        ("another id", log(1, 0), log(2, 0), Some(&none), Some(0)),
-        (
-            "the same id continuing none",
-            log(1, 0),
-            log(1, 1),
-            Some(&none),
-            None,
-        ),
-        ("another id, no lineage", log(1, 0), log(2, 0), None, None),
-    ] {
-        let dir = scratch("pin-head-another-log");
-        let st = StateDir::open(&dir).expect("open");
-        st.take_incarnation(0).expect("an attach");
-        st.set_post_pin("s-a", 1, &headed).expect("reserved");
-        st.forget_log_offsets(20, Some(was), Some(now), None, lineage)
-            .expect("forgotten");
-        assert_eq!(
-            st.post_pin("s-a", 1).expect("reads").map(|pin| pin.at),
-            Some(want),
-            "{what}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Rule {
+        AtTheHead,
+        FromTheStart,
+        Gone,
+    }
+    for rule in [Rule::AtTheHead, Rule::FromTheStart, Rule::Gone] {
+        for (what, keep_below, want) in [
+            ("a log that continues none", None, Some(50)),
+            ("a move that continues to 30", Some(30), Some(30)),
+            ("a move that continues to 45", Some(45), Some(40)),
+        ] {
+            let want = match rule {
+                _ if keep_below.is_some() => want,
+                Rule::AtTheHead => want,
+                Rule::FromTheStart => Some(0),
+                Rule::Gone => None,
+            };
+            let dir = scratch("pin-head-continues-none");
+            let st = StateDir::open(&dir).expect("open");
+            st.heads_from_the_logs_start(rule == Rule::FromTheStart);
+            st.pin_head_gone_on_another_log(rule == Rule::Gone);
+            st.take_incarnation(0).expect("an attach");
+            st.set_post_pin("s-a", 1, &headed).expect("reserved");
+            st.forget_log_offsets(50, Some(now), keep_below, None)
+                .expect("forgotten");
+            assert_eq!(
+                st.post_pin("s-a", 1).expect("reads").map(|pin| pin.at),
+                Some(want),
+                "{rule:?}: {what}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -2606,7 +2617,7 @@ fn a_receipts_pin_keeps_its_head_beside_it() {
         Some((log(1, 0), 40)),
         "the head survives a reopen"
     );
-    st.forget_log_offsets(20, Some(log(1, 0)), Some(log(2, 0)), None, Some(&none))
+    st.forget_log_offsets(20, Some(log(2, 0)), None, Some(&none))
         .expect("forgotten");
     assert_eq!(
         st.receipt_head("s-a", 3, headed.seq).expect("reads"),
@@ -3432,13 +3443,13 @@ fn a_log_switch_refuses_a_dangling_offset_directory() {
         }
         std::os::unix::fs::symlink(dir.join("missing"), &area).unwrap();
         assert!(
-            st.forget_log_offsets(20, None, None, None, None).is_err(),
+            st.forget_log_offsets(20, None, None, None).is_err(),
             "unreadable {blocked} was empty"
         );
         assert!(area.is_symlink(), "the unreadable directory entry stays");
         std::fs::remove_file(&area).unwrap();
         assert!(
-            st.forget_log_offsets(20, None, None, None, None).is_ok(),
+            st.forget_log_offsets(20, None, None, None).is_ok(),
             "an absent directory is empty"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3463,6 +3474,7 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     st.set_log_witness(&LogWitness {
         high: 500,
         id: None,
+        met: None,
     })
     .expect("write");
     let w = st.log_witness().expect("read back");
@@ -3470,7 +3482,8 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
         w,
         LogWitness {
             high: 500,
-            id: None
+            id: None,
+            met: None,
         }
     );
     assert!(w.replaced_by(499, None) && w.replaced_by(499, Some(a)));
@@ -3478,6 +3491,7 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     let with_id = LogWitness {
         high: 500,
         id: Some(a),
+        met: None,
     };
     st.set_log_witness(&with_id).expect("write");
     assert_eq!(st.log_witness(), Some(with_id));
@@ -3494,11 +3508,137 @@ fn the_log_witness_round_trips_and_names_another_log_by_identity_or_head() {
     );
     assert_eq!(
         LogWitness::parse("id=00ff high=7"),
-        Some(LogWitness { high: 7, id: None })
+        Some(LogWitness {
+            high: 7,
+            id: None,
+            met: None
+        })
     );
     assert_eq!(LogWitness::parse("high=+7"), None);
     assert_eq!(LogWitness::parse("id=00ff"), None);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A WITNESS KEEPS WHERE THE NODE MET ITS LOG** ([`Met`]): `met=<log>@<head>` after the rest,
+/// read back as written; a witness without it (an older build's) reads with none, and one whose
+/// meeting does not read keeps the rest and names none, so a read back finds no floor there
+/// and the record is published again at its pin.
+#[test]
+fn a_witness_keeps_where_the_node_met_its_log() {
+    let log = astream_broker::LogIdentity {
+        id: [0xcc; 16],
+        generation: 3,
+    };
+    let met = Met { log, head: 41 };
+    let witness = LogWitness {
+        high: 57,
+        id: Some(log),
+        met: Some(met),
+    };
+    let line = witness.render();
+    assert_eq!(line, format!("id={log} high=57 met={log}@41"));
+    assert_eq!(LogWitness::parse(&line), Some(witness));
+    let dir = scratch("witness-met");
+    let st = StateDir::open(&dir).expect("open");
+    st.set_log_witness(&witness).expect("write");
+    assert_eq!(
+        StateDir::open(&dir).expect("reopen").log_witness(),
+        Some(witness)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let without = LogWitness {
+        met: None,
+        ..witness
+    };
+    assert_eq!(
+        LogWitness::parse(&format!("id={log} high=57")),
+        Some(without)
+    );
+    for torn in [
+        format!("id={log} high=57 met={log}@"),
+        format!("id={log} high=57 met={log}41"),
+        format!("id={log} high=57 met=00ff@41"),
+        format!("id={log} high=57 met={log}@+41"),
+    ] {
+        assert_eq!(LogWitness::parse(&torn), Some(without), "{torn}");
+    }
+}
+
+/// **THE NODE STANDS MET WHERE IT MET THE LOG'S LINE, BROUGHT DOWN BY EACH MOVE** ([`Met::after`]):
+/// the same log keeps the meeting; a move that continues it to a fork brings its head down to the
+/// fork and keeps the log it met, never up; a log that continues none, and a node that stood met
+/// nowhere, meet the new log at the attach's head; a log with no identity meets none.
+#[test]
+fn the_node_stands_met_where_it_met_the_logs_line_brought_down_by_each_move() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let at = |l, head| Some(Met { log: l, head });
+    let met = at(log(1, 0), 30);
+    assert_eq!(
+        Met::after(met, Some(log(1, 0)), 80, None),
+        met,
+        "the same log"
+    );
+    assert_eq!(
+        Met::after(met, Some(log(1, 1)), 80, Some(Some(12))),
+        at(log(1, 0), 12),
+        "a move whose fork lies below the meeting"
+    );
+    assert_eq!(
+        Met::after(met, Some(log(1, 1)), 80, Some(Some(60))),
+        met,
+        "a move whose fork lies above it"
+    );
+    assert_eq!(
+        Met::after(met, Some(log(2, 0)), 80, Some(None)),
+        at(log(2, 0), 80),
+        "another log"
+    );
+    assert_eq!(
+        Met::after(met, Some(log(1, 1)), 80, Some(None)),
+        at(log(1, 1), 80),
+        "the same id continuing none"
+    );
+    assert_eq!(
+        Met::after(None, Some(log(1, 0)), 80, None),
+        at(log(1, 0), 80),
+        "met nowhere before"
+    );
+    assert_eq!(
+        Met::after(None, Some(log(1, 1)), 80, Some(Some(12))),
+        at(log(1, 1), 80),
+        "met nowhere before a move"
+    );
+    assert_eq!(Met::after(met, None, 80, None), None, "no identity");
+}
+
+/// **A READ BACK ON A LOG THAT CONTINUES NONE STARTS WHERE THE NODE MET ITS LINE**
+/// ([`Met::floor`]): a head kept on another id, or on a generation of the met line older than
+/// the meeting, reads back from the meeting's head; one kept on the met generation or a later
+/// one (a generation since the meeting a lineage did not relate) reads back from nowhere, and
+/// so does any where the log read now is of another line.
+#[test]
+fn a_read_back_on_a_log_that_continues_none_starts_where_the_node_met_its_line() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let met = Met {
+        log: log(1, 2),
+        head: 40,
+    };
+    let now = log(1, 5);
+    assert_eq!(met.floor(log(9, 0), now), Some(40), "another id");
+    assert_eq!(met.floor(log(1, 1), now), Some(40), "before the meeting");
+    assert_eq!(met.floor(log(1, 2), now), None, "the met generation");
+    assert_eq!(met.floor(log(1, 4), now), None, "a generation since");
+    assert_eq!(
+        met.floor(log(9, 0), log(7, 0)),
+        None,
+        "another line read now"
+    );
 }
 
 #[test]
@@ -4293,6 +4433,7 @@ fn resume_through(
     let witness = LogWitness {
         high: c,
         id: Some(log(rg)),
+        met: None,
     };
     let keep_below = if rebase_at_head {
         None
@@ -4302,7 +4443,7 @@ fn resume_through(
     let mut cursors = BTreeMap::new();
     cursors.insert("t".to_string(), TopicCursor { next: c });
     st.set_topics("s-r", &cursors).expect("write the cursor");
-    st.forget_log_offsets(h, None, Some(log(g)), keep_below, Some(&lineage))
+    st.forget_log_offsets(h, Some(log(g)), keep_below, Some(&lineage))
         .expect("forget or clamp");
     i64::try_from(st.topics("s-r")["t"].next).expect("an offset")
 }
@@ -4407,14 +4548,14 @@ fn a_generation_clamp_preserves_uncertain_refill_evidence() {
         &BTreeMap::from([("topic".to_string(), 1), ("gone".to_string(), 7)]),
     )
     .unwrap();
-    st.forget_log_offsets(9, None, None, Some(6), None).unwrap();
+    st.forget_log_offsets(9, None, Some(6), None).unwrap();
     assert_eq!(
         st.topic_floors(sid).unwrap(),
         BTreeMap::from([("topic".into(), 1)])
     );
     assert_eq!(st.topics(sid)["topic"].next, 6);
     assert_eq!(st.seen_off(sid), Some(5));
-    st.forget_log_offsets(9, None, None, None, None).unwrap();
+    st.forget_log_offsets(9, None, None, None).unwrap();
     assert!(st.topic_floors(sid).unwrap().is_empty());
 
     let mut preserved = Vec::new();
@@ -4426,7 +4567,7 @@ fn a_generation_clamp_preserves_uncertain_refill_evidence() {
             std::fs::write(&floor, bytes).unwrap();
             let before_topics = std::fs::read(dir.path().join("topics").join(sid)).unwrap();
             let before_seen = std::fs::read(dir.path().join("seen").join(sid)).unwrap();
-            let result = st.forget_log_offsets(9, None, None, keep, None);
+            let result = st.forget_log_offsets(9, None, keep, None);
             preserved.push(
                 result.is_err()
                     && std::fs::read(&floor).is_ok_and(|got| got == bytes)
@@ -4618,7 +4759,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 Some(""),
                 "the mirror's pin stays, for the mirror to refuse"
             );
-            st.publication_offset_resets(None, false)
+            st.publication_offset_resets(None, 0)
                 .expect("a log move's reset reads");
             assert!(st.set_aside_torn().expect("again").is_empty(), "idempotent");
             std::fs::write(&journal_path, &cut_journal).expect("a record cut short");
@@ -4666,7 +4807,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 next.post_pin("s-a", 2).expect_err("refused").kind(),
                 io::ErrorKind::InvalidData
             );
-            assert!(next.publication_offset_resets(None, false).is_err());
+            assert!(next.publication_offset_resets(None, 0).is_err());
             assert!(next.topic_floors("s-a").is_err());
             assert!(next
                 .logpin()

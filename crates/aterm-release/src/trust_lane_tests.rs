@@ -3783,9 +3783,12 @@ fn a_log_read_error_after_completed_checks_prevents_conclusion() {
     }
 }
 
+/// A receipt fault: its name, and how it damages a repo's receipts.
+type Fault = (&'static str, fn(&Path));
+
 #[test]
 fn incomplete_execution_receipts_after_checks_cannot_file_facts_or_raise_floors() {
-    let faults: [(&str, fn(&Path)); 4] = [
+    let faults: [Fault; 4] = [
         (".trustd-lost", |repo| {
             fs::create_dir(
                 repo.parent()

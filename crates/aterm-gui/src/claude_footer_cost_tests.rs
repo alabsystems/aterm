@@ -1050,7 +1050,7 @@ fn the_kept_reads_and_fits_follow_their_inputs() {
         .expect("a cell the footer writes");
     let placed = move |app: &mut App| {
         let frame_row = strip(app) + rule;
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.input_scratch.images[frame_row].push((col, image()));
     };
     typed += 1;

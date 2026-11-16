@@ -5,13 +5,16 @@
 //! Pinned reads import an exact observed OID; ordinary main refreshes reuse the checkout's
 //! objects. Writes carry the expected ref and stop on an unknown outcome; one agh says sent
 //! nothing may be made again. Neither a failed agh command nor an unrecognised URL falls back
-//! to git.
+//! to git. The reads every host makes (`engine`'s main refresh) build everywhere; the writes,
+//! the commit import and the deadline runners serve `verify land` alone and build where it does
+//! (unix).
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::Command;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Output;
+#[cfg(unix)]
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +26,7 @@ pub(crate) enum Tool {
 /// How a remote step is run: [`run`], or [`run_unless`].
 pub(crate) type Runner<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, String> + 'a;
 
+#[cfg(unix)]
 pub(crate) fn run(
     root: &Path,
     git: &dyn Fn(&Path) -> Command,
@@ -37,6 +41,7 @@ pub(crate) fn run(
 
 /// [`run`], ended once `stopped` reads `true` (read at least every
 /// [`aterm_uds::deadline::STOP_TICK`]): an ended step publishes no output and is an error.
+#[cfg(unix)]
 pub(crate) fn run_unless(
     root: &Path,
     git: &dyn Fn(&Path) -> Command,
@@ -167,6 +172,38 @@ fn success(tool: Tool, out: Output) -> Result<Vec<u8>, String> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReadStep {
+    FetchUrl,
+    PushUrl,
+    GithubRef,
+    GithubMainSnapshot,
+    GithubSnapshot,
+    LocalRef,
+    LocalSnapshot,
+    CommitInspection,
+}
+
+impl ReadStep {
+    const fn context(self) -> &'static str {
+        match self {
+            Self::FetchUrl => "remote fetch URL discovery",
+            Self::PushUrl => "remote push URL discovery",
+            Self::GithubRef => "GitHub ref resolution",
+            Self::GithubMainSnapshot => "GitHub main snapshot import",
+            Self::GithubSnapshot => "GitHub exact snapshot import",
+            Self::LocalRef => "local ref resolution",
+            Self::LocalSnapshot => "local exact snapshot import",
+            Self::CommitInspection => "local commit inspection",
+        }
+    }
+}
+
+/// Name the semantic read without adding its arguments or private input to the error.
+fn read_step<T>(step: ReadStep, read: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    read().map_err(|why| format!("{}: {why}", step.context()))
+}
+
 pub(crate) struct Remote<'a> {
     root: &'a Path,
     name: &'a str,
@@ -174,6 +211,7 @@ pub(crate) struct Remote<'a> {
     run: &'a Runner<'a>,
 }
 
+#[cfg(unix)]
 pub(crate) enum Pushed {
     Done,
     Rejected(String),
@@ -188,6 +226,7 @@ pub(crate) enum Pushed {
 }
 
 /// agh's one machine diagnostic of a failed command: the fields a caller decides by.
+#[cfg(unix)]
 #[derive(serde::Deserialize)]
 struct Refusal {
     v: u8,
@@ -201,6 +240,7 @@ struct Refusal {
 
 /// Read the machine diagnostic, never its human `why` or suggested command: `None` unless
 /// stderr holds exactly one, for this exit.
+#[cfg(unix)]
 fn refusal(out: &Output) -> Option<Refusal> {
     #[derive(serde::Deserialize)]
     struct Diagnostic {
@@ -221,6 +261,7 @@ fn refusal(out: &Output) -> Option<Refusal> {
 
 /// The foreign intent whose open entry refused this write before it sent anything. Unknown
 /// outcomes without this exact pre-send refusal remain fatal, including older agh diagnostics.
+#[cfg(unix)]
 fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
     let error = refusal(out)?;
     if error.exit == 13
@@ -239,6 +280,7 @@ fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
 /// later attempt may cure (could not run, a rate limit, a server failure), with no side effect,
 /// for this repository where it names one. agh settles such a write's intent itself, so the
 /// journal holds nothing open for it. Any other failure keeps its own meaning.
+#[cfg(unix)]
 fn unsent(out: &Output, repo: &str) -> bool {
     refusal(out).is_some_and(|error| {
         matches!(
@@ -252,22 +294,30 @@ fn unsent(out: &Output, repo: &str) -> bool {
 impl<'a> Remote<'a> {
     pub(crate) fn open(root: &'a Path, name: &'a str, run: &'a Runner<'a>) -> Result<Self, String> {
         let url = |push| {
-            let mut args = words(&["remote", "get-url", "--all"]);
-            if push {
-                args.push("--push".into());
-            }
-            args.push(name.into());
-            let out = run(Tool::Git, &args)?;
-            // git may echo a malformed configured URL on failure. Keep this read's error local.
-            if !out.status.success() {
-                return Err("cannot read the remote's expanded URL".to_owned());
-            }
-            let text = std::str::from_utf8(&out.stdout).map_err(|_| "remote URL is not UTF-8")?;
-            let lines: Vec<_> = text.lines().collect();
-            if lines.len() != 1 {
-                return Err("remote must have exactly one fetch URL and one push URL".into());
-            }
-            kind(lines[0])
+            let step = if push {
+                ReadStep::PushUrl
+            } else {
+                ReadStep::FetchUrl
+            };
+            read_step(step, || {
+                let mut args = words(&["remote", "get-url", "--all"]);
+                if push {
+                    args.push("--push".into());
+                }
+                args.push(name.into());
+                let out = run(Tool::Git, &args)?;
+                // git may echo a malformed configured URL on failure. Keep this read's error local.
+                if !out.status.success() {
+                    return Err("cannot read the remote's expanded URL".to_owned());
+                }
+                let text =
+                    std::str::from_utf8(&out.stdout).map_err(|_| "remote URL is not UTF-8")?;
+                let lines: Vec<_> = text.lines().collect();
+                if lines.len() != 1 {
+                    return Err("remote must have exactly one fetch URL and one push URL".into());
+                }
+                kind(lines[0])
+            })
         };
         let kind = url(false)?;
         if kind != url(true)? {
@@ -281,8 +331,19 @@ impl<'a> Remote<'a> {
         })
     }
 
+    /// The GitHub `OWNER/REPO` this remote names; `None` for a local repository. Read by
+    /// `verify watch` alone, which builds on unix only.
+    #[cfg(unix)]
+    pub(crate) fn github(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Github(slug) => Some(slug),
+            Kind::Local(_) => None,
+        }
+    }
+
     /// Reject a source agh cannot push before the caller spends time judging it.
     /// Local Git remotes do not impose agh's complete-history requirement.
+    #[cfg(unix)]
     pub(crate) fn admit_push_source(&self) -> Result<(), String> {
         if matches!(self.kind, Kind::Local(_)) {
             return Ok(());
@@ -309,7 +370,9 @@ impl<'a> Remote<'a> {
         const INTO: &str = "refs/agh/fetched-main";
         let mut args = words(&["repo", "fetch-main", slug]);
         args.push(self.root.as_os_str().to_owned());
-        let out = success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+        let out = read_step(ReadStep::GithubMainSnapshot, || {
+            success(Tool::Agh, (self.run)(Tool::Agh, &args)?)
+        })?;
         let value: Value =
             aterm_json::from_slice(&out).map_err(|e| format!("agh fetch-main: {e}"))?;
         if value["ref"].as_str() != Some(INTO) {
@@ -318,13 +381,15 @@ impl<'a> Remote<'a> {
         let tip = value["oid"]
             .as_str()
             .ok_or("agh's main snapshot names no commit")?;
-        if !aterm_types::land_trailer::object_id(tip) {
+        if !aterm_land_trailer::object_id(tip) {
             return Err("agh's main snapshot is not one exact object ID".into());
         }
-        let kind = success(
-            Tool::Git,
-            (self.run)(Tool::Git, &words(&["cat-file", "-t", tip]))?,
-        )?;
+        let kind = read_step(ReadStep::CommitInspection, || {
+            success(
+                Tool::Git,
+                (self.run)(Tool::Git, &words(&["cat-file", "-t", tip]))?,
+            )
+        })?;
         if kind != b"commit\n" {
             return Err("agh's main snapshot is not a commit object".into());
         }
@@ -335,13 +400,15 @@ impl<'a> Remote<'a> {
     pub(crate) fn fetch(&self, reference: &str) -> Result<Option<String>, String> {
         match &self.kind {
             Kind::Local(_) => {
-                let out = success(
-                    Tool::Git,
-                    (self.run)(
+                let out = read_step(ReadStep::LocalRef, || {
+                    success(
                         Tool::Git,
-                        &local_words(&["ls-remote", self.name, reference]),
-                    )?,
-                )?;
+                        (self.run)(
+                            Tool::Git,
+                            &local_words(&["ls-remote", self.name, reference]),
+                        )?,
+                    )
+                })?;
                 let text = std::str::from_utf8(&out).map_err(|_| "remote refs are not UTF-8")?;
                 let mut found = text
                     .lines()
@@ -350,29 +417,33 @@ impl<'a> Remote<'a> {
                 let Some((sha, _)) = found.next() else {
                     return Ok(None);
                 };
-                if found.next().is_some() || !aterm_types::land_trailer::object_id(sha) {
+                if found.next().is_some() || !aterm_land_trailer::object_id(sha) {
                     return Err("remote did not return one exact commit ID".into());
                 }
-                success(
-                    Tool::Git,
-                    (self.run)(
+                read_step(ReadStep::LocalSnapshot, || {
+                    success(
                         Tool::Git,
-                        &local_words(&["fetch", "--quiet", "--no-tags", self.name, sha]),
-                    )?,
-                )?;
+                        (self.run)(
+                            Tool::Git,
+                            &local_words(&["fetch", "--quiet", "--no-tags", self.name, sha]),
+                        )?,
+                    )
+                })?;
                 Ok(Some(sha.to_owned()))
             }
             Kind::Github(slug) => {
                 let name = reference
                     .strip_prefix("refs/")
                     .ok_or("remote ref must start with refs/")?;
-                let out = success(
-                    Tool::Agh,
-                    (self.run)(
+                let out = read_step(ReadStep::GithubRef, || {
+                    success(
                         Tool::Agh,
-                        &words(&["repo", "refs", slug, "--ref", reference]),
-                    )?,
-                )?;
+                        (self.run)(
+                            Tool::Agh,
+                            &words(&["repo", "refs", slug, "--ref", reference]),
+                        )?,
+                    )
+                })?;
                 let value: Value =
                     aterm_json::from_slice(&out).map_err(|e| format!("agh refs: {e}"))?;
                 let value = value.get("answer").unwrap_or(&value);
@@ -386,7 +457,7 @@ impl<'a> Remote<'a> {
                     return Ok(None);
                 };
                 let sha = row["oid"].as_str().ok_or("agh ref has no object ID")?;
-                if found.next().is_some() || !aterm_types::land_trailer::object_id(sha) {
+                if found.next().is_some() || !aterm_land_trailer::object_id(sha) {
                     return Err("agh did not return one exact commit ID".into());
                 }
                 // The ref can advance after observation; import the immutable snapshot itself.
@@ -400,28 +471,31 @@ impl<'a> Remote<'a> {
     /// branch, index or checkout moves. Unlike [`Self::fetch`], `sha` need be no ref's tip, as a
     /// superproject's gitlink can pin any commit the remote holds. A local remote is asked over
     /// the file transport, GitHub through agh.
+    #[cfg(unix)]
     pub(crate) fn import_commit(&self, sha: &str, into: &str) -> Result<(), String> {
-        if !aterm_types::land_trailer::object_id(sha) {
+        if !aterm_land_trailer::object_id(sha) {
             return Err("a commit import needs one exact object ID".into());
         }
         match &self.kind {
             Kind::Local(_) => {
                 let wanted = format!("+{sha}:{into}");
-                success(
-                    Tool::Git,
-                    (self.run)(
+                read_step(ReadStep::LocalSnapshot, || {
+                    success(
                         Tool::Git,
-                        &local_words(&[
-                            "fetch",
-                            "--quiet",
-                            "--no-tags",
-                            "--no-write-fetch-head",
-                            "--recurse-submodules=no",
-                            self.name,
-                            &wanted,
-                        ]),
-                    )?,
-                )?;
+                        (self.run)(
+                            Tool::Git,
+                            &local_words(&[
+                                "fetch",
+                                "--quiet",
+                                "--no-tags",
+                                "--no-write-fetch-head",
+                                "--recurse-submodules=no",
+                                self.name,
+                                &wanted,
+                            ]),
+                        )?,
+                    )
+                })?;
                 self.require_commit(sha)
             }
             Kind::Github(slug) => self.agh_commit(slug, sha, into),
@@ -444,16 +518,20 @@ impl<'a> Remote<'a> {
             "--input".into(),
             input.into_os_string(),
         ]);
-        success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+        read_step(ReadStep::GithubSnapshot, || {
+            success(Tool::Agh, (self.run)(Tool::Agh, &args)?)
+        })?;
         self.require_commit(sha)
     }
 
     /// `sha` is a commit object in this repository.
     fn require_commit(&self, sha: &str) -> Result<(), String> {
-        let object = success(
-            Tool::Git,
-            (self.run)(Tool::Git, &words(&["cat-file", "-t", sha]))?,
-        )?;
+        let object = read_step(ReadStep::CommitInspection, || {
+            success(
+                Tool::Git,
+                (self.run)(Tool::Git, &words(&["cat-file", "-t", sha]))?,
+            )
+        })?;
         if object == b"commit\n" {
             Ok(())
         } else {
@@ -469,6 +547,7 @@ impl<'a> Remote<'a> {
     /// included (a fast-forward plain git would take), refuses it. An unknown outcome stops the
     /// caller; only a typed refusal which sent nothing permits observation of the blocking
     /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]).
+    #[cfg(unix)]
     pub(crate) fn push(
         &self,
         reference: &str,
@@ -532,6 +611,7 @@ impl<'a> Remote<'a> {
 
     /// Observe only the exact foreign journal entry which refused our pre-send attempt. The
     /// caller owns the deadline; neither journal reads nor superseding writers extend it.
+    #[cfg(unix)]
     pub(crate) fn wait_for_intent(
         &self,
         intent: &agh::IntentId,

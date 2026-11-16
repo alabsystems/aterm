@@ -16,20 +16,30 @@ pub(super) struct TokenRow {
 }
 
 /// The rows of the tokens `standings` names, at `now` (unix seconds): each token entry described
-/// with its account, its state, where it was minted and when it ends, and its meta entry as
-/// metadata for it. The class is consumed in place, like every entry.
+/// with its account, its state, where it was minted and when it ends, when and on which Mac it
+/// was verified where its pair reads as one token and its meta carries a verification (the Mac
+/// that compared it, which need not be the one that minted it), and its meta entry as metadata
+/// for it. The class is consumed in place, like every entry.
 pub(super) fn token_rows(standings: &[crate::claude_token::Standing], now: u64) -> Vec<TokenRow> {
     let mut rows = Vec::with_capacity(standings.len() * 2);
     for standing in standings {
         let state = standing.state(now).words();
         let description = match &standing.meta {
-            Some(meta) => format!(
-                "Claude Code token for {}, consumed in place by aterm's harness: no file; never \
-                 export it. {state}; minted on {}, ends {}",
-                meta.email,
-                meta.minted_on,
-                day(meta.expires_at)
-            ),
+            Some(meta) => {
+                let verified = meta
+                    .verification()
+                    .filter(|_| standing.check == crate::claude_token::Check::Readable)
+                    .map_or_else(String::new, |verified| {
+                        format!(", verified {} on {}", day(verified.at), verified.on)
+                    });
+                format!(
+                    "Claude Code token for {}, consumed in place by aterm's harness: no file; \
+                     never export it. {state}; minted on {}{verified}, ends {}",
+                    meta.email,
+                    meta.minted_on,
+                    day(meta.expires_at)
+                )
+            }
             None => format!(
                 "Claude Code token, consumed in place by aterm's harness: no file; never export \
                  it. {state}"

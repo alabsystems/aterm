@@ -501,18 +501,69 @@ impl GlanceBudget {
     }
 }
 
-/// Where aterm keeps its own files on this platform: its state folder on every unix, the build
-/// cache's folder (`~/Library/Caches/aterm`) on macOS, and atpkg's package prefix on every unix.
-pub(crate) fn own_paths(home: Option<&Path>, state: Option<PathBuf>, macos: bool) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = state.into_iter().collect();
-    if let Some(home) = home {
+/// Where this platform's path functions put aterm's folders.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnDirs {
+    /// `$HOME`.
+    pub(crate) home: Option<PathBuf>,
+    /// The state folder (`aterm_types::dirs::state_dir`).
+    pub(crate) state: Option<PathBuf>,
+    /// The config folder (`aterm_types::dirs::aterm_config_dir`).
+    pub(crate) config: Option<PathBuf>,
+    /// The logs folder (`aterm_types::dirs::logs_dir`).
+    pub(crate) logs: Option<PathBuf>,
+    /// The control folder (`aterm_uds::control_socket_dir`): the state folder on macOS and a
+    /// folder in it elsewhere, or `$XDG_RUNTIME_DIR/aterm` where that is set, which lies in no
+    /// other folder of aterm's and so is an own root of its own. It holds the `image` verb's
+    /// captures.
+    pub(crate) control: Option<PathBuf>,
+}
+
+impl OwnDirs {
+    /// This process's.
+    pub(crate) fn live() -> Self {
+        Self {
+            home: aterm_types::dirs::home_dir(),
+            state: aterm_types::dirs::state_dir(),
+            config: aterm_types::dirs::aterm_config_dir(),
+            logs: aterm_types::dirs::logs_dir(),
+            control: aterm_uds::control_socket_dir(),
+        }
+    }
+}
+
+/// Where aterm keeps its own files on this platform, so nothing it writes is outside the aterm
+/// scope's count: its state, config, logs and control folders; on macOS the build cache's folder
+/// (`~/Library/Caches/aterm`); and on every unix atpkg's package prefix, the folder the vault
+/// lies in (`~/.config/aterm`, whatever `$XDG_CONFIG_HOME` says), `~/.aterm` (the file store,
+/// the CLI logins, the release ring) and `~/.cache/aterm` (the caches kept off the build cache).
+/// A path named twice is listed once.
+pub(crate) fn own_paths(dirs: &OwnDirs, macos: bool) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = dirs.state.iter().cloned().collect();
+    if let Some(home) = dirs.home.as_deref() {
         if macos {
             out.push(home.join("Library/Caches/aterm"));
         }
         #[cfg(unix)]
         out.push(atpkg::platform::default_prefix(home));
     }
-    out
+    out.extend(dirs.config.iter().cloned());
+    out.extend(dirs.logs.iter().cloned());
+    out.extend(dirs.control.iter().cloned());
+    #[cfg(unix)]
+    if let Some(home) = dirs.home.as_deref() {
+        let vault = aterm_secrets::client::Paths::locate_for_home(home).dir;
+        out.extend(vault.parent().map(Path::to_path_buf));
+        out.push(home.join(".aterm"));
+        out.push(home.join(".cache/aterm"));
+    }
+    let mut once: Vec<PathBuf> = Vec::with_capacity(out.len());
+    for p in out {
+        if !once.contains(&p) {
+            once.push(p);
+        }
+    }
+    once
 }
 
 /// aterm's own folders, each once: a folder inside another is that one's (atpkg's prefix lies

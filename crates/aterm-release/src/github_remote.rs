@@ -120,25 +120,6 @@ fn repository_file_with(
         .map_err(|error| words(client, &error))
 }
 
-fn lane_record_with(
-    client: &Github,
-    slug: &Slug,
-    journal: &str,
-    tree: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    if !agh::path::is_sha(journal) || !agh::path::is_sha(tree) {
-        return Err("a lane record read requires exact journal and tree object IDs".into());
-    }
-    match client
-        .contents(slug)
-        .raw(Some(journal), &format!("verdicts/{tree}.toml"), 16 << 20)
-    {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind == agh::error::Kind::NotFound => Ok(None),
-        Err(error) => Err(words(client, &error)),
-    }
-}
-
 /// Whether the identity this Mac's agh routes a write of `slug` to may push to it, by one read
 /// of the repository's permissions as that identity (what `agh can <slug> push` asks):
 /// `Ok(Ok(()))` when it may; `Ok(Err(why))` when no writer is routed, GitHub refuses it or it
@@ -207,13 +188,24 @@ pub(crate) fn helper_arguments(
 }
 
 impl Remote {
-    /// Read only the selected tree's record at an observed journal OID. Never transfer the
-    /// append-only journal's history into a fresh cutter clone.
-    pub(crate) fn lane_record(&self, journal: &str, tree: &str) -> Result<Option<Vec<u8>>, String> {
-        self.ensure_origin()?;
-        let bytes = lane_record_with(&self.client, &self.slug, journal, tree)?;
-        self.ensure_origin()?;
-        Ok(bytes)
+    /// The follower's newest status on `commit` (context [`aterm_verify::FOLLOWER_CONTEXT`]):
+    /// its state and description, `None` where it posted none.
+    pub(crate) fn follower(&self, commit: &str) -> Result<Option<(String, String)>, String> {
+        if !agh::path::is_sha(commit) {
+            return Err("a follower status read requires an exact commit ID".into());
+        }
+        let route =
+            agh::policy::RouteRequest::read(agh::policy::RouteTarget::Repo(self.slug.clone()))
+                .with_named(self.named.clone());
+        let path = format!("/repos/{}/commits/{commit}/statuses", self.slug);
+        let answer = self
+            .client
+            .call(&agh::Call::get(path, route))
+            .and_then(|answer| answer.json())
+            .map_err(|error| words(&self.client, &error))?;
+        let statuses = aterm_verify::watch::follower_statuses(&answer)
+            .ok_or("GitHub's answer for a commit's statuses is not a list")?;
+        Ok(statuses.into_iter().next())
     }
     /// The immutable repository captured when this source was admitted.
     pub(crate) fn repository(&self) -> &Slug {

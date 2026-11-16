@@ -126,6 +126,10 @@ fn slot_keys_bind_full_process_lineage_and_are_bounded_utf8_keys() {
             ..base.clone()
         },
         Caller {
+            sid: "s-0123456789abcdef0123".into(),
+            ..base.clone()
+        },
+        Caller {
             pid: 43,
             ..base.clone()
         },
@@ -136,16 +140,23 @@ fn slot_keys_bind_full_process_lineage_and_are_bounded_utf8_keys() {
     ] {
         assert_ne!(key, slot_key(&alternate, &binding).unwrap());
     }
-    assert!(
-        slot_key(
-            &Caller {
-                sid: "../../escape".into(),
-                ..base
-            },
-            &binding
-        )
-        .is_err()
-    );
+    for sid in [
+        "../../escape",
+        "s-1",
+        "s-0123456789ABCDEF0123",
+        "t000000000u",
+    ] {
+        assert!(
+            slot_key(
+                &Caller {
+                    sid: sid.into(),
+                    ..base.clone()
+                },
+                &binding
+            )
+            .is_err()
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -6,27 +6,37 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use aterm_vitals::blockage::{Blockage, BlockageBox};
+use aterm_vitals::heat::{
+    ClockRange, Counters, HeatBook, PressureBox, ThermalPressure, UsualClocks,
+};
 use aterm_vitals::model::{
-    GpuSample, LinkKind, LinkSample, MemSample, Pressure, ProcSample, STRIP_HISTORY_CAP,
-    STRIP_RINGS, Sample, SavedStrip, StripEvent, StripEventKind, StripLine, TabRoot, TaskRoom,
-    Ticks, VolumeSample,
+    ClusterSpec, GpuSample, LinkKind, LinkSample, MemSample, PlaceKind, Pressure, ProcSample,
+    ProcState, STRIP_HISTORY_CAP, STRIP_RINGS, Sample, SavedStrip, StripEvent, StripEventKind,
+    StripLine, TabRoot, TaskRoom, Ticks, VolumeSample,
 };
 use aterm_vitals::ring::{
     Agg, BUCKET_MS, GapKind, LONG_BUCKET_MS, LONG_BUCKETS, RECENT_CAP, RING_BUCKETS, SavedRing,
     TimeGap,
 };
+use aterm_vitals::situation::{
+    Lid, LidReading, Power, PowerSource, Reading, Situation, Span, Stay,
+};
+use aterm_vitals::starts::{CoalTaskRead, CoalTasks};
 
 use super::{
-    BASE_FILE, LEGACY_FILE, STRIP_MAX_BYTES, STRIP_SCHEMA, StripStore, TAIL_FILE, base_json,
-    base_of, line_json, strip_dir,
+    BASE_FILE, LEGACY_FILE, STRIP_MAX_BYTES, STRIP_SCHEMA, StripStore, TAIL_FILE, TAIL_MAX_BYTES,
+    base_json, base_of, line_json, line_of, strip_dir,
 };
 use crate::vitals_host::StripLock;
 
 /// The wall clock the tests' readings start at: an epoch's start.
 const T0: i64 = 1_793_000_000_000;
 
-/// Reading `i` of a machine one second apart from [`T0`]'s half-slot, every strip ring fed: the
-/// rows, Network's two directions, memory pressure, aterm's own processes and the process count.
+/// Reading `i` of a machine one second apart from [`T0`]'s half-slot, the rows' strip rings fed:
+/// the rows, Network's two directions, memory pressure, aterm's own processes and the process
+/// count; and of the instruments', the thermal pressure level and blockage, with a stay for the
+/// situation's span. [`instrumented`] feeds the heat chain's and the exits ring too.
 fn reading(i: u64) -> Sample {
     let mono_ms = (i + 1) * 1_000;
     let wobble = (i * 7_919) % 1_009;
@@ -95,6 +105,7 @@ fn reading(i: u64) -> Sample {
             agent_leader: None,
         }],
         links: Some(vec![LinkSample {
+            byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
             name: "en0".into(),
             kind: LinkKind::Wifi,
             up: true,
@@ -111,6 +122,149 @@ fn reading(i: u64) -> Sample {
         },
         starts: Some(aterm_vitals::StartCount::Forks(40 * i + wobble % 7)),
         self_uid: Some(501),
+        thermal_pressure: Some(Ok(if wobble.is_multiple_of(5) {
+            ThermalPressure::Moderate
+        } else {
+            ThermalPressure::Nominal
+        })),
+        place: Some(PlaceKind::Lan),
+        situation: at_a_desk(),
+        ..Sample::default()
+    }
+}
+
+fn situation(source: PowerSource, lid: Lid) -> Situation {
+    Situation {
+        lid: Reading::Read(LidReading {
+            lid,
+            changed_ms: None,
+        }),
+        power: Reading::Read(Power {
+            source,
+            battery: None,
+            adapter_w: None,
+            changed_ms: None,
+        }),
+        ..Situation::default()
+    }
+}
+
+/// On AC with the lid open.
+fn at_a_desk() -> Situation {
+    situation(PowerSource::Ac, Lid::Open)
+}
+
+/// Reading `i`, a second after the one before from [`T0`]'s half-slot, with every instrument's
+/// reader answering (A4): one coalition that has done a second's work each second (four Super
+/// cores at 4000 MHz, three Efficiency cores' worth at 2500 MHz, a watt a busy core and a GPU
+/// drawing 1.6 W four readings in five and 1.1 W the fifth), started 40 tasks and ended 30;
+/// thermal pressure Moderate one reading in seven; a zombie under the tab's shell; on the LAN on AC for the first 40 readings,
+/// then on a hotspot on battery.
+fn instrumented(i: u64) -> Sample {
+    let k = i + 1;
+    let mono_ms = k * 1_000;
+    let (p_ns, e_ns) = (4_000_000_000_u64, 3_000_000_000_u64);
+    let (p_cycles, e_cycles) = (16_000_000_000_u64, 7_500_000_000_u64);
+    let ticks = |ns: u64| ns * 3 / 125;
+    let so_far = Counters {
+        cpu_ticks: ticks(p_ns + e_ns) * k,
+        qos_ticks: ticks(p_ns + e_ns) * k,
+        p_ticks: ticks(p_ns) * k,
+        energy_nj: (p_ns + e_ns) * k,
+        instructions: 2 * (p_cycles + e_cycles) * k,
+        cycles: (p_cycles + e_cycles) * k,
+        p_instructions: 2 * p_cycles * k,
+        p_cycles: p_cycles * k,
+        gpu_energy_nj: 1_500_000_000 * k + (k % 5) * 100_000_000,
+        ..Counters::default()
+    }
+    .words();
+    let read = CoalTaskRead::of(
+        Some(1),
+        false,
+        [CoalTasks {
+            id: 1,
+            started: 40 * k,
+            exited: 30 * k,
+        }],
+    )
+    .with_heat(HeatBook {
+        at_ns: mono_ms * 1_000_000,
+        timebase: (125, 3),
+        by_id: vec![(1, so_far)],
+        total: Ok(so_far),
+    });
+    let proc = |pid, ppid, name: &str, state| ProcSample {
+        pid,
+        start: Some(1),
+        ppid,
+        uid: Some(501),
+        name: name.into(),
+        state,
+        ..ProcSample::default()
+    };
+    let away = i >= 40;
+    Sample {
+        at_ns: mono_ms * 1_000_000,
+        at_unix_ms: T0 + 500 + 1_000 * i as i64,
+        mono_ms,
+        cadence_ms: 1_000,
+        cores: Some(
+            (0..10)
+                .map(|c| Ticks {
+                    busy: k * if c < 4 { 100 } else { 50 },
+                    total: k * 100,
+                })
+                .collect(),
+        ),
+        clusters: vec![
+            ClusterSpec {
+                name: "Super".into(),
+                logical: vec![0, 1, 2, 3],
+            },
+            ClusterSpec {
+                name: "Efficiency".into(),
+                logical: (4..10).collect(),
+            },
+        ],
+        procs: Some(vec![
+            proc(100, 1, "aterm", ProcState::Run),
+            proc(200, 100, "zsh", ProcState::Run),
+            proc(300, 200, "cc", ProcState::Zombie),
+        ]),
+        self_pid: 100,
+        self_uid: Some(501),
+        tabs: vec![TabRoot {
+            key: 7,
+            tab: 7,
+            shell_pid: 200,
+            label: "Tab 1".into(),
+            program: "make".into(),
+            tab_id: Some(7),
+            agent_leader: None,
+        }],
+        starts: Some(aterm_vitals::StartCount::Coalitions { read, own: None }),
+        coal_lane: aterm_vitals::explain::CoalLane::On,
+        thermal_pressure: Some(Ok(if i % 7 == 3 {
+            ThermalPressure::Moderate
+        } else {
+            ThermalPressure::Nominal
+        })),
+        clock_range: Some(Ok(ClockRange {
+            p_mhz: (1308.0, 4464.0),
+            e_mhz: (972.0, 3048.0),
+        })),
+        cpu_brand: Some("Apple M5".into()),
+        place: Some(if away {
+            PlaceKind::Hotspot
+        } else {
+            PlaceKind::Lan
+        }),
+        situation: if away {
+            situation(PowerSource::Battery, Lid::Open)
+        } else {
+            at_a_desk()
+        },
         ..Sample::default()
     }
 }
@@ -164,7 +318,10 @@ fn longs(strip: &SavedStrip) -> Vec<Vec<(i64, Agg)>> {
 
 /// Record §9: the schema-1 file a build before the append-only checkpoint wrote restores
 /// nothing, so no bucket's read time, minimum or start meaning is invented, and goes at the first
-/// base written. A prior schema cannot prove the scope coverage the current schema preserves.
+/// base written; a base of schema 1 restores nothing either, in the old layout or in the
+/// current one, where only the schema guard refuses it; nor does a base labelled with an
+/// earlier schema this reads (2, 3) that does not hold that schema's rings, nor one of the
+/// schema after this. None panics.
 /// CONTROL: the same strip written at the current schema restores.
 #[test]
 fn a_schema_one_strip_file_restores_nothing() {
@@ -202,7 +359,7 @@ fn a_schema_one_strip_file_restores_nothing() {
     let current = std::fs::read_to_string(&base).expect("the base");
     let schema = format!("{{\"schema\":{STRIP_SCHEMA},");
     assert!(current.starts_with(&schema), "{current}");
-    for other in [1, 2, STRIP_SCHEMA + 1] {
+    for other in [1, 2, 3, STRIP_SCHEMA + 1] {
         let relabelled = current.replacen(&schema, &format!("{{\"schema\":{other},"), 1);
         std::fs::write(&base, relabelled).expect("a base of another schema");
         assert_eq!(
@@ -210,6 +367,15 @@ fn a_schema_one_strip_file_restores_nothing() {
             SavedStrip::default(),
             "a schema-{other} base in the current layout"
         );
+    }
+    // A base labelled 2 or 3 that holds one ring: neither schema's count, so neither reads it.
+    let one_ring = r#"{"schema":2,"generation":4,"last_wall_ms":1793000060000,"through_k":179300005,"clean_stop":true,"caps":[8.0,null,null,null,null,null,null],"rings":[{"b":[[179300004,10000,10,0,0.5,0.25,0.75],[179300005,10000,10,0,0.25,0.125,0.5]],"r":[[1793000059500,0.25,false,1000]],"l":[[2988333,20000,20,0,0.375,0.125,0.75]],"f":179300006}],"proc_starts":true,"gaps":[],"events":[]}"#;
+    for text in [
+        one_ring.to_owned(),
+        one_ring.replacen("{\"schema\":2,", "{\"schema\":3,", 1),
+    ] {
+        std::fs::write(&base, &text).expect("a one-ring base");
+        assert_eq!(store_in(home).1, SavedStrip::default(), "{text}");
     }
 }
 
@@ -265,7 +431,7 @@ fn fullest_ring(seed: f64) -> SavedRing {
     let agg = |j: usize, tau_ms: u32, n: u16| Agg {
         tau_ms,
         n,
-        over_ms: tau_ms - 1,
+        over_ms: tau_ms,
         mean: v(j),
         min: v(j) - 1.000_000_000_000_1,
         max: v(j) + 1.000_000_000_000_1,
@@ -295,8 +461,10 @@ fn fullest_ring(seed: f64) -> SavedRing {
     }
 }
 
-/// Record §9: a base with every ring at its fullest, its numbers at their widest, and the most
-/// gaps and events a strip keeps, is under 85 % of [`STRIP_MAX_BYTES`], and reads back whole.
+/// Record §9, with A4's rings (N3): a base with each of its [`STRIP_RINGS`] rings at its
+/// fullest (the instruments' four among them), its numbers at their widest, the most gaps,
+/// events and situation spans a strip keeps, each span's words the longest, and every usual
+/// clock taught, is under 85 % of [`STRIP_MAX_BYTES`], and reads back whole.
 /// CONTROL: the bound is what a read refuses past.
 #[test]
 fn a_full_strip_base_fits_within_85_percent_of_its_cap() {
@@ -320,12 +488,45 @@ fn a_full_strip_base_fits_within_85_percent_of_its_cap() {
                 label: "memory pressure critical".into(),
             })
             .collect(),
+        situation: (0..STRIP_HISTORY_CAP as i64)
+            .map(|j| Span {
+                start_ms: T0 + j * 100_000,
+                end_ms: T0 + j * 100_000 + 99_999,
+                stay: Stay {
+                    place: Some(PlaceKind::Cellular),
+                    power: Some(PowerSource::Battery),
+                    lid: Some(Lid::Closed),
+                },
+            })
+            .collect(),
+        usual: UsualClocks::restored(
+            &(0..10_u8)
+                .map(|d| {
+                    (
+                        d,
+                        123_456.789_012_345_67 + f64::from(d),
+                        4_464.123_456_789_012 - f64::from(d),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
         ..SavedStrip::default()
     };
+    assert_eq!(
+        STRIP_RINGS, 24,
+        "the rows' 17, the scope's 3 and the instruments' 4"
+    );
     for slot in 0..STRIP_RINGS {
         *full.ring_mut(slot).expect("a slot") = fullest_ring(slot as f64);
     }
+    assert!(full.ring_mut(STRIP_RINGS).is_none());
+    assert_eq!(full.usual.saved().len(), 10);
     let text = base_json(&full, u64::MAX).expect("text");
+    eprintln!(
+        "a full base is {} bytes, {:.1} % of its bound",
+        text.len(),
+        text.len() as f64 * 100.0 / STRIP_MAX_BYTES as f64
+    );
     assert!(
         text.len() as u64 * 100 <= STRIP_MAX_BYTES * 85,
         "{} bytes is over 85 % of the {STRIP_MAX_BYTES}-byte bound",
@@ -798,9 +999,11 @@ fn a_restored_strip_keeps_the_gaps_events_and_places_of_its_tail() {
     assert!(!base.strip_events.contains(&event), "CONTROL");
 }
 
-/// Record §9: an hour of readings a second, every ring fed, writes under 2 MB to the strip's
-/// files: a base at the start and at the hour, and a line per epoch between. CONTROL: a whole
-/// base every 10 s, the schema-1 checkpoint's rule, would write far more.
+/// Record §9, with A4's rings (N3): an hour of readings a second, the rows' rings and the
+/// instruments' four fed, each line with the stay's span and the usual clock the reading
+/// taught, writes under 2 MB to the strip's files: a base at the start and at the hour, and a
+/// line per epoch between. CONTROL: a whole base every 10 s, the schema-1 checkpoint's rule,
+/// would write far more.
 #[test]
 fn the_strip_writes_under_two_megabytes_an_hour() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
@@ -808,13 +1011,30 @@ fn the_strip_writes_under_two_megabytes_an_hour() {
     let mut model = aterm_vitals::Vitals::new();
     let t0 = Instant::now();
     let mut whole_every_10s = 0_u64;
+    // The rows' readings with the heat chain's and the exit counter's beside them.
+    let every_ring = |i: u64| {
+        let heat = instrumented(i);
+        Sample {
+            cores: heat.cores,
+            clusters: heat.clusters,
+            starts: heat.starts,
+            coal_lane: heat.coal_lane,
+            clock_range: heat.clock_range,
+            cpu_brand: heat.cpu_brand,
+            ..reading(i)
+        }
+    };
+    let mut a_line = None;
     for i in 0..=3_600 {
-        let _ = model.absorb(&reading(i));
+        let _ = model.absorb(&every_ring(i));
         store.keep(
             &model,
             t0 + Duration::from_secs(i),
             &mut StripLock::Unlocked,
         );
+        if i == 3_595 {
+            a_line = tail_in(dir.path()).lines().last().map(str::to_owned);
+        }
         if i % 10 == 0 {
             whole_every_10s +=
                 base_json(&model.saved_strip(false), 1).map_or(0, |t| t.len() as u64);
@@ -823,6 +1043,19 @@ fn the_strip_writes_under_two_megabytes_an_hour() {
     let written = store.bytes_written();
     eprintln!(
         "an hour wrote {written} bytes; a whole base every 10 s would write {whole_every_10s}"
+    );
+    let held = model.saved_strip(false);
+    for slot in 20..STRIP_RINGS {
+        assert!(
+            held.ring(slot).is_some_and(|r| r.buckets.len() >= 359),
+            "slot {slot} read the hour"
+        );
+    }
+    assert!(!held.situation.is_empty() && !held.usual.saved().is_empty());
+    let line = a_line.expect("the hour's last line, before the hourly base emptied the tail");
+    assert!(
+        line.contains("\"s\":[[") && line.contains("\"u\":[["),
+        "{line}"
     );
     assert!(written < 2_000_000, "{written} bytes in an hour");
     assert!(
@@ -853,9 +1086,30 @@ fn a_tail_line_reads_back_as_written() {
         proc_starts: Some(true),
         time_gaps: Vec::new(),
         strip_events: Vec::new(),
+        spans: vec![
+            Span {
+                start_ms: T0,
+                end_ms: T0 + 4_500,
+                stay: Stay {
+                    place: Some(PlaceKind::Vpn),
+                    power: Some(PowerSource::Ac),
+                    lid: Some(Lid::None),
+                },
+            },
+            Span {
+                start_ms: T0 + 4_500,
+                end_ms: T0 + 9_500,
+                stay: Stay {
+                    place: None,
+                    power: Some(PowerSource::Ups),
+                    lid: None,
+                },
+            },
+        ],
+        usual: vec![(3, 12.5, 2_812.25), (9, 61.0, 4_011.5)],
     };
     let text = line_json(&line, 7).expect("text");
-    assert_eq!(super::line_of(&text), Some((7, line.clone())));
+    assert_eq!(line_of(&text), Some((7, line.clone())));
     let mut strip = SavedStrip {
         last_wall_ms: T0,
         through_k: 179_299_999,
@@ -865,4 +1119,429 @@ fn a_tail_line_reads_back_as_written() {
     odd.rings.push((u8::MAX, odd.rings[0].1));
     assert!(strip.replay(odd));
     assert_eq!(strip.rings[0].buckets.len(), 1);
+}
+
+/// The tail's bound holds what its constant says (N3): four hours of lines, each with every
+/// ring's bucket at its widest, the stay's span moved and every usual clock taught, fit
+/// [`TAIL_MAX_BYTES`], and such a line reads back as written.
+/// CONTROL: five hours of them do not, so the bound is no looser than it says.
+#[test]
+fn four_hours_of_the_fullest_lines_fit_the_tails_bound() {
+    let v = |slot: usize| -(123_456_789.012_345_67 + slot as f64);
+    let line = StripLine {
+        k: (T0 + 7 * 3_600_000).div_euclid(BUCKET_MS),
+        wall_ms: T0 + 7 * 3_600_000,
+        caps: [Some(1.234_567_890_123_456_7e15); 7],
+        rings: (0..STRIP_RINGS)
+            .map(|slot| {
+                (
+                    slot as u8,
+                    Agg {
+                        tau_ms: 10_000,
+                        n: u16::MAX,
+                        over_ms: 10_000,
+                        mean: v(slot),
+                        min: v(slot) - 1.000_000_000_000_1,
+                        max: v(slot) + 1.000_000_000_000_1,
+                    },
+                )
+            })
+            .collect(),
+        proc_starts: Some(true),
+        time_gaps: Vec::new(),
+        strip_events: Vec::new(),
+        spans: vec![Span {
+            start_ms: T0 + 6 * 3_600_000,
+            end_ms: T0 + 7 * 3_600_000,
+            stay: Stay {
+                place: Some(PlaceKind::Cellular),
+                power: Some(PowerSource::Battery),
+                lid: Some(Lid::Closed),
+            },
+        }],
+        usual: (0..10_u8)
+            .map(|d| {
+                (
+                    d,
+                    123_456.789_012_345_67 + f64::from(d),
+                    4_464.123_456_789_012 - f64::from(d),
+                )
+            })
+            .collect(),
+    };
+    let text = line_json(&line, u64::MAX).expect("text");
+    assert_eq!(line_of(&text), Some((u64::MAX, line)));
+    let bytes = text.len() as u64 + 1;
+    let lines_an_hour = 3_600_000 / BUCKET_MS as u64;
+    eprintln!("the fullest line is {bytes} bytes");
+    assert!(
+        4 * lines_an_hour * bytes <= TAIL_MAX_BYTES,
+        "four hours of {bytes}-byte lines pass the {TAIL_MAX_BYTES}-byte bound"
+    );
+    assert!(5 * lines_an_hour * bytes > TAIL_MAX_BYTES, "CONTROL");
+}
+
+/// A base as schema 3 wrote it (20 rings: the rows' 17, the scope's coverage and its raw CPU
+/// charge) reads with each of those rings as written, and with the instruments' rings, the
+/// situation spans and the usual clocks empty: nothing is made up for what it never held.
+/// CONTROL: the same 20 rings labelled with the current schema are too few, and restore nothing.
+#[test]
+fn a_schema_three_base_keeps_its_rings_and_starts_the_instruments_empty() {
+    const SCHEMA_3_RINGS: usize = 20;
+    let mut saved = SavedStrip {
+        last_wall_ms: T0 + 7 * 3_600_000,
+        through_k: (T0 + 7 * 3_600_000).div_euclid(BUCKET_MS) - 1,
+        ..SavedStrip::default()
+    };
+    for slot in 0..SCHEMA_3_RINGS {
+        *saved.ring_mut(slot).expect("a slot") = fullest_ring(slot as f64);
+    }
+    let mut document: super::BaseDoc =
+        aterm_json::from_str(&base_json(&saved, 5).expect("text")).expect("a base");
+    assert_eq!(document.rings.len(), STRIP_RINGS);
+    document.schema = 3;
+    document.rings.truncate(SCHEMA_3_RINGS);
+    let (generation, back) =
+        base_of(&aterm_json::to_string(&document).expect("text")).expect("schema 3 reads");
+    assert_eq!(generation, 5);
+    for slot in 0..SCHEMA_3_RINGS {
+        assert_eq!(back.ring(slot), saved.ring(slot), "slot {slot}");
+        assert!(back.ring(slot).is_some_and(|r| !r.is_empty()));
+    }
+    for slot in SCHEMA_3_RINGS..STRIP_RINGS {
+        assert!(
+            back.ring(slot).is_some_and(SavedRing::is_empty),
+            "instrument slot {slot} starts empty"
+        );
+    }
+    assert!(back.situation.is_empty());
+    assert_eq!(back.usual, UsualClocks::default());
+
+    document.schema = STRIP_SCHEMA;
+    assert_eq!(
+        base_of(&aterm_json::to_string(&document).expect("text")),
+        None,
+        "CONTROL: the current schema holds {STRIP_RINGS} rings"
+    );
+}
+
+/// A situation span reads back with its words (netplace's kind, the power source, the lid), a
+/// value no reader gave as an empty word.
+/// CONTROL: a span that names a word nobody says (`checking` is no kind a span keeps), ends
+/// before it starts, or holds no value at all is dropped, and the line's other spans stand.
+#[test]
+fn a_span_reads_back_by_its_words_and_a_damaged_one_is_dropped() {
+    let spans: Vec<Span> = [
+        (Some(PlaceKind::Lan), Some(PowerSource::Ac), Some(Lid::Open)),
+        (
+            Some(PlaceKind::Hotspot),
+            Some(PowerSource::Battery),
+            Some(Lid::Closed),
+        ),
+        (
+            Some(PlaceKind::Cellular),
+            Some(PowerSource::Ups),
+            Some(Lid::None),
+        ),
+        (Some(PlaceKind::Vpn), None, None),
+        (Some(PlaceKind::Offline), None, Some(Lid::Open)),
+        (None, Some(PowerSource::Ac), None),
+    ]
+    .into_iter()
+    .zip(0_i64..)
+    .map(|((place, power, lid), j)| Span {
+        start_ms: T0 + j * 1_000,
+        end_ms: T0 + j * 1_000 + 1_000,
+        stay: Stay { place, power, lid },
+    })
+    .collect();
+    let line = StripLine {
+        k: 179_300_000,
+        wall_ms: T0 + 9_500,
+        spans: spans.clone(),
+        ..StripLine::default()
+    };
+    let text = line_json(&line, 2).expect("text");
+    for word in [
+        "lan", "hotspot", "cellular", "vpn", "offline", "battery", "ups", "closed",
+    ] {
+        assert!(text.contains(&format!("\"{word}\"")), "{word}: {text}");
+    }
+    assert_eq!(line_of(&text).map(|(_, l)| l.spans), Some(spans));
+
+    let damaged = format!(
+        r#"{{"g":2,"k":179300000,"w":{w},"c":[],"r":[],"s":[[{t},{t},"checking","ac","open"],[{t},{t},"lan","mains","open"],[{t},{t},"lan","ac","ajar"],[{t},{before},"lan","ac","open"],[{t},{t},"","",""],[{t},{t},"vpn","",""]]}}"#,
+        w = T0 + 9_500,
+        t = T0,
+        before = T0 - 1,
+    );
+    assert_eq!(
+        line_of(&damaged).map(|(_, l)| l.spans),
+        Some(vec![Span {
+            start_ms: T0,
+            end_ms: T0,
+            stay: Stay {
+                place: Some(PlaceKind::Vpn),
+                power: None,
+                lid: None,
+            },
+        }])
+    );
+}
+
+/// Each slot's 10 s bucket of epoch `k`.
+fn bucket_at(strip: &SavedStrip, slot: usize, k: i64) -> Option<Agg> {
+    strip
+        .ring(slot)
+        .and_then(|r| r.buckets.iter().find(|(bk, _)| *bk == k))
+        .map(|(_, a)| *a)
+}
+
+/// A4's rings across a relaunch (N3): compute watts, the thermal pressure level with each box's
+/// share at Moderate or more and its worst level, process exits a second and the blockage share
+/// with its worst kind come back from the base and its tail as the live model holds them, the
+/// situation spans with them, and the model that restores them draws the same boxes. The run
+/// ends with no stop's write, as a crash ends it: the tail alone carries what closed since the
+/// first base.
+/// CONTROL: without the tail the base written at the first reading holds none of the four
+/// rings' closed buckets and no span past its own reading; and a model that restores nothing
+/// holds none.
+#[test]
+fn the_instruments_rings_restore_after_a_relaunch() {
+    const INSTRUMENTS: std::ops::Range<usize> = 20..STRIP_RINGS;
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let (mut store, _) = store_in(dir.path());
+    let mut model = aterm_vitals::Vitals::new();
+    let t0 = Instant::now();
+    // Reading 90 is the first past epoch 8's end: the last line is written at it.
+    let mut at_last_line = None;
+    for i in 0..95 {
+        let _ = model.absorb(&instrumented(i));
+        store.keep(
+            &model,
+            t0 + Duration::from_secs(i),
+            &mut StripLock::Unlocked,
+        );
+        if i == 90 {
+            at_last_line = Some((model.strip_spans().to_vec(), *model.usual_clocks()));
+        }
+    }
+    let (spans, usual) = at_last_line.expect("reading 90");
+    let live = model.saved_strip(false);
+    let through = model.strip_open_k().expect("read") - 1;
+    let k0 = T0.div_euclid(BUCKET_MS);
+    assert_eq!(through, k0 + 8);
+
+    // What the live model holds, so the restore below is of something: 8.5 W of compute (7 W of
+    // CPU, and the GPU's 1.6 W eight readings in ten and 1.1 W two); the pressure box of readings 20 to 29 (reading 24 at Moderate: a second of
+    // ten); 30 exits a second; the zombie counted from its tenth second, a steady pile.
+    let watts = bucket_at(&live, 20, k0 + 2).expect("compute watts");
+    assert!((watts.mean - 8.5).abs() < 1e-9, "{watts:?}");
+    let pressed = PressureBox::of(&bucket_at(&live, 21, k0 + 2).expect("pressure")).expect("read");
+    assert!((pressed.share - 0.1).abs() < 1e-9, "{pressed:?}");
+    assert_eq!(pressed.worst, ThermalPressure::Moderate);
+    assert_eq!(bucket_at(&live, 22, k0 + 2).map(|a| a.mean), Some(30.0));
+    assert_eq!(
+        bucket_at(&live, 23, k0 + 2)
+            .as_ref()
+            .and_then(BlockageBox::of),
+        Some(BlockageBox {
+            share: 1.0,
+            worst: Some(Blockage::SteadyPile)
+        })
+    );
+    assert_eq!(
+        bucket_at(&live, 23, k0).as_ref().and_then(BlockageBox::of),
+        Some(BlockageBox {
+            share: 0.0,
+            worst: None
+        }),
+        "the zombie's first ten seconds read clear"
+    );
+    assert_eq!(
+        spans
+            .iter()
+            .map(|s| (s.stay.place, s.stay.power, s.start_ms - T0, s.end_ms - T0))
+            .collect::<Vec<_>>(),
+        [
+            (Some(PlaceKind::Lan), Some(PowerSource::Ac), 500, 39_500),
+            (
+                Some(PlaceKind::Hotspot),
+                Some(PowerSource::Battery),
+                39_500,
+                90_500
+            ),
+        ]
+    );
+
+    // The files: the first reading's base with nine lines replayed.
+    assert_eq!(tail_in(dir.path()).lines().count(), 9);
+    let (_, kept) = store_in(dir.path());
+    assert_eq!(kept.through_k, through);
+    for slot in INSTRUMENTS {
+        let (file, held) = (&closed(&kept, through)[slot], &closed(&live, through)[slot]);
+        assert_eq!(file, held, "slot {slot}");
+        assert!(file.len() >= 8, "slot {slot} read {} epochs", file.len());
+    }
+    assert_eq!(longs(&kept)[INSTRUMENTS], longs(&live)[INSTRUMENTS]);
+    assert_eq!(
+        kept.situation, spans,
+        "the spans as the last line left them"
+    );
+    assert_eq!(kept.usual, usual);
+
+    // The relaunch.
+    let mut relaunched = aterm_vitals::Vitals::new();
+    relaunched.restore_strip_history(kept, T0 + 120_000);
+    let back = relaunched.saved_strip(false);
+    for slot in INSTRUMENTS {
+        assert_eq!(
+            closed(&back, through)[slot],
+            closed(&live, through)[slot],
+            "slot {slot}"
+        );
+    }
+    assert_eq!(
+        bucket_at(&back, 21, k0 + 2)
+            .as_ref()
+            .and_then(PressureBox::of),
+        Some(pressed)
+    );
+    assert_eq!(relaunched.strip_spans(), spans);
+    assert_eq!(*relaunched.usual_clocks(), usual);
+
+    // A base written whole holds them with no tail, the open epoch and the raw readings too.
+    store.stop(
+        &model,
+        true,
+        t0 + Duration::from_secs(95),
+        &mut StripLock::Unlocked,
+    );
+    assert_eq!(tail_in(dir.path()), "");
+    let (_, whole) = store_in(dir.path());
+    assert_eq!(whole, model.saved_strip(true));
+    assert_eq!(whole.situation, model.strip_spans());
+
+    // CONTROL: the first reading's base alone.
+    let alone = aterm_tempfile::tempdir().expect("scratch state");
+    let (mut store, _) = store_in(alone.path());
+    let mut model = aterm_vitals::Vitals::new();
+    for i in 0..95 {
+        let _ = model.absorb(&instrumented(i));
+        store.keep(
+            &model,
+            t0 + Duration::from_secs(i),
+            &mut StripLock::Unlocked,
+        );
+    }
+    std::fs::remove_file(strip_dir(alone.path()).join(TAIL_FILE)).expect("the tail");
+    let (_, base) = store_in(alone.path());
+    assert_eq!(base.through_k, k0 - 1, "the base holds no closed epoch");
+    for slot in INSTRUMENTS {
+        let held = &closed(&base, through)[slot];
+        assert!(
+            held.iter().all(|&(k, _)| k == k0),
+            "slot {slot} holds its open epoch at most: {held:?}"
+        );
+        assert_ne!(*held, closed(&live, through)[slot], "slot {slot}");
+    }
+    assert_eq!(
+        base.situation
+            .iter()
+            .map(|s| (s.start_ms - T0, s.end_ms - T0))
+            .collect::<Vec<_>>(),
+        [(500, 500)]
+    );
+    assert_eq!(base.usual, UsualClocks::default());
+    // CONTROL: nothing restored.
+    let fresh = aterm_vitals::Vitals::new().saved_strip(false);
+    for slot in INSTRUMENTS {
+        assert_eq!(closed(&fresh, through)[slot], Vec::new());
+    }
+}
+
+/// The heat chain's peaks and usual clocks across a relaunch (N3): the compute watts peak and
+/// the work-per-joule peak come back from the peaks file, the usual Super clock of each decile
+/// from the strip's checkpoint (here its tail: the run ends with no stop's write of the strip),
+/// and the relaunched model holds each as the run before learned it.
+/// CONTROL: a relaunch with neither file has learned none; a peaks file written before these
+/// two rows reads with the peaks it holds and learns these from zero; and usual clocks the
+/// first base never held are gone without the tail.
+#[test]
+fn the_heat_peaks_and_usual_clocks_restore_after_a_relaunch() {
+    use crate::vitals_host::{PEAKS_FILE, PeakFile, peaks_of};
+    let dir = aterm_tempfile::tempdir().expect("scratch state");
+    let peaks_path = dir.path().join(PEAKS_FILE);
+    let t0 = Instant::now();
+    let (mut peaks_file, none) = PeakFile::open(Some(peaks_path.clone()), t0);
+    assert_eq!(none, aterm_vitals::Peaks::default());
+    let (mut store, _) = store_in(dir.path());
+    let mut model = aterm_vitals::Vitals::new();
+    for i in 0..95 {
+        let _ = model.absorb(&instrumented(i));
+        store.keep(
+            &model,
+            t0 + Duration::from_secs(i),
+            &mut StripLock::Unlocked,
+        );
+    }
+    let today = u32::try_from(T0.div_euclid(86_400_000)).expect("a day");
+    let learned = model.peaks().clone();
+    let watts = learned.compute_w.peak(today).expect("a watts peak");
+    assert!((watts - 8.5).abs() < 1e-9, "{watts}");
+    // 47e9 instructions a second on the CPU's 7 W.
+    let work = learned.work_per_joule.peak(today).expect("a work peak");
+    assert!((work - 47e9 / 7.0).abs() < 1.0, "{work}");
+    assert!(learned.compute_w.read_s >= 30 && learned.work_per_joule.read_s >= 30);
+    let usual = *model.usual_clocks();
+    assert!(
+        usual
+            .usual(9)
+            .is_some_and(|mhz| (mhz - 4000.0).abs() < 0.01),
+        "four Super cores busy throughout teach decile 9: {usual:?}"
+    );
+    // The peaks file is written at the thread's stop; the strip is left as a crash leaves it.
+    peaks_file.keep(&learned, t0 + Duration::from_secs(95), true);
+
+    let (_, peaks) = PeakFile::open(Some(peaks_path.clone()), Instant::now());
+    assert_eq!(peaks, learned);
+    let (_, kept) = store_in(dir.path());
+    let mut relaunched = aterm_vitals::Vitals::new();
+    relaunched.restore_peaks(peaks);
+    relaunched.restore_strip_history(kept, T0 + 120_000);
+    assert_eq!(relaunched.peaks().compute_w.peak(today), Some(watts));
+    assert_eq!(relaunched.peaks().work_per_joule.peak(today), Some(work));
+    assert_eq!(relaunched.peaks().compute_w, learned.compute_w);
+    assert_eq!(relaunched.peaks().work_per_joule, learned.work_per_joule);
+    // The last line was written at reading 90: the clocks as they stood then, already learned.
+    let restored = *relaunched.usual_clocks();
+    assert!(
+        restored
+            .usual(9)
+            .is_some_and(|mhz| (mhz - 4000.0).abs() < 0.01),
+        "{restored:?}"
+    );
+    assert!(
+        (restored.deciles[9].read_s - 90.0).abs() < 1.5,
+        "ninety seconds of the ninety-four: {restored:?}"
+    );
+
+    // CONTROL: neither file.
+    let fresh = aterm_vitals::Vitals::new();
+    assert_eq!(fresh.peaks().compute_w, aterm_vitals::DailyMax::default());
+    assert_eq!(*fresh.usual_clocks(), UsualClocks::default());
+    // CONTROL: a file from before the two rows.
+    let text = std::fs::read_to_string(&peaks_path).expect("the peaks file");
+    assert!(
+        text.contains("\"compute_w\"") && text.contains("\"work_per_joule\""),
+        "{text}"
+    );
+    let before = r#"{"schema":1,"peaks":[{"name":"net_rx","read_s":86400,"days":[[20380,2500000.0]]},{"name":"proc_starts","read_s":600,"days":[[20380,41.5]]}]}"#;
+    let old = peaks_of(before).expect("a file from before");
+    assert_eq!(old.proc_starts.peak(20_380), Some(41.5));
+    assert_eq!(old.compute_w, aterm_vitals::DailyMax::default());
+    assert_eq!(old.work_per_joule, aterm_vitals::DailyMax::default());
+    // CONTROL: without the tail.
+    std::fs::remove_file(strip_dir(dir.path()).join(TAIL_FILE)).expect("the tail");
+    assert_eq!(store_in(dir.path()).1.usual, UsualClocks::default());
 }

@@ -184,6 +184,7 @@ pub const SIDE_LANES: [&str; 2] = ["tippy", "cells"];
 
 /// Every side lane that once built in the pre-[`lanes_dir`] location. The retired trust lane
 /// stays here until no checkout can retain one of its old directories or removal asides.
+#[cfg(unix)]
 const OLD_SIDE_LANES: [&str; 3] = ["tippy", "trust", "cells"];
 
 /// Target directory for `lane`'s cargo invocations, or `None` for [`Lane::Pure`].
@@ -277,7 +278,7 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 /// an empty selection, and no measuring rows' compile where the test compile builds them or no
 /// matrix will run ([`folds_measuring`], [`named_skip`]).
 pub(crate) fn wanted(ctx: &Ctx) -> Vec<StageId> {
-    let mut wanted = crate::checks::stages_of(&ctx.checks);
+    let mut wanted = crate::checks::stages_of(&ctx.checks, ctx.checkers_in_tests);
     if ctx.compile_only {
         wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::MeasurePrebuild));
     }
@@ -368,7 +369,7 @@ fn preflight_of(id: StageId, release: bool) -> &'static [StageId] {
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let wanted = wanted(ctx);
     // Pooling bounds resource use but does not replace early-error ordering.
-    let pooled = ctx.pool.is_some() && !ctx.background;
+    let pooled = ctx.pool.is_some();
     let v: Vec<StageSpec> = declared(&ctx.scope)
         .into_iter()
         .filter(|s| wanted.contains(&s.id))
@@ -437,9 +438,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         planned.push(s);
     }
     for s in &mut planned {
-        // Unpooled independent lanes would each spend the managed CPU grant. Background
-        // plans also retain their existing one-stage policy.
-        if (ctx.env.build_slot_held.is_some() && !pooled) || ctx.background {
+        // Unpooled independent lanes would each spend the managed CPU grant.
+        if ctx.env.build_slot_held.is_some() && !pooled {
             s.exclusive = true;
         }
     }

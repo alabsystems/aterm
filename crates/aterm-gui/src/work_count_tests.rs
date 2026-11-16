@@ -34,7 +34,7 @@ fn workspace(tabs: usize, panes: usize) -> App {
 }
 
 fn set_grid(app: &mut App, rows: u16, cols: u16) {
-    let ws = app.windows.get_mut(&WindowId(0)).expect("fixture window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("fixture window");
     ws.rows = rows;
     ws.cols = cols;
 }
@@ -237,6 +237,15 @@ fn assert_published_title(
     );
 }
 
+fn begin_cold_title_membership_control(app: &mut App) {
+    // Fixture construction now publishes titles. Start this measured cold phase after setup,
+    // invalidating through the real mutable topology API rather than clearing a private index.
+    for mut window in app.windows.values_mut() {
+        let _ = window.tab_set.take_focused_view_visits_for_test();
+        let _ = window.tab_set.active_mut();
+    }
+}
+
 fn assert_title_caches_warmed(app: &App) {
     for (wid, window) in &app.windows {
         assert_eq!(
@@ -263,6 +272,7 @@ fn a_steady_title_gate_walks_no_tab() {
     let (mut app, unrelated) = title_workspace(TABS);
     let wid = WindowId(0);
     let active = app.focused_session_id(wid).expect("an active session");
+    begin_cold_title_membership_control(&mut app);
     let mut now = Instant::now();
     app.observe_title_drift(active, now);
     for _ in 0..16 {
@@ -282,9 +292,10 @@ fn a_steady_title_gate_walks_no_tab() {
     );
     assert_unrelated_titles_untouched(&app, unrelated, &before);
 
-    let window = app.windows.get_mut(&wid).expect("fixture window");
+    let mut window = app.windows.get_mut(&wid).expect("fixture window");
     window.tab_title_epochs.remove(&active);
     let _ = window.tab_set.tab_at_mut(0).expect("mutable topology loan");
+    drop(window);
     now += Duration::from_millis(500);
     app.observe_title_drift(active, now);
     assert_eq!(
@@ -302,6 +313,7 @@ fn title_labels_follow_detach_migrate_attach_and_close_without_unrelated_walks()
     let tab = app.windows[&source].tab_set.active().unwrap();
     let (tab_id, view) = (tab.id, tab.focus);
     let session = app.focused_session_id(source).unwrap();
+    begin_cold_title_membership_control(&mut app);
     let mut now = Instant::now();
     report_title(&mut app, session, "before move", &mut now);
     assert_published_title(&app, source, tab_id, Some(session), "before move");
@@ -370,6 +382,7 @@ fn title_labels_follow_native_split_close_and_reopen_without_unrelated_walks() {
     let (session, terminal) =
         app.split_active_with_stub_terminal(wid, tab_model::SplitAxis::Horizontal);
     let tab = app.windows[&wid].tab_set.active().unwrap().id;
+    begin_cold_title_membership_control(&mut app);
     let mut now = Instant::now();
     report_title(&mut app, session, "mixed terminal", &mut now);
     assert_published_title(&app, wid, tab, Some(session), "mixed terminal");
@@ -444,6 +457,7 @@ fn title_labels_follow_recursive_native_terminal_replacement_without_unrelated_w
         restore::NativeLeafRestore::about(),
     ));
     let probe = app.focused_session_id(unrelated[0]).unwrap();
+    begin_cold_title_membership_control(&mut app);
     let mut now = Instant::now();
     report_title(&mut app, session, "before restore", &mut now);
     assert_title_caches_warmed(&app);
@@ -963,4 +977,196 @@ fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
         font_refusals: Vec::new(),
         reason: crate::app_colorscheme::ThemeChange::ConfigReload,
     });
+}
+
+fn title_output_authority_case(windows: usize, hidden_output: bool, omit_completion: bool) {
+    let mut app = workspace(30, if hidden_output { 2 } else { 1 });
+    for _ in 1..windows {
+        app.frontmost_window = Some(WindowId(0));
+        let sid = app.next_session_id;
+        app.push_stub_tab(WindowId(0), stub_session(sid));
+        let wid = app.detach_active_tab_logical().unwrap();
+        for _ in 1..30 {
+            let sid = app.next_session_id;
+            app.push_stub_tab(wid, stub_session(sid));
+        }
+    }
+    app.frontmost_window = Some(WindowId(0));
+    app.sync_active_session();
+    let tab = app.windows[&WindowId(0)].tab_set.active().unwrap();
+    let view = if hidden_output {
+        tab.root
+            .leaves()
+            .into_iter()
+            .find(|view| *view != tab.focus)
+            .unwrap()
+    } else {
+        tab.focus
+    };
+    let sid = app
+        .view_store
+        .get(view)
+        .copied()
+        .and_then(tab_model::View::terminal_session)
+        .unwrap();
+    let now = Instant::now();
+    for _ in 0..12 {
+        app.on_output_wake(sid, now);
+    }
+    let _ = take_title_focus_visits(&app);
+    let _ = work_counts::take_title_refresh();
+    let mut run = || {
+        for _ in 0..100 {
+            app.on_output_wake(sid, now);
+        }
+        let work = work_counts::take_title_refresh();
+        assert_eq!(
+            work.window_gates, 0,
+            "unchanged output must not visit title windows"
+        );
+        assert_eq!(
+            work.membership_probes, 0,
+            "unchanged output must not join reverse views"
+        );
+        assert_eq!(
+            work.drift_tabs + work.drift_cache_probes + work.cache_probes,
+            0
+        );
+        assert_eq!(take_title_focus_visits(&app), 0);
+    };
+    if omit_completion {
+        crate::title_authority::with_fault(crate::title_authority::Fault::Completion, run);
+    } else {
+        run();
+    }
+}
+
+#[test]
+fn title_authority_output_hits_visit_no_window_membership_or_cache() {
+    for windows in [1, 2, 5] {
+        for hidden in [false, true] {
+            title_output_authority_case(windows, hidden, false);
+        }
+    }
+}
+
+#[test]
+fn title_authority_missing_completion_is_detected_by_actual_window_work() {
+    let rejected = std::panic::catch_unwind(|| title_output_authority_case(2, false, true));
+    assert!(
+        rejected.is_err(),
+        "the window-work oracle must reject the production slow gate"
+    );
+}
+
+fn geometry_title_authority_case(tabs: usize, snapshot: bool) {
+    let mut app = workspace(tabs, 1);
+    let now = Instant::now();
+    for _ in 0..4 {
+        app.observe_title_drift(0, now);
+    }
+    let revision = app.windows.title_authority().revision();
+    let _ = take_title_focus_visits(&app);
+    let _ = work_counts::take_title_refresh();
+    let mut run = || {
+        for _ in 0..8 {
+            let mut ws = app.windows.get_mut(&WindowId(0)).unwrap();
+            ws.rows += 1;
+        }
+        assert!(revision.is_current(app.windows.title_authority()));
+        let work = work_counts::take_title_refresh();
+        assert_eq!(
+            work.drift_tabs, 0,
+            "a geometry loan cannot snapshot tab membership"
+        );
+        assert_eq!(take_title_focus_visits(&app), 0);
+    };
+    if snapshot {
+        crate::title_authority::with_fault(crate::title_authority::Fault::GeneralSnapshot, run);
+    } else {
+        run();
+    }
+}
+
+#[test]
+fn title_authority_geometry_loans_do_not_scan_or_invalidate_at_any_tab_count() {
+    for tabs in [1, 30, 200] {
+        geometry_title_authority_case(tabs, false);
+    }
+    assert!(std::panic::catch_unwind(|| geometry_title_authority_case(30, true)).is_err());
+}
+
+#[test]
+fn title_authority_cold_delivery_prunes_each_owner_once_not_once_per_session() {
+    let run = |rescan: bool| {
+        const TABS: usize = 30;
+        let mut app = workspace(TABS, 1);
+        let sessions: Vec<_> = app.pool.iter().map(|session| session.id).collect();
+        for &sid in &sessions {
+            app.pool
+                .get(sid)
+                .unwrap()
+                .term
+                .lock()
+                .unwrap()
+                .process(format!("\x1b]2;topology-{sid}\x07").as_bytes());
+        }
+        let now = Instant::now();
+        for &sid in &sessions {
+            app.observe_title_drift(sid, now);
+        }
+        let pacing: Vec<_> = sessions
+            .iter()
+            .map(|sid| (*sid, app.title_drift.last_flush[sid]))
+            .collect();
+        app.windows.get_mut(&WindowId(0)).unwrap().tab_title_epochs =
+            crate::title_authority::TitleEpochs::default();
+        let _ = work_counts::take_title_refresh();
+        let mut publish = || {
+            app.inspect_app(crate::app_control::InspectRequest::Tabs)
+                .unwrap();
+            let work = work_counts::take_title_refresh();
+            assert_eq!(
+                work.identities, TABS,
+                "one complete publication for this dirty owner"
+            );
+            assert_eq!(
+                work.drift_tabs, 0,
+                "topology already owns canonical membership pruning"
+            );
+            assert_eq!(
+                work.drift_cache_probes, 0,
+                "topology cannot repeat ordinary drift pruning per session"
+            );
+            for &(sid, paced) in &pacing {
+                let epoch = app
+                    .pool
+                    .get(sid)
+                    .unwrap()
+                    .term
+                    .lock()
+                    .unwrap()
+                    .title_epoch();
+                assert_eq!(
+                    app.windows[&WindowId(0)].tab_title_epochs.get(&sid),
+                    Some(&epoch)
+                );
+                assert_eq!(app.title_drift.last_flush[&sid], paced);
+                assert!(
+                    app.windows[&WindowId(0)].tab_chrome_titles[&sid]
+                        .contains(&format!("topology-{sid}"))
+                );
+            }
+        };
+        if rescan {
+            crate::title_authority::with_fault(
+                crate::title_authority::Fault::TopologyRescan,
+                publish,
+            );
+        } else {
+            publish();
+        }
+    };
+    run(false);
+    assert!(std::panic::catch_unwind(|| run(true)).is_err());
 }

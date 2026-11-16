@@ -470,11 +470,14 @@ impl VersionedConfigService {
         })
     }
 
-    /// Resolve one worker-observed generation before it crosses to the event loop.
+    /// Resolve one worker-observed generation before it crosses to the event loop. The harness
+    /// registry is read again here, off the event loop, so a changed `[harness] dev` or
+    /// `shell_env_strip` reaches the next shell ([`aterm_agent::harness::registry::current`]).
     pub(crate) fn prepare_observation(
         observation: ConfigDiskObservation,
         themes: Arc<crate::app_config::ThemeCatalog>,
     ) -> Result<PreparedConfigObservation, ConfigFailure> {
+        let _ = aterm_agent::harness::registry::current();
         let values = parse_values(&observation.text)?;
         let disk_faults = parse_disk_faults(&observation.text);
         let config = parse_config(&observation.text)?;

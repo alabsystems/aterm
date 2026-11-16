@@ -396,8 +396,40 @@ enum WakePlan {
 /// blocks on `ack` until the writer's batch fsync makes the record durable (or fails).
 struct WriteOp {
     kind: WriteKind,
-    ack: Sender<AckResult>,
+    ack: AckSender,
     conn_id: Option<u64>,
+}
+
+/// Staging refuses and fences later fresh operations before their append. The
+/// final ack path also latches commit, full-flush and quorum errors before the
+/// single writer starts its next batch; it cannot undo an already staged suffix.
+struct AckSender {
+    sender: Sender<AckResult>,
+    fresh: Option<Arc<AtomicBool>>,
+}
+
+impl From<Sender<AckResult>> for AckSender {
+    fn from(sender: Sender<AckResult>) -> Self {
+        Self {
+            sender,
+            fresh: None,
+        }
+    }
+}
+
+impl AckSender {
+    fn send(&self, result: AckResult) -> Result<(), mpsc::SendError<AckResult>> {
+        if result.is_err() {
+            self.fence_fresh();
+        }
+        self.sender.send(result)
+    }
+
+    fn fence_fresh(&self) {
+        if let Some(fence) = &self.fresh {
+            fence.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -433,6 +465,14 @@ fn refusal(code: u8, msg: impl Into<String>) -> Refusal {
 }
 
 enum WriteKind {
+    /// Conditional append: any held key is a refusal, even for identical bytes.
+    /// Its AckSender carries the mandatory connection-local fresh fence.
+    FreshPublish {
+        producer_id: u64,
+        producer_seq: u64,
+        subject: String,
+        body: Vec<u8>,
+    },
     Publish {
         producer_id: u64,
         producer_seq: u64,
@@ -2159,7 +2199,8 @@ impl HelloCopy {
                         | crate::proto::REQUEST_STATS
                         | crate::proto::REQUEST_BURST_MARKS
                         | crate::proto::REQUEST_RELAY
-                        | crate::proto::REQUEST_SETTLE,
+                        | crate::proto::REQUEST_SETTLE
+                        | crate::proto::REQUEST_FRESH_PUBLISH,
                 ),
                 // Never copied: the answer reads it fresh from the vitals
                 // (`hello_health`), since it moves with every batch's flush.
@@ -7730,12 +7771,27 @@ fn handle_conn_with_peer(
         &mut had_will,
         &peer,
     );
+    finish_disconnected_will(shared, conn_id, &mut will, had_will, &peer, now_unix_ms);
+    res
+}
+
+/// Dispose of the last registered will, sampling each authorization deadline at
+/// its original point. In particular, a certificate is checked after revocation
+/// reloading, which can take time. Nonexpiring capability authority reads no clock.
+/// Firing and cleanup remain fire-and-forget writes; the caller never waits on a
+/// possibly stopped writer. The private clock effect makes these boundaries testable.
+fn finish_disconnected_will(
+    shared: &Arc<Shared>,
+    conn_id: u64,
+    will: &mut Vec<(WillRecord, u64)>,
+    had_will: bool,
+    peer: &PeerAuth,
+    mut now: impl FnMut() -> u64,
+) {
     if let Some((will, until)) = will.pop() {
-        if lapsed(until).is_none()
-            && peer_revocation_reason(shared, &peer).is_none()
-            && peer
-                .cert_valid_before_ms
-                .is_none_or(|exp| now_unix_ms() < exp)
+        if (until == u64::MAX || now() < until)
+            && peer_revocation_reason(shared, peer).is_none()
+            && peer.cert_valid_before_ms.is_none_or(|exp| now() < exp)
             && !is_will_principal_revoked(shared, will.producer_id)
         {
             fire_will_for_conn(shared, Some(conn_id), will);
@@ -7745,7 +7801,6 @@ fn handle_conn_with_peer(
     } else if had_will {
         drop_will_for_conn(shared, conn_id);
     }
-    res
 }
 
 /// Enqueue a durable mutation on the writer queue and WAIT for its ack — the shape a
@@ -7784,7 +7839,7 @@ fn submit_blocking(shared: &Arc<Shared>, kind: WriteKind) -> AckResult {
         .writes
         .send(Queued::Op(WriteOp {
             kind,
-            ack: tx,
+            ack: tx.into(),
             conn_id: None,
         }))
         .is_err()
@@ -7857,7 +7912,7 @@ fn fire_will_for_conn(shared: &Arc<Shared>, conn_id: Option<u64>, will: WillReco
     let (tx, _rx) = mpsc::channel();
     let _ = shared.writes.send(Queued::Op(WriteOp {
         kind: WriteKind::WillFire { conn_id, will },
-        ack: tx,
+        ack: tx.into(),
         conn_id: None,
     }));
 }
@@ -7866,7 +7921,7 @@ fn drop_will_for_conn(shared: &Arc<Shared>, conn_id: u64) {
     let (tx, _rx) = mpsc::channel();
     let _ = shared.writes.send(Queued::Op(WriteOp {
         kind: WriteKind::WillDrop { conn_id },
-        ack: tx,
+        ack: tx.into(),
         conn_id: None,
     }));
 }
@@ -8156,6 +8211,7 @@ fn serve_conn(
     // latches no fence, and a write it pipelined behind one lands as on an unfenced broker,
     // so a client that predates the verb is served as it always was.
     let replicate_diverged = Arc::new(AtomicBool::new(false));
+    let fresh_fenced = Arc::new(AtomicBool::new(false));
     // The requests read off the socket and not yet served: one read takes every frame
     // that has arrived, and the loop asks it whether the next request is already here
     // whole before it lets the writes it holds go ([`Held`]). Bytes left in it when a
@@ -8228,11 +8284,13 @@ fn serve_conn(
                 return Ok(());
             }
             None => {
-                if !emit(
-                    &mut stream,
-                    &mut pipe,
-                    Err(refusal(ERR_REFUSED, "malformed request")),
-                )? {
+                let err = refusal(ERR_REFUSED, "malformed request");
+                let kept = if crate::proto::is_fresh_request(&payload) {
+                    emit_fresh_refusal(shared, &mut stream, &mut pipe, &fresh_fenced, err)?
+                } else {
+                    emit(&mut stream, &mut pipe, Err(err))?
+                };
+                if !kept {
                     break;
                 }
                 continue;
@@ -8240,11 +8298,13 @@ fn serve_conn(
         };
         // Bounded names, before anything (the capability gate included) parses one.
         if let Some(err) = oversized_name(&req) {
-            if !emit(
-                &mut stream,
-                &mut pipe,
-                Err(refusal(ERR_RECORD_REFUSED, err)),
-            )? {
+            let err = refusal(ERR_RECORD_REFUSED, err);
+            let kept = if matches!(req, Request::FreshPublish { .. }) {
+                emit_fresh_refusal(shared, &mut stream, &mut pipe, &fresh_fenced, err)?
+            } else {
+                emit(&mut stream, &mut pipe, Err(err))?
+            };
+            if !kept {
                 break;
             }
             continue;
@@ -8377,6 +8437,13 @@ fn serve_conn(
                             let why = ungranted(secret, &keyring, &req, now);
                             let err = refusal(ERR_UNAUTHORIZED, why);
                             let keep_open = match &req {
+                                Request::FreshPublish { .. } => emit_fresh_refusal(
+                                    shared,
+                                    &mut stream,
+                                    &mut pipe,
+                                    &fresh_fenced,
+                                    err,
+                                )?,
                                 Request::Relay {
                                     producer_id,
                                     producer_seq,
@@ -8453,6 +8520,7 @@ fn serve_conn(
             &mut asks,
             &_conn_guard.fences_gaps,
             &replicate_diverged,
+            &fresh_fenced,
             until,
             peer,
             #[cfg(feature = "cap")]
@@ -8511,6 +8579,7 @@ fn dispatch_request(
     asks: &mut TailAsks,
     fences_gaps: &Cell<bool>,
     replicate_diverged: &Arc<AtomicBool>,
+    fresh_fenced: &Arc<AtomicBool>,
     until: u64,
     peer: &PeerAuth,
     #[cfg(feature = "cap")] keyring: &mut Vec<astream_cap::Capability>,
@@ -8520,6 +8589,21 @@ fn dispatch_request(
     // The connection a refused write fences, once it asked ([`Request::FenceGaps`]).
     let fence = fences_gaps.get().then_some(conn_id);
     match req {
+        Request::FreshPublish {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        } => serve_fresh_publish(
+            shared,
+            stream,
+            pipe,
+            fresh_fenced,
+            producer_id,
+            producer_seq,
+            subject,
+            body,
+        ),
         Request::Publish {
             producer_id,
             producer_seq,
@@ -8953,6 +9037,42 @@ fn serve_retire(
             subject,
             offset,
             log,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_fresh_publish(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    fresh: &Arc<AtomicBool>,
+    producer_id: u64,
+    producer_seq: u64,
+    subject: String,
+    body: Vec<u8>,
+) -> io::Result<bool> {
+    // Fresh is a data append only; it never uses Publish's legacy retire command.
+    if let Some(err) = publish_subject_error(&subject) {
+        return emit_fresh_refusal(shared, stream, pipe, fresh, err);
+    }
+    if let Err(err) = check_publish_rate_limit(
+        shared,
+        producer_id,
+        subject.len().saturating_add(body.len()),
+    ) {
+        return emit_fresh_refusal(shared, stream, pipe, fresh, err);
+    }
+    emit_fresh_op(
+        shared,
+        stream,
+        pipe,
+        fresh,
+        WriteKind::FreshPublish {
+            producer_id,
+            producer_seq,
+            subject,
+            body,
         },
     )
 }
@@ -10066,6 +10186,11 @@ fn cap_authorized_until(
             producer_id,
             ..
         }
+        | Request::FreshPublish {
+            subject,
+            producer_id,
+            ..
+        }
         | Request::Will {
             subject,
             producer_id,
@@ -10230,6 +10355,7 @@ fn oversized_name(req: &Request) -> Option<String> {
     const NONE: (&str, &str) = ("", "");
     let names: [(&str, &str); 2] = match req {
         Request::Publish { subject, .. }
+        | Request::FreshPublish { subject, .. }
         | Request::Relay { subject, .. }
         | Request::Will { subject, .. }
         | Request::Retire { subject, .. } => [("subject", subject), NONE],
@@ -10388,13 +10514,25 @@ impl Pipeline {
     }
 
     fn submit_conn_opt(&mut self, conn_id: Option<u64>, kind: WriteKind) -> bool {
+        self.submit_with_fresh(conn_id, kind, None)
+    }
+
+    fn submit_with_fresh(
+        &mut self,
+        conn_id: Option<u64>,
+        kind: WriteKind,
+        fresh: Option<Arc<AtomicBool>>,
+    ) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
         if !self.reserve(ack_rx) {
             return false; // ack-writer gone (its socket died); nothing committed
         }
         self.held.ops.push(WriteOp {
             kind,
-            ack: ack_tx,
+            ack: AckSender {
+                sender: ack_tx,
+                fresh,
+            },
             conn_id,
         });
         true
@@ -10478,6 +10616,46 @@ fn emit_conn_op(
         )?),
     };
     Ok(p.submit_conn_opt(conn_id, kind))
+}
+
+/// A fresh refusal is a writer operation even when validation found it before
+/// staging. Latching on the reader would overtake valid earlier requests.
+fn emit_fresh_refusal(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    fresh: &Arc<AtomicBool>,
+    err: Refusal,
+) -> io::Result<bool> {
+    emit_fresh_op(
+        shared,
+        stream,
+        pipe,
+        fresh,
+        WriteKind::PreRefused {
+            producer_id: 0,
+            producer_seq: 0,
+            err,
+        },
+    )
+}
+
+fn emit_fresh_op(
+    shared: &Arc<Shared>,
+    stream: &mut Conn,
+    pipe: &mut Option<Pipeline>,
+    fresh: &Arc<AtomicBool>,
+    kind: WriteKind,
+) -> io::Result<bool> {
+    let p = match pipe {
+        Some(p) => p,
+        None => pipe.insert(Pipeline::start(
+            stream,
+            Duration::from_millis(shared.write_timeout_ms.load(Ordering::Relaxed)),
+            shared.writes.clone(),
+        )?),
+    };
+    Ok(p.submit_with_fresh(None, kind, Some(Arc::clone(fresh))))
 }
 
 /// Answer a producer's write refused before the writer saw it. On a connection that asked to
@@ -11168,7 +11346,7 @@ fn stage_batch_ops(
     visible_head: u64,
     mut rejoined_left: usize,
 ) -> (
-    Vec<Sender<AckResult>>,
+    Vec<AckSender>,
     Vec<AckResult>,
     Vec<bool>,
     FlushAsked,
@@ -11177,7 +11355,7 @@ fn stage_batch_ops(
     bool,
     Option<(crate::LogIdentity, Offset)>,
 ) {
-    let mut acks: Vec<Sender<AckResult>> = Vec::new();
+    let mut acks: Vec<AckSender> = Vec::new();
     let mut results: Vec<AckResult> = Vec::new();
     // Which ops are `Flush` requests: answered with the durable head once the batch's
     // full flush (if any) has run.
@@ -11217,6 +11395,7 @@ fn stage_batch_ops(
     // that record is the log's newest (see below).
     let mut adopt: Option<(crate::LogIdentity, Offset)> = None;
     for op in batch {
+        let fresh = op.ack.fresh.clone();
         acks.push(op.ack);
         let mut is_local = matches!(op.kind, WriteKind::WillRegister { .. });
         flushes.push(matches!(op.kind, WriteKind::Flush | WriteKind::Settle));
@@ -11251,6 +11430,9 @@ fn stage_batch_ops(
             _ => None,
         };
         if let Some(msg) = &refused_poisoned {
+            if let Some(fence) = &fresh {
+                fence.store(true, Ordering::Relaxed);
+            }
             if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
                 fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
             }
@@ -11260,7 +11442,22 @@ fn stage_batch_ops(
             poisoned = true;
             continue;
         }
+        if fresh
+            .as_ref()
+            .is_some_and(|fence| fence.load(Ordering::Relaxed))
+        {
+            local_only.push(is_local);
+            sticky_meta.push(None);
+            results.push(Err(refusal(
+                crate::proto::ERR_FRESH_FENCED,
+                "fresh publication fenced: reconnect before publishing again",
+            )));
+            continue;
+        }
         if poisoned {
+            if let Some(fence) = &fresh {
+                fence.store(true, Ordering::Relaxed);
+            }
             if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
                 if let Err(fence_seq) = fences.check(m.conn_id, m.producer_id, m.producer_seq) {
                     local_only.push(is_local);
@@ -11294,6 +11491,9 @@ fn stage_batch_ops(
         }
         let staged = match op.kind {
             WriteKind::PreRefused { err, .. } => {
+                if let Some(fence) = &fresh {
+                    fence.store(true, Ordering::Relaxed);
+                }
                 if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
                     fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
                 }
@@ -11301,6 +11501,30 @@ fn stage_batch_ops(
                 sticky_meta.push(None);
                 results.push(Err(err));
                 continue;
+            }
+            WriteKind::FreshPublish {
+                producer_id,
+                producer_seq,
+                subject,
+                body,
+            } => {
+                // The same key lookup as ordinary publish, including staged keys
+                // and producer lineage, while holding the writer's log lock.
+                if !is_hidden_subject(&subject) {
+                    if let Some(offset) = guard.produced_dup(producer_id, producer_seq) {
+                        if let Some(fence) = &fresh {
+                            fence.store(true, Ordering::Relaxed);
+                        }
+                        local_only.push(is_local);
+                        sticky_meta.push(None);
+                        results.push(Err(refusal(
+                            crate::proto::ERR_FRESH_HELD,
+                            format!("fresh publication key already held at {}", offset.0),
+                        )));
+                        continue;
+                    }
+                }
+                guard.stage_publish(producer_id, producer_seq, subject, body)
             }
             WriteKind::Publish {
                 producer_id,
@@ -11488,6 +11712,9 @@ fn stage_batch_ops(
                 (ERR_REFUSED, format!("append failed: {e}"))
             }
         };
+        if let Some(fence) = &fresh {
+            fence.store(true, Ordering::Relaxed);
+        }
         if let (Some(fences), Some(m)) = (fences_guard.as_deref_mut(), op_sticky) {
             fences.record_refusal(m.conn_id, m.producer_id, m.producer_seq);
         }
@@ -11963,7 +12190,7 @@ fn forget_by_writer(shared: &Shared, subjects: Vec<(String, Offset)>) -> u64 {
     let (tx, rx) = mpsc::channel();
     let op = WriteOp {
         kind: WriteKind::Forget { subjects },
-        ack: tx,
+        ack: tx.into(),
         conn_id: None,
     };
     if shared.writes.send(Queued::Op(op)).is_err() {
@@ -12077,7 +12304,7 @@ fn finish_batch_acks_and_flush(
     commit_res: Result<crate::store::Committed, (u8, String)>,
     to_ship: Option<Vec<(Arc<BrokerRecord>, Option<u64>)>>,
     flush: Option<(u64, crate::storage::FlushHandle)>,
-    acks: Vec<Sender<AckResult>>,
+    acks: Vec<AckSender>,
     results: Vec<AckResult>,
     local_only: Vec<bool>,
     sticky_meta: Vec<Option<StickyOpMeta>>,
@@ -12155,13 +12382,7 @@ fn finish_batch_acks_and_flush(
     // goodbye for a producer told it registered nothing. No reader is shown the record
     // early by acking it (a hidden subject is delivered to nobody), so nothing is lost by
     // answering it with the commit.
-    let mut waiting: Vec<(
-        Sender<AckResult>,
-        AckResult,
-        bool,
-        bool,
-        Option<StickyOpMeta>,
-    )> = Vec::new();
+    let mut waiting: Vec<(AckSender, AckResult, bool, bool, Option<StickyOpMeta>)> = Vec::new();
     for ((((ack, res), local), meta), is_flush) in acks
         .into_iter()
         .zip(results)
@@ -13847,7 +14068,7 @@ mod tests {
             (
                 WriteOp {
                     kind,
-                    ack,
+                    ack: ack.into(),
                     conn_id: None,
                 },
                 rx,
@@ -15255,7 +15476,7 @@ mod tests {
                 .writes
                 .send(Queued::Op(WriteOp {
                     kind,
-                    ack: tx,
+                    ack: tx.into(),
                     conn_id: None,
                 }))
                 .unwrap();
@@ -15492,7 +15713,7 @@ mod tests {
                 .writes
                 .send(Queued::Op(WriteOp {
                     kind,
-                    ack: tx,
+                    ack: tx.into(),
                     conn_id,
                 }))
                 .unwrap();
@@ -15580,7 +15801,7 @@ mod tests {
                 .writes
                 .send(Queued::Op(WriteOp {
                     kind,
-                    ack: tx,
+                    ack: tx.into(),
                     conn_id: None,
                 }))
                 .unwrap();
@@ -15930,3 +16151,11 @@ mod retention_tick_tests;
 #[cfg(all(test, unix, feature = "retention"))]
 #[path = "held_tail_wire_tests.rs"]
 mod held_tail_wire_tests;
+
+#[cfg(test)]
+#[path = "fresh_publish_tests.rs"]
+mod fresh_publish_tests;
+
+#[cfg(all(test, unix, feature = "cap"))]
+#[path = "disconnected_will_tests.rs"]
+mod disconnected_will_tests;

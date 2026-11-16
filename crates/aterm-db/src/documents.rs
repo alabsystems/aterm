@@ -5,7 +5,7 @@
 //! are eligible; this kernel supplies no membership or resource authority.
 
 use crate::database::{Candidate, Cell, Change};
-use astream_wire::sync::{Digest, Index};
+use astream_wire::sync::Digest;
 use aterm_json::Value;
 use std::collections::BTreeMap;
 
@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 pub(crate) mod application;
 #[cfg(unix)]
 pub(crate) mod log;
+pub(crate) mod materialized;
 
 pub(crate) type Cells = BTreeMap<(String, String), Cell>;
 
@@ -51,7 +52,7 @@ pub(crate) type Cells = BTreeMap<(String, String), Cell>;
     )
 )]
 pub(crate) fn apply(
-    index: &Index,
+    observes: &dyn Fn(&Digest, &Digest) -> bool,
     cells: &mut Cells,
     operation: Digest,
     changes: &[Change],
@@ -66,7 +67,7 @@ pub(crate) fn apply(
             cell.candidates.clear();
         } else if !cell.stopped {
             cell.candidates
-                .retain(|old| !index.observes(&operation, &old.operation));
+                .retain(|old| !observes(&operation, &old.operation));
             cell.candidates.push(Candidate {
                 operation,
                 value: change.value.clone().unwrap_or(Value::Null),

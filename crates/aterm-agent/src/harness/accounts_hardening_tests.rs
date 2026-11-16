@@ -319,7 +319,10 @@ fn mailbox_admission_refusal_preserves_attempt_history() {
                     state.parked.insert("work".into(), clock);
                 }
                 "bot" => {
-                    state.bot_checked.insert("work".into(), clock);
+                    state.unrecorded_checks.insert(
+                        "work".into(),
+                        super::login_activity_tests::a_check_met("work"),
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -337,7 +340,7 @@ fn mailbox_admission_refusal_preserves_attempt_history() {
             );
             state.in_flight = false;
             state.parked.clear();
-            state.bot_checked.clear();
+            state.unrecorded_checks.clear();
         }
         drop(
             AutoRenewPermit::claim_with_mailbox(&guard, "work", clock, false, Some(changed))
@@ -449,13 +452,15 @@ impl MailboxAdmission {
             }
             "Bot" => {
                 for key in Self::KEYS {
-                    state.bot_checked.insert(key.into(), self.clock);
+                    state
+                        .unrecorded_checks
+                        .insert(key.into(), super::login_activity_tests::a_check_met(key));
                 }
             }
             "Release" => {
                 state.in_flight = false;
                 state.parked.clear();
-                state.bot_checked.clear();
+                state.unrecorded_checks.clear();
             }
             _ => panic!("unknown mailbox admission action"),
         }
@@ -467,7 +472,7 @@ impl MailboxAdmission {
             1
         } else if state.parked.contains_key(Self::KEYS[0]) {
             2
-        } else if state.bot_checked.contains_key(Self::KEYS[0]) {
+        } else if state.unrecorded_checks.contains_key(Self::KEYS[0]) {
             3
         } else {
             0

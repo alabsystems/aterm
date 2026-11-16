@@ -39,6 +39,116 @@ fn an_installer_uses_the_site_file_bound() {
     assert!(read_text(&source).is_none());
 }
 
+/// The shipped get-aterm.ps1 with `pin` in place of its own, line ends as git checks it out.
+fn get_aterm_pinned(pin: &aterm_bootstrap_verify::pin::WindowsPin) -> String {
+    let path = aterm_tempfile::manifest_dir()
+        .join("../..")
+        .join(WINDOWS_INSTALLER_SOURCE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n");
+    pin.rewrite(&text).unwrap()
+}
+
+/// A pin of `repo`'s release verifier.
+fn windows_pin(repo: &str) -> aterm_bootstrap_verify::pin::WindowsPin {
+    aterm_bootstrap_verify::pin::WindowsPin {
+        repo: repo.into(),
+        tag: "v0.120.0".into(),
+        x86_64: "ab".repeat(32),
+    }
+}
+
+/// /get-aterm.ps1 is the public commit's script, byte for byte, when it pins this repository's
+/// verifier and installs from this repository by default; an empty pin serves nothing.
+/// NEGATIVE CONTROLS: a -Repo default of another repository (in either place the script sets
+/// one), a pin of another repository's verifier, a malformed pin, a script over the site's bound
+/// and none at all each refuse, the empty pin's script with another -Repo default among them.
+#[test]
+fn a_windows_installer_is_served_only_pinned_to_this_repository() {
+    let slug = "alabsystems/aterm";
+    let root = aterm_tempfile::tempdir().unwrap();
+    let source = root.path().join(WINDOWS_INSTALLER_SOURCE);
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let served = |text: &str| {
+        std::fs::write(&source, text).unwrap();
+        windows_installer(root.path(), slug)
+    };
+
+    let pinned = get_aterm_pinned(&windows_pin(slug));
+    assert_eq!(served(&pinned).unwrap().as_deref(), Some(pinned.as_str()));
+    let unpinned = get_aterm_pinned(&aterm_bootstrap_verify::pin::WindowsPin::default());
+    assert_eq!(served(&unpinned).unwrap(), None);
+
+    let default = "[string]$Repo = \"alabsystems/aterm\"";
+    assert_eq!(
+        pinned.matches(default).count(),
+        2,
+        "the script's own default and its install function's"
+    );
+    for text in [&pinned, &unpinned] {
+        for nth in 0..2 {
+            let mut at = text.match_indices(default).map(|(i, _)| i);
+            let i = at.nth(nth).unwrap();
+            let other = format!(
+                "{}[string]$Repo = \"someone-else/aterm\"{}",
+                &text[..i],
+                &text[i + default.len()..]
+            );
+            let why = served(&other).unwrap_err();
+            assert!(why.contains("does not declare"), "{nth}: {why}");
+        }
+    }
+    let why =
+        served(&pinned.replace(default, "[string]$Source = \"alabsystems/aterm\"")).unwrap_err();
+    assert!(why.contains("does not declare"), "{why}");
+
+    let why = served(&get_aterm_pinned(&windows_pin("someone-else/aterm"))).unwrap_err();
+    assert!(
+        why.contains("pins the release verifier of someone-else/aterm"),
+        "{why}"
+    );
+    for malformed in [
+        pinned.replace(
+            "$AtermVerifierTag = \"v0.120.0\"",
+            "$AtermVerifierTag = \"v0.120\"",
+        ),
+        pinned.replace(&"ab".repeat(32), &"AB".repeat(32)),
+        pinned.replace("$AtermVerifierTag = \"v0.120.0\"\n", ""),
+        format!("{pinned}$AtermVerifierRepo = \"alabsystems/aterm\"\n"),
+    ] {
+        assert_ne!(malformed, pinned);
+        let why = served(&malformed).unwrap_err();
+        assert!(
+            why.contains("carries no readable release verifier pin"),
+            "{why}"
+        );
+    }
+
+    let mut bounded = pinned.clone();
+    bounded.push('#');
+    bounded.extend(std::iter::repeat_n(
+        ' ',
+        MAX_SITE_FILE_BYTES as usize - bounded.len(),
+    ));
+    assert_eq!(served(&bounded).unwrap().as_deref(), Some(bounded.as_str()));
+    bounded.push('\n');
+    let why = served(&bounded).unwrap_err();
+    assert!(why.contains("no readable"), "{why}");
+
+    std::fs::remove_file(&source).unwrap();
+    let why = windows_installer(root.path(), slug).unwrap_err();
+    assert!(
+        why.contains(
+            "the public commit has no readable apps/aterm-win/get-aterm.ps1 to serve as \
+             /get-aterm.ps1"
+        ),
+        "{why}"
+    );
+    std::fs::create_dir(&source).unwrap();
+    assert!(windows_installer(root.path(), slug).is_err());
+}
+
 /// A sync removes a scratch an earlier one kept only once its hold is spent (a restart
 /// here); a kept one still held, one with no stamp (a sync's live scratch) and a
 /// directory named otherwise stay.

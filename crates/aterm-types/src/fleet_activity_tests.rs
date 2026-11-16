@@ -6,7 +6,8 @@ use super::*;
 const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const C: &str = "cccccccccccccccccccccccccccccccc";
-const SID: &str = "s-0123456789abcdef0123";
+const SID: &str = "tqn5r6e0148";
+const LEGACY: &str = "s-0123456789abcdef0123";
 
 const BLOCKED: Outcome = Outcome::Blocked {
     level: FleetAccess::ReadOnly,
@@ -59,9 +60,18 @@ fn every_drive_kind_has_its_plain_type_or_is_a_service() {
 #[test]
 fn a_poll_is_not_counted_and_a_sessions_read_is() {
     for kind in DriveKind::ALL {
-        let asked = counted(kind, Some(SID));
+        for by in [SID, LEGACY] {
+            let asked = counted(kind, Some(by));
+            assert_eq!(asked, Plain::of(kind), "{kind:?}: {by}");
+            if let Some(row) = Row::of(1, Way::In, (A, None), kind, Some(by), Outcome::Admitted) {
+                assert_eq!(
+                    row.by.as_deref(),
+                    Some(by),
+                    "the requester stays attributed"
+                );
+            }
+        }
         let unasked = counted(kind, None);
-        assert_eq!(asked, Plain::of(kind), "{kind:?}");
         match Plain::of(kind) {
             Some(Plain::Read) => assert_eq!(unasked, None, "{kind:?} with no session is a poll"),
             plain => assert_eq!(unasked, plain, "{kind:?}"),
@@ -72,18 +82,34 @@ fn a_poll_is_not_counted_and_a_sessions_read_is() {
             "{kind:?}"
         );
     }
-    // A requester that is no session aterm minted names nobody: its read is a poll too.
-    assert!(
-        Row::of(
-            1,
-            Way::In,
-            (A, None),
-            DriveKind::Read,
-            Some("me"),
-            Outcome::Admitted
-        )
-        .is_none()
-    );
+    // A malformed requester names nobody. Its read is a poll; another request keeps its type
+    // without that attribution. An exact legacy session remains valid requester metadata.
+    for other in ["me", "s-0123456789abcdef012", "s-0123456789ABCDEF0123"] {
+        assert!(
+            Row::of(
+                1,
+                Way::In,
+                (A, None),
+                DriveKind::Read,
+                Some(other),
+                Outcome::Admitted
+            )
+            .is_none()
+        );
+        assert_eq!(
+            Row::of(
+                1,
+                Way::In,
+                (A, None),
+                DriveKind::Turn,
+                Some(other),
+                Outcome::Admitted
+            )
+            .expect("the request still counts")
+            .by,
+            None
+        );
+    }
     // No node, no row.
     assert!(
         Row::of(
@@ -129,6 +155,15 @@ fn a_row_reads_back_from_its_line() {
     // A later build's extra word is passed over; a line short of a row's words is no row.
     let line = format!("{} via=mesh", rows_line());
     assert_eq!(Row::parse(&line), Row::parse(&rows_line()));
+    let legacy = rows_line().replace(SID, LEGACY);
+    assert_eq!(
+        Row::parse(&legacy),
+        Some(Row {
+            by: Some(LEGACY.to_owned()),
+            ..row(1_000, Way::In, A, DriveKind::Turn, Outcome::Admitted)
+        }),
+        "an exact legacy requester remains attributed"
+    );
     // A mesh node's id is its key's principal.
     let mesh = Row::of(
         5_000,
@@ -229,7 +264,7 @@ fn a_record_past_its_size_folds_every_like_request_and_loses_no_count() {
         Way::In,
         (A, Some("m86")),
         DriveKind::Spawn,
-        Some("s-fedcba98765432100123"),
+        Some("tqn5r6e0149"),
         BLOCKED,
     )
     .expect("a request");
@@ -629,13 +664,19 @@ fn a_survey_line_names_the_session_that_asked() {
         let rest = line.strip_prefix("survey").expect("a survey");
         assert_eq!(survey_asker(rest), None, "{line:?} is a poll");
         assert_eq!(survey_unmarked(line), None);
-        let marked = survey_marked(line, SID);
-        let rest = marked.strip_prefix("survey").expect("a survey");
-        assert_eq!(survey_asker(rest), Some(SID), "{marked:?}");
-        assert_eq!(survey_unmarked(&marked).as_deref(), Some(line));
+        for by in [SID, LEGACY] {
+            let marked = survey_marked(line, by);
+            let rest = marked.strip_prefix("survey").expect("a survey");
+            assert_eq!(survey_asker(rest), Some(by), "{marked:?}");
+            assert_eq!(survey_unmarked(&marked).as_deref(), Some(line));
+        }
     }
     assert_eq!(survey_asker("by=me"), None);
     assert_eq!(survey_asker("by="), None);
+    assert_eq!(survey_asker("by=s-0123456789abcdef012"), None);
+    assert_eq!(survey_asker("by=s-0123456789ABCDEF0123"), None);
     // A word that names no session is left for whoever serves the line to refuse.
     assert_eq!(survey_unmarked("survey by=me"), None);
+    assert_eq!(survey_unmarked("survey by=s-0123456789abcdef012"), None);
+    assert_eq!(survey_unmarked("survey by=s-0123456789ABCDEF0123"), None);
 }

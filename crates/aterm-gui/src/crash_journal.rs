@@ -2585,6 +2585,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             holds: a_holds,
             sid: a_sid,
             lineage: a_lineage,
+            opened_ms: a_opened_ms,
             log_ep: a_log_ep,
             land_at: a_land_at,
             autopilot_by: a_autopilot_by,
@@ -2614,6 +2615,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             holds: b_holds,
             sid: b_sid,
             lineage: b_lineage,
+            opened_ms: b_opened_ms,
             log_ep: b_log_ep,
             land_at: b_land_at,
             autopilot_by: b_autopilot_by,
@@ -2642,6 +2644,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && a_holds == b_holds
             && a_sid == b_sid
             && a_lineage == b_lineage
+            && a_opened_ms == b_opened_ms
             && a_log_ep == b_log_ep
             && a_land_at == b_land_at
             && a_autopilot_by == b_autopilot_by

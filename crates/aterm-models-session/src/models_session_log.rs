@@ -2334,9 +2334,9 @@ pub fn transcript_join_model() -> Model {
     }
 }
 
-/// CLAIMED TURN EDGES (ATERM-KI-1029-1): what `aterm_slog::TurnTracker::claim_edge` and a transcript read `state=partial` make of two vendor turns of a codex-alab run, each its own span, whichever source reads a turn first.
+/// CLAIMED TURN EDGES (ATERM-KI-1029-1): what `aterm_slog::TurnTracker::claim_edge` and a transcript read `state=partial` make of two vendor turns of a codex-alab run, each its own span, whichever source reads a turn first, under the run's turn bucket.
 ///
-/// The engine parses each turn's beginning and end in order (`d`: B1 E1 B2 E2), the host feeds them in that order (`f`, never past `d`), and the rollout tap reads each turn's prompt and end rows in order (`p`: P1 T1 P2 T2). `c1`, `c2` are the claim's turns of spans 1 and 2 and `x1`, `x2` the transcript's (0 none, 1 open, 2 closed); `u1`, `u2` say a transcript turn is still on the untaken list no beginning took (a row end that closes it leaves it there); `n1`, `n2` say a prompt named a claim turn; the ghost `xc2` is set when a claim's end closed `x2`. A beginning closes the claim's own turn still open (its end was lost; this feed loses no edge, so here that never fires), then, with no turn running or only an untaken one, takes the oldest untaken turn as its span's, does nothing while another turn runs, and else opens a claim turn. An end closes the turn running unless it is untaken. A prompt names the claim's turn open, or closed and named by none, and else opens its own turn (fix E1), untaken; a row end closes the transcript's own open turn. Laws: no span holds two turns (`NoSpanTwice`), each turn whose edges were fed is in the log (`EveryFedTurnLogged`), and a claim closes the second span's transcript turn only at that span's own end (`ClaimClosesOnlyAFedEnd`). ASSUMPTION (residual R4): the tap reads the second prompt only once the engine parsed the first turn's end and the host fed its beginning, as a parse not stalled across a turn boundary past the tap's recheck gives (`Prompt2`'s guard). Mutants: Buggy=1, a beginning ignores the untaken list (`BeginSkipsFifo`); Buggy=2, the host feeds no beginning, as before the fix (`BeginUnfed`); Buggy=3, an end closes an untaken turn (`EndClosesUntaken`).
+/// The engine parses each turn's beginning and end in order (`d`: B1 E1 B2 E2), the host feeds them in that order (`f`, never past `d`), and the rollout tap reads each turn's prompt and end rows in order (`p`: P1 T1 P2 T2). `c1`, `c2` are the claim's turns of spans 1 and 2 and `x1`, `x2` the transcript's (0 none, 1 open, 2 closed); `u1`, `u2` say a transcript turn is still on the untaken list no beginning took (a row end that closes it leaves it there); `n1`, `n2` say a prompt named a claim turn; the ghost `xc2` is set when a claim's end closed `x2`. A beginning closes the claim's own turn still open (its end was lost; this feed loses no edge, so here that never fires), then, with no turn running or only an untaken one, takes the oldest untaken turn as its span's, does nothing while another turn runs, and else opens a claim turn, unless the run's turn bucket refuses it (`RefuseBegin1`, `RefuseBegin2`), which the host says (`s1`, `s2`). Span 1 may be resumed (`Resume1`: codex-alab cleared its report mid-turn and sent it again, a resumed beginning the engine draws), which moves nothing in the span whose beginning the tracker read; the ghost `k1` counts the claim turns opened for span 1. An end closes the turn running unless it is untaken. A prompt names the claim's turn open, or closed and named by none, and else opens its own turn (fix E1), untaken; a row end closes the transcript's own open turn. Laws: no span holds two turns (`NoSpanTwice`), each turn whose edges were fed is in the log or its refusal said (`EveryFedTurnLoggedOrSaid`), a claim closes the second span's transcript turn only at that span's own end (`ClaimClosesOnlyAFedEnd`), and a span's resumed beginning opens no second claim turn (`OneClaimPerSpan`). ASSUMPTION (residual R4): the tap reads the second prompt only once the engine parsed the first turn's end and the host fed its beginning, as a parse not stalled across a turn boundary past the tap's recheck gives (`Prompt2`'s guard). ASSUMPTION (residual R2): no rollout row of a span whose beginning the bucket refused is read (`Prompt1`'s guard): read before the second beginning, its prompt would open a turn that beginning takes as its own span's, and read after, it would name the second span's claimed turn, and that span's own prompt would then open it a second turn. Mutants: Buggy=1, a beginning ignores the untaken list (`BeginSkipsFifo`); Buggy=2, the host feeds no beginning, as before the fix (`BeginUnfed`); Buggy=3, an end closes an untaken turn (`EndClosesUntaken`); Buggy=4, the bucket refuses a turn and nothing says so (`RefuseUnsaid`); Buggy=5, a resumed beginning closes the running claim turn and opens another, as a beginning does (`ResumeSplits`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claimed_turn_edges_model() -> Model {
@@ -2355,15 +2355,26 @@ pub fn claimed_turn_edges_model() -> Model {
             var n1 = 0;
             var n2 = 0;
             var xc2 = 0;
+            var s1 = 0;
+            var s2 = 0;
+            var k1 = 0;
 
             action Parse when (d <= 3) {
                 d = d + 1;
             }
             action FeedBegin1 when (f == 0 && d > f) {
                 f = 1;
-                u1 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 1 { 0 } else { u1 };
-                u2 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 1 { 0 } else { u2 };
-                c1 = if (c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 0 { 1 } else { c1 };
+                u1 = if ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 1 { 0 } else { u1 };
+                u2 = if ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 1 { 0 } else { u2 };
+                c1 = if ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0 { 1 } else { c1 };
+                k1 = if ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0 { k1 + 1 } else { k1 };
+            }
+            action RefuseBegin1 when (f == 0 && d > f && ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0) {
+                f = 1;
+                s1 = 1;
+            }
+            action Resume1 when (f == 1) {
+                f = 1;
             }
             action FeedEnd1 when (f == 1 && d > f) {
                 f = 2;
@@ -2376,9 +2387,14 @@ pub fn claimed_turn_edges_model() -> Model {
             action FeedBegin2 when (f == 2 && d > f) {
                 f = 3;
                 c1 = if c1 == 1 { 2 } else { c1 };
-                u1 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 1 { 0 } else { u1 };
-                u2 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 1 { 0 } else { u2 };
-                c2 = if (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1) && u1 == 0 && u2 == 0 { 1 } else { c2 };
+                u1 = if ((c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 1 { 0 } else { u1 };
+                u2 = if ((c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 1 { 0 } else { u2 };
+                c2 = if ((c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0 { 1 } else { c2 };
+            }
+            action RefuseBegin2 when (f == 2 && d > f && ((c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0) {
+                f = 3;
+                c1 = if c1 == 1 { 2 } else { c1 };
+                s2 = 1;
             }
             action FeedEnd2 when (f == 3 && d > f) {
                 f = 4;
@@ -2388,7 +2404,7 @@ pub fn claimed_turn_edges_model() -> Model {
                 x2 = if x2 == 1 && u2 == 0 { 2 } else { x2 };
                 xc2 = if x2 == 1 && u2 == 0 { 1 } else { xc2 };
             }
-            action Prompt1 when (p == 0) {
+            action Prompt1 when (p == 0 && s1 == 0) {
                 p = 1;
                 n1 = if c1 > 0 { 1 } else { n1 };
                 x1 = if c1 == 0 { 1 } else { x1 };
@@ -2426,11 +2442,159 @@ pub fn claimed_turn_edges_model() -> Model {
                 x2 = if x2 == 1 { 2 } else { x2 };
                 xc2 = if x2 == 1 { 1 } else { xc2 };
             }
+            action RefuseUnsaid when (Buggy == 4 && f == 0 && d > f && ((c1 == 0 || c1 == 2) && (c2 == 0 || c2 == 2) && (x1 == 0 || x1 == 2 || u1 == 1) && (x2 == 0 || x2 == 2 || u2 == 1)) && u1 == 0 && u2 == 0) {
+                f = 1;
+            }
+            action ResumeSplits when (Buggy == 5 && f == 1 && c1 == 1 && k1 == 1) {
+                k1 = 2;
+            }
 
             invariant NoSpanTwice: (c1 == 0 || x1 == 0) && (c2 == 0 || x2 == 0);
-            invariant EveryFedTurnLogged: (f <= 1 || c1 + x1 > 0) && (f <= 3 || c2 + x2 > 0);
+            invariant EveryFedTurnLoggedOrSaid: (f <= 1 || c1 + x1 > 0 || s1 == 1) && (f <= 3 || c2 + x2 > 0 || s2 == 1);
             invariant ClaimClosesOnlyAFedEnd: xc2 == 0 || f > 3;
-            bound StateBounded: d <= 4 && f <= 4 && p <= 4 && c1 <= 2 && c2 <= 2 && x1 <= 2 && x2 <= 2 && u1 <= 1 && u2 <= 1 && n1 <= 1 && n2 <= 1 && xc2 <= 1;
+            invariant OneClaimPerSpan: k1 <= 1;
+            bound StateBounded: d <= 4 && f <= 4 && p <= 4 && c1 <= 2 && c2 <= 2 && x1 <= 2 && x2 <= 2 && u1 <= 1 && u2 <= 1 && n1 <= 1 && n2 <= 1 && xc2 <= 1 && s1 <= 1 && s2 <= 1 && k1 <= 2;
+        }
+    }
+}
+
+/// PROGRAM EDGE FEED (ATERM-KI-1029-1): where the session log's feed of a codex's OSC 7501 turn edges (`aterm-gui`'s `SessionLog::feed_leaving` and `SessionLog::feed_front`, reading past the log's own cursor on every status sweep) puts each turn across one foreground move, from program A to program B.
+///
+/// A takes the front first (`lk`: 1 a codex, named, its agent run open; 2 another program, which writes no turn) and may write a turn (`wa`); it leaves with its `clear` (`ex` 1: `Exit` at rest, `ExitInTurn` mid-turn, which `ia` remembers, as Ctrl+Z gives) or without one (`ex` 2: `Kill`, or another program's `Leave`), and B takes the front (`bk`: 1 a codex, 2 another program). B writes a turn of its own (`wb` 1, `WriteB`) or, a codex where A cleared mid-turn, re-sends the in-turn report (`wb` 2, `ResumeB`), for which the engine draws a resumed beginning (`eb`: the write drew an edge). The log sees the move at a sweep (`mv`), then the resolver names B (`nm`), whose run opens at the next sweep's block read. The host's sweeps: A's turn while A is in front is fed to A's run (`SweepFront`); a sweep that sees the move feeds the edges before A's `clear` to A's run still open, before the block read can close it (`SweepMoveSplit`), counts every edge past the cursor when no `clear` split them and a codex left, as their writer cannot be told (`SweepMoveKilled`, said: `sd`; the ghost `am` marks that ambiguity), and leaves them for B when what left was no codex (`SweepMoveOther`); B's edges wait while B is unnamed (`Hold`), are fed to B's codex run once named (`SweepCodex`), and are dropped quietly under another program (`SweepOther`, `qb`); a write of B's that drew no edge leaves the cursor nothing to wait at, so the next sweep reads past it. `ca`, `cb` say the cursor passed A's and B's writes; `fa`, `fb` count the turns fed to A's and B's runs; the ghost `wr` marks a turn fed to a run that is not its writer's. Laws: every consumed edge is fed or said, or dropped under another program (`EveryConsumedFedOrSaid`); no turn is fed to another writer's run (`FedToItsWriter`); the log says a turn only where its writer cannot be told (`SaidOnlyWhenAmbiguous`); a codex's turn re-entered while no report stood has a turn in its new run once the log read past it (`ResumedSpanLogged`, the critic's blocker); and no turn is fed twice (`FedOnce`). Mutants: Buggy=1, the gate before the fix, a sweep that sees the move or reads under an unnamed front consumes the edges unfed and unsaid (`MoveUnfed`, `UnnamedUnfed`); Buggy=2, no `clear` split, A's edges left for B (`MoveNoSplit`); Buggy=3, the cursor stays behind a fed turn, which the next sweep feeds again (`Refeed`); Buggy=4, the move's feed after the block read closed A's run (`MoveFeedAfterEnd`); Buggy=5, a move with no `clear` from no codex counts what B wrote (`MoveCountsAll`); Buggy=6, the engine draws no resumed beginning (`ResumeUndrawn`).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn program_edge_feed_model() -> Model {
+    aterm_spec::ty_model! {
+        ProgramEdgeFeed {
+            const Buggy = 0;
+            var lk = 0;
+            var ex = 0;
+            var bk = 0;
+            var wa = 0;
+            var ia = 0;
+            var wb = 0;
+            var eb = 0;
+            var mv = 0;
+            var nm = 0;
+            var ca = 0;
+            var cb = 0;
+            var fa = 0;
+            var fb = 0;
+            var sd = 0;
+            var qb = 0;
+            var wr = 0;
+            var am = 0;
+
+            action StartCodex when (lk == 0) {
+                lk = 1;
+            }
+            action StartOther when (lk == 0) {
+                lk = 2;
+            }
+            action WriteA when (lk == 1 && ex == 0 && wa == 0) {
+                wa = 1;
+            }
+            action Exit when (lk == 1 && ex == 0) {
+                ex = 1;
+            }
+            action ExitInTurn when (lk == 1 && ex == 0 && wa == 1) {
+                ex = 1;
+                ia = 1;
+            }
+            action Kill when (lk == 1 && ex == 0) {
+                ex = 2;
+            }
+            action Leave when (lk == 2 && ex == 0) {
+                ex = 2;
+            }
+            action ArriveCodex when (ex > 0 && bk == 0) {
+                bk = 1;
+            }
+            action ArriveOther when (ex > 0 && bk == 0) {
+                bk = 2;
+            }
+            action WriteB when (bk > 0 && wb == 0) {
+                wb = 1;
+                eb = 1;
+            }
+            action ResumeB when (bk == 1 && ia == 1 && wb == 0) {
+                wb = 2;
+                eb = 1;
+            }
+            action Name when (mv == 1 && nm == 0) {
+                nm = 1;
+            }
+
+            action SweepFront when (lk == 1 && ex == 0 && wa == 1 && ca == 0) {
+                ca = 1;
+                fa = fa + 1;
+            }
+            action SweepMoveSplit when (ex == 1 && bk > 0 && mv == 0) {
+                mv = 1;
+                ca = if wa == 1 { 1 } else { ca };
+                fa = if wa == 1 && ca == 0 { fa + 1 } else { fa };
+                cb = if wb > 0 && eb == 0 { 1 } else { cb };
+            }
+            action SweepMoveKilled when (ex == 2 && lk == 1 && bk > 0 && mv == 0) {
+                mv = 1;
+                am = 1;
+                ca = if wa == 1 { 1 } else { ca };
+                cb = if wb > 0 { 1 } else { cb };
+                sd = sd + (if wa == 1 && ca == 0 { 1 } else { 0 }) + (if wb > 0 && cb == 0 && eb == 1 { 1 } else { 0 });
+            }
+            action SweepMoveOther when (ex == 2 && lk == 2 && bk > 0 && mv == 0) {
+                mv = 1;
+            }
+            action Hold when (mv == 1 && nm == 0 && wb > 0 && cb == 0) {
+                mv = 1;
+                cb = if eb == 0 { 1 } else { cb };
+            }
+            action SweepCodex when (mv == 1 && nm == 1 && bk == 1 && ((wb > 0 && cb == 0) || (wa == 1 && ca == 0))) {
+                cb = if wb > 0 { 1 } else { cb };
+                ca = if wa == 1 { 1 } else { ca };
+                fb = fb + (if wb > 0 && cb == 0 && eb == 1 { 1 } else { 0 }) + (if wa == 1 && ca == 0 { 1 } else { 0 });
+                wr = if wa == 1 && ca == 0 { 1 } else { wr };
+            }
+            action SweepOther when (mv == 1 && nm == 1 && bk == 2 && ((wb > 0 && cb == 0) || (wa == 1 && ca == 0))) {
+                cb = if wb > 0 { 1 } else { cb };
+                ca = if wa == 1 { 1 } else { ca };
+                qb = if wb > 0 && cb == 0 && eb == 1 { 1 } else { qb };
+            }
+
+            action MoveUnfed when (Buggy == 1 && ex > 0 && bk > 0 && mv == 0) {
+                mv = 1;
+                am = if ex == 2 && lk == 1 { 1 } else { am };
+                ca = if wa == 1 { 1 } else { ca };
+                cb = if wb > 0 { 1 } else { cb };
+            }
+            action UnnamedUnfed when (Buggy == 1 && mv == 1 && nm == 0 && wb > 0 && cb == 0) {
+                cb = 1;
+            }
+            action MoveNoSplit when (Buggy == 2 && ex == 1 && bk > 0 && mv == 0) {
+                mv = 1;
+            }
+            action Refeed when (Buggy == 3 && ex == 0 && ca == 1 && fa == 1) {
+                fa = 2;
+            }
+            action MoveFeedAfterEnd when (Buggy == 4 && ex == 1 && bk > 0 && mv == 0 && wa == 1 && ca == 0) {
+                mv = 1;
+                ca = 1;
+            }
+            action MoveCountsAll when (Buggy == 5 && ex == 2 && lk == 2 && bk > 0 && mv == 0 && wb > 0 && eb == 1) {
+                mv = 1;
+                cb = 1;
+                sd = sd + 1;
+            }
+            action ResumeUndrawn when (Buggy == 6 && bk == 1 && ia == 1 && wb == 0) {
+                wb = 2;
+            }
+
+            invariant EveryConsumedFedOrSaid: ca + (if eb == 1 { cb } else { 0 }) <= fa + fb + sd + qb;
+            invariant FedToItsWriter: wr == 0;
+            invariant SaidOnlyWhenAmbiguous: sd == 0 || am == 1;
+            invariant ResumedSpanLogged: wb <= 1 || cb == 0 || nm == 0 || bk == 0 || bk == 2 || fb > 0;
+            invariant FedOnce: fa <= 1 && fb <= 1;
+            bound StateBounded: lk <= 2 && ex <= 2 && bk <= 2 && wa <= 1 && ia <= 1 && wb <= 2 && eb <= 1 && mv <= 1 && nm <= 1 && ca <= 1 && cb <= 1 && fa <= 2 && fb <= 2 && sd <= 2 && qb <= 1 && wr <= 1 && am <= 1;
         }
     }
 }

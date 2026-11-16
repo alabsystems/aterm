@@ -2245,7 +2245,8 @@ impl App {
         });
         let focused_session = self.focused_session_id(wid);
         let pool = &self.pool;
-        let Some(ws) = self.windows.get_mut(&wid).map(Box::as_mut) else {
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(ws) = route_projection.as_deref_mut().map(Box::as_mut) else {
             return;
         };
         let search_open = ws.search.is_some();
@@ -2573,9 +2574,10 @@ impl App {
             return;
         }
         let ch = u16_of(self.win_cell_size(wid).1);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let arts = match &ws.claude_card.arts {
             Some(arts) if arts.ch() == ch => Arc::clone(arts),
             _ => {
@@ -2588,6 +2590,7 @@ impl App {
             }
         };
         let list: Vec<Arc<aterm_core::render::FxArt>> = arts.arts().cloned().collect();
+        drop(route_guard_ws);
         self.queue_fx_prefetch(wid, &list);
     }
 
@@ -2720,7 +2723,8 @@ impl App {
                 }
             }
         };
-        for (wid, ws) in &mut self.windows {
+        for (wid, mut route_guard_ws) in &mut self.windows {
+            let ws = &mut **route_guard_ws;
             for entry in &mut ws.claude_card.entries {
                 if entry.live() && entry.deferred.is_none() && entry.card.deadline(now).is_none() {
                     entry.asked = true;
@@ -2755,9 +2759,10 @@ impl App {
 
     /// Handle window focus changes for card and panel return animations.
     pub(crate) fn claude_glass_focus(&mut self, wid: WindowId, focused: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let cards = &mut ws.claude_card;
         if !focused {
             cards.away = (cards.any_shown() || cards.panels.any_breath()).then(card_now);
@@ -2769,15 +2774,17 @@ impl App {
         {
             return;
         }
+        drop(route_guard_ws);
         self.rearm_claude_cards(wid, || now.get());
         self.rearm_claude_panels(wid, || now.get());
     }
 
     /// Re-arm card intro animations for all shown cards in `wid`.
     pub(crate) fn rearm_claude_cards(&mut self, wid: WindowId, now: impl FnOnce() -> Instant) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if !ws.claude_card.any_shown() {
             return;
         }

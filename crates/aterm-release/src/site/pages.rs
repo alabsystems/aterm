@@ -453,6 +453,13 @@ pub enum Difference {
     InstallerNotFetched,
     /// The live `/install.sh` is not the checkout's.
     InstallerDiffers,
+    /// The checkout serves `/get-aterm.ps1` and the live site does not.
+    WindowsInstallerNotFetched,
+    /// The live `/get-aterm.ps1` is not the checkout's.
+    WindowsInstallerDiffers,
+    /// The live site serves a `/get-aterm.ps1` the checkout does not hold (one a sync removed
+    /// once the public commit's script pinned no release verifier).
+    WindowsInstallerStale,
 }
 
 impl fmt::Display for Difference {
@@ -478,6 +485,14 @@ impl fmt::Display for Difference {
             Self::InstallerDiffers => {
                 f.write_str("live /install.sh differs from the checkout's public/install.sh")
             }
+            Self::WindowsInstallerNotFetched => f.write_str("/get-aterm.ps1 was not fetched"),
+            Self::WindowsInstallerDiffers => {
+                f.write_str("live /get-aterm.ps1 differs from the checkout's public/get-aterm.ps1")
+            }
+            Self::WindowsInstallerStale => f.write_str(
+                "the live site serves /get-aterm.ps1, and the checkout has no \
+                 public/get-aterm.ps1",
+            ),
         }
     }
 }
@@ -541,6 +556,14 @@ pub fn compare(facts: &Facts, local: &Copies<'_>, live: &Copies<'_>) -> Vec<Diff
             Some(l) if l != local_installer => out.push(Difference::InstallerDiffers),
             Some(_) => {}
         }
+    }
+    // The checkout serves no /get-aterm.ps1 while the public commit's copy pins no verifier, and
+    // the live site must then serve none either.
+    match ((local.get)("get-aterm.ps1"), (live.get)("get-aterm.ps1")) {
+        (Some(_), None) => out.push(Difference::WindowsInstallerNotFetched),
+        (Some(l), Some(v)) if l != v => out.push(Difference::WindowsInstallerDiffers),
+        (None, Some(_)) => out.push(Difference::WindowsInstallerStale),
+        _ => {}
     }
     out
 }

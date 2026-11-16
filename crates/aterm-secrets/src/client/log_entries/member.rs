@@ -27,7 +27,8 @@
 
 use super::waiting::{
     Landed, WaitingWrite, everyone_fresh_to, everyone_seal, held_defers, land_member_writes,
-    overtaken_since, overtaker, sign_everyone, still_waits, take_back_member_writes, waits_here,
+    overtaken_since, overtaker, sign_everyone, still_waits, take_back_member_writes,
+    waiting_bytes_here, waits_here,
 };
 use super::*;
 
@@ -145,6 +146,13 @@ pub struct MemberEntry {
     /// replaces a newer value, and settles no conflict. `None`: a person's write, which stands
     /// over whatever it replaces.
     pub read_as: Option<SecretBytes>,
+    /// The ops a settle stands on: every op the name's register held when the settler read it
+    /// (its concurrent siblings, `OpenedAudienceEntries::everyone_ops`), which the write replaces
+    /// as a person's write replaces concurrent values (a `Delete`, then the `Put`). The draft is
+    /// refused where the register holds any other set of ops by then, and it never waits for a
+    /// vault pass, which would sign it over a log it did not read: a settle never replaces a
+    /// write it did not see (`claude_token::settle`). `None`: no settle.
+    pub settles: Option<BTreeSet<RecordId>>,
 }
 
 impl MemberEntry {
@@ -165,6 +173,16 @@ fn changed_refusal(name: &str) -> String {
         "`{name}` changed since this write read it (in the vault, or in a write of this Mac's \
          still to be signed): the write is of the value it read, so nothing is written and the \
          newer value stands"
+    )
+}
+
+/// Why a settle of `name` ([`MemberEntry::settles`]) is refused: its register holds other ops than
+/// the settler read, or the write would wait for a vault pass, which signs over a log it did not
+/// read.
+fn settle_refusal(name: &str) -> String {
+    format!(
+        "`{name}` holds other writes than this settle read, or the settle would wait for the \
+         vault pass: nothing is written, and the next reading settles what stands then"
     )
 }
 
@@ -286,7 +304,9 @@ fn dangling_anchor(everyone: Option<&BTreeMap<String, Entry>>, tos: &[Entry]) ->
 /// the `Put`s, sealed as a vault pass seals ([`everyone_seal`]) under one epoch at one
 /// `authored_ms`, each after a `Delete` where the log holds concurrent values for its name, which
 /// the person's write settles. Where the log holds every entry as it would leave it already,
-/// nothing is signed; where it holds some, every entry is signed again, so the draft stays one.
+/// nothing is signed; where it holds some, every entry is signed again, so the draft stays one. A
+/// settle ([`MemberEntry::settles`]) is refused where a name's register holds other ops than it
+/// read, and where it would wait, and is signed even where every entry holds its value already.
 fn draft_member_set(
     paths: &Paths,
     store: &Store,
@@ -301,7 +321,31 @@ fn draft_member_set(
     let Some((actor, device, incarnation)) = open_local_member_signer(paths, log)? else {
         return nothing(Drafted::NotSeated);
     };
+    let settling = entries.iter().any(|entry| entry.settles.is_some());
+    // A write that waits is asked its class here, where the command queues it: the vault pass
+    // that signs it once its key is here asks nothing, so a refusal is this command's answer.
+    // A settle never waits (it is refused first), so nothing is asked of one.
+    // It is asked beside every write that already waits here and that it does not replace, which
+    // that pass signs with it.
+    let waiting = waiting_bytes_here(paths, identity, &|name| {
+        entries.iter().any(|entry| entry.name == name)
+    });
+    let asks = |tos: &mut dyn Iterator<Item = &Entry>| {
+        let batch = tos.fold(Authoring::default(), |batch, to| {
+            let (bytes, class) = waiting_put(to, Author::Person);
+            batch.with_put(bytes, class)
+        });
+        log.author_ask(
+            &batch.beside_waiting(waiting),
+            Author::Person,
+            &actor,
+            now_ms,
+        )
+    };
     let Some(opened) = log.open_audience_entries(identity)? else {
+        if let Some(entry) = entries.iter().find(|entry| entry.settles.is_some()) {
+            return nothing(Drafted::Refused(settle_refusal(&entry.name)));
+        }
         let mut writes = Vec::new();
         for entry in entries {
             match planned(entry, None, false) {
@@ -309,6 +353,7 @@ fn draft_member_set(
                 Err(why) => return nothing(Drafted::Refused(why.to_string())),
             }
         }
+        asks(&mut writes.iter().filter_map(WaitingWrite::entry))?;
         return nothing(Drafted::Waits(WaitFor::NewestUnopened, writes));
     };
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
@@ -343,6 +388,15 @@ fn draft_member_set(
     let mut reads = Vec::with_capacity(entries.len());
     let mut conflicted = Vec::with_capacity(entries.len());
     for entry in entries {
+        if let Some(ids) = &entry.settles
+            && opened
+                .everyone_ops(&entry.name)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                != *ids
+        {
+            return nothing(Drafted::Refused(settle_refusal(&entry.name)));
+        }
         let read = everyone.and_then(|held| held.get(&entry.name));
         let concurrent = opened
             .conflicts
@@ -364,6 +418,10 @@ fn draft_member_set(
         return nothing(Drafted::Refused(why));
     }
     let waits = |why| {
+        if let Some(entry) = entries.iter().find(|entry| entry.settles.is_some()) {
+            return nothing(Drafted::Refused(settle_refusal(&entry.name)));
+        }
+        asks(&mut tos.iter())?;
         let writes = tos
             .iter()
             .zip(&reads)
@@ -399,7 +457,9 @@ fn draft_member_set(
                 .flatten()
         })
         .collect();
-    if let Some(holding) = holding {
+    // A settle signs even where each name holds its value already: siblings that write the same
+    // value are no conflict, yet two drafts' winners still split the pair.
+    if let Some(holding) = holding.filter(|_| !settling) {
         return nothing(Drafted::Signed(holding));
     }
     if rotation_due(log, &opened, &EpochAudience::Everyone) {
@@ -427,6 +487,7 @@ fn draft_member_set(
         seal,
         &deletes,
         &puts,
+        Some((Author::Person, waiting)),
     )?;
     let signed: Vec<RecordId> = minted
         .iter()
@@ -591,6 +652,12 @@ pub(crate) fn member_write(
         }
     }
     let by = on_busy.deadline();
+    // A settle never waits for a vault pass ([`MemberEntry::settles`]): busy, it is refused.
+    let on_busy = if entries.iter().any(|entry| entry.settles.is_some()) {
+        OnBusy::Refuse(by)
+    } else {
+        on_busy
+    };
     let busy = || match on_busy {
         OnBusy::Refuse(_) => None,
         OnBusy::Wait(_) => Some(WaitFor::LockDeadline),
@@ -948,6 +1015,10 @@ fn unset_under_old_epoch() -> bool {
 /// the `Delete`s a reseal issues again (F21 rule 5,
 /// [`crate::membership_log::OpenedAudienceEntries::keyed_deletes`]): the one batch an admin's
 /// edit that takes names out of `[everyone]` signs ([`draft_sealed_away`]).
+///
+/// The batch is a membership write whole, so no class stop is asked of it: a `Delete` is
+/// membership, and the entries sealed again are the reseal that `Delete` owes, as a removal's
+/// re-key is the removal's. It runs to the log's bound, which [`Log::insert`] holds it to.
 fn draft_member_unset(
     paths: &Paths,
     store: &Store,
@@ -992,6 +1063,8 @@ fn draft_member_unset(
             seal,
             &deletes,
             &[],
+            // A `Delete` alone: critical.
+            None,
         )?;
         return Ok((minted, DraftedUnset::Deleted));
     }
@@ -1035,6 +1108,8 @@ fn draft_member_unset(
             &stays,
             &dropped,
             &mut minted,
+            // Critical whole (above): nothing is asked of its `Put`s, each sealed again.
+            (&mut PutNotes::default(), &|_| true),
         )
     })?;
     Ok((minted, DraftedUnset::Deleted))

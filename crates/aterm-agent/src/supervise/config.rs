@@ -948,6 +948,32 @@ impl SupervisorConfig {
             if OWNER_TABLES.contains(&key.as_str()) {
                 continue;
             }
+            if key == REGISTRY_DEV {
+                if !value
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().all(|id| id.as_str().is_some()))
+                {
+                    notes.push(format!(
+                        "{REGISTRY_DEV}: harness ids whose development link makes a row, an \
+                         array of strings, not a TOML {} — ignored",
+                        value.type_str()
+                    ));
+                }
+                continue;
+            }
+            if key == REGISTRY_LEAD {
+                if !value
+                    .as_table()
+                    .is_some_and(|words| words.values().all(|id| id.as_str().is_some()))
+                {
+                    notes.push(format!(
+                        "{REGISTRY_LEAD}: a table of agent words, each naming the harness id \
+                         that leads it, not a TOML {} — ignored",
+                        value.type_str()
+                    ));
+                }
+                continue;
+            }
             if let Err(e) = cfg.set_value(&key, value) {
                 notes.push(e);
             }
@@ -1076,6 +1102,9 @@ impl SupervisorConfig {
                 _ => continue,
             };
             let key = key.as_str();
+            if key == REGISTRY_DEV || key == REGISTRY_LEAD {
+                continue;
+            }
             if OWNER_TABLES.contains(&key) {
                 if !head.is_empty() {
                     let at = head.join(".").replace(".[]", "[]");
@@ -1988,6 +2017,15 @@ fn written(value: &aterm_toml::Value) -> String {
 /// The root `[harness]` keys only the owner writes: the mode and the owner's own source and rule
 /// tables (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1, §3.3).
 pub const OWNER_KEYS: [&str; 3] = ["occupancy", OWNER_TABLES[0], OWNER_TABLES[1]];
+
+/// `[harness] dev`: the harness ids whose development link makes a registry row with no
+/// verified row. The harness registry reads it ([`atpkg::config::load_harness`],
+/// `docs/HARNESS-CONTRACT.md` §2), never [`SupervisorConfig`].
+pub const REGISTRY_DEV: &str = "dev";
+
+/// `[harness] lead.<word> = "<id>"`: the development link that leads `word` although an
+/// installed row leads it too. The harness registry reads it, never [`SupervisorConfig`].
+pub const REGISTRY_LEAD: &str = "lead";
 
 /// The owner's source and rule tables: [`super::occupancy::owner_rules::OwnerTables`]' to read,
 /// never [`SupervisorConfig`]'s (not keys of it, so never `unknown key` either).

@@ -5,8 +5,8 @@
 
 use aterm_core::terminal::program_state::{ProgramBlockedKind, ProgramState, ProgramStateWord};
 use aterm_slog::{
-    Amend, BoundedText, BoundedToken, Claimed, ClaimedBox, ClaimedReport, Conf, Fields, Key, Kind,
-    Mark, Node, Src, Stamp, Val,
+    Amend, BoundedText, BoundedToken, ClaimedBox, ClaimedReport, Conf, Fields, Key, Kind, Mark,
+    Node, Src, Stamp, Val,
 };
 
 use super::{SessionLog, name_fp, tok, with};
@@ -26,10 +26,19 @@ pub(crate) enum TitleStands {
     CommandLine,
 }
 
-/// A program's moves written at once before its run's bucket is empty (6F-4, U17).
+/// A program's moves written at once before its run's bucket is empty (6F-4, U17), and the
+/// claimed turns a codex run opens at once before its turn bucket is ([`ProgramMarks`]).
 pub(crate) const PROGRAM_BURST: u64 = 20;
-/// Past the burst, a program's run earns one program mark this often (monotonic ms).
+/// Past the burst, a program's run earns one program mark, and a codex run one claimed turn,
+/// this often (monotonic ms).
 pub(crate) const PROGRAM_REFILL_MS: u64 = 1_000;
+
+// The engine can retain at least one full burst between readings. More arrivals can still
+// overflow the ring before a reading; that loss is reported separately as an eviction gap.
+const _: () = assert!(
+    PROGRAM_BURST as usize <= aterm_core::terminal::program_state::PROGRAM_TURNS_KEPT,
+    "the engine keeps at least a turn bucket's burst of turns"
+);
 const PROGRAM_FULL_MILLI: u64 = PROGRAM_BURST * 1_000;
 
 /// WHAT THE SUPERVISOR'S ATTENTION ESCALATES ([`SessionLog::observe_meta`], fix E3): read from
@@ -106,9 +115,6 @@ impl MarkBucket {
 pub(crate) struct ProgramWords {
     pub(crate) state: &'static str,
     pub(crate) ask: Option<&'static str>,
-    /// What it claims of its turn (`None`: no report shown), which a codex-alab's turns follow
-    /// ([`SessionLog::claim_turn`]).
-    pub(crate) claimed: Option<Claimed>,
     /// The box it shows: a `blocked` report on a permission or a question (none on a login, or a
     /// `blocked` naming no kind), which a codex-alab's claimed box steps follow
     /// ([`SessionLog::claim_box`]).
@@ -126,14 +132,12 @@ impl ProgramWords {
             ProgramWords {
                 state: "none",
                 ask: None,
-                claimed: None,
                 boxed: None,
                 began,
             },
             |s| ProgramWords {
                 state: s.state.as_str(),
                 ask: s.kind.map(|k| k.as_str()),
-                claimed: Some(claimed_of(s.state)),
                 boxed: boxed_of(s),
                 began,
             },
@@ -162,25 +166,25 @@ fn boxed_of(s: ProgramState) -> Option<ClaimedBox> {
     }
 }
 
-/// What a report of `word` claims of its turn: `working` and `blocked` that one runs, `idle` and
-/// `done` that it rested, `error` that it failed.
-const fn claimed_of(word: ProgramStateWord) -> Claimed {
-    match word {
-        ProgramStateWord::Working | ProgramStateWord::Blocked => Claimed::Working,
-        ProgramStateWord::Idle | ProgramStateWord::Done => Claimed::Rested,
-        ProgramStateWord::Error => Claimed::Failed,
-    }
-}
-
-/// THE PROGRAM MARKS' BUCKET: the run in front's tokens, and the newest move not yet written.
+/// THE PROGRAM MARKS' BUCKET: the run in front's tokens, the newest move not yet written, the
+/// codex run's turn bucket, and the claimed turns no log holds that no record said yet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramMarks {
-    /// The run the bucket is the share of (`None`: no move yet).
+    /// The run the buckets are the share of (`None`: no move yet).
     run: Option<Node>,
-    /// Its tokens.
+    /// Its mark tokens.
     bucket: MarkBucket,
+    /// Its claimed-turn tokens ([`crate::session_log::SessionLog::feed_front`]): marks and turns
+    /// each have their own, so a program flapping past both writes at most a burst of each, then
+    /// one of each a second.
+    turns: MarkBucket,
     /// The newest move not yet written, its observation time, and how many states it replaced.
     pending: Option<(ProgramWords, Stamp, u64)>,
+    /// Claimed turns the log does not hold (the turn bucket refused them, or their edges could
+    /// not be told to a run), which the next `program` mark says (`dropped=`), or the close of
+    /// the run they are the share of when no mark is pending then. Kept across a run change
+    /// until said.
+    dropped: u64,
 }
 
 /// WHAT THE PERSON IS SHOWN of a session's need: the printed tuple, as its `shown` mark words it.
@@ -367,6 +371,16 @@ const PROGRESS_WORDS: &[&str] = &[
 ];
 
 impl Observed {
+    /// `n` more claimed turns the log does not hold, for the next record to say.
+    pub(super) const fn program_dropped(&mut self, n: u64) {
+        self.program.dropped = self.program.dropped.saturating_add(n);
+    }
+
+    /// One token of the codex run's turn bucket at `now` (monotonic ms), if one is free.
+    pub(super) fn spend_turn(&mut self, now: u64) -> bool {
+        self.program.turns.spend(now, false)
+    }
+
     /// The carry's tokens for the `state` host line.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_tokens(&self) -> String {
@@ -483,7 +497,7 @@ impl Observed {
 }
 
 impl SessionLog {
-    fn front_run(&self) -> Node {
+    pub(super) fn front_run(&self) -> Node {
         let open = |n: Node| self.log.is_open(n).then_some(n);
         self.agent
             .as_ref()
@@ -493,7 +507,7 @@ impl SessionLog {
             .unwrap_or(Node::SESSION)
     }
 
-    fn codex_run(&self) -> Option<Node> {
+    pub(super) fn codex_run(&self) -> Option<Node> {
         self.agent
             .as_ref()
             .filter(|a| {
@@ -600,9 +614,10 @@ impl SessionLog {
         }
     }
 
-    /// `mark <run> program state= [ask=] [coalesced=]`, and a codex-alab's turn and box by each
-    /// one written ([`Self::claim_turn`], [`Self::claim_box`]); `began` is where the shown report
-    /// began in the engine.
+    /// `mark <run> program state= [ask=] [coalesced=] [dropped=]`, and a codex-alab's box by
+    /// each one written ([`Self::claim_box`]); `began` is where the shown report began in the
+    /// engine. The mark moves no turn: a codex-alab's claimed turns move by the engine's edges
+    /// alone ([`Self::feed_front`]).
     pub(crate) fn observe_program(&mut self, shown: Option<ProgramState>, began: u64, at: Stamp) {
         let words = ProgramWords::of(shown, began);
         let run = self.front_run();
@@ -615,84 +630,19 @@ impl SessionLog {
         self.write_program(at, false);
     }
 
-    /// The program bucket's run is `run` from now: a new one first writes the last run's pending
-    /// state, then starts full with none pending.
-    fn enter_program_run(&mut self, run: Node, at: Stamp) {
+    /// The program buckets' run is `run` from now: a new one first writes the last run's pending
+    /// state, then starts with both buckets full and none pending; the turns no record said yet
+    /// stay to be said.
+    pub(super) fn enter_program_run(&mut self, run: Node, at: Stamp) {
         if self.observed.program.run != Some(run) {
             self.write_program(at, true);
             self.observed.program = ProgramMarks {
                 run: Some(run),
                 bucket: MarkBucket::full(at.mono_ms),
+                turns: MarkBucket::full(at.mono_ms),
                 pending: None,
+                dropped: self.observed.program.dropped,
             };
-        }
-    }
-
-    /// THE EDGES NO SHOWN MOVE CLAIMS ([`crate::program_state::ProgramStateGate::observe_fed`]),
-    /// oldest first, at `at`'s sweep: each moves the codex run's claimed turns ([`Self::claim_turn`])
-    /// through `aterm_slog::TurnTracker::claim_edge`, dated at its parse batch's wall clock
-    /// ([`super::stamp_at_wall`]; the sweep's stamp where the batch read none), and a beginning
-    /// that would open a turn pays one token of the run's program bucket for it, opening none on a
-    /// refusal. It writes no mark. Nothing moves unless the run in front is a codex's. Answers
-    /// whether a record was written.
-    pub(crate) fn observe_program_edges(
-        &mut self,
-        fed: &[crate::program_state::FedEdge],
-        at: Stamp,
-    ) -> bool {
-        let run = self.front_run();
-        if self.codex_run() != Some(run) {
-            return false;
-        }
-        self.enter_program_run(run, at);
-        self.reconcile_person(at);
-        self.resync();
-        let seq0 = self.log.last_seq();
-        let Self {
-            log,
-            agent,
-            observed,
-            ..
-        } = self;
-        if let Some(a) = agent.as_mut() {
-            for edge in fed {
-                let (claimed, wall_ms) = match *edge {
-                    crate::program_state::FedEdge::Began(ms) => (Claimed::Working, ms),
-                    crate::program_state::FedEdge::Ended(word, ms) => (claimed_of(word), ms),
-                };
-                let edge_at = super::stamp_at_wall(at, wall_ms.unwrap_or(at.wall_ms));
-                let _ = a.tracker.claim_edge(log, claimed, edge_at, &mut || {
-                    observed.program.bucket.spend(at.mono_ms, false)
-                });
-            }
-        }
-        log.last_seq() != seq0
-    }
-
-    /// THE CLAIM'S TURNS: a codex-alab's screen opens no turn, so its run's turns follow the
-    /// program marks written on it: `working` (or `blocked` in one) opens one and `idle`, `done`
-    /// or `error` closes it at the state's observation time, at `src=engine conf=claim`
-    /// (`aterm_slog::TurnTracker::claim`), each
-    /// with its duration whatever its rollout tap binds; while a rollout is read `state=on` it
-    /// opens its own turns and the claim stands aside, one read `state=partial` adds to the
-    /// claim's and opens a turn only where none runs (fix E1), which the next `working` takes as
-    /// the turn running. A shown move's turn moves with its written mark, and an edge no shown
-    /// move claims moves it through [`Self::observe_program_edges`]; the run's bucket bounds both,
-    /// so a program flapping faster than the bucket opens no more turns than the bucket pays for.
-    /// Past the bucket's burst a rest and the next `working` inside one refill coalesce into the
-    /// newest mark: the rest's edge still ends its turn, but the next turn opens only once its
-    /// `working` is written, so one whose rest replaced that `working` first is no claimed turn.
-    fn claim_turn(&mut self, run: Node, claimed: Claimed, event_at: Stamp, at: Stamp) {
-        if self.codex_run() != Some(run) {
-            return;
-        }
-        self.reconcile_person(at);
-        self.resync();
-        let Self { log, agent, .. } = self;
-        if let Some(a) = agent.as_mut() {
-            // Mark emission and person reconciliation use the flush clock; only the
-            // claimed event keeps its observation clock across a delayed bucket tick.
-            let _ = a.tracker.claim(log, claimed, event_at);
         }
     }
 
@@ -706,14 +656,19 @@ impl SessionLog {
         self.write_program(at, true);
     }
 
-    /// The run `closing` is about to close.
-    pub(super) fn settle_program(&mut self, closing: Node, at: Stamp) {
-        let Some(run) = self.observed.program.run else {
-            return;
-        };
-        if run == closing || self.descends(run, closing) {
-            self.write_program(at, true);
+    /// The run `closing` is about to close: the pending state of the run the buckets are the
+    /// share of, when it is `closing` or under it, is written now. Answers the claimed turns no
+    /// record said yet when `closing` is that run and no mark was pending to say them, for its
+    /// close to say (`dropped=`): a mark is written only for a move, as each is a
+    /// `program-state` row.
+    pub(super) fn settle_program(&mut self, closing: Node, at: Stamp) -> Option<u64> {
+        let run = self.observed.program.run?;
+        if run != closing && !self.descends(run, closing) {
+            return None;
         }
+        self.write_program(at, true);
+        let p = &mut self.observed.program;
+        (run == closing && p.dropped > 0).then(|| std::mem::take(&mut p.dropped))
     }
 
     fn write_program(&mut self, at: Stamp, force: bool) {
@@ -734,24 +689,24 @@ impl SessionLog {
             Key::Coalesced,
             (replaced > 0).then_some(Val::U(replaced)),
         );
+        let dropped = std::mem::take(&mut p.dropped);
+        let f = with(f, Key::Dropped, (dropped > 0).then_some(Val::U(dropped)));
         self.put(Kind::Program, Src::Engine, Conf::Claim, node, f, at);
-        if let Some(claimed) = words.claimed {
-            self.claim_turn(node, claimed, event_at, at);
-        }
         self.claim_box(node, words.report(), event_at, at);
     }
 
     /// THE CLAIM'S BOXES (GAP 26): a codex-alab's screen opens no step, so its run's approval
-    /// and question steps follow the program marks written on it, each after its turn moved
-    /// ([`Self::claim_turn`]), so a box that begins a turn hangs from it: a mark `blocked` on a
+    /// and question steps follow the program marks written on it, each after the engine's edges
+    /// the sweep read moved its turn ([`Self::feed_front`]), so a box that begins a turn hangs
+    /// from it: a mark `blocked` on a
     /// permission or a question opens one step at `src=engine conf=claim`
     /// (`aterm_slog::TurnTracker::claim_box`), one per box its report's `began` names, and the
     /// next mark that stops showing that box ends it, attributed by the input bound to it as a
     /// screen step is. Every written mark reaches it, `state=none` included, so the run's
     /// bucket bounds the boxes as it bounds the marks: a box whose `blocked` coalesced away
-    /// past the burst is no step. As [`Self::claim_turn`] does, the box moves at the state's
-    /// observation time `event_at`, so a mark the bucket delayed neither opens its box after
-    /// the edge that ends its turn nor drags that turn's close to the flush; person
+    /// past the burst is no step. The box moves at the state's observation time `event_at`, so a
+    /// mark the bucket delayed neither opens its box after the edge that ends its turn nor drags
+    /// that turn's close to the flush; person
     /// reconciliation keeps the flush clock `at`. Nothing moves unless `run` is a codex's.
     fn claim_box(&mut self, run: Node, report: ClaimedReport, event_at: Stamp, at: Stamp) {
         if self.codex_run() != Some(run) {
@@ -763,6 +718,12 @@ impl SessionLog {
         if let Some(a) = agent.as_mut() {
             let _ = a.tracker.claim_box(log, report, event_at);
         }
+    }
+
+    /// The claimed turns the log counted and no record said yet.
+    #[cfg(test)]
+    pub(crate) const fn program_dropped_pending(&self) -> u64 {
+        self.observed.program.dropped
     }
 
     /// The codex run's claimed box step, while one stands ([`Self::claim_box`]).

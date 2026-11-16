@@ -1436,9 +1436,11 @@ const PULSE_LOOK: std::time::Duration = std::time::Duration::from_secs(30);
 /// a working holder's lease can lapse.
 const PULSE_RENEW_S: u64 = 300;
 
-/// The longest the heartbeat alone keeps a line: past this long with no completed row and no
-/// new step, working processes renew nothing more (an audit renews the lease itself and does
-/// not restart this count). It is [`MAX_LEASE_S`], above
+/// The longest the heartbeat alone keeps a line, the lease it renews included: counted from the
+/// look that first saw the run's newest progress (a completed row or a new step; it looks every
+/// [`PULSE_LOOK`]), it renews no lease that would run past this, so with no completed row and no
+/// new step the line lapses this long after that look however its processes work (an audit
+/// renews the lease itself and does not restart this count). It is [`MAX_LEASE_S`], above
 /// verify's three-hour ceiling on one check's work and more than twice the longest row-less
 /// stretch measured in a qualification that passed (108 minutes, 0.199.0), so a tree that
 /// spins without ever finishing anything still loses its line.
@@ -1511,8 +1513,9 @@ impl Pulse {
     }
 
     /// Renew `state`'s lease at `now` on `evidence`, where the heartbeat is due: there is
-    /// evidence, nothing renewed the lease for [`PULSE_RENEW_S`], and the run itself made
-    /// progress (a row or a step) within [`PULSE_ALONE_S`]. Whether it renewed.
+    /// evidence, nothing renewed the lease for [`PULSE_RENEW_S`], and the lease renewed now
+    /// ([`lease_s`]) runs out no later than [`PULSE_ALONE_S`] after the look that first saw the
+    /// run's newest progress (a row or a step). Whether it renewed.
     fn beat(&mut self, state: &mut State, evidence: Option<String>, now: u64) -> bool {
         let progress = (state.step.clone(), state.rows.len());
         if self.mark.as_ref().is_none_or(|(seen, _)| *seen != progress) {
@@ -1522,7 +1525,8 @@ impl Pulse {
         let Some(evidence) = evidence else {
             return false;
         };
-        if now.saturating_sub(state.at) < PULSE_RENEW_S || now.saturating_sub(since) > PULSE_ALONE_S
+        if now.saturating_sub(state.at) < PULSE_RENEW_S
+            || now.saturating_sub(since).saturating_add(lease_s(state)) > PULSE_ALONE_S
         {
             return false;
         }

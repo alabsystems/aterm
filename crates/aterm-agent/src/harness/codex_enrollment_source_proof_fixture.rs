@@ -73,6 +73,8 @@ impl CandidateLease {
 enum Purpose {
     Source,
     Retained,
+    RetainedDistinct,
+    RetainedResources,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,7 +219,14 @@ impl SourceProofLaunch {
     /// Authenticated fixture purpose only; native construction and process
     /// admission still independently check this original launch.
     pub fn retained_frontend(&self) -> bool {
-        matches!(self.body.purpose, Purpose::Retained)
+        matches!(
+            self.body.purpose,
+            Purpose::Retained | Purpose::RetainedDistinct | Purpose::RetainedResources
+        )
+    }
+
+    pub fn resources_frontend(&self) -> bool {
+        matches!(self.body.purpose, Purpose::RetainedResources)
     }
 
     pub fn advance(&self, env: &Env) -> SourceProofAdvance {
@@ -359,6 +368,18 @@ impl SourceProofLaunch {
         let mut images = vec![self.candidate.image.clone()];
         if let Some(replacement) = &self.replacement {
             images.push(replacement.image.clone());
+        }
+        Ok(images)
+    }
+    /// Exact process-image multiplicity selected by the authenticated driver,
+    /// independently of frontend checkpoint data or child-reported processes.
+    pub fn retained_backend_images(&self) -> Result<Vec<Image>, String> {
+        let mut images = self.retained_images()?;
+        if matches!(
+            self.body.purpose,
+            Purpose::RetainedDistinct | Purpose::RetainedResources
+        ) {
+            images.push(self.candidate.image.clone());
         }
         Ok(images)
     }
@@ -504,6 +525,12 @@ impl NativeSourceProofWorld {
     }
     pub fn retained_task(&self, candidate: &Path) -> Result<String, String> {
         self.task(candidate, Purpose::Retained, None)
+    }
+    pub fn retained_distinct_task(&self, candidate: &Path) -> Result<String, String> {
+        self.task(candidate, Purpose::RetainedDistinct, None)
+    }
+    pub fn retained_resources_task(&self, candidate: &Path) -> Result<String, String> {
+        self.task(candidate, Purpose::RetainedResources, None)
     }
     pub fn retained_upgrade_task(
         &self,

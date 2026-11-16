@@ -471,6 +471,7 @@ fn a_metadata_collision_after_payload_publication_leaves_no_ready_or_current() {
     let hooks = crate::install::StageHooks {
         pre_swap: Some(&hook),
         sidecars: Some(&records),
+        records: &[],
         ..crate::install::StageHooks::NONE
     };
     let parent = fs::Parent::open(&_lock, PROGRAM, true).unwrap();
@@ -528,6 +529,7 @@ fn a_late_payload_name_collision_preserves_the_first_publishers_bytes() {
     let hooks = crate::install::StageHooks {
         pre_swap: Some(&hook),
         sidecars: Some(&records),
+        records: &[],
         ..crate::install::StageHooks::NONE
     };
     let input = std::fs::File::open(w.artifact.join("bin").join(COMMAND)).unwrap();

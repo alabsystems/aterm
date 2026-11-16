@@ -6,7 +6,10 @@
 //! start, with no relaunch and nothing for the person to do
 //! (`docs/DESIGN-claude-accounts-v2-2026-10-15.md`). The judgment is aterm's own
 //! (`aterm harness tap --launch`, which prints the `--settings` value or nothing); the block only
-//! asks it and puts what it printed ahead of the launch's own arguments.
+//! asks it and puts what it printed ahead of the launch's own arguments. The same verb first
+//! settles the launch's folder trust (aterm's `harness::launch_trust`), so the block is also the
+//! one step a launch may wait on: for a folder Claude Code holds no trust record for, and for
+//! seconds at most.
 
 use std::path::Path;
 
@@ -21,13 +24,21 @@ pub fn of(program: &str) -> bool {
 
 /// What the block asks of the aterm it names, ahead of the launch's own arguments: aterm's
 /// `harness tap --launch --`, which reads no stdin, prints the `--settings` value or nothing, and
-/// exits 0.
+/// exits 0. It returns at once where the folder's trust is recorded or is not aterm's to settle;
+/// otherwise it waits, within a bound of its own, while Claude Code records it.
 pub const VERB: [&str; 4] = ["harness", "tap", "--launch", "--"];
+
+/// The variable the block sets for that one command: `1` where the launch's standard output is a
+/// terminal, `0` where it is not (a pipe, a file, a tool's shell). aterm settles no folder trust
+/// for a launch that says `0`: Claude Code prints and exits there and draws no dialog.
+pub const STDOUT_TTY_ENV: &str = "ATERM_LAUNCH_STDOUT_TTY";
 
 /// The note line ahead of the block.
 const NOTE: &str = "# atpkg: aterm's usage tap — inside an aterm tab, `aterm harness tap --launch` \
      names the `--settings` value that hands this launch's usage figures to aterm's footer, or \
-     nothing, and a launch it names none for runs as typed (aterm help harness).\n";
+     nothing, and a launch it names none for runs as typed; before that, where aterm's policy \
+     trusts this folder and Claude Code holds no trust record for it, it has Claude Code record \
+     one, within a bound of seconds (aterm help harness).\n";
 
 /// The aterm executable beside `atpkg` (`atpkg` and `aterm` are one program under two names, laid
 /// side by side), or `None` where `atpkg` names no file (an empty path).
@@ -43,9 +54,11 @@ pub fn aterm_beside(atpkg: &Path) -> Option<std::path::PathBuf> {
 /// name, or Windows, whose `.cmd` twin carries no prelude: none). Inside an aterm tab
 /// (`ATERM_PARENT_SESSION_ID` set) with the harness on for this launch (`ATERM_NO_HARNESS`
 /// empty or unset: `claude --no-harness` sets it), it runs the aterm beside `atpkg` on the
-/// launch's arguments, its stdin `/dev/null` and its stderr dropped; where that printed a value,
+/// launch's arguments, its stdin `/dev/null`, its stderr dropped and [`STDOUT_TTY_ENV`] saying
+/// whether the launch's own standard output is a terminal; where that printed a value,
 /// the launch runs with `--settings <value>` ahead of its own arguments, and where it printed
-/// nothing, failed or is not there, the launch runs as typed. It sits after the `--yolo` block,
+/// nothing, failed or is not there, the launch runs as typed. The launch waits for that aterm to
+/// exit, which is bounded by aterm's own deadline for the folder's trust (the module's). It sits after the `--yolo` block,
 /// which reads `--settings` as a posture of the person's own, and ends with the renderer block
 /// ([`RENDERER_BLOCK`]).
 #[must_use]
@@ -62,7 +75,10 @@ pub fn sh_prelude(program: &str, atpkg: Option<&Path>) -> String {
         "if [ -n \"${ATERM_PARENT_SESSION_ID-}\" ] && [ -z \"${ATERM_NO_HARNESS-}\" ] && [ -x ",
     );
     s.push_str(&aterm);
-    s.push_str(" ]; then\n  __atpkg_tap=$(");
+    s.push_str(" ]; then\n  if [ -t 1 ]; then __atpkg_tty=1; else __atpkg_tty=0; fi\n");
+    s.push_str("  __atpkg_tap=$(");
+    s.push_str(STDOUT_TTY_ENV);
+    s.push_str("=$__atpkg_tty ");
     s.push_str(&aterm);
     for word in VERB {
         s.push(' ');

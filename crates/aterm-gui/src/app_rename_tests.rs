@@ -119,7 +119,7 @@ fn a_close_during_the_edit_drops_the_commit_instead_of_retargeting() {
     );
     assert!(meta_events(&app, 0).is_empty());
 
-    app.windows.get_mut(&wid).unwrap().rename_edit = None;
+    app.windows.get_mut(&wid).unwrap().routing.set_rename(None);
     let gone = crate::tab_model::TabId::from_stored(u64::MAX);
     assert!(!app.begin_session_rename(wid, gone));
     assert_eq!(app.rename_edit_session(wid), None);

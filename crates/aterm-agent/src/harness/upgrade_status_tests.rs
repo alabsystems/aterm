@@ -5881,6 +5881,10 @@ const WAITS: &[&str] = &[
     "no-process",
     "argv-unreadable",
     "exe-unreadable",
+    crate::harness::upgrade_drive::TERMINAL_UNREAD,
+    crate::harness::relaunch::SHELL_UNREAD,
+    crate::harness::relaunch::LAYOUT_UNREAD,
+    crate::harness::relaunch::RECORDS_UNREAD,
     "version-unreadable",
     "no-version",
     "home-unreadable",
@@ -9639,4 +9643,48 @@ fn every_account_refusal_wait_has_a_class_and_words() {
     assert_eq!(wait_class("account"), WaitClass::UnderWay);
     assert!(wait_words_of(upgrade::Agent::Claude, "account").is_some());
     assert_eq!(wait_class("account-policy-new"), WaitClass::Unclassified);
+}
+
+/// LS-72: EVERY PROCESS FACT A RELAUNCH SNAPSHOT DID NOT READ IS A TAB NOT READ, AS A WAIT. The
+/// drive waits on the snapshot's own refusal word (`wait:terminal-unread` where the agent's
+/// terminal was not read); each code [`relaunch::SnapshotRefusal::of`] calls unread for a fact
+/// not read is [`WaitClass::TabUnread`], with or without a `release:` prefix, never a wait aterm
+/// does not classify (which `--status` prints and `harness-stuck` names at its horizon), and its
+/// row's cause is never `unclassified`. CONTROL: the answer `terminal` is the person's.
+#[test]
+fn every_snapshot_fact_not_read_waits_as_a_tab_not_read() {
+    use crate::harness::relaunch::{
+        EXE_UNREADABLE, LAYOUT_UNREAD, RECORDS_UNREAD, SHELL_UNREAD, SnapshotRefusal,
+    };
+    for word in [
+        crate::harness::upgrade_drive::TERMINAL_UNREAD,
+        SHELL_UNREAD,
+        LAYOUT_UNREAD,
+        RECORDS_UNREAD,
+        EXE_UNREADABLE,
+        "ids",
+        "argv-unreadable",
+        "home-unreadable",
+        "files-unreadable",
+    ] {
+        assert_eq!(SnapshotRefusal::of(word), SnapshotRefusal::Unread(word));
+        assert_eq!(wait_class(word), WaitClass::TabUnread, "{word}");
+        assert_eq!(
+            wait_class(&format!("release:{word}")),
+            WaitClass::TabUnread,
+            "{word}"
+        );
+        let row = Row {
+            wait_seen: NOW,
+            ..pending_with(word)
+        };
+        assert_ne!(row.cause(), Cause::Unclassified(word.to_string()), "{word}");
+        assert_ne!(row.cause_word(NOW), "unclassified", "{word}");
+    }
+    assert_eq!(wait_class("terminal"), WaitClass::Person);
+    // LS-72: arguments withheld for good are no tab not read yet: another user's agent.
+    assert_eq!(
+        wait_class(crate::harness::relaunch::ARGV_WITHHELD),
+        WaitClass::Person
+    );
 }

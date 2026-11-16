@@ -583,7 +583,8 @@ fn fig(pct_x10: u32, reset: i64, at: i64) -> WindowFig {
 
 /// The state's diff gives session starts and ends (a session gone, a new one, one moved to
 /// another account), a reading that moved a point or more or changed its reset (not one that
-/// moved less), and each wall seen or cleared.
+/// moved less), and each wall seen or cleared, once: a standing wall seen again, which moves only
+/// its newest sighting ([`Wall::seen()`]), is no new note.
 /// NEGATIVE CONTROL: with `moved` noting any change (`>= 0`), the half-point move is noted:
 /// `` left: [… ("quota", "ac-0123456789abcdef"), ("quota", "ac-0123456789abcdef"), ("wall",
 /// "ac-0123456789abcdef")] ``.
@@ -617,6 +618,7 @@ fn observe_notes_sessions_readings_and_walls_from_the_diff() {
             by: HERE.into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     let notes = observe(Cli::Claude, &before, &mut after.clone(), &mut [], 40);
@@ -653,6 +655,17 @@ fn observe_notes_sessions_readings_and_walls_from_the_diff() {
         )
     );
     assert_eq!((notes[5].window, notes[5].until), (Some("5h"), Some(5_000)));
+
+    // The same wall seen standing again moves only its newest sighting: no second note.
+    let mut again = after.clone();
+    let wall = again
+        .accounts
+        .get_mut("ann")
+        .and_then(|ann| ann.walls.get_mut(SESSION_LIMIT))
+        .unwrap();
+    wall.seen = Some(35);
+    let notes = observe(Cli::Claude, &after, &mut again, &mut [], 41);
+    assert!(notes.is_empty(), "{notes:?}");
 }
 
 /// The backfill notes the local ledger's last 30 days and the state's standing facts once,
@@ -871,6 +884,7 @@ fn a_workspace_reading_names_its_sub_account_and_another_macs_is_left() {
                 by: HERE.into(),
                 attempts: 0,
                 cleared: false,
+                seen: None,
             },
         );
     }

@@ -740,7 +740,7 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.os_window_for_test = true;
             ws.focused = at_park;
         }
@@ -798,7 +798,7 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
         if refused {
             pending.teardown = crate::DeferredHandoffTeardown::QuitRequested;
         }
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.focused = at_write;
         }
         app.finish_proven_handoff(respin);

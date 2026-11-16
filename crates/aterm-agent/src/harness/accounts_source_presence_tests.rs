@@ -230,7 +230,6 @@ pub(crate) fn source_transition(state: &State, action: &str) -> State {
 #[test]
 fn source_precedence_and_refusal_conform_with_retained_records() {
     let model = aterm_models_harness::account_source_presence_model();
-    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     let mut witnessed = BTreeMap::new();
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

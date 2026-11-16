@@ -696,7 +696,7 @@ fn a_file_roster_cannot_redirect_or_hold_a_hidden_backend_sign_in() {
                 state: Some("expired"),
                 next: Some("inactive-file-row".into()),
                 off: Some("an inactive pool switch".into()),
-                bot_check_at: Some(1_800_000_000),
+                check_at: Some(1_800_000_000),
                 sign_in_refused: Some("an inactive file-account refusal".into()),
                 ..CliAccounts::default()
             });
@@ -1078,6 +1078,8 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
                 ..accounts::Sample::default()
             },
             walls: Vec::new(),
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let pick =
@@ -1886,6 +1888,7 @@ fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
                     outcome: "failed",
                     routes: "profile: the sign-in did not finish; profile(ready)".into(),
                     since: 1_800_000_000 - 600,
+                    for_a_person: false,
                 });
             },
             "upkeep",
@@ -1932,9 +1935,10 @@ fn with_nobody_here_aterm_starts_only_a_sign_in_that_runs_unattended() {
     assert!(matches!(done, Done::Failed(_)), "{done:?}");
 }
 
-/// WITH NOBODY AT THIS RUN A POOL'S RENEWAL WAITS ON WHAT HOLDS IT: Cloudflare's bot check on
-/// record within the upkeep's hold, or a stop for a person (whose step the refusal names);
-/// nothing runs. CONTROL: past the hold, the renewal runs with stdin closed.
+/// WITH NOBODY AT THIS RUN A POOL'S RENEWAL WAITS ON WHAT HOLDS IT: a bot protection's check of
+/// the row's account on record, a minute or a day and six hours on (on no clock, its refusal
+/// naming the person's own sign-in), or a stop for a person (whose step the refusal names);
+/// nothing runs. CONTROL: with neither on record, the renewal runs with stdin closed.
 #[test]
 fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
     use crate::ai::connector::KIMI;
@@ -1952,10 +1956,18 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
         (
             "bot check",
             crate::ai::facts::CliAccounts {
-                bot_check_at: Some(1_800_000_000 - 60),
+                check_at: Some(1_800_000_000 - 60),
                 ..pool.clone()
             },
-            "bot check",
+            "aterm harness accounts login kimi-one --cli kimi",
+        ),
+        (
+            "bot check a day on",
+            crate::ai::facts::CliAccounts {
+                check_at: Some(1_800_000_000 - hold - 86_400),
+                ..pool.clone()
+            },
+            "bot protection",
         ),
         (
             "a person's step",
@@ -1975,10 +1987,7 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
         );
         assert!(runner.calls().is_empty(), "{case}");
     }
-    pooled.pool = Some(crate::ai::facts::CliAccounts {
-        bot_check_at: Some(1_800_000_000 - hold),
-        ..pool
-    });
+    pooled.pool = Some(pool);
     let runner = FakeRunner::quiet();
     let done = agent.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
     assert_eq!(done, Done::SignedIn(None), "CONTROL");

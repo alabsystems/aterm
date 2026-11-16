@@ -1562,6 +1562,59 @@ fn index_name(index: u32) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The exact BSD interface's controller publishes its active medium's speed in bits/s
+/// (`IONetworkController.h`, `kIOLinkSpeed`). No selected-medium maximum is substituted.
+fn network_link_rate(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `name` is NUL-terminated; the dictionary is +1 or NULL.
+    let matching = unsafe { iokit::IOBSDNameMatching(MAIN_PORT_DEFAULT, 0, name.as_ptr()) };
+    if matching.is_null() {
+        return None;
+    }
+    // SAFETY: The call consumes `matching`; its service is +1 or 0.
+    let interface =
+        unsafe { iokit::IOServiceGetMatchingService(MAIN_PORT_DEFAULT, matching.cast_const()) };
+    if interface == 0 {
+        return None;
+    }
+    let interface = Io(interface);
+    let mut parents = 0;
+    // SAFETY: `interface` is live, the plane NUL-terminated and `parents` writable; on
+    // success it owns a +1 iterator, released below.
+    let kr = unsafe {
+        iokit::IORegistryEntryGetParentIterator(
+            interface.0,
+            c"IOService".as_ptr(),
+            &raw mut parents,
+        )
+    };
+    if kr != 0 || parents == 0 {
+        return None;
+    }
+    let parents = Io(parents);
+    for _ in 0..8 {
+        // SAFETY: `parents` is live; each returned entry is +1, or 0 at the end.
+        let parent = unsafe { iokit::IOIteratorNext(parents.0) };
+        if parent == 0 {
+            return None;
+        }
+        let parent = Io(parent);
+        // SAFETY: `parent` is live and the class name NUL-terminated.
+        if unsafe { iokit::IOObjectConformsTo(parent.0, c"IONetworkController".as_ptr()) } == 0 {
+            continue;
+        }
+        let status = Cf::string(c"IOLinkStatus")?;
+        let speed = Cf::string(c"IOLinkSpeed")?;
+        let number = |key: &Cf| {
+            Cf::property(parent.0, key.0)
+                .and_then(|v| cf_i64(v.0))
+                .and_then(|v| u64::try_from(v).ok())
+        };
+        return iflist::controller_rate(number(&status)?, number(&speed)?);
+    }
+    None
+}
+
 /// [`crate::net_links_into`] on macOS ([`iflist::link_kind`]).
 pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> {
     let mut links = iflist::links_of(iflist_bytes(scratch)?);
@@ -1575,6 +1628,7 @@ pub(crate) fn net_links_into(scratch: &mut Vec<u8>) -> Option<Vec<LinkReading>> 
         link.kind = iflist::link_kind(&link.name, || {
             sock.as_ref().and_then(|s| functional_type(s, &link.name))
         });
+        link.rate_bps = iflist::link_rate(link, || network_link_rate(&link.name));
     }
     Some(links)
 }

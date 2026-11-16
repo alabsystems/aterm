@@ -7,8 +7,8 @@
 use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
-    Body, Entrant, EpochAudience, Evidence, Log, MemberId, Record, RecordId, Root, SeatAudience,
-    Store, encode_records, secure_twins,
+    Author, Authoring, Body, Class, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, Record,
+    RecordId, Root, SeatAudience, Store, encode_records, secure_twins,
 };
 use aterm_digest::Sha256;
 use aterm_mesh_core::no_lost_edit as nle;
@@ -33,17 +33,10 @@ mod enrollment_seat_tests;
 #[path = "log_entries/no_leak_tests.rs"]
 mod no_leak_tests;
 
-const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
-
-/// Deterministic SHA-256 digest over a [`Log`]'s current head [`RecordId`]s.
+/// Deterministic SHA-256 digest over a [`Log`]'s current head [`RecordId`]s
+/// ([`Log::heads_digest`], the value a vault server advertises as its TXT `rec=`).
 pub(super) fn records_heads_digest(log: &Log) -> [u8; 32] {
-    let heads = log.heads();
-    let mut buf = Vec::with_capacity(HEADS_DIGEST_MAGIC.len() + heads.len() * 32);
-    buf.extend_from_slice(HEADS_DIGEST_MAGIC);
-    for id in heads {
-        buf.extend_from_slice(&id);
-    }
-    Sha256::digest(&buf)
+    log.heads_digest()
 }
 
 pub(super) fn genesis_matches_lineage(
@@ -1551,7 +1544,8 @@ pub(super) fn overlay_log_onto_document(
                         }
                     }
                 }
-                doc.set_entry_with(
+                // The log holds this value: the text that reads it shows it at any size.
+                doc.hold_entry_with(
                     &aud,
                     &entry.name,
                     entry.value.as_slice(),
@@ -2088,33 +2082,32 @@ pub(super) fn open_local_member_signer_held_until(
     Ok(Some((actor, device, incarnation)))
 }
 
-fn pending_remove_cutoffs(
+/// The `Remove`s this Mac, `actor`, owes for the keys a version names on `code-only` lines
+/// (`matches_recipient`): each current seat of one of them, and each writer successor below
+/// their seats ([`super::remove::successors_of`]), at its cutoff; and of each such seat other
+/// members removed short of a quorum and this Mac did not, its share at the cutoff most of
+/// their `Remove`s name.
+pub(super) fn pending_remove_cutoffs(
     log: &Log,
     actor: &MemberId,
     matches_recipient: impl Fn(&Recipient) -> bool,
 ) -> Vec<(MemberId, RecordId)> {
     let membership = log.membership();
     let voided = membership.voided();
-    let mut out = Vec::new();
-    for (id, m) in membership.members() {
-        if id == actor || !matches_recipient(&m.binding.recipient()) {
-            continue;
-        }
-        let cutoff = log
-            .records()
-            .skip(1)
-            .filter(|r| !voided.contains(r.id()) && r.actor() == id)
-            .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
-            .map_or(m.entry, |r| *r.id());
-        out.push((*id, cutoff));
-    }
     let mut removed_matching: BTreeSet<MemberId> = BTreeSet::new();
+    let mut named: BTreeSet<Recipient> = membership
+        .members()
+        .values()
+        .map(|m| m.binding.recipient())
+        .filter(|recipient| matches_recipient(recipient))
+        .collect();
     if let Body::Genesis { founders, .. } = log.genesis().body() {
         for f in founders {
             if let Some(b) = &f.binding
                 && matches_recipient(&b.recipient())
             {
                 removed_matching.insert(b.actor());
+                named.insert(b.recipient());
             }
         }
     }
@@ -2127,7 +2120,26 @@ fn pending_remove_cutoffs(
             && matches_recipient(&entrant.request.binding().recipient())
         {
             removed_matching.insert(entrant.member());
+            named.insert(entrant.request.binding().recipient());
         }
+    }
+    // A key let go is its Mac's removal, which takes the Mac's writer successors out with it:
+    // each is the same Mac's writer under an age identity of its own, on the same disk, which
+    // no `code-only` line names (`super::remove::successors_of`).
+    let heirs = super::remove::successors_of(log, &membership, &named);
+    removed_matching.extend(heirs.iter().copied());
+    let mut out = Vec::new();
+    for (id, m) in membership.members() {
+        if id == actor || !(matches_recipient(&m.binding.recipient()) || heirs.contains(id)) {
+            continue;
+        }
+        let cutoff = log
+            .records()
+            .skip(1)
+            .filter(|r| !voided.contains(r.id()) && r.actor() == id)
+            .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id())))
+            .map_or(m.entry, |r| *r.id());
+        out.push((*id, cutoff));
     }
     for (target, removal) in membership.removed() {
         if target == actor
@@ -2210,6 +2222,11 @@ pub(super) fn append_document_diff_to_log(
     doc: &Document,
     base: Base<'_>,
 ) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
+    // A mirror carries into the log a version already published, which every Mac reads by its
+    // lockers whether or not its records follow: no class is asked of it. Refused, the version
+    // would stand with no records and the sync pass that mirrors it would fail at every pass.
+    // What an automatic writer publishes is asked where it publishes
+    // (`super::publish_as_with_removal`), which refuses one whose edit it cannot draft.
     let drafted = draft_document_diff_until(
         paths,
         config,
@@ -2218,6 +2235,7 @@ pub(super) fn append_document_diff_to_log(
         identity,
         doc,
         base,
+        None,
         None,
         None,
     )?;
@@ -2973,7 +2991,9 @@ pub(super) use waiting::{
 };
 #[cfg(not(test))]
 use waiting::{everyone_edit, held_values_or_unread};
-use waiting::{moves_wait, read_waiting, settle_uncarried, standing, unread_as_none};
+use waiting::{
+    moves_wait, read_waiting, settle_uncarried, standing, unread_as_none, waiting_bytes_here,
+};
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
 /// `[everyone]` (unless `readmit` lets it back in, or its `Wrap` may still arrive: `flight`).
@@ -3139,6 +3159,7 @@ fn draft_sealed_away(
     puts: &[&Entry],
     dropped: &[&String],
     minted: &mut Vec<Record>,
+    (notes, carried): (&mut PutNotes, &dyn Fn(&Entry) -> bool),
 ) -> crate::Result<()> {
     let (draft_ep, epoch_key) = log.draft_epoch(
         actor,
@@ -3162,6 +3183,7 @@ fn draft_sealed_away(
             .draft_put(actor, authored_ms, epoch_id, &epoch_key, entry)?
             .sign(writer_seed, incarnation)?;
         let _ = log.insert(rec.clone())?;
+        notes.put(&rec, &entry.name, carried(entry));
         minted.push(rec);
     }
     for name in dropped {
@@ -3172,6 +3194,101 @@ fn draft_sealed_away(
         minted.push(rec);
     }
     Ok(())
+}
+
+/// What a publish's draft asks of the class stops ([`edit_batch`], [`Log::authored_ask`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ask<'a> {
+    /// An edit by its author: every `Put` it changed is the author's write.
+    Edit(Author<'a>),
+    /// A publish that lets a Mac in (an approval, an open admission, the approvals pass naming a
+    /// Mac the log let in), by its author: the swarm roster and the Commons control, which name
+    /// who is in, are membership where it changes them, as the keys it wraps to that Mac are,
+    /// since an admission stopped there is half done. Any other `Put` it changed, a
+    /// credential's, a configuration's or another control record's, is still its author's
+    /// write.
+    LetsIn(Author<'a>),
+}
+
+impl<'a> Ask<'a> {
+    /// Who authors the draft.
+    pub(super) const fn author(self) -> Author<'a> {
+        match self {
+            Self::Edit(author) | Self::LetsIn(author) => author,
+        }
+    }
+}
+
+/// What a draft knows of the `Put`s it signs that their records do not say: nothing in a
+/// record tells a value the edit changed from one it only sealed again, nor names the entry it
+/// writes. Which a `Put` is, is told where it is drafted ([`edit_batch`]).
+#[derive(Default)]
+pub(super) struct PutNotes {
+    /// The `Put`s that seal again, under a fresh epoch, an entry the edit left as the log holds
+    /// it: the reseal a `Delete`, a changed list or unsettled heads owe. Such a `Put` is no
+    /// write of its author's; it carries the batch as its `Epoch` and `Wrap`s do.
+    carried: BTreeSet<RecordId>,
+    /// Whether the draft lets a Mac in ([`Ask::LetsIn`]).
+    lets_in: bool,
+    /// Where it does, the `Put`s it changed of the swarm roster or the Commons control:
+    /// membership.
+    admits: BTreeSet<RecordId>,
+}
+
+impl PutNotes {
+    /// The notes of a draft asked `ask` ([`Ask::LetsIn`] or not).
+    pub(super) fn of(ask: Option<Ask<'_>>) -> Self {
+        Self {
+            lets_in: matches!(ask, Some(Ask::LetsIn(_))),
+            ..Self::default()
+        }
+    }
+
+    /// Note `put`, a `Put` a draft signed of the entry `name`; `carried` where the edit left its
+    /// entry as the log holds it.
+    pub(super) fn put(&mut self, put: &Record, name: &str, carried: bool) {
+        if carried {
+            self.carried.insert(*put.id());
+        } else if self.lets_in
+            && (name == crate::SWARM_ROSTER_ENTRY
+                || name.starts_with(crate::commons::CONTROL_PREFIX))
+        {
+            self.admits.insert(*put.id());
+        }
+    }
+}
+
+/// The records an edit or a member's write drafted, as the class stops weigh them
+/// ([`Authoring`]): a `Put` the edit changed is its author's write ([`Class::of_author`]), a
+/// credential's as any other, except the swarm roster's or the Commons control's in a draft that
+/// lets a Mac in ([`Ask::LetsIn`]), which is membership; every other kind is classed by itself
+/// ([`Class::of_kind`]), and an `Epoch`, a `Wrap` and a `Put` that only seals again an entry the
+/// edit left alone ([`PutNotes::carried`]) carry the batch. So a person's batch is judged by what
+/// the person changed: a `Delete` with the reseal it owes is membership whole, as a member's
+/// `unset` is, and any `Put` the person changed makes it a person's write. An automatic writer's
+/// batch is automatic whatever it holds ([`Authoring::class_from`]) and is asked for every byte
+/// it signs; only the `Put`s it changed are held to its size limit.
+pub(super) fn edit_batch(minted: &[Record], notes: &PutNotes, author: Author<'_>) -> Authoring {
+    Authoring::classed(minted, |record| match record.kind() {
+        Kind::Put if notes.carried.contains(record.id()) => None,
+        Kind::Put if notes.admits.contains(record.id()) => Some(Class::Membership),
+        Kind::Put => Some(Class::of_author(author)),
+        kind => Class::of_kind(kind),
+    })
+}
+
+/// A `[everyone]` write of `entry` that waits for a key, as the class stops weigh it where its
+/// command queues it: the least wire bytes its `Put` takes once signed
+/// ([`crate::membership_log::entries::most_bytes::put_least`]) and its class from `author`. The
+/// pass that signs it later asks nothing ([`sign_everyone`]).
+pub(super) fn waiting_put(entry: &Entry, author: Author<'_>) -> (usize, Class) {
+    let bytes = crate::membership_log::entries::most_bytes::put_least(
+        &EpochAudience::Everyone,
+        entry.name.len(),
+        entry.anchor.as_deref().map(str::len),
+        crate::membership_log::entries::stored_value_len(&entry.name, entry.value.as_slice()),
+    );
+    (bytes, Class::of_author(author))
 }
 
 /// What an edit started from, for [`draft_document_diff_until`].
@@ -3342,6 +3459,7 @@ pub(super) fn draft_document_diff(
         base,
         None,
         None,
+        Some(Ask::Edit(Author::Person)),
     )?
     .map(|(drafted, _)| drafted))
 }
@@ -3372,9 +3490,24 @@ pub(super) fn draft_document_diff(
 /// ([`view_waiting`]; `None` for an edit made from no such view): the edit is drafted against it
 /// ([`everyone_edit`]), and the log and the writes that wait now are read under one observation of
 /// this Mac's state, so a vault pass signs none of them between the two reads (one-mesh W3).
+///
+/// `ask` says who makes the edit and whether it lets a Mac in ([`Ask`]): the batch is drafted,
+/// then weighed by class against the log's fill beside what waits on this Mac for a key
+/// ([`waiting_bytes_here`]), and from an automatic writer against its size limit and its seat's
+/// day budget too, before anything is held or sent ([`edit_batch`], [`Log::authored_ask`]); the
+/// `[everyone]` writes a person's edit leaves waiting for a key are weighed there too, with
+/// every write that waits beside them ([`waiting_put`]), and an automatic writer's edit that
+/// would leave one waiting is refused. `None` is an edit no class stop is asked of: a mirror of
+/// a version already published.
+///
+/// # Errors
+/// Beside the draft's own, [`crate::ErrorKind::MembershipCapacity`] where the batch, or what it
+/// leaves waiting, would pass its class's stop or an automatic writer's budget, and an error of
+/// no such kind where an automatic writer's write would wait for a key: nothing is signed into
+/// the log and nothing waits.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the existing document-diff inputs plus the view and a caller-owned deadline"
+    reason = "the existing document-diff inputs plus the view, a caller-owned deadline and the ask"
 )]
 pub(super) fn draft_document_diff_until(
     paths: &Paths,
@@ -3386,6 +3519,7 @@ pub(super) fn draft_document_diff_until(
     base: Base<'_>,
     view: Option<&Waiting>,
     deadline: Option<std::time::Instant>,
+    ask: Option<Ask<'_>>,
 ) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
     super::publication_current(deadline)?;
     let observation = match view {
@@ -3417,6 +3551,7 @@ pub(super) fn draft_document_diff_until(
         (view, held.as_ref()),
         deadline,
         true,
+        ask,
     );
     drop(observation);
     drafted
@@ -3503,6 +3638,9 @@ pub(super) fn draft_document_diff_in_store(
         (None, Ok(&Waiting::default())),
         deadline,
         false,
+        // A removal's batch is membership whole, and its room was reserved before its `Remove`
+        // (`super::remove::RemovalFill`): the classes ask nothing more of it.
+        None,
     )?
     .map(|(drafted, _)| drafted))
 }
@@ -3511,10 +3649,14 @@ pub(super) fn draft_document_diff_in_store(
 /// `waits_for_key` and a `Remove` here waits for its rotation. `(view, held)` is the view the
 /// edit was made from and this Mac's waiting writes as read with `store`, or why they did not
 /// read: an edit that writes `[everyone]` refuses then, since any write it makes may be over one
-/// of them.
+/// of them. `ask` is who makes the edit and whether it lets a Mac in ([`Ask`]), whose batch the
+/// class stops weigh, with the `[everyone]` writes it leaves waiting ([`waiting_put`]); `None`
+/// for a removal's batch, membership whole, and for a mirror, which carries a version already
+/// published. An edit that signs a `Remove` itself (a `code-only` line) is membership whole too:
+/// its fill reserved its room.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the document-diff inputs, the view and what waits, a deadline and the wait switch"
+    reason = "the document-diff inputs, the view and what waits, a deadline, the wait switch and the ask"
 )]
 fn draft_document_diff_with(
     paths: &Paths,
@@ -3525,6 +3667,7 @@ fn draft_document_diff_with(
     (view, held): (Option<&Waiting>, Result<&Waiting, &Error>),
     deadline: Option<std::time::Instant>,
     waits_for_key: bool,
+    ask: Option<Ask<'_>>,
 ) -> crate::Result<Option<(Drafted, EveryoneWrites)>> {
     super::publication_current(deadline)?;
     let Some(mut log) = store.log().cloned() else {
@@ -3536,6 +3679,9 @@ fn draft_document_diff_with(
     };
     let authored_ms = aterm_time::unix_millis().unwrap_or(0);
     let mut minted = Vec::new();
+    // What the class stops are told of the `Put`s this draft signs ([`PutNotes`]).
+    let mut notes = PutNotes::of(ask);
+    let author = ask.map(Ask::author);
     let code_only: BTreeSet<String> = doc.code_only().into_iter().collect();
     if !code_only.is_empty() {
         let to_remove =
@@ -3582,6 +3728,7 @@ fn draft_document_diff_with(
             })?;
         }
     }
+    let removes = !minted.is_empty();
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(None);
     };
@@ -3806,6 +3953,20 @@ fn draft_document_diff_with(
         resolving(aud, name)
             || (*aud == Audience::Everyone && !settle_uncarried() && carried.resolves(name))
     };
+    // An automatic writer's write never waits: a vault pass signs what waits as the person's it
+    // was queued for, with no class or budget asked, and nothing in the waiting file says who
+    // queued it. The writer is refused here, signing and queueing nothing, and offers its write
+    // again once the key is here.
+    if waits
+        && let Some(Author::Automatic(writer)) = author
+        && edit.writes.authoring_over(held, Author::Person).bytes > 0
+    {
+        return Err(Error::new(format!(
+            "{writer}'s write was not signed: a removal's new key is not here yet, and an \
+             automatic writer's write does not wait for one; it can be offered again once the key \
+             is here"
+        )));
+    }
     let everyone = if waits {
         EveryoneWrites {
             waits: !edit.writes.is_empty(),
@@ -3908,6 +4069,12 @@ fn draft_document_diff_with(
                         &puts,
                         &dropped,
                         &mut minted,
+                        // An entry the text holds as the edit's base did is sealed again whole.
+                        (&mut notes, &|entry| {
+                            before
+                                .get(&entry.name)
+                                .is_some_and(|was| same_entry(was, entry))
+                        }),
                     )?;
                 }
                 continue;
@@ -4040,6 +4207,7 @@ fn draft_document_diff_with(
                                 .draft_put(&actor, authored_ms, epoch_id, &epoch_key, entry)?
                                 .sign(writer_seed, incarnation)?;
                             let _ = log.insert(put_rec.clone())?;
+                            notes.put(&put_rec, name, false);
                             minted.push(put_rec);
                         }
                     }
@@ -4091,18 +4259,19 @@ fn draft_document_diff_with(
                             let _ = log.insert(del_rec.clone())?;
                             minted.push(del_rec);
                         }
-                        let unchanged = !whole
-                            && !resolve
+                        let unchanged = !resolve
                             && log_map
                                 .and_then(|m| m.get(name))
                                 .is_some_and(|cur| same_entry(cur, entry));
-                        if unchanged {
+                        if unchanged && !whole {
                             continue;
                         }
                         let put_rec = log
                             .draft_put(&actor, authored_ms, epoch_id, &epoch_key, entry)?
                             .sign(writer_seed, incarnation)?;
                         let _ = log.insert(put_rec.clone())?;
+                        // Unchanged, it is here only for the fresh epoch: sealed again whole.
+                        notes.put(&put_rec, name, unchanged);
                         minted.push(put_rec);
                     }
                 }
@@ -4203,6 +4372,12 @@ fn draft_document_diff_with(
                             })
                         })
                     });
+                // The control as the log holds it already: put again, it is sealed again for the
+                // Macs the epoch reaches, no change of the person's ([`PutNotes::carried`]).
+                let control_carried = opened
+                    .commons_control
+                    .as_ref()
+                    .is_some_and(|held| held.as_slice() == ctrl_entry.value.as_slice());
                 let reusable_commons = if !departed_wrapped
                     && let Some(ep_id) = sealing_epoch(
                         &log,
@@ -4253,6 +4428,7 @@ fn draft_document_diff_with(
                             )?
                             .sign(writer_seed, incarnation)?;
                         let _ = log.insert(put_rec.clone())?;
+                        notes.put(&put_rec, &ctrl_entry.name, control_carried);
                         minted.push(put_rec);
                     }
                 } else if commons_descriptor_due(
@@ -4298,6 +4474,7 @@ fn draft_document_diff_with(
                         )?
                         .sign(writer_seed, incarnation)?;
                     let _ = log.insert(put_rec.clone())?;
+                    notes.put(&put_rec, &ctrl_entry.name, control_carried);
                     minted.push(put_rec);
                 }
             }
@@ -4381,6 +4558,7 @@ fn draft_document_diff_with(
                     &[],
                     &names,
                     &mut minted,
+                    (&mut notes, &|_| false),
                 )?;
             }
         }
@@ -4421,11 +4599,49 @@ fn draft_document_diff_with(
                 &[],
                 &dropped,
                 &mut minted,
+                (&mut notes, &|_| false),
             )?;
         }
         Ok(())
     })?;
 
+    // The whole batch is drafted: weigh it by class before any of it is held, kept or sent. A
+    // person's edit that only mints or wraps keys changes who opens an audience (a Mac the
+    // person listed is let in): membership, as an admission is. An automatic writer's batch is
+    // automatic whatever it holds.
+    if let Some(author) = author.filter(|_| !removes) {
+        // What waits here for a key and this edit leaves as it is: a pass signs it later and
+        // asks nothing, so the batch is weighed beside it. A name the edit writes now or leaves
+        // waiting itself (`everyone.pending`) is weighed as this edit's.
+        let waiting = waiting_bytes_here(paths, identity, &|name| everyone.pending.contains(name));
+        log.authored_ask(
+            &edit_batch(&minted, &notes, author)
+                .keys_as(Class::Membership)
+                .beside_waiting(waiting),
+            author,
+            &actor,
+            authored_ms,
+        )?;
+        // The `[everyone]` writes this edit leaves waiting for the new key are asked here too,
+        // over the log with the batch in it: the vault pass that signs them once the key is here
+        // asks nothing, so the refusal is this command's answer and never a pass's. The writes
+        // it queues are weighed beside every other one that waits with them: those it keeps,
+        // asked when they were queued, and those the other names wait with.
+        if everyone.waits {
+            let queued = everyone.pending.authoring_over(held, author);
+            let kept = everyone
+                .pending
+                .authoring_over(&Waiting::default(), author)
+                .bytes
+                .saturating_sub(queued.bytes);
+            log.author_ask(
+                &queued.beside_waiting(kept.saturating_add(waiting)),
+                author,
+                &actor,
+                authored_ms,
+            )?;
+        }
+    }
     Ok(Some((Drafted::from_log(minted, &log), everyone)))
 }
 
@@ -5083,6 +5299,8 @@ pub fn publish_local_node_key(
             minted.push(rec);
             Ok(())
         })?;
+        // A `Node` is membership (`Class::of_kind`): it binds the key peers admit this Mac by,
+        // the last step of its admission, and runs to the log's bound, which `insert` held it to.
         Ok((minted, ()))
     })?
     else {
@@ -5099,8 +5317,10 @@ pub fn publish_local_node_key(
 /// No configured log or no active local signer means there is nothing to publish.
 ///
 /// # Errors
-/// The number is held by another Mac, the signing key is unavailable, or the record store
-/// cannot be read or updated. A rejected label is never published as a successful rename.
+/// The number is held by another Mac, the signing key is unavailable, the record store cannot
+/// be read or updated, or the log is past the stop of a person's write
+/// ([`crate::ErrorKind::MembershipCapacity`]). A rejected label is never published as a
+/// successful rename.
 pub fn publish_local_chosen_name(
     paths: &Paths,
     number: aterm_types::machine_name::Number,
@@ -5139,15 +5359,23 @@ pub fn publish_local_chosen_name(
         if let Some(why) = super::lab_labels(paths)?.held.get(&number) {
             return Err(Error::new(format!("{number} is {}", why.phrase())));
         }
+        let authored_ms = aterm_time::unix_millis().unwrap_or(0);
         let rec = device.with_seed(|seed| {
-            log.draft(
-                &actor,
-                aterm_time::unix_millis().unwrap_or(0),
-                Body::Name { name: name.clone() },
-            )
-            .sign(seed, incarnation)
+            log.draft(&actor, authored_ms, Body::Name { name: name.clone() })
+                .sign(seed, incarnation)
         })?;
         log.insert(rec.clone())?;
+        // A `Name` is a person's write: it stops where the log keeps room for removals.
+        log.authored_ask(
+            &edit_batch(
+                std::slice::from_ref(&rec),
+                &PutNotes::default(),
+                Author::Person,
+            ),
+            Author::Person,
+            &actor,
+            authored_ms,
+        )?;
         if log.membership_ref().chosen_label(&actor) != Some(name.as_str()) {
             return Err(Error::new(format!(
                 "{name} is held or concurrently chosen by another Mac"
@@ -8026,7 +8254,12 @@ const fn heal_hold_keeps_ranks() -> bool {
 
 /// How many of `gaps` heal `Wrap`s, signed by `actor`, the log takes while it keeps free, in
 /// records and in bytes, what the re-keys a held `Remove` made due owe ([`owed_rekeys`]; one-mesh
-/// proofs P6, F4).
+/// proofs P6, F4). No class stop is asked of a heal
+/// ([`crate::membership_log::budgets::author_stop`]): it is what an admitted Mac reads by, what
+/// gives a removal's rotation its carrier and what makes concurrent heads twins a writer seals
+/// under, so held at a class stop it would leave an admission or a removal, each membership,
+/// half done, and a person's write waiting on a key no pass hands out. Its `Wrap`s are a few
+/// hundred bytes each and one per gap.
 fn heal_room(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,

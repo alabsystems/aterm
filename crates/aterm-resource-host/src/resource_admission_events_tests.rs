@@ -6,7 +6,7 @@ use std::io::Write as _;
 fn pair() -> (Events, CtlStream) {
     let (host, client) = CtlStream::pair().unwrap();
     let binding = Binding {
-        session: "s-0000000000000000000a".into(),
+        session: "t000000000a".into(),
         attempt: [7; 16],
     };
     (Events::new(host.into(), binding).unwrap(), client)

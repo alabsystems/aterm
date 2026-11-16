@@ -101,15 +101,15 @@ fn detached_facts_survive_body_eviction_without_accepting_changed_bytes_or_keys(
     // cache. Later successes must populate the independently retained facts.
     for wire in &wires {
         cache.verify_identified(&signer, wire).unwrap();
-        wire.remember_non_cut(crypto::payload_key_identity(&[41; 32]));
+        wire.remember_non_control(crypto::payload_key_identity(&[41; 32]));
     }
     drop(wires);
     for _ in 0..3 {
         for bytes in &bytes {
             let wire = Identified::new_with(bytes.clone(), Some(&facts));
             cache.verify_identified(&signer, &wire).unwrap();
-            assert!(wire.verified_non_cut(&crypto::payload_key_identity(&[41; 32])));
-            assert!(!wire.verified_non_cut(&crypto::payload_key_identity(&[42; 32])));
+            assert!(wire.verified_non_control(&crypto::payload_key_identity(&[41; 32])));
+            assert!(!wire.verified_non_control(&crypto::payload_key_identity(&[42; 32])));
         }
     }
     assert_eq!(cache.checks.load(Ordering::Relaxed), 3);
@@ -125,7 +125,7 @@ fn detached_facts_survive_body_eviction_without_accepting_changed_bytes_or_keys(
     let mut changed = bytes[0].clone();
     changed[0] ^= 1;
     let wire = Identified::new_with(changed, Some(&facts));
-    assert!(!wire.verified_non_cut(&crypto::payload_key_identity(&[41; 32])));
+    assert!(!wire.verified_non_control(&crypto::payload_key_identity(&[41; 32])));
     assert!(cache.verify_identified(&signer, &wire).is_err());
     assert_eq!(cache.checks.load(Ordering::Relaxed), 5);
     assert!(

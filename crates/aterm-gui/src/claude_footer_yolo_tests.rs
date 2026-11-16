@@ -262,7 +262,8 @@ fn the_mode_row_reads_claudes_jobs_and_the_grid_keeps_claudes_row() {
         );
         assert_eq!(cells.len(), vendor.len());
         assert_eq!(grid_text(&app, session, 23).trim_end(), drawn.trim_end());
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+        let ws = &mut **field_guard_ws;
         assert!(undo(&mut ws.claude_footer_undo, &mut ws.input_scratch));
         assert_eq!(ws.input_scratch.cells[row], vendor, "{mode:?}: undone");
         assert_eq!(
@@ -654,7 +655,8 @@ fn the_wrapped_effort_hint_is_blanked_with_the_row() {
     assert_eq!(glass_of(&app, wid, mode).trim_end(), "1 shell");
     assert_eq!(glass_of(&app, wid, under).trim(), "", "the hint is blanked");
     assert!(grid_text(&app, session, 23).contains("/effort"), "the grid");
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+    let ws = &mut **field_guard_ws;
     assert!(ws.claude_footer_undo.swallows(23, 100), "nothing under it");
     assert!(undo(&mut ws.claude_footer_undo, &mut ws.input_scratch));
     assert_eq!(

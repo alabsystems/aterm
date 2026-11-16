@@ -82,13 +82,8 @@ fn native_raise_selects_only_the_isolated_session() {
     assert_eq!(sole_session("123 0 T000000A12B alive"), None);
     assert_eq!(
         sole_session("123 0 s-0123456789abcdef0123 - alive"),
-        Some("s-0123456789abcdef0123"),
-        "a tab opened before the update keeps its earlier ID"
-    );
-    assert_eq!(
-        sole_session("123 0 s-0123456789abcdef0123 alive\n123 1 t000000c34d alive"),
         None,
-        "one tab of each form is two tabs"
+        "the isolated instance mints its own tab, and a legacy ID is no tab ID"
     );
     assert_eq!(sole_session("123 0 s-000000a12b alive"), None);
 }

@@ -12,6 +12,8 @@ use crate::input::InputEvent;
 pub(crate) struct HumanInputStamp {
     at: AtomicU64,
     count: AtomicU64,
+    /// Person gestures being routed: their sequence may be visible before their bytes are queued.
+    delivering: AtomicU64,
     /// THE NUMBER OF THE LAST GESTURE THAT REACHED THE PROGRAM,
     /// `0` for none: a key that encodes to
     /// bytes, text, a paste, a wheel the program is sent (a report or
@@ -80,6 +82,7 @@ impl Default for HumanInputStamp {
         Self {
             at: AtomicU64::new(0),
             count: AtomicU64::new(0),
+            delivering: AtomicU64::new(0),
             reached: AtomicU64::new(0),
             burst: AtomicU64::new(0),
             at_continuous: AtomicU64::new(0),
@@ -174,7 +177,27 @@ pub(crate) struct PersonProbe {
     pub(crate) plain_enter: bool,
 }
 
+/// Keeps a person gesture ahead of concurrent fenced writes until its dispatch has queued it.
+pub(crate) struct PersonDelivery<'a>(&'a HumanInputStamp);
+
+impl Drop for PersonDelivery<'_> {
+    fn drop(&mut self) {
+        self.0.delivering.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl HumanInputStamp {
+    /// Begin before publishing the gesture's sequence; keep this guard through its dispatch.
+    pub(crate) fn begin_delivery(&self) -> PersonDelivery<'_> {
+        self.delivering.fetch_add(1, Ordering::AcqRel);
+        PersonDelivery(self)
+    }
+
+    /// A counted gesture may still be on its way to the ordered writer.
+    pub(crate) fn delivery_pending(&self) -> bool {
+        self.delivering.load(Ordering::Acquire) != 0
+    }
+
     /// [`Self::note_reaching`] for a gesture that reached the program: whether it opens a burst.
     #[cfg(test)]
     pub(crate) fn note(&self, now_us: u64, gesture: Gesture) -> bool {

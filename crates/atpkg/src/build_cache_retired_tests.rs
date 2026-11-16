@@ -1949,7 +1949,7 @@ fn a_linked_worktree_holding_another_worktree_stays() {
     std::fs::create_dir_all(g.checkout().join(".git/info")).expect("git's info folder");
     std::fs::write(g.checkout().join(".git/info/exclude"), "/.claude/\n").expect("written");
     let wt = linked(&g, "done");
-    let y = wt.join(".claude/worktrees/y");
+    let y = wt.join(".claude").join("worktrees").join("y");
     git(
         &g.checkout(),
         &["worktree", "add", "-q", "--detach", &for_git(&y), "HEAD"],
@@ -2453,7 +2453,7 @@ fn a_submodule_folder_holding_files_but_no_git_keeps_its_worktree() {
 fn a_month_old(path: &Path) {
     let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
     std::fs::File::options()
-        .read(true)
+        .write(true)
         .open(path)
         .and_then(|f| f.set_modified(month))
         .expect("its old time");

@@ -122,18 +122,24 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
 /// Mode repair cannot remove an extended ACL. Judge the retained descriptor
 /// before reads or writes; the caller supplies its own mode and owner policy.
 fn check_access_list(file: &File, directory: bool) -> io::Result<()> {
+    match access_list_refusal(file, directory)? {
+        Some(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, why)),
+        None => Ok(()),
+    }
+}
+
+/// [`check_access_list`]'s verdict apart from a failure to reach one: why the file's access
+/// list refuses it, `None` where it does not. An error is the look failing (an `fstat`, or the
+/// list's read, which can fail for memory), not a verdict on the file: looked at again, it may
+/// pass.
+fn access_list_refusal(file: &File, directory: bool) -> io::Result<Option<&'static str>> {
     let verdict = if directory {
         astream_sys::owner_private_dir(file)?
     } else {
         astream_sys::owner_private(file)?
     };
-    if matches!(verdict, Err(astream_sys::NotPrivate::Acl)) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "an access list (ACL) grants access beyond the file mode",
-        ));
-    }
-    Ok(())
+    Ok(matches!(verdict, Err(astream_sys::NotPrivate::Acl))
+        .then_some("an access list (ACL) grants access beyond the file mode"))
 }
 
 /// Who may own and what mode a read admits.
@@ -202,11 +208,11 @@ fn read_opened(
 #[derive(Debug)]
 pub enum Unread {
     /// The file is one the reader refuses as it is: a symlink, not a regular file, owned by
-    /// another user, a mode that lets other users write it, or past the bound. Read again, it is
-    /// refused again until it changes.
+    /// another user, a mode or an access list that lets other users write it, or past the bound.
+    /// Read again, it is refused again until it changes.
     Refused(Error),
-    /// The open, `fstat` or read failed (too many open files, an I/O error): read again, it may
-    /// read.
+    /// The open, `fstat`, look at its access list or read failed (too many open files, memory,
+    /// an I/O error): read again, it may read.
     Failed(Error),
 }
 
@@ -308,7 +314,18 @@ fn open_admitted(
             }
         }
         Admit::Private | Admit::Owned => {
-            check_access_list(&file, false).map_err(|e| refused(e.to_string()))?;
+            // A look at the access list that failed is a failed read, which a later look may
+            // pass, never a refusal of the file as it is.
+            let list = access_list_refusal(&file, false);
+            #[cfg(test)]
+            let list = if take_access_list_failure(path) {
+                Err(io::Error::from(io::ErrorKind::OutOfMemory))
+            } else {
+                list
+            };
+            if let Some(why) = list.map_err(failed)? {
+                return Err(refused(why.to_owned()));
+            }
             if meta.uid() != euid() {
                 return Err(refused(format!(
                     "owned by uid {}, not this user",
@@ -1717,6 +1734,37 @@ pub(crate) fn fail_reads_after(path: &Path, skip: usize, times: usize) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(path.to_path_buf(), (skip, times));
+}
+
+/// Looks at the access list of each path this test process fails ([`fail_access_lists`]).
+#[cfg(test)]
+static ACCESS_LIST_FAILS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Fail the next `times` looks at the access list of the file at `path` as a look that ran out
+/// of memory would, after the file opened.
+#[cfg(test)]
+pub(crate) fn fail_access_lists(path: &Path, times: usize) {
+    ACCESS_LIST_FAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), times);
+}
+
+/// Whether this look at the access list of `path` is one [`fail_access_lists`] fails, counting
+/// it.
+#[cfg(test)]
+fn take_access_list_failure(path: &Path) -> bool {
+    let mut fails = ACCESS_LIST_FAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match fails.get_mut(path) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Whether this read of `path` is one [`fail_reads_after`] fails, counting it.

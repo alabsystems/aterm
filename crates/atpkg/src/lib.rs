@@ -87,6 +87,7 @@ pub mod gc;
 /// fetching lazily (agh's answer, asked hermetically).
 pub mod git_lazy_fetch;
 pub mod harness;
+pub mod harness_record;
 pub mod hooks;
 /// Which program and build a running image is, from the executable the kernel mapped.
 pub mod image;

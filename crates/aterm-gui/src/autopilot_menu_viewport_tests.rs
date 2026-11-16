@@ -313,17 +313,29 @@ fn an_unpainted_or_previously_hidden_action_cannot_be_chosen() {
         assert_eq!(selected(&app, wid), "fact-menu/account/account-settings");
     }
     // A new Name row cannot keep the old positions, so this refresh really compacts
-    // geometry instead of retaining the intentional gaps of removed choices.
-    let fresh = crate::fact_menu::rows(
+    // geometry instead of retaining the intentional gaps of removed choices. The Account card
+    // draws no tab name (`fact_menu_account::head_rows`), so the head is the one a renamed
+    // pane's other cards draw (`header_rows`). Without it every fresh row took a place of the old
+    // card's on Windows, whose card says in notes that signing in by hand is unavailable there
+    // (ATERM-KI-1105-14), and the refresh kept the 87 rows' geometry.
+    let title = "Replacement pool";
+    let mut fresh = crate::fact_menu::rows(
         Fact::Account,
         &crate::fact_menu::FactMenuFacts {
-            title: "Replacement pool".into(),
-            name: Some("A renamed pane whose title needs its own menu row".into()),
+            title: title.into(),
             cli: Some(aterm_agent::harness::accounts::Cli::Kimi),
             accounts: Vec::new(),
             ..Default::default()
         },
     );
+    let head = crate::autopilot_menu::header_rows(
+        title,
+        Some("A renamed pane whose title needs its own menu row"),
+        crate::autopilot_menu::MAX_CONTENT,
+    );
+    assert!(head.iter().any(|row| matches!(row, MenuRow::Name(_))));
+    assert_eq!(fresh[0], MenuRow::Header(title.into()));
+    fresh.splice(..1, head);
     let menu = app.autopilot_menu.as_mut().unwrap();
     assert!(menu.refresh_rows(fresh, "Replacement pool".into()));
     frame(&mut app, wid);

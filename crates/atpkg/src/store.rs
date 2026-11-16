@@ -1242,6 +1242,11 @@ pub const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
     crate::peers::UNIT_SUFFIX,
     #[cfg(unix)]
     crate::local_harness::SUFFIX,
+    crate::harness_record::RECORD_SUFFIX,
+    crate::harness_record::PKG_SUFFIX,
+    crate::harness_record::PKG_SIG_SUFFIX,
+    crate::harness_record::ROSTER_SUFFIX,
+    crate::harness_record::ROSTER_SIG_SUFFIX,
 ];
 
 /// Record `tools`, the admitted names of the build's signed `exposes`, beside `build_dir`
@@ -1849,15 +1854,20 @@ fn discard_build_after_sdk_admission(build_dir: &Path, memo: Memo) {
 }
 
 /// Take a refused build that [`discard_build`] left in place (its first-exec hold keeps the tree)
-/// out of every reader's reach: its ready marker and its tree-root record go, so completeness
+/// out of every reader's reach: its ready marker, its tree-root record and its harness record go, so completeness
 /// checks, discovery and a lock's standing read it absent and gc's partial arm sweeps the tree
 /// once the hold lets go. Best effort: a marker that cannot be removed leaves the build as it was.
 pub(crate) fn unmark_refused(build_dir: &Path) {
     if clear_build_ready(build_dir).is_err() {
         return;
     }
-    if let Some(record) = sidecar_path(build_dir, crate::trust_lock::TREE_ROOT_SUFFIX) {
-        let _ = std::fs::remove_file(record);
+    for suffix in [
+        crate::trust_lock::TREE_ROOT_SUFFIX,
+        crate::harness_record::RECORD_SUFFIX,
+    ] {
+        if let Some(record) = sidecar_path(build_dir, suffix) {
+            let _ = std::fs::remove_file(record);
+        }
     }
 }
 

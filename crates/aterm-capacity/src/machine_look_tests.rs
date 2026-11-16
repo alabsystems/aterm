@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::floor::{GIB, Knobs};
-use aterm_sysprobe::{LinkCounters, LinkKind};
+use aterm_sysprobe::{LinkByteCounter, LinkCounters, LinkKind};
 
 /// The wall clock of a test machine's first look, Unix ms.
 const T0: u64 = 1_800_000_000_000;
@@ -105,6 +105,7 @@ fn link(name: &str, index: u32, rate_bps: Option<u64>, rx: u64, tx: u64) -> Link
         up: true,
         loopback: false,
         physical: Some(true),
+        byte_counter: LinkByteCounter::Cumulative64,
         rate_bps,
         rx: LinkCounters {
             bytes: rx,
@@ -134,8 +135,8 @@ fn full_look() -> Look {
             compressed: Some(3 * GIB),
             app: 18 * GIB,
             shared: Some(GIB),
-            swap_used: 0,
-            swap_total: 2 * GIB,
+            swap_used: Some(0),
+            swap_total: Some(2 * GIB),
             pressure: Some(MemoryLevel::Normal),
             ..aterm_sysprobe::MemoryDetail::default()
         }),
@@ -311,6 +312,42 @@ fn an_unread_figure_is_none_and_never_zero() {
     assert_eq!(look.limits, Limits::UNREAD);
 }
 
+#[test]
+fn unknown_swap_stays_absent_while_measured_zero_survives_the_machine_and_fleet_views() {
+    for (used, total) in [
+        (None, None),
+        (Some(0), Some(0)),
+        (None, Some(2 * GIB)),
+        (Some(3 * MIB / 2), Some(5 * MIB / 2)),
+    ] {
+        let mut machine = Machine::unread();
+        machine.look = full_look();
+        let memory = machine.look.memory.as_mut().unwrap();
+        memory.swap_used = used;
+        memory.swap_total = total;
+        let look = machine.look_at(&mut Keeper::new(), 0.0);
+        assert_eq!(
+            (look.swap_used_mb, look.swap_total_mb),
+            (used.map(mib), total.map(mib))
+        );
+        assert_eq!(
+            look.mem_total_mb,
+            Some(48 * 1024),
+            "other memory figures remain measured"
+        );
+
+        let fleet = crate::host_vitals::HostVitals::of(&machine.look, None);
+        assert_eq!(fleet.swap_used_bytes, used);
+        let wire = aterm_json::to_value(&fleet).unwrap();
+        assert_eq!(wire.get("swap_used_bytes").and_then(|v| v.as_u64()), used);
+        assert_eq!(
+            wire.get("swap_used_bytes").is_none(),
+            used.is_none(),
+            "unknown swap is omitted, and an observed zero remains on the wire"
+        );
+    }
+}
+
 /// LAW: CPU busy and the network rates are means between two looks, so a machine's first look
 /// has none, and the look a minute later has the mean over that minute. CONTROLS: the counters
 /// since boot read 10% busy and megabytes moved at the first look, so a rate made from one look
@@ -481,7 +518,7 @@ fn a_rate_with_no_look_45_to_90_seconds_back_is_unread() {
     );
 }
 
-/// LAW: a counter that went back (a reset, a wrap, an interface made again) or a core count
+/// LAW: a cumulative 64-bit counter that went back, or a core count
 /// that changed gives no rate: not a zero and not the wrapped difference. Each rate fails by
 /// itself, and the window stands while the other formed. CONTROL: the same counters going
 /// forward give both.
@@ -789,6 +826,168 @@ fn the_network_pair_is_the_fastest_links_and_never_passes_its_rate_by_summing_li
         a_minute(None, Some(links(2, true))),
         (Some(10_000_000), None, None, None),
         "the links were not read a minute ago"
+    );
+}
+
+/// Routing residues can cross zero in a short, capacity-bounded window. The same raw
+/// values are not a valid delta after an interface replacement, source change or reset.
+#[test]
+fn network_rates_preserve_modulo_source_and_interface_identity() {
+    const MODULUS: u64 = 1 << 32;
+    let mut before = link(
+        "en0",
+        8,
+        Some(100_000_000),
+        MODULUS - 1_024_000,
+        MODULUS - 2_048_000,
+    );
+    before.byte_counter = LinkByteCounter::DarwinModulo32;
+    before.rx.packets = 1000;
+    before.tx.packets = 2000;
+    let mut now = before.clone();
+    now.rx.bytes = 2_048_000;
+    now.tx.bytes = 1_024_000;
+    now.rx.packets += 3000;
+    now.tx.packets += 3000;
+    let read = |before: &LinkReading, now: &LinkReading, seconds| {
+        let retained = [LinkBytes {
+            name: before.name.clone(),
+            sample: link_byte_sample(before),
+        }];
+        let net = Net::of(
+            Some(&[now]),
+            Some((&retained, Duration::from_secs(seconds))),
+        );
+        (net.link_kbps, net.rx_kbps, net.tx_kbps, net.other_kbps)
+    };
+    assert_eq!(
+        read(&before, &now, 1),
+        (Some(100_000), Some(24_576), Some(24_576), Some(0))
+    );
+    assert_eq!(
+        read(&before, &now, 60),
+        (Some(100_000), Some(409), Some(409), Some(0))
+    );
+
+    let unread = (Some(100_000), None, None, Some(0));
+    let mut changed = now.clone();
+    changed.index += 1;
+    assert_eq!(
+        read(&before, &changed, 1),
+        unread,
+        "the same name on another interface is no baseline"
+    );
+    changed = now.clone();
+    changed.byte_counter = LinkByteCounter::Cumulative64;
+    assert_eq!(
+        read(&before, &changed, 1),
+        unread,
+        "counter sources must agree"
+    );
+    changed = now.clone();
+    changed.rx.packets = before.rx.packets - 1;
+    assert_eq!(
+        read(&before, &changed, 1),
+        unread,
+        "a packet reset is not a byte wrap"
+    );
+    changed = now.clone();
+    changed.rate_bps = Some(10_000_000);
+    assert_eq!(
+        read(&before, &changed, 1),
+        (Some(10_000), None, None, Some(0)),
+        "a changed capacity does not establish the past window's bound"
+    );
+
+    before.byte_counter = LinkByteCounter::Cumulative64;
+    before.rx.bytes = 70 * GIB;
+    before.tx.bytes = 80 * GIB;
+    now = before.clone();
+    now.rx.bytes += 3_072_000;
+    now.tx.bytes += 3_072_000;
+    assert_eq!(
+        read(&before, &now, 1),
+        (Some(100_000), Some(24_576), Some(24_576), Some(0)),
+        "ordinary full-width cumulative counters retain their real totals"
+    );
+}
+
+/// A small forward residue on a fast link cannot identify how many 4 GiB wraps occurred
+/// during the keeper's 45–90 second window. Capacity remains known while use stays unknown.
+#[test]
+fn long_network_looks_do_not_present_a_forward_modulo_residue_as_measured_traffic() {
+    for gap in [45, 60, 90] {
+        let mut m = Machine::unread();
+        let mut before = link("en0", 8, Some(10_000_000_000), 1_024_000, 2_048_000);
+        before.byte_counter = LinkByteCounter::DarwinModulo32;
+        before.rx.packets = 1000;
+        before.tx.packets = 2000;
+        m.links = Some(vec![before.clone()]);
+        let mut keeper = Keeper::new();
+        m.look_at(&mut keeper, 0.0);
+        before.rx.bytes += 1_024_000;
+        before.tx.bytes += 1_024_000;
+        before.rx.packets += 1000;
+        before.tx.packets += 1000;
+        m.links = Some(vec![before]);
+        let look = m.look_at(&mut keeper, gap as f64);
+        assert_eq!(look.rate_win_ms, Some(gap * 1000));
+        assert_eq!(
+            (
+                look.net_link_kbps,
+                look.net_rx_kbps,
+                look.net_tx_kbps,
+                look.net_other_kbps
+            ),
+            (Some(10_000_000), None, None, Some(0)),
+            "{gap} seconds permit multiple wraps even though both residues increased"
+        );
+    }
+}
+
+/// A moving link without a byte bound makes only its own share unavailable. An idle
+/// interface with unchanged packets and bytes does not erase another link's measured use.
+#[test]
+fn unknown_modulo_traffic_does_not_become_zero_in_network_capacity_totals() {
+    let mut main_before = link("en0", 8, Some(10_000_000_000), 70 * GIB, 80 * GIB);
+    main_before.rx.packets = 1000;
+    main_before.tx.packets = 2000;
+    let mut main_now = main_before.clone();
+    main_now.rx.bytes += 7_500_000;
+    main_now.tx.bytes += 750_000;
+    let mut other_before = link("en1", 9, None, 1_024_000, 2_048_000);
+    other_before.byte_counter = LinkByteCounter::DarwinModulo32;
+    other_before.rx.packets = 500;
+    other_before.tx.packets = 600;
+    let mut other_now = other_before.clone();
+    let retained = [
+        LinkBytes {
+            name: main_before.name.clone(),
+            sample: link_byte_sample(&main_before),
+        },
+        LinkBytes {
+            name: other_before.name.clone(),
+            sample: link_byte_sample(&other_before),
+        },
+    ];
+    let read = |main: &LinkReading, other: &LinkReading| {
+        let net = Net::of(
+            Some(&[main, other]),
+            Some((&retained, Duration::from_secs(60))),
+        );
+        (net.rx_kbps, net.tx_kbps, net.other_kbps)
+    };
+    assert_eq!(
+        read(&main_now, &other_now),
+        (Some(1000), Some(100), Some(0)),
+        "unchanged unused interface"
+    );
+    other_now.rx.bytes += 1024;
+    other_now.rx.packets += 1;
+    assert_eq!(
+        read(&main_now, &other_now),
+        (Some(1000), Some(100), None),
+        "moving bytes with no capacity have no proven wrap count"
     );
 }
 

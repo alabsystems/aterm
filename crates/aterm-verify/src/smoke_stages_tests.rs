@@ -6,6 +6,18 @@ use crate::EnvSnapshot;
 use crate::scope::Scope;
 
 #[test]
+fn debug_and_release_aos_contracts_are_distinct() {
+    let attach = "OK aos attached=true code=shipped revision=1 ";
+    let detach = "OK aos attached=false";
+    let no_publication = "ERR no published plan is live in the front window (a repair, an attach or a detach since its publication drops its bundle)";
+    assert!(aos_debug_verdict(attach, detach, no_publication).is_ok());
+    assert!(aos_debug_verdict(attach, detach, AOS_BUNDLE_REFUSAL).is_err());
+    assert!(aos_release_verdict(attach, detach, AOS_BUNDLE_REFUSAL).is_ok());
+    assert!(aos_release_verdict(attach, detach, no_publication).is_err());
+    assert!(aos_debug_verdict(attach, detach, "OK bundle=published").is_err());
+}
+
+#[test]
 fn required_initial_present_waits_for_a_scheduled_frame() {
     let clock = std::cell::Cell::new(Duration::from_secs(16));
     let mut polls = 0;

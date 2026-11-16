@@ -2965,7 +2965,9 @@ fn new_window(
 pub fn local_of(ls: &str, sid: &str) -> Option<String> {
     ls.lines().find_map(|l| {
         let f: Vec<&str> = l.split_whitespace().collect();
-        let at = f.iter().position(|t| aterm_types::tab_id::is_tab_id(t))?;
+        let at = f
+            .iter()
+            .position(|t| aterm_types::control_verbs::is_minted_sid(t))?;
         let local = f[..at].last()?;
         (f[at] == sid && local.bytes().all(|b| b.is_ascii_digit())).then(|| (*local).to_string())
     })

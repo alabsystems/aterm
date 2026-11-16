@@ -12,6 +12,7 @@ fn record(pid: u32, start_ms: u64, need: Need, held: Option<u32>) -> Record {
         accounting: crate::Accounting::Holder,
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/ck".to_owned(),
         need,

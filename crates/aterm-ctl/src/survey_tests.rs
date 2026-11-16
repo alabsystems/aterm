@@ -144,12 +144,12 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
     let fleet = parse_args(&parts(&["survey", "--fleet", "--timeout", "2.5"])).unwrap();
     assert!(fleet.fleet && fleet.host.is_none());
     assert_eq!(fleet.within, Duration::from_millis(2500));
-    let host = parse_args(&parts(&["survey", "--host", "m7", "--sid", "s-2"])).unwrap();
+    let host = parse_args(&parts(&["survey", "--host", "m7", "--sid", "t2xxxxxxxxx"])).unwrap();
     assert_eq!(host.host.as_deref(), Some("m7"));
     assert_eq!(host.within, FLEET_WITHIN);
-    let all = parse_args(&parts(&["survey", "--json", "--sid", "@s-1"])).unwrap();
+    let all = parse_args(&parts(&["survey", "--json", "--sid", "@t1xxxxxxxxx"])).unwrap();
     assert!(all.json);
-    assert_eq!(all.sid.as_deref(), Some("s-1"));
+    assert_eq!(all.sid.as_deref(), Some("t1xxxxxxxxx"));
     let budget = parse_args(&parts(&["survey", "--fleet", "--budget", "500"])).unwrap();
     assert_eq!(budget.budget, 500);
     for bad in [
@@ -169,9 +169,9 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
         &["survey", "--timeout", "3"],
         &["survey", "--host", "m7", "--budget", "10"],
         &["survey", "--json", "--budget", "500"],
-        &["survey", "--sid", "s-1", "--budget", "500"],
+        &["survey", "--sid", "t1xxxxxxxxx", "--budget", "500"],
         &["survey", "--brief", "--json"],
-        &["survey", "--brief", "--sid", "s-1"],
+        &["survey", "--brief", "--sid", "t1xxxxxxxxx"],
         &["survey", "--brief", "--fleet"],
         &["survey", "--brief", "--host", "m7"],
     ] {
@@ -1232,8 +1232,8 @@ fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
                 "instance pid=77065 host={host} version={version} sessions=3 level=content \
                  at_ms=1{cut}"
             ),
-            row("s-1", "busy"),
-            row("s-2", "prompt"),
+            row("t1xxxxxxxxx", "busy"),
+            row("t2xxxxxxxxx", "prompt"),
         ];
         let reply = HostReply {
             reason: None,
@@ -2494,24 +2494,24 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
             ("agent", "busy"),
         ]),
         wire_row(&[
-            ("sid", "s-1 (you)"),
+            ("sid", "t1xxxxxxxxx (you)"),
             ("program", "zsh (you)"),
             ("agent", "-"),
         ]),
         wire_row(&[
-            ("sid", "s-2"),
+            ("sid", "t2xxxxxxxxx"),
             ("program", "claude"),
             ("agent", "idle (you)"),
             ("task", "done x=1"),
         ]),
         wire_row(&[
-            ("sid", "s-3"),
+            ("sid", "t3xxxxxxxxx"),
             ("program", "claude"),
             ("agent", "busy"),
             ("doing", "mcp__docs__batch"),
         ]),
         wire_row(&[
-            ("sid", "s-4"),
+            ("sid", "t4xxxxxxxxx"),
             ("program", "zsh"),
             ("program_kind", "shell"),
             ("agent", "-"),
@@ -2529,7 +2529,7 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
         node: None,
         answer: parse_reply(&lines),
     };
-    let peer = render_text(&[from(true)], DEFAULT_BUDGET, Some("s-1"));
+    let peer = render_text(&[from(true)], DEFAULT_BUDGET, Some("t1xxxxxxxxx"));
     assert_eq!(
         peer.lines().filter(|l| l.starts_with("== ")).count(),
         1,
@@ -2541,12 +2541,15 @@ fn a_peer_row_cannot_forge_a_header_or_the_you_mark() {
         peer.contains("\n? running ?") || peer.contains("\n? ? idle"),
         "{peer}"
     );
-    assert!(peer.contains("\ns-2 claude ? task=?/0"), "{peer}");
+    assert!(peer.contains("\nt2xxxxxxxxx claude ? task=?/0"), "{peer}");
     assert!(
-        peer.contains("\ns-3 claude busy mcp__docs__batch"),
+        peer.contains("\nt3xxxxxxxxx claude busy mcp__docs__batch"),
         "{peer}"
     );
-    assert!(peer.contains("\ns-4 running run_tests.sh"), "{peer}");
+    assert!(
+        peer.contains("\nt4xxxxxxxxx running run_tests.sh"),
+        "{peer}"
+    );
     let here = render_text(&[from(false)], DEFAULT_BUDGET, None);
     assert!(
         here.contains("\n== fleet owner-mac pid 1 claude busy"),
@@ -2840,12 +2843,12 @@ fn survey_error_row_carries_reason() {
 #[test]
 fn a_sid_not_found_here_names_the_fleet() {
     let here = [reply(1, vec![shell(1)])];
-    let alone = sid_not_found(&here, "s-77", false);
+    let alone = sid_not_found(&here, "t77xxxxxxxx", false);
     assert!(
         alone.contains("--fleet --sid <s>, or --host <h> --sid <s>"),
         "{alone}"
     );
-    assert!(!sid_not_found(&here, "s-77", true).contains("--fleet"));
+    assert!(!sid_not_found(&here, "t77xxxxxxxx", true).contains("--fleet"));
 }
 
 #[test]
@@ -3483,6 +3486,218 @@ fn an_instances_home_and_checkouts_print_under_its_header() {
     assert!(!text.contains(&format!("r{CHECKOUTS_SHOWN:02}")), "{text}");
 }
 
+/// AN INSTANCE'S HOME SAYS ITS FULLEST STORE: where a Mac's header names the store of aterm's
+/// nearest the bound it refuses writes at, the block says it on a line after the build output,
+/// at content (under the home) and at facts (under the home volume) alike: a fixed word and a
+/// share, no path. A header that says none (an older aterm, or `-`), one key alone, or a name
+/// that is no fixed word shows no line, never `0%`; `--json` carries the keys as sent.
+/// NEGATIVE CONTROL: with the line left out, a Mac whose vault log holds 83 % of its bound
+/// reads in `aterm ctl survey` like one at 3 %; with the name shown as sent, a peer's
+/// `store_worst=a@b.example` is printed under its home.
+#[test]
+fn an_instances_home_says_its_fullest_store_and_its_share() {
+    const DISK: &str = " home_free_mb=831488 home_total_mb=1906688 home_build_mb=86016 \
+         home_build_at_ms=1793122800000 home_build_partial=0";
+    const STORE: &str = " store_worst=vault-records store_worst_pct=83";
+    let text_of = |head: &str| {
+        let reply = accounts_reply(true, head, Vec::new());
+        let text = render_full(std::slice::from_ref(&reply), None);
+        assert_line_caps(&text);
+        text
+    };
+    let content = format!(" home=/Users//a{DISK} repos=0 repos_at=1793129820000 repos_cut=0{STORE}");
+    let text = text_of(&content);
+    assert!(
+        text.contains(
+            "\n  build output 84 GiB, sized 2h ago\n  fullest store vault-records, 83% of its \
+             bound\n"
+        ),
+        "{text}"
+    );
+    let json = render_json(&[accounts_reply(true, &content, Vec::new())]);
+    for said in [
+        "\"store_worst\":\"vault-records\"",
+        "\"store_worst_pct\":\"83\"",
+    ] {
+        assert!(json.contains(said), "{said}: {json}");
+    }
+    // At facts, which says no home: under the home volume, after the build output.
+    let text = text_of(&format!("{DISK}{STORE}"));
+    assert!(
+        text.contains(
+            "\n  home volume 812 GiB free of 1862 GiB\n  build output 84 GiB, sized 2h ago\n  \
+             fullest store vault-records, 83% of its bound\n"
+        ),
+        "{text}"
+    );
+    // With no build output said, the store's line still shows.
+    let text = text_of(&format!(
+        " home_free_mb=831488 home_total_mb=1906688{STORE}"
+    ));
+    assert!(
+        text.contains(
+            "\n  home volume 812 GiB free of 1862 GiB\n  fullest store vault-records, 83% of \
+             its bound\n"
+        ),
+        "{text}"
+    );
+    // Past its bound, and a measured 0.
+    for (pct, said) in [("104", "104% of its bound"), ("0", "0% of its bound")] {
+        let text = text_of(&format!(
+            "{DISK} store_worst=journal-outbox store_worst_pct={pct}"
+        ));
+        assert!(
+            text.contains(&format!("\n  fullest store journal-outbox, {said}\n")),
+            "{text}"
+        );
+    }
+    // None said, one key alone, an unreadable share, or a name that is no fixed word: no line.
+    for tokens in [
+        "",
+        " store_worst=- store_worst_pct=-",
+        " store_worst=vault-records",
+        " store_worst_pct=83",
+        " store_worst=vault-records store_worst_pct=x",
+        " store_worst=a@b.example store_worst_pct=83",
+        " store_worst=Vault%20Records store_worst_pct=83",
+        " store_worst=- store_worst_pct=83",
+    ] {
+        let text = text_of(&format!("{DISK}{tokens}"));
+        assert!(!text.contains("fullest store"), "{tokens}: {text}");
+        assert!(text.contains("\n  build output 84 GiB"), "{tokens}: {text}");
+    }
+}
+
+/// AN INSTANCE'S HOME SAYS ITS VOLUME'S SIZE AND ITS BUILD OUTPUT: the home line says the free
+/// space of the size (`812 GiB free of 1862 GiB`), and the next line the build output the Mac's
+/// disk watch last sized there with that sizing's age on the Mac's own clock (`  build output 84
+/// GiB, sized 2h ago`, `at least` where the sizing was cut short, `0s` for a sizing that clock
+/// puts after its answer), whether or not its checkouts were read; `--json` carries the figures
+/// as the header said them. A reply at facts, which says no home, still shows the volume's
+/// figures and the build output, with no path. An older aterm, a `-` and a key the line cannot
+/// read say nothing of a figure, never 0: the home line keeps its free space alone and no build
+/// line shows.
+/// NEGATIVE CONTROL: with the build line left out of the return before the checkouts, a home
+/// whose checkouts are not read yet shows no build output; with the partial word ignored, a cut
+/// sizing reads `84 GiB`; with a missing total read as 0, the older home line says `of 0 MiB`;
+/// with no line where the reply says no home, the facts reply shows neither line.
+#[test]
+fn an_instances_home_says_its_volumes_size_and_its_build_output() {
+    const DISK: &str = " home_free_mb=831488 home_total_mb=1906688 home_build_mb=86016 \
+         home_build_at_ms=1793122800000 home_build_partial=0";
+    let text_of = |head: &str| {
+        let reply = accounts_reply(true, head, Vec::new());
+        let text = render_full(std::slice::from_ref(&reply), None);
+        assert_line_caps(&text);
+        text
+    };
+
+    let read = format!(" home=/Users//a{DISK} repos=0 repos_at=1793129820000 repos_cut=0");
+    let text = text_of(&read);
+    assert!(
+        text.contains(
+            "\n  home /Users//a, 812 GiB free of 1862 GiB \u{b7} checkouts read 3m ago: none\n  \
+             build output 84 GiB, sized 2h ago\n"
+        ),
+        "{text}"
+    );
+    let json = render_json(&[accounts_reply(true, &read, Vec::new())]);
+    for said in [
+        "\"home_free_mb\":\"831488\"",
+        "\"home_total_mb\":\"1906688\"",
+        "\"home_build_mb\":\"86016\"",
+        "\"home_build_at_ms\":\"1793122800000\"",
+        "\"home_build_partial\":\"0\"",
+    ] {
+        assert!(json.contains(said), "{said}: {json}");
+    }
+
+    // Checkouts not read yet: the build output still shows.
+    let text = text_of(&format!(
+        " home=/Users//a{DISK} repos=- repos_at=- repos_cut=-"
+    ));
+    assert!(
+        text.contains(
+            "\n  home /Users//a, 812 GiB free of 1862 GiB \u{b7} checkouts not read yet\n  build \
+             output 84 GiB, sized 2h ago\n"
+        ),
+        "{text}"
+    );
+
+    // A sizing cut short is a floor; a small one is in MiB.
+    let cut = DISK
+        .replacen("home_build_partial=0", "home_build_partial=1", 1)
+        .replacen("home_build_mb=86016", "home_build_mb=512", 1);
+    let text = text_of(&format!(
+        " home=/Users//a{cut} repos=0 repos_at=1 repos_cut=0"
+    ));
+    assert!(
+        text.contains("\n  build output at least 512 MiB, sized 2h ago\n"),
+        "{text}"
+    );
+
+    // A sizing its Mac's clock puts after its answer (a clock set back since): 0s old, never
+    // negative.
+    let later = DISK.replacen(
+        "home_build_at_ms=1793122800000",
+        "home_build_at_ms=1793130005000",
+        1,
+    );
+    let text = text_of(&format!(
+        " home=/Users//a{later} repos=0 repos_at=1 repos_cut=0"
+    ));
+    assert!(
+        text.contains("\n  build output 84 GiB, sized 0s ago\n"),
+        "{text}"
+    );
+
+    // At facts the reply says no home: the volume's figures and the build output, no path.
+    let text = text_of(DISK);
+    assert!(
+        text.contains(
+            "\n  home volume 812 GiB free of 1862 GiB\n  build output 84 GiB, sized 2h ago\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("/Users/"), "{text}");
+    let text = text_of(" home_free_mb=- home_total_mb=1906688");
+    assert!(text.contains("\n  home volume of 1862 GiB\n"), "{text}");
+    assert!(!text.contains("build output"), "{text}");
+    let text = text_of(" home_free_mb=- home_total_mb=-");
+    assert!(!text.contains("\n  home"), "nothing said, no line: {text}");
+
+    // The size alone, where the free space is unknown.
+    let sized = DISK.replacen("home_free_mb=831488", "home_free_mb=-", 1);
+    let text = text_of(&format!(
+        " home=/Users//a{sized} repos=0 repos_at=1 repos_cut=0"
+    ));
+    assert!(
+        text.contains("\n  home /Users//a, on a 1862 GiB volume \u{b7} checkouts read"),
+        "{text}"
+    );
+
+    // Unknown, never 0: an older aterm, dashes, and keys the line cannot read.
+    for disk in [
+        " home_free_mb=831488".to_owned(),
+        " home_free_mb=831488 home_total_mb=- home_build_mb=- home_build_at_ms=- \
+         home_build_partial=-"
+            .to_owned(),
+        DISK.replacen("home_build_partial=0", "home_build_partial=2", 1)
+            .replacen("home_total_mb=1906688", "home_total_mb=0", 1),
+        DISK.replacen("home_build_at_ms=1793122800000", "home_build_at_ms=0", 1)
+            .replacen("home_total_mb=1906688", "home_total_mb=x", 1),
+    ] {
+        let text = text_of(&format!(
+            " home=/Users//a{disk} repos=0 repos_at=1 repos_cut=0"
+        ));
+        assert!(
+            text.contains("\n  home /Users//a, 812 GiB free \u{b7} checkouts read"),
+            "{disk}: {text}"
+        );
+        assert!(!text.contains("build output"), "{disk}: {text}");
+    }
+}
+
 /// AN ACCOUNT IS SHOWN BY ITS ADDRESS (owner, 2026-11-09: "show the email"): a row that sends
 /// `email=` is named by it, one from an older member that sends none by its label, and a session's
 /// `account` is shown whole on every view. A peer's name that is neither a plain word nor an
@@ -3515,7 +3730,7 @@ fn a_peers_account_is_shown_by_its_address_and_a_control_byte_never() {
     ];
     let mut reply = accounts_reply(true, " accounts=3", rows);
     let session = Fields::of(
-        "session local=1 sid=s-a1 state=running program=claude program_kind=agent agent=busy \
+        "session local=1 sid=ta1xxxxxxxx state=running program=claude program_kind=agent agent=busy \
          account=abcdef%40example.com",
     );
     reply
@@ -3540,7 +3755,7 @@ fn a_peers_account_is_shown_by_its_address_and_a_control_byte_never() {
         json.contains("\"account\":\"abcdef@example.com\""),
         "{json}"
     );
-    let sid = render_sid(&replies, "s-a1", None).expect("its session");
+    let sid = render_sid(&replies, "ta1xxxxxxxx", None).expect("its session");
     assert!(sid.contains("  account: abcdef@example.com\n"), "{sid}");
 }
 

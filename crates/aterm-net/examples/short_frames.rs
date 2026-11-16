@@ -9,7 +9,7 @@
 mod probe {
     use aterm_net::{
         fleet::{self, FleetOp, FleetScope, FleetSecret},
-        lan::{Connection, Listener, Scope},
+        lan::{Connection, RecheckedListener, Scope},
     };
     use std::{
         io::{self, Read, Write},
@@ -43,7 +43,7 @@ mod probe {
         stream.flush()
     }
 
-    fn serve(listener: &Listener, requested: Option<bool>) -> Result<bool, Error> {
+    fn serve(listener: &RecheckedListener, requested: Option<bool>) -> Result<bool, Error> {
         let until = Instant::now() + HANG;
         let accepted = loop {
             match listener.accept() {
@@ -133,7 +133,8 @@ mod probe {
         match arguments.as_slice() {
             [] => {
                 for (name, requested) in MODES {
-                    let listener = Listener::bind("127.0.0.1:0".parse()?, Scope::Loopback)?;
+                    let listener =
+                        RecheckedListener::bind("127.0.0.1:0".parse()?, Scope::Loopback)?;
                     let address = listener.local_addr()?;
                     let server = thread::spawn(move || serve(&listener, requested));
                     let received = measure(address, Scope::Loopback, name, requested)?;
@@ -144,7 +145,7 @@ mod probe {
                 }
             }
             [verb, address] if verb == "listen" => {
-                let listener = Listener::bind(address.parse()?, Scope::Lan)?;
+                let listener = RecheckedListener::bind(address.parse()?, Scope::Lan)?;
                 println!("listen={}", listener.local_addr()?);
                 io::stdout().flush()?;
                 for (name, requested) in MODES {

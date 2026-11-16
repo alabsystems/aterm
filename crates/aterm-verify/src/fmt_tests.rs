@@ -433,6 +433,91 @@ fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
     );
 }
 
+/// A CHANGE IS JUDGED BY THE FILES IT HOLDS UNLIKE ITS BASE: a file its base holds unformatted
+/// (a main pushed without the formatter) is no landing's red, while one the change wrote is.
+/// A changed `rustfmt.toml` widens the run to every file. NEGATIVE CONTROL: the whole-tree run
+/// names the base's file too.
+#[test]
+fn a_change_is_judged_by_its_own_files_and_its_base_by_the_whole_tree() {
+    let tools = real_tools();
+    if tools.trustfmt.is_none() {
+        aterm_uds::host::could_not_run(format!(
+            "{}, so this machine cannot show the check either way",
+            tools.missing_trustfmt_label()
+        ));
+    }
+    let untidy = "pub fn wrong(  ) ->usize{1}\n";
+    let t = tree(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"fx\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        ),
+        ("rustfmt.toml", "edition = \"2021\"\n"),
+        ("src/lib.rs", untidy),
+    ]);
+    let root = t.path().to_path_buf();
+    let scratch = t.path().join(".scratch");
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    git_in(
+        &root,
+        &[
+            &["init", "-q", "-b", "main"],
+            &["config", "user.name", "Andrew Yates"],
+            &["config", "user.email", "test@example.invalid"],
+            &["add", "Cargo.toml", "rustfmt.toml", "src"],
+            &["commit", "-q", "-m", "base"],
+        ],
+    );
+    std::fs::write(root.join("src/new.rs"), untidy).expect("write");
+    let reds = |scope: crate::Scope| {
+        let ctx = Ctx::new_with_tools(
+            root.clone(),
+            scope,
+            crate::EnvSnapshot::capture(),
+            scratch.clone(),
+            tools.clone(),
+        );
+        let mut r = Report::new("fmt");
+        run(&ctx, &mut r);
+        r.findings().into_iter().map(|f| f.id).collect::<Vec<_>>()
+    };
+    let change = || {
+        crate::Scope::Changed(crate::scope::Changed {
+            base: "main".into(),
+            crates: vec!["fx".into()],
+            any_lib: true,
+            seeds: vec!["fx".into()],
+            alone: vec![],
+        })
+    };
+    assert_eq!(
+        reds(change()),
+        ["src/new.rs"],
+        "the base's file is not the change's"
+    );
+    assert_eq!(
+        reds(crate::Scope::workspace()),
+        ["src/lib.rs", "src/new.rs"],
+        "the whole tree names the base's file too"
+    );
+    std::fs::write(
+        root.join("src/new.rs"),
+        "pub fn wrong() -> usize {\n    1\n}\n",
+    )
+    .expect("write");
+    assert!(reds(change()).is_empty(), "a formatted change is green");
+    std::fs::write(
+        root.join("rustfmt.toml"),
+        "edition = \"2021\"\nmax_width = 100\n",
+    )
+    .expect("write");
+    assert_eq!(
+        reds(change()),
+        ["src/lib.rs"],
+        "a changed rustfmt.toml judges every file"
+    );
+}
+
 #[test]
 fn an_edition_line_is_read_and_a_workspace_key_is_not() {
     assert_eq!(

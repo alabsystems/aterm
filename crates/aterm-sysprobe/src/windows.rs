@@ -455,7 +455,6 @@ pub fn memory_detail_of(
         limit: pages(perf.commit_limit),
         exact: true,
     };
-    let (swap_used, swap_total) = swap_pages.map_or((0, 0), |(u, t)| (pages(u), pages(t)));
     Some(MemoryDetail {
         total,
         available,
@@ -470,8 +469,8 @@ pub fn memory_detail_of(
         file_backed: cache,
         app: in_use - kernel,
         shared: None,
-        swap_used,
-        swap_total,
+        swap_used: swap_pages.map(|(used, _)| pages(used)),
+        swap_total: swap_pages.map(|(_, total)| pages(total)),
         pressure: commit_level(&commit, low_memory),
         commit: Some(commit),
         exact: false,

@@ -98,14 +98,29 @@ impl ExecSource {
         Some(source)
     }
 
+    /// The source a capture of `process` would give from its `args` and `cwd`
+    /// ([`Self::capture`]), with no kernel read and no exec generation: for a test that keeps
+    /// sources of processes it does not run as Codex, which need be no live ones. Of a process no
+    /// longer live, its [`Self::current`] is false, so [`Self::prepare_on`] answers
+    /// `exec-source-changed` once its handoff has run; what that handoff read and recorded is the
+    /// test's to judge.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn observed(process: Process, args: ProcArgs, cwd: PathBuf) -> Option<Self> {
+        Self::from_observations(process, args, cwd)
+    }
+
     /// Prepare through the existing account pool, including its fresh source and
     /// destination usage reads, machine claims and login generations. There is no
     /// shell command or shell dialect in this session's launch representation.
+    /// The handoff leaves what the session's `intent` asks
+    /// ([`crate::harness::codex_rotation::Ask`]): its source's wall, of the codex bucket or of the
+    /// limit the intent names, so no exec prepare drops the limit it was asked about.
     pub fn prepare(
         &self,
         seat: &crate::harness::accounts_pool::Seat<'_>,
         sid: &str,
-        expected_source: &crate::harness::codex_renewal::Identity,
+        intent: &crate::harness::codex_renewal::Intent,
         reader: &dyn crate::harness::codex_rotation::UsageReader,
         wait: std::time::Duration,
     ) -> Result<Option<crate::harness::codex_rotation::Proposal<ExecCommand>>, &'static str> {
@@ -113,7 +128,7 @@ impl ExecSource {
             return Err("exec-source-changed");
         }
         let program = std::str::from_utf8(&self.process.image.path).map_err(|_| "exec-program")?;
-        self.prepare_on(seat, sid, expected_source, reader, wait, Path::new(program))
+        self.prepare_on(seat, sid, intent, reader, wait, Path::new(program))
     }
 
     /// [`Self::prepare`], judging the Codex `program` this session execs.
@@ -121,7 +136,7 @@ impl ExecSource {
         &self,
         seat: &crate::harness::accounts_pool::Seat<'_>,
         sid: &str,
-        expected_source: &crate::harness::codex_renewal::Identity,
+        intent: &crate::harness::codex_renewal::Intent,
         reader: &dyn crate::harness::codex_rotation::UsageReader,
         wait: std::time::Duration,
         program: &Path,
@@ -140,20 +155,13 @@ impl ExecSource {
             mode: seat.mode_for(accounts::Cli::Codex),
             relaunch: (),
         };
-        let result = codex_rotation::prepare_exec(
-            seat,
-            &session,
-            program,
-            expected_source,
-            reader,
-            wait,
-            |row| {
+        let result =
+            codex_rotation::prepare_exec(seat, &session, program, intent, reader, wait, |row| {
                 let home = row.dir.as_ref().map(PathBuf::from).unwrap_or_else(|| {
                     seat.home.join(accounts::Cli::Codex.accounts().default_home)
                 });
                 self.command_for(&home.join("auth.json"))
-            },
-        );
+            });
         if !self.current() {
             return Err("exec-source-changed");
         }

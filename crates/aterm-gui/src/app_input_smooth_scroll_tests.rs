@@ -1785,7 +1785,7 @@ fn a_mixed_tab_s_scroll_motion_asks_for_frames_only_when_a_row_moves() {
             "PRECONDITION: a mixed tab"
         );
         let _ = app.prepare_layout_coordinate_space(wid, mixed);
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         if let Some(route) = route {
             ws.last_layout_coordinate_space
                 .as_mut()
@@ -1798,6 +1798,7 @@ fn a_mixed_tab_s_scroll_motion_asks_for_frames_only_when_a_row_moves() {
             ws.front_terminal().is_some(),
             "PRECONDITION: the terminal leaf has focus"
         );
+        drop(ws);
         let term = seed_history(&app, wid);
         (app, wid, term)
     };
@@ -1939,9 +1940,10 @@ fn a_mixed_tab_s_glide_step_that_cancels_an_output_repin_asks_for_its_frame() {
         "PRECONDITION: a mixed tab"
     );
     let _ = app.prepare_layout_coordinate_space(wid, route);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.focused = true;
     ws.frame_interval = Some(Duration::from_micros(8_333));
+    drop(ws);
     let term = seed_history(&app, wid);
     term_lock(&term).scroll_display(20);
     app.scroll_wheel_animated_at(wid, &term, -3, None, None, Instant::now());

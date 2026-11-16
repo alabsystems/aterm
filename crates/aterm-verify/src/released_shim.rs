@@ -274,26 +274,32 @@ mod mac {
         (parts.next().is_none() && version.2 == 0).then_some(version)
     }
 
-    /// Every fetched public release tag (`vMAJOR.MINOR.0`) no newer than the workspace version
-    /// `current` and reachable from `head`, by version, oldest first.
-    pub(super) fn public_releases(
+    /// One fetched public release tag (`vMAJOR.MINOR.0`).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct PublicTag {
+        /// Its version, `X.Y.0`, without the `v`.
+        pub(super) version: String,
+        /// Whether the candidate holds it: the commit it names is in `head`'s ancestry.
+        pub(super) held: bool,
+    }
+
+    /// The names of `root`'s `refs/tags/v*`, or of those merged into `merged` where it is given.
+    fn tag_names(
         root: &Path,
         env: &EnvSnapshot,
-        head: &str,
-        current: &str,
+        merged: Option<&str>,
     ) -> Result<Vec<String>, String> {
-        let current = release_version(current)
-            .ok_or_else(|| format!("workspace version {current:?} is not MAJOR.MINOR.0"))?;
         let mut cmd = crate::git_provider::command();
         for name in crate::changed::GIT_REDIRECTS {
             cmd.env_remove(name);
         }
-        cmd.current_dir(root).env("PATH", &env.path).args([
-            "for-each-ref",
-            &format!("--merged={head}"),
-            "--format=%(refname:strip=2)",
-            "refs/tags/v*",
-        ]);
+        cmd.current_dir(root)
+            .env("PATH", &env.path)
+            .arg("for-each-ref");
+        if let Some(head) = merged {
+            cmd.arg(format!("--merged={head}"));
+        }
+        cmd.args(["--format=%(refname:strip=2)", "refs/tags/v*"]);
         // A hang detector, as for the listing below.
         let out = io(aterm_uds::deadline::output_while_process_progressing(
             &mut cmd,
@@ -309,15 +315,60 @@ mod mac {
         }
         let listed = String::from_utf8(out.stdout)
             .map_err(|_| "git for-each-ref returned non-UTF-8 text".to_string())?;
-        let mut releases: Vec<_> = listed
-            .lines()
+        Ok(listed.lines().map(str::to_owned).collect())
+    }
+
+    /// Every public release tag (`vMAJOR.MINOR.0`) this clone has fetched, whether `head` holds
+    /// it or not, by version, oldest first.
+    pub(super) fn public_tags(
+        root: &Path,
+        env: &EnvSnapshot,
+        head: &str,
+    ) -> Result<Vec<PublicTag>, String> {
+        let held: std::collections::BTreeSet<String> =
+            tag_names(root, env, Some(head))?.into_iter().collect();
+        let mut tags: Vec<_> = tag_names(root, env, None)?
+            .into_iter()
             .filter_map(|tag| {
-                let version = release_version(tag)?;
-                (version <= current).then(|| (version, tag.trim_start_matches('v').to_owned()))
+                let key = release_version(&tag)?;
+                Some((
+                    key,
+                    PublicTag {
+                        version: tag.trim_start_matches('v').to_owned(),
+                        held: held.contains(&tag),
+                    },
+                ))
             })
             .collect();
-        releases.sort_unstable();
-        Ok(releases.into_iter().map(|(_, name)| name).collect())
+        tags.sort_unstable_by_key(|(key, _)| *key);
+        Ok(tags.into_iter().map(|(_, tag)| tag).collect())
+    }
+
+    /// The versions of `tags` the candidate holds and that are no newer than its workspace
+    /// version `current`: the releases it may be judged with, oldest first.
+    fn held_releases<'a>(tags: &'a [PublicTag], current: &str) -> Result<Vec<&'a str>, String> {
+        let current = release_version(current)
+            .ok_or_else(|| format!("workspace version {current:?} is not MAJOR.MINOR.0"))?;
+        Ok(tags
+            .iter()
+            .filter(|tag| tag.held && release_version(&tag.version).is_some_and(|v| v <= current))
+            .map(|tag| tag.version.as_str())
+            .collect())
+    }
+
+    /// Every fetched public release tag (`vMAJOR.MINOR.0`) no newer than the workspace version
+    /// `current` and reachable from `head`, by version, oldest first.
+    pub(super) fn public_releases(
+        root: &Path,
+        env: &EnvSnapshot,
+        head: &str,
+        current: &str,
+    ) -> Result<Vec<String>, String> {
+        let tags = public_tags(root, env, head)?;
+        Ok(held_releases(&tags, current)?
+            .into_iter()
+            .map(str::to_owned)
+            .collect())
     }
 
     fn git_files(root: &Path, env: &EnvSnapshot) -> Result<Vec<PathBuf>, String> {
@@ -395,8 +446,8 @@ mod mac {
     pub(super) struct Judging {
         /// Its version, `X.Y.0`.
         pub(super) version: String,
-        /// The newest fetched public tag's version, where the installed app is the release
-        /// immediately before it.
+        /// The newest public tag the candidate holds at or before its workspace version, where
+        /// the installed app is the release immediately before it.
         pub(super) newer: Option<String>,
     }
 
@@ -406,64 +457,124 @@ mod mac {
             match &self.newer {
                 None => format!("aterm {}", self.version),
                 Some(newer) => format!(
-                    "aterm {} (the release before v{newer}, the newest fetched public tag; \
-                     update the installed app to judge with v{newer})",
+                    "aterm {} (the release before v{newer}, the newest public tag the candidate \
+                     holds at or before its workspace version; update the installed app to \
+                     judge with v{newer})",
                     self.version
                 ),
             }
         }
     }
 
-    /// WHICH INSTALLED APP MAY JUDGE: a public release that is the newest fetched public tag in
-    /// the candidate's ancestry, or the one immediately before it. `installed` is the first line
-    /// of the app's `--version`, `releases` those tags' versions, oldest first
-    /// ([`public_releases`]). In the hours after a release is published a
-    /// Mac that has fetched its tag and not yet updated still judges, and its row says with
-    /// which release; a development build, a release two or more behind and one no fetched tag
-    /// names decide nothing.
+    /// WHICH INSTALLED APP MAY JUDGE: a public release that is the newest public tag the
+    /// candidate holds at or before its workspace version, or the one immediately before it.
+    /// `installed` is the first line of the app's `--version`, `workspace` the candidate's
+    /// workspace version, and `tags` every public tag this clone fetched, oldest first, each
+    /// with whether the candidate holds it ([`public_tags`]). In the hours after a release is
+    /// published a Mac that has fetched its tag and not yet updated still judges, and its row
+    /// says with which release. Nothing else judges, and each refusal names its own cause and
+    /// the act that clears it: a development build (install a public release); a release two or
+    /// more behind that newest tag (update the installed app); and a release those tags do not
+    /// place, by where its own tag stands: not fetched (fetch the tags), fetched outside the
+    /// candidate's ancestry (merge origin/main where origin/main holds that tag; or else install
+    /// the newest release the candidate holds at or before its workspace version, where it
+    /// holds one), or in that ancestry past the candidate's workspace version (take
+    /// origin/main's version back).
     ///
     /// # Errors
-    /// As above, each with its remedy.
-    pub(super) fn judging_release(installed: &str, releases: &[String]) -> Result<Judging, String> {
-        let Some(version) = public_version(installed) else {
+    /// As above, each with its remedy; and a workspace version that is not `MAJOR.MINOR.0`.
+    pub(super) fn judging_release(
+        installed: &str,
+        workspace: &str,
+        tags: &[PublicTag],
+    ) -> Result<Judging, String> {
+        let Some((version, key)) =
+            public_version(installed).and_then(|v| Some((v, release_version(v)?)))
+        else {
             return Err(format!(
                 "installed {installed:?} is a development or unreadable build, not a public \
                  release; install the newest public release before judging bootstrap compatibility"
             ));
         };
-        let Some((newest, older)) = releases.split_last() else {
-            return Err(
-                "no fetched public vMAJOR.MINOR.0 tag at or before the workspace version is in \
-                 the candidate; fetch public tags (`git fetch origin --tags`)"
-                    .into(),
-            );
-        };
-        if version == newest {
-            return Ok(Judging {
-                version: version.to_owned(),
-                newer: None,
-            });
+        let releases = held_releases(tags, workspace)?;
+        let newer: Vec<&str> = releases
+            .iter()
+            .copied()
+            .filter(|tag| release_version(tag).is_some_and(|v| v > key))
+            .collect();
+        let placed = releases.iter().any(|tag| release_version(tag) == Some(key));
+        match (placed, newer.as_slice()) {
+            (true, []) => {
+                return Ok(Judging {
+                    version: version.to_owned(),
+                    newer: None,
+                });
+            }
+            (true, [newest]) => {
+                return Ok(Judging {
+                    version: version.to_owned(),
+                    newer: Some((*newest).to_owned()),
+                });
+            }
+            (_, [_, .., newest]) => {
+                // Every fetched release after the installed one up to `newest` counts, held or
+                // not: a release whose tag sits off the candidate's ancestry (cut from a release
+                // branch) is still one the installed app is behind.
+                let top = release_version(newest);
+                let behind = tags
+                    .iter()
+                    .filter_map(|tag| release_version(&tag.version))
+                    .filter(|v| *v > key && Some(*v) <= top)
+                    .count();
+                return Err(format!(
+                    "installed aterm {version} is {behind} releases behind v{newest}, the newest \
+                     public tag the candidate holds at or before its workspace version \
+                     {workspace}; only that release or the one before it judges bootstrap \
+                     compatibility: update the installed app"
+                ));
+            }
+            (false, _) => {}
         }
-        if older.last().is_some_and(|previous| previous == version) {
-            return Ok(Judging {
-                version: version.to_owned(),
-                newer: Some(newest.clone()),
-            });
-        }
-        Err(match older.iter().rev().position(|tag| tag == version) {
-            Some(behind) => format!(
-                "installed aterm {version} is {} releases behind the newest fetched public tag \
-                 v{newest}; only that release or the one before it judges bootstrap \
-                 compatibility: update the installed app",
-                behind + 1
+        let holds = match releases.last() {
+            Some(newest) => format!(
+                "the newest public tag the candidate holds at or before its workspace version \
+                 {workspace} is v{newest}"
             ),
             None => format!(
-                "installed aterm {version} is no fetched public tag (the newest fetched is \
-                 v{newest}); fetch public tags (`git fetch origin --tags`), then ensure the \
-                 installed app is the newest public release or the one before it before judging \
-                 bootstrap compatibility"
+                "the candidate holds no public tag at or before its workspace version {workspace}"
             ),
-        })
+        };
+        Err(
+            match tags
+                .iter()
+                .find(|tag| release_version(&tag.version) == Some(key))
+            {
+                None => format!(
+                    "installed aterm {version}'s tag v{version} is not fetched in this clone \
+                     ({holds}); fetch public tags (`git fetch origin --tags`)"
+                ),
+                // Main does not hold every release tag (v0.40.0, for one, is beside it), so
+                // merging main clears this only where main holds the tag; installing the newest
+                // release the candidate holds at or before its workspace version clears it
+                // wherever the candidate holds one.
+                Some(tag) if !tag.held => {
+                    let install = releases.last().map_or_else(String::new, |newest| {
+                        format!(", or else install aterm {newest}, which the candidate holds")
+                    });
+                    format!(
+                        "installed aterm {version}'s tag v{version} is fetched but not in the \
+                         candidate's ancestry ({holds}); merge origin/main into the candidate \
+                         where origin/main holds v{version} (`git merge-base --is-ancestor \
+                         v{version} origin/main`){install}"
+                    )
+                }
+                Some(_) => format!(
+                    "installed aterm {version}'s tag v{version} is in the candidate's ancestry, \
+                     but the candidate's workspace version {workspace} is behind it, so the \
+                     candidate moved its version back; take origin/main's workspace version"
+                ),
+            },
+        )
     }
 
     /// A home and a call the shim places a build's intermediates by, named for the placement
@@ -537,6 +648,28 @@ mod mac {
         }
     }
 
+    /// Why the store gives no pair to judge with ([`Store::read`], [`Store::release`]).
+    #[derive(Debug)]
+    pub(super) enum Unready {
+        /// This machine has none to judge with: its package prefix holds no `targo` shim, or the
+        /// shim's `aterm.app` is not installed. The text says where the missing piece comes
+        /// from. The lanes and the tests of a pair end COULD NOT RUN on it.
+        Absent(String),
+        /// The pair is there and wrong: a shim that cannot be read or names no helper, a helper
+        /// outside an `aterm.app` (a loose binary, a dev bundle) or missing from its installed
+        /// app, or a development or unreadable app. A test of the pair fails on it; the lane
+        /// still decides nothing, since the installed pair is no fault of the candidate.
+        Defect(String),
+    }
+
+    impl std::fmt::Display for Unready {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Absent(why) | Self::Defect(why) => f.write_str(why),
+            }
+        }
+    }
+
     /// This machine's package store: its prefix, and the text of its `targo` shim.
     pub(super) struct Store {
         prefix: PathBuf,
@@ -544,47 +677,100 @@ mod mac {
     }
 
     impl Store {
-        pub(super) fn read(env: &EnvSnapshot) -> Result<Self, String> {
+        /// The store of the package prefix the caller configured
+        /// (`EnvSnapshot::test_package_prefix`, chosen before a test HOME replaces the caller's).
+        ///
+        /// # Errors
+        /// [`Unready::Absent`] where the prefix holds no `bin/targo`; [`Unready::Defect`] where
+        /// it is there and cannot be read.
+        pub(super) fn read(env: &EnvSnapshot) -> Result<Self, Unready> {
             let prefix = env.test_package_prefix.clone().unwrap_or_else(|| {
                 crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
             });
-            let text = io(fs::read_to_string(prefix.join("bin/targo")))?;
+            let shim = prefix.join("bin/targo");
+            let text = match fs::read_to_string(&shim) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Unready::Absent(format!(
+                        "no targo shim at {}: this package prefix holds no installed Trust \
+                         toolchain, which both bootstrap pairs build with; `aterm pkg install \
+                         trust`, run with the installed public aterm.app's `aterm`, writes it \
+                         there",
+                        shim.display()
+                    )));
+                }
+                Err(e) => return Err(Unready::Defect(format!("{}: {e}", shim.display()))),
+            };
             Ok(Self { prefix, text })
         }
 
         /// The first line of the installed app's `--version`, where the store's shim names a
         /// helper in the installed public release.
-        pub(super) fn release(&self) -> Result<String, String> {
-            let helper = atpkg::build_cache::registered::shim_helper(&self.text)
-                .ok_or("installed shim names no helper; repair the installed release")?;
-            // A candidate binary or dev bundle is not evidence about the installed public release.
+        ///
+        /// # Errors
+        /// [`Unready::Absent`] where the shim's `aterm.app` is not installed; [`Unready::Defect`]
+        /// for every other refusal ([`Unready`]).
+        pub(super) fn release(&self) -> Result<String, Unready> {
+            let shim = self.prefix.join("bin/targo");
+            let helper =
+                atpkg::build_cache::registered::shim_helper(&self.text).ok_or_else(|| {
+                    Unready::Defect(format!(
+                        "installed shim {} names no helper; repair the installed release",
+                        shim.display()
+                    ))
+                })?;
+            // A candidate binary or dev bundle is not evidence about the installed public
+            // release: the shim must name an `aterm.app`'s helper. Only that app being gone is an
+            // absence of this machine.
             let app = helper
                 .parent()
                 .and_then(Path::parent)
                 .and_then(Path::parent)
-                .ok_or("helper is outside an app")?;
-            if app.file_name().is_none_or(|n| n != "aterm.app") {
-                return Err(format!(
-                    "helper {} is not the installed aterm.app",
+                .filter(|app| app.file_name().is_some_and(|n| n == "aterm.app"))
+                .ok_or_else(|| {
+                    Unready::Defect(format!(
+                        "the installed shim {} hands its builds to {}, which is no aterm.app's \
+                         helper (a loose binary or a dev bundle); `aterm pkg install trust`, run \
+                         with the installed public aterm.app's `aterm`, rewrites the shim",
+                        shim.display(),
+                        helper.display()
+                    ))
+                })?;
+            if !app.exists() {
+                return Err(Unready::Absent(format!(
+                    "the installed shim {} hands its builds to {}, and no {} is installed: this \
+                     machine has no installed public aterm release to judge with; install it \
+                     (tools/install.sh), and `aterm pkg install trust` with its `aterm` rewrites \
+                     the shim",
+                    shim.display(),
+                    helper.display(),
+                    app.display()
+                )));
+            }
+            if !helper.is_file() {
+                return Err(Unready::Defect(format!(
+                    "the installed shim's helper {} is not in its app; repair the installed \
+                     release",
                     helper.display()
-                ));
+                )));
             }
             let mut version = aterm_uds::spawnfd::command(helper.with_file_name("aterm"));
             version.arg("--version");
             // A hang detector, as for the build: ended only once the app's output and its
             // process tree's CPU and I/O stay still for a minute.
-            let version = io(aterm_uds::deadline::output_while_process_progressing(
+            let version = aterm_uds::deadline::output_while_process_progressing(
                 &mut version,
                 Duration::from_secs(60),
                 "the installed app's aterm --version",
-            ))?;
+            )
+            .map_err(|e| Unready::Defect(format!("{}: {e}", app.display())))?;
             let said = String::from_utf8_lossy(&version.stdout);
             let line = said.lines().next().unwrap_or_default();
             if !version.status.success() || public_version(line).is_none() {
-                return Err(
-                    "helper belongs to a development or unreadable app, not a public release"
-                        .into(),
-                );
+                return Err(Unready::Defect(format!(
+                    "helper {} belongs to a development or unreadable app, not a public release",
+                    helper.display()
+                )));
             }
             Ok(line.to_owned())
         }
@@ -637,7 +823,16 @@ mod mac {
             label: String,
             placement: Placement,
         ) -> Result<Self, String> {
-            let scratch = io(aterm_tempfile::tempdir())?;
+            // The home is the build's TMPDIR too, and a toolchain that runs a job server binds
+            // its socket in a folder it makes there (Trust build 20882's `tjs-<16 hex>/s`). A
+            // socket's path holds 104 bytes on macOS and the account's temporary root takes
+            // most of them, so that toolchain would bind under `/tmp`, outside this rig's
+            // custody, where the sandbox refuses it. Under the short `/tmp` the socket fits
+            // in the home.
+            let scratch = io(aterm_tempfile::Builder::new()
+                .prefix("rs-")
+                .suffix(".noindex")
+                .tempdir_in("/tmp"))?;
             let home = io(scratch.path().canonicalize())?;
             // Model the account cache parent the placement names, without any managed cache
             // or marker: the shim places a build by the first of the cache's folders that
@@ -735,7 +930,10 @@ mod mac {
                 .env("CARGO_HOME", &self.cargo).env("RUSTUP_HOME", &self.rustup)
                 .env("TMPDIR", &self.home).env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .current_dir(&self.tree)
-                .args(["-p", "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write* (subpath (param \"SCRATCH\")) (subpath (param \"LEDGER\")) (literal \"/dev/null\"))", "-D"])
+                // No network, and no write outside the home and the capacity ledger. A socket
+                // whose path is in the home is the build's own (the toolchain's job server):
+                // it reaches nothing outside this rig.
+                .args(["-p", "(version 1)(allow default)(deny network*)(allow network-bind network-inbound network-outbound (subpath (param \"SCRATCH\")))(deny file-write*)(allow file-write* (subpath (param \"SCRATCH\")) (subpath (param \"LEDGER\")) (literal \"/dev/null\"))", "-D"])
                 .arg(format!("SCRATCH={}", self.home.display()))
                 .arg("-D").arg(format!("LEDGER={}", ledger.display()));
             Ok(cmd)
@@ -853,10 +1051,10 @@ mod mac {
             .and_then(aterm_toml::Value::as_str)
             .ok_or("workspace has no version")?;
         let head = crate::head_commit(root, &env.path).ok_or("candidate has no HEAD")?;
-        let releases = public_releases(root, env, &head, current)?;
-        let store = Store::read(env)?;
-        let installed = store.release()?;
-        let judging = judging_release(&installed, &releases)?;
+        let tags = public_tags(root, env, &head)?;
+        let store = Store::read(env).map_err(|unready| unready.to_string())?;
+        let installed = store.release().map_err(|unready| unready.to_string())?;
+        let judging = judging_release(&installed, current, &tags)?;
         let rig = Rig::new(
             env,
             &store,
@@ -879,7 +1077,7 @@ mod mac {
         placement: Placement,
         execution: exec::ExecEnv<'_>,
     ) -> Result<exec::MachineRun, String> {
-        let store = Store::read(env)?;
+        let store = Store::read(env).map_err(|unready| unready.to_string())?;
         let rig = Rig::new(
             env,
             &store,

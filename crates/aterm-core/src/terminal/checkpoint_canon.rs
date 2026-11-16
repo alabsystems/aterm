@@ -41,7 +41,7 @@ use crate::grid::{CellFlags, MAX_GRID_COLS, MAX_GRID_ROWS, PackedColor, VisibleC
 use crate::scrollback::{deserialize_lines_strict, max_linked_record_bytes};
 
 /// The version [`TerminalCheckpoint::canonical`] writes after its magic.
-pub const CHECKPOINT_CANON_VERSION: u32 = 4;
+pub const CHECKPOINT_CANON_VERSION: u32 = 5;
 
 /// The version [`TerminalConfig::canonical`] writes after its magic.
 pub const CONFIG_CANON_VERSION: u32 = 1;
@@ -1289,6 +1289,7 @@ fn enc_output(w: &mut W, o: &OutputStateRepr) {
         sgr_stack,
         saved_modes,
         program_state,
+        other_program_state,
     } = o;
     w.opt(*rep, |w, c| w.u32(u32::from(c)));
     w.opt(*underline_color, W::u32);
@@ -1325,6 +1326,7 @@ fn enc_output(w: &mut W, o: &OutputStateRepr) {
         w.bool(*set);
     }
     w.opt_str(program_state.as_deref());
+    w.opt_str(other_program_state.as_deref());
 }
 
 fn dec_output(d: &mut R<'_>) -> Result<OutputStateRepr, CanonFault> {
@@ -1363,6 +1365,7 @@ fn dec_output(d: &mut R<'_>) -> Result<OutputStateRepr, CanonFault> {
             })
         })?,
         program_state: d.opt_string(f)?,
+        other_program_state: d.opt_string(f)?,
     })
 }
 

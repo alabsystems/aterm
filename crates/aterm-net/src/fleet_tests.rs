@@ -197,12 +197,24 @@ fn node(byte: u8) -> NodeIdentity {
     NodeIdentity::from_seed(&format!("{byte:02x}").repeat(16), &[byte; 32]).unwrap()
 }
 
-/// Two database endpoints meet on the newest database protocol both offer: version 6 is this
-/// build (`atdb/6`), 5 is delta-frontier repair, 4 is 0.153 (`atdb/4`), 3 and 2 the builds
+/// Two database endpoints meet on the newest database protocol both offer: version 7 is this
+/// build (`atdb/7`, range-reconciled table inventories), 6 the duplex build before it, 5 is
+/// delta-frontier repair, 4 is 0.153 (`atdb/4`), 3 and 2 the builds
 /// before it, and 1 a fleet endpoint that offers no database protocol.
 #[test]
 fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() {
     for (listener_version, dialer_version, expected) in [
+        (7, 7, ALPN_DATABASE_RECONCILE),
+        (7, 6, ALPN_DATABASE_DUPLEX),
+        (6, 7, ALPN_DATABASE_DUPLEX),
+        (7, 5, ALPN_DATABASE_DELTA),
+        (5, 7, ALPN_DATABASE_DELTA),
+        (7, 4, ALPN_DATABASE_FRONTIER),
+        (4, 7, ALPN_DATABASE_FRONTIER),
+        (7, 2, ALPN_DATABASE_REPAIR),
+        (2, 7, ALPN_DATABASE_REPAIR),
+        (7, 1, ALPN_NODES),
+        (1, 7, ALPN_NODES),
         (6, 6, ALPN_DATABASE_DUPLEX),
         (6, 5, ALPN_DATABASE_DELTA),
         (5, 6, ALPN_DATABASE_DELTA),
@@ -243,7 +255,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
         let (listened, dialed) = over_loopback(
             move |tcp| {
                 let me = node(1);
-                let mut accepted = if listener_version == 6 {
+                let mut accepted = if listener_version == 7 {
                     server_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if listener_version >= 2 {
                     let mut config = (*database_server_config()).clone();
@@ -288,7 +300,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
             },
             move |tcp| {
                 let me = node(2);
-                let mut dialed = if dialer_version == 6 {
+                let mut dialed = if dialer_version == 7 {
                     client_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if dialer_version >= 2 {
                     let mut config = (*database_client_config()).clone();

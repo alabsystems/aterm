@@ -13,14 +13,36 @@ pub(super) struct Lab {
     service: VersionedConfigService,
 }
 
+/// A caller-owned native guard projected only to the Settings fixture payload.
+pub(super) struct SettingsMutation<'a>(crate::option_routing::ViewMutation<'a>);
+impl std::ops::Deref for SettingsMutation<'_> {
+    type Target = SettingsViewState;
+    fn deref(&self) -> &Self::Target {
+        let AppViewState::Settings(state) = &*self.0 else {
+            panic!("Settings view");
+        };
+        state
+    }
+}
+impl std::ops::DerefMut for SettingsMutation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let AppViewState::Settings(state) = &mut *self.0 else {
+            panic!("Settings view");
+        };
+        state
+    }
+}
+
 impl Lab {
     pub(super) fn new(source: &str) -> Self {
         let service = VersionedConfigService::new(source.to_string()).expect("valid fixture");
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view");
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("projects");
+        drop(route_native_guard);
         Self {
             runtime,
             instance,
@@ -36,11 +58,12 @@ impl Lab {
         state
     }
 
-    pub(super) fn state_mut(&mut self) -> &mut SettingsViewState {
-        let Some(AppViewState::Settings(state)) = self.runtime.view_state_mut(self.view) else {
-            panic!("Settings view");
-        };
-        state
+    pub(super) fn state_mut(&mut self) -> SettingsMutation<'_> {
+        SettingsMutation(
+            self.runtime
+                .view_state_mut(self.view)
+                .expect("Settings view"),
+        )
     }
 
     /// Dispatch `event` to the view.

@@ -37,6 +37,7 @@ fn a_prepared_account_is_not_a_next_sign_in_target() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
     let now = 1_800_000_000;

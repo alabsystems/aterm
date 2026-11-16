@@ -256,6 +256,11 @@ pub struct Tried {
     pub routes: String,
     /// Since when it has ended so (Unix seconds).
     pub since: i64,
+    /// A bot protection stopped a sign-in of the row's account and that stands on record
+    /// ([`crate::harness::accounts::check_stopped_at`]): nothing signs it in again with nobody at
+    /// this Mac, on any clock, until a person does (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md`
+    /// §3).
+    pub for_a_person: bool,
 }
 
 /// `label`'s failed automatic sign-in on record in `logins`, where one stands.
@@ -269,6 +274,7 @@ fn tried_of(
         outcome: attempt.outcome.as_str(),
         routes: attempt.routes.clone(),
         since: attempt.since,
+        for_a_person: crate::harness::accounts::check_stopped_at(raw, logins).is_some(),
     })
 }
 
@@ -535,9 +541,11 @@ pub struct CliAccounts {
     /// ([`crate::harness::accounts_sync::unaddressed_sign_in_task_at`]): its browser profile
     /// signed in once, or its sign-in approved.
     pub person_task: Option<crate::harness::accounts::SignInAction>,
-    /// When that row's newest sign-in on record met Cloudflare's bot check, which did not clear
-    /// ([`crate::harness::accounts_sync::bot_check_on_record_at`]).
-    pub bot_check_at: Option<i64>,
+    /// When a bot protection (Cloudflare's check, a block page) last stopped a sign-in of that
+    /// row's account, where that stands on record with no signed-in `accounts browser` window
+    /// since ([`crate::harness::accounts_sync::check_standing_at`]): nothing signs it in again with
+    /// nobody at this Mac, on any clock, until a person does.
+    pub check_at: Option<i64>,
     /// The switch that keeps aterm's own sign-ins off here, where one does
     /// ([`crate::harness::accounts_sync::sign_ins_off_for`]).
     pub off: Option<String>,
@@ -1844,8 +1852,7 @@ fn pool_for_with(
                         .is_some()
                 })
                 .map(|task| task.action);
-            out.bot_check_at =
-                crate::harness::accounts_sync::bot_check_on_record_at(store, raw, &logins);
+            out.check_at = crate::harness::accounts_sync::check_standing_at(store, raw, &logins);
         }
     }
     out.off = m

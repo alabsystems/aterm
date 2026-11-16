@@ -112,7 +112,7 @@ impl Directory {
             // Preserve discovery's historical access to those slots; a hidden
             // declaration for an unretained slot cannot authorize a fallback.
             for item in evidence {
-                if item.catalog_eligible || item.cutoff {
+                if item.catalog_eligible || item.is_table_control() {
                     continue;
                 }
                 let record = item

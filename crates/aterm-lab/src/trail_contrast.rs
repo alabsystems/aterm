@@ -43,7 +43,10 @@ usage: targo --unverified lab trail-contrast <png> [--find TEXT]... [--cells ROW
 The WCAG contrast of the cells of an aterm capture, as JSON: the grid (from the frame's own <stem>.<frame>.dims.txt or its <stem>.dims.txt sidecar, --dims,
 or --origin and --cell), the page colour (the grid's most common colour, or --page), one line per measured glyph cell (--find: each glyph of every occurrence of
 TEXT in the screen text; --cells and --row: cells by number; none: every glyph on screen), the caret (its ink against the
-closer of the page and the halo it sits in) with the --newest N (3) glyphs left of it, and diff_vs_clean, the pixels the effects changed outside the caret cell.
+closer of the page and the halo it sits in; a bar's or an underline's line also against the ground beside each of its pixels,
+ring_contrast, the worst slice across the line: a bar's pixel row, an underline's pixel column, each slice's lower median)
+with the --newest N (3) glyphs left of it, and diff_vs_clean, the pixels the effects changed outside the caret cell. A glyph under
+a bar or an underline is judged by its own strokes: the caret's line, where the clean twin draws it, is no part of it.
 With the frame's clean twin (<stem>.<frame>.clean.png, `image clean`) a glyph's ink and ground are the pixels that are
 glyph core and pure ground in the twin, read from the frame, so a halo or a ribbon under the glyph counts against it;
 clean_contrast is the same glyph with no effect drawn. local_contrast judges each solid ink pixel against the ground next
@@ -511,14 +514,16 @@ pub fn find_cells(lines: &[String], needle: &str) -> Vec<Glyph> {
     out
 }
 
-/// One cell's measure, as the report's fields.
+/// One cell's measure, as the report's fields. `skip`, a box of the cell's pixels left out of its
+/// glyph: a bar or an underline caret's own span where its clean twin draws it
+/// ([`thin_caret_span`]), so the letter under the caret is judged by its own strokes and the line
+/// by the caret's reading ([`thin_caret_reading`]'s ring).
 fn measure_cell(
     frame: &Image,
     clean: Option<&Image>,
     grid: &Grid,
-    row: i64,
-    col: i64,
-    span: i64,
+    (row, col, span): (i64, i64, i64),
+    skip: Option<PxBox>,
 ) -> Vec<(String, J)> {
     let kv = |pairs: Vec<(&str, J)>| -> Vec<(String, J)> {
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -544,7 +549,25 @@ fn measure_cell(
             ("contrast", J::Float(round_to(ratio, 2))),
         ]);
     };
-    let clean_px = clean.region(b);
+    let mut clean_px = clean.region(b);
+    let mut pixels = pixels;
+    if let Some(skip) = skip {
+        let bw = usize::try_from(b.x1 - b.x0).unwrap_or(0);
+        if bw > 0 && clean_px.len() == pixels.len() && clean_px.len() % bw == 0 {
+            let kept = |i: usize| {
+                let (x, y) = (b.x0 + (i % bw) as i64, b.y0 + (i / bw) as i64);
+                !skip.holds(x, y)
+            };
+            let keep = |px: &[Rgb]| -> Vec<Rgb> {
+                px.iter()
+                    .enumerate()
+                    .filter(|&(i, _)| kept(i))
+                    .map(|(_, &p)| p)
+                    .collect()
+            };
+            (clean_px, pixels) = (keep(&clean_px), keep(&pixels));
+        }
+    }
     let clean_ground = mode(clean_px.iter().copied()).unwrap_or_default();
     let extreme = most_contrasting(&clean_px, clean_ground).unwrap_or(clean_ground);
     if contrast(extreme, clean_ground) < BLANK_BELOW {
@@ -578,7 +601,8 @@ fn measure_cell(
         ),
         ("core_px", J::Int(core_px)),
     ]);
-    if let Some(l) = solid_ink_ratios(frame, clean, b, clean_ground, extreme).map(|r| Local::of(&r))
+    if let Some(l) =
+        solid_ink_ratios_but(frame, clean, b, clean_ground, extreme, skip).map(|r| Local::of(&r))
     {
         out.extend(kv(vec![
             ("local_contrast", J::Float(round_to(l.worst_row, 2))),
@@ -587,7 +611,8 @@ fn measure_cell(
             ("local_px", J::Int(l.judged)),
         ]));
     }
-    if let Some(l) = solid_ink_ratios(clean, clean, b, clean_ground, extreme).map(|r| Local::of(&r))
+    if let Some(l) =
+        solid_ink_ratios_but(clean, clean, b, clean_ground, extreme, skip).map(|r| Local::of(&r))
     {
         out.push((
             "clean_local_contrast".to_string(),
@@ -600,7 +625,8 @@ fn measure_cell(
 /// What the local measure found in one glyph ([`Local::of`] its [`solid_ink_ratios`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Local {
-    /// The worst pixel row's lower median ratio.
+    /// The worst slice's lower median ratio: a pixel row's, or the column of an underline caret's
+    /// line its judged pixels are keyed by.
     worst_row: f64,
     /// The worst single pixel's ratio.
     worst_px: f64,
@@ -645,12 +671,12 @@ fn ring_ground(frame: &Image, clean: &Image, ground: Rgb, x: i64, y: i64) -> Opt
     None
 }
 
-/// Each pixel of `b` whose clean colour is `ink`, judged in the frame against its [`ring_ground`], as `(y, ratio)` in
-/// row-major order; a pixel with no ground that near is left out.
+/// Each pixel of `b` but `skip`'s whose clean colour is `ink`, judged in the frame against its [`ring_ground`], as
+/// `(y, ratio)` in row-major order; a pixel with no ground that near is left out.
 fn local_ratios(
     frame: &Image,
     clean: &Image,
-    b: PxBox,
+    (b, skip): (PxBox, Option<PxBox>),
     ground: Rgb,
     ink: impl Fn(Rgb) -> bool,
 ) -> Vec<(i64, f64)> {
@@ -664,7 +690,7 @@ fn local_ratios(
                 usize::try_from(x).unwrap_or(0),
                 usize::try_from(y).unwrap_or(0),
             );
-            if !ink(clean.at(xu, yu)) {
+            if skip.is_some_and(|s| s.holds(x, y)) || !ink(clean.at(xu, yu)) {
                 continue;
             }
             let Some(g) = ring_ground(frame, clean, ground, x, y) else {
@@ -686,21 +712,36 @@ pub(crate) fn solid_ink_ratios(
     ground: Rgb,
     extreme: Rgb,
 ) -> Option<Vec<(i64, f64)>> {
+    solid_ink_ratios_but(frame, clean, b, ground, extreme, None)
+}
+
+/// [`solid_ink_ratios`] with the pixels of `skip` left out of the glyph ([`measure_cell`]'s).
+fn solid_ink_ratios_but(
+    frame: &Image,
+    clean: &Image,
+    b: PxBox,
+    ground: Rgb,
+    extreme: Rgb,
+    skip: Option<PxBox>,
+) -> Option<Vec<(i64, f64)>> {
     let solid = SOLID_SHARE * contrast(extreme, ground);
-    let judged = local_ratios(frame, clean, b, ground, |c| contrast(c, ground) >= solid);
+    let judged = local_ratios(frame, clean, (b, skip), ground, |c| {
+        contrast(c, ground) >= solid
+    });
     if !judged.is_empty() {
         return Some(judged);
     }
     let ground_luma = luminance(ground);
     let reach = CORE_SHARE * (luminance(extreme) - ground_luma).abs();
-    let judged = local_ratios(frame, clean, b, ground, |c| {
+    let judged = local_ratios(frame, clean, (b, skip), ground, |c| {
         c != ground && (luminance(c) - ground_luma).abs() >= reach
     });
     (!judged.is_empty()).then_some(judged)
 }
 
 impl Local {
-    /// The measure of `judged`, [`local_ratios`]' pixels: the worst pixel row's lower median, the worst pixel, and the
+    /// The measure of `judged`, [`local_ratios`]' pixels keyed by their slice (a pixel row, or an underline's pixel
+    /// column), in slice order: the worst slice's lower median, the worst pixel, and the
     /// pixels under [`LEGIBLE`].
     fn of(judged: &[(i64, f64)]) -> Local {
         let (mut worst_row, mut worst_px, mut under) = (f64::INFINITY, f64::INFINITY, 0i64);
@@ -819,8 +860,16 @@ fn measure_caret(
 /// is) and while its colour is the strongest line's own ink or that ink's antialiased edge
 /// ([`blends`] with the page).
 ///
-/// Its `contrast` is the span's median in the frame against the closer of the page and the median
-/// of the cell's other pixels (the halo it sits in).
+/// A span read in the twin keeps only the lines whose median is the twin's strongest line's own ink
+/// or its antialiased edge ([`blends`] with the page), as a span read in the frame does: a grey
+/// stem flush against the bar is the letter's, not the caret's.
+///
+/// Its `contrast` is the lowest of the span's median in the frame against the page and against
+/// the median of the cell's other pixels (the halo it sits in), and, with a twin, its
+/// `ring_contrast`: each pixel of the line read against its ring as a letter's stroke is
+/// ([`local_ratios`]: the ground beside it, 1 px out else 2, that the twin shows as the cell's
+/// ground), each pixel row's lower median, the worst row. A light laid against the bar outside its
+/// cell, which the cell's median never sees, is what the line is read against.
 fn measure_thin_caret(
     frame: &Image,
     clean: Option<&Image>,
@@ -829,7 +878,28 @@ fn measure_thin_caret(
     page: Rgb,
     shape: CaretShape,
 ) -> J {
-    thin_caret_reading(frame, clean, grid, at, page, shape, true)
+    thin_caret_reading(frame, clean, grid, at, page, shape, Spans::OWN)
+}
+
+/// What a thin caret's reading keeps of its line ([`thin_caret_reading`]); each `false` is its
+/// tests' negative control.
+#[derive(Clone, Copy, Debug)]
+struct Spans {
+    /// A span keeps only the lines whose median is the strongest line's own ink or its edge.
+    own_ink: bool,
+    /// The ring reads only the line's pixels the twin draws in the caret's solid ink.
+    solid_ring: bool,
+    /// The ring is read slice by slice across the line (a bar's pixel rows, an underline's
+    /// pixel columns), each slice's lower median; else by pixel rows, as a letter's strokes are.
+    across: bool,
+}
+
+impl Spans {
+    const OWN: Self = Self {
+        own_ink: true,
+        solid_ring: true,
+        across: true,
+    };
 }
 
 /// How far, in 8-bit channel steps, a line's colour may sit off the blend of the page and a thin
@@ -871,8 +941,9 @@ fn blends(c: Rgb, a: Rgb, b: Rgb) -> bool {
     off(straight).min(off(linear)) <= BLEND_SLACK
 }
 
-/// [`measure_thin_caret`]'s reading; `own_ink` false widens a span read in the frame by strength
-/// alone (its tests' negative control).
+/// [`measure_thin_caret`]'s reading; `spans` says what it keeps of the line ([`Spans`]: an
+/// `own_ink` false widens a span by strength alone, a `solid_ring` false reads every pixel of the
+/// span against its ring, an `across` false reads an underline's ring by pixel rows).
 fn thin_caret_reading(
     frame: &Image,
     clean: Option<&Image>,
@@ -880,8 +951,9 @@ fn thin_caret_reading(
     (row, col): (i64, i64),
     page: Rgb,
     shape: CaretShape,
-    own_ink: bool,
+    spans: Spans,
 ) -> J {
+    let own_ink = spans.own_ink;
     let cell = grid.cell_box(row, col, 1);
     let pixels = frame.region(cell);
     let (w, h) = (
@@ -940,8 +1012,18 @@ fn thin_caret_reading(
         .and_then(|twin| {
             let drawn = |i: usize| strength_of(&twin, i);
             let seat = strongest(&drawn);
-            (drawn(seat) >= CARET_DIFF).then(|| run(seat, &|i| drawn(i) >= CARET_DIFF))
+            let seat_ink = median(&line_of(&twin, seat)).unwrap_or(page);
+            (drawn(seat) >= CARET_DIFF).then(|| {
+                let (lo, hi) = run(seat, &|i| {
+                    drawn(i) >= CARET_DIFF
+                        && (!own_ink
+                            || blends(median(&line_of(&twin, i)).unwrap_or(page), page, seat_ink))
+                });
+                (lo, hi, seat_ink)
+            })
         });
+    let seat_ink = twin_span.map(|(_, _, ink)| ink);
+    let twin_span = twin_span.map(|(lo, hi, _)| (lo, hi));
     let span_from = if twin_span.is_some() { "twin" } else { "frame" };
     let (lo, hi) = twin_span.unwrap_or_else(|| {
         let seat = strongest(&strength);
@@ -975,12 +1057,67 @@ fn thin_caret_reading(
         .copied()
         .filter(|&p| contrast(p, page) >= CARET_DIFF)
         .collect();
-    let reading = contrast(colour, page).min(contrast(colour, ground));
     let (from, to) = if bar {
         (cell.x0 + lo as i64, cell.x0 + hi as i64)
     } else {
         (cell.y0 + lo as i64, cell.y0 + hi as i64)
     };
+    // The line read as a reader sees it: each of its pixels against the ground beside it.
+    let ring = clean.filter(|_| twin_span.is_some()).and_then(|clean| {
+        let line = if bar {
+            PxBox {
+                x0: from,
+                x1: to,
+                ..cell
+            }
+        } else {
+            PxBox {
+                y0: from,
+                y1: to,
+                ..cell
+            }
+        };
+        // The cell's ground: its twin's commonest colour off the line.
+        let ground = mode(
+            clean
+                .region(cell)
+                .into_iter()
+                .enumerate()
+                .filter(|&(i, _)| !in_span(i))
+                .map(|(_, p)| p),
+        )?;
+        // Only the pixels the twin draws in the caret's solid ink: an edge row of the span is a
+        // blend across the cell, and where a letter's descender greys part of it its median
+        // blends with the caret's ink while its pixels are the page's and the letter's
+        // (GitHub Light's and Dracula's underline under coloured-prompt's `j` read 1.05 on their
+        // page pixels).
+        let solid = seat_ink.map(|ink| SOLID_SHARE * contrast(ink, ground));
+        let ink = |c: Rgb| !spans.solid_ring || solid.is_none_or(|s| contrast(c, ground) >= s);
+        // Read slice by slice across the line, as a reader sees a break in it: a bar's pixel
+        // rows, an underline's pixel columns. Read by rows, an underline's row of 14 px kept its
+        // lower median with 6 of them at 2.4:1 against a light beside them (GitHub Light's
+        // underline in jump, CT-51).
+        let judged = if bar || !spans.across {
+            local_ratios(frame, clean, (line, None), ground, ink)
+        } else {
+            (line.x0..line.x1)
+                .flat_map(|x| {
+                    let column = PxBox {
+                        x0: x,
+                        x1: x + 1,
+                        ..line
+                    };
+                    local_ratios(frame, clean, (column, None), ground, ink)
+                        .into_iter()
+                        .map(move |(_, r)| (x, r))
+                })
+                .collect()
+        };
+        (!judged.is_empty()).then(|| Local::of(&judged))
+    });
+    let reading = contrast(colour, page)
+        .min(contrast(colour, ground))
+        .min(ring.map_or(f64::INFINITY, |l| l.worst_row));
     out.set(
         "coverage",
         J::Float(round_to(lit.len() as f64 / pixels.len() as f64, 3)),
@@ -993,6 +1130,10 @@ fn thin_caret_reading(
     );
     out.set("span", J::Arr(vec![J::Int(from), J::Int(to)]));
     out.set("span_from", J::s(span_from));
+    if let Some(l) = ring {
+        out.set("ring_contrast", J::Float(round_to(l.worst_row, 2)));
+        out.set("ring_min", J::Float(round_to(l.worst_px, 2)));
+    }
     out.set("contrast", J::Float(round_to(reading, 2)));
     out.set("peak_contrast", J::Float(round_to(peak, 2)));
     out.set(
@@ -1000,6 +1141,36 @@ fn thin_caret_reading(
         median(&lit).map_or(J::Null, |m| J::Float(round_to(contrast(m, page), 2))),
     );
     out
+}
+
+/// The pixels of a bar or an underline caret's line where its clean twin draws it, from its
+/// reading ([`measure_caret`]): the columns of its span down its cell, or the rows of it across.
+/// `None` for a block, or a span read in the frame (a twin that draws no caret there holds none
+/// of it in its glyph).
+fn thin_caret_span(caret: &J, grid: &Grid) -> Option<PxBox> {
+    if caret.get("span_from").and_then(J::as_str) != Some("twin") {
+        return None;
+    }
+    let (row, col) = (
+        caret.get("row").and_then(J::as_i64)?,
+        caret.get("col").and_then(J::as_i64)?,
+    );
+    let span = caret.get("span").and_then(J::as_arr)?;
+    let (from, to) = (span.first()?.as_i64()?, span.get(1)?.as_i64()?);
+    let cell = grid.cell_box(row, col, 1);
+    match caret.get("read_as").and_then(J::as_str)? {
+        "bar" => Some(PxBox {
+            x0: from,
+            x1: to,
+            ..cell
+        }),
+        "underline" => Some(PxBox {
+            y0: from,
+            y1: to,
+            ..cell
+        }),
+        _ => None,
+    }
 }
 
 /// A block caret's reading. Its ink is the lit pixels within the geometric half of the peak's ratio to the page
@@ -1487,6 +1658,27 @@ pub fn report(a: &Args) -> Result<J, String> {
         );
     }
 
+    // The caret is read first: a bar's or an underline's line is no stroke of the letter under it.
+    let caret_read = match caret {
+        Some((row, col)) if grid.holds(row, col) => {
+            let shape = CaretShape::named(
+                caret_facts
+                    .iter()
+                    .find(|(k, _)| k == "shape")
+                    .and_then(|(_, v)| v.as_str()),
+            );
+            let mut c = measure_caret(&frame, clean.as_ref(), &grid, (row, col), page, shape);
+            for (k, v) in caret_facts {
+                c.set(&k, v);
+            }
+            Some(((row, col), c))
+        }
+        _ => None,
+    };
+    let caret_line = caret_read
+        .as_ref()
+        .and_then(|(at, c)| thin_caret_span(c, &grid).map(|b| (*at, b)));
+
     let mut cells = Vec::with_capacity(targets.len());
     let mut measured: Vec<f64> = Vec::new();
     for t in &targets {
@@ -1504,13 +1696,15 @@ pub fn report(a: &Args) -> Result<J, String> {
         if let Some(c) = t.ch {
             entry.push(("char".into(), J::s(c.to_string())));
         }
+        let skip = caret_line
+            .filter(|&(at, _)| at == (t.row, t.col))
+            .map(|(_, b)| b);
         entry.extend(measure_cell(
             &frame,
             clean.as_ref(),
             &grid,
-            t.row,
-            t.col,
-            t.width,
+            (t.row, t.col, t.width),
+            skip,
         ));
         let cell = J::Obj(entry);
         if let Some(c) = judged(&cell) {
@@ -1544,19 +1738,7 @@ pub fn report(a: &Args) -> Result<J, String> {
     let mut caret_box = None;
     let mut caret_report = J::Null;
     let mut newest_contrasts: Vec<Option<f64>> = Vec::new();
-    if let Some((row, col)) = caret
-        && grid.holds(row, col)
-    {
-        let shape = CaretShape::named(
-            caret_facts
-                .iter()
-                .find(|(k, _)| k == "shape")
-                .and_then(|(_, v)| v.as_str()),
-        );
-        let mut c = measure_caret(&frame, clean.as_ref(), &grid, (row, col), page, shape);
-        for (k, v) in caret_facts {
-            c.set(&k, v);
-        }
+    if let Some(((row, col), mut c)) = caret_read {
         let mut newest = Vec::new();
         let mut at = col - 1;
         let want = usize::try_from(a.newest.max(0)).unwrap_or(0);
@@ -1578,7 +1760,13 @@ pub fn report(a: &Args) -> Result<J, String> {
             if let Some(c) = ch {
                 entry.push(("char".into(), J::s(c.to_string())));
             }
-            entry.extend(measure_cell(&frame, clean.as_ref(), &grid, row, at, width));
+            entry.extend(measure_cell(
+                &frame,
+                clean.as_ref(),
+                &grid,
+                (row, at, width),
+                None,
+            ));
             let entry = J::Obj(entry);
             if entry.get("blank").is_some() {
                 break;

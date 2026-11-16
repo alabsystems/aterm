@@ -479,7 +479,7 @@ pub fn agent_tcc(
 #[must_use]
 pub fn print_disabled_cmd() -> Cmd {
     Cmd::new(LAUNCHCTL)
-        .args(["print-disabled", "system"])
+        .args(aterm_uds::launchd::PRINT_DISABLED_SYSTEM)
         .budget(READ_BUDGET)
 }
 
@@ -547,30 +547,18 @@ pub fn grant(rows: &[TccRow], client: &str, service: &str) -> Read<i64> {
         .map_or(Read::Absent, |r| Read::Value(r.auth_value))
 }
 
-/// Parses whether `label` is enabled in `launchctl print-disabled system` output.
+/// Parses whether `label` is enabled in `launchctl print-disabled system` output, by its row of
+/// the `disabled services` block ([`aterm_uds::launchd::job_switch_in`]): `Absent` when the
+/// block has no row for it.
 #[must_use]
 pub fn launchd_enabled(text: &str, label: &str) -> Read<bool> {
-    if !text.contains("disabled services = {") {
-        return Read::Unusable(format!(
-            "launchctl print-disabled printed {:?}, not its service list",
-            text.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
-        ));
+    use aterm_uds::launchd::{JobSwitch, job_switch_in};
+    match job_switch_in(text, label) {
+        Ok(JobSwitch::On) => Read::Value(true),
+        Ok(JobSwitch::Off) => Read::Value(false),
+        Ok(JobSwitch::Unlisted) => Read::Absent,
+        Err(why) => Read::Unusable(why),
     }
-    let quoted = format!("\"{label}\"");
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once("=>") else {
-            continue;
-        };
-        if name.trim() != quoted {
-            continue;
-        }
-        return match value.trim() {
-            "enabled" | "false" => Read::Value(true),
-            "disabled" | "true" => Read::Value(false),
-            other => Read::Unusable(format!("launchctl says {label} is {other:?}")),
-        };
-    }
-    Read::Absent
 }
 
 /// Whether the system service `label` is enabled, read through `run`.

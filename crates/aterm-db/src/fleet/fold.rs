@@ -18,19 +18,29 @@
 //!   read again as of the fold's instant: a window whose reset has passed has no figure.
 //!   `expected` comes from the registry's preferences and from nothing else; `active` is
 //!   evidence, each piece with the word of what gave it, and is stored nowhere. An agent an
-//!   unproven answer listed is no evidence.
+//!   unproven answer listed is no evidence. What the registry states (`status`, a stated
+//!   `plan`, `expected`) is a person's word and no observation is written over it: an observed
+//!   fact stands in its own column beside it, with when it was read and the Mac that read it,
+//!   and where the two differ both are shown (`plan_mismatch`). `observed` is what Macs saw
+//!   of the account ([`ObservedState`]), derived here beside the `status` it never rewrites;
+//!   `last_seen` and `seen_on` are the sightings of its login (`crate::alab::sighted`). Each
+//!   fact's provenance has one shape, `<fact>_at` and `<fact>_by`: a time never after the read
+//!   of the input that carried it, and the Mac by its label, else its machine key, else the
+//!   first 8 digits of its Commons uuid.
 //! - **Agents**: every agent session a machine listed in an answer no older than
 //!   [`AGENTS_KEEP_MS`]. Its account is the registry row its word resolves to; a word that
 //!   resolves to none is dropped and counted ([`Counts::unresolved_accounts`]).
 
 use super::read::{AccountWord, Harness, Latest, OWN_ID, Sighted};
 use super::rows::{
-    ACCOUNT_STATUS, AccountRef, AccountRow, AgentRow, Evidence, EvidenceHow, MACHINE_STATUS,
-    MachineRef, MachineRow, RETIRED, Reach, UNREGISTERED, Via, WindowRow, WindowState,
+    ACCOUNT_STATUS, AccountRef, AccountRow, AgentRow, Evidence, EvidenceHow, Fact, MACHINE_STATUS,
+    MachineRef, MachineRow, ObservedState, PlanSource, RETIRED, Reach, SEEN_ON_MAX, SeenOn, Stamp,
+    UNREGISTERED, Via, WindowRow, WindowState,
 };
+use crate::alab::sighted as sightings;
 use crate::alab::{
     journal::{
-        event::Window,
+        event::{SIGNIN_IN, Window},
         seen::{Seen, Usage, WindowQuota},
     },
     view::LabView,
@@ -419,6 +429,49 @@ fn window_row(quotas: &[&WindowQuota], now_s: u64) -> (WindowRow, Option<(u64, S
     }
 }
 
+/// What the fleet observed of one account, and the newest evidence of that state: `evidence` is
+/// every piece that puts it on a Mac a live machine row binds (not yet one per machine and
+/// source), `signed_out` each Mac's word that its login ended (its newest sign-in word, where
+/// that is not `in`, or its registry row that says `signed-out`), with when it stated it, and
+/// `seen` each Mac's newest sighting of it, for the Macs that state no word. Signed in on any
+/// Mac is signed in; with no `in`, a Mac whose login file names it and that states no word has
+/// seen it, which may be a login nobody noted; a Mac that states its login ended says it is
+/// signed out, which is more than a place says; a place row, a claim or an agent session with
+/// nothing else is a place only. A piece's time is since when it holds, by its writer's clock
+/// and never after it was read, so nothing was observed in the future. The registry's status
+/// takes no part: it is what a person states, and this stands beside it.
+fn observed_state(
+    evidence: &[Evidence],
+    seen: impl Iterator<Item = Stamp>,
+    signed_out: impl Iterator<Item = Stamp>,
+) -> (ObservedState, Option<Stamp>) {
+    fn newest(stamps: impl Iterator<Item = Stamp>) -> Option<Stamp> {
+        stamps.max_by(|a, b| (a.at_ms, &a.by).cmp(&(b.at_ms, &b.by)))
+    }
+    let of = |signed_in: bool| {
+        evidence
+            .iter()
+            .filter(move |e| (e.how == EvidenceHow::SignedIn) == signed_in)
+            .map(|e| Stamp {
+                at_ms: e.since_ms.map_or(e.at_ms, |since| since.min(e.at_ms)),
+                by: e.on.name().to_owned(),
+            })
+    };
+    if let Some(read) = newest(of(true)) {
+        return (ObservedState::SignedIn, Some(read));
+    }
+    if let Some(read) = newest(seen) {
+        return (ObservedState::Seen, Some(read));
+    }
+    if let Some(read) = newest(signed_out) {
+        return (ObservedState::SignedOut, Some(read));
+    }
+    match newest(of(false)) {
+        Some(read) => (ObservedState::PlaceOnly, Some(read)),
+        None => (ObservedState::NeverSeen, None),
+    }
+}
+
 /// A machine row's sighting facts. `newest_ms` is the newest read that could have named the
 /// machine: any read for this Mac, a read that asked the fleet for a peer.
 fn sighted_facts(
@@ -746,7 +799,27 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         label: lab.and_then(|lab| lab.machine_label(pk)).map(str::to_owned),
     };
     let bound = |uuid: &str| lab.and_then(|lab| lab.bound.get(uuid)).map(String::as_str);
+    // The Mac of Commons uuid `uuid` as a fact's `by` names it: its machine's label, else its
+    // machine's key, else (no live machine row binds it) the first 8 digits of the uuid, as
+    // `aterm db ai-accounts` names such a Mac. Whoever read a fact is always named.
+    let mac_word = |uuid: &str| -> String {
+        match bound(uuid) {
+            Some(pk) => machine_ref(pk).name().to_owned(),
+            None => uuid.chars().take(8).collect(),
+        }
+    };
     let journal_at = inputs.journal.at_ms().unwrap_or(0);
+    // Where each account was sighted: every Mac's `account-obs` rows (the registry's) and the
+    // journal's `seen` events, in the one fold `aterm db ai-accounts --registry` reads too. A
+    // sighting was read no later than the later of its two sources: the fold dates none after
+    // that read, and believes none dated past the clock-skew bound ahead of it.
+    let sighted_at = journal_at.max(inputs.lab.at_ms().unwrap_or(0));
+    let sighted = sightings::fold(
+        lab.map_or(&[][..], |lab| lab.account_obs.as_slice()),
+        &seen.map(sightings::heard).unwrap_or_default(),
+        sighted_at,
+        now_ms,
+    );
     let known_to_journal: BTreeSet<String> = seen.map(Seen::accounts).unwrap_or_default();
     // Whether any machine's answer still speaks for its agents: with none, how many sessions
     // run on an account is unread, not zero.
@@ -762,16 +835,23 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         };
         let (w5h, read5) = window_row(&of(Window::FiveHour), now_s);
         let (w7d, read7) = window_row(&of(Window::Week), now_s);
-        let wall_until = quotas
+        // The wall that stands longest, with when it was hit and the Mac that hit it.
+        let wall = quotas
             .iter()
             .filter_map(|q| q.wall.as_ref())
             .filter(|wall| wall.until.is_none_or(|until| until > now_s))
-            .map(|wall| wall.until)
-            .max_by_key(|until| until.unwrap_or(u64::MAX));
-        let walled = known_to_journal
-            .contains(pk)
-            .then_some(wall_until.is_some());
-        let wall_until_ms = wall_until.flatten().map(ms);
+            .max_by_key(|wall| (wall.until.unwrap_or(u64::MAX), wall.t, &wall.uuid));
+        let walled = known_to_journal.contains(pk).then_some(wall.is_some());
+        let wall_until_ms = wall.and_then(|wall| wall.until).map(ms);
+        // Each fact's provenance: when it was read, never after the journal that carried it,
+        // and the Mac that read it.
+        let read_of = |uuid: &str, t: u64| Stamp {
+            at_ms: ms(t).min(journal_at),
+            by: mac_word(uuid),
+        };
+        let wall_read = wall.map(|wall| read_of(&wall.uuid, wall.t));
+        let [w5h_read, w7d_read] =
+            [&read5, &read7].map(|read| read.as_ref().map(|(t, uuid)| read_of(uuid, *t)));
         let read_by = [read5, read7]
             .into_iter()
             .flatten()
@@ -835,7 +915,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                 }
             }
             for (uuid, signed) in seen.signins.get(pk).into_iter().flatten() {
-                if let Some(machine) = bound(uuid).filter(|_| signed.state == "in") {
+                if let Some(machine) = bound(uuid).filter(|_| signed.state == SIGNIN_IN) {
                     evidence.push(Evidence {
                         on: machine_ref(machine),
                         how: EvidenceHow::SignedIn,
@@ -845,6 +925,110 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                 }
             }
         }
+        // The Macs that sighted it, a live machine row's or not (a sighting is a dated fact of
+        // the Mac that wrote it, whatever became of that Mac): one entry per Mac as a fact
+        // names it, two uuids of one machine row at the newer sighting and the more tabs.
+        let spotted = sighted.get(pk);
+        let mut seen_by: BTreeMap<String, (SeenOn, Option<MachineRef>)> = BTreeMap::new();
+        for (uuid, on) in spotted.into_iter().flat_map(|s| s.macs.iter()) {
+            // The count of its running tabs changes by itself when a sighting lapses.
+            if let Some(lapses) = on.lapses_ms {
+                next.at(lapses);
+            }
+            let by = mac_word(uuid);
+            let held = seen_by.entry(by.clone()).or_insert((
+                SeenOn {
+                    on: by,
+                    tabs: 0,
+                    at_ms: 0,
+                },
+                bound(uuid).map(machine_ref),
+            ));
+            held.0.tabs = held.0.tabs.max(on.tabs);
+            held.0.at_ms = held.0.at_ms.max(on.at_ms);
+        }
+        // What each Mac says of its own login, beside what its login files show. A Mac's word
+        // says more than its login file does (a file names its account long after the login
+        // ended), so a Mac that states one is not one that only sighted the account. A Mac is
+        // what a fact's `by` names: two uuids of one machine row are one Mac, and a Mac no live
+        // machine row binds states its word as any other does. Only its `in` is no word: it is
+        // no Mac of the lab, so that signs nothing in and its sighting is all it says.
+        let mut worded: BTreeSet<String> = BTreeSet::new();
+        let mut signed_out: Vec<Stamp> = Vec::new();
+        for (uuid, signed) in seen
+            .and_then(|seen| seen.signins.get(pk))
+            .into_iter()
+            .flatten()
+        {
+            let ended = signed.state != SIGNIN_IN;
+            if !ended && bound(uuid).is_none() {
+                continue;
+            }
+            let by = mac_word(uuid);
+            if ended {
+                signed_out.push(Stamp {
+                    at_ms: ms(signed.t).min(journal_at),
+                    by: by.clone(),
+                });
+            }
+            worded.insert(by);
+        }
+        // A registry row that says `signed-out` is its Mac's word too, for as long as that Mac,
+        // under any of its uuids, has sighted nothing since.
+        let mut row_out: BTreeMap<String, u64> = BTreeMap::new();
+        for (uuid, at_ms) in spotted.into_iter().flat_map(|s| s.out.iter()) {
+            let held = row_out.entry(mac_word(uuid)).or_default();
+            *held = (*held).max(*at_ms);
+        }
+        row_out.retain(|by, out| seen_by.get(by).is_none_or(|(on, _)| on.at_ms <= *out));
+        signed_out.extend(row_out.iter().map(|(by, at_ms)| Stamp {
+            at_ms: *at_ms,
+            by: by.clone(),
+        }));
+        let seen_wordless: Vec<Stamp> = seen_by
+            .values()
+            .filter(|(on, _)| !worded.contains(&on.on) && !row_out.contains_key(&on.on))
+            .map(|(on, _)| Stamp {
+                at_ms: on.at_ms,
+                by: on.on.clone(),
+            })
+            .collect();
+        let last_seen = seen_by
+            .values()
+            .map(|(on, _)| (on.at_ms, &on.on))
+            .max()
+            .map(|(at_ms, by)| Stamp {
+                at_ms,
+                by: by.clone(),
+            });
+        // The ones that sighted it last, then in the machines' order: by number, then the Macs
+        // no machine row binds.
+        let mut seen_on: Vec<(SeenOn, Option<MachineRef>)> = seen_by.into_values().collect();
+        seen_on.sort_by(|(a, _), (b, _)| (b.at_ms, &a.on).cmp(&(a.at_ms, &b.on)));
+        seen_on.truncate(SEEN_ON_MAX);
+        seen_on.sort_by_key(|(on, machine)| {
+            let number = machine
+                .as_ref()
+                .and_then(|machine| machine.label.as_deref())
+                .and_then(Number::leading);
+            (machine.is_none(), number.is_none(), number, on.on.clone())
+        });
+        let seen_on: Vec<SeenOn> = seen_on.into_iter().map(|(on, _)| on).collect();
+        // With no journal read the `seen` events were not: the rows alone say where it was
+        // sighted only where one names it.
+        let sightings_read = seen.is_some() || !seen_on.is_empty();
+
+        // What the fleet observed of it, judged before the evidence keeps one piece per
+        // (machine, source): the newest evidence of the best state any Mac gives it.
+        let (observed, observed_read) = match seen {
+            Some(_) => {
+                let (state, read) =
+                    observed_state(&evidence, seen_wordless.into_iter(), signed_out.into_iter());
+                (Some(state), read)
+            }
+            // With no journal read no Mac's sign-in word was read: what was observed is unread.
+            None => (None, None),
+        };
         evidence.sort_by_key(|e| {
             let number = e.on.label.as_deref().and_then(Number::leading);
             (
@@ -857,6 +1041,25 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         });
         evidence.dedup_by(|a, b| a.on.machine == b.on.machine && a.how == b.how);
         let last_use = seen.and_then(|seen| seen.last_use.get(pk));
+        // The plan a Mac's CLI reported names its provider's plan row (`<provider>-<word>`, as
+        // the registry keys a plan), so it reads in the words the registry's own cell does.
+        let plan_observed = seen.and_then(|seen| seen.plan(pk)).map(|plan| Fact {
+            v: match account.provider.as_deref() {
+                Some(provider) => format!("{provider}-{}", plan.word),
+                None => plan.word.clone(),
+            },
+            read: Stamp {
+                at_ms: ms(plan.t),
+                by: mac_word(&plan.uuid),
+            },
+        });
+        // What the registry states stands; an observed plan fills the cell only where it
+        // states none, and never replaces it.
+        let (plan, plan_source) = match (&account.plan, &plan_observed) {
+            (Some(set), _) => (Some(set.clone()), Some(PlanSource::Set)),
+            (None, Some(observed)) => (Some(observed.v.clone()), Some(PlanSource::Observed)),
+            (None, None) => (None, None),
+        };
         accounts.push(AccountRow {
             account: account.pk.clone(),
             provider: account.provider.clone(),
@@ -867,7 +1070,9 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             } else {
                 Some(RETIRED)
             },
-            plan: account.plan.clone(),
+            plan,
+            plan_source,
+            plan_observed,
             w5h,
             w7d,
             walled,
@@ -882,8 +1087,14 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
             active: evidence_read.then_some(evidence),
             agents: agent_sessions,
             last_use_ms: last_use.map(|(_, t)| ms(*t)),
-            last_use_on: last_use
-                .and_then(|(uuid, _)| bound(uuid).and_then(|pk| machine_ref(pk).label)),
+            last_use_on: last_use.map(|(uuid, _)| mac_word(uuid)),
+            observed,
+            observed_read,
+            w5h_read,
+            w7d_read,
+            wall_read,
+            last_seen,
+            seen_on: sightings_read.then_some(seen_on),
         });
     }
     accounts.sort_by(|a, b| {

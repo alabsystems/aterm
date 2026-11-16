@@ -20,8 +20,8 @@
 //!   whether the peak each was claimed by was measured at the width it ran at, their CPU and
 //!   wait for a core, and the recording pass's claim and peak. One row a run, never one a binary,
 //!   which keeps the log near a megabyte a day.
-//! - `run`, once the run has reported ([`run`]): its checkout, whether `verify land` judged it,
-//!   ran it in the background or `--admit now` forced it, its checks, its start and end, its
+//! - `run`, once the run has reported ([`run`]): its checkout, whether `verify land` judged it
+//!   or `--admit now` forced it, its checks, its start and end, its
 //!   stages' CPU and its binaries', and its outcome. A run is one run of the checks
 //!   (`crate::run_with`), not one process: a process that runs several (`verify release-input`,
 //!   one a check) writes a `run` row for each, each under its own id ([`Tally`]).
@@ -379,15 +379,13 @@ const fn outcome(code: i32) -> &'static str {
 
 /// The `run` row of `ctx`'s run, begun at `start_ms` and ending with `code`: what was asked of
 /// it, as `ctx` says. `land`: `verify land` judged it, which is a run given `--queued-since`
-/// ([`Tally::judged_by_land`]); `background`
-/// ([`Ctx::background`]); `forced`: `--admit now` decides its admissions ([`Ctx::quiet`]).
+/// ([`Tally::judged_by_land`]); `forced`: `--admit now` decides its admissions ([`Ctx::quiet`]).
 pub(crate) fn run_row(ctx: &Ctx, start_ms: u64, code: i32) -> Row {
     let checks: Vec<Value> = ctx.checks.iter().map(|c| Value::from(c.name())).collect();
     Row::now("run")
         .with("run", ctx.admission.id())
         .with("checkout", ctx.root.display().to_string())
         .with("land", ctx.admission.land.load(Ordering::Relaxed))
-        .with("background", ctx.background)
         .with("forced", ctx.quiet == Some(aterm_capacity::Admit::Now))
         .with("checks", checks)
         .with("start_ms", start_ms)

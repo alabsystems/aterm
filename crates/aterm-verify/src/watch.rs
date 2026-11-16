@@ -1,108 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Idle-capacity main sampling. The controller renews a remote lease while a disposable
-//! process group judges one immutable tree with that tree's tools. Only journal records leave it.
-//! A renewal that fails ends no judgment, and an attempt's last record is kept in the checkout
-//! until the journal holds it.
+//! The follower: judges origin/main's newest tip after the landings that made it, one pass at a
+//! time, and says what it found as a GitHub commit status on that commit. A pass runs every row
+//! to its end (a red stops no later row), and nothing preempts it. A red pass starts one repair
+//! worker, unless one is still working or could not finish the same reds, which bisects over
+//! first-parent landings and fixes forward. The verdict is the status; nothing else is kept.
 
-use crate::judged::{self, Decision, Record, Row};
-use aterm_uds::spawnfd::Tether as _;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[path = "watch_census.rs"]
-mod census;
 #[path = "watch_service.rs"]
 mod service;
 
-const HELP: &str = "verify watch [--workspace DIR] [--remote NAME] [--branch BRANCH] [--once] [--interval SECONDS]\n\
-verify watch --census REF [--since UNIX_SECONDS] [--flaky] reads states and causes from a fetched journal.\n\
-With --since, count attempts from history, including overwritten cancellations, and emit JSON records.\n\
-With --flaky, list instead the test cases that were red on one tree and green on another with\n\
-an unchanged closure: for each test case a red row names, a record whose same row passed and\n\
-whose commit holds the case's closure under the same git object ids. The closure is the case's\n\
-crate, every path package Cargo.lock resolves below it (one the root manifest patches in\n\
-included) and the toolchain files (trust.lock, rust-toolchain.toml, .cargo); it is computed at\n\
-both commits and must name the same paths and the same registry packages. A line gives the\n\
-case, both commits, both hosts, each row's load1 and, as config_changed, which of Cargo.toml,\n\
-Cargo.lock and .gitmodules differ outside that closure. It reads journal records and git\n\
-objects and starts no build, test or judgment.\n\
-The list cannot show a case that fails only in a saturated landing (the lane samples at\n\
-Background rank), a case whose row never passed on an unchanged closure, or a change outside\n\
-the closure (a root manifest row that is no dependency, a file the case reads elsewhere in the\n\
-tree or on its host).\n\
-verify watch --install [--workspace DIR] [--interval SECONDS] installs a persistent macOS main lane.\n\
-Samples origin/main in a dedicated persistent clone at Background rank. Claims and verdicts\n\
-are appended to refs/aterm/judged (14 days of records). A release ends the sample; Ordinary\n\
-work retains priority for overlapping resources. --once attempts one sample. No hook, gate or publication.\n\
-A claim that cannot be renewed ends no sample; a record the journal did not take is kept in the\n\
-clone and published by the next loop.\n";
+/// The context the follower's commit statuses carry.
+pub const CONTEXT: &str = crate::FOLLOWER_CONTEXT;
 
-/// Re-run a Background verifier as its own cancellable process group when its launcher did not
-/// give it one. A candidate can be newer than a long-lived watch controller: the invariant
-/// belongs to the candidate that asks for Background claims, not to the route that launched it.
-///
-/// `Some` is the re-run's exit code, or [`crate::exit::COULD_NOT_RUN`] when it could not start or
-/// did not report one. The caller exits with it. `None` means this invocation already owns its
-/// group, or is not a Background run.
-#[must_use]
-pub fn background_entry(args: &[std::ffi::OsString]) -> Option<i32> {
-    background_entry_with(args, background_requested(args), true)
-}
+const HELP: &str = "verify watch [--workspace DIR] [--remote NAME] [--branch BRANCH] [--once] [--interval SECONDS] [--repair-cwd DIR]\n\
+Follows origin/main in a dedicated clone: each pass judges the newest tip no follower has\n\
+judged, with the verifier built from that tip, and posts the verdict as a commit status\n\
+(context aterm/follower) through agh. A pass runs the release's rows (ship inputs, the\n\
+x86_64 compat compile, verify release --tree, verify cells, verify appkit on a Mac with a\n\
+desk session, ship's export and cut checks, the inputs recheck) to their ends: a red stops\n\
+no later row, and no other work preempts it. Reds are named by package, target and test.\n\
+A red pass starts one Claude Code repair worker in DIR (default: this repository's main\n\
+checkout) unless the last one still works or could not finish the same reds; it bisects over\n\
+first-parent landings and fixes forward.\n\
+--once judges one tip and ends. No hook, gate or publication.\n\
+verify watch --install [--workspace DIR] [--interval SECONDS] [--repair-cwd DIR] installs it\n\
+as this user's LaunchAgent, replacing an earlier install.\n";
 
-fn background_requested(args: &[std::ffi::OsString]) -> bool {
-    args.iter().any(|arg| {
-        let arg = arg.to_string_lossy();
-        arg.split_once('=').map_or(arg.as_ref(), |(flag, _)| flag) == "--background"
-    })
-}
-
-fn background_entry_with(
-    args: &[std::ffi::OsString],
-    requested: bool,
-    tether: bool,
-) -> Option<i32> {
-    // SAFETY: getpgrp has no pointer arguments and only reads this process's group.
-    if !requested || unsafe { libc::getpgrp() } == std::process::id() as i32 {
-        return None;
-    }
-    let run = || -> std::io::Result<std::process::ExitStatus> {
-        let mut command = aterm_uds::spawnfd::command(std::env::current_exe()?);
-        command.args(args).setsid(true);
-        if tether {
-            command.tether();
-        }
-        command.spawn()?.wait()
-    };
-    Some(match run() {
-        Ok(status) => {
-            if !status.success() {
-                eprintln!("verify background child: {status}");
-            }
-            background_status(status)
-        }
-        Err(why) => {
-            eprintln!("verify: --background could not enter its dedicated process group: {why}");
-            crate::exit::COULD_NOT_RUN
-        }
-    })
-}
-
-fn background_status(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => code,
-        (None, Some(signal))
-            if signal == libc::SIGHUP || signal == libc::SIGINT || signal == libc::SIGTERM =>
-        {
-            75
-        }
-        (None, _) => crate::exit::COULD_NOT_RUN,
-    }
-}
+/// The longest a GitHub status description is, in characters.
+const DESCRIPTION_CHARS: usize = 140;
+/// How many first-parent commits before a red tip a pass reads for the last green one.
+const WALK: usize = 100;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -111,6 +43,33 @@ struct Options {
     branch: String,
     once: bool,
     interval: Duration,
+    /// Where a repair worker starts: `--repair-cwd`, else [`main_checkout`].
+    repair_cwd: Option<PathBuf>,
+}
+
+impl Options {
+    /// The folder a repair worker starts in. A worktree is removed once its branch lands, so
+    /// the default is the main checkout of `cwd`'s repository, never `cwd` itself.
+    fn repair_cwd(&self, cwd: &Path) -> Result<PathBuf, String> {
+        self.repair_cwd
+            .clone()
+            .map_or_else(|| main_checkout(cwd), Ok)
+    }
+}
+
+/// The main checkout of `cwd`'s repository: the folder that holds its common `.git`.
+fn main_checkout(cwd: &Path) -> Result<PathBuf, String> {
+    let common = PathBuf::from(git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
+    match (common.file_name(), common.parent()) {
+        (Some(name), Some(parent)) if name == ".git" => Ok(parent.to_owned()),
+        _ => Err(format!(
+            "{} is no main checkout's .git; name the repair folder with --repair-cwd",
+            common.display()
+        )),
+    }
 }
 
 fn options(args: &[String], cwd: &Path) -> Result<Options, String> {
@@ -121,6 +80,7 @@ fn options(args: &[String], cwd: &Path) -> Result<Options, String> {
         branch: "main".into(),
         once: false,
         interval: Duration::from_secs(60),
+        repair_cwd: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -128,6 +88,9 @@ fn options(args: &[String], cwd: &Path) -> Result<Options, String> {
             "--once" => opts.once = true,
             "--workspace" => {
                 opts.workspace = cwd.join(it.next().ok_or("--workspace needs a directory")?)
+            }
+            "--repair-cwd" => {
+                opts.repair_cwd = Some(cwd.join(it.next().ok_or("--repair-cwd needs a directory")?))
             }
             "--remote" => opts.remote = it.next().ok_or("--remote needs a name")?.clone(),
             "--branch" => opts.branch = it.next().ok_or("--branch needs a branch")?.clone(),
@@ -151,27 +114,38 @@ fn options(args: &[String], cwd: &Path) -> Result<Options, String> {
     Ok(opts)
 }
 
-fn now() -> u64 {
-    aterm_time::unix_secs().unwrap_or(0)
+/// A git command in `root`, with no inherited token.
+fn git_command(root: &Path) -> aterm_uds::spawnfd::Command {
+    let mut cmd = crate::git_provider::command();
+    cmd.current_dir(root).env_remove("GITHUB_TOKEN");
+    cmd
+}
+
+/// The output of a command that must end within a minute.
+fn output(cmd: &mut aterm_uds::spawnfd::Command, input: &[u8]) -> Result<String, String> {
+    let out = aterm_uds::deadline::output_with_input_until(
+        cmd,
+        aterm_uds::secret::Secret::new(input),
+        Instant::now() + Duration::from_secs(60),
+        64 * 1024 * 1024,
+    )
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    judged::git(root, args).map_err(|why| format!("git {}: {why}", args.join(" ")))
+    output(git_command(root).args(args), &[])
+        .map(|s| s.trim().to_owned())
+        .map_err(|why| format!("git {}: {why}", args.join(" ")))
 }
 
-/// The lane controller. An internal sample bootstrap is always launched in its own process group;
-/// it replaces itself with the verifier built from the sampled head before orchestration begins.
+/// The follower's controller and its pass's two internal halves. The pass bootstrap (`--sample`)
+/// builds the tip's verifier and replaces itself with it (`--pass`), so every row and the
+/// verdict come from the tip being judged.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
-    let _ = crate::report::running_driver();
-    if args.first().is_some_and(|s| s == "--census") {
-        return match census::run_args(cwd, &args[1..]) {
-            Ok(()) => 0,
-            Err(why) => {
-                eprintln!("verify watch census: {why}");
-                3
-            }
-        };
-    }
     if args.first().is_some_and(|s| s == "--install") {
         return match options(&args[1..], cwd).and_then(|o| service::install(&o, cwd)) {
             Ok(()) => 0,
@@ -198,13 +172,13 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
             None => 2,
         };
     }
-    if args.first().is_some_and(|s| s == "--sample-ready") {
+    if args.first().is_some_and(|s| s == "--pass") {
         return match args.get(1) {
-            Some(result) => match sample_ready(cwd, Path::new(result)) {
+            Some(result) => match pass(cwd, Path::new(result)) {
                 Ok(true) => 0,
                 Ok(false) => 75,
                 Err(why) => {
-                    eprintln!("watch sampled-head runner: {why}");
+                    eprintln!("watch pass: {why}");
                     3
                 }
             },
@@ -230,7 +204,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 fn controller(opts: &Options, cwd: &Path) -> Result<(), String> {
     let parent = opts.workspace.parent().ok_or("workspace has no parent")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    // A host-wide lock, independent of the chosen checkout: at most one controller per Mac.
+    // A host-wide lock, independent of the chosen checkout: at most one follower per Mac.
     let lock_path = PathBuf::from(std::env::var_os("HOME").ok_or("no HOME")?)
         .join(".local/state/aterm-verify/watch.lock");
     fs::create_dir_all(lock_path.parent().ok_or("lock has no parent")?)
@@ -243,16 +217,19 @@ fn controller(opts: &Options, cwd: &Path) -> Result<(), String> {
         .open(lock_path)
         .map_err(|e| e.to_string())?;
     let _lock = aterm_toolchain::record_lock::RecordLock::try_lock(lock_file, 0)
-        .map_err(|e| format!("another sample owns this Mac: {e}"))?;
+        .map_err(|e| format!("another follower runs on this Mac: {e}"))?;
     let mut opts = opts.clone();
+    let repair_cwd = opts.repair_cwd(cwd)?;
     opts.workspace = prepare_workspace(&opts, cwd)?;
+    let mut world = Live::open(&opts.workspace, &repair_cwd)?;
     let stop = aterm_toolchain::interrupt::Watch::enter();
     let mut declined = None;
+    let mut worker = None;
     loop {
         if stop.caught().is_some() {
             return Ok(());
         }
-        let result = attempt(&opts);
+        let result = attempt(&opts, &mut world, &mut worker);
         if let Some(line) = log_line(&mut declined, &result) {
             eprintln!("{line}");
         }
@@ -266,29 +243,30 @@ fn controller(opts: &Options, cwd: &Path) -> Result<(), String> {
 /// How a turn of the controller's loop ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Start {
-    /// A tree was claimed, and its attempt's last record is in the journal.
+    /// A tip was judged, or its pass was interrupted.
     Judged,
-    /// No sample started, and why.
+    /// No pass started, and why.
     Declined(String),
 }
 
-/// What a turn of the loop leaves in the lane's own log: a failure each time, and a declined
-/// start once per reason, `declined` being the reason last written. A lane that starts nothing
-/// for hours says why once, not at every turn.
-fn log_line(declined: &mut Option<String>, result: &Result<Start, String>) -> Option<String> {
-    let reason = match result {
-        Ok(Start::Declined(why)) => Some(why),
-        _ => None,
-    };
+/// What a turn of the loop leaves in the follower's own log: a failure or a declined start once
+/// per reason, `last` being the line last written. A follower that starts nothing for hours, or
+/// that GitHub refuses at every turn, says why once, not at every turn; a pass in between makes
+/// the reason news again.
+fn log_line(last: &mut Option<String>, result: &Result<Start, String>) -> Option<String> {
     let line = match result {
-        Err(why) => Some(format!("verify watch: sample could not run: {why}")),
-        Ok(Start::Declined(why)) if declined.as_ref() != Some(why) => {
-            Some(format!("verify watch: no sample started: {why}"))
+        Err(why) => format!("verify watch: pass could not run: {why}"),
+        Ok(Start::Declined(why)) => format!("verify watch: no pass started: {why}"),
+        Ok(Start::Judged) => {
+            *last = None;
+            return None;
         }
-        Ok(_) => None,
     };
-    *declined = reason.cloned();
-    line
+    if last.as_ref() == Some(&line) {
+        return None;
+    }
+    *last = Some(line.clone());
+    Some(line)
 }
 
 fn prepare_workspace(opts: &Options, cwd: &Path) -> Result<PathBuf, String> {
@@ -311,7 +289,7 @@ fn prepare_workspace(opts: &Options, cwd: &Path) -> Result<PathBuf, String> {
                 opts.workspace.to_str().ok_or("workspace is not UTF-8")?,
             ],
         )?;
-        // Seed independent objects locally; every sample still fetches the actual remote.
+        // Seed independent objects locally; every pass still fetches the actual remote.
         // A full network clone of this repository can exceed the bounded Git call.
         git(&opts.workspace, &["remote", "set-url", "origin", &source])?;
         fs::write(
@@ -334,468 +312,502 @@ fn prepare_workspace(opts: &Options, cwd: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(root).map_err(|e| e.to_string())
 }
 
-fn attempt(opts: &Options) -> Result<Start, String> {
-    let signal_from = aterm_uds::signal_origin::records().len();
-    let root = &opts.workspace;
-    // What the last attempt left reaches the journal before anything new is claimed.
-    settle(root, now())?;
-    if foreground_waiting(root)? {
-        return Ok(Start::Declined(
-            "a release holds this Mac, or foreground work waits for its capacity".into(),
-        ));
+/// One follower status on a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Status {
+    /// `pending`, `success`, `failure` or `error`.
+    state: String,
+    description: String,
+}
+
+impl Status {
+    fn new(state: &str, description: String) -> Self {
+        Self {
+            state: state.into(),
+            description: clip(&description, DESCRIPTION_CHARS),
+        }
     }
+
+    /// Whether this status is a verdict: a commit that has one is not judged again.
+    fn verdict(&self) -> bool {
+        matches!(self.state.as_str(), "success" | "failure" | "error")
+    }
+
+    /// The repair worker a failure names: a tab ID, or the `s-` ID of a worker started before
+    /// the `t` form.
+    fn worker(&self) -> Option<&str> {
+        let rest = self.description.split_once("repair ")?.1;
+        let sid = rest.split([':', ' ', ';']).next()?;
+        let named = aterm_types::tab_id::is_tab_id(sid) || aterm_types::tab_id::is_legacy(sid);
+        (self.state == "failure" && named).then_some(sid)
+    }
+}
+
+/// Where a repair worker's task stands, as `aterm ctl @<sid> task` says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Worker {
+    /// It works, or it is stalled at a start or a hold it leaves by itself; or its record could
+    /// not be read. It holds the one repair place.
+    Working,
+    /// It ended unfinished (`failed`), or is stalled where only a mark moves it: it keeps the
+    /// reds it was given.
+    Failed,
+    /// It finished, exited, runs no task, or its session is gone.
+    Ended,
+}
+
+/// A worker's [`Worker`] from its task record (`OK task rev=… state=<s> … why=<w> …`).
+fn task_state(record: &str) -> Worker {
+    let word = |key: &str| {
+        record
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+    };
+    match (word("state="), word("why=")) {
+        (Some("working"), _) | (Some("stalled"), Some("startup" | "held")) => Worker::Working,
+        (Some("failed" | "stalled"), _) => Worker::Failed,
+        (Some(_), _) => Worker::Ended,
+        (None, _) if record.split_whitespace().eq(["OK", "task", "-"]) => Worker::Ended,
+        (None, _) => Worker::Working,
+    }
+}
+
+/// What a pass reads and writes beyond its checkout: main's commit statuses and the repair
+/// worker. The controller's is [`Live`]; a test scripts one.
+trait World {
+    /// The follower's statuses on `commit`, newest first.
+    fn statuses(&mut self, commit: &str) -> Result<Vec<Status>, String>;
+    /// Post `status` on `commit`.
+    fn post(&mut self, commit: &str, status: &Status) -> Result<(), String>;
+    /// Where the worker `sid`'s task stands.
+    fn worker(&mut self, sid: &str) -> Worker;
+    /// End the agent of `sid`, a worker that no longer holds the repair place, so ended workers
+    /// do not pile up idle.
+    fn retire(&mut self, sid: &str);
+    /// Start a repair worker on `task`: its sid.
+    fn spawn(&mut self, task: &str) -> Result<String, String>;
+}
+
+/// The live world: GitHub through the verifier's linked agh, routed by the clone's own remote,
+/// and the workers through `aterm ctl`.
+struct Live {
+    root: PathBuf,
+    slug: String,
+    repair_cwd: PathBuf,
+}
+
+impl Live {
+    fn open(root: &Path, repair_cwd: &Path) -> Result<Self, String> {
+        let until = Instant::now() + Duration::from_secs(60);
+        let run = |tool, args: &[std::ffi::OsString]| {
+            crate::remote::run(root, &git_command, tool, args, until)
+        };
+        let remote = crate::remote::Remote::open(root, "origin", &run)?;
+        let slug = remote
+            .github()
+            .ok_or("the follower posts commit statuses, so its origin must be a GitHub repository")?
+            .to_owned();
+        Ok(Self {
+            root: root.to_owned(),
+            slug,
+            repair_cwd: repair_cwd.to_owned(),
+        })
+    }
+
+    fn agh(&self, args: &[&str]) -> Result<Vec<u8>, String> {
+        let args: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+        let out = crate::remote::run(
+            &self.root,
+            &git_command,
+            crate::remote::Tool::Agh,
+            &args,
+            Instant::now() + Duration::from_secs(120),
+        )?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(format!(
+                "agh {}: {}",
+                args.first()
+                    .map(|a| a.to_string_lossy())
+                    .unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    fn ctl(args: &[&str], input: &[u8]) -> Result<String, String> {
+        let mut cmd = aterm_uds::spawnfd::command("aterm");
+        cmd.arg("ctl").args(args);
+        output(&mut cmd, input).map_err(|why| format!("aterm ctl {}: {why}", args[0]))
+    }
+}
+
+/// The follower's statuses, `(state, description)` newest first, in GitHub's answer to
+/// `GET /repos/{owner}/{repo}/commits/{sha}/statuses`; `None` where the answer is no list.
+pub fn follower_statuses(answer: &aterm_json::Value) -> Option<Vec<(String, String)>> {
+    let text =
+        |row: &aterm_json::Value, key: &str| row[key].as_str().unwrap_or_default().to_owned();
+    Some(
+        answer
+            .as_array()?
+            .iter()
+            .filter(|row| row["context"].as_str() == Some(CONTEXT))
+            .map(|row| (text(row, "state"), text(row, "description")))
+            .collect(),
+    )
+}
+
+impl World for Live {
+    fn statuses(&mut self, commit: &str) -> Result<Vec<Status>, String> {
+        let path = format!("repos/{}/commits/{commit}/statuses", self.slug);
+        let body = self.agh(&["api", &path])?;
+        let value: aterm_json::Value =
+            aterm_json::from_slice(&body).map_err(|e| format!("{path}: {e}"))?;
+        let rows = follower_statuses(&value).ok_or_else(|| format!("{path}: no list"))?;
+        Ok(rows
+            .into_iter()
+            .map(|(state, description)| Status { state, description })
+            .collect())
+    }
+
+    fn post(&mut self, commit: &str, status: &Status) -> Result<(), String> {
+        let path = format!("repos/{}/statuses/{commit}", self.slug);
+        self.agh(&[
+            "api",
+            &path,
+            "-X",
+            "POST",
+            "-f",
+            &format!("state={}", status.state),
+            "-f",
+            &format!("context={CONTEXT}"),
+            "-f",
+            &format!("description={}", status.description),
+        ])
+        .map(drop)
+    }
+
+    fn worker(&mut self, sid: &str) -> Worker {
+        match Self::ctl(&[&format!("@{sid}"), "task"], &[]) {
+            Ok(record) => task_state(&record),
+            Err(why) if why.contains("no such session") => Worker::Ended,
+            // Unread is not ended: a second worker beside a live one is the failure to avoid.
+            Err(_) => Worker::Working,
+        }
+    }
+
+    fn retire(&mut self, sid: &str) {
+        // `quiet=60`: a tab a person typed in during the last minute is theirs, and stays.
+        if let Err(why) = Self::ctl(&[&format!("@{sid}"), "signal", "term", "quiet=60"], &[]) {
+            eprintln!("verify watch: worker {sid} left as it is: {why}");
+        }
+    }
+
+    fn spawn(&mut self, task: &str) -> Result<String, String> {
+        let cwd = format!("cwd={}", self.repair_cwd.display());
+        let reply = Self::ctl(
+            &[
+                "spawn",
+                "agent=claude",
+                // The follower has no tab of its own: a worker it starts opens behind the
+                // person's work, never in front of it.
+                "raise=false",
+                &cwd,
+                "why=the follower found main red: bisect and fix forward",
+                "label=follower-repair",
+                "-",
+            ],
+            task.as_bytes(),
+        )?;
+        reply
+            .lines()
+            .find_map(|line| line.strip_prefix("OK "))
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("aterm ctl spawn answered {reply:?}"))
+    }
+}
+
+fn host() -> String {
+    aterm_uds::process::kernel_host_name().unwrap_or_else(|| "this Mac".into())
+}
+
+/// One turn: fetch main, and judge its newest tip unless a follower already has.
+fn attempt(
+    opts: &Options,
+    world: &mut dyn World,
+    worker: &mut Option<String>,
+) -> Result<Start, String> {
+    let root = &opts.workspace;
     // verify watch follows the invoking checkout's arbitrary remote, which may be private. URL
     // shape alone is no authority to classify this read as credential-less.
     git(root, &["fetch", "--quiet", "origin", &opts.branch])?;
-    let commit = git(root, &["rev-parse", "FETCH_HEAD^{commit}"])?;
-    let tree = git(root, &["rev-parse", &format!("{commit}^{{tree}}")])?;
-    let host = aterm_uds::process::kernel_host_name().ok_or("host has no name")?;
-    let started = now();
-    let mut record = Record {
-        commit: commit.clone(),
-        tree,
-        host,
-        // No verifier has run yet. Only a sampled-head result may name one.
-        verifier: String::new(),
-        controller: format!(
-            "sha256={} pid={} {}",
-            crate::report::running_driver().unwrap_or("unavailable"),
-            std::process::id(),
-            aterm_uds::signal_origin::identity(std::process::id() as i32)
-        ),
-        inputs: String::new(),
-        token: aterm_uds::rand::hex_token::<16>().map_err(|e| e.to_string())?,
-        state: "judging".into(),
-        cause: String::new(),
-        started,
-        updated: started,
-        lease_until: started + judged::LEASE,
-        rows: Vec::new(),
+    let tip = git(root, &["rev-parse", "FETCH_HEAD^{commit}"])?;
+    if let Some(done) = world.statuses(&tip)?.into_iter().find(Status::verdict) {
+        return Ok(Start::Declined(format!(
+            "{tip} has the follower's {}: {}",
+            done.state, done.description
+        )));
+    }
+    world.post(
+        &tip,
+        &Status::new("pending", format!("judging on {}", host())),
+    )?;
+    let Some(sample) = judge(root, &tip).unwrap_or_else(|why| {
+        Some(Sample {
+            state: "could-not-run".into(),
+            rows: vec![could_not_run("follower", why)],
+        })
+    }) else {
+        // The controller was stopped: the tip keeps its pending status and is judged again.
+        return Ok(Start::Judged);
     };
-    eprintln!(
-        "watch controller: {}; tree={}",
-        record.controller, record.tree
+    let before: Vec<String> = git(
+        root,
+        &[
+            "rev-list",
+            "--first-parent",
+            &format!("--max-count={WALK}"),
+            &format!("{tip}^"),
+        ],
+    )
+    .map(|text| text.lines().map(str::to_owned).collect())
+    .unwrap_or_default();
+    let status = conclude(world, &tip, &before, &sample, worker, &opts.workspace)?;
+    println!(
+        "verify watch: {tip} {}: {}",
+        status.state, status.description
     );
-    // The claim precedes all expensive work. A losing append must inspect the winning claim.
-    loop {
-        let until = judged::deadline();
-        let head = judged::head(root, "origin", until)?;
-        if let Some(held) = holder(root, head.as_deref(), &record.tree, now(), until)? {
-            return Ok(Start::Declined(format!(
-                "{} is {} by {}",
-                record.commit, held.state, held.host
-            )));
-        }
-        if judged::append(root, "origin", head.as_deref(), &record, until)? {
-            break;
+    for row in &sample.rows {
+        for red in &row.red_items {
+            println!("verify watch: red {}: {red}", row.id);
         }
     }
-    // Kept from the claim until the journal holds this attempt's last record: a controller that
-    // ends while judging leaves its claim here, for the next loop to close. A claim whose append
-    // ended with its outcome unknown (the push child killed at its deadline after the remote
-    // took the commit) returned above: it is not kept, and lapses with no later record.
-    save(root, &record)?;
-    let mut unrenewed = None;
-    let result = judge(root, &mut record, &mut unrenewed);
-    if let Err(why) = result {
-        record.state = "could-not-run".into();
-        record.cause = why.clone();
-        record.rows.push(lane_row(why));
-    }
-    let signals: Vec<_> = aterm_uds::signal_origin::records()
-        .into_iter()
-        .skip(signal_from)
-        .collect();
-    if !signals.is_empty() {
-        record.cause.push_str(&format!("\n{}", signals.join("\n")));
-    }
-    if let Some(why) = unrenewed {
-        record.cause.push_str(&format!("\n{why}"));
-    }
-    conclude(root, &mut record, now())?;
     Ok(Start::Judged)
 }
 
-/// The record that keeps a new claim out of `tree` at `epoch`: a live claim or a verdict in its
-/// slot, or a verdict filed beside it. A tree with a verdict is not judged again, wherever the
-/// verdict is filed, so no red is run again into a pass.
-fn holder(
-    root: &Path,
-    head: Option<&str>,
-    tree: &str,
-    epoch: u64,
-    until: Instant,
-) -> Result<Option<Record>, String> {
-    if let Some(held) = judged::record(root, head, tree, until)?
-        && held.occupied(epoch)
-    {
-        return Ok(Some(held));
-    }
-    Ok(judged::beside(root, head, tree, until)?
-        .into_iter()
-        .find(|late| matches!(late.state.as_str(), "pass" | "red")))
+/// What the commits before a red tip say: the newest green, the oldest red since it, and the
+/// newest failure, which names the repair worker last started.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Before {
+    green: Option<String>,
+    oldest_red: Option<String>,
+    failure: Option<Status>,
+    /// Every status was read back to the green, or to the end of the commits given. Where not,
+    /// a worker no status read names may still work.
+    complete: bool,
 }
 
-#[derive(Debug)]
-enum PublishError {
-    /// Another attempt's live claim or verdict holds the tree's slot; what it is.
-    Displaced(String),
-    Unavailable(String),
-}
-
-impl From<String> for PublishError {
-    fn from(why: String) -> Self {
-        Self::Unavailable(why)
+impl Before {
+    /// The repair worker the newest failure names.
+    fn worker(&self) -> Option<&str> {
+        self.failure.as_ref().and_then(Status::worker)
     }
 }
 
-impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Displaced(held) => write!(f, "another attempt holds this tree: {held}"),
-            Self::Unavailable(why) => f.write_str(why),
+/// Read the follower's statuses of `before` (first-parent commits, newest first) back to the
+/// newest green. A read that fails ends the walk with what it found.
+fn walk(world: &mut dyn World, before: &[String]) -> Before {
+    let mut found = Before {
+        complete: true,
+        ..Before::default()
+    };
+    for commit in before {
+        let statuses = match world.statuses(commit) {
+            Ok(statuses) => statuses,
+            Err(why) => {
+                eprintln!(
+                    "verify watch: the walk to the last green tip stopped at {commit}: {why}"
+                );
+                found.complete = false;
+                break;
+            }
+        };
+        let Some(status) = statuses.into_iter().find(Status::verdict) else {
+            continue;
+        };
+        match status.state.as_str() {
+            "success" => {
+                found.green = Some(commit.clone());
+                break;
+            }
+            "failure" => {
+                found.oldest_red = Some(commit.clone());
+                if found.failure.is_none() {
+                    found.failure = Some(status);
+                }
+            }
+            _ => {}
         }
     }
+    found
+}
+
+/// Post `sample`'s verdict on `tip`. A red pass names one repair worker in its failure: the one
+/// `worker` or the newest failure names while it works, or while it could not finish these same
+/// reds (a fresh one would meet what stopped it); else a new one, the ended one retired. Where
+/// the statuses could not be read back to a worker or a green, none is started: one may work.
+fn conclude(
+    world: &mut dyn World,
+    tip: &str,
+    before: &[String],
+    sample: &Sample,
+    worker: &mut Option<String>,
+    root: &Path,
+) -> Result<Status, String> {
+    let status = match sample.state.as_str() {
+        "pass" => Status::new(
+            "success",
+            format!(
+                "pass on {}: {}",
+                host(),
+                sample
+                    .rows
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ),
+        "red" => {
+            let reds = reds(&sample.rows);
+            let failure = |sid: Option<&str>| {
+                let repair = sid.map_or_else(String::new, |sid| format!(", repair {sid}"));
+                Status::new(
+                    "failure",
+                    format!("{} red{repair}: {}", reds.len(), reds.join("; ")),
+                )
+            };
+            let earlier = walk(world, before);
+            let named = worker
+                .clone()
+                .or_else(|| earlier.worker().map(str::to_owned));
+            let held = named.map(|sid| {
+                let state = world.worker(&sid);
+                (sid, state)
+            });
+            *worker = match held {
+                Some((sid, Worker::Working)) => Some(sid),
+                Some((sid, Worker::Failed))
+                    if earlier.failure.as_ref() == Some(&failure(Some(&sid))) =>
+                {
+                    Some(sid)
+                }
+                None if !earlier.complete => None,
+                ended => {
+                    if let Some((sid, _)) = ended {
+                        world.retire(&sid);
+                    }
+                    let task = repair_task(tip, &earlier, &sample.rows, root);
+                    match world.spawn(&task) {
+                        Ok(sid) => Some(sid),
+                        Err(why) => {
+                            eprintln!("verify watch: no repair worker started: {why}");
+                            None
+                        }
+                    }
+                }
+            };
+            failure(worker.as_deref())
+        }
+        _ => {
+            let row = sample
+                .rows
+                .iter()
+                .find(|row| row.outcome != "pass")
+                .map_or_else(
+                    || "no row".to_owned(),
+                    |row| {
+                        format!(
+                            "{}: {}",
+                            row.id,
+                            row.log
+                                .lines()
+                                .rev()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("")
+                        )
+                    },
+                );
+            Status::new("error", format!("could not run {row}"))
+        }
+    };
+    world.post(tip, &status)?;
+    Ok(status)
+}
+
+/// Every red of a pass, in row order, each once.
+fn reds(rows: &[Row]) -> Vec<String> {
+    let mut reds: Vec<String> = Vec::new();
+    for red in rows.iter().flat_map(|row| &row.red_items) {
+        if !reds.contains(red) {
+            reds.push(red.clone());
+        }
+    }
+    reds
+}
+
+/// `text` in at most `chars` characters, an ellipsis ending one that was cut.
+fn clip(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(chars.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// The repair worker's task: the red tip, the last green tip, and every red. The bisect runs
+/// between the tip, which these reds were seen on, and the green, the one tip known good; the
+/// oldest red since the green may have been red for other tests, so it is only named.
+fn repair_task(tip: &str, earlier: &Before, rows: &[Row], root: &Path) -> String {
+    let (green_line, range) = match &earlier.green {
+        Some(green) => (
+            format!("The last green first-parent tip is {green}."),
+            format!("git bisect start --first-parent {tip} {green}"),
+        ),
+        None => (
+            "No first-parent tip read before it is green: mark a good one yourself (`git bisect good <rev>`) once the red tests pass there.".to_owned(),
+            format!("git bisect start --first-parent {tip}"),
+        ),
+    };
+    let oldest = earlier.oldest_red.as_ref().map_or_else(String::new, |red| {
+        format!(" The oldest red tip since then is {red}; its reds may be other ones.")
+    });
+    let mut task = format!(
+        "The follower (`verify watch`, commit status context {CONTEXT}) judged origin/main red at {tip}. \
+         {green_line}{oldest}\n\nRed, by row, then package, target and test:\n"
+    );
+    for row in rows.iter().filter(|row| row.outcome == "red") {
+        for red in &row.red_items {
+            task.push_str(&format!("- {}: {red}\n", row.id));
+        }
+    }
+    task.push_str(&format!(
+        "\nFind the landing that turned each red and fix it forward:\n\
+         1. Work in a new worktree of your own under ~/.ubd, never in the follower's checkout {}.\n\
+         2. Run each red test on origin/main first. Where every one passes there, a landing since {tip} \
+         fixed them: name it and end.\n\
+         3. Bisect over first-parent landings only, running only the red tests, one at a time: \
+         `{range}`, then `git bisect run targo --unverified test -p <package> <target> -- <test> --exact`.\n\
+         4. Fix forward on a branch and land it with `targo --unverified verify land`. Revert nothing.\n\
+         A red that does not reproduce is read for a product cause first. Delete a test only where its \
+         own timing is the shown cause, never only because its red did not reproduce. Where no cause \
+         is found, end with `Could not finish: <why>`: this follower starts no other worker on the \
+         same reds.\n",
+        root.display()
+    ));
+    task
 }
 
 const STOP_GRACE: Duration = Duration::from_secs(20);
-/// How long after a renewal that failed the next one is tried, in seconds.
-const RENEW_RETRY: u64 = 60;
-const _: () = assert!(RENEW_RETRY < judged::RENEW_EVERY);
-
-/// When a claim is renewed: at each stage end and at least every [`judged::RENEW_EVERY`]
-/// seconds, and [`RENEW_RETRY`] seconds after a renewal the journal did not take. A renewal
-/// that fails is counted and ends nothing: a judgment of an hour or two is worth more than its
-/// lease, and where two hosts each reach a pass or a red for one tree the journal keeps both
-/// ([`publish`]).
-struct Renewal {
-    next: Instant,
-    stages: usize,
-    failures: u32,
-    last_failure: Option<String>,
-}
-
-impl Renewal {
-    /// A claim whose first renewal is due at `now`: it carries the sampled inputs.
-    fn new(now: Instant) -> Self {
-        Self {
-            next: now,
-            stages: 0,
-            failures: 0,
-            last_failure: None,
-        }
-    }
-
-    fn due(&self, now: Instant, stages: usize) -> bool {
-        now >= self.next || stages != self.stages
-    }
-
-    fn renewed(&mut self, now: Instant, stages: usize) {
-        self.next = now + Duration::from_secs(judged::RENEW_EVERY);
-        self.stages = stages;
-    }
-
-    fn failed(&mut self, now: Instant, stages: usize, why: &PublishError) {
-        // Another attempt's hold ends with its verdict or its lease, neither of them soon.
-        let again = match why {
-            PublishError::Displaced(_) => judged::RENEW_EVERY,
-            PublishError::Unavailable(_) => RENEW_RETRY,
-        };
-        self.next = now + Duration::from_secs(again);
-        self.stages = stages;
-        self.failures += 1;
-        self.last_failure = Some(why.to_string());
-    }
-
-    /// What the renewals that failed leave for the attempt's last record.
-    fn evidence(&self) -> Option<String> {
-        self.last_failure.as_ref().map(|last| {
-            format!(
-                "claim renewals that failed: {}; the last: {last}",
-                self.failures
-            )
-        })
-    }
-}
-
-/// Whether `held`, the record in a tree's slot, keeps `record` out of it: another attempt's
-/// live claim or verdict. Anything else there is what a new claim may replace
-/// ([`Record::occupied`]), and so may this attempt's own next record.
-fn displaced_by<'a>(held: Option<&'a Record>, record: &Record, epoch: u64) -> Option<&'a Record> {
-    held.filter(|held| held.token != record.token && held.occupied(epoch))
-}
-
-/// Renew `record`'s claim of its tree's slot, where no other attempt holds it.
-fn renew(root: &Path, record: &Record, epoch: u64, until: Instant) -> Result<(), PublishError> {
-    loop {
-        let head = judged::head(root, "origin", until)?;
-        let held = judged::record(root, head.as_deref(), &record.tree, until)?;
-        if let Some(held) = displaced_by(held.as_ref(), record, epoch) {
-            return Err(PublishError::Displaced(format!(
-                "{} by {}",
-                held.state, held.host
-            )));
-        }
-        if judged::append(root, "origin", head.as_deref(), record, until)? {
-            return Ok(());
-        }
-    }
-}
-
-/// File `record`, an attempt's last, in the journal, and say where. It goes beside its tree's
-/// slot only where another attempt's live claim, or another attempt's pass or red, holds the
-/// slot ([`displaced_by`]); the slot keeps that record. Anywhere else it goes at the slot.
-/// Where the slot holds another attempt's lapsed claim, or the cancelled or could-not-run
-/// record another attempt ended with, this record replaces it at the head, and the replaced
-/// record stays only in the journal's history (`--census REF --since` reads it). Another
-/// attempt's pass or red is never replaced. A record the journal has already held is not
-/// appended again. Every write is the journal's compare-and-swap append.
-fn publish(
-    root: &Path,
-    record: &Record,
-    epoch: u64,
-    until: Instant,
-) -> Result<Option<judged::Place>, String> {
-    loop {
-        let head = judged::head(root, "origin", until)?;
-        if judged::published(root, head.as_deref(), record, until)? {
-            return Ok(None);
-        }
-        let held = judged::record(root, head.as_deref(), &record.tree, until)?;
-        let place = match displaced_by(held.as_ref(), record, epoch) {
-            Some(_) => judged::Place::Beside,
-            None => judged::Place::Slot,
-        };
-        if judged::append_at(root, "origin", head.as_deref(), record, place, until)? {
-            return Ok(Some(place));
-        }
-    }
-}
-
-/// What a judgment's wait reads and does. The controller's is [`Live`]; a test scripts one, and
-/// runs a judgment's hours in no time.
-trait Attended {
-    /// The sample's exit status, once it has ended.
-    fn exited(&mut self) -> Result<Option<std::process::ExitStatus>, String>;
-    /// End the sample and what it started.
-    fn stop(&mut self) -> Result<(), String>;
-    /// The signal this controller caught, if any.
-    fn signal(&self) -> Option<i32>;
-    /// Now: the monotonic clock, and Unix seconds.
-    fn now(&self) -> (Instant, u64);
-    /// How many of the sample's stages have ended.
-    fn stages(&mut self) -> usize;
-    /// Wait before the next look.
-    fn pause(&mut self);
-}
-
-/// How a judgment's wait ended.
-#[derive(Debug)]
-enum Ended {
-    Exited(std::process::ExitStatus),
-    /// This controller caught the signal and stopped the sample.
-    Interrupted(i32),
-}
-
-/// The controller's sample: its process group, the checkout its stages write their logs in, and
-/// the real clocks.
-struct Live<'a> {
-    child: aterm_uds::spawnfd::Child,
-    stopped: aterm_toolchain::interrupt::Watch,
-    root: &'a Path,
-    began: std::time::SystemTime,
-    looked: Option<Instant>,
-    stages: usize,
-}
-
-impl Attended for Live<'_> {
-    fn exited(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
-        self.child.try_wait().map_err(|e| e.to_string())
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        stop_sample(&mut self.child)
-    }
-
-    fn signal(&self) -> Option<i32> {
-        self.stopped.caught()
-    }
-
-    fn now(&self) -> (Instant, u64) {
-        (Instant::now(), now())
-    }
-
-    fn stages(&mut self) -> usize {
-        // One directory read every few seconds, not at every look.
-        if self
-            .looked
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
-        {
-            self.stages = stage_ends(self.root, self.began);
-            self.looked = Some(Instant::now());
-        }
-        self.stages
-    }
-
-    fn pause(&mut self) {
-        self.stopped.nap(Duration::from_millis(100), &|| false);
-    }
-}
-
-/// How many stages of the sample that began at `since` have ended: each writes
-/// `.git/watch-<stage>.log` once, as it ends. The sample's own output and the service's log
-/// are no stage's.
-fn stage_ends(root: &Path, since: std::time::SystemTime) -> usize {
-    let Ok(entries) = fs::read_dir(root.join(".git")) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("watch-")
-                && name.ends_with(".log")
-                && name != "watch-sample.log"
-                && name != "watch-service.log"
-                && entry
-                    .metadata()
-                    .and_then(|file| file.modified())
-                    .is_ok_and(|written| written >= since)
-        })
-        .count()
-}
-
-/// Where the checkout keeps its controller's attempt, from the claim until the journal holds
-/// the attempt's last record.
-fn saved(root: &Path) -> PathBuf {
-    root.join(".git/watch-record.toml")
-}
-
-/// Keep `record` in the checkout, whole or not at all.
-fn save(root: &Path, record: &Record) -> Result<(), String> {
-    let path = saved(root);
-    let fresh = path.with_extension("toml.new");
-    fs::write(
-        &fresh,
-        aterm_toml::to_string(record).map_err(|e| e.to_string())?,
-    )
-    .and_then(|()| fs::rename(&fresh, &path))
-    .map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// End an attempt at `epoch`: its last record is kept in the checkout first, so a publish that
-/// fails, or a controller that ends here, leaves it for the next loop ([`settle`]).
-fn conclude(root: &Path, record: &mut Record, epoch: u64) -> Result<(), String> {
-    record.updated = epoch;
-    record.lease_until = 0;
-    save(root, record)?;
-    settle(root, epoch)
-}
-
-/// Publish the record the checkout keeps ([`publish`]), and forget it once the journal holds
-/// it. A kept record still `judging` is a claim whose controller ended before its attempt did,
-/// since no judgment of this controller is in flight when its loop turns: it is closed as
-/// could-not-run. A kept record that cannot be read is set aside, and stops no later sample.
-fn settle(root: &Path, epoch: u64) -> Result<(), String> {
-    let path = saved(root);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    let mut record = match aterm_toml::from_str::<Record>(&text) {
-        Ok(record) => record,
-        Err(error) => {
-            let aside = path.with_extension("unreadable.toml");
-            eprintln!(
-                "verify watch: {} is no record ({error}); kept as {}",
-                path.display(),
-                aside.display()
-            );
-            return fs::rename(&path, &aside).map_err(|e| format!("{}: {e}", path.display()));
-        }
-    };
-    if record.state == "judging" {
-        let why = "the controller ended before this attempt had a last record";
-        record.state = "could-not-run".into();
-        record.cause = why.into();
-        record.rows.push(lane_row(why.into()));
-        record.updated = epoch;
-        record.lease_until = 0;
-        save(root, &record)?;
-    }
-    let place = publish(root, &record, epoch, judged::deadline())?;
-    fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!(
-        "verify watch: {} {} elapsed_s={} (journal {}, {}) cause={:?}",
-        record.state,
-        record.commit,
-        record.updated.saturating_sub(record.started),
-        judged::REF,
-        match place {
-            Some(judged::Place::Slot) => "at its tree's slot",
-            Some(judged::Place::Beside) => "beside another attempt's record",
-            None => "which held it already",
-        },
-        record.cause
-    );
-    Ok(())
-}
-
-/// The row of a record the lane itself could not run.
-fn lane_row(why: String) -> Row {
-    Row {
-        id: "lane".into(),
-        outcome: "could-not-run".into(),
-        log: why,
-        red_items: vec![],
-        suspects: vec![],
-        fixed_by: None,
-        decisions: vec![],
-    }
-}
-
-/// Wait for `sample` to end, renewing `record`'s claim meanwhile ([`Renewal`]). Only the
-/// sample's own end or this controller's signal ends the wait. A renewal the journal did not
-/// take is logged and counted, and what the count holds is returned beside the end.
-fn attend(
-    root: &Path,
-    record: &mut Record,
-    sample: &mut dyn Attended,
-) -> Result<(Ended, Option<String>), String> {
-    let mut renewal = Renewal::new(sample.now().0);
-    loop {
-        if let Some(status) = sample.exited()? {
-            return Ok((Ended::Exited(status), renewal.evidence()));
-        }
-        if let Some(signal) = sample.signal() {
-            sample.stop()?;
-            return Ok((Ended::Interrupted(signal), renewal.evidence()));
-        }
-        let (at, epoch) = sample.now();
-        let stages = sample.stages();
-        if renewal.due(at, stages) {
-            record.updated = epoch;
-            record.lease_until = epoch + judged::LEASE;
-            match judged::interruptible(|| renew(root, record, epoch, judged::deadline())) {
-                Ok(()) => renewal.renewed(at, stages),
-                Err(why) => {
-                    eprintln!(
-                        "verify watch: the claim was not renewed, and the sample goes on: {why}"
-                    );
-                    renewal.failed(at, stages, &why);
-                }
-            }
-        }
-        sample.pause();
-    }
-}
 
 fn sample_command(program: &Path) -> aterm_uds::spawnfd::Command {
+    use aterm_uds::spawnfd::Tether as _;
     let mut cmd = aterm_uds::spawnfd::command(program);
     // launchd's session is zero. Tests exercise native terminal identities, so
-    // the sample leads both its own session and its cancellable process group.
+    // the pass leads both its own session and its cancellable process group.
     cmd.setsid(true).tether();
     cmd
 }
@@ -828,7 +840,7 @@ impl SampleExec {
             cwd: root.to_owned(),
             args: vec![
                 "watch".into(),
-                "--sample-ready".into(),
+                "--pass".into(),
                 result.as_os_str().to_owned(),
             ],
             removed: sample_removed_env(),
@@ -856,7 +868,7 @@ impl SampleExec {
             return std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "sample exec is in {}, expected {}",
+                    "pass exec is in {}, expected {}",
                     here.display(),
                     cwd.display()
                 ),
@@ -913,108 +925,64 @@ fn configure_sample_test(mut next: SampleExec) -> SampleExec {
     next
 }
 
-/// Judge `record`'s commit in a sample of its own, and leave the attempt's state, cause and
-/// rows in `record`. `unrenewed` is what the claim's failed renewals left, if any failed.
-fn judge(root: &Path, record: &mut Record, unrenewed: &mut Option<String>) -> Result<(), String> {
+/// Judge `tip` in a pass of its own: its result, or `None` when this controller was stopped.
+fn judge(root: &Path, tip: &str) -> Result<Option<Sample>, String> {
     if !git(root, &["status", "--porcelain"])?.is_empty() {
         return Err("watch workspace is dirty; preserving its work".into());
     }
-    git(root, &["checkout", "--quiet", "--detach", &record.commit])?;
+    git(root, &["checkout", "--quiet", "--detach", tip])?;
     // vendor/astream is private. Its URL may be HTTPS, but only caller authority—not URL shape—
     // can say a read is anonymous.
     git(root, &["submodule", "update", "--init", "vendor/astream"])?;
     git(root, &["config", "submodule.recurse", "true"])?;
-    // The wait's first renewal carries these to the journal.
-    record.inputs = source_inputs(root)?;
     let result = root.join(".git/watch-result.toml");
     let _ = fs::remove_file(&result);
     let log = root.join(".git/watch-sample.log");
     // This controller may be long-lived. It launches only the tiny bootstrap in its own image;
-    // that bootstrap builds and execs this sampled head's verifier before any row is run.
+    // that bootstrap builds and execs the tip's verifier before any row is run.
     let mut cmd = sample_command(&std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.current_dir(root)
         .args(["watch", "--sample"])
         .arg(&result);
-    let output = File::create(&log).map_err(|e| e.to_string())?;
-    cmd.stderr(output.try_clone().map_err(|e| e.to_string())?)
-        .stdout(output);
-    let began = std::time::SystemTime::now();
-    let child = cmd.spawn().map_err(|e| e.to_string())?;
-    let mut live = Live {
-        child,
-        stopped: aterm_toolchain::interrupt::Watch::enter(),
-        root,
-        began,
-        looked: None,
-        stages: 0,
-    };
-    let (ended, evidence) = attend(root, record, &mut live)?;
-    *unrenewed = evidence;
-    let status = match ended {
-        Ended::Exited(status) => status,
-        Ended::Interrupted(signal) => {
-            record.state = "cancelled".into();
-            record.cause = format!(
-                "controller signal={signal}; {}",
-                aterm_uds::signal_origin::records().join("\n")
-            );
-            return Ok(());
+    let file = File::create(&log).map_err(|e| e.to_string())?;
+    cmd.stderr(file.try_clone().map_err(|e| e.to_string())?)
+        .stdout(file);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let stop = aterm_toolchain::interrupt::Watch::enter();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
         }
+        if stop.caught().is_some() {
+            stop_sample(&mut child)?;
+            return Ok(None);
+        }
+        stop.nap(Duration::from_millis(100), &|| false);
     };
+    let text = fs::read_to_string(&log).unwrap_or_default();
     if !status.success() {
-        if status.code().is_none() || status.code() == Some(75) {
-            cancel_record(
-                record,
-                status,
-                &fs::read_to_string(&log).unwrap_or_default(),
-            );
-            return Ok(());
-        }
-        return Err(format!(
-            "sample exited {status}: {}",
-            row(
-                "sample",
-                status.code(),
-                &fs::read_to_string(&log).unwrap_or_default()
-            )
-            .log
-        ));
+        return Ok(Some(stopped_sample(status, &text)));
     }
-    let text = fs::read_to_string(result).map_err(|error| error.to_string())?;
-    accept_sample_result(&text, record)
+    let result = fs::read_to_string(result).map_err(|error| error.to_string())?;
+    aterm_toml::from_str(&result).map_err(|error| error.to_string())
 }
 
-/// The controller's root-free acceptance boundary. It can copy a sampled result, but has no
-/// repository capability with which to reinterpret or re-attribute it.
-fn accept_sample_result(text: &str, record: &mut Record) -> Result<(), String> {
-    let sample = aterm_toml::from_str::<Sample>(text).map_err(|error| error.to_string())?;
-    // The sampled-head image owns verifier identity, verdict, input and attribution semantics.
-    // The long-lived controller owns only the lease and append; recomputing here would silently
-    // restore its stale rules.
-    record.state = sample.state;
-    record.verifier = sample.verifier;
-    record.inputs = sample.inputs;
-    record.rows = sample.rows;
-    record.cause = record
-        .rows
-        .iter()
-        .filter(|row| row.outcome == "could-not-run")
-        .map(|row| format!("{}: {}", row.id, row.log))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(())
-}
-
-fn cancel_record(record: &mut Record, status: std::process::ExitStatus, log: &str) {
+/// The result of a pass that ended with no result of its own: what stopped it, and its log.
+fn stopped_sample(status: std::process::ExitStatus, log: &str) -> Sample {
     use std::os::unix::process::ExitStatusExt as _;
-    let log = row("sample", Some(75), log).log;
-    record.state = "cancelled".into();
-    record.cause = match status.signal() {
-        Some(signal) => {
-            format!("sample signal={signal}; sender unavailable from wait status\n{log}")
-        }
-        None => format!("sample exit=75; refusal or cooperative stop\n{log}"),
+    let mut row = row("sample", status.code(), log);
+    row.outcome = "could-not-run".into();
+    row.red_items.clear();
+    let why = match (status.signal(), status.code()) {
+        (Some(signal), _) => format!("pass signal={signal}; sender unavailable from wait status"),
+        (None, Some(75)) => "pass exit=75: refusal or cooperative stop".to_owned(),
+        (None, code) => format!("pass exited {code:?}"),
     };
+    row.log = format!("{why}\n{}", row.log);
+    Sample {
+        state: "could-not-run".into(),
+        rows: vec![row],
+    }
 }
 
 fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
@@ -1034,26 +1002,83 @@ fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+/// One row of a pass: what ran, how it ended, and its reds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Row {
+    id: String,
+    /// `pass`, `red` or `could-not-run`.
+    outcome: String,
+    log: String,
+    /// Each red by package, target and test, or by check and finding.
+    red_items: Vec<String>,
+}
+
+/// What a pass hands its controller.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Sample {
+    /// `pass`, `red` or `could-not-run`.
     state: String,
-    verifier: String,
-    inputs: String,
     rows: Vec<Row>,
 }
 
-fn verdict(rows: &[Row]) -> &'static str {
+/// The rows of a pass, in order: the release's tree rows, then cells, and appkit where the Mac
+/// has a desk session.
+const ROWS: [(&str, &[&str]); 8] = [
+    ("inputs", &["ship", "inputs"]),
+    ("stable-x86_64", &["ship", "check", "--compat"]),
+    ("tree", &["verify", "release", "--tree"]),
+    ("cells", &["verify", "cells"]),
+    ("appkit", &["verify", "appkit"]),
+    ("export", &["ship", "check", "--export"]),
+    ("cut", &["ship", "check", "--cut", "--source"]),
+    ("inputs-end", &["ship", "inputs", "--recheck"]),
+];
+
+/// The rows a pass runs on a Mac with (`desk`) or without a desk session.
+fn planned(desk: bool) -> Vec<(&'static str, &'static [&'static str])> {
+    ROWS.into_iter()
+        .filter(|(id, _)| desk || *id != "appkit")
+        .collect()
+}
+
+/// Whether this Mac has a desk session of this user that AppKit checks can run in: its console
+/// is this user's and unlocked, and no SSH session carries the run.
+fn desk() -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    cfg!(target_os = "macos")
+        && std::env::var_os("SSH_CONNECTION").is_none_or(|ssh| ssh.is_empty())
+        && fs::metadata("/dev/console")
+            .is_ok_and(|console| console.uid() == aterm_uds::peer::our_uid())
+        && !crate::smoke::screen_locked()
+}
+
+/// A `verify` row that exited 0 with a check that skipped ran less than it was planned to (an
+/// appkit stage on a console locked since the pass planned it, a cell with no targo): it could
+/// not run, never a pass. `verify` itself refuses a skip only under `release`.
+fn skip_is_no_pass(row: &mut Row, output: &str) {
+    if row.outcome != "pass" {
+        return;
+    }
+    let skipped: Vec<String> = output
+        .lines()
+        .filter_map(crate::event_log::CheckRow::of_event)
+        .filter(|check| check.word == "skip")
+        .map(|check| check.check)
+        .collect();
+    if !skipped.is_empty() {
+        row.outcome = "could-not-run".into();
+        row.log.push_str(&format!(
+            "\n{} skipped; a skip is no pass",
+            skipped.join(", ")
+        ));
+    }
+}
+
+/// A pass's verdict: red where a row is red, a pass only where every planned row passed.
+fn verdict(rows: &[Row], planned: &[&str]) -> &'static str {
     if rows.iter().any(|r| r.outcome == "red") {
         "red"
-    } else if rows.len() == 6
-        && [
-            "inputs",
-            "stable-x86_64",
-            "tree",
-            "export",
-            "cut",
-            "inputs-end",
-        ]
+    } else if planned
         .iter()
         .all(|id| rows.iter().any(|r| r.id == *id && r.outcome == "pass"))
     {
@@ -1067,173 +1092,6 @@ fn inherited_build_env(name: &str) -> bool {
     aterm_toolchain::release_env::clears(name)
         || aterm_toolchain::release_env::launcher_env(name)
         || name.starts_with("TRUST_TARGO_")
-}
-
-fn scrub(cmd: &mut aterm_uds::spawnfd::Command) {
-    for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(inherited_build_env) {
-            cmd.env_remove(name);
-        }
-    }
-}
-
-/// Whether a new sample must stay out of the lane until foreground work has entered it. Once a
-/// sample owns a judging claim, its Background stage admissions retain their place behind
-/// Ordinary work instead of discarding the judgment.
-fn foreground_waiting(root: &Path) -> Result<bool, String> {
-    pressure_waiting(root, SamplePhase::Starting)
-}
-
-/// Whether a Release or line must stop an in-flight judgment before its next stage. Ordinary
-/// work is deliberately absent: capacity gives its overlapping resource reservations priority.
-pub(crate) fn running_should_stop(root: &Path) -> Result<bool, String> {
-    pressure_waiting(root, SamplePhase::Running)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SamplePhase {
-    Starting,
-    Running,
-}
-
-fn pressure_waiting(root: &Path, phase: SamplePhase) -> Result<bool, String> {
-    let ledger = aterm_capacity::Ledger::user().ok_or("no capacity ledger")?;
-    let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
-    let rows = ledger.list().map_err(|e| e.to_string())?;
-    Ok(pressure_requires_stop(&root, &rows, phase))
-}
-
-fn pressure_requires_stop(
-    root: &Path,
-    rows: &[aterm_capacity::Record],
-    phase: SamplePhase,
-) -> bool {
-    rows.iter().any(|r| {
-        r.need.rank == aterm_capacity::Rank::Release
-            || (phase == SamplePhase::Starting
-                && r.need.rank == aterm_capacity::Rank::Ordinary
-                && r.held.is_none()
-                && Path::new(&r.checkout) != root)
-    })
-}
-
-/// One non-tree stage's atomic resource envelope. Memory and cores must be admitted together:
-/// a Background memory wait may never retain cores a foreground build needs.
-fn stage_need(id: &str, cores: u32) -> aterm_capacity::Need {
-    aterm_capacity::Need::new(format!("verify watch {id}"))
-        .mem_gib(26)
-        .cores(cores)
-        .covers()
-}
-
-fn candidate_build_command(
-    root: &Path,
-    targo: &Path,
-    stage2: &Path,
-    path: &std::ffi::OsStr,
-    cores: u32,
-    marker: &str,
-) -> crate::exec::Cmd {
-    crate::exec::Cmd::new(targo)
-        .args([
-            "--unverified",
-            "build",
-            "--locked",
-            "--profile",
-            "test",
-            "-p",
-            "aterm-verify",
-            "--bin",
-            "aterm-verify",
-        ])
-        .env("TRUST_STAGE2_BIN", stage2)
-        .env("PATH", path)
-        .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
-        .env("CARGO_BUILD_JOBS", cores.to_string())
-        .env("BUILD_SLOT_HELD", "1")
-        .env(aterm_capacity::COVER_ENV, marker)
-}
-
-/// Inert evidence returned only after the candidate's combined memory/CPU claim is gone.
-/// Keeping the claim local to [`run_candidate_build`] makes it impossible for result writing,
-/// metadata reads or sampled-input collection to retain those resources.
-struct CandidateBuild {
-    ran: crate::exec::Run,
-    began: Instant,
-    admission_waiting_s: f64,
-    granted_cores: u32,
-}
-
-fn run_candidate_build(
-    root: &Path,
-    env: &crate::EnvSnapshot,
-    tools: &crate::Toolchain,
-    scratch: &Path,
-    removed_env: &[&str],
-) -> Result<Option<CandidateBuild>, String> {
-    let admitted_at = Instant::now();
-    let stage_claim = match aterm_capacity::admit(
-        stage_need("candidate", aterm_capacity::cores()),
-        aterm_capacity::Admit::Preemptible,
-    ) {
-        Ok(claim) => claim,
-        Err(why @ aterm_capacity::Error::Stopped { .. }) => {
-            eprintln!("watch candidate admission stopped: {why}");
-            return Ok(None);
-        }
-        Err(why) => return Err(why.to_string()),
-    };
-    let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
-    let granted_cores = stage_claim.cores();
-    let marker = stage_claim.record().cover_marker();
-    let direct_path = tools.path_with_stage2_first(&env.path);
-    let cmd = candidate_build_command(
-        root,
-        &tools.targo,
-        &tools.stage2_dir,
-        &direct_path,
-        granted_cores,
-        &marker,
-    );
-    let began = Instant::now();
-    let ran = crate::exec::run(
-        &cmd,
-        crate::exec::ExecEnv {
-            events: None,
-            cwd: root,
-            path: &env.path,
-            scratch,
-            child_ceiling: None,
-            remove_env: removed_env,
-            add_env: &[],
-            stage_groups: None,
-            host: &crate::exec::LiveHost,
-            hang_samples: None,
-        },
-    );
-    drop(stage_claim);
-    Ok(Some(CandidateBuild {
-        ran,
-        began,
-        admission_waiting_s,
-        granted_cores,
-    }))
-}
-
-/// The already-built sampled-head verifier for the tree row. It starts directly, so it, not a
-/// `targo run` wrapper, leads the cancellable process group and owns its Background claims.
-fn tree_command(
-    root: &Path,
-    program: &Path,
-    args: &[&str],
-    stage2: &Path,
-    path: &std::ffi::OsStr,
-) -> crate::exec::Cmd {
-    crate::exec::Cmd::new(program)
-        .args(args.iter().copied())
-        .env("TRUST_STAGE2_BIN", stage2)
-        .env("PATH", path)
-        .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
 }
 
 fn sample_removed_env() -> Vec<String> {
@@ -1255,35 +1113,44 @@ fn sample_removed_env() -> Vec<String> {
     removed
 }
 
+fn exec_env<'a>(
+    root: &'a Path,
+    env: &'a crate::EnvSnapshot,
+    scratch: &'a Path,
+    removed: &'a [&'a str],
+) -> crate::exec::ExecEnv<'a> {
+    crate::exec::ExecEnv {
+        events: None,
+        cwd: root,
+        path: &env.path,
+        scratch,
+        child_ceiling: None,
+        remove_env: removed,
+        add_env: &[],
+        stage_groups: None,
+        host: &crate::exec::LiveHost,
+        hang_samples: None,
+    }
+}
+
+/// The pass bootstrap: build the tip's verifier, then replace this image with it.
 fn sample(root: &Path, result: &Path) -> Result<bool, String> {
-    use aterm_capacity::Machine as _;
     crate::exec::group::kill_on_interrupt();
     let test_handoff = sample_test_handoff();
     let is_test_handoff = test_handoff.is_some();
-    // This is the long-lived controller's only sampled work. Build the sampled head's verifier
-    // while this process leads the controller-owned group, then replace this image in place so
-    // every row, input, attribution, seal and verdict rule comes from the head being judged.
+    // Build the tip's verifier while this process leads the controller-owned group, then
+    // replace this image in place so every row, attribution and verdict rule comes from the tip
+    // being judged.
     let (stage2, path) = if let Some(handoff) = test_handoff {
         handoff
     } else {
-        let _claim = match aterm_capacity::admit(
-            aterm_capacity::Need::new("verify watch sample bootstrap"),
-            aterm_capacity::Admit::Preemptible,
-        ) {
-            Ok(claim) => claim,
-            Err(why @ aterm_capacity::Error::Stopped { .. }) => {
-                eprintln!("watch bootstrap admission stopped: {why}");
-                return Ok(false);
-            }
-            Err(why) => return Err(why.to_string()),
-        };
         let env = crate::EnvSnapshot::capture();
         let tools = crate::preflight(&env, root)?;
         let prefix = aterm_toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
         let lease = aterm_toolchain::lease::hold_for(
             &prefix,
             &tools.stage2_dir,
-            "verify watch sampled-head bootstrap",
+            "verify watch pass bootstrap",
             aterm_toolchain::lease::DEFAULT_WAIT,
         )
         .map_err(|e| format!("{e:?}"))?;
@@ -1293,39 +1160,37 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         let scratch = root.join(".git/watch-exec");
         fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
         let removed = sample_removed_env();
-        let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
-        // `run_candidate_build` cannot return its claim, so everything below this call runs
-        // after the candidate's memory and cores have been released.
-        let Some(built) = run_candidate_build(root, &env, &tools, &scratch, &removed_refs)? else {
-            return Ok(false);
-        };
-        fs::write(root.join(".git/watch-candidate.log"), &built.ran.output)
-            .map_err(|e| e.to_string())?;
+        let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+        let direct_path = tools.path_with_stage2_first(&env.path);
+        let cmd = crate::exec::Cmd::new(&tools.targo)
+            .args([
+                "--unverified",
+                "build",
+                "--locked",
+                "--profile",
+                "test",
+                "-p",
+                "aterm-verify",
+                "--bin",
+                "aterm-verify",
+            ])
+            .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
+            .env("PATH", &direct_path)
+            .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"));
+        let ran = crate::exec::run(&cmd, exec_env(root, &env, &scratch, &removed));
+        fs::write(root.join(".git/watch-candidate.log"), &ran.output).map_err(|e| e.to_string())?;
         let run_stopping = crate::exec::group::stopping();
-        if built.ran.code == Some(75) || run_stopping {
-            eprintln!("{}", stopped_run("bootstrap", &built.ran, run_stopping));
+        if ran.code == Some(75) || run_stopping {
+            eprintln!("{}", stopped_run("bootstrap", &ran, run_stopping));
             return Ok(false);
         }
-        if !built.ran.ok {
-            let mut row = candidate_failure_row(&built.ran);
-            row.log = format!(
-                "sampled-head verifier did not start; bootstrap evidence only: \
-                 granted_cores={} admission_waiting_s={} load1={:?} elapsed_s={}\n{}",
-                built.granted_cores,
-                built.admission_waiting_s,
-                aterm_capacity::Live.read(None).load1,
-                built.began.elapsed().as_secs_f64(),
-                row.log
-            );
-            write_bootstrap_result(root, result, row)?;
+        if !ran.ok {
+            write_bootstrap_result(result, candidate_failure_row(&ran))?;
             return Ok(true);
         }
-        // Returning only inert argv/env data makes this scope the cleanup proof: the bootstrap
-        // claim and compiler lease are dropped before an exec can skip destructors.
-        (
-            tools.stage2_dir.clone(),
-            tools.path_with_stage2_first(&env.path),
-        )
+        // Returning only inert argv/env data makes this scope the cleanup proof: the compiler
+        // lease is dropped before an exec can skip destructors.
+        (tools.stage2_dir.clone(), direct_path)
     };
     // Production and the subprocess negative control share this one candidate selection. A
     // stale/current-image construction here therefore breaks the control.
@@ -1336,12 +1201,8 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     } else {
         next
     };
-    if !is_test_handoff && running_should_stop(root)? {
-        eprintln!(
-            "watch bootstrap handoff: Release capacity or live line claim requested preemption"
-        );
-        return Ok(false);
-    }
+    #[cfg(not(test))]
+    let _ = is_test_handoff;
     if !crate::exec::group::default_interrupts_for_exec() {
         eprintln!("watch bootstrap handoff: pending interrupt prevented exec");
         return Ok(false);
@@ -1349,16 +1210,8 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     let error = next.exec();
     crate::exec::group::kill_on_interrupt();
     Err(format!(
-        "could not replace the bootstrap with the sampled-head verifier: {error}"
+        "could not replace the bootstrap with the tip's verifier: {error}"
     ))
-}
-
-fn source_inputs(root: &Path) -> Result<String, String> {
-    let mut inputs = git(root, &["rev-parse", "HEAD:rust-toolchain.toml"])?;
-    if let Ok(lock) = git(root, &["rev-parse", "--verify", "HEAD:trust.lock"]) {
-        inputs.push_str(&format!("\ntrust.lock={lock}"));
-    }
-    Ok(inputs)
 }
 
 fn candidate_failure_row(ran: &crate::exec::Run) -> Row {
@@ -1376,7 +1229,7 @@ fn stopped_run(scope: &str, ran: &crate::exec::Run, run_stopping: bool) -> Strin
         Some(why) => ("environment", why),
         None if run_stopping => (
             "run-stop",
-            format!("sample run marked stopping; {}", ran.unnamed_cause()),
+            format!("pass run marked stopping; {}", ran.unnamed_cause()),
         ),
         None => ("child-exit", ran.unnamed_cause()),
     };
@@ -1386,7 +1239,7 @@ fn stopped_run(scope: &str, ran: &crate::exec::Run, run_stopping: bool) -> Strin
     )
 }
 
-fn write_bootstrap_result(root: &Path, result: &Path, mut row: Row) -> Result<(), String> {
+fn write_bootstrap_result(result: &Path, mut row: Row) -> Result<(), String> {
     let state = if row.outcome == "red" {
         "red"
     } else {
@@ -1394,41 +1247,11 @@ fn write_bootstrap_result(root: &Path, result: &Path, mut row: Row) -> Result<()
         row.red_items.clear();
         "could-not-run"
     };
-    row.suspects.clear();
-    row.fixed_by = None;
-    row.decisions.clear();
     write_result(
         result,
         &Sample {
             state: state.into(),
-            verifier: String::new(),
-            inputs: source_inputs(root)?,
             rows: vec![row],
-        },
-    )
-}
-
-fn write_sampled_result(root: &Path, result: &Path, mut rows: Vec<Row>) -> Result<(), String> {
-    let commit = git(root, &["rev-parse", "HEAD"])?;
-    let tree = git(root, &["rev-parse", "HEAD^{tree}"])?;
-    if let Err(why) = attribute(root, &commit, &tree, &mut rows)
-        && let Some(row) = rows.last_mut()
-    {
-        row.log
-            .push_str(&format!("\nsuspect attribution unavailable: {why}"));
-    }
-    let mut inputs = source_inputs(root)?;
-    if let Some(row) = rows.iter().find(|row| row.id == "inputs") {
-        inputs = format!("compiler-pin={inputs}\n{}", row.log);
-    }
-    let state = verdict(&rows).to_owned();
-    write_result(
-        result,
-        &Sample {
-            state,
-            verifier: commit,
-            inputs,
-            rows,
         },
     )
 }
@@ -1438,122 +1261,57 @@ fn write_result(result: &Path, sample: &Sample) -> Result<(), String> {
     fs::write(result, text).map_err(|e| e.to_string())
 }
 
-fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
-    use aterm_capacity::Machine as _;
+/// A row the follower itself could not run, and why.
+fn could_not_run(id: &str, why: String) -> Row {
+    Row {
+        id: id.into(),
+        outcome: "could-not-run".into(),
+        log: why,
+        red_items: vec![],
+    }
+}
+
+/// The pass itself, in the tip's own verifier: every planned row to its end.
+fn pass(root: &Path, result: &Path) -> Result<bool, String> {
     let current = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let expected = fs::canonicalize(candidate_path(root)).map_err(|e| e.to_string())?;
     if current != expected {
         return Err(format!(
-            "sampled-head runner is {}, expected {}",
+            "the pass runs {}, expected {}",
             current.display(),
             expected.display()
         ));
     }
     crate::exec::group::kill_on_interrupt();
-    // The zero-resource claim gives a release authority to end the whole sample group even
-    // between stages. Resource ownership belongs to each stage, where memory and CPU are one
-    // ordered admission.
-    let _claim = match aterm_capacity::admit(
-        aterm_capacity::Need::new("verify watch sample lifecycle"),
-        aterm_capacity::Admit::Preemptible,
-    ) {
-        Ok(claim) => claim,
-        Err(why @ aterm_capacity::Error::Stopped { .. }) => {
-            eprintln!("watch sample lifecycle admission stopped: {why}");
-            return Ok(false);
-        }
-        Err(why) => return Err(why.to_string()),
-    };
     let env = crate::EnvSnapshot::capture();
     let tools = crate::preflight(&env, root)?;
     let prefix = aterm_toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
     let lease = aterm_toolchain::lease::hold_for(
         &prefix,
         &tools.stage2_dir,
-        "verify watch sample",
+        "verify watch pass",
         aterm_toolchain::lease::DEFAULT_WAIT,
     )
     .map_err(|e| format!("{e:?}"))?;
     if let aterm_toolchain::lease::Hold::NotTaken(_, why) = &lease {
         return Err(format!("compiler lease: {why}"));
     }
-    let mut rows = Vec::new();
     let scratch = root.join(".git/watch-exec");
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let removed = sample_removed_env();
-    let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
-    // Compat first: this is the same snapshot, compiler and invocation as the stage step.
-    let stages: [(&str, &[&str]); 6] = [
-        ("inputs", &["ship", "inputs"]),
-        ("stable-x86_64", &["ship", "check", "--compat"]),
-        ("tree", &["verify", "release", "--tree", "--background"]),
-        ("export", &["ship", "check", "--export"]),
-        ("cut", &["ship", "check", "--cut", "--source"]),
-        ("inputs-end", &["ship", "inputs", "--recheck"]),
-    ];
-    for (id, args) in stages {
-        if running_should_stop(root)? {
-            eprintln!(
-                "watch before stage={id}: Release capacity or live line claim requested preemption"
-            );
-            return Ok(false);
-        }
-        let admitted_at = Instant::now();
-        let stage_claim = if id == "tree" {
-            None
-        } else {
-            Some(
-                match aterm_capacity::admit(
-                    stage_need(id, aterm_capacity::cores()),
-                    aterm_capacity::Admit::Preemptible,
-                ) {
-                    Ok(claim) => claim,
-                    Err(why @ aterm_capacity::Error::Stopped { .. }) => {
-                        eprintln!("watch stage={id} admission stopped: {why}");
-                        return Ok(false);
-                    }
-                    Err(why) => return Err(why.to_string()),
-                },
-            )
-        };
-        let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
-        let granted_cores = stage_claim.as_ref().map_or(0, aterm_capacity::Claim::cores);
-        let log = root.join(format!(".git/watch-{id}.log"));
+    let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
+    let direct_path = tools.path_with_stage2_first(&env.path);
+    let rows_planned = planned(desk());
+    let mut rows = Vec::new();
+    for (id, args) in &rows_planned {
         let began = Instant::now();
-        let ran = if id == "tree" {
-            // The sampled-head verifier was built once by the bootstrap and is this process's
-            // own image. Its nested tree verifier owns each combined memory/CPU claim, so the
-            // sample retains no outer cores around those admissions.
-            assert!(stage_claim.is_none());
-            let direct_path = tools.path_with_stage2_first(&env.path);
-            let current = std::env::current_exe().map_err(|e| e.to_string())?;
-            let direct = tree_command(root, &current, &args[1..], &tools.stage2_dir, &direct_path);
-            let mut ran = crate::exec::run(
-                &direct,
-                crate::exec::ExecEnv {
-                    events: None,
-                    cwd: root,
-                    path: &env.path,
-                    scratch: &scratch,
-                    child_ceiling: None,
-                    remove_env: &removed_refs,
-                    add_env: &[],
-                    stage_groups: None,
-                    host: &crate::exec::LiveHost,
-                    hang_samples: None,
-                },
-            );
-            if let Ok(build_output) = fs::read_to_string(root.join(".git/watch-candidate.log")) {
-                ran.output.insert_str(0, &build_output);
-            }
-            ran
+        let cmd = if args[0] == "verify" {
+            // The tip's verifier is this process's own image, built once by the bootstrap.
+            crate::exec::Cmd::new(std::env::current_exe().map_err(|e| e.to_string())?)
+                .args(args[1..].iter().copied())
         } else {
-            let stage_marker = stage_claim
-                .as_ref()
-                .map(|held| held.record().cover_marker())
-                .ok_or("watch stage has no resource claim")?;
-            let cmd = crate::exec::Cmd::new(&tools.targo)
+            crate::exec::Cmd::new(&tools.targo)
                 .args([
                     "--unverified",
                     "run",
@@ -1565,67 +1323,50 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
                     "--",
                 ])
                 .args(args[1..].iter().copied())
-                .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
-                .env("PATH", tools.path_with_stage2_first(&env.path))
-                .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
-                .env("CARGO_BUILD_JOBS", granted_cores.to_string())
-                .env("BUILD_SLOT_HELD", "1")
-                .env(aterm_capacity::COVER_ENV, stage_marker);
-            crate::exec::run(
-                &cmd,
-                crate::exec::ExecEnv {
-                    events: None,
-                    cwd: root,
-                    path: &env.path,
-                    scratch: &scratch,
-                    child_ceiling: None,
-                    remove_env: &removed_refs,
-                    add_env: &[],
-                    stage_groups: None,
-                    host: &crate::exec::LiveHost,
-                    hang_samples: None,
-                },
-            )
-        };
-        fs::write(&log, &ran.output).map_err(|e| e.to_string())?;
+        }
+        .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
+        .env("PATH", &direct_path)
+        .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"));
+        let mut ran = crate::exec::run(&cmd, exec_env(root, &env, &scratch, &removed));
+        if *id == "tree"
+            && let Ok(build_output) = fs::read_to_string(root.join(".git/watch-candidate.log"))
+        {
+            ran.output.insert_str(0, &build_output);
+        }
+        fs::write(root.join(format!(".git/watch-{id}.log")), &ran.output)
+            .map_err(|e| e.to_string())?;
         let run_stopping = crate::exec::group::stopping();
         if ran.code == Some(75) || run_stopping {
-            eprintln!(
-                "{}",
-                stopped_run(&format!("stage={id}"), &ran, run_stopping)
-            );
+            eprintln!("{}", stopped_run(&format!("row={id}"), &ran, run_stopping));
             return Ok(false);
         }
         let mut row = row(id, ran.code, &ran.output);
+        if args[0] == "verify" {
+            skip_is_no_pass(&mut row, &ran.output);
+        }
         if let Some(why) = ran.environment_failure() {
             row.outcome = "could-not-run".into();
             row.red_items.clear();
             row.log.push_str(&format!("\n{why}"));
         }
-        if id == "inputs-end"
+        if *id == "inputs-end"
             && row.outcome == "pass"
             && !rows
-                .first()
-                .is_some_and(|r: &Row| seals_match(&r.log, &row.log))
+                .iter()
+                .find(|r: &&Row| r.id == "inputs")
+                .is_some_and(|r| seals_match(&r.log, &row.log))
         {
             row.outcome = "could-not-run".into();
             row.log
-                .push_str("\ninputs changed during the sample; no green verdict");
+                .push_str("\ninputs changed during the pass; no green verdict");
         }
-        row.log = format!(
-            "granted_cores={} admission_waiting_s={admission_waiting_s} load1={:?} elapsed_s={}\n{}",
-            granted_cores,
-            aterm_capacity::Live.read(None).load1,
-            began.elapsed().as_secs_f64(),
-            row.log
-        );
-        let red = row.outcome == "red";
+        row.log = format!("elapsed_s={}\n{}", began.elapsed().as_secs(), row.log);
+        // A red row stops no later one: the pass names every red it can see.
         rows.push(row);
-        if red {
-            break;
-        }
     }
-    write_sampled_result(root, result, rows)?;
+    let ids: Vec<&str> = rows_planned.iter().map(|(id, _)| *id).collect();
+    let state = verdict(&rows, &ids).to_owned();
+    write_result(result, &Sample { state, rows })?;
     Ok(true)
 }
 
@@ -1639,17 +1380,38 @@ fn seals_match(first: &str, last: &str) -> bool {
     seal(first).is_some() && seal(first) == seal(last)
 }
 
-#[derive(serde::Deserialize)]
-struct StageEvidence {
-    event: String,
-    findings: Vec<String>,
-    decisions: Vec<StageDecision>,
-}
-
-#[derive(serde::Deserialize)]
-struct StageDecision {
-    detail: String,
-    outcome: String,
+/// A red as the follower names it: a test by package, target and test, with any shard filter
+/// left out (`-p aterm-gui --lib -- settings:: -- settings::x` is `aterm-gui --lib
+/// settings::x`), a test binary with no case by its binary and why, and a check's finding by
+/// its check.
+fn red_name(red: &crate::event_log::Red) -> String {
+    let binary = |spec: &str| -> String {
+        spec.strip_prefix("-p ")
+            .unwrap_or(spec)
+            .split(" -- ")
+            .next()
+            .unwrap_or(spec)
+            .to_owned()
+    };
+    match &red.id {
+        Some(id) if id.starts_with("-p ") => match id.rsplit_once(" -- ") {
+            Some((_, case)) => format!("{} {case}", binary(id)),
+            None => binary(id),
+        },
+        Some(_) => red.what.clone(),
+        None => match red.what.strip_prefix("-p ") {
+            Some(rest) => {
+                let (spec, why) = rest.split_once(": ").unwrap_or((rest, ""));
+                let spec = binary(spec);
+                if why.is_empty() {
+                    spec
+                } else {
+                    format!("{spec}: {why}")
+                }
+            }
+            None => red.what.clone(),
+        },
+    }
 }
 
 fn row(id: &str, code: Option<i32>, text: &str) -> Row {
@@ -1659,41 +1421,28 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
         Some(101) if text.contains("could not compile") => "red",
         _ => "could-not-run",
     };
-    let mut red_items = Vec::new();
-    let mut decisions = Vec::new();
-    let mut stage_evidence = false;
-    for line in text
-        .lines()
-        .filter_map(|l| l.strip_prefix("verify-event: "))
-    {
-        if let Ok(event) = aterm_json::from_str::<StageEvidence>(line)
-            && event.event == "stage-finished"
-        {
-            // Stage findings contain proven failures. Aggregate check findings also
-            // contain blocked rows, and human summaries add timing-dependent aliases.
-            stage_evidence = true;
-            if outcome == "red" {
-                red_items.extend(event.findings);
+    let mut red_items: Vec<String> = Vec::new();
+    if outcome == "red" {
+        for red in text.lines().flat_map(crate::event_log::Red::of_event) {
+            let name = red_name(&red);
+            if !red_items.contains(&name) {
+                red_items.push(name);
             }
-            decisions.extend(event.decisions.into_iter().map(|item| Decision {
-                id: item.detail,
-                outcome: item.outcome,
-            }));
+        }
+        if red_items.is_empty() {
+            red_items.extend(
+                text.lines()
+                    .filter_map(|l| l.trim().strip_prefix("FAIL").map(|s| s.trim().to_owned()))
+                    .filter(|s| !s.is_empty()),
+            );
+            red_items.dedup();
+        }
+        if red_items.is_empty() {
+            red_items.push(id.into());
         }
     }
-    if outcome == "red" && !stage_evidence {
-        red_items.extend(
-            text.lines()
-                .filter_map(|l| l.trim().strip_prefix("FAIL").map(|s| s.trim().to_owned())),
-        );
-    }
-    if outcome == "red" && red_items.is_empty() {
-        red_items.push(id.into());
-    }
-    red_items.sort();
-    red_items.dedup();
-    // Keep the final tail and explicit preemption evidence: later NOT RUN reporting must
-    // not erase the signal sender or the admission condition from the portable journal.
+    // Keep the final tail and the signal provenance before it: later NOT RUN reporting must not
+    // erase the signal sender.
     let tail = text
         .lines()
         .rev()
@@ -1711,7 +1460,7 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
     });
     for line in text
         .lines()
-        .filter(|line| line.starts_with("capacity background ") || line.starts_with("watch "))
+        .filter(|line| line.starts_with("watch "))
         .take(16)
         .chain(provenance)
     {
@@ -1720,598 +1469,12 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
         }
     }
     evidence.push(&tail);
-    let log = evidence.join("\n");
     Row {
         id: id.into(),
         outcome: outcome.into(),
-        log,
+        log: evidence.join("\n"),
         red_items,
-        suspects: vec![],
-        fixed_by: None,
-        decisions,
     }
-}
-
-fn attribute(root: &Path, commit: &str, tree: &str, rows: &mut [Row]) -> Result<(), String> {
-    let until = judged::deadline();
-    let head = judged::head(root, "origin", until)?;
-    let previous = judged::records(root, head.as_deref(), until)?;
-    // A late verdict for an older head must not move the attribution base backwards. Commit
-    // topology, not journal publication time, defines the last opposing verdict on this head's
-    // history. Reading the ancestry once also drops records from rewritten or unrelated refs.
-    let ancestors: BTreeSet<String> = git(root, &["rev-list", commit])?
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    for row in rows {
-        let wanted = if row.outcome == "red" {
-            "pass"
-        } else if row.outcome == "pass" {
-            "red"
-        } else {
-            continue;
-        };
-        let candidates: Vec<&Record> = previous
-            .iter()
-            .filter(|r| {
-                r.tree != tree
-                    && ancestors.contains(&r.commit)
-                    && r.rows
-                        .iter()
-                        .any(|old| old.id == row.id && old.outcome == wanted)
-            })
-            .collect();
-        if candidates.is_empty() {
-            continue;
-        }
-        let mut independent = vec!["merge-base", "--independent"];
-        independent.extend(candidates.iter().map(|record| record.commit.as_str()));
-        let independent = git(root, &independent)?;
-        let maxima: Vec<&str> = independent.lines().collect();
-        let [nearest] = maxima.as_slice() else {
-            // Two incomparable last verdicts (possible after rewritten histories rejoin) define
-            // no honest single range. Leave attribution empty rather than inventing one.
-            continue;
-        };
-        let Some(base) = candidates
-            .iter()
-            .copied()
-            .find(|record| record.commit == *nearest)
-        else {
-            return Err("independent attribution base was not a journal candidate".into());
-        };
-        let evidence = if row.outcome == "red" {
-            &*row
-        } else {
-            base.rows
-                .iter()
-                .find(|r| r.id == row.id)
-                .ok_or("missing attribution row")?
-        };
-        let links = transition_gitlinks(root, &base.commit)?;
-        let roots = item_crates(evidence, &links);
-        let paths = item_paths(root, &roots, row.outcome == "red", &links)?;
-        let range = format!("{}..{}", base.commit, commit);
-        let mut args = vec!["rev-list", "--no-merges", range.as_str()];
-        if !paths.is_empty() {
-            args.push("--");
-            args.extend(paths.iter().map(String::as_str));
-            args.extend(WORKSPACE_INPUTS);
-        }
-        let commits = git(root, &args)?;
-        let suspects: Vec<String> = commits.lines().map(str::to_owned).collect();
-        if row.outcome == "red" {
-            row.suspects = suspects;
-        } else if suspects.len() == 1 {
-            row.fixed_by = suspects.first().cloned();
-        }
-    }
-    Ok(())
-}
-
-/// Workspace configuration can change any item's compiled graph.
-const WORKSPACE_INPUTS: [&str; 6] = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "trust.lock",
-    "rust-toolchain.toml",
-    ".cargo",
-    ".gitmodules",
-];
-
-fn transition_gitlinks(root: &Path, base: &str) -> Result<String, String> {
-    let mut links = git(root, &["ls-tree", "-rz", "--full-tree", "HEAD"])?;
-    links.push('\0');
-    links.push_str(&git(root, &["ls-tree", "-rz", "--full-tree", base])?);
-    Ok(links)
-}
-
-fn item_crates(row: &Row, links: &str) -> BTreeSet<String> {
-    named_crates(&format!("{}\n{}", row.log, row.red_items.join("\n")), links)
-}
-
-/// The crates `text` names: a path through `crates/` or under a git pin of `links`, and each
-/// `-p` package.
-fn named_crates(text: &str, links: &str) -> BTreeSet<String> {
-    let mut result = BTreeSet::new();
-    for token in text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
-    {
-        let scoped =
-            gitlink_suffix(token, links).or_else(|| token.find("crates/").map(|at| &token[at..]));
-        let Some(scoped) = scoped else {
-            continue;
-        };
-        let parts: Vec<_> = Path::new(scoped)
-            .components()
-            .filter_map(|part| match part {
-                std::path::Component::Normal(part) => part.to_str(),
-                _ => None,
-            })
-            .collect();
-        if let Some(at) = parts.iter().position(|part| *part == "crates")
-            && parts.get(at + 1).is_some()
-        {
-            result.insert(parts[..=at + 1].join("/"));
-        }
-    }
-    let words: Vec<_> = text.split_whitespace().collect();
-    for pair in words.windows(2) {
-        if pair[0] == "-p" {
-            let name = pair[1].split('@').next().unwrap_or(pair[1]);
-            if name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-            {
-                result.insert(format!("crates/{name}"));
-            }
-        }
-    }
-    result
-}
-
-fn item_paths(
-    root: &Path,
-    roots: &BTreeSet<String>,
-    dependencies: bool,
-    links: &str,
-) -> Result<BTreeSet<String>, String> {
-    let read = |name: &str| {
-        crate::read_regular_text(root.join(name))
-            .map_err(|e| e.to_string())
-            .and_then(|text| aterm_toml::from_str(&text).map_err(|e| e.to_string()))
-            .map_err(|why| format!("{name}: {why}"))
-    };
-    item_closure(root, roots, dependencies, links, &|| {
-        let env = crate::EnvSnapshot::capture();
-        let tools = crate::preflight(&env, root)?;
-        let mut cmd = aterm_uds::spawnfd::command(&tools.targo);
-        cmd.current_dir(root)
-            .args(["metadata", "--locked", "--no-deps", "--format-version", "1"]);
-        scrub(&mut cmd);
-        let text = judged::output(&mut cmd, None)?;
-        Ok(Described {
-            metadata: aterm_json::from_str(&text).map_err(|e| e.to_string())?,
-            manifest: read("Cargo.toml")?,
-            lock: read("Cargo.lock")?,
-        })
-    })
-    .map(|closure| closure.paths)
-}
-
-/// What an item's closure is read from, of one tree.
-struct Described {
-    /// The workspace as `targo metadata --no-deps` words it: its `packages`, each a `name`, a
-    /// `manifest_path` under the root and `dependencies` by `name` and `path`.
-    metadata: aterm_json::Value,
-    /// The root manifest, whose `[patch]` tables put a package named by version at a path.
-    manifest: aterm_toml::Value,
-    /// `Cargo.lock`, which names every package each package links.
-    lock: aterm_toml::Value,
-}
-
-/// What an item reads of a workspace.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Closure {
-    /// The directories of its crates and of every path package those link, each a git pin where
-    /// it lies in one.
-    paths: BTreeSet<String>,
-    /// The registry packages those link, each as the lock identifies it: its name, version,
-    /// source and checksum.
-    registry: BTreeSet<String>,
-}
-
-/// The closure of the crates at `roots` (with `dependencies`, of every package those link too)
-/// in the workspace `described` answers with, asked only where a root lies outside every git pin
-/// of `links`.
-fn item_closure<D: std::borrow::Borrow<Described>>(
-    root: &Path,
-    roots: &BTreeSet<String>,
-    dependencies: bool,
-    links: &str,
-    described: &dyn Fn() -> Result<D, String>,
-) -> Result<Closure, String> {
-    if roots.is_empty() {
-        return Ok(Closure::default());
-    }
-    let (pinned, roots) = split_gitlink_paths(roots, links);
-    let mut closure = Closure::default();
-    if !roots.is_empty() {
-        let described = described()?;
-        let described = described.borrow();
-        let graph = metadata_graph(root, &described.metadata)?;
-        let roots = resolve_roots(root, &roots, &described.metadata, &graph)?;
-        if dependencies {
-            closure = locked_closure(root, &roots, described)?;
-            closure.paths.extend(dependency_closure(&roots, &graph));
-        } else {
-            closure.paths = roots;
-        }
-        closure.paths = gitlink_paths(&closure.paths, links);
-    }
-    closure.paths.extend(pinned);
-    Ok(closure)
-}
-
-/// The path packages a root manifest's `[patch]` tables name: each one's package name and its
-/// directory under the root.
-fn patched(manifest: &aterm_toml::Value) -> Vec<(String, String)> {
-    use aterm_toml::Value;
-    manifest
-        .get("patch")
-        .and_then(Value::as_table)
-        .into_iter()
-        .flat_map(|sources| sources.values())
-        .filter_map(Value::as_table)
-        .flat_map(|rows| rows.iter())
-        .filter_map(|(key, row)| {
-            let path = row.get("path")?.as_str()?;
-            let name = row.get("package").and_then(Value::as_str).unwrap_or(key);
-            Some((
-                name.to_owned(),
-                crate::export_scan::join_lexically("", path),
-            ))
-        })
-        .collect()
-}
-
-/// Where the description puts each package, by name: where a package of it, a path dependency
-/// or a patch row of the root manifest has one of that name.
-fn placed(
-    root: &Path,
-    described: &Described,
-) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
-    use aterm_json::Value;
-    fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-        value.get(key).and_then(Value::as_str)
-    }
-    let mut placed = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut place = |name: Option<&str>, dir: Option<String>| {
-        if let (Some(name), Some(dir)) = (name, dir) {
-            placed.entry(name.to_owned()).or_default().insert(dir);
-        }
-    };
-    let under = |path: &Path| path.strip_prefix(root).ok()?.to_str().map(str::to_owned);
-    let packages = described
-        .metadata
-        .get("packages")
-        .and_then(Value::as_array)
-        .ok_or("metadata has no packages")?;
-    for package in packages {
-        place(
-            text(package, "name"),
-            text(package, "manifest_path")
-                .and_then(|manifest| under(Path::new(manifest).parent()?)),
-        );
-        for dependency in package
-            .get("dependencies")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            place(
-                text(dependency, "name"),
-                text(dependency, "path").and_then(|path| under(Path::new(path))),
-            );
-        }
-    }
-    for (name, path) in patched(&described.manifest) {
-        place(Some(&name), Some(path));
-    }
-    Ok(placed)
-}
-
-/// One `[[package]]` of a `Cargo.lock`.
-struct Locked<'a> {
-    name: &'a str,
-    version: &'a str,
-    /// Where it comes from. A path package has none.
-    source: Option<&'a str>,
-    checksum: &'a str,
-    /// Each as `name`, `name version` or `name version (source)`: as much as tells the package
-    /// from the lock's others.
-    dependencies: Vec<&'a str>,
-}
-
-impl Locked<'_> {
-    /// Whether a dependency's words name this package.
-    fn is(&self, version: Option<&str>, source: Option<&str>) -> bool {
-        version.is_none_or(|version| version == self.version)
-            && source.is_none_or(|source| {
-                self.source.is_some_and(|from| {
-                    source.strip_prefix('(').and_then(|s| s.strip_suffix(')')) == Some(from)
-                })
-            })
-    }
-}
-
-/// The packages of a `Cargo.lock`, by name.
-fn locked(lock: &aterm_toml::Value) -> Result<BTreeMap<&str, Vec<Locked<'_>>>, String> {
-    use aterm_toml::Value;
-    let mut locked = BTreeMap::<&str, Vec<Locked<'_>>>::new();
-    for package in lock
-        .get("package")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let text = |key: &str| package.get(key).and_then(Value::as_str);
-        let (Some(name), Some(version)) = (text("name"), text("version")) else {
-            return Err("Cargo.lock holds a package without a name or a version".into());
-        };
-        locked.entry(name).or_default().push(Locked {
-            name,
-            version,
-            source: text("source"),
-            checksum: text("checksum").unwrap_or_default(),
-            dependencies: package
-                .get("dependencies")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect(),
-        });
-    }
-    Ok(locked)
-}
-
-/// What the lock resolves below the packages at `roots`: the directories of the path packages
-/// and the identities of the rest. The lock names every package a package links, so it holds
-/// the edges no manifest names by path: a dependency by version that the root manifest's
-/// `[patch]` tables put at a path, whether a workspace crate names it or a registry package
-/// between them does.
-///
-/// A path package's directories are those [`placed`] has for its name, so two of one name (two
-/// versions of one patched package) are both in the closure. One nothing places adds no path:
-/// the manifest that names it is one the description lacks, a git pin's or (under `--no-deps`)
-/// a path package's outside the workspace.
-///
-/// # Errors
-/// A root whose package the lock does not hold: nothing says what it links.
-fn locked_closure(
-    root: &Path,
-    roots: &BTreeSet<String>,
-    described: &Described,
-) -> Result<Closure, String> {
-    let placed = placed(root, described)?;
-    let locked = locked(&described.lock)?;
-    let mut pending = Vec::new();
-    for dir in roots {
-        let before = pending.len();
-        pending.extend(
-            placed
-                .iter()
-                .filter(|(_, dirs)| dirs.contains(dir))
-                .flat_map(|(name, _)| locked.get(name.as_str()).into_iter().flatten())
-                .filter(|package| package.source.is_none()),
-        );
-        if pending.len() == before {
-            return Err(format!("Cargo.lock holds no package at {dir}"));
-        }
-    }
-    let mut closure = Closure::default();
-    let mut seen = BTreeSet::new();
-    while let Some(package) = pending.pop() {
-        if !seen.insert((package.name, package.version, package.source)) {
-            continue;
-        }
-        match package.source {
-            Some(source) => {
-                closure.registry.insert(format!(
-                    "{} {} {source} {}",
-                    package.name, package.version, package.checksum
-                ));
-            }
-            None => closure
-                .paths
-                .extend(placed.get(package.name).into_iter().flatten().cloned()),
-        }
-        for dependency in &package.dependencies {
-            let mut words = dependency.splitn(3, ' ');
-            let name = words.next().unwrap_or_default();
-            let (version, source) = (words.next(), words.next());
-            pending.extend(
-                locked
-                    .get(name)
-                    .into_iter()
-                    .flatten()
-                    .filter(|package| package.is(version, source)),
-            );
-        }
-    }
-    Ok(closure)
-}
-
-fn resolve_roots(
-    root: &Path,
-    roots: &BTreeSet<String>,
-    metadata: &aterm_json::Value,
-    graph: &DependencyGraph,
-) -> Result<BTreeSet<String>, String> {
-    let packages = metadata
-        .get("packages")
-        .and_then(aterm_json::Value::as_array)
-        .ok_or("metadata has no packages")?;
-    let mut resolved = BTreeSet::new();
-    for scope in roots {
-        if graph.contains_key(scope) {
-            resolved.insert(scope.clone());
-            continue;
-        }
-        let name = scope.strip_prefix("crates/").unwrap_or(scope);
-        let mut found = false;
-        for package in packages {
-            if package.get("name").and_then(aterm_json::Value::as_str) == Some(name)
-                && let Some(manifest) = package
-                    .get("manifest_path")
-                    .and_then(aterm_json::Value::as_str)
-                && let Some(dir) = Path::new(manifest)
-                    .parent()
-                    .and_then(|p| p.strip_prefix(root).ok())
-                    .and_then(Path::to_str)
-            {
-                resolved.insert(dir.to_owned());
-                found = true;
-            }
-            if let Some(dependencies) = package
-                .get("dependencies")
-                .and_then(aterm_json::Value::as_array)
-            {
-                for dependency in dependencies {
-                    if dependency.get("name").and_then(aterm_json::Value::as_str) == Some(name)
-                        && let Some(path) =
-                            dependency.get("path").and_then(aterm_json::Value::as_str)
-                        && let Some(path) = Path::new(path)
-                            .strip_prefix(root)
-                            .ok()
-                            .and_then(Path::to_str)
-                    {
-                        resolved.insert(path.to_owned());
-                        found = true;
-                    }
-                }
-            }
-        }
-        if !found {
-            return Err(format!("cannot resolve item scope {scope}"));
-        }
-    }
-    Ok(resolved)
-}
-
-fn gitlink_paths(paths: &BTreeSet<String>, tree: &str) -> BTreeSet<String> {
-    paths
-        .iter()
-        .map(|path| enclosing_gitlink(path, tree).map_or_else(|| path.clone(), str::to_owned))
-        .collect()
-}
-
-fn split_gitlink_paths(
-    paths: &BTreeSet<String>,
-    tree: &str,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut linked = BTreeSet::new();
-    let mut ordinary = BTreeSet::new();
-    for path in paths {
-        if let Some(link) = enclosing_gitlink(path, tree) {
-            linked.insert(link.to_owned());
-        } else {
-            ordinary.insert(path.clone());
-        }
-    }
-    (linked, ordinary)
-}
-
-fn enclosing_gitlink<'a>(path: &str, tree: &'a str) -> Option<&'a str> {
-    tree.split('\0')
-        .filter_map(|entry| {
-            let (header, path) = entry.split_once('\t')?;
-            header.starts_with("160000 ").then_some(path)
-        })
-        .find(|link| Path::new(path).starts_with(link))
-}
-
-fn gitlink_suffix<'a>(path: &'a str, tree: &str) -> Option<&'a str> {
-    tree.split('\0')
-        .filter_map(|entry| {
-            let (header, link) = entry.split_once('\t')?;
-            header.starts_with("160000 ").then_some(link)
-        })
-        .filter_map(|link| {
-            if path == link || path.starts_with(&format!("{link}/")) {
-                return Some((link.len(), path));
-            }
-            let needle = format!("/{link}");
-            let at = path.find(&needle)? + 1;
-            let end = at + link.len();
-            (path.as_bytes().get(end).is_none() || path.as_bytes().get(end) == Some(&b'/'))
-                .then_some((link.len(), &path[at..]))
-        })
-        .max_by_key(|(link_len, _)| *link_len)
-        .map(|(_, suffix)| suffix)
-}
-
-type DependencyGraph = BTreeMap<String, (String, BTreeSet<String>)>;
-
-fn metadata_graph(root: &Path, value: &aterm_json::Value) -> Result<DependencyGraph, String> {
-    let mut graph = BTreeMap::new();
-    let packages = value
-        .get("packages")
-        .and_then(aterm_json::Value::as_array)
-        .ok_or("metadata has no packages")?;
-    for package in packages {
-        let manifest = package
-            .get("manifest_path")
-            .and_then(aterm_json::Value::as_str)
-            .ok_or("package has no manifest")?;
-        let Some(dir) = Path::new(manifest)
-            .parent()
-            .and_then(|p| p.strip_prefix(root).ok())
-            .and_then(Path::to_str)
-        else {
-            continue;
-        };
-        let mut deps = BTreeSet::new();
-        if let Some(dependencies) = package
-            .get("dependencies")
-            .and_then(aterm_json::Value::as_array)
-        {
-            for dep in dependencies {
-                if let Some(path) = dep.get("path").and_then(aterm_json::Value::as_str)
-                    && let Ok(path) = Path::new(path).strip_prefix(root)
-                    && let Some(path) = path.to_str()
-                {
-                    deps.insert(path.to_owned());
-                }
-            }
-        }
-        graph.insert(dir.to_owned(), (dir.to_owned(), deps));
-    }
-    Ok(graph)
-}
-
-fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTreeSet<String> {
-    let mut paths = roots.clone();
-    let mut pending: Vec<_> = graph
-        .iter()
-        .filter(|(_, (dir, _))| roots.contains(dir))
-        .map(|(name, _)| name.clone())
-        .collect();
-    let mut seen = BTreeSet::new();
-    while let Some(name) = pending.pop() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        if let Some((dir, deps)) = graph.get(&name) {
-            paths.insert(dir.clone());
-            pending.extend(deps.iter().cloned());
-        } else {
-            // --no-deps omits non-workspace path packages; their enclosing Git pin
-            // still affects this item's compiled inputs.
-            paths.insert(name);
-        }
-    }
-    paths
 }
 
 #[cfg(test)]

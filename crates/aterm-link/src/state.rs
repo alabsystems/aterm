@@ -154,16 +154,45 @@ pub struct LogWitness {
     pub high: u64,
     /// The identity of that log, once a broker that answers one was read.
     pub id: Option<astream_broker::LogIdentity>,
+    /// Where this node MET that log's line ([`Met`]), once a broker that answers an identity was
+    /// read: `None` for a witness that names no identity, or one an older build wrote.
+    pub met: Option<Met>,
+}
+
+/// WHERE A NODE MET THE LOG IT READS: the log it attached to when it last met one that continues
+/// none of the log it read before (another id; the same id continuing nothing; a move whose
+/// lineage it was not told), or when it first named a log at all, and the head it read there,
+/// brought down to the fork of each move since that continues it ([`Met::after`]).
+///
+/// Every record that landed before the node met the log lies below `head` on it, if the log
+/// holds it at all: astream gives a log that KEPT its records another id as well as an empty
+/// one (`logid::settle`: a fresh id where its identity sidecar does not read, `Prior::Unreadable`;
+/// one derived from the records it kept where the sidecar is gone, `Prior::Absent`), each at
+/// generation 0 with an empty lineage, so an id that changed proves nothing about what lies
+/// below. And every record the node published on the log since it met it lies at or above
+/// `head`: it publishes on a log only once it attached to it, and a move that cut below `head`
+/// brought it down to the fork, below which the moved generation still holds what the earlier
+/// one held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Met {
+    /// The log met.
+    pub log: astream_broker::LogIdentity,
+    /// Its head when it was met, brought down to the fork of each move since.
+    pub head: u64,
 }
 
 impl LogWitness {
     /// The one line this is stored as.
     #[must_use]
     pub fn render(&self) -> String {
-        match self.id {
+        let mut line = match self.id {
             Some(id) => format!("id={id} high={}", self.high),
             None => format!("high={}", self.high),
+        };
+        if let Some(met) = self.met {
+            line.push_str(&format!(" met={}@{}", met.log, met.head));
         }
+        line
     }
 
     /// Parse one back: `None` without a readable `high=`.
@@ -179,7 +208,17 @@ impl LogWitness {
             .split_whitespace()
             .find_map(|tok| tok.strip_prefix("id="))
             .and_then(astream_broker::LogIdentity::parse);
-        Some(Self { high, id })
+        let met = line
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("met="))
+            .and_then(|met| {
+                let (log, head) = met.split_once('@')?;
+                Some(Met {
+                    log: astream_broker::LogIdentity::parse(log)?,
+                    head: crate::parse_uint(head)?,
+                })
+            });
+        Some(Self { high, id, met })
     }
 
     /// Whether a broker answering `head` under `id` is provably not the log this witness saw.
@@ -200,6 +239,52 @@ impl LogWitness {
             return Some(u64::MAX);
         }
         now.continues(was, lineage?)
+    }
+}
+
+impl Met {
+    /// Where the node stands met once an attach read `now` at `head`, having stood met at `met`
+    /// on the log it read before: there on the same log (`replaced` `None`); down to `fork` where
+    /// the attach found it replaced by a move that continues it to that fork (`Some(Some(fork))`);
+    /// and at `now`'s `head` where it found a log that continues none of it (`Some(None)`), or
+    /// where the node stood met nowhere (no log named before, or a witness an older build
+    /// wrote). `None` where `now` names no identity.
+    #[must_use]
+    pub fn after(
+        met: Option<Self>,
+        now: Option<astream_broker::LogIdentity>,
+        head: u64,
+        replaced: Option<Option<u64>>,
+    ) -> Option<Self> {
+        let now = now?;
+        Some(match (met, replaced) {
+            (Some(met), None) => met,
+            (Some(met), Some(Some(fork))) => Self {
+                head: met.head.min(fork),
+                ..met
+            },
+            _ => Self { log: now, head },
+        })
+    }
+
+    /// WHERE A READ BACK OF A HEAD KEPT ON LOG `was` STARTS ON `now`, a log of the line this
+    /// meeting is of, which continues none of `was` as far as the broker told: the head the
+    /// node met the line at, above every record that landed before (a sender's earlier post of
+    /// the same words among them) and at or below every copy the node published on it since.
+    /// `None` where `now` is of another line, and where `was` may be a generation of this line
+    /// since the meeting (its id, a generation at or past the met one's, which a lineage window
+    /// too short to reach it, or a move told without one, leaves unrelated): a head kept there
+    /// lies above records of the line that landed before it, and the meeting's head below them.
+    /// There the record is published again at its pin, and astream's dedup answers a copy whose
+    /// key stands.
+    #[must_use]
+    pub fn floor(
+        &self,
+        was: astream_broker::LogIdentity,
+        now: astream_broker::LogIdentity,
+    ) -> Option<u64> {
+        let since = was.id == self.log.id && was.generation >= self.log.generation;
+        (now.id == self.log.id && !since).then_some(self.head)
     }
 }
 
@@ -668,19 +753,6 @@ struct AsksRead {
     damaged: Option<Vec<u8>>,
 }
 
-/// Whether `now` is ANOTHER LOG than `was`, every record on it landed after anything read on
-/// `was`: both named, under different ids, and told with a lineage, so by a broker that mints a
-/// fresh id only for a log that holds no record (`logid::settle`). The same id that continues
-/// nothing (a restored or shortened copy, a move older than the lineage's window) or a log told
-/// without lineage (an older broker) may still hold earlier records, and is not.
-pub(crate) fn another_log(
-    was: Option<astream_broker::LogIdentity>,
-    now: Option<astream_broker::LogIdentity>,
-    lineage: Option<&astream_broker::Lineage>,
-) -> bool {
-    lineage.is_some() && matches!((was, now), (Some(was), Some(now)) if was.id != now.id)
-}
-
 /// The reservations a moved generation resets ([`StateDir::publication_offset_resets`]).
 #[derive(Debug)]
 struct OffsetResets {
@@ -757,6 +829,8 @@ pub struct StateDir {
     skip_publication_resets: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pin_head_gone_on_another_log: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    heads_from_the_logs_start: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -1707,6 +1781,8 @@ impl StateDir {
             #[cfg(test)]
             pin_head_gone_on_another_log: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            heads_from_the_logs_start: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
@@ -1806,13 +1882,29 @@ impl StateDir {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// The negative control of a pin's head on another log, which takes the head out as every
-    /// build before ATERM-KI-1111-4 did, so the pin's retry reads nothing back
+    /// The negative control of a pin's head on a log that continues none, which takes the head
+    /// out as every build before ATERM-KI-1111-4 did, so the pin's retry reads nothing back
     /// ([`crate::sim::world::Mutant::PinHeadGoneOnAnotherLog`]).
     #[cfg(test)]
     pub(crate) fn pin_head_gone_on_another_log(&self, on: bool) {
         self.pin_head_gone_on_another_log
             .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a pin's head on a log that continues none, which goes to 0, the
+    /// log's start, as ATERM-KI-1111-4's rule took it on another id, not to the head the attach
+    /// read ([`crate::sim::world::Mutant::ReadBackFromTheLogsStart`]).
+    #[cfg(test)]
+    pub(crate) fn heads_from_the_logs_start(&self, on: bool) {
+        self.heads_from_the_logs_start
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every write from now on through `disk`: a unit test moves a live bridge's dir onto a
+    /// simulated device ([`crate::sim::device::Device`]) to cut its power.
+    #[cfg(test)]
+    pub(crate) fn write_through(&mut self, disk: crate::fx::Disk) {
+        self.disk = disk;
     }
 
     /// The negative control of a lease that names its boot on every volume, and the stand-in for
@@ -3621,44 +3713,52 @@ impl StateDir {
         self.write(&format!("keys/{sid}"), &lines.join("\n"))
     }
 
-    /// What a moved generation resets in the reservations: each `original-off` the new log does
+    /// What a change of log resets in the reservations: each `original-off` the new log does
     /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
-    /// head ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) past where the new log continues the old, brought down to it,
-    /// brought to the log's start on `another_log`, and taken out where the log continues none
-    /// and is not another (aterm-link B05 review; ATERM-KI-1111-4). A head is an offset of the
-    /// log the pin was made on, and past the fork the new log's offsets name records published
-    /// since, a copy a retry published there among them, so its read back starts at the fork.
-    /// ANOTHER LOG is one under another id, told with its lineage ([`another_log`]): every
-    /// record on it landed after the pin was made, so its read back starts at 0. Taken out
-    /// there, the retry read nothing back, and an attempt the attach's replay published on the
-    /// new log, its answer unknown (a poisoned broker's), its dedup key cut, was published a
-    /// second time (the lossy-log sim's seed 2201). A log that keeps its id and continues
-    /// nothing (a restored or shortened copy, a move older than the lineage's window) or whose
-    /// lineage is unknown may still hold records from before the pin, and a read back from 0
-    /// would settle the pin on an earlier identical record and never publish it, so its head is
-    /// taken out and the retry publishes unread, as before.
+    /// head ([`PublishPin::at`]; not a receipt's, kept with its log, [`ACK_HEADS`]) brought to
+    /// where it stands on the new log, whose head the attach read is `head`. A head is an offset
+    /// of the log the pin was made on. Past the fork `keep_below` where the new log continues
+    /// the old, the new log's offsets name records published since, a copy a retry published
+    /// there among them, so the head comes down to the fork (aterm-link B05 review). On a log
+    /// that continues none (another id, the same id continuing nothing, a lineage unknown) it
+    /// goes to `head`: every record that landed before the attach, a sender's earlier post of
+    /// the same words among them, lies below it if that log holds it at all, and every copy a
+    /// retry or the attach's replay publishes there lands at or above it. Not to 0: astream
+    /// gives a log that kept its records another id too (a fresh one where its identity sidecar
+    /// does not read, one derived from its records where the sidecar is gone), and a read back
+    /// from 0 there settled the post on that earlier record and never published it (critic
+    /// review F1, 2026-11-13). Nor taken out, as every build before ATERM-KI-1111-4 took it: the
+    /// retry read nothing back, and an attempt the attach's replay published on the new log, its
+    /// answer unknown (a poisoned broker's), its dedup key cut, was published a second time (the
+    /// lossy-log sim's seed 2201).
     fn publication_offset_resets(
         &self,
         keep_below: Option<u64>,
-        another_log: bool,
+        head: u64,
     ) -> io::Result<OffsetResets> {
         #[cfg(test)]
-        let head_gone = self
-            .pin_head_gone_on_another_log
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let (head_gone, from_start) = (
+            self.pin_head_gone_on_another_log
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.heads_from_the_logs_start
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         #[cfg(not(test))]
-        let head_gone = false;
-        let fork = keep_below.or((another_log && !head_gone).then_some(0));
+        let (head_gone, from_start) = (false, false);
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
                 .is_some_and(|off| keep_below.is_none_or(|f| off >= f));
             let off_reset = stale && pin.original_off.take().is_some();
-            let past = pin.at.is_some_and(|at| fork.is_none_or(|f| at > f));
-            if past {
-                pin.at = fork;
-            }
-            off_reset || past
+            let at = pin.at.and_then(|at| match keep_below {
+                Some(fork) => Some(at.min(fork)),
+                None if head_gone => None,
+                None if from_start => Some(0),
+                None => Some(head),
+            });
+            let moved = at != pin.at;
+            pin.at = at;
+            off_reset || moved
         };
         let mut rewrites = Vec::new();
         let path = self.path("keys");
@@ -5676,11 +5776,10 @@ impl StateDir {
         }
     }
 
-    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. `was` is the log those offsets were read on, where known.
+    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. A post pin's head ([`PublishPin::at`]) goes where it stands on this log ([`StateDir::publication_offset_resets`]); a record in flight's and a receipt's stay with the log they name, which the read back maps (`Bridge::read_back_from`).
     pub fn forget_log_offsets(
         &self,
         head: u64,
-        was: Option<astream_broker::LogIdentity>,
         log: Option<astream_broker::LogIdentity>,
         keep_below: Option<u64>,
         lineage: Option<&astream_broker::Lineage>,
@@ -5771,7 +5870,7 @@ impl StateDir {
                 posts: Vec::new(),
             }
         } else {
-            self.publication_offset_resets(keep_below, another_log(was, log, lineage))?
+            self.publication_offset_resets(keep_below, head)?
         };
         let in_flight = self.in_flight()?;
         let owed = self.owed_entries();
@@ -5845,9 +5944,19 @@ impl StateDir {
         self.read("bus-log").and_then(|s| LogWitness::parse(&s))
     }
 
-    /// Record what this node knows of the bus log it reads.
+    /// Record what this node knows of the bus log it reads, as written: a power cut may take it
+    /// back ([`StateDir::rebase_log_witness`] is the write that survives one).
     pub fn set_log_witness(&self, witness: &LogWitness) -> io::Result<()> {
         self.write("bus-log", &witness.render())
+    }
+
+    /// Record the witness of a log the attach judged to replace the one before it, on the media
+    /// before this returns. The head the node met that log at ([`Met`]) is the floor of every read
+    /// back of a head kept on an earlier log (`Bridge::read_back_from`), and the attach's replay
+    /// publishes above it next: a witness a power cut took back to the earlier log would have the
+    /// next attach meet the log again, at a later head above the copies that replay published.
+    pub fn rebase_log_witness(&self, witness: &LogWitness) -> io::Result<()> {
+        self.write_durable("bus-log", &witness.render())
     }
 
     /// The known log identity this node saw rewind (reuse its offsets), which stays refused.

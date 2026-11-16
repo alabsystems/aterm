@@ -338,10 +338,11 @@ fn transition_with(
             accepted = call(&broker, token.bytes()); // A failed observation burns the old lease.
         }
         "IssueRollback" | "AbsentRollback" => {
+            // The vault writes no file under the home (LT-04A): its local state is all a
+            // rollback restores.
             let old = [
                 f.lab.paths[0].dir.join("state.toml"),
                 f.lab.paths[0].dir.join("vault"),
-                f.lab.paths[0].home.join(".secrets").join(broker::ENTRY),
             ]
             .map(|p| {
                 let bytes = std::fs::read(&p).unwrap();
@@ -639,9 +640,7 @@ fn broker_policy_authentication_and_advanced_floor_hold_old_tokens() {
             .unwrap();
     });
     // A file at the policy's old `~/.secrets` path changes nothing: the vault's policy holds.
-    let file = f.lab.paths[0].home.join(".secrets").join(broker::ENTRY);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, b"version = 1\n").unwrap();
+    f.write_untrusted_home_entry(broker::ENTRY, b"version = 1\n");
     let entered = Cell::new(0);
     assert!(
         broker

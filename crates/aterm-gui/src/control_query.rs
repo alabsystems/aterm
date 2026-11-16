@@ -1993,7 +1993,10 @@ thread_local! {
 /// `person` and the first `inputs` count are taken under the rows' hold once its wait is over, so neither is older
 /// than the frame read; before the rows, so a gesture they miss moves `human_seq` past an `if-human=` fence.
 /// `"title"` is read in that same hold, so the title and the rows are one snapshot (a separate `title` read takes
-/// its own lock and can fall on either side of a frame).
+/// its own lock and can fall on either side of a frame), and so is `"program_report"`, the OSC 7501 report standing
+/// as the body that says it (`state=<word>:app=<app>[:kind=<kind>]`, `ProgramStateReport::run_sign`), sent last and
+/// only while one stands and its writer's group holds the front (a writer killed mid-turn leaves its report
+/// standing): Claude Code's run sign where its answered query leaves its title no glyph.
 pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
@@ -2016,6 +2019,7 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
         seq,
         generation,
         title,
+        program_report,
         first,
         end,
         launch,
@@ -2055,6 +2059,7 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
             t.content_seq(),
             screen_gen(&t),
             t.title().to_owned(),
+            t.program_state().run_sign(),
             first,
             end,
             launch.map_or_else(|| "null".to_string(), |w| w.json(human_seq)),
@@ -2148,6 +2153,10 @@ pub(crate) fn cmd_text_json_read<P: Into<PersonStamps>>(
         }
         if frame_open {
             out.push_str(",\"frame\":\"open\"");
+        }
+        if let Some(report) = &program_report {
+            out.push(',');
+            out.push_str(&json_str_field("program_report", report));
         }
         out.push('}');
     }

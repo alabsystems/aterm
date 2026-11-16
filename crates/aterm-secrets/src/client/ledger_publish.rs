@@ -812,7 +812,8 @@ pub fn merge_diverged_heads(heads: &[ObservedHead]) -> crate::Result<MergedHeads
                 if already_present {
                     continue;
                 }
-                doc.set_entry_with(
+                // A published head holds this entry: the merge carries it at any size.
+                doc.hold_entry_with(
                     &mapped_audience,
                     &entry.name,
                     entry.value.as_slice(),

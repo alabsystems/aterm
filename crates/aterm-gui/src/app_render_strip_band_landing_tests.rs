@@ -15,7 +15,7 @@ fn compose(app: &mut App, wid: WindowId) {
         .term
         .clone();
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         let mut term = term_lock(&terminal);
         term.resize(rows, cols);
         term.cell_frame_into(&mut ws.input_scratch, usize::from(rows), usize::from(cols));

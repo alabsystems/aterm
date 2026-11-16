@@ -684,7 +684,7 @@ fn a_requests_why_is_one_short_visible_line() {
 #[test]
 fn requester_line_round_trips() {
     use super::Requester;
-    let sid = "s-0123456789abcdef0123";
+    let sid = "tqn5r6e0148";
     for requester in [
         Requester::of(
             Some(sid),
@@ -693,6 +693,12 @@ fn requester_line_round_trips() {
             Some("a\u{e9}…@example.com"),
         ),
         Requester::of(Some(sid), None, None, Some("team acct")),
+        Requester::of(
+            Some("s-0123456789abcdef0123"),
+            Some("claude"),
+            Some("Opus 5.5"),
+            Some("a\u{e9}…@example.com"),
+        ),
         Requester::default(),
     ] {
         let line = requester.line();
@@ -723,7 +729,7 @@ fn requester_line_round_trips() {
     );
     // The longest of every part still fits the line the driven Mac reads.
     let longest = Requester::of(
-        Some(sid),
+        Some("s-0123456789abcdef0123"),
         Some(&"p".repeat(super::REQUESTER_TOKEN_MAX)),
         Some(&"m".repeat(super::REQUESTER_TOKEN_MAX)),
         Some(&"a".repeat(super::REQUESTER_ACCOUNT_BYTES)),
@@ -759,22 +765,31 @@ fn requester_refuses_unknown_or_repeated_key() {
     }
 }
 
-/// A REQUESTER'S SID IS ONE ATERM MINTED, IN EITHER FORM. NEGATIVE CONTROLS: a short, long,
-/// uppercase or non-hex sid, a `t` ID one character short or long, upper-case or with a
-/// Crockford alias, a chosen name and an alias are refused on the wire and left out by
-/// [`super::Requester::of`].
+/// A REQUESTER'S SID IS A CANONICAL TAB ID OR AN EXACT LEGACY SESSION ID. NEGATIVE CONTROLS: a
+/// short, long, uppercase or non-hex legacy sid, a `t` ID one character short or long, upper-case
+/// or with a Crockford alias, a chosen name and an alias are refused on the wire and left out by
+/// [`super::Requester::of`] without dropping its valid program, model or account.
 #[test]
 fn requester_refuses_unminted_sid() {
     use super::{Requester, is_minted_sid};
     let line = |sid: &str| format!("requester sid={sid} program=- model=- account=-");
-    // A tab opened before the `t` form keeps its `s-` ID, and an earlier build's requester line
-    // names it so: both forms read.
-    for minted in ["s-0123456789abcdef0123", "tqn5r6e0148"] {
+    for minted in [
+        "tqn5r6e0148",
+        "t0000000000",
+        "tzzzzzzzzzz",
+        "s-0123456789abcdef0123",
+        "s-00000000000000000000",
+        "s-ffffffffffffffffffff",
+    ] {
         assert!(is_minted_sid(minted), "{minted}");
         assert_eq!(
             Requester::parse(&line(minted)).map(|r| r.sid().map(str::to_owned)),
             Ok(Some(minted.to_owned())),
             "{minted}"
+        );
+        assert_eq!(
+            Requester::of(Some(minted), None, None, None).sid(),
+            Some(minted)
         );
     }
     for unminted in [
@@ -793,6 +808,16 @@ fn requester_refuses_unminted_sid() {
         assert!(!is_minted_sid(unminted), "{unminted}");
         assert!(Requester::parse(&line(unminted)).is_err(), "{unminted}");
         assert_eq!(Requester::of(Some(unminted), None, None, None).sid(), None);
+        let requester = Requester::of(
+            Some(unminted),
+            Some("claude"),
+            Some("Opus 5.5"),
+            Some("team acct"),
+        );
+        assert_eq!(requester.sid(), None, "{unminted}");
+        assert_eq!(requester.program(), Some("claude"), "{unminted}");
+        assert_eq!(requester.model(), Some("opus-5.5"), "{unminted}");
+        assert_eq!(requester.account(), Some("team acct"), "{unminted}");
     }
 }
 

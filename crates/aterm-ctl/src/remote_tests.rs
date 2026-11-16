@@ -80,13 +80,19 @@ fn link(answer: fn(&str) -> String, seen: &'static Mutex<Vec<String>>) -> DriveL
 
 #[test]
 fn a_drive_names_each_session_by_its_sid() {
-    assert!(refuse_local_selector(&words("@s-a1 status")).is_ok());
-    assert!(refuse_local_selector(&words("hold s-a1 on")).is_ok());
-    for local in ["@self", "@env", "@.", "@3", "@s-a1,@s-b2", "@s-", "@s-zz"] {
-        let refusal = refuse_local_selector(&words(&format!("{local} status")))
-            .expect_err(local)
-            .to_string();
-        assert!(refusal.contains("by its sid"), "{local}: {refusal}");
+    assert!(refuse_local_selector(&words("@ta1xxxxxxxx status")).is_ok());
+    assert!(refuse_local_selector(&words("hold ta1xxxxxxxx on")).is_ok());
+    for local in [
+        "@self",
+        "@env",
+        "@.",
+        "@3",
+        "@ta1xxxxxxxx,@tb2xxxxxxxx",
+        "@s-",
+        "@s-zz",
+    ] {
+        let refusal = refuse_local_selector(&words(&format!("{local} status"))).expect_err(local);
+        assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput, "{local}");
     }
 }
 
@@ -108,10 +114,8 @@ fn a_drive_names_a_tab_by_its_id_in_either_form() {
         "Tqn5r6e0148",
         "s-0123456789abcdeg0123",
     ] {
-        let refusal = refuse_local_selector(&words(&format!("@{bad} status")))
-            .expect_err(bad)
-            .to_string();
-        assert!(refusal.contains("by its sid"), "{bad}: {refusal}");
+        let refusal = refuse_local_selector(&words(&format!("@{bad} status"))).expect_err(bad);
+        assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput, "{bad}");
         assert_eq!(spawned_sid_from_answer(&format!("OK spawned @{bad}")), None);
     }
 }
@@ -125,7 +129,7 @@ fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
         if sent.contains(" text") {
             "OK 0\n".to_owned()
         } else {
-            "OK schema=1 sid=s-a1\n".to_owned()
+            "OK schema=1 sid=ta1xxxxxxxx\n".to_owned()
         }
     }
     fn drive(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
@@ -137,14 +141,14 @@ fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
         ..LocalVerbs::NONE
     };
     for typed in [
-        "status @s-a1",
-        "text s-a1 tail=3",
-        "read @s-a1",
-        "@s-a1 read trim",
-        "hold s-a1 on",
-        "close s-a1",
-        "close @s-a1",
-        "@s-a1 close",
+        "status @ta1xxxxxxxx",
+        "text ta1xxxxxxxx tail=3",
+        "read @ta1xxxxxxxx",
+        "@ta1xxxxxxxx read trim",
+        "hold ta1xxxxxxxx on",
+        "close ta1xxxxxxxx",
+        "close @ta1xxxxxxxx",
+        "@ta1xxxxxxxx close",
     ] {
         let argv = ["--host", "lab-mini"]
             .into_iter()
@@ -162,19 +166,19 @@ fn a_drive_hears_a_reads_session_in_front_of_its_verb() {
         local,
     )
     .expect_err("a local number");
-    assert!(refusal.to_string().contains("by its sid"), "{refusal}");
+    assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput);
     let seen = SEEN.lock().unwrap();
     assert_eq!(
         *seen,
         [
-            "@s-a1 status",
-            "@s-a1 text tail=3",
-            "@s-a1 text",
-            "@s-a1 text trim",
-            "hold s-a1 on",
-            "@s-a1 close",
-            "@s-a1 close",
-            "@s-a1 close"
+            "@ta1xxxxxxxx status",
+            "@ta1xxxxxxxx text tail=3",
+            "@ta1xxxxxxxx text",
+            "@ta1xxxxxxxx text trim",
+            "hold ta1xxxxxxxx on",
+            "@ta1xxxxxxxx close",
+            "@ta1xxxxxxxx close",
+            "@ta1xxxxxxxx close"
         ]
     );
 }
@@ -189,24 +193,24 @@ fn turn_sent(parts: &[&str]) -> io::Result<String> {
 fn a_turn_over_a_drive_waits_inside_its_connection() {
     let sent = |line: &str| turn_sent(&line.split_whitespace().collect::<Vec<_>>()).unwrap();
     assert_eq!(
-        sent("@s-a1 turn fix the test"),
+        sent("@ta1xxxxxxxx turn fix the test"),
         "timeout=20000 fix the test"
     );
     assert_eq!(
-        sent("@s-a1 turn settle=submitted timeout=15000 go"),
+        sent("@ta1xxxxxxxx turn settle=submitted timeout=15000 go"),
         "settle=submitted timeout=15000 go"
     );
     assert_eq!(
-        sent("@s-a1 turn set timeout=90000 in the config"),
+        sent("@ta1xxxxxxxx turn set timeout=90000 in the config"),
         "timeout=20000 set timeout=90000 in the config"
     );
-    let refusal = turn_sent(&["@s-a1", "turn", "timeout=60000", "go"])
+    let refusal = turn_sent(&["@ta1xxxxxxxx", "turn", "timeout=60000", "go"])
         .expect_err("past the cap")
         .to_string();
     assert!(
         refusal.contains("give it a shorter timeout=, or say settle=submitted")
-            && refusal.contains("`aterm ctl --host lab-mini await task @s-a1:<task_rev>`")
-            && refusal.contains("`aterm ctl --host lab-mini @s-a1 status` (or `text`)"),
+            && refusal.contains("`aterm ctl --host lab-mini await task @ta1xxxxxxxx:<task_rev>`")
+            && refusal.contains("`aterm ctl --host lab-mini @ta1xxxxxxxx status` (or `text`)"),
         "{refusal}"
     );
 }
@@ -215,35 +219,47 @@ fn a_turn_over_a_drive_waits_inside_its_connection() {
 fn a_turns_timeout_over_a_drive_is_the_one_the_driven_mac_reads() {
     for (parts, wire) in [
         (
-            &["@s-a1", "turn", "--", "timeout=5000 echo T2"][..],
+            &["@ta1xxxxxxxx", "turn", "--", "timeout=5000 echo T2"][..],
             "-- timeout=5000 echo T2",
         ),
         (
-            &["@s-a1", "turn", "timeout=1 x", "timeout=99999"][..],
+            &["@ta1xxxxxxxx", "turn", "timeout=1 x", "timeout=99999"][..],
             "timeout=1 x timeout=99999",
         ),
         (
-            &["@s-a1", "turn", "timeout=99999", "timeout=5000", "go"][..],
+            &[
+                "@ta1xxxxxxxx",
+                "turn",
+                "timeout=99999",
+                "timeout=5000",
+                "go",
+            ][..],
             "timeout=99999 timeout=5000 go",
         ),
         (
-            &["@s-a1", "turn", "timeout=abc", "go"][..],
+            &["@ta1xxxxxxxx", "turn", "timeout=abc", "go"][..],
             "timeout=abc go",
         ),
         (
-            &["@s-a1", "turn", "--", "--", "timeout=99999"][..],
+            &["@ta1xxxxxxxx", "turn", "--", "--", "timeout=99999"][..],
             "-- timeout=20000 -- timeout=99999",
         ),
         (
-            &["@s-a1", "turn", "idle=5", "--", "timeout=99999"][..],
+            &["@ta1xxxxxxxx", "turn", "idle=5", "--", "timeout=99999"][..],
             "timeout=20000 idle=5 -- timeout=99999",
         ),
     ] {
         assert_eq!(turn_sent(parts).unwrap(), wire, "{parts:?}");
     }
-    let refusal = turn_sent(&["@s-a1", "turn", "timeout=5000", "timeout=60000", "go"])
-        .expect_err("the last timeout= is the one read")
-        .to_string();
+    let refusal = turn_sent(&[
+        "@ta1xxxxxxxx",
+        "turn",
+        "timeout=5000",
+        "timeout=60000",
+        "go",
+    ])
+    .expect_err("the last timeout= is the one read")
+    .to_string();
     assert!(refusal.contains("at most timeout=22000"), "{refusal}");
 }
 
@@ -251,33 +267,33 @@ fn a_turns_timeout_over_a_drive_is_the_one_the_driven_mac_reads() {
 fn a_turns_leading_options_keep_their_place_over_a_drive() {
     for (sent, wire) in [
         (
-            "@s-a1 turn id=7f:3:41 run the tests",
+            "@ta1xxxxxxxx turn id=7f:3:41 run the tests",
             "id=7f:3:41 timeout=20000 run the tests",
         ),
         (
-            "@s-a1 turn if-supervisor=h-9 idle=600 go",
+            "@ta1xxxxxxxx turn if-supervisor=h-9 idle=600 go",
             "if-supervisor=h-9 timeout=20000 idle=600 go",
         ),
         (
-            "@s-a1 turn cause=@12 id=k:1:2 go",
+            "@ta1xxxxxxxx turn cause=@12 id=k:1:2 go",
             "cause=@12 id=k:1:2 timeout=20000 go",
         ),
         (
-            "@s-a1 turn id=k:1:2 settle=submitted timeout=9000 go",
+            "@ta1xxxxxxxx turn id=k:1:2 settle=submitted timeout=9000 go",
             "id=k:1:2 settle=submitted timeout=9000 go",
         ),
         (
-            "@s-a1 turn -- id=k literal",
+            "@ta1xxxxxxxx turn -- id=k literal",
             "-- timeout=20000 id=k literal",
         ),
-        ("@s-a1 turn id=k", "id=k timeout=20000"),
+        ("@ta1xxxxxxxx turn id=k", "id=k timeout=20000"),
     ] {
         let parts: Vec<&str> = sent.split_whitespace().collect();
         assert_eq!(turn_sent(&parts).unwrap(), wire, "{sent}");
     }
     for long in [
-        "@s-a1 turn id=k:1:2 timeout=60000 go",
-        "@s-a1 turn if-supervisor=h-9 id=k timeout=60000 go",
+        "@ta1xxxxxxxx turn id=k:1:2 timeout=60000 go",
+        "@ta1xxxxxxxx turn if-supervisor=h-9 id=k timeout=60000 go",
     ] {
         let refusal = turn_sent(&long.split_whitespace().collect::<Vec<_>>())
             .expect_err(long)
@@ -442,9 +458,14 @@ fn a_plain_fleet_shell_takes_one_req_of_request_id_shape() {
 
 #[test]
 fn what_never_crosses_the_fleet_is_refused_here() {
-    let none = run("lab-mini", &words("@s-a1 status"), None, &LocalVerbs::NONE)
-        .expect_err("no fleet client")
-        .to_string();
+    let none = run(
+        "lab-mini",
+        &words("@ta1xxxxxxxx status"),
+        None,
+        &LocalVerbs::NONE,
+    )
+    .expect_err("no fleet client")
+    .to_string();
     assert!(none.contains("does not link"), "{none}");
     fn unreachable(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
         panic!("dialled")
@@ -454,10 +475,10 @@ fn what_never_crosses_the_fleet_is_refused_here() {
         ..LocalVerbs::NONE
     };
     for frame in [
-        "@s-a1 send --stdin",
-        "@s-a1 send -",
-        "@s-a1 paste -",
-        "@s-a1 feed-bin",
+        "@ta1xxxxxxxx send --stdin",
+        "@ta1xxxxxxxx send -",
+        "@ta1xxxxxxxx paste -",
+        "@ta1xxxxxxxx feed-bin",
     ] {
         let refusal = run("lab-mini", &words(frame), None, &local)
             .expect_err(frame)
@@ -466,7 +487,7 @@ fn what_never_crosses_the_fleet_is_refused_here() {
     }
     let aimed = run(
         "lab-mini",
-        &words("@s-a1 spawn agent=claude -"),
+        &words("@ta1xxxxxxxx spawn agent=claude -"),
         None,
         &local,
     )
@@ -509,23 +530,24 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
         fleet_drive: Some(left),
         ..LocalVerbs::NONE
     };
-    let off = run("lab-mini", &words("hold s-a1 off"), None, &local)
+    let off = run("lab-mini", &words("hold ta1xxxxxxxx off"), None, &local)
         .expect_err("no fleet")
         .to_string();
     assert!(
-        off.starts_with("this machine is in no fleet; if this machine took s-a1 on lab-mini, ")
-            && off.ends_with(
-                "`aterm ctl --host lab-mini hold s-a1 off` from here works once this machine is \
+        off.starts_with(
+            "this machine is in no fleet; if this machine took ta1xxxxxxxx on lab-mini, "
+        ) && off.ends_with(
+            "`aterm ctl --host lab-mini hold ta1xxxxxxxx off` from here works once this machine is \
                  in that fleet again (a fleet it issued went with its leave)"
-            ),
+        ),
         "{off}"
     );
     assert!(!off.contains("stands until"), "{off}");
-    let at = run("lab-mini", &words("hold @s-a1 off"), None, &local)
+    let at = run("lab-mini", &words("hold @ta1xxxxxxxx off"), None, &local)
         .expect_err("no fleet")
         .to_string();
     assert_eq!(at, off, "the remedy names the bare sid a hold takes");
-    for other in ["hold s-a1 on", "@s-a1 status"] {
+    for other in ["hold ta1xxxxxxxx on", "@ta1xxxxxxxx status"] {
         let said = run("lab-mini", &words(other), None, &local)
             .expect_err(other)
             .to_string();
@@ -541,20 +563,20 @@ fn a_hold_off_after_a_leave_names_what_lifts_the_hold() {
         fleet_drive: Some(unbooked),
         ..LocalVerbs::NONE
     };
-    let off = run("lab-mnii", &words("hold s-a1 off"), None, &local)
+    let off = run("lab-mnii", &words("hold ta1xxxxxxxx off"), None, &local)
         .expect_err("no such Mac in the book")
         .to_string();
     assert!(
         off.starts_with(
-            "`lab-mnii` is no Mac this machine's book records; if this machine took s-a1 on \
+            "`lab-mnii` is no Mac this machine's book records; if this machine took ta1xxxxxxxx on \
              lab-mnii, "
         ) && off.ends_with(
-            "`aterm ctl --host lab-mnii hold s-a1 off` from here works once this machine's book \
+            "`aterm ctl --host lab-mnii hold ta1xxxxxxxx off` from here works once this machine's book \
              records that Mac again"
         ),
         "{off}"
     );
-    let on = run("lab-mnii", &words("hold s-a1 on"), None, &local)
+    let on = run("lab-mnii", &words("hold ta1xxxxxxxx on"), None, &local)
         .expect_err("no such Mac in the book")
         .to_string();
     assert_eq!(on, "`lab-mnii` is no Mac this machine's book records");
@@ -575,15 +597,19 @@ fn an_exchange_is_framed_as_on_one_mac() {
         Exchange::Completed(code) => code,
         Exchange::Busy => panic!("the fixture is not busy"),
     };
-    assert_eq!(ran("@s-a1 close\n", "close"), ExitCode::FAILURE);
+    assert_eq!(ran("@ta1xxxxxxxx close\n", "close"), ExitCode::FAILURE);
     assert_eq!(
-        ran("@s-a1 turn timeout=20000 go\n", "turn"),
+        ran("@ta1xxxxxxxx turn timeout=20000 go\n", "turn"),
         ExitCode::from(EXIT_TIMEOUT)
     );
-    assert_eq!(ran("@s-a1 text\n", "text"), ExitCode::SUCCESS);
+    assert_eq!(ran("@ta1xxxxxxxx text\n", "text"), ExitCode::SUCCESS);
     assert_eq!(
         *SEEN.lock().unwrap(),
-        ["@s-a1 close", "@s-a1 turn timeout=20000 go", "@s-a1 text"]
+        [
+            "@ta1xxxxxxxx close",
+            "@ta1xxxxxxxx turn timeout=20000 go",
+            "@ta1xxxxxxxx text"
+        ]
     );
 }
 
@@ -600,7 +626,7 @@ fn a_busy_fleet_handoff_retries_under_one_deadline() {
     let budget = Duration::from_secs(60);
     let mut attempts = Vec::new();
     let code = exchange_with_retry(
-        "@s-a1 post key=k kind=note -- once\n",
+        "@ta1xxxxxxxx post key=k kind=note -- once\n",
         "post",
         Within::Drive(budget),
         |remaining| {
@@ -619,8 +645,8 @@ fn a_busy_fleet_handoff_retries_under_one_deadline() {
     assert_eq!(
         *SEEN.lock().unwrap(),
         [
-            "@s-a1 post key=k kind=note -- once",
-            "@s-a1 post key=k kind=note -- once"
+            "@ta1xxxxxxxx post key=k kind=note -- once",
+            "@ta1xxxxxxxx post key=k kind=note -- once"
         ]
     );
 }
@@ -636,7 +662,7 @@ fn a_plain_shell_spawn_retries_only_a_complete_predispatch_busy_reply() {
         aterm_types::control_verbs::CONTROL_BUSY_LINE.to_owned()
     }
     fn ready(_: &str) -> String {
-        "OK s-00000000000000aa\n".to_owned()
+        "OK t0000000000\n".to_owned()
     }
     fn eof(_: &str) -> String {
         String::new()
@@ -717,11 +743,15 @@ fn a_fleet_retry_requires_the_exact_complete_predispatch_busy_reply() {
     ] {
         SEEN.lock().unwrap().clear();
         let mut calls = 0;
-        let result =
-            exchange_with_retry("@s-a1 post key=k kind=note -- once\n", "post", OWN, |_| {
+        let result = exchange_with_retry(
+            "@ta1xxxxxxxx post key=k kind=note -- once\n",
+            "post",
+            OWN,
+            |_| {
                 calls += 1;
                 Ok(link(answer, &SEEN))
-            });
+            },
+        );
         assert_eq!(
             calls, 1,
             "only a full exact Busy refusal may repeat the request"
@@ -738,7 +768,7 @@ fn busy_does_not_extend_an_expired_fleet_deadline() {
     }
     let mut calls = 0;
     let error = exchange_with_retry(
-        "@s-a1 inbox\n",
+        "@ta1xxxxxxxx inbox\n",
         "inbox",
         Within::Drive(Duration::ZERO),
         |_| {
@@ -774,7 +804,7 @@ fn a_partial_fleet_send_is_never_repeated() {
     }
     let mut calls = 0;
     assert!(
-        exchange_with_retry("@s-a1 send once\n", "send", OWN, |_| {
+        exchange_with_retry("@ta1xxxxxxxx send once\n", "send", OWN, |_| {
             calls += 1;
             Ok(DriveLink {
                 stream: Box::new(PartialSend(true)),
@@ -857,15 +887,15 @@ fn a_workers_task_crosses_only_after_go() {
     assert_eq!(*seen, [head.clone(), head.clone(), head]);
 }
 
-/// A worker `agent=claude cwd=/w -` sent to `host`, its task `go on`, by `s-5e1`.
+/// A worker `agent=claude cwd=/w -` sent to `host`, its task `go on`, by `t5e1xxxxxxx`.
 fn fleet_worker<'a>(host: &str, args: &'a [String]) -> Worker<'a> {
     Worker {
         host: host.to_owned(),
         placed: crate::board::Placed::default(),
         args,
         label: Some("dx".to_owned()),
-        starter: Some("s-5e1"),
-        head: "spawn agent=claude cwd=/w - from=s-5e1",
+        starter: Some("t5e1xxxxxxx"),
+        head: "spawn agent=claude cwd=/w - from=t5e1xxxxxxx",
         task: b"go on",
     }
 }
@@ -890,13 +920,14 @@ fn spawn_rows(log: &std::path::Path) -> Vec<aterm_telemetry::Row> {
 /// is the call's own error alone, which exits 0 (`exit_for`). The answer is printed once, after
 /// both: as it prints, the log holds the row and the board the worker.
 /// NEGATIVE CONTROL: the same spawn with stdout open writes the same row and board row, and
-/// prints `OK` once.
+/// prints `OK` once. Only Unix keeps a board (`Board::bind`): elsewhere the row is all a
+/// spawn records.
 #[test]
 fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn go(_: &str) -> String {
         format!(
-            "{}OK s-0e1 task_rev=1\n",
+            "{}OK t0e1xxxxxxx task_rev=1\n",
             aterm_types::control_verbs::task_frame_go(b"go on".len())
         )
     }
@@ -918,7 +949,7 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
                 at_print.borrow_mut().push((
                     line.to_owned(),
                     spawn_rows(&log).len(),
-                    crate::board::Board::at(&board).row("s-0e1").is_some(),
+                    crate::board::Board::at(&board).row("t0e1xxxxxxx").is_some(),
                 ));
             }
         };
@@ -927,7 +958,7 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
         });
         assert_eq!(
             *at_print.borrow(),
-            [("OK s-0e1 task_rev=1".to_owned(), 1, true)],
+            [("OK t0e1xxxxxxx task_rev=1".to_owned(), 1, cfg!(unix))],
             "printed after the row and the board's record (closed stdout: {closed})"
         );
         if closed {
@@ -939,7 +970,7 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
         }
         assert_eq!(
             printed,
-            ["OK s-0e1 task_rev=1"],
+            ["OK t0e1xxxxxxx task_rev=1"],
             "the answer, printed once (closed stdout: {closed})"
         );
         let rows = spawn_rows(&log);
@@ -949,30 +980,33 @@ fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
                 .collect::<Vec<_>>(),
             [(
                 aterm_telemetry::Outcome::Ok,
-                Some("s-0e1"),
+                Some("t0e1xxxxxxx"),
                 Some("0a".repeat(16).as_str())
             )],
             "one sender's row naming the worker (closed stdout: {closed})"
         );
-        let row = board
-            .row("s-0e1")
-            .unwrap_or_else(|| panic!("the board holds the worker (closed stdout: {closed})"));
-        assert_eq!(
-            (
-                row.node,
-                row.host.as_deref(),
-                row.label.as_deref(),
-                row.cwd.as_deref(),
-                row.from.as_deref()
-            ),
-            (
-                Some("0a".repeat(16)),
-                Some("lab-mini"),
-                Some("dx"),
-                Some("/w"),
-                Some("s-5e1")
-            )
-        );
+        #[cfg(unix)]
+        {
+            let row = board
+                .row("t0e1xxxxxxx")
+                .unwrap_or_else(|| panic!("the board holds the worker (closed stdout: {closed})"));
+            assert_eq!(
+                (
+                    row.node,
+                    row.host.as_deref(),
+                    row.label.as_deref(),
+                    row.cwd.as_deref(),
+                    row.from.as_deref()
+                ),
+                (
+                    Some("0a".repeat(16)),
+                    Some("lab-mini"),
+                    Some("dx"),
+                    Some("/w"),
+                    Some("t5e1xxxxxxx")
+                )
+            );
+        }
     }
 }
 
@@ -1033,11 +1067,12 @@ fn an_await_over_a_drive_waits_in_short_legs() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn worker(sent: &str) -> String {
         if sent.contains("timeout=0 ") || sent.trim_end().ends_with("timeout=0") {
-            "OK 1 status=timeout\n@s-a1 rev=3 state=working agent=busy attention=- \
+            "OK 1 status=timeout\n@ta1xxxxxxxx rev=3 state=working agent=busy attention=- \
              result_bytes=0\n"
                 .to_owned()
         } else {
-            "OK 1\n@s-a1 rev=4 state=done agent=idle attention=- result_bytes=12\n".to_owned()
+            "OK 1\n@ta1xxxxxxxx rev=4 state=done agent=idle attention=- result_bytes=12\n"
+                .to_owned()
         }
     }
     fn drive(host: &str, within: Duration) -> Result<DriveLink, DriveRefused> {
@@ -1046,11 +1081,10 @@ fn an_await_over_a_drive_waits_in_short_legs() {
         Ok(link(worker, &SEEN))
     }
     let refusal = await_task::run_driven(&words("await task @3"), None, "lab-mini", drive)
-        .expect_err("a local number")
-        .to_string();
-    assert!(refusal.contains("by its sid"), "{refusal}");
+        .expect_err("a local number");
+    assert_eq!(refusal.kind(), io::ErrorKind::InvalidInput);
     let code = await_task::run_driven(
-        &words("await task @s-a1 timeout=120000"),
+        &words("await task @ta1xxxxxxxx timeout=120000"),
         None,
         "lab-mini",
         drive,
@@ -1061,8 +1095,8 @@ fn an_await_over_a_drive_waits_in_short_legs() {
     assert_eq!(
         *seen,
         [
-            "await task @s-a1 any timeout=0",
-            "await task @s-a1:3 any timeout=20000"
+            "await task @ta1xxxxxxxx any timeout=0",
+            "await task @ta1xxxxxxxx:3 any timeout=20000"
         ]
     );
     drop(seen);
@@ -1073,7 +1107,7 @@ fn an_await_over_a_drive_waits_in_short_legs() {
     };
     let code = run(
         "lab-mini",
-        &words("@s-a1:0 await task timeout=18446744073709551615"),
+        &words("@ta1xxxxxxxx:0 await task timeout=18446744073709551615"),
         Some(Some(Duration::from_secs(u64::MAX))),
         &local,
     )
@@ -1082,8 +1116,8 @@ fn an_await_over_a_drive_waits_in_short_legs() {
     assert_eq!(
         *SEEN.lock().unwrap(),
         [
-            "await task @s-a1:0 any timeout=0",
-            "await task @s-a1:0 any timeout=20000"
+            "await task @ta1xxxxxxxx:0 any timeout=0",
+            "await task @ta1xxxxxxxx:0 any timeout=20000"
         ]
     );
 }
@@ -1118,7 +1152,7 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
         asked_by: None,
         unnamed: None,
     };
-    let turned = exchange(cut(), "@s-a1 turn timeout=20000 go\n", "turn", OWN)
+    let turned = exchange(cut(), "@ta1xxxxxxxx turn timeout=20000 go\n", "turn", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
@@ -1126,23 +1160,23 @@ fn a_drive_cut_before_its_answer_says_what_cuts_one_and_what_may_have_landed() {
             "lab-mini cut the drive connection before it answered (its person took back"
         ) && turned.contains("lowered its fleet level, its fleet key or listen place changed, or")
             && turned.contains(
-                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
+                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @ta1xxxxxxxx status`"
             )
             && !turned.contains("docs.rs"),
         "{turned}"
     );
-    let held = exchange(cut(), "hold s-a1 on\n", "hold", OWN)
+    let held = exchange(cut(), "hold ta1xxxxxxxx on\n", "hold", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
-        held.contains("`aterm ctl --host lab-mini @s-a1 status`"),
+        held.contains("`aterm ctl --host lab-mini @ta1xxxxxxxx status`"),
         "{held}"
     );
-    let read = exchange(cut(), "@s-a1 text\n", "text", OWN)
+    let read = exchange(cut(), "@ta1xxxxxxxx text\n", "text", OWN)
         .expect_err("cut")
         .to_string();
     assert!(
-        read.contains("`aterm ctl --host lab-mini @s-a1 text …` again says which")
+        read.contains("`aterm ctl --host lab-mini @ta1xxxxxxxx text …` again says which")
             && !read.contains("landed"),
         "{read}"
     );
@@ -1186,23 +1220,28 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
         asked_by: None,
         unnamed: None,
     };
-    let turned =
-        exchange(frozen(), "@s-a1 turn timeout=20000 go\n", "turn", OWN).expect_err("unanswered");
+    let turned = exchange(
+        frozen(),
+        "@ta1xxxxxxxx turn timeout=20000 go\n",
+        "turn",
+        OWN,
+    )
+    .expect_err("unanswered");
     assert_eq!(turned.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
     let turned = turned.to_string();
     assert!(
         turned.starts_with("lab-mini did not answer within 28 s (its aterm is stopped, frozen")
             && turned.contains(
-                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @s-a1 status`"
+                "what this `turn` sent may have landed: `aterm ctl --host lab-mini @ta1xxxxxxxx status`"
             )
             && !turned.contains("os error"),
         "{turned}"
     );
-    let read = exchange(frozen(), "@s-a1 text\n", "text", OWN)
+    let read = exchange(frozen(), "@ta1xxxxxxxx text\n", "text", OWN)
         .expect_err("unanswered")
         .to_string();
     assert!(
-        read.contains("`aterm ctl --host lab-mini @s-a1 text …` again is safe")
+        read.contains("`aterm ctl --host lab-mini @ta1xxxxxxxx text …` again is safe")
             && !read.contains("landed"),
         "{read}"
     );
@@ -1215,7 +1254,7 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
     );
     let reader_gone = io::Error::new(io::ErrorKind::BrokenPipe, crate::StdoutClosed);
     assert!(
-        crate::is_stdout_closed(&closed("lab-mini", "@s-a1 text\n", OWN, reader_gone)),
+        crate::is_stdout_closed(&closed("lab-mini", "@ta1xxxxxxxx text\n", OWN, reader_gone)),
         "a closed stdout is no cut of the drive"
     );
     fn drive(_: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
@@ -1227,8 +1266,9 @@ fn a_drive_whose_answer_never_comes_says_which_peer_and_what_may_have_landed() {
             unnamed: None,
         })
     }
-    let awaited = await_task::run_driven(&words("await task @s-a1"), None, "lab-mini", drive)
-        .expect_err("unanswered");
+    let awaited =
+        await_task::run_driven(&words("await task @ta1xxxxxxxx"), None, "lab-mini", drive)
+            .expect_err("unanswered");
     assert_eq!(awaited.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
     let awaited = awaited.to_string();
     assert!(
@@ -1254,7 +1294,8 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         ..LocalVerbs::NONE
     };
     let five = Some(Some(Duration::from_secs(5)));
-    let turned = run("lab-mini", &words("@s-a1 turn go"), five, &local).expect_err("unanswered");
+    let turned =
+        run("lab-mini", &words("@ta1xxxxxxxx turn go"), five, &local).expect_err("unanswered");
     assert_eq!(turned.kind(), io::ErrorKind::WouldBlock, "exit 124 stays");
     let turned = turned.to_string();
     assert!(
@@ -1266,13 +1307,13 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         ) && !turned.contains("frozen"),
         "{turned}"
     );
-    let read = run("lab-mini", &words("@s-a1 status"), five, &local)
+    let read = run("lab-mini", &words("@ta1xxxxxxxx status"), five, &local)
         .expect_err("unanswered")
         .to_string();
     assert!(
         read.starts_with(
             "no answer came from lab-mini within this call's --timeout of 5 s (a longer"
-        ) && read.contains("`aterm ctl --host lab-mini @s-a1 status …` again is safe"),
+        ) && read.contains("`aterm ctl --host lab-mini @ta1xxxxxxxx status …` again is safe"),
         "{read}"
     );
     let spawned = spawn_exchange(
@@ -1289,7 +1330,7 @@ fn a_reply_cut_at_a_shorter_timeout_is_said_as_that_timeout_not_the_peers() {
         "{spawned}"
     );
     for total in [None, Some(None), Some(Some(Duration::from_secs(60)))] {
-        let own = run("lab-mini", &words("@s-a1 turn go"), total, &local)
+        let own = run("lab-mini", &words("@ta1xxxxxxxx turn go"), total, &local)
             .expect_err("unanswered")
             .to_string();
         assert!(
@@ -1307,7 +1348,7 @@ fn a_cut_names_a_deadline_under_a_second_as_it_is() {
     let cut = |within| {
         closed(
             "lab-mini",
-            "@s-a1 status\n",
+            "@ta1xxxxxxxx status\n",
             within,
             io::ErrorKind::WouldBlock.into(),
         )
@@ -1349,8 +1390,8 @@ fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
         (Some(None), DRIVE_WITHIN),
         (Some(Some(Duration::from_secs(60))), DRIVE_WITHIN),
     ] {
-        let refused =
-            run("lab-mini", &words("@s-a1 status"), total, &local).expect_err("never served");
+        let refused = run("lab-mini", &words("@ta1xxxxxxxx status"), total, &local)
+            .expect_err("never served");
         assert_eq!(crate::exit_for(&refused), ExitCode::from(2), "{refused}");
         assert_eq!(
             ASKED.lock().unwrap().pop(),
@@ -1365,7 +1406,7 @@ fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
     ] {
         let awaited = run(
             "lab-mini",
-            &words("await task @s-a1 timeout=2000"),
+            &words("await task @ta1xxxxxxxx timeout=2000"),
             total,
             &local,
         )
@@ -1386,7 +1427,8 @@ fn a_handshake_that_never_comes_waits_the_callers_deadline_and_exits_2() {
         fleet_drive: Some(cut),
         ..LocalVerbs::NONE
     };
-    let refused = run("lab-mini", &words("@s-a1 status"), None, &local).expect_err("refused");
+    let refused =
+        run("lab-mini", &words("@ta1xxxxxxxx status"), None, &local).expect_err("refused");
     assert_eq!(crate::exit_for(&refused), ExitCode::FAILURE, "{refused}");
 }
 
@@ -1395,7 +1437,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
     static ASKED: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn baseline(_: &str) -> String {
-        "OK 1 status=timeout\n@s-a1 rev=3 state=working agent=busy attention=- result_bytes=0\n"
+        "OK 1 status=timeout\n@ta1xxxxxxxx rev=3 state=working agent=busy attention=- result_bytes=0\n"
             .to_owned()
     }
     fn drive(_: &str, within: Duration) -> Result<DriveLink, DriveRefused> {
@@ -1420,7 +1462,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
     let five = Duration::from_secs(5);
     let code = run(
         "lab-mini",
-        &words("await task @s-a1 timeout=600000"),
+        &words("await task @ta1xxxxxxxx timeout=600000"),
         Some(Some(five)),
         &local,
     )
@@ -1434,7 +1476,7 @@ fn an_await_over_a_drive_ends_within_ctls_own_timeout() {
     assert_eq!(asked.len(), 2, "a baseline and one leg: {asked:?}");
     assert!(asked.iter().all(|within| *within <= five), "{asked:?}");
     let seen = SEEN.lock().unwrap();
-    assert_eq!(*seen, ["await task @s-a1 any timeout=0"]);
+    assert_eq!(*seen, ["await task @ta1xxxxxxxx any timeout=0"]);
 }
 
 /// The survey `--host any` reads in these tests: m1 lets this Mac drive it and has a weekly
@@ -1629,7 +1671,7 @@ fn host_any_spawns_a_claude_or_codex_worker_alone() {
     };
     for line in [
         "survey",
-        "@s-a1 spawn agent=claude -",
+        "@ta1xxxxxxxx spawn agent=claude -",
         "spawn agent=agy -",
         "spawn -",
         "spawn cwd=/tmp",
@@ -1674,6 +1716,7 @@ fn scratch_board(
 }
 
 /// A row of a worker this Mac started on `node` (`None`: this Mac).
+#[cfg(unix)]
 fn started_on(sid: &str, node: Option<&str>) -> crate::board::Row {
     crate::board::Row {
         node: node.map(str::to_owned),
@@ -1683,6 +1726,7 @@ fn started_on(sid: &str, node: Option<&str>) -> crate::board::Row {
 
 /// A worker `--host any` spawned is followed to its Mac by its sid: from the board row the
 /// spawn recorded, else from the one live, proven member whose survey lists it.
+#[cfg(unix)]
 #[test]
 fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
     static DIALLED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -1698,7 +1742,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                     label: "m-unproven".into(),
                     answer: Ok(vec![
                         "instance host=m-unproven drive=1 sessions=1".into(),
-                        "session sid=s-f00d agent=idle".into(),
+                        "session sid=tf00dxxxxxx agent=idle".into(),
                     ]),
                     fault: survey::PeerFault::Other,
                     unproven: true,
@@ -1712,7 +1756,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                     label: "m-by-hand at 192.168.1.9".into(),
                     answer: Ok(vec![
                         "instance host=m-by-hand drive=1 sessions=1".into(),
-                        "session sid=s-f00d agent=idle".into(),
+                        "session sid=tf00dxxxxxx agent=idle".into(),
                     ]),
                     fault: survey::PeerFault::Other,
                     unproven: false,
@@ -1725,7 +1769,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                     label: "m4.local at 192.168.1.4".into(),
                     answer: Ok(vec![
                         "instance host=m4 drive=1 sessions=1".into(),
-                        "session sid=s-f00d agent=idle".into(),
+                        "session sid=tf00dxxxxxx agent=idle".into(),
                     ]),
                     fault: survey::PeerFault::Other,
                     unproven: false,
@@ -1754,7 +1798,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
                         .unwrap_or_else(|p| p.into_inner())
                         .push((self.peer.clone(), req.clone()));
                     let text = if req.starts_with("await task") {
-                        "OK 1\n@s-c25a rev=2 state=done agent=idle attention=- result_bytes=5\n"
+                        "OK 1\n@tc25axxxxxx rev=2 state=done agent=idle attention=- result_bytes=5\n"
                             .to_owned()
                     } else if req.ends_with(" result") {
                         "OK 1\nNothing left: verified.\n".to_owned()
@@ -1788,10 +1832,10 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
         })
     }
 
-    // The board places s-c25a on m3: `await task` and `@s-c25a result` follow it there, while
-    // `@s-f00d`, which the board does not hold, falls back to `fleet_survey` and routes to `m4`.
+    // The board places tc25axxxxxx on m3: `await task` and `@tc25axxxxxx result` follow it there, while
+    // `@tf00dxxxxxx`, which the board does not hold, falls back to `fleet_survey` and routes to `m4`.
     board
-        .record(&started_on("s-c25a", Some("m3")))
+        .record(&started_on("tc25axxxxxx", Some("m3")))
         .expect("record");
     let local = LocalVerbs {
         fleet_drive: Some(drive),
@@ -1799,15 +1843,21 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
         ..LocalVerbs::NONE
     };
     assert_eq!(
-        run("any", &words("await task @s-c25a since=0"), None, &local).unwrap(),
+        run(
+            "any",
+            &words("await task @tc25axxxxxx since=0"),
+            None,
+            &local
+        )
+        .unwrap(),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        run("any", &words("@s-c25a result"), None, &local).unwrap(),
+        run("any", &words("@tc25axxxxxx result"), None, &local).unwrap(),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        run("any", &words("@s-f00d status"), None, &local).unwrap(),
+        run("any", &words("@tf00dxxxxxx status"), None, &local).unwrap(),
         ExitCode::SUCCESS
     );
 
@@ -1817,14 +1867,14 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
         vec![
             (
                 "m3".to_owned(),
-                "await task @s-c25a:0 any timeout=0".to_owned()
+                "await task @tc25axxxxxx:0 any timeout=0".to_owned()
             ),
-            ("m3".to_owned(), "@s-c25a result".to_owned()),
-            ("node-m4".to_owned(), "@s-f00d status".to_owned()),
+            ("m3".to_owned(), "@tc25axxxxxx result".to_owned()),
+            ("node-m4".to_owned(), "@tf00dxxxxxx status".to_owned()),
         ]
     );
 
-    let no_survey = resolve_any_sid_hosts(&["s-dead"], None, None).expect_err("no survey_fn");
+    let no_survey = resolve_any_sid_hosts(&["tdeadxxxxxx"], None, None).expect_err("no survey_fn");
     assert_eq!(no_survey.kind(), io::ErrorKind::Unsupported);
 
     fn unserved_survey(
@@ -1836,7 +1886,7 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
         })
     }
     let unserved_err =
-        resolve_any_sid_hosts(&["s-dead"], None, Some(unserved_survey)).expect_err("unserved");
+        resolve_any_sid_hosts(&["tdeadxxxxxx"], None, Some(unserved_survey)).expect_err("unserved");
     assert_eq!(crate::exit_for(&unserved_err), ExitCode::from(2));
 }
 
@@ -1845,13 +1895,16 @@ fn host_any_follows_a_spawned_workers_sid_to_its_mac() {
 /// started); a sid more than one proven peer lists is refused rather than picked; a sid the board
 /// places on this Mac is refused (`--host any` drives other Macs); and a row's file open to
 /// others is not read.
+#[cfg(unix)]
 #[test]
 fn host_any_follows_the_board_first_and_never_records_a_survey() {
     let (_tmp, _guard, board) = scratch_board("any-harden");
     board
-        .record(&started_on("s-c25a", Some("m3")))
+        .record(&started_on("tc25axxxxxx", Some("m3")))
         .expect("record");
-    board.record(&started_on("s-0ca1", None)).expect("record");
+    board
+        .record(&started_on("t0ca1xxxxxx", None))
+        .expect("record");
 
     fn conflicting_survey(
         _: &survey::FleetAsk<'_>,
@@ -1865,8 +1918,8 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
                     label: "m-a".into(),
                     answer: Ok(vec![
                         "instance host=m-a drive=1 sessions=3".into(),
-                        "session sid=s-c25a agent=idle".into(),
-                        "session sid=s-a1b2 agent=idle".into(),
+                        "session sid=tc25axxxxxx agent=idle".into(),
+                        "session sid=ta1b2xxxxxx agent=idle".into(),
                         format!("session sid={huge_sid} agent=idle"),
                     ]),
                     fault: survey::PeerFault::Other,
@@ -1880,8 +1933,8 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
                     label: "m-b".into(),
                     answer: Ok(vec![
                         "instance host=m-b drive=1 sessions=2".into(),
-                        "session sid=s-a1b2 agent=idle".into(),
-                        "session sid=s-b001 agent=idle".into(),
+                        "session sid=ta1b2xxxxxx agent=idle".into(),
+                        "session sid=tb001xxxxxx agent=idle".into(),
                     ]),
                     fault: survey::PeerFault::Other,
                     unproven: false,
@@ -1898,37 +1951,43 @@ fn host_any_follows_the_board_first_and_never_records_a_survey() {
     }
 
     assert_eq!(
-        resolve_any_sid_hosts(&["s-c25a"], None, Some(unasked)).unwrap(),
+        resolve_any_sid_hosts(&["tc25axxxxxx"], None, Some(unasked)).unwrap(),
         vec!["m3".to_owned()],
         "a sid the board holds needs no survey"
     );
     assert_eq!(
-        resolve_any_sid_hosts(&["s-c25a", "s-b001"], None, Some(conflicting_survey)).unwrap(),
+        resolve_any_sid_hosts(
+            &["tc25axxxxxx", "tb001xxxxxx"],
+            None,
+            Some(conflicting_survey)
+        )
+        .unwrap(),
         vec!["m3".to_owned(), "node-b".to_owned()],
-        "m-a listing s-c25a does not move it off the board's m3"
+        "m-a listing tc25axxxxxx does not move it off the board's m3"
     );
     assert!(
-        board.row("s-b001").is_none(),
+        board.row("tb001xxxxxx").is_none(),
         "a survey's finding is not written down"
     );
-    let ambig =
-        resolve_any_sid_hosts(&["s-a1b2"], None, Some(conflicting_survey)).expect_err("ambiguous");
+    let ambig = resolve_any_sid_hosts(&["ta1b2xxxxxx"], None, Some(conflicting_survey))
+        .expect_err("ambiguous");
     assert!(
         ambig.to_string().contains("multiple fleet peers")
             && ambig.to_string().contains("node-a")
             && ambig.to_string().contains("node-b"),
         "{ambig}"
     );
-    let here = resolve_any_sid_hosts(&["s-0ca1"], None, Some(unasked)).expect_err("this Mac");
+    let here = resolve_any_sid_hosts(&["t0ca1xxxxxx"], None, Some(unasked)).expect_err("this Mac");
     assert_eq!(here.kind(), io::ErrorKind::InvalidInput, "{here}");
     assert!(here.to_string().contains("runs on this Mac"), "{here}");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let file = board.dir().join("s-c25a");
+        let file = board.dir().join("tc25axxxxxx");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let loose = resolve_any_sid_hosts(&["s-c25a"], None, Some(conflicting_survey)).unwrap();
+        let loose =
+            resolve_any_sid_hosts(&["tc25axxxxxx"], None, Some(conflicting_survey)).unwrap();
         assert_eq!(
             loose,
             vec!["node-a".to_owned()],
@@ -2004,31 +2063,31 @@ fn a_request_sent_over_a_drive_is_one_row_as_the_other_macs_lock_answered_it() {
     let (node, asker) = (Some(ACTIVITY_NODE), Some(ACTIVITY_ASKER));
     let by = Some(ACTIVITY_ASKER.to_owned());
     assert_eq!(
-        run(node, asker, "@s-a1 turn timeout=20000 go\n", "turn"),
+        run(node, asker, "@ta1xxxxxxxx turn timeout=20000 go\n", "turn"),
         [(Plain::Typed, false, by.clone())]
     );
     assert_eq!(
-        run(node, asker, "@s-a1 text\n", "text"),
+        run(node, asker, "@ta1xxxxxxxx text\n", "text"),
         [(Plain::Read, false, by.clone())]
     );
     assert_eq!(
-        run(node, asker, "@s-a1 send hi\n", "send"),
+        run(node, asker, "@ta1xxxxxxxx send hi\n", "send"),
         [(Plain::Typed, true, by)],
         "the lock's refusal"
     );
     assert_eq!(
-        run(node, asker, "@s-a1 close\n", "close"),
+        run(node, asker, "@ta1xxxxxxxx close\n", "close"),
         [],
         "the gate's refusal"
     );
     // No session asked: a read is aterm's own poll, a typed line still counts.
-    assert_eq!(run(node, None, "@s-a1 text\n", "text"), []);
+    assert_eq!(run(node, None, "@ta1xxxxxxxx text\n", "text"), []);
     assert_eq!(
-        run(node, None, "@s-a1 turn timeout=20000 go\n", "turn"),
+        run(node, None, "@ta1xxxxxxxx turn timeout=20000 go\n", "turn"),
         [(Plain::Typed, false, None)]
     );
     assert_eq!(
-        run(None, asker, "@s-a1 turn timeout=20000 go\n", "turn"),
+        run(None, asker, "@ta1xxxxxxxx turn timeout=20000 go\n", "turn"),
         [],
         "no node proved"
     );
@@ -2042,7 +2101,7 @@ fn a_spawn_sent_to_another_mac_is_a_new_job_row_admitted_or_blocked() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
     fn go(_: &str) -> String {
         format!(
-            "{}OK s-0e1 task_rev=1\n",
+            "{}OK t0e1xxxxxxx task_rev=1\n",
             aterm_types::control_verbs::task_frame_go(b"go on".len())
         )
     }

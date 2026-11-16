@@ -829,7 +829,16 @@ impl Store {
     /// account and credential images in provider admission projections.
     #[cfg(test)]
     pub(in crate::harness) fn is_sync_receipt_file(&self, path: &Path) -> bool {
-        path == self.dir.join(RECEIPT) || path == self.dir.join(WITNESS)
+        path == &self.sync_receipt_file() || path == self.dir.join(WITNESS)
+    }
+
+    /// Path to the sync receipt, a commit's first write and its last: pending (its plan
+    /// held) while the commit's images are installed, which [`Store::load`] refuses as an
+    /// interrupted sync, and complete once they all are. A watcher of the store's files that
+    /// reads at each write watches this one too, so its last read follows the completion.
+    #[must_use]
+    pub fn sync_receipt_file(&self) -> PathBuf {
+        self.dir.join(RECEIPT)
     }
 
     /// State and history share the existing journal without requiring a roster or login file.
@@ -1844,6 +1853,8 @@ impl Store {
         } else {
             5
         })?;
+        #[cfg(any(test, debug_assertions))]
+        before_receipt();
         self.save_receipt(&receipt)
     }
 
@@ -2298,6 +2309,52 @@ impl Store {
         }
         Ok(changed)
     }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The pause [`paused_before_receipt_for_test`] holds on this thread.
+    static BEFORE_RECEIPT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `pause` called by each commit it makes on this thread once the commit's images
+/// are installed and before its receipt completes: the moment a reader of the store finds the
+/// commit under way ([`Store::load`] refuses it as an interrupted sync). Another thread's
+/// commits do not pause.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn paused_before_receipt_for_test<R>(
+    pause: impl FnMut() + 'static,
+    f: impl FnOnce() -> R,
+) -> R {
+    /// Puts back the pause that was held before, however `f` ends.
+    struct Restore(Option<Box<dyn FnMut()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            BEFORE_RECEIPT.with(|held| *held.borrow_mut() = before);
+        }
+    }
+    let _restore = Restore(BEFORE_RECEIPT.with(|held| held.replace(Some(Box::new(pause)))));
+    f()
+}
+
+/// A commit's images are installed and its receipt is about to complete: run this thread's
+/// pause, if one is held ([`paused_before_receipt_for_test`]). A commit the pause itself makes
+/// does not pause again.
+#[cfg(any(test, debug_assertions))]
+fn before_receipt() {
+    let Some(mut pause) = BEFORE_RECEIPT.with(std::cell::RefCell::take) else {
+        return;
+    };
+    pause();
+    BEFORE_RECEIPT.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(pause);
+        }
+    });
 }
 
 #[cfg(test)]

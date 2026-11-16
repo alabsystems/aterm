@@ -880,7 +880,7 @@ fn the_final_matching_inventory_read_rejects_real_inventory_and_control_changes(
 #[test]
 fn tls_fetches_historical_keys_then_repairs_pages_and_restarts() {
     let p = Pair::new(true, 35);
-    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
+    let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     let (mut keys_sent, mut keys_received) = (0, 0);
     for _ in 0..3 {
@@ -1063,6 +1063,7 @@ fn full_batches_continue_without_starving_another_table() {
                 Endpoint::from_bootstrap(&pair.lab.bootstrap(node))
                     .unwrap()
                     .unwrap()
+                    .duplex()
                     .with_tables(
                         pair.lab.paths[node].clone(),
                         tables
@@ -1150,6 +1151,7 @@ fn incoming_backlog_guides_a_different_peer_without_starving_regular_tables() {
         let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
             .unwrap()
             .unwrap()
+            .duplex()
             .with_tables(
                 lab.paths[node].clone(),
                 tables
@@ -1276,6 +1278,7 @@ fn concurrent_local_writes_do_not_erase_a_remote_backlog() {
             let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
                 .unwrap()
                 .unwrap()
+                .duplex()
                 .with_tables(
                     lab.paths[node].clone(),
                     tables
@@ -1417,6 +1420,7 @@ fn stale_backlog_yields_across_first_contact_peers() {
             let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(node))
                 .unwrap()
                 .unwrap()
+                .duplex()
                 .with_tables(
                     lab.paths[node].clone(),
                     tables
@@ -1743,6 +1747,7 @@ fn damaged_neighbor_case(case: usize) -> [i64; 4] {
         Endpoint::from_bootstrap(&p.lab.bootstrap(node))
             .unwrap()
             .unwrap()
+            .duplex()
             .with_tables(
                 p.lab.paths[node].clone(),
                 tables
@@ -2292,7 +2297,7 @@ fn wire_bounds_and_fair_rotation_do_not_depend_on_acknowledgements() {
 fn a_round_catches_the_peer_up_only_once_it_lacks_nothing_of_the_table() {
     let records = BATCH + 4;
     let p = Pair::new(false, records);
-    let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
+    let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
     let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
     p.round(&a, &b, &mut ra, &mut rb);
     let first = ra.application().expect("a completed application round");
@@ -2384,7 +2389,7 @@ pub fn repair_transition(
     let (scenario, (stored, acknowledged, control)) = match action {
         "NewMember" | "LostKey" => {
             let p = Pair::new(true, 1);
-            let (a, b) = (p.endpoint(0, true), p.endpoint(1, true));
+            let (a, b) = (p.endpoint(0, true).duplex(), p.endpoint(1, true).duplex());
             let (mut ra, mut rb) = (PeerRepair::default(), PeerRepair::default());
             p.round(&a, &b, &mut ra, &mut rb);
             let sent = ra.application().unwrap().sent;
@@ -2690,14 +2695,16 @@ fn blocking_reads_cannot_turn_a_changed_roster_into_a_successful_round() {
                 &mut Report::default(),
             )
         } else {
-            round.receive_batch(
-                &mut stream,
-                actor,
-                p.scope.digest(),
-                kind,
-                &mut Repair::default(),
-                &mut Report::default(),
-            )
+            round
+                .receive_batch(
+                    &mut stream,
+                    actor,
+                    p.scope.digest(),
+                    kind,
+                    &mut Repair::default(),
+                    &mut Report::default(),
+                )
+                .map(drop)
         };
         assert!(
             result.is_err(),
@@ -3004,4 +3011,212 @@ fn a_repair_round_appends_what_it_brings_as_local() {
     let seen = seen.take();
     assert_eq!(p.count(0), 2, "the round brought the old peer's operation");
     assert_eq!(seen, [(p.scope.digest(), Via::Local)]);
+}
+
+/// `sender` and `receiver` run one application round over a socket pair, each with `repair`'s
+/// `atdb/7` choice.
+fn rbsr_round(
+    sender: &Replica,
+    receiver: &Replica,
+    repairs: &mut [Repair; 2],
+) -> [Result<Report>; 2] {
+    let (mut left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+    for stream in [&left, &right] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+    }
+    let (client, server) = repairs.split_at_mut(1);
+    thread::scope(|threads| {
+        let worker = threads.spawn(move || {
+            let mut right = right;
+            receiver.exchange(&mut right, sender.actor, Side::Responder, &mut server[0])
+        });
+        let result = sender.exchange(&mut left, receiver.actor, Side::Initiator, &mut client[0]);
+        drop(left);
+        [result, worker.join().unwrap()]
+    })
+}
+
+/// On `atdb/7` one round drains the whole difference: a peer that lacks three batches and more
+/// of a table has every record of it after one round, caught up, where `atdb/6`'s round moves one
+/// batch ([`a_round_catches_the_peer_up_only_once_it_lacks_nothing_of_the_table`]).
+/// NEGATIVE CONTROL: with `reconcile` false on both sides (the `atdb/6` wire), the same round
+/// leaves the peer at `BATCH` records: `` left: 16 right: 53 ``.
+#[test]
+fn rbsr_round_drains_a_difference_larger_than_a_batch_in_one_round() {
+    let records = 3 * BATCH + 5;
+    let pair = Pair::new(false, records);
+    let (sender, receiver) = (pair.replica(0), pair.replica(1));
+    let reconciling = || Repair {
+        reconcile: true,
+        ..Repair::default()
+    };
+    let mut repairs = [reconciling(), reconciling()];
+    let [sent, received] = rbsr_round(&sender, &receiver, &mut repairs);
+    let (sent, received) = (sent.unwrap(), received.unwrap());
+    assert_eq!(pair.count(1), records);
+    assert_eq!((sent.sent, received.received), (records, records));
+    assert!(sent.caught_up, "{sent:?}");
+    // A second round finds nothing to move.
+    let [again, _] = rbsr_round(&sender, &receiver, &mut repairs);
+    assert_eq!(again.unwrap().sent, 0);
+
+    // The `atdb/6` wire, as before: one batch a round.
+    let other = Pair::new(false, records);
+    let mut whole = [Repair::default(), Repair::default()];
+    let [sent, _] = rbsr_round(&other.replica(0), &other.replica(1), &mut whole);
+    assert_eq!(sent.unwrap().sent, BATCH);
+    assert_eq!(other.count(1), BATCH);
+}
+
+/// A record ships after every parent of it it ships with, across actors: a child by the actor
+/// that sorts first, with the lower digest, still follows its parent by another actor, and the
+/// same actor's records keep their sequence.
+/// NEGATIVE CONTROL: ordering by (actor, sequence, digest) alone, or by digest, puts the child
+/// first: `` left: [child, parent, ...] ``.
+#[test]
+fn rbsr_ships_a_cross_actor_child_after_its_missing_parent() {
+    use astream_wire::sync::Header;
+    let header = |id: u8, actor: u8, sequence: u64, parents: &[u8]| Header {
+        id: [id; 32],
+        actor: [actor; 48],
+        sequence,
+        previous: None,
+        parents: parents.iter().map(|p| [*p; 32]).collect(),
+    };
+    let parent = header(0x90, 0xf0, 1, &[]);
+    let child = header(0x10, 0x01, 1, &[0x90]);
+    let next = Header {
+        previous: Some([0x10; 32]),
+        ..header(0x05, 0x01, 2, &[0x10])
+    };
+    let unrelated = header(0x50, 0x01, 7, &[]);
+    let headers = [&parent, &child, &next, &unrelated];
+    let by_id = |id: &Digest| headers.iter().find(|h| h.id == *id).copied();
+    let ids = [next.id, child.id, unrelated.id, parent.id];
+    let ordered = crate::table::store::causal_order(&ids, by_id);
+    let at = |id: Digest| ordered.iter().position(|o| *o == id).unwrap();
+    assert_eq!(ordered.len(), 4);
+    assert!(at(parent.id) < at(child.id), "{ordered:?}");
+    assert!(at(child.id) < at(next.id), "{ordered:?}");
+    // Ties among ready records go by actor, then sequence: the unrelated record by the lower
+    // actor ships before the parent by the higher one.
+    assert!(at(unrelated.id) < at(parent.id), "{ordered:?}");
+}
+
+/// Counts the bytes written through it.
+struct Counted<S> {
+    inner: S,
+    written: usize,
+}
+
+impl<S: Read> Read for Counted<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for Counted<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Reconcile `a` with `b` over a socket pair: what each learned of the other and the bytes both
+/// wrote.
+fn reconciled(
+    a: astream_wire::sync::rbsr::Snapshot,
+    b: astream_wire::sync::rbsr::Snapshot,
+) -> (Option<BTreeSet<Digest>>, Option<BTreeSet<Digest>>, usize) {
+    let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+    for stream in [&left, &right] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+    }
+    thread::scope(|threads| {
+        let worker = threads.spawn(move || {
+            let mut stream = Counted {
+                inner: right,
+                written: 0,
+            };
+            let remote =
+                reconcile_inventory(&mut stream, Side::Responder, Some(b), || Ok(())).unwrap();
+            (remote, stream.written)
+        });
+        let mut stream = Counted {
+            inner: left,
+            written: 0,
+        };
+        let remote = reconcile_inventory(&mut stream, Side::Initiator, Some(a), || Ok(())).unwrap();
+        let (other, written) = worker.join().unwrap();
+        (remote, other, stream.written + written)
+    })
+}
+
+/// Two 8,192-record tables that differ by 16 records on each side reconcile in under 8 KiB, both
+/// ways together, and each side learns the other's exact set, where `atdb/6` sends each whole list
+/// (256 KiB each way). Side a holds four writers' 2,048-record chains; side b lacks each chain's
+/// last four and holds a fifth writer's 16: the table round's snapshot agrees each writer's prefix
+/// by its frontier, so only the tails are reconciled by range.
+/// Without the writers' chains (`Snapshot::new`, ranges alone) the same SHA-256 identities take
+/// about 8.7 KiB: still exact, and under 16 KiB, a thirtieth of the whole lists.
+/// NEGATIVE CONTROL: with `side` building `Snapshot::new` in place of `Snapshot::from_inventory`
+/// (the frontier stage dropped), the first assertion fails at about 8.7 KiB.
+#[test]
+fn rbsr_8192_record_inventories_differing_by_16_reconcile_under_8_kib() {
+    use astream_wire::sync::{Header, Index, rbsr::Snapshot};
+    let id = |actor: u8, sequence: u64| -> Digest {
+        Sha256::digest([&[actor][..], &sequence.to_le_bytes()].concat())
+    };
+    let chain = |actor: u8, upto: u64| -> Vec<Header> {
+        (1..=upto)
+            .map(|sequence| {
+                let previous = (sequence > 1).then(|| id(actor, sequence - 1));
+                Header {
+                    id: id(actor, sequence),
+                    actor: [actor; 48],
+                    sequence,
+                    previous,
+                    parents: previous.into_iter().collect(),
+                }
+            })
+            .collect()
+    };
+    let side = |chains: &[(u8, u64)]| -> (Snapshot, BTreeSet<Digest>) {
+        let mut index = Index::new(1 << 16);
+        let mut ids = BTreeSet::new();
+        for (actor, upto) in chains {
+            for header in chain(*actor, *upto) {
+                ids.insert(header.id);
+                index.insert(header).unwrap();
+            }
+        }
+        (Snapshot::from_inventory(ids.clone(), &index), ids)
+    };
+    let (a, a_ids) = side(&[(1, 2048), (2, 2048), (3, 2048), (4, 2048)]);
+    let (b, b_ids) = side(&[(1, 2044), (2, 2044), (3, 2044), (4, 2044), (5, 16)]);
+    assert_eq!((a_ids.len(), b_ids.len()), (8192, 8192));
+    let (learned_a, learned_b, bytes) = reconciled(a, b);
+    assert_eq!(learned_a, Some(b_ids.clone()));
+    assert_eq!(learned_b, Some(a_ids.clone()));
+    assert!(bytes < 8 * 1024, "{bytes} bytes with writer frontiers");
+
+    let (learned_a, learned_b, ranges) =
+        reconciled(Snapshot::new(a_ids.clone()), Snapshot::new(b_ids.clone()));
+    assert_eq!(learned_a, Some(b_ids));
+    assert_eq!(learned_b, Some(a_ids));
+    assert!(ranges < 16 * 1024, "{ranges} bytes by ranges alone");
+    println!(
+        "8192 records, d=16 each way: {bytes} bytes with writer frontiers, {ranges} by ranges"
+    );
 }

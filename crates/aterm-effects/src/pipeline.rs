@@ -289,6 +289,16 @@ pub struct EffectsPipeline {
     /// The size a fitted head goes to this frame, as its route read it, the time, and whether
     /// the host animates.
     flying_fit_goal: Option<(f32, Instant, bool)>,
+    /// Where the fitted glide takes off from on a frame it leaves its row's seat by the wall for
+    /// the row above ([`crate::rainbow_kitty::companion::head_fit_seat`]): its row's seat for
+    /// this caret, clear of it.
+    flying_take_off: Option<(i32, i32)>,
+    /// The glide leaves the wall this frame: no seat there holds it
+    /// ([`crate::rainbow_kitty::companion::HeadFitSeat::Leave`]).
+    flying_leaves: bool,
+    /// The caret's row and the top of the landing the last frame prepared laid the flier at
+    /// (`EffectsPipeline::wall_held_up`).
+    flying_seat_y: Option<(u16, i32)>,
 
     decos: WordDecorations,
     /// Compiled lexicon + resolved config.
@@ -462,6 +472,9 @@ impl EffectsPipeline {
             flying_sky_row: None,
             flying_fit: crate::rainbow_kitty::companion::HeadFit::WHOLE,
             flying_fit_goal: None,
+            flying_take_off: None,
+            flying_leaves: false,
+            flying_seat_y: None,
             decos: WordDecorations::default(),
             sparkle: None,
             deco_cfg: DecoConfig::default(),
@@ -1155,6 +1168,30 @@ impl EffectsPipeline {
     #[inline]
     pub const fn set_thin_caret_read(&mut self, on: bool) {
         self.cursor.glow.set_thin_caret_read(on);
+    }
+
+    /// A test's negative control: a bar or underline caret reads against its cell alone, not
+    /// the light beside its line (`CursorGlow::set_thin_caret_ring`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_thin_caret_ring(&mut self, on: bool) {
+        self.cursor.glow.set_thin_caret_ring(on);
+    }
+
+    /// A test's negative control: the ground a thin caret's cell is read on leaves its letter
+    /// out (`CursorGlow::set_thin_caret_text`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_thin_caret_text(&mut self, on: bool) {
+        self.cursor.glow.set_thin_caret_text(on);
+    }
+
+    /// A test's negative control: the guard passes over the letter under a bar or underline
+    /// caret as under a block (`CursorGlow::set_letter_guard_thin_caret`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_thin_caret(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard_thin_caret(on);
     }
 
     /// The ground the last frame read its bar or underline caret against, after any hold

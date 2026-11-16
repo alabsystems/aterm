@@ -665,7 +665,7 @@ fn a_move_ends_every_wait_but_that_of_a_row_a_page_stopped() {
     assert_eq!(ladder.vault_turn(Some([1; 32]), t0), VaultTurn::Due);
     ladder.vault_done(Vault::Unchanged(51));
     ladder.failed("stopped", "mailbox", t0);
-    ladder.page_stopped("stopped", until);
+    ladder.page_stopped("stopped", Some(until));
     ladder.failed("relay", "mailbox", t0);
     let later = t0 + Duration::from_secs(60);
     assert_eq!(
@@ -695,6 +695,37 @@ fn a_move_ends_every_wait_but_that_of_a_row_a_page_stopped() {
     assert!(
         !ladder.held("stopped", "mailbox", later),
         "the record says go"
+    );
+}
+
+#[test]
+fn a_row_a_bot_protection_stopped_waits_for_a_person_on_no_clock() {
+    let t0 = Instant::now();
+    let mut ladder = Ladder::default();
+    ladder.failed("checked", "mailbox", t0);
+    ladder.page_stopped("checked", None);
+    let later = t0 + BACKOFF_MAX * 4;
+    assert_eq!(
+        ladder.retry_at("checked", later),
+        None,
+        "no next try is promised"
+    );
+    ladder.moved(later);
+    assert!(ladder.held("checked", "mailbox", later), "no clock ends it");
+    assert!(
+        ladder.held("checked", "a new mailbox", later),
+        "no new input ends it"
+    );
+    ladder.failed("timed", "mailbox", t0);
+    ladder.page_stopped("timed", Some(t0 + BACKOFF_FIRST));
+    assert!(
+        !ladder.held("timed", "mailbox", later),
+        "NEGATIVE CONTROL: a page's wait with a clock ends"
+    );
+    ladder.page_ended("checked");
+    assert!(
+        !ladder.held("checked", "mailbox", later),
+        "the record says a person went on from it"
     );
 }
 

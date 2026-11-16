@@ -508,6 +508,7 @@ impl Grid {
     }
 
     /// Set the row counter for a move that scrolled nothing into history: lines put back in front of the ring, or keys raised to cover a rewrap or a restore.
+    /// A counter that moves gives every retained row a new key, so it bumps `history_renumber_epoch` (what each absolute-row-keyed cache, the viewport row memo among them, is keyed on) and loses the anchors.
     pub(super) fn renumber_rows(&mut self, counter: u64) {
         let owed = self
             .storage
@@ -515,6 +516,8 @@ impl Grid {
             .owed(self.storage.absolute_row_counter, self.storage.resize_law);
         let skew = self.window_skew();
         if counter != self.storage.absolute_row_counter {
+            self.storage.history_renumber_epoch =
+                self.storage.history_renumber_epoch.saturating_add(1);
             self.lose_anchors_renumbered();
         }
         self.storage.absolute_row_counter = counter;

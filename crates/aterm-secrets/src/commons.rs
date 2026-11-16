@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod constraints;
 #[cfg(unix)]
 pub mod everyone_key;
+pub mod finality;
 #[cfg(unix)]
 pub mod fold;
 #[cfg(unix)]

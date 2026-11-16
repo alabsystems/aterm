@@ -6,7 +6,8 @@
 //! publishes on its `metrics.log` each one that changed:
 //!
 //! - one quota row per account row of each pooled CLI, from `harness::cli::survey_accounts` (its
-//!   plan the one `aterm harness accounts` names) and the journal book's facts for the account
+//!   plan the one `aterm harness accounts` names, its lifts the newest wall of each window this
+//!   Mac lifted on it) and the journal book's facts for the account
 //!   ([`aterm_db::alab::journal::book_facts`]); an account the log holds a row of that the
 //!   roster no longer lists is published once as removed ([`QuotaRow::ended`]);
 //! - one agy row per home whose last reading the agy store keeps (`<harness>/agy-quota/`);
@@ -23,6 +24,15 @@
 //! the Mac's `now/activity` row is published when the count changed, and again each
 //! [`ACTIVITY_REFRESH_S`] it did not, so a reader can tell a count that still holds from one a Mac
 //! stopped publishing.
+//!
+//! A lift is published when the store writes it, not at the next pass: a watch on each pool's
+//! accounts state ([`LiftWatch`]) tells the publisher of each write, and where an account's lifts
+//! are not the ones it last published, it publishes the snapshot rows that changed at once
+//! ([`Publisher::lifted`]), the lifted account's quota row among them. It and the pass take
+//! turns from snapshot to publish, so neither publishes an older snapshot over the other's.
+//! Every writer of the store is heard, a window's harness, the CLI and this service alike.
+//! Other Macs lift their walls from that row (`crate::quota_lifts`), so an account one Mac saw
+//! come back is usable on every other at once, with no read of the provider there.
 //!
 //! The pass is the node service's own, not the journal flusher's: the flusher runs in whichever
 //! process holds the Commons owner lease (a window, after a node restart), and not at all while
@@ -51,8 +61,9 @@ use aterm_agent::harness::{
 };
 use aterm_db::alab::journal::{self as journal, BookFacts, Pk, Spool};
 use aterm_metrics::row::{
-    ACTIVITY_REFRESH_S, ActivityRow, AgyGroup, AgyRow, Label, ManagerEntry, NEEDS_MAX, NeedsRow,
-    PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row, SignIn, UnreadRow, WindowRecord, Word,
+    ACTIVITY_REFRESH_S, ActivityRow, AgyGroup, AgyRow, Label, Lift, ManagerEntry, NEEDS_MAX,
+    NeedsRow, PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row, SignIn, UnreadRow, WindowRecord,
+    Word,
 };
 use aterm_metrics::rules::{HOUR_AGE, MINUTE_AGE};
 use aterm_metrics::subject::{
@@ -936,11 +947,21 @@ struct Accounts {
     unkeyed: BTreeMap<Cli, BTreeSet<String>>,
 }
 
+/// Each account's lifts on this Mac, the newest of each window
+/// ([`accounts::Account::newest_lifts`]), by pool and label.
+type Lifts = BTreeMap<(accounts::Cli, String), Vec<accounts::Lift>>;
+
 /// The publisher: what the folds keep, and what the log holds.
 pub(crate) struct Publisher {
     places: Places,
     folds: Mutex<Folds>,
+    /// Held from a snapshot of this Mac's rows through its publish, by a pass and by
+    /// [`Publisher::lifted`] alike: each publishes its snapshot before the other takes one, so a
+    /// pass's snapshot from before a lift is never published over the lift's.
+    turn: Mutex<()>,
     shown: Mutex<Option<Shown>>,
+    /// The lifts [`Publisher::lifted`] last published (or found published).
+    lifts: Mutex<Lifts>,
     /// The needs row the windows' latest pushes make, once the node service has read them.
     needs: Mutex<Option<NeedsRow>>,
     /// The activity row the node service's latest count of its windows' agents makes.
@@ -961,7 +982,9 @@ impl Publisher {
                 off,
                 ..Gaps::default()
             })),
+            turn: Mutex::new(()),
             shown: Mutex::new(None),
+            lifts: Mutex::new(Lifts::new()),
             needs: Mutex::new(None),
             activity: Mutex::new(None),
         }
@@ -988,8 +1011,91 @@ impl Publisher {
             BTreeMap::new()
         };
         drop(folds);
+        let _turn = self.turn.lock_or_recover();
         let rows = publishing.then(|| self.snapshot(log.node(), now));
         self.publish(log, now, Projected { rows, windows })
+    }
+
+    /// A pool's accounts store was written ([`LiftWatch`]): where an account's lifts are not the
+    /// ones last published, publish this Mac's snapshot rows on `log` at once, each that changed
+    /// (the lifted account's quota row among them), not at the next pass. It takes its turn with
+    /// the pass from the store's read through the publish. The lifts count as published only once
+    /// the log took every row: after a refused publish, or a log whose rows could not be read
+    /// back, the next write tries again. A store that does not read keeps the lifts last
+    /// published of it, so a commit under way publishes nothing until its receipt's write.
+    /// With `publishing` off (`[alab] journal = false`) nothing is read or published, as a pass
+    /// publishes no account row then; with no log the lift waits for the next pass that has one.
+    pub(crate) fn lifted(&self, log: Option<&dyn Log>, now: u64, publishing: bool) -> Report {
+        let Some(log) = log.filter(|_| publishing) else {
+            return Report::default();
+        };
+        let _turn = self.turn.lock_or_recover();
+        let now_s = i64::try_from(now).unwrap_or(i64::MAX);
+        let mut lifts = Lifts::new();
+        for (pool, store) in self.pool_stores() {
+            let Ok((state, _)) = store.load(now_s) else {
+                // A store that does not read now, a commit's under way among them, keeps the
+                // lifts last published of it: its commit's receipt is its last write, whose
+                // own tell reads it whole ([`Publisher::watched_files`]).
+                let published = self.lifts.lock_or_recover();
+                lifts.extend(
+                    published
+                        .iter()
+                        .filter(|((of, _), _)| *of == pool)
+                        .map(|(key, newest)| (key.clone(), newest.clone())),
+                );
+                continue;
+            };
+            for (label, account) in &state.accounts {
+                let newest = account.newest_lifts(&state.machine);
+                if !newest.is_empty() {
+                    lifts.insert((pool, label.clone()), newest);
+                }
+            }
+        }
+        if *self.lifts.lock_or_recover() == lifts {
+            return Report::default();
+        }
+        let rows = Some(self.snapshot(log.node(), now));
+        let report = self.publish(
+            log,
+            now,
+            Projected {
+                rows,
+                windows: BTreeMap::new(),
+            },
+        );
+        if !report.unread && report.refused.is_none() {
+            *self.lifts.lock_or_recover() = lifts;
+        }
+        report
+    }
+
+    /// The accounts store of each pool whose rows are per account, as a survey opens it.
+    fn pool_stores(&self) -> Vec<(accounts::Cli, accounts::Store)> {
+        let Some(harness) = &self.places.harness else {
+            return Vec::new();
+        };
+        accounts::Cli::ALL
+            .into_iter()
+            .filter(|pool| metrics_cli(*pool).is_some())
+            .filter_map(|pool| match (pool, &self.places.home) {
+                (_, Some(home)) => Some((pool, accounts::Store::at_for(harness, pool, home))),
+                (accounts::Cli::Claude, None) => Some((pool, accounts::Store::at(harness))),
+                (_, None) => None,
+            })
+            .collect()
+    }
+
+    /// What a [`LiftWatch`] watches of each pool's accounts store: its state file, and its sync
+    /// receipt ([`accounts::Store::sync_receipt_file`]). A commit installs the state file while
+    /// its receipt is pending, when the store does not read, and completes the receipt last, so
+    /// the receipt's write is told once the commit's lift reads.
+    pub(crate) fn watched_files(&self) -> Vec<PathBuf> {
+        self.pool_stores()
+            .into_iter()
+            .flat_map(|(_, store)| [store.state_file(), store.sync_receipt_file()])
+            .collect()
     }
 
     /// Keep the off spans beside the spool, so a restart drops what they span too.
@@ -1256,7 +1362,7 @@ fn kept(metric: Metric, window: Window, now_ms: u64) -> bool {
 }
 
 /// The metrics CLI of a pool whose rows are per account; agy's quota is per home.
-const fn metrics_cli(pool: accounts::Cli) -> Option<Cli> {
+pub(crate) const fn metrics_cli(pool: accounts::Cli) -> Option<Cli> {
     match pool {
         accounts::Cli::Claude => Some(Cli::Claude),
         accounts::Cli::Codex => Some(Cli::Codex),
@@ -1306,6 +1412,17 @@ fn quota_row(cli: Cli, account: &SurveyAccount, book: &BookFacts, now: u64) -> O
         last_end: facts.and_then(|f| f.last_end),
         sessions_7d: facts.map_or(0, |f| f.sessions_7d),
         plan: plan_word(account),
+        lifts: account
+            .lifts
+            .iter()
+            .filter_map(|lift| {
+                Some(Lift {
+                    window: Word::new(&lift.window)?,
+                    at: secs(Some(lift.at))?,
+                    reset: secs(lift.reset),
+                })
+            })
+            .collect(),
     })
 }
 
@@ -1416,12 +1533,40 @@ fn merged_needs(windows: &BTreeMap<u32, NeedsRow>, now: u64) -> NeedsRow {
     }
 }
 
+/// The watch that publishes a lift when the store writes it: it watches each pool's accounts
+/// store ([`Publisher::watched_files`]) and calls its `told` at each settled write, and at its
+/// first look at each file, on a thread of its own ([`aterm_uds::file_watch::FileWatch`]); dropping it
+/// stops the thread.
+pub(crate) struct LiftWatch {
+    _watch: aterm_uds::file_watch::FileWatch,
+}
+
+impl LiftWatch {
+    /// Watch `files`, calling `told` at each settled write of one.
+    ///
+    /// # Errors
+    /// Where the platform's file events or the watch's thread cannot start.
+    pub(crate) fn start(
+        files: Vec<PathBuf>,
+        mut told: impl FnMut() + Send + 'static,
+    ) -> io::Result<Self> {
+        let watch = aterm_uds::file_watch::FileWatch::platform(
+            "aterm-metrics-lifts",
+            Box::new(move |_| told()),
+        )?;
+        for (key, file) in (0u64..).zip(files) {
+            watch.watch(key, file);
+        }
+        Ok(Self { _watch: watch })
+    }
+}
+
 /// The node service's publisher.
 static PUBLISHER: OnceLock<Publisher> = OnceLock::new();
 
 /// Start publishing from `aterm node serve`: a pass every [`PASS_EVERY`] on a thread of its own,
-/// the Mac's needs row on each change of the windows' needs, and its activity row on each count
-/// of the windows' agents.
+/// a lift as the store writes it ([`LiftWatch`]), the Mac's needs row on each change of the
+/// windows' needs, and its activity row on each count of the windows' agents.
 pub(crate) fn start() {
     let publisher = PUBLISHER.get_or_init(|| Publisher::new(Places::of_process()));
     let _ = aterm_gui::install_window_needs(Arc::new(move |windows| {
@@ -1434,10 +1579,25 @@ pub(crate) fn start() {
         let now = aterm_time::unix_secs().unwrap_or(0);
         publisher.activity(log.as_ref().map(|l| l as &dyn Log), row.clone(), now);
     }));
-    let publishing = journal::Publishing::new(aterm_types::dirs::aterm_config_path());
+    let publishing = Arc::new(journal::Publishing::new(
+        aterm_types::dirs::aterm_config_path(),
+    ));
+    let watch = LiftWatch::start(publisher.watched_files(), {
+        let publishing = Arc::clone(&publishing);
+        move || {
+            let log = NodeLog::current();
+            let now = aterm_time::unix_secs().unwrap_or(0);
+            publisher.lifted(log.as_ref().map(|l| l as &dyn Log), now, publishing.now());
+        }
+    });
+    if let Err(error) = &watch {
+        aterm_log::warn!("node: no lift watch, so a lift waits for the next pass: {error}");
+    }
     let spawned = std::thread::Builder::new()
         .name("aterm-metrics".to_owned())
         .spawn(move || {
+            // The watch lives as long as the passes do.
+            let _watch = watch;
             loop {
                 std::thread::sleep(PASS_EVERY);
                 let log = NodeLog::current();

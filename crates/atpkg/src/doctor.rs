@@ -937,7 +937,8 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ),
     (
         "ATERM_OPERATOR",
-        "a manager session: `aterm ctl survey` and `spawn agent=claude`",
+        "native subagents for same-machine delegation, your own shell/background tools for \
+         commands, or `aterm ctl survey` to inspect existing sessions",
     ),
     (
         "ATERM_NO_OPERATOR",

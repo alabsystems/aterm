@@ -397,7 +397,7 @@ fn production_headless_image_keeps_one_full_pet_during_reduced_motion_singing() 
     app.sparkle = None;
     let now = Instant::now() + Duration::from_secs(60);
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window 0");
         ws.focused = true;
         let tenure_start = now - Duration::from_secs(7);
         for i in 0..160u64 {
@@ -422,7 +422,7 @@ fn production_headless_image_keeps_one_full_pet_during_reduced_motion_singing() 
     render_front_image(&mut app);
 
     let (cell_w, cell_h) = app.win_cell_size(wid);
-    let ws = app.windows.get_mut(&wid).expect("headless window 0");
+    let mut ws = app.windows.get_mut(&wid).expect("headless window 0");
     assert!(
         ws.fx.companions_mut().cursor_cat.is_active(),
         "the capture-owned detector sync spends the authenticated hidden tenure"
@@ -475,7 +475,7 @@ fn production_headless_image_keeps_the_flying_cat_without_sparkle_words() {
     app.sparkle = None;
     let now = Instant::now();
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window 0");
         ws.focused = true;
         let start = now - Duration::from_millis(95 * 40);
         for i in 0..96u64 {
@@ -528,7 +528,7 @@ fn serious_mode_capture_hard_retires_a_song_rearmed_after_transition() {
     let now = Instant::now();
     let start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window 0");
         for i in 0..SING_ARM_REPEATS {
             ws.fx.companions_mut().kitty_sing.note_char(
                 start + Duration::from_millis(u64::from(i) * 10),
@@ -684,7 +684,7 @@ fn headless_capture_ticks_fire_live_then_decays_to_zero() {
         crate::app_render::ComposedCursorFxClock::Advance(t0),
     );
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window 0");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window 0");
         ws.fx.cursor_mut().glow.note_synthetic_move(t0);
         ws.fx.cursor_mut().trail.note_synthetic_move(t0);
     }

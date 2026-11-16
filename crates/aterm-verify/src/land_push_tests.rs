@@ -11,7 +11,7 @@
 
 use super::markdown::{DOC, edit_line, markdown_world, rechecked, rival_does};
 use super::*;
-use aterm_types::land_trailer::Rechecked;
+use aterm_land_trailer::Rechecked;
 use std::cell::Cell;
 use std::ffi::OsString;
 

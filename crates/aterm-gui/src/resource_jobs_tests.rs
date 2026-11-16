@@ -24,7 +24,7 @@ fn closed_native_source(
         at_unix_ms: 1,
         originals: Vec::new(),
         sessions: vec![SessionUsage {
-            session: "s-acde1122".into(),
+            session: "t00acde1122".into(),
             reaped_cpu_ns: 10,
             unread: 0,
         }],
@@ -33,7 +33,7 @@ fn closed_native_source(
         next_seq: 1,
         terminals: vec![Terminal {
             seq: 1,
-            session: "s-acde1122".into(),
+            session: "t00acde1122".into(),
             process: ProcessKey { pid: 300, start: 3 },
             uid: Some(501),
             coalition: None,
@@ -60,7 +60,7 @@ fn ended_native_source_recovery_preserves_final_custody_and_accepts_the_new_curs
         host_pid: old.pid,
         host_start: old.start,
         seq,
-        session: "s-acde1122".into(),
+        session: "t00acde1122".into(),
         pid: 400 + seq as u32,
         start: 4 + seq,
         uid: Some(501),
@@ -100,7 +100,7 @@ fn ended_native_source_recovery_preserves_final_custody_and_accepts_the_new_curs
             result: Ok(closed_native_source(new)),
         },
         7,
-        &[(7, "s-acde1122".into())],
+        &[(7, "t00acde1122".into())],
     );
     assert_eq!(state.native_host, Some(new));
     assert_eq!(
@@ -122,7 +122,7 @@ fn ended_native_source_recovery_preserves_final_custody_and_accepts_the_new_curs
     deliver_native(
         &mut state,
         &mut observed,
-        &[(7, "s-acde1122".into())],
+        &[(7, "t00acde1122".into())],
         native_cut(20),
     );
     assert_eq!(observed.native_terminals.len(), 3);
@@ -249,7 +249,7 @@ fn completed_native_journal_gaps_are_cpu_only_but_unproven_active_origins_affect
             native_tracking_cut: Some(0),
             ..State::default()
         };
-        state.native_receipts.insert("s-acde1122".into(), (10, 0));
+        state.native_receipts.insert("t00acde1122".into(), (10, 0));
         let mut native = closed_native_source(host);
         match kind {
             "journal" => {
@@ -280,7 +280,7 @@ fn completed_native_journal_gaps_are_cpu_only_but_unproven_active_origins_affect
 #[test]
 fn natural_origins_cross_private_handoff_by_stable_session_and_current_generation() {
     use aterm_vitals::model::{ProcSample, Sample, TabRoot};
-    let sid = "s-acde1122".to_string();
+    let sid = "t00acde1122".to_string();
     let tab = |key| TabRoot {
         key,
         tab: key,
@@ -318,7 +318,7 @@ fn natural_origins_cross_private_handoff_by_stable_session_and_current_generatio
     .unwrap();
     for (current_boot, current_sid, generation, owned, tab_owned) in [
         ([7; 16], sid.clone(), 201, true, true),
-        ([7; 16], "s-fedc3322".into(), 201, true, false),
+        ([7; 16], "t00fedc3322".into(), 201, true, false),
         ([7; 16], sid.clone(), 999, false, false),
         ([8; 16], sid.clone(), 201, false, false),
     ] {
@@ -365,7 +365,7 @@ fn natural_origins_cross_private_handoff_by_stable_session_and_current_generatio
 #[test]
 fn an_inflight_reading_cannot_overwrite_unadopted_origin_handoff() {
     use aterm_vitals::model::ProcessOrigin;
-    let sessions = [(7, "s-acde1122".to_string())];
+    let sessions = [(7, "t00acde1122".to_string())];
     let original = ProcessOrigin {
         process: ProcessKey {
             pid: 201,
@@ -412,7 +412,7 @@ fn natural_origin_inventory_bounds_and_missing_coverage_survive_private_handoff(
                 .collect(),
             false,
         ),
-        &[(7, "s-acde1122".into())],
+        &[(7, "t00acde1122".into())],
     );
     assert_eq!(state.origins.len(), PROCESS_ORIGIN_CAP);
     assert!(state.origins_incomplete);
@@ -431,7 +431,7 @@ fn natural_origin_inventory_bounds_and_missing_coverage_survive_private_handoff(
     assert!(restore_origins_into(
         &mut restored,
         &mut model,
-        &[(99, "s-acde1122".into())]
+        &[(99, "t00acde1122".into())]
     ));
     assert_eq!(model.process_origins().0.len(), PROCESS_ORIGIN_CAP);
     let mut foreign_boot = State::default();
@@ -455,7 +455,7 @@ fn conflicting_carried_origins_are_rejected_instead_of_choosing_a_tab() {
     let claim = CarriedOrigin {
         pid: 201,
         start: 201,
-        session: Some("s-acde1122".into()),
+        session: Some("t00acde1122".into()),
         shared: false,
     };
     let mut carry = Carry {
@@ -472,7 +472,7 @@ fn conflicting_carried_origins_are_rejected_instead_of_choosing_a_tab() {
     carry.origins.insert(
         1,
         CarriedOrigin {
-            session: Some("s-fedc3322".into()),
+            session: Some("t00fedc3322".into()),
             ..claim
         },
     );
@@ -517,7 +517,7 @@ fn historical_native_receipts_survive_their_custodian_and_missing_time_does_not_
         host_pid: 100,
         host_start: 1,
         seq: 1,
-        session: "s-acde1122".into(),
+        session: "t00acde1122".into(),
         pid: 200,
         start: 2,
         uid: Some(0),
@@ -647,7 +647,7 @@ fn bounding_combined_native_custody_preserves_current_scope_gaps_and_separates_f
             host_pid: 100,
             host_start: 1,
             seq,
-            session: "s-acde1122".into(),
+            session: "t00acde1122".into(),
             pid: 200,
             start: 2,
             uid: None,
@@ -693,7 +693,7 @@ fn carried(root: ProcessKey, member: ProcessKey) -> aterm_json::Value {
         jobs: vec![CarriedJob {
             pid: root.pid,
             start: root.start,
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             ai: "codex".into(),
             label: "project:compiler".into(),
             active: true,
@@ -978,7 +978,7 @@ fn resource_program_preserves_observed_names_including_names_resolved_during_pro
 fn activation_is_bounded_under_tab_churn_and_keeps_closed_tabs_live_jobs() {
     let mut state = State::default();
     for id in 0..1000 {
-        activate_resource_sessions(&mut state, &[(id, format!("s-{id:x}"))]);
+        activate_resource_sessions(&mut state, &[(id, format!("t{id:010x}"))]);
     }
     assert!(state.activated.is_empty());
     let root = ProcessKey { pid: 20, start: 2 };
@@ -986,14 +986,14 @@ fn activation_is_bounded_under_tab_churn_and_keeps_closed_tabs_live_jobs() {
         .ledger
         .register(Job {
             root,
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             ai: "codex".into(),
             label: "build".into(),
         })
         .unwrap();
-    activate_resource_sessions(&mut state, &[(10, "s-a".into())]);
+    activate_resource_sessions(&mut state, &[(10, "t000000000a".into())]);
     activate_resource_sessions(&mut state, &[]);
-    assert_eq!(state.activated, HashSet::from(["s-a".to_string()]));
+    assert_eq!(state.activated, HashSet::from(["t000000000a".to_string()]));
     state.ledger.observe(&[]);
     activate_resource_sessions(&mut state, &[]);
     assert!(state.activated.is_empty());
@@ -1012,15 +1012,15 @@ fn a_carried_closed_tabs_authorized_job_stays_active_but_new_jobs_wait_for_hosti
     );
     state.activated.extend(active);
     activate_resource_sessions(&mut state, &[]);
-    assert!(state.activated.contains("s-a"));
+    assert!(state.activated.contains("t000000000a"));
     let mut fresh = State::default();
     let value = changed_carry(root, |job| job.active = false);
     let active = restore_into(&mut fresh.ledger, value, Some([7; 16]), &current);
     fresh.activated.extend(active);
     activate_resource_sessions(&mut fresh, &[]);
     assert!(fresh.activated.is_empty());
-    activate_resource_sessions(&mut fresh, &[(10, "s-a".into())]);
-    assert!(fresh.activated.contains("s-a"));
+    activate_resource_sessions(&mut fresh, &[(10, "t000000000a".into())]);
+    assert!(fresh.activated.contains("t000000000a"));
 }
 
 #[test]
@@ -1060,7 +1060,7 @@ fn late_registered_root_replaces_the_sweeps_stale_pid_identity() {
     ledger
         .register(Job {
             root,
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             ai: "codex".into(),
             label: "build".into(),
         })
@@ -1097,7 +1097,7 @@ fn truncated_sweep_retains_ownership_and_never_refreshes_old_usage_as_zero() {
         .ledger
         .register(Job {
             root,
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             ai: "codex".into(),
             label: "build".into(),
         })
@@ -1158,7 +1158,7 @@ fn sampled(
     second: u64,
     epoch: Instant,
 ) -> aterm_vitals::model::Snapshot {
-    let observed = sample_into(state, sweep, &[(1, "s-a".into())], lookup, epoch);
+    let observed = sample_into(state, sweep, &[(1, "t000000000a".into())], lookup, epoch);
     let complete = !observed.incomplete;
     let expected_jobs = observed.delegated.len();
     let snapshot = vitals.absorb(&aterm_vitals::model::Sample {
@@ -1208,7 +1208,7 @@ fn unreadable_retained_members_keep_ownership_and_old_age_until_complete_recover
                 .ledger
                 .register(Job {
                     root,
-                    session: "s-a".into(),
+                    session: "t000000000a".into(),
                     ai: "codex".into(),
                     label: "build".into(),
                 })
@@ -1350,7 +1350,7 @@ fn fresh_reused_member_identity_never_repairs_old_detached_ownership() {
     ledger
         .register(Job {
             root,
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             ai: "codex".into(),
             label: "build".into(),
         })
@@ -1406,7 +1406,7 @@ fn confirmed_exit_or_reuse_prunes_previously_unavailable_detached_members() {
         ledger
             .register(Job {
                 root,
-                session: "s-a".into(),
+                session: "t000000000a".into(),
                 ai: "codex".into(),
                 label: "build".into(),
             })
@@ -1463,7 +1463,7 @@ fn missing_old_and_new_roots_at_one_pid_share_one_fresh_identity_read() {
         ledger
             .register(Job {
                 root,
-                session: "s-a".into(),
+                session: "t000000000a".into(),
                 ai: "codex".into(),
                 label: "build".into(),
             })
@@ -1520,7 +1520,7 @@ fn handoff_keeps_live_detached_members_and_refuses_other_boots_and_reused_pids()
             root
         }]
     );
-    assert_eq!(ledger.jobs()[0].session, "s-a");
+    assert_eq!(ledger.jobs()[0].session, "t000000000a");
     let mut other = Ledger::default();
     restore_into(&mut other, carried(root, member), Some([8; 16]), &current);
     assert!(other.is_empty());
@@ -1533,10 +1533,26 @@ fn handoff_keeps_live_detached_members_and_refuses_other_boots_and_reused_pids()
 #[test]
 fn handoff_bounds_and_invalid_sessions_never_create_job_ownership() {
     let root = ProcessKey { pid: 20, start: 2 };
-    let value = changed_carry(root, |job| job.session = "s-not-a-valid-id".into());
     let mut ledger = Ledger::default();
-    restore_into(&mut ledger, value, Some([7; 16]), &|_| Some(root));
-    assert!(ledger.is_empty());
+    // No loose `s-` form names a tab: only the `t` form and a legacy tab's exact ID do.
+    for refused in [
+        "s-not-a-valid-id",
+        "s-a",
+        "s-acde1122",
+        "s-0123456789ABCDEF0123",
+        "t00000000",
+    ] {
+        let value = changed_carry(root, |job| job.session = refused.into());
+        restore_into(&mut ledger, value, Some([7; 16]), &|_| Some(root));
+        assert!(ledger.is_empty(), "{refused} owns no job");
+    }
+    // A legacy tab's shell still holds its exact `s-` ID on this Mac, so its job crosses.
+    let legacy = "s-0123456789abcdef0123";
+    let value = changed_carry(root, |job| job.session = legacy.into());
+    let mut kept = Ledger::default();
+    restore_into(&mut kept, value, Some([7; 16]), &|_| Some(root));
+    assert_eq!(kept.jobs().len(), 1);
+    assert_eq!(kept.jobs()[0].session, legacy);
     let value = changed_carry(root, |job| {
         job.members = vec![(20, 2); aterm_vitals::delegated::MAX_MEMBERS + 1];
     });
@@ -1552,7 +1568,7 @@ fn native_receipt_inventory_is_order_independent_and_accepts_new_sessions() {
     let count = 4096u64;
     let receipts: Vec<_> = (0..count)
         .map(|i| SessionUsage {
-            session: format!("s-{i:08x}"),
+            session: format!("t{i:010x}"),
             reaped_cpu_ns: 1000 + i,
             unread: i % 3,
         })
@@ -1579,13 +1595,13 @@ fn native_receipt_inventory_is_order_independent_and_accepts_new_sessions() {
     let increased = native.sessions[0].session.clone();
     native.sessions[0].reaped_cpu_ns += 10;
     native.sessions.push(SessionUsage {
-        session: "s-ffffffff".into(),
+        session: "t00ffffffff".into(),
         reaped_cpu_ns: 10,
         unread: 0,
     });
     native.next_seq = count + 1;
     native.terminals[0].seq = native.next_seq;
-    native.terminals[0].session = "s-ffffffff".into();
+    native.terminals[0].session = "t00ffffffff".into();
     let mut observed = Observation::default();
     assert!(apply_native(&mut state, &mut observed, native.clone(), &[]));
     assert!(!observed.incomplete && !observed.source_lost);
@@ -1597,11 +1613,11 @@ fn native_receipt_inventory_is_order_independent_and_accepts_new_sessions() {
         }
         assert_eq!(state.native_receipts.get(&session), Some(&counters));
     }
-    assert_eq!(state.native_receipts["s-ffffffff"], (10, 0));
+    assert_eq!(state.native_receipts["t00ffffffff"], (10, 0));
     assert_eq!(state.native_pending.len(), 1);
     assert_eq!(
         state.native_pending[&(host.pid, host.start, count + 1)].session,
-        "s-ffffffff"
+        "t00ffffffff"
     );
 
     // An increasing unread counter is accepted, but still records historical CPU loss.
@@ -1617,62 +1633,230 @@ fn native_receipt_inventory_is_order_independent_and_accepts_new_sessions() {
 
 #[cfg(unix)]
 #[test]
-fn native_receipts_reject_missing_or_decreasing_counters_before_adoption() {
+fn idle_primary_native_receipts_still_reject_missing_or_decreasing_counters() {
     use aterm_resource_host::resource_observation::{ProcessKey as NativeKey, SessionUsage};
     let host = NativeKey { pid: 100, start: 1 };
     let previous = HashMap::from([
-        ("s-acde1122".into(), (100, 2)),
-        ("s-acde3344".into(), (200, 3)),
+        ("t00acde1122".into(), (100, 2)),
+        ("t00acde3344".into(), (200, 3)),
     ]);
     for missing in ["session", "cpu", "unread"] {
+        for prior_lost in [false, true] {
+            let mut state = State {
+                native_host: Some(host),
+                native_seq: 2,
+                native_lost_origins: 4,
+                native_receipts: previous.clone(),
+                native_tracking: true,
+                native_tracking_cut: Some(7),
+                native_observed_revision: 8,
+                native_source_lost: prior_lost,
+                native_queue_lost: 3,
+                native_cpu_cut: native_cut(5),
+                ..State::default()
+            };
+            state.native_receipts.reserve(128);
+            let capacity = state.native_receipts.capacity();
+            let mut finished = false;
+            finish_native_if_idle(&mut state, 0, 8, || {
+                finished = true;
+                false
+            });
+            assert!(finished);
+            assert_eq!(state.native_receipts, previous);
+            assert_eq!(state.native_receipts.capacity(), capacity);
+            assert_eq!(state.native_host, Some(host));
+            assert_eq!(state.native_seq, 2);
+            assert_eq!(state.native_lost_origins, 4);
+            assert!(!state.native_tracking);
+            assert_eq!(state.native_tracking_cut, None);
+            assert_eq!(state.native_observed_revision, 8);
+            assert_eq!(state.native_cpu_cut, native_cut(5));
+            assert_eq!(state.native_source_lost, prior_lost);
+            assert_eq!(state.native_queue_lost, 3);
+            state.native_outstanding = true;
+            state.native_awaiting_observation = true;
+            let mut native = closed_native_source(host);
+            native.next_seq = 3;
+            native.terminals[0].seq = 3;
+            native.lost_origins = 4;
+            native.sessions = vec![
+                SessionUsage {
+                    session: "t00acde1122".into(),
+                    reaped_cpu_ns: 100,
+                    unread: 2,
+                },
+                SessionUsage {
+                    session: "t00acde3344".into(),
+                    reaped_cpu_ns: 200,
+                    unread: 3,
+                },
+            ];
+            match missing {
+                "session" => {
+                    native.sessions.pop();
+                }
+                "cpu" => native.sessions[0].reaped_cpu_ns -= 1,
+                "unread" => native.sessions[1].unread -= 1,
+                _ => unreachable!(),
+            }
+            let mut observed = Observation::default();
+            assert!(
+                !apply_native(&mut state, &mut observed, native, &[]),
+                "{missing}"
+            );
+            assert!(observed.incomplete, "{missing}");
+            assert_eq!(state.native_receipts, previous, "{missing}");
+            assert_eq!(state.native_seq, 2, "{missing}");
+            assert_eq!(state.native_lost_origins, 4, "{missing}");
+            assert!(state.native_pending.is_empty(), "{missing}");
+            assert!(
+                state.native_outstanding && state.native_awaiting_observation,
+                "{missing}"
+            );
+            assert_eq!(state.native_source_lost, prior_lost, "{missing}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn retiring_an_idle_native_observer_releases_its_receipt_epoch() {
+    use aterm_resource_host::resource_observation::ProcessKey as NativeKey;
+    let old = NativeKey { pid: 100, start: 1 };
+    let new = NativeKey { pid: 200, start: 2 };
+    let mut state = State {
+        native_host: Some(old),
+        native_seq: 99,
+        native_lost_origins: 4,
+        native_receipts: HashMap::with_capacity(128),
+        native_tracking: true,
+        native_tracking_cut: Some(7),
+        native_observed_revision: 8,
+        native_source_lost: true,
+        native_queue_lost: 3,
+        native_cpu_cut: native_cut(5),
+        ..State::default()
+    };
+    state
+        .native_receipts
+        .insert("t00acde1122".into(), (1000, 7));
+    assert!(state.native_receipts.capacity() > 0);
+    let mut finished = false;
+    finish_native_if_idle(&mut state, 0, 8, || {
+        finished = true;
+        true
+    });
+    assert!(finished);
+    assert!(state.native_receipts.is_empty());
+    assert_eq!(state.native_receipts.capacity(), 0);
+    assert_eq!(state.native_host, None);
+    assert_eq!(state.native_seq, 0);
+    assert_eq!(state.native_lost_origins, 0);
+    assert!(!state.native_tracking);
+    assert_eq!(state.native_tracking_cut, None);
+    assert_eq!(state.native_observed_revision, 8);
+    assert_eq!(state.native_cpu_cut, native_cut(5));
+    assert!(state.native_source_lost);
+    assert_eq!(state.native_queue_lost, 3);
+
+    let mut observed = Observation::default();
+    assert!(apply_native(
+        &mut state,
+        &mut observed,
+        closed_native_source(new),
+        &[]
+    ));
+    assert_eq!(state.native_host, Some(new));
+    assert_eq!(state.native_seq, 1);
+    assert_eq!(state.native_receipts["t00acde1122"], (10, 0));
+    assert!(state.native_pending.is_empty() && state.native_delivered.is_empty());
+    assert!(observed.source_lost && !observed.incomplete);
+    assert_eq!(state.native_cpu_cut, native_cut(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_observer_retirement_waits_for_every_demand_and_final_adoption() {
+    use aterm_resource_host::resource_observation::ProcessKey as NativeKey;
+    let host = NativeKey { pid: 100, start: 1 };
+    for blocker in [
+        "submitting",
+        "revision",
+        "outstanding",
+        "unadopted",
+        "awaiting",
+        "pending",
+    ] {
         let mut state = State {
-            native_host: Some(host),
-            native_seq: 2,
-            native_lost_origins: 4,
-            native_receipts: previous.clone(),
-            native_outstanding: true,
-            native_awaiting_observation: true,
+            native_tracking: true,
+            native_tracking_cut: Some(0),
+            native_observed_revision: 8,
+            native_source_lost: true,
+            native_queue_lost: 3,
+            native_cpu_cut: native_cut(5),
             ..State::default()
         };
-        let mut native = closed_native_source(host);
-        native.next_seq = 3;
-        native.terminals[0].seq = 3;
-        native.lost_origins = 4;
-        native.sessions = vec![
-            SessionUsage {
-                session: "s-acde1122".into(),
-                reaped_cpu_ns: 100,
-                unread: 2,
-            },
-            SessionUsage {
-                session: "s-acde3344".into(),
-                reaped_cpu_ns: 200,
-                unread: 3,
-            },
-        ];
-        match missing {
-            "session" => {
-                native.sessions.pop();
-            }
-            "cpu" => native.sessions[0].reaped_cpu_ns -= 1,
-            "unread" => native.sessions[1].unread -= 1,
-            _ => unreachable!(),
-        }
         let mut observed = Observation::default();
-        assert!(
-            !apply_native(&mut state, &mut observed, native, &[]),
-            "{missing}"
+        assert!(apply_native(
+            &mut state,
+            &mut observed,
+            closed_native_source(host),
+            &[]
+        ));
+        if blocker != "pending" {
+            deliver_native(&mut state, &mut observed, &[], native_cut(20));
+            if blocker != "unadopted" {
+                native_model_pending_into(&mut state, false);
+            }
+        }
+        state.native_outstanding = blocker == "outstanding";
+        state.native_awaiting_observation = blocker == "awaiting";
+        state.native_receipts.reserve(128);
+        let receipts = state.native_receipts.clone();
+        let capacity = state.native_receipts.capacity();
+        let cut = state.native_cpu_cut;
+        let demand = (
+            state.native_outstanding,
+            state.native_unadopted,
+            state.native_awaiting_observation,
         );
-        assert!(observed.incomplete, "{missing}");
-        assert_eq!(state.native_receipts, previous, "{missing}");
-        assert_eq!(state.native_seq, 2, "{missing}");
-        assert_eq!(state.native_lost_origins, 4, "{missing}");
-        assert!(state.native_pending.is_empty(), "{missing}");
+        let custody = |state: &State| {
+            aterm_json::to_value((
+                state.native_pending.iter().collect::<Vec<_>>(),
+                state.native_delivered.iter().collect::<Vec<_>>(),
+            ))
+            .unwrap()
+        };
+        let before = custody(&state);
+        let submitting = usize::from(blocker == "submitting");
+        let revision = if blocker == "revision" { 9 } else { 8 };
+        finish_native_if_idle(&mut state, submitting, revision, || {
+            panic!("{blocker} still owns sampling demand")
+        });
+        assert_eq!(state.native_receipts, receipts, "{blocker}");
+        assert_eq!(state.native_receipts.capacity(), capacity, "{blocker}");
+        assert_eq!(state.native_host, Some(host), "{blocker}");
+        assert_eq!(state.native_seq, 1, "{blocker}");
+        assert_eq!(state.native_lost_origins, 0, "{blocker}");
+        assert_eq!(state.native_tracking_cut, Some(0), "{blocker}");
         assert!(
-            state.native_outstanding && state.native_awaiting_observation,
-            "{missing}"
+            state.native_tracking && state.native_source_lost,
+            "{blocker}"
         );
-        assert!(!state.native_source_lost, "{missing}");
+        assert_eq!(state.native_observed_revision, 8, "{blocker}");
+        assert_eq!(state.native_queue_lost, 3, "{blocker}");
+        assert_eq!(state.native_cpu_cut, cut, "{blocker}");
+        assert_eq!(
+            (
+                state.native_outstanding,
+                state.native_unadopted,
+                state.native_awaiting_observation
+            ),
+            demand,
+            "{blocker}"
+        );
+        assert_eq!(custody(&state), before, "{blocker}");
     }
 }
 
@@ -1687,8 +1871,8 @@ fn a_new_native_host_starts_new_receipt_counters() {
         native_seq: 99,
         native_lost_origins: 4,
         native_receipts: HashMap::from([
-            ("s-acde1122".into(), (1000, 7)),
-            ("s-acde3344".into(), (2000, 8)),
+            ("t00acde1122".into(), (1000, 7)),
+            ("t00acde3344".into(), (2000, 8)),
         ]),
         native_tracking: true,
         native_tracking_cut: Some(0),
@@ -1706,7 +1890,7 @@ fn a_new_native_host_starts_new_receipt_counters() {
     assert_eq!(state.native_lost_origins, 0);
     assert_eq!(
         state.native_receipts,
-        HashMap::from([("s-acde1122".into(), (10, 0))])
+        HashMap::from([("t00acde1122".into(), (10, 0))])
     );
     assert!(observed.source_lost && !observed.incomplete);
     assert_eq!(state.native_pending.len(), 1);
@@ -1720,7 +1904,7 @@ fn duplicate_native_receipts_reject_the_whole_observation_before_any_adoption() 
     let new = NativeKey { pid: 200, start: 2 };
     for host in [old, new] {
         for reversed in [false, true] {
-            let previous = HashMap::from([("s-acde1122".into(), (1000, 0))]);
+            let previous = HashMap::from([("t00acde1122".into(), (1000, 0))]);
             let mut state = State {
                 native_host: Some(old),
                 native_seq: 99,
@@ -1740,12 +1924,12 @@ fn duplicate_native_receipts_reject_the_whole_observation_before_any_adoption() 
             }
             native.sessions = vec![
                 SessionUsage {
-                    session: "s-acde1122".into(),
+                    session: "t00acde1122".into(),
                     reaped_cpu_ns: 1000,
                     unread: 0,
                 },
                 SessionUsage {
-                    session: "s-acde1122".into(),
+                    session: "t00acde1122".into(),
                     reaped_cpu_ns: 2000,
                     unread: 0,
                 },
@@ -1783,7 +1967,7 @@ fn native_observations_keep_session_origin_and_consume_final_generations_once() 
         host_child_cpu_ns: Some(0),
         at_unix_ms: 1000,
         originals: vec![Original {
-            session: "s-a".into(),
+            session: "t000000000a".into(),
             process: root,
             cpu_ns: Some(10),
             child_cpu_ns: Some(0),
@@ -1819,7 +2003,7 @@ fn native_observations_keep_session_origin_and_consume_final_generations_once() 
         ]),
         ..Default::default()
     };
-    let tabs = [(1, "s-a".into()), (2, "s-b".into())];
+    let tabs = [(1, "t000000000a".into()), (2, "t000000000b".into())];
     apply_native(&mut state, &mut observed, native.clone(), &tabs);
     assert_eq!(observed.native_roots[0].tab, Some(1));
     assert!(
@@ -1867,7 +2051,7 @@ fn native_observations_keep_session_origin_and_consume_final_generations_once() 
     native.host_child_cpu_ns = Some(35);
     native.terminals.push(Terminal {
         seq: 1,
-        session: "s-a".into(),
+        session: "t000000000a".into(),
         process: root,
         uid: Some(0),
         coalition: None,

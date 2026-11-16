@@ -242,6 +242,24 @@ impl RekeyDue {
             after_grace: false,
         })
     }
+
+    /// Whether a Mac waits on this due: a writer, on a rotation or a coalesce (no writer seals
+    /// under heads that differ or that wrap a removed Mac, `client::log_entries`'
+    /// `sealing_epoch`), or a reader, on a reseal of a keyed epoch it holds no key of (F21
+    /// rule 7). A reseal alone, of an audience every seated member of `membership` can already
+    /// reseal (each holds every newest epoch and every uncovered keyed one), keeps no Mac
+    /// waiting. A host list's due is always read as waited on: the seats outside the list hold
+    /// none of its keys. The class stops hold only a re-key nothing waits on
+    /// ([`super::budgets::Class::Automatic`]).
+    #[must_use]
+    pub fn waited_on(&self, membership: &Membership) -> bool {
+        self.rotation
+            || self.coverage
+            || membership
+                .members()
+                .keys()
+                .any(|seat| !self.resealers.contains(seat))
+    }
 }
 
 /// Whether `actor` carries the epoch at `at` for having minted it: only under the negative control

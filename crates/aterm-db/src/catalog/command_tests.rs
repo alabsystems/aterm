@@ -422,6 +422,114 @@ fn membership_history_is_reported_without_admin_or_table_initialization() {
     assert!(!lab.paths[1].dir.join("commons/tables").exists());
 }
 
+/// Each record of a records stream, read from its frame header alone: its kind's code and the
+/// frame's bytes. Independent of the readers the vault's own counts use.
+fn frames(wire: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut rows = Vec::new();
+    let mut at = 0;
+    while at < wire.len() {
+        let frame = &wire[at..];
+        assert_eq!(&frame[..4], b"ALM1");
+        let clock = 127 + 32 * usize::from(frame[126]);
+        let body = u32::from_be_bytes(frame[clock + 8..clock + 12].try_into().unwrap());
+        let len = clock + 12 + usize::try_from(body).unwrap() + 64;
+        rows.push((frame[37], &frame[..len]));
+        at += len;
+    }
+    assert_eq!(at, wire.len(), "the stream frames with no remainder");
+    rows
+}
+
+/// `commons-status`' meter is the vault log's fill, the reading `aterm secrets status` says:
+/// `held_bytes` and `bytes_by_kind` equal a census of the complete records' frame headers,
+/// `byte_bound` is the bound every class stop is a share of, and a record that waits for a
+/// parent is in `record_bytes` and in neither, since no class stop judges it.
+#[test]
+fn vault_fill_commons_status_meter_equals_a_header_census() {
+    use aterm_secrets::{client, commons::roster::Role, text::Audience};
+    let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Reader]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let encoded = client::load_records(&lab.paths[0]).unwrap().encode();
+    client::save_records(&lab.paths[1], &encoded).unwrap();
+    lab.bootstrap(1);
+    // The writer signs two edits, and the reader takes the second's record without the
+    // first's, its parent: it waits.
+    for name in ["note", "another"] {
+        let admin = client::admin_open(&lab.paths[0]).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(&Audience::Everyone, name, &[b'n'; 4096])
+            .unwrap();
+        client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    }
+    let after = client::load_records(&lab.paths[0]).unwrap().encode();
+    let held_before = frames(&encoded);
+    let signed: Vec<&[u8]> = frames(&after)
+        .into_iter()
+        .map(|(_, frame)| frame)
+        .filter(|frame| held_before.iter().all(|(_, held)| held != frame))
+        .collect();
+    assert_eq!(signed.len(), 2, "CONTROL: each edit signed one record");
+    client::save_records(&lab.paths[1], &signed[1..].concat()).unwrap();
+
+    let store = client::load_records(&lab.paths[1]).unwrap();
+    let log = store.log().unwrap();
+    let held: Vec<u8> = log
+        .records()
+        .flat_map(|record| record.bytes().iter().copied())
+        .collect();
+    let census = frames(&held);
+    let observed = &status(&lab.paths[1])["membership_history"];
+    let waiting = observed["waiting_records"].as_u64().unwrap();
+    assert!(waiting > 0, "CONTROL: records wait: {observed}");
+    let bytes = |rows: &[(u8, &[u8])]| rows.iter().map(|(_, frame)| frame.len()).sum::<usize>();
+    assert_eq!(observed["held_bytes"], json!(bytes(&census)));
+    assert_eq!(
+        observed["byte_bound"],
+        json!(aterm_secrets::membership_log::MAX_RECORDS_STREAM)
+    );
+    assert_eq!(
+        observed["record_bytes"],
+        json!(bytes(&frames(&store.encode()))),
+        "every retained record, the waiting ones too"
+    );
+    assert!(
+        observed["record_bytes"].as_u64() > observed["held_bytes"].as_u64(),
+        "CONTROL: what waits is not in the meter"
+    );
+    let by_kind = observed["bytes_by_kind"].as_object().unwrap();
+    for (code, word) in [
+        (1, "genesis"),
+        (2, "admit"),
+        (3, "remove"),
+        (4, "name"),
+        (5, "epoch"),
+        (6, "wrap"),
+        (7, "put"),
+        (8, "delete"),
+        (9, "node"),
+    ] {
+        let of_kind: Vec<(u8, &[u8])> = census
+            .iter()
+            .copied()
+            .filter(|(kind, _)| *kind == code)
+            .collect();
+        assert_eq!(by_kind[word], json!(bytes(&of_kind)), "{word}");
+    }
+    assert_eq!(by_kind.len(), 9, "each kind and no other");
+    assert_eq!(
+        by_kind.values().filter_map(Value::as_u64).sum::<u64>(),
+        observed["held_bytes"].as_u64().unwrap(),
+        "the kinds sum to the whole"
+    );
+    assert!(
+        by_kind["genesis"].as_u64() > Some(0) && by_kind["put"].as_u64() > Some(0),
+        "CONTROL: the log holds records of more than one kind: {by_kind:?}"
+    );
+    // The same reading `aterm secrets status` says.
+    let fill = client::log_fill(&lab.paths[1]).unwrap().unwrap().fill;
+    assert_eq!(observed["held_bytes"], json!(fill.bytes));
+}
+
 /// A Mac that opened Commons and then lost its `commons` folder but kept its claim (a partial
 /// reset) holds custody to recover, not custody pending: `commons-status` fails naming the
 /// recovery rather than the missing folder.
@@ -1890,7 +1998,10 @@ fn commons_open_declares_no_table_whose_secret_cells_name_store_entries() {
             open(table.role).unwrap();
         }
     }
-    assert_eq!(refused, 1, "control: one generation names store entries");
+    assert_eq!(
+        refused, 2,
+        "control: the third and fourth generations name store entries"
+    );
     let listing = run_at(
         "commons-tables",
         &mut BTreeMap::new(),
@@ -1905,7 +2016,7 @@ fn commons_open_declares_no_table_whose_secret_cells_name_store_entries() {
         .flat_map(|table| table["declarations"].as_array().unwrap())
         .filter_map(|declaration| declaration["role"].as_str())
         .collect();
-    assert_eq!(declared.len(), GENERATIONS.len() - 1, "{listing}");
+    assert_eq!(declared.len(), GENERATIONS.len() - refused, "{listing}");
 }
 
 #[test]

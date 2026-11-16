@@ -1463,6 +1463,8 @@ fn a_launch_reads_each_rows_usage_in_its_own_home_and_leaves_a_full_one() {
             ..Sample::default()
         },
         walls: vec![(accounts::SESSION_LIMIT, Some(reset))],
+        refusal: None,
+        limits: Default::default(),
     };
     let read = |cli: Cli, home: &Path, _: Option<&str>, _: i64| {
         assert_eq!(cli, Cli::Codex);
@@ -1572,6 +1574,8 @@ fn record_usage_reads_the_default_home_before_linking_overlays_so_startup_files_
             ..Sample::default()
         },
         walls: vec![(accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))],
+        refusal: None,
+        limits: Default::default(),
     };
     let read = |cli: Cli, home: &Path, _: Option<&str>, _: i64| {
         assert_eq!(cli, Cli::Kimi);
@@ -1645,6 +1649,8 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
             ..Sample::default()
         },
         walls: Vec::new(),
+        refusal: None,
+        limits: Default::default(),
     };
     let pick = launch_env(
         &world.seat(),
@@ -1668,6 +1674,8 @@ fn fleet_synced_single_enrolled_row_and_lazy_backup_measure_usage_and_launch_unt
             ..Sample::default()
         },
         walls: vec![(accounts::WEEK_LIMIT, Some(later.now + 24 * HOUR))],
+        refusal: None,
+        limits: Default::default(),
     };
     assert_eq!(
         launch_env(
@@ -1913,6 +1921,8 @@ fn a_login_the_provider_refused_is_signed_out_and_launches_leave_it_until_it_rea
                     ..Sample::default()
                 },
                 walls: Vec::new(),
+                refusal: None,
+                limits: Default::default(),
             }),
         )],
     };
@@ -2013,6 +2023,8 @@ fn a_cold_relaunch_reads_the_row_it_ran_on_before_it_judges_it() {
                 ..Sample::default()
             },
             walls: vec![(accounts::SESSION_LIMIT, Some(NOW + 2 * HOUR))],
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let moved = cold_launch_env(&world.seat(), Cli::Codex, &on_work, &full, None)
@@ -2052,6 +2064,8 @@ fn a_cold_relaunch_reads_the_row_it_ran_on_before_it_judges_it() {
                 ..Sample::default()
             },
             walls: Vec::new(),
+            refusal: None,
+            limits: Default::default(),
         })
     };
     assert_eq!(

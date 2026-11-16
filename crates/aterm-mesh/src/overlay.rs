@@ -3,9 +3,18 @@
 
 //! The overlay (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.6, "The overlay"): each Mac keeps
 //! k = 4 sticky neighbours among the current seats it can reach. Every 10 minutes it swaps one for
-//! a random other seat, and it replaces a dead one at once. With fewer than k up it dials seats from
-//! its address cache and the `_alab._tcp` browse until it has k. With fewer than 6 members, every
-//! member is a neighbour.
+//! a random other seat, and it replaces a neighbour as soon as its link ends (a keepalive or
+//! re-proof failure, within about 15 s of silence: `aterm_net::fleet::link::SILENCE_DROP`). With
+//! fewer than k up it dials seats from its address cache and the `_alab._tcp` browse until it has
+//! k. With fewer than 6 members, every member is a neighbour.
+//!
+//! **Sleep, wake and a network change.** A link's clock does not run while this Mac sleeps, so a
+//! link that went dead in sleep would otherwise wait out a re-proof round minutes away. On a wake
+//! or a change of this Mac's network path the node service hands the event to [`Waker::woke`]:
+//! every link is asked to re-prove now, within [`WAKE_REPROVE_WITHIN`] (one left unanswered ends,
+//! and the overlay replaces it), the overlay's bell rings, every relay and every dial is kicked
+//! out of its back-off, and presence forgets every seat's advance, so no seat reads up on a row from before
+//! the sleep until a fresh one arrives.
 //!
 //! [`Overlay`] is the rule alone, a pure state machine stepped on what this Mac sees ([`Sight`]):
 //! it answers which seats to dial and which links it dialed to let go ([`Plan`]). [`Attached`] runs
@@ -50,6 +59,29 @@ pub const DIAL_MAX: Duration = Duration::from_secs(5 * 60);
 
 /// The bound on one dial and its handshake.
 pub const DIAL_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long a link has to answer the re-proof a wake or a path change asks ([`Waker::woke`]).
+pub const WAKE_REPROVE_WITHIN: Duration = Duration::from_secs(5);
+
+/// What the mesh reacts to in one way ([`Waker::woke`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Woke {
+    /// This Mac woke from sleep.
+    Wake,
+    /// This Mac's network path changed: another interface, or one lost or back.
+    PathChanged,
+}
+
+impl Woke {
+    /// The event's word, as the journal says it.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Wake => "a wake from sleep",
+            Self::PathChanged => "a network path change",
+        }
+    }
+}
 
 /// What this Mac sees when the overlay steps: the other current seats, those it holds a live link
 /// to and which of those it dialed, those it is dialing, and those it has an address for, each by
@@ -125,6 +157,12 @@ impl Overlay {
                 (now.saturating_add(DIAL_FIRST), DIAL_FIRST),
             );
         }
+    }
+
+    /// This Mac woke or its network path changed: every dial's back-off ends, since a dial that
+    /// failed before may reach its seat now, and each seat starts again from [`DIAL_FIRST`].
+    pub fn woke(&mut self) {
+        self.retry.clear();
     }
 
     /// The earliest time past `now` the overlay would plan something new by itself: the next swap
@@ -303,6 +341,8 @@ struct Runtime {
     stop: AtomicBool,
     dials: Mutex<Dials>,
     chosen: Mutex<BTreeSet<String>>,
+    /// A wake or a path change asked the next step to kick every relay.
+    kick: AtomicBool,
 }
 
 /// The overlay and the relays running over one generation's neighbour table: dropped, every relay
@@ -333,6 +373,7 @@ impl Mesh {
             stop: AtomicBool::new(false),
             dials: Mutex::new(Dials::default()),
             chosen: Mutex::new(BTreeSet::new()),
+            kick: AtomicBool::new(false),
         });
         *self.wake.lock_or_recover() = Some(Arc::downgrade(&runtime.bell));
         let running = Arc::clone(&runtime);
@@ -356,6 +397,54 @@ impl Attached {
     #[must_use]
     pub fn chosen(&self) -> BTreeSet<String> {
         self.runtime.chosen.lock_or_recover().clone()
+    }
+
+    /// What hands this overlay a wake or a path change ([`Waker::woke`]), from any thread, for
+    /// as long as it runs.
+    #[must_use]
+    pub fn waker(&self) -> Waker {
+        Waker {
+            runtime: Arc::downgrade(&self.runtime),
+        }
+    }
+}
+
+/// Hands one running overlay a wake or a path change ([`Attached::waker`]): held weakly, so it
+/// keeps nothing alive and does nothing once the overlay stopped.
+#[derive(Clone)]
+pub struct Waker {
+    runtime: Weak<Runtime>,
+}
+
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Waker").finish_non_exhaustive()
+    }
+}
+
+impl Waker {
+    /// React to `why`, a wake from sleep or a change of this Mac's network path, as one plain
+    /// step the system's announcements only feed: ask every link to re-prove its peer now,
+    /// answered within [`WAKE_REPROVE_WITHIN`] or the link ends; forget every seat's advance on
+    /// presence's board, so each reads silent until a fresh row arrives; and ring the overlay's
+    /// bell, whose next step kicks every relay out of its back-off, ends every dial's back-off
+    /// ([`Overlay::woke`]) and replaces each link that ended. The links asked, or `None` where the overlay stopped.
+    pub fn woke(&self, why: Woke) -> Option<usize> {
+        let runtime = self.runtime.upgrade()?;
+        if runtime.stopped() {
+            return None;
+        }
+        let links = runtime.table.reprove_all(WAKE_REPROVE_WITHIN);
+        runtime.mesh.forget_advances();
+        runtime.kick.store(true, Ordering::Release);
+        runtime.bell.ring();
+        aterm_log::info!(
+            "mesh: {}: {links} links re-prove within {} s, every seat reads silent until its next row",
+            why.word(),
+            WAKE_REPROVE_WITHIN.as_secs()
+        );
+        runtime.mesh.report(&relay::Event::Woke { why, links });
+        Some(links)
     }
 }
 
@@ -435,10 +524,18 @@ impl Runtime {
                 .collect();
             self.hook_ends(&mut hooked, &links);
             let changed = mesh.generation.load(Ordering::Acquire);
-            let kick_all = changed != generation;
+            let woke = self.kick.swap(false, Ordering::AcqRel);
+            if woke {
+                overlay.woke();
+            }
+            let kick_all = changed != generation || woke;
             generation = changed;
             let arrived = std::mem::take(&mut *mesh.arrived.lock_or_recover());
             self.keep_relays(&mut relays, &mut ending, &seats, &links, kick_all, &arrived);
+            if woke {
+                let kicked = relays.values().map(BTreeMap::len).sum();
+                mesh.report(&relay::Event::Kicked { relays: kicked });
+            }
             ending.retain(|handle| !handle.is_finished());
             let names: BTreeSet<String> = seats.keys().cloned().collect();
             let up: BTreeSet<String> = links

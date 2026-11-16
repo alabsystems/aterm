@@ -89,18 +89,26 @@ fn a_scoped_relaunch_claim_gets_a_restart_event_not_a_signal() {
 
 #[test]
 fn a_scoped_account_event_carries_only_the_row_and_its_home() {
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
     let ctx = crate::session_store::test_handle_on(4242, -1).ctx;
-    crate::session_timeline::scoped_input_tests::install(
+    let mut scoped =
+        crate::session_timeline::scoped_input_tests::scoped(&[Scope::Relaunch, Scope::Accounts]);
+    scoped.claim.contract = UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
         &ctx,
-        71,
-        &[aterm_agent::harness::contract::Scope::Relaunch],
-    );
+        "grok-alab@4242",
+        Some(71),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("fixture claim");
     let env = aterm_agent::harness::accounts_pool::LoginEnv {
         label: "work".to_string(),
         var: "KIMI_CODE_HOME",
         value: Some(crate::test_host::abs("/tmp/account home")),
     };
-    assert!(record_scoped_account(&ctx, "account", &env));
+    assert!(record_scoped_restart(&ctx, "account", Some(&env), None));
     let events = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
     let event = events.last().expect("the account event");
     assert_eq!(event.kind, RESTART_EVENT);
@@ -111,15 +119,147 @@ fn a_scoped_account_event_carries_only_the_row_and_its_home() {
             crate::test_host::abs("/tmp/account%20home")
         )
     );
-    assert!(!record_scoped_account(&ctx, "asked", &env));
-    assert!(!record_scoped_account(
+    assert!(!record_scoped_restart(&ctx, "asked", Some(&env), None));
+    assert!(!record_scoped_restart(
         &ctx,
         "account",
-        &aterm_agent::harness::accounts_pool::LoginEnv {
+        Some(&aterm_agent::harness::accounts_pool::LoginEnv {
             value: Some("relative".to_string()),
             ..env
-        }
+        }),
+        None,
     ));
+}
+
+/// AN ACCOUNT MOVE REACHES ONLY A CLAIM GRANTED `accounts` (HX-05's review, finding 13): the event
+/// names the account's home, which aterm hands only to a verified installed or seed build, so a
+/// claim holding `relaunch` without `accounts` (a contract 3 claim, whose grammar has no such
+/// word, and a development link's contract 4 claim, granted every word but it) is told no account
+/// move, with or without a model riding it, and nothing reaches its timeline; a model restart
+/// still reaches it. CONTROL: a contract 4 claim granted `accounts` is told the move, its home
+/// with it. NEGATIVE CONTROL: before the fix both relaunch claims were told the move, home and
+/// all, while their replies said `accounts` was not granted.
+#[test]
+fn an_account_move_reaches_only_a_claim_granted_accounts() {
+    use aterm_agent::harness::contract::{SCOPED, Scope, UNIVERSAL};
+    let env = aterm_agent::harness::accounts_pool::LoginEnv {
+        label: "work".to_string(),
+        var: "ACCOUNT_HOME",
+        value: Some(crate::test_host::abs("/tmp/account home")),
+    };
+    let claimed = |n: u64, contract: u32, scopes: &[Scope]| {
+        let ctx = crate::session_store::test_handle_on(7650 + n, -1).ctx;
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(scopes);
+        scoped.claim.contract = contract;
+        crate::session_timeline::claim_supervisor_scoped(
+            &ctx,
+            "grok-alab@4242",
+            Some(71),
+            scoped,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("fixture claim");
+        ctx
+    };
+    let restarts = |ctx: &SessionCtx| {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .view_copy(None, 0)
+            .rows()
+            .into_iter()
+            .filter(|row| row.kind == RESTART_EVENT)
+            .map(|row| row.payload.to_string())
+            .collect::<Vec<_>>()
+    };
+    for (n, contract, scopes) in [
+        (1, SCOPED, &[Scope::Relaunch, Scope::Upgrade][..]),
+        (
+            2,
+            UNIVERSAL,
+            &[Scope::Relaunch, Scope::Upgrade, Scope::TurnEnd][..],
+        ),
+    ] {
+        let ctx = claimed(n, contract, scopes);
+        assert!(
+            !record_scoped_restart(&ctx, "account", Some(&env), None),
+            "contract {contract}: no account move without `accounts`"
+        );
+        assert!(
+            !record_scoped_restart(&ctx, "account", Some(&env), Some("model-b")),
+            "contract {contract}: nor one a model rides"
+        );
+        assert!(
+            restarts(&ctx).is_empty(),
+            "contract {contract}: nothing reaches its timeline"
+        );
+        assert!(
+            record_scoped_restart(&ctx, "model", None, Some("model-b")),
+            "contract {contract}: a model restart still reaches it"
+        );
+        assert_eq!(restarts(&ctx), ["cause=model model=model-b"]);
+    }
+    let ctx = claimed(3, UNIVERSAL, &[Scope::Relaunch, Scope::Accounts]);
+    assert!(
+        record_scoped_restart(&ctx, "account", Some(&env), None),
+        "CONTROL"
+    );
+    assert_eq!(
+        restarts(&ctx),
+        [format!(
+            "cause=account to=work home={}",
+            crate::test_host::abs("/tmp/account%20home")
+        )]
+    );
+}
+
+/// A MODEL RESTART NAMES ITS MODEL IN `model=`, NEVER IN `to=` (HX-06; the client's Decision
+/// 13): `cause=model model=<word>` for a contract 4 claim of `accounts` alone, the account fields
+/// only beside an account. NEGATIVE CONTROLS: a word a vendor's command line could misread (a
+/// leading `-`, a space, empty) and an event naming neither account nor model are refused, and a
+/// claim of `approvals` alone hears nothing.
+#[test]
+fn a_model_restart_names_its_model_in_its_own_word() {
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
+    let ctx = crate::session_store::test_handle_on(4242, -1).ctx;
+    let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[Scope::Accounts]);
+    scoped.claim.contract = UNIVERSAL;
+    crate::session_timeline::claim_supervisor_scoped(
+        &ctx,
+        "grok-alab@4242",
+        Some(71),
+        scoped,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("fixture claim");
+    let last = || {
+        let rows = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
+        rows.last()
+            .filter(|row| row.kind == RESTART_EVENT)
+            .map(|row| row.payload.to_string())
+    };
+    assert!(record_scoped_restart(
+        &ctx,
+        "model",
+        None,
+        Some("claude-opus-4[1m]")
+    ));
+    assert_eq!(
+        last().as_deref(),
+        Some("cause=model model=claude-opus-4[1m]")
+    );
+    for bad in ["-c", "two words", ""] {
+        assert!(
+            !record_scoped_restart(&ctx, "model", None, Some(bad)),
+            "{bad:?}"
+        );
+    }
+    assert!(!record_scoped_restart(&ctx, "model", None, None));
+    let ctx = crate::session_store::test_handle_on(4243, -1).ctx;
+    crate::session_timeline::scoped_input_tests::install(&ctx, 72, &[Scope::Approvals]);
+    assert!(!record_scoped_restart(&ctx, "model", None, Some("grok-4")));
 }
 
 #[test]

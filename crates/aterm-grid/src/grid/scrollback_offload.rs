@@ -759,8 +759,6 @@ impl Grid {
         let retained = u64::from(self.storage.visible_rows).saturating_add(sb as u64);
         if self.storage.absolute_row_counter < retained {
             self.renumber_rows(retained);
-            self.storage.history_renumber_epoch =
-                self.storage.history_renumber_epoch.saturating_add(1);
             self.invalidate_host_coordinates();
         }
 

@@ -153,7 +153,7 @@ fn a_write_waiting_here_offers_nothing_and_says_not_yet_in_vault() {
         accounts: vec![waiting],
         peers: PeersShown::NotRead,
         sessions: None,
-        steps: BTreeMap::new(),
+        steps: Held::default(),
     };
     let text = report.text();
     assert!(text.contains("not yet in vault"), "{text}");
@@ -280,7 +280,7 @@ fn the_report_carries_the_fields() {
         sessions: Some(sessions_of(&[format!(
             "session local=1 sid=s-1 account=work auth=token token={KEY}"
         )])),
-        steps: BTreeMap::new(),
+        steps: Held::default(),
     };
     let text = report.text();
     for field in [entry.as_str(), "m7 in aterm's window", "@s-1", "token"] {
@@ -303,6 +303,7 @@ fn the_report_carries_the_fields() {
         "used_on",
         "vault",
         "verified",
+        "verified_on",
         "rejected_at",
         "offer",
         "login",
@@ -316,6 +317,74 @@ fn the_report_carries_the_fields() {
     assert_eq!(account["used_on"]["peers_read"], Value::from(true));
     assert_eq!(json["sessions"][0]["route"], Value::from("token"));
     assert_eq!(json["sessions"][0]["token"], Value::from(KEY));
+}
+
+/// A TOKEN'S VERIFICATION IS SHOWN FROM THE VAULT'S STAMP, WITH THE MAC THAT WROTE IT (FL-134):
+/// any Mac that holds the account's stored login verifies a token, so the Mac showing it need not
+/// be the one that wrote `verified`. This Mac's row says nothing (m12 verified the token), or says
+/// its own write's time (its stamp lost the settle to m12's): either way the report's text and
+/// JSON carry the vault's stamp, when and on which Mac. A pair that does not read as one token
+/// shows no verification. Where the vault was not read, the row's own time stands, naming no Mac.
+/// NEGATIVE CONTROL (2026-11-15, by hand, then restored): with the report reading
+/// `row.verified`, "another Mac's stamp" fails.
+#[test]
+fn a_verification_is_shown_from_the_vaults_stamp_with_the_mac_that_wrote_it() {
+    let then = NOW - 2 * DAY;
+    let stamped = || {
+        let mut standing = standing(NOW + 300 * DAY, &[]);
+        let verified = standing
+            .meta
+            .as_mut()
+            .and_then(|meta| meta.verified.as_mut())
+            .expect("a stamp");
+        (verified.on, verified.at) = ("m12".to_owned(), then);
+        standing
+    };
+    let shown_with = |found: &Lookup<Standing>, verified: Option<u64>| {
+        account(
+            covered(LoginHalf::Ok),
+            found,
+            Some(TokenRow { verified, ..row() }),
+            Some(false),
+            NOW,
+        )
+    };
+    let report = |shown: AccountToken| Report::Accounts {
+        accounts: vec![shown],
+        peers: PeersShown::Read,
+        sessions: None,
+        steps: Held::default(),
+    };
+    let by_m12 = Lookup::Found(stamped());
+    for (why, row_says) in [
+        ("another Mac's stamp", None),
+        ("the vault's stamp, not this Mac's write", Some(NOW - 3_600)),
+    ] {
+        let report = report(shown_with(&by_m12, row_says));
+        let words = format!("verified {} on m12", date(then));
+        assert!(report.text().contains(&words), "{why}: {}", report.text());
+        let json = report.json();
+        assert_eq!(json["accounts"][0]["verified"], Value::from(then), "{why}");
+        assert_eq!(
+            json["accounts"][0]["verified_on"],
+            Value::from("m12"),
+            "{why}"
+        );
+    }
+    let mut unsettled = stamped();
+    unsettled.check = Check::Mismatched(aterm_secrets::claude_token::Mismatch::Draft);
+    let text = report(shown_with(&Lookup::Found(unsettled), Some(NOW - 3_600))).text();
+    assert!(
+        !text.contains("verified "),
+        "no token read, so none verified: {text}"
+    );
+    let unread = report(shown_with(&Lookup::Unknown, Some(NOW - 3_600)));
+    let text = unread.text();
+    assert!(
+        text.contains(&format!("verified {};", date(NOW - 3_600))),
+        "the vault not read: this Mac's row, naming no Mac: {text}"
+    );
+    assert_eq!(unread.json()["accounts"][0]["verified_on"], Value::Null);
 }
 
 fn peer(label: &str, answer: Result<Vec<String>, String>) -> aterm_ctl::PeerSurvey {
@@ -995,7 +1064,7 @@ fn each_session_names_the_account_its_login_record_names() {
         accounts: vec![shown.clone()],
         peers: PeersShown::NotRead,
         sessions: Some(named),
-        steps: BTreeMap::new(),
+        steps: Held::default(),
     };
     let text = report.text();
     assert!(
@@ -1034,10 +1103,14 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     );
     let step = Stopped::new(MetWord::WindowHumanCheck, NOW, "2.1.318", "").expect("a record");
     token_steps::put(&store, KEY, Some(&step)).unwrap();
-    let steps = held_steps(&store, std::slice::from_ref(&none), None, || {
-        Some("2.1.318".to_owned())
-    });
-    assert_eq!(steps.get(KEY), Some(&step));
+    let steps = held_steps(
+        &store,
+        std::slice::from_ref(&none),
+        (None, &|_| None),
+        || Some("2.1.318".to_owned()),
+    );
+    assert_eq!(steps.stopped.get(KEY), Some(&step));
+    assert!(steps.tried.is_empty(), "{steps:?}");
     let report = Report::Accounts {
         accounts: vec![none.clone()],
         peers: PeersShown::NotRead,
@@ -1063,9 +1136,12 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     assert_eq!(json["accounts"][0]["step"]["at"], Value::from(NOW));
     // A new Claude Code build releases it, and so does a token made after the stop.
     assert!(
-        held_steps(&store, std::slice::from_ref(&none), None, || {
-            Some("2.1.319".to_owned())
-        })
+        held_steps(
+            &store,
+            std::slice::from_ref(&none),
+            (None, &|_| None),
+            || { Some("2.1.319".to_owned()) }
+        )
         .is_empty()
     );
     let made = account(
@@ -1079,8 +1155,108 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     later.at = NOW - 2 * DAY;
     token_steps::put(&store, KEY, Some(&later)).unwrap();
     assert!(
-        held_steps(&store, std::slice::from_ref(&made), None, || None).is_empty(),
+        held_steps(
+            &store,
+            std::slice::from_ref(&made),
+            (None, &|_| None),
+            || None
+        )
+        .is_empty(),
         "a released record was shown"
+    );
+}
+
+/// THE UPKEEP'S RECORD OF A RUN IS SHOWN ON DEMAND WHILE IT HOLDS THE GAP (FL-138): a code
+/// page's stop that a mailbox the window reads now let through is not shown, while the upkeep's
+/// record of the run that met it, which no mailbox lets through, is: the report's line says when,
+/// the gap and what runs it again, its JSON carries the gap, the token's `minted_at` and when,
+/// and neither names a host. A record of another token's gap (the vault holds a token made
+/// since), or one a new Claude Code build released, is not shown.
+/// NEGATIVE CONTROL: with `held_steps` reading no tried record, the report says nothing of why
+/// no token is being made: `` the upkeep's held run was not shown ``.
+#[test]
+fn the_upkeeps_record_of_a_run_is_shown_on_demand_while_it_holds_the_gap() {
+    use crate::harness::accounts_tokens::Gap;
+    use crate::harness::open_url::MetWord;
+    let (_dir, store) = scratch();
+    let none = account(
+        covered(LoginHalf::Ok),
+        &Lookup::Absent,
+        None,
+        Some(false),
+        NOW,
+    );
+    let stop = Stopped::new(MetWord::WindowCodeNoMailbox, NOW, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&stop)).unwrap();
+    let ran = Tried::new((Gap::None, None), NOW, "2.1.318", &aterm_stamp::build_id());
+    token_steps::put_tried(&store, KEY, Some(&ran)).unwrap();
+    // aterm's window reads the account's mailbox now, from a configuration no file dates (as a
+    // vault mailbox entry is one).
+    let mailbox = |name: &str| -> Option<std::ffi::OsString> {
+        use crate::harness::headless_oauth::{IMAP_PASS_ENV, IMAP_URL_ENV, IMAP_USER_ENV};
+        match name {
+            IMAP_URL_ENV => Some("imaps://imap.example.test/INBOX".into()),
+            IMAP_USER_ENV => Some(EMAIL.into()),
+            IMAP_PASS_ENV => Some("a fixture's word".into()),
+            _ => None,
+        }
+    };
+    let held = |accounts: &[AccountToken], cli: &str| {
+        held_steps(&store, accounts, (None, &mailbox), || Some(cli.to_owned()))
+    };
+    let steps = held(std::slice::from_ref(&none), "2.1.318");
+    assert!(
+        steps.stopped.is_empty(),
+        "CONTROL: the window's mailbox let the code page's stop through: {steps:?}"
+    );
+    assert_eq!(
+        steps.tried.get(KEY),
+        Some(&ran),
+        "the upkeep's held run was not shown"
+    );
+    let report = Report::Accounts {
+        accounts: vec![none.clone()],
+        peers: PeersShown::NotRead,
+        sessions: None,
+        steps,
+    };
+    let text = report.text();
+    assert!(
+        text.contains(
+            "\n    token upkeep: ran 2027-01-15 for its year-long token (none): this Mac's \
+             upkeep's capture with nobody there made no token, and it runs none again for that \
+             token until a new Claude Code or aterm build, the account's window store, a mailbox \
+             configuration file or its saved Google mail grant written after it, or a token made \
+             after it, such as `aterm harness accounts token work` makes"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("token step:"), "{text}");
+    assert!(!text.contains("example.test"), "{text}");
+    let json = report.json();
+    assert_eq!(json["accounts"][0]["tried"]["gap"], Value::from("none"));
+    assert_eq!(json["accounts"][0]["tried"]["minted_at"], Value::Null);
+    assert_eq!(json["accounts"][0]["tried"]["at"], Value::from(NOW));
+    assert_eq!(json["accounts"][0]["step"], Value::Null);
+
+    assert!(
+        held(std::slice::from_ref(&none), "2.1.319")
+            .tried
+            .is_empty(),
+        "a new Claude Code build's run was held"
+    );
+    let made = account(
+        covered(LoginHalf::Ok),
+        &Lookup::Found(standing(NOW + 300 * DAY, &[])),
+        None,
+        Some(false),
+        NOW,
+    );
+    assert!(
+        held(std::slice::from_ref(&made), "2.1.318")
+            .tried
+            .is_empty(),
+        "another token's gap was shown"
     );
 }
 

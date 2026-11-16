@@ -132,7 +132,7 @@ fn compose_route_chrome_and_overlay_inputs_reuse_the_frame_plan() {
             }
         }
         app.search_enter();
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.focused = true;
             ws.input_scratch.cells = vec![Vec::new(); usize::from(ws.rows)];
         }
@@ -365,15 +365,15 @@ fn stable_single_pane_control_keeps_body_cadence_and_single_pane_latches() {
     let route = app.active_visible_content_route(wid).unwrap();
     assert!(!app.prepare_layout_coordinate_space(wid, route));
     {
-        let state = app.windows.get_mut(&wid).unwrap();
+        let mut state = app.windows.get_mut(&wid).unwrap();
         state.focused = true;
         state.last_composed = Some(true);
         state.pill_shown = true;
         state.composed_cursor_effect_valid = true;
         state.composed_cursor_effect_session = Some(0);
-        charge_cursor_body(state, now);
+        charge_cursor_body(&mut state, now);
         assert!(!state.is_split());
-        assert!(!legacy_projection_is_split(state));
+        assert!(!legacy_projection_is_split(&state));
     }
 
     assert!(!app.prepare_layout_coordinate_space(wid, route));
@@ -401,15 +401,15 @@ fn pure_split_control_clears_single_pane_latches_and_includes_body_cadence() {
     let route = app.active_visible_content_route(wid).unwrap();
     assert!(app.prepare_layout_coordinate_space(wid, route));
     {
-        let state = app.windows.get_mut(&wid).unwrap();
+        let mut state = app.windows.get_mut(&wid).unwrap();
         state.focused = true;
         state.last_composed = Some(false);
         state.pill_shown = true;
         state.fx.cursor_mut().glow.note_kill(now, true);
-        charge_cursor_body(state, now);
+        charge_cursor_body(&mut state, now);
         assert!(state.is_split());
         assert!(
-            legacy_projection_is_split(state),
+            legacy_projection_is_split(&state),
             "pure terminal split is the positive legacy-projection control"
         );
     }
@@ -449,7 +449,7 @@ fn same_class_zoom_transition_resets_coordinate_bound_cursor_effects() {
         .cursor_mut()
         .glow
         .note_kill(Instant::now(), true);
-    charge_cursor_body(app.windows.get_mut(&wid).unwrap(), Instant::now());
+    charge_cursor_body(&mut app.windows.get_mut(&wid).unwrap(), Instant::now());
     let old_key = app.windows[&wid].last_layout_coordinate_space;
     assert!(
         app.windows
@@ -480,9 +480,10 @@ fn authoritative_headless_split_capture_retires_charged_bodies_after_divider_mov
     assert!(app.prepare_terminal_capture_grid(wid).is_some());
 
     let now = Instant::now();
-    let state = app.windows.get_mut(&wid).expect("headless window");
+    let mut state = app.windows.get_mut(&wid).expect("headless window");
     state.fx.cursor_mut().glow.note_kill(now, true);
-    charge_cursor_body(state, now);
+    charge_cursor_body(&mut state, now);
+    drop(state);
     let divider = app.active_visible_leaf_plan(wid).unwrap().dividers[0]
         .path
         .clone();
@@ -518,9 +519,10 @@ fn authoritative_headless_mixed_zoom_capture_retires_charged_bodies() {
     assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
 
     let now = Instant::now();
-    let state = app.windows.get_mut(&wid).expect("headless window");
+    let mut state = app.windows.get_mut(&wid).expect("headless window");
     state.fx.cursor_mut().glow.note_kill(now, true);
-    charge_cursor_body(state, now);
+    charge_cursor_body(&mut state, now);
+    drop(state);
     assert!(
         app.windows
             .get_mut(&wid)
@@ -563,9 +565,10 @@ fn authoritative_headless_tab_capture_retires_charged_bodies() {
     assert!(app.prepare_terminal_capture_grid(wid).is_some());
 
     let now = Instant::now();
-    let state = app.windows.get_mut(&wid).expect("headless window");
+    let mut state = app.windows.get_mut(&wid).expect("headless window");
     state.fx.cursor_mut().glow.note_kill(now, true);
-    charge_cursor_body(state, now);
+    charge_cursor_body(&mut state, now);
+    drop(state);
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     assert!(
         !cursor_bodies_are_retired(&app.windows[&wid]),
@@ -636,13 +639,13 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     let now = Instant::now();
 
     {
-        let state = app.windows.get_mut(&wid).unwrap();
+        let mut state = app.windows.get_mut(&wid).unwrap();
         state
             .fx
             .companion_mut()
             .set_species(aterm_effects::kitty_pet::PetSpecies::Dog);
         let pet = crate::app_render::pet_tick_for_test(
-            state,
+            &mut state,
             aterm_effects::host::CaptureMode::StaticCapture,
             aterm_effects::kitty_pet::PetSense {
                 caret_drawn: true,
@@ -687,7 +690,7 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
 
     app.windows.get_mut(&wid).unwrap().scale = 2.0;
     assert!(!app.prepare_layout_coordinate_space(wid, route));
-    let state = app.windows.get_mut(&wid).unwrap();
+    let mut state = app.windows.get_mut(&wid).unwrap();
     assert!(
         state.fx.companion_mut().brain().is_active(),
         "a re-grid of the focused view keeps the resident's body"
@@ -713,12 +716,13 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     assert!(state.composed_cursor_style_override.is_none());
     assert!(state.input_scratch.cursor_fill_override.is_none());
     assert!(state.input_scratch.cursor_effect_style_override.is_none());
+    drop(state);
 
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     {
-        let state = app.windows.get_mut(&wid).unwrap();
+        let mut state = app.windows.get_mut(&wid).unwrap();
         let pet = crate::app_render::pet_tick_for_test(
-            state,
+            &mut state,
             aterm_effects::host::CaptureMode::StaticCapture,
             aterm_effects::kitty_pet::PetSense {
                 caret_drawn: true,
@@ -741,7 +745,7 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     }
     let route = app.active_visible_content_route(wid).unwrap();
     assert!(!app.prepare_layout_coordinate_space(wid, route));
-    let state = app.windows.get_mut(&wid).unwrap();
+    let mut state = app.windows.get_mut(&wid).unwrap();
     assert!(
         !state.fx.companion_mut().brain().is_active()
             && !state.fx.companion_mut().brain().needs_frames(),
@@ -838,15 +842,15 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     let route = app.active_visible_content_route(wid).unwrap();
     assert!(app.prepare_layout_coordinate_space(wid, route));
     {
-        let state = app.windows.get_mut(&wid).unwrap();
+        let mut state = app.windows.get_mut(&wid).unwrap();
         state.focused = true;
         state.last_composed = Some(false);
         state.pill_shown = true;
         state.fx.cursor_mut().glow.note_kill(now, true);
-        charge_cursor_body(state, now);
+        charge_cursor_body(&mut state, now);
         assert_eq!(state.tab_set.active().unwrap().root.len(), 2);
         assert!(
-            !legacy_projection_is_split(state),
+            !legacy_projection_is_split(&state),
             "the mixed fixture reproduces the one-pane compatibility projection"
         );
         assert!(
@@ -884,7 +888,7 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
 
     let now = Instant::now();
     {
-        let ws = app.windows.get_mut(&wid).expect("headless window");
+        let mut ws = app.windows.get_mut(&wid).expect("headless window");
         let sense = |now, caret| aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
             now,
@@ -899,17 +903,17 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
             wrapped: false,
         };
         let _ = crate::app_render::pet_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::Present,
             sense(now, Some((2, 2))),
         );
         let _ = crate::app_render::pet_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::Present,
             sense(now + Duration::from_millis(16), Some((2, 2))),
         );
         let _ = crate::app_render::pet_tick_for_test(
-            ws,
+            &mut ws,
             aterm_effects::host::CaptureMode::Present,
             sense(now + Duration::from_millis(420), Some((2, 34))),
         );
@@ -927,8 +931,11 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
         .expect("an art");
         let body = aterm_render::sprites::FreeSprite::whole(0, 0, art);
         let tiles = aterm_effects::matrix_rain::RainBaker::default();
-        ws.fx
-            .publish_for_test(&[body.clone(), body], (&[], &tiles), &mut ws.input_scratch);
+        {
+            let ws = &mut **ws;
+            ws.fx
+                .publish_for_test(&[body.clone(), body], (&[], &tiles), &mut ws.input_scratch);
+        }
         ws.input_scratch.nova_add = vec![aterm_core::render::GlowQuad::default()];
         ws.input_scratch.cursor_glow_add = vec![aterm_core::render::GlowQuad::default()];
     }
@@ -1119,7 +1126,7 @@ fn a_zoomed_mixed_tab_draws_its_terminal_leaf() {
             );
         }
         {
-            let ws = app.windows.get_mut(&wid).expect("the window");
+            let mut ws = app.windows.get_mut(&wid).expect("the window");
             ws.focused = true;
             assert!(
                 ws.tab_set.active_mut().is_some_and(|tab| tab.toggle_zoom()),
@@ -1182,7 +1189,7 @@ fn a_mixed_frame_s_scroll_pill_owes_no_wakes() {
     let _ = app.prepare_layout_coordinate_space(wid, route);
     let t0 = Instant::now();
     let interval = Duration::from_millis(16);
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.focused = true;
     assert!(
         ws.front_terminal().is_some(),

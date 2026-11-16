@@ -230,3 +230,153 @@ fn a_bar_caret_reads_against_its_cell_on_paper() {
         (&["flat rainbow + cat", "comet"], Scene::Typing),
     );
 }
+
+/// The columns the clean twin draws the bar in ([`bar_reading`]'s span), from the cell's left.
+fn bar_span(k: &Kept, page: u32) -> Option<(usize, usize)> {
+    let (cw, ch) = k.cell;
+    let (x0, y0) = (k.left + k.caret.1 * cw, k.top + k.caret.0 * ch);
+    let strength = |x: usize| {
+        let mut c: Vec<f64> = (y0..y0 + ch)
+            .map(|y| contrast(k.clean[y * k.w + x0 + x] & 0x00FF_FFFF, page))
+            .collect();
+        c.sort_unstable_by(f64::total_cmp);
+        c[c.len() / 2]
+    };
+    let quarter = cw.div_ceil(4).max(1);
+    let seat = (0..quarter).max_by(|&a, &b| strength(a).total_cmp(&strength(b)))?;
+    if strength(seat) < CARET_DIFF {
+        return None;
+    }
+    let (mut lo, mut hi) = (seat, seat + 1);
+    while lo > 0 && strength(lo - 1) >= CARET_DIFF {
+        lo -= 1;
+    }
+    while hi < cw && strength(hi) >= CARET_DIFF {
+        hi += 1;
+    }
+    Some((lo, hi))
+}
+
+/// The bar read as a reader sees it, as `trail-contrast`'s thin-caret reader takes its ring:
+/// each pixel of its line against the median of the frame's pixels on its nearest Chebyshev
+/// ring (1, else 2) that are the cell's ground in the clean twin (its commonest colour off the
+/// line), the worst pixel row's lower median. `None` where the clean twin draws no bar.
+pub fn bar_ring_reading(k: &Kept, page: u32) -> Option<f64> {
+    let (cw, ch) = k.cell;
+    let (lo, hi) = bar_span(k, page)?;
+    let (x0, y0) = (k.left + k.caret.1 * cw, k.top + k.caret.0 * ch);
+    let h = k.px.len() / k.w;
+    let mut counts: std::collections::HashMap<u32, (usize, usize)> = Default::default();
+    let mut i = 0;
+    for y in y0..y0 + ch {
+        for x in 0..cw {
+            if !(lo..hi).contains(&x) {
+                counts
+                    .entry(k.clean[y * k.w + x0 + x] & 0x00FF_FFFF)
+                    .or_insert((0, i))
+                    .0 += 1;
+                i += 1;
+            }
+        }
+    }
+    let ground = counts
+        .iter()
+        .max_by(|a, b| a.1.0.cmp(&b.1.0).then(b.1.1.cmp(&a.1.1)))
+        .map(|(&c, _)| c)?;
+    let mut worst = f64::INFINITY;
+    for y in y0..y0 + ch {
+        let mut row = Vec::new();
+        for x in x0 + lo..x0 + hi {
+            let mut ring = Vec::new();
+            for d in 1..=2i64 {
+                for dy in -d..=d {
+                    for dx in -d..=d {
+                        if dx.abs().max(dy.abs()) != d {
+                            continue;
+                        }
+                        let (xx, yy) = (x as i64 + dx, y as i64 + dy);
+                        if xx < 0 || yy < 0 || xx as usize >= k.w || yy as usize >= h {
+                            continue;
+                        }
+                        let j = yy as usize * k.w + xx as usize;
+                        if k.clean[j] & 0x00FF_FFFF == ground {
+                            ring.push(k.px[j] & 0x00FF_FFFF);
+                        }
+                    }
+                }
+                if !ring.is_empty() {
+                    break;
+                }
+            }
+            if let Some(g) = median(&ring) {
+                row.push(contrast(k.px[y * k.w + x] & 0x00FF_FFFF, g));
+            }
+        }
+        if !row.is_empty() {
+            row.sort_unstable_by(f64::total_cmp);
+            worst = worst.min(row[(row.len() - 1) / 2]);
+        }
+    }
+    worst.is_finite().then_some(worst)
+}
+
+/// The scenes a bar caret's ring is read in: a band head beside the caret (typing, a wrapped
+/// line, a coloured focus row) and a letter under it (move-up).
+const RING_SCENES: [Scene; 4] = [
+    Scene::Typing,
+    Scene::Wrapped,
+    Scene::FocusWrap,
+    Scene::MoveUp,
+];
+
+/// A THIN CARET READS AGAINST ITS RING (CT-51 Rule A; `thin_caret.rs`): Rainbow's bar reads
+/// 4.5:1 or more against the light beside its line in every frame of [`RING_SCENES`], its
+/// cell's ground read with the letter under it as the frame lays it (the effects' ground within
+/// two levels of the frame's; `thin_caret_tests` holds the letter's part with its control).
+/// NEGATIVE CONTROL: read against its cell alone (`set_thin_caret_ring(false)`), the bar reads
+/// under the ruling against its ring on some frame.
+fn rings_read_on(look: Look) {
+    let read = |controls: fn(&mut EffectsPipeline)| -> Vec<(Scene, u64, f64, bool)> {
+        aterm_spec::check::each(&RING_SCENES, |&scene| {
+            bar_scene("rainbow", look, scene, controls)
+                .iter()
+                .filter_map(|k| {
+                    let ring = bar_ring_reading(k, look.bg)?;
+                    let agrees = match (bar_reading(k, look.bg), k.caret_ground) {
+                        (Some((_, _, ground)), Some(seen)) => near(seen, ground, 2),
+                        _ => true,
+                    };
+                    Some((scene, k.ms, ring, agrees))
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    let shipped = read(|_| {});
+    assert!(!shipped.is_empty(), "no bar read on {}", look.name);
+    let under: Vec<String> = shipped
+        .iter()
+        .filter(|r| r.2 < CARET_MIN || !r.3)
+        .map(|(s, ms, c, a)| format!("{s:?} @{ms} ring {c:.2} ground agrees {a}"))
+        .collect();
+    assert!(under.is_empty(), "on {}: {under:?}", look.name);
+    let ringless = read(|fx| fx.set_thin_caret_ring(false));
+    let worst = ringless.iter().map(|r| r.2).fold(f64::INFINITY, f64::min);
+    assert!(
+        worst < CARET_MIN,
+        "control: read against its cell alone, the bar's ring reads {worst:.2} at worst on {}",
+        look.name
+    );
+}
+
+#[test]
+fn a_bar_caret_reads_against_its_ring_on_the_dark_page() {
+    rings_read_on(DARK);
+}
+
+#[test]
+fn a_bar_caret_reads_against_its_ring_on_paper() {
+    rings_read_on(GITHUB_LIGHT);
+}

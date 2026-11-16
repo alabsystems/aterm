@@ -442,6 +442,7 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             Some(renewal::Request::Commit(_)) => "commit",
             Some(renewal::Request::Status(_)) => "status",
             Some(renewal::Request::Consume { .. }) => "consume",
+            Some(renewal::Request::Complete { .. }) => "complete",
             None => "invalid",
         };
         let outcome = [
@@ -550,7 +551,8 @@ fn serve_claimed(
     };
     if let renewal::Request::Commit(id)
     | renewal::Request::Status(id)
-    | renewal::Request::Consume { id, .. } = &request
+    | renewal::Request::Consume { id, .. }
+    | renewal::Request::Complete { id, .. } = &request
         && renewal::read_receipt(&env, id).is_some_and(|receipt| receipt.intent.purpose != purpose)
     {
         return "ERR codex-renewal wrong recovery purpose\n".into();
@@ -676,6 +678,11 @@ fn serve_claimed(
                 _ => unreachable!(),
             };
             status(ctx, &env, &proof, &copy, &current, &id, other)
+        }
+        // Only a pool move's grammar parses it, and the guard above held its receipt to that
+        // purpose.
+        renewal::Request::Complete { id, turn } => {
+            rotation::complete(ctx, &env, &proof, &copy, &id, &turn)
         }
     }
 }

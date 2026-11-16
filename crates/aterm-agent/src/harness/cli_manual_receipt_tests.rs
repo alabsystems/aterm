@@ -259,7 +259,11 @@ fn a_manual_plan_preserves_a_concurrent_fleet_edit_even_for_an_already_listed_ro
 #[test]
 fn a_manual_plan_rechecks_configuration_and_higher_priority_inputs_before_its_receipt() {
     let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-    for config_changed in [false, true] {
+    #[cfg(unix)]
+    let changes = [false, true];
+    #[cfg(not(unix))]
+    let changes = [true];
+    for config_changed in changes {
         let (_tmp, env, row, plan) = planned(false);
         let roster = env.accounts_roster().unwrap();
         let fleet = roster.with_file_name(accounts_sync::FLEET_ROSTER_FILE);
@@ -267,7 +271,9 @@ fn a_manual_plan_rechecks_configuration_and_higher_priority_inputs_before_its_re
         if config_changed {
             crate::test_config::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m4'\n")
                 .unwrap();
-        } else {
+        }
+        #[cfg(unix)]
+        if !config_changed {
             crate::vault_entry::put(
                 env.home.as_ref().unwrap(),
                 accounts_sync::FLEET_ROSTER_FILE,

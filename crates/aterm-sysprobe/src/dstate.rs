@@ -8,8 +8,10 @@
 //! threads say it, and it refuses other users' threads: the census reads this user's.
 //!
 //! A pass reads processes in pid order from where the last stopped, each process's threads as the
-//! job probe reads them (at most [`crate::jobs::MAX_THREADS`]), until its thread time would pass
-//! [`PASS_BUDGET_NS`]. It stops *before* a process whose read could cross the budget: the margin
+//! job probe reads them (at most [`crate::jobs::MAX_THREADS`]; a process with more is read cut,
+//! and says so: [`Read::Threads`]' `cut`, [`Marked::cut`], [`Pass::cut_unmarked`]), until its
+//! thread time would pass [`PASS_BUDGET_NS`].
+//! It stops *before* a process whose read could cross the budget: the margin
 //! is the costliest one-process read of the open cover and of the last one that ended, at least
 //! [`MARGIN_FLOOR_NS`] and at most [`MARGIN_CAP_NS`], so one costly read holds it up for two
 //! covers at most, and a pass still reads half its budget of its cover meanwhile. The list's own
@@ -44,6 +46,9 @@ pub enum Read {
         threads: u32,
         /// Of them, uninterruptible.
         uninterruptible: u32,
+        /// Whether it has more threads than were read (its list was cut at
+        /// [`crate::jobs::MAX_THREADS`]): `uninterruptible` then counts at least those.
+        cut: bool,
     },
     /// Its threads were not read: a zombie (which has none), or a process the kernel refuses.
     Refused,
@@ -76,6 +81,9 @@ pub struct Marked {
     pub name: String,
     /// Its threads in an uninterruptible wait.
     pub uninterruptible: u32,
+    /// Its thread list was cut at [`crate::jobs::MAX_THREADS`]: `uninterruptible` counts at least
+    /// those.
+    pub cut: bool,
     /// The pass before marked it too (the same pid and start): held for two passes running.
     pub again: bool,
 }
@@ -91,6 +99,10 @@ pub struct Pass {
     pub read: u32,
     /// Processes whose threads it could not read.
     pub refused: u32,
+    /// Processes whose thread list was cut at [`crate::jobs::MAX_THREADS`] with none of the
+    /// threads read uninterruptible: any of them may hold one past the cut, so `marked` then
+    /// names at least the processes so.
+    pub cut_unmarked: u32,
     /// Whether it read to the end of the list: a cover is done.
     pub cover_done: bool,
     /// Passes the cover it ended took, this one included, where it ended one.
@@ -177,7 +189,9 @@ impl<S: Source> Census<S> {
             let read = self.source.read(m.pid);
             Self::note(&mut clock, &mut out, read);
             if let Read::Threads {
-                uninterruptible, ..
+                uninterruptible,
+                cut,
+                ..
             } = read
                 && uninterruptible > 0
                 && let Some((start_us, name)) = self.source.identity(m.pid)
@@ -188,6 +202,7 @@ impl<S: Source> Census<S> {
                     start_us,
                     name,
                     uninterruptible,
+                    cut,
                 });
             }
             self.tick(&mut clock);
@@ -223,7 +238,9 @@ impl<S: Source> Census<S> {
                 Self::note(&mut clock, &mut out, read);
                 cover_reads += 1;
                 if let Read::Threads {
-                    uninterruptible, ..
+                    uninterruptible,
+                    cut,
+                    ..
                 } = read
                     && uninterruptible > 0
                     && let Some((start_us, name)) = self.source.identity(pid)
@@ -233,6 +250,7 @@ impl<S: Source> Census<S> {
                         start_us,
                         name,
                         uninterruptible,
+                        cut,
                         again: false,
                     });
                 }
@@ -281,8 +299,14 @@ impl<S: Source> Census<S> {
     fn note(clock: &mut Clock, out: &mut Pass, read: Read) {
         out.read += 1;
         clock.reads += 1;
-        if !matches!(read, Read::Threads { .. }) {
-            out.refused += 1;
+        match read {
+            Read::Threads {
+                uninterruptible: 0,
+                cut: true,
+                ..
+            } => out.cut_unmarked += 1,
+            Read::Threads { .. } => {}
+            Read::Refused | Read::Gone => out.refused += 1,
         }
     }
 

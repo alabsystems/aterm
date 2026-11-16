@@ -89,7 +89,7 @@ impl Directory {
                 .map_err(|_| Error::new("opaque catalog record cannot establish absence"))?;
         }
         for item in evidence.iter().filter(|_| require_understood) {
-            if item.cutoff {
+            if item.is_table_control() {
                 continue;
             }
             if let Some(record) = &item.record {

@@ -76,16 +76,32 @@ fn names(line: &str, figures: &[&str]) {
     }
 }
 
+/// The words by which a line would tell someone to free space by hand, any case.
+const BY_HAND: [&str; 7] = [
+    "free at least",
+    "free space",
+    "free some",
+    "free room",
+    "free up",
+    "by hand",
+    "what to free",
+];
+
+/// Whether `line` tells someone to free space by hand ([`BY_HAND`]).
+fn hand(line: &str) -> bool {
+    let line = line.to_lowercase();
+    BY_HAND.iter().any(|w| line.contains(w))
+}
+
 /// A first run claims the 27 GiB cold budget, and says so first. On a volume 16 GiB above its
-/// floor beside a held 5 GiB claim it reclaims first (13 GiB, its line naming what stayed of a
-/// stage the pass could not finish), then asks the window's watch for the floor, the held claim
-/// and its need, and only then waits, within the room but short of what that claim holds, its
-/// line naming the need, the free space, what is reserved and the largest holder; it is admitted
-/// once room comes, and what it wrote is kept. Negative control: the next run, with room, is
-/// relieved of nothing and says nothing, and it claims what the first run wrote, not the cold
-/// budget.
+/// floor beside a held 5 GiB claim it reclaims first (16 GiB, its line naming what stayed of a
+/// stage the pass could not finish), then asks the window's watch for the room its next look
+/// judges it by (36 GiB: the floor, its need and the 5 GiB that claim has still to write
+/// beside it), and then, within the room that claim leaves, it starts at once, with no wait
+/// line; what it wrote is kept. Negative control: the next run, with room, is relieved of
+/// nothing and says nothing, and it claims what the first run wrote, not the cold budget.
 #[test]
-fn a_short_volume_is_reclaimed_first_then_waited_for() {
+fn a_short_volume_is_reclaimed_first_then_started() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("admit-disk-")
         .tempdir()
@@ -108,9 +124,9 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
             Box::new(move |room: super::Room<'_>, _stopped| {
                 assert_eq!(room.mount, Path::new("/Volumes/scratch"));
                 pass_order.lock().expect("order").push("reclaim");
-                pass_m.set(image(40, 33));
+                pass_m.set(image(40, 36));
                 (
-                    13 * GIB,
+                    16 * GIB,
                     vec![PathBuf::from("/Volumes/scratch/gone/.cargo-build")],
                     vec![
                         "1 entry of /Volumes/scratch/left/.cargo-build.removing stayed: tmp/d"
@@ -120,7 +136,11 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
             }),
             Box::new(move |bytes, _mount, _stopped| {
                 ask_order.lock().expect("order").push("ask");
-                assert_eq!(bytes, 36 * GIB, "the floor, the held claim and the need");
+                assert_eq!(
+                    bytes,
+                    36 * GIB,
+                    "the floor, what the held claim has still to write and the need"
+                );
                 Some("OK why=no-room".to_owned())
             }),
             Box::new(|_mount, _stopped| {
@@ -149,28 +169,20 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
         &reclaimed,
         &[
             "/Volumes/scratch",
-            "13 GiB",
+            "16 GiB",
             "gone/.cargo-build",
             "; 1 entry of /Volumes/scratch/left/.cargo-build.removing stayed: tmp/d",
         ],
     );
     let asked = rx.recv_timeout(MUST_HAPPEN).expect("the watch's line");
     names(&asked, &["36 GiB", "why=no-room"]);
-    let wait = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(
-        &wait,
-        &[
-            "verify lint -p aterm-capacity",
-            "27 GiB",
-            "29 GiB",
-            "5 GiB reserved",
-            "/Volumes/scratch/ballast",
-        ],
-    );
+    let admitted = joined(waiting, "the run's admission after its relief").expect("admitted");
     assert_eq!(*order.lock().expect("order"), ["reclaim", "ask"]);
-    assert!(!waiting.is_finished(), "it waits instead of starting short");
-    m.set(image(40, 40));
-    let admitted = joined(waiting, "the run's admission once room came").expect("admitted");
+    let after: Vec<String> = rx.try_iter().collect();
+    assert!(
+        after.iter().all(|l| !l.contains(" waits (")),
+        "no wait line: {after:?}"
+    );
     assert_eq!(
         (admitted.estimate.bytes, admitted.estimate.runs),
         (27 * GIB, 0),
@@ -210,12 +222,12 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
 /// UNMET: a first run's 27 GiB on a volume 16 GiB above its floor, which its relief brings to
 /// 18 GiB (the pass reclaims 2 GiB, the watch it asks frees nothing), is refused at the next
 /// look, no wait line said: the lines are its figure's why, the reclaim's and the watch's, and
-/// the refusal names the run, what it is short of, what holds the most on the volume, how much
-/// to free there and that its relief ran (the way to start it at once is its caller's to add).
-/// The claim leaves the ledger and nothing is kept. The
-/// admission runs on a thread of its own, joined within the hang detector, so a wait fails the
-/// test. NEGATIVE CONTROL: [`a_short_volume_is_reclaimed_first_then_waited_for`], within the room
-/// after its relief, waits and is admitted.
+/// the refusal names the run, what it is short of, what holds the most on the volume, that its
+/// relief ran and that it ends now rather than wait for disk, and no space to free by hand (the
+/// way to start it at once is its caller's to add). The claim leaves the ledger and nothing is
+/// kept. The admission runs on a thread of its own, joined within the hang detector, so a wait
+/// fails the test. NEGATIVE CONTROL: [`a_short_volume_is_reclaimed_first_then_started`], within
+/// the room after its relief, is admitted.
 #[test]
 fn a_run_its_relief_leaves_beyond_the_room_is_refused_at_once() {
     let dir = aterm_tempfile::Builder::new()
@@ -269,10 +281,11 @@ fn a_run_its_relief_leaves_beyond_the_room_is_refused_at_once() {
             "verify lint -p aterm-capacity: disk short by 9 GiB",
             "needs 27 GiB on /Volumes/scratch, 18 GiB free above its 4 GiB floor",
             "largest on /Volumes/scratch: /Volumes/scratch/ballast 18 GiB",
-            "Free at least 9 GiB on /Volumes/scratch",
             "once its relief freed what it could",
+            "ends now rather than wait for disk",
         ],
     );
+    assert!(!hand(&refused), "{refused}");
     assert_eq!(
         said.len(),
         3,
@@ -287,6 +300,73 @@ fn a_run_its_relief_leaves_beyond_the_room_is_refused_at_once() {
         "it left the queue"
     );
     assert!(Footprints::load(&record).runs().is_empty(), "nothing kept");
+}
+
+/// NO REFUSAL ASKS ANYONE TO FREE SPACE BY HAND: a first run's 27 GiB on a volume 20 GiB above
+/// its floor, outside aterm (the window's watch answers nothing) and with nothing for the build
+/// cache's pass to reclaim, ends at once as UNMET, and neither its refusal nor a line said before
+/// it tells anyone to free space ([`BY_HAND`]): the refusal names what the run was short of, on
+/// which volume, what holds the most there and that it ends now rather than wait for disk. The
+/// admission runs on a thread of its own, joined within the hang detector, so a wait fails the
+/// test. NEGATIVE CONTROL: the words a refusal said before
+/// (`Free at least 9 GiB on /Volumes/scratch`), and the GUI's `Free up space…`, are caught.
+#[test]
+fn an_unmet_disk_need_names_no_space_to_free_by_hand() {
+    assert!(
+        hand(". Free at least 9 GiB on /Volumes/scratch"),
+        "the old words are caught"
+    );
+    assert!(hand("Free up space…"), "the GUI's words are caught");
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-by-hand-")
+        .tempdir()
+        .expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let run = verify_run(dir.path());
+    let their_ledger = ledger.clone();
+    let deciding = std::thread::spawn(move || {
+        let mut relief = Reclaim::of(
+            Box::new(|_, _| (0, Vec::new(), Vec::new())),
+            Box::new(|_, _, _| None),
+            Box::new(|_, _| vec![(PathBuf::from("/Volumes/scratch/ballast"), 18 * GIB)]),
+        );
+        let mut said = Vec::new();
+        let got = admit_on(
+            run,
+            &their_ledger,
+            &Fixed::new(image(40, 24)),
+            Admit::Wait,
+            Pace {
+                poll: Duration::from_millis(5),
+                line_every: Duration::from_secs(60),
+            },
+            &mut relief,
+            &mut |l| said.push(l.to_owned()),
+        );
+        (got.map(|a| a.estimate.bytes), said)
+    });
+    let (got, said) = joined(deciding, "its refusal");
+    let refused = match got {
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => e.to_string(),
+        other => panic!("refused as unmet, got {other:?}"),
+    };
+    names(
+        &refused,
+        &[
+            "disk short by 7 GiB",
+            "/Volumes/scratch",
+            "largest on /Volumes/scratch: /Volumes/scratch/ballast 18 GiB",
+            "ends now rather than wait for disk",
+        ],
+    );
+    assert!(!hand(&refused), "{refused}");
+    assert_eq!(said.len(), 2, "the figure and the reclaim: {said:?}");
+    names(&said[1], &["/Volumes/scratch", "nothing unused"]);
+    assert!(said.iter().all(|l| !hand(l)), "{said:?}");
+    assert!(
+        ledger.list().expect("listed").is_empty(),
+        "it left the queue"
+    );
 }
 
 /// A need above what the volume holds over its floor is refused at once, naming the need and
@@ -374,12 +454,12 @@ fn a_claim_says_why_its_figure_is_what_it_is_before_it_starts_short() {
     let _ = started.finish();
 }
 
-/// The window's disk watch is asked for the floor, what the claims ahead reserve and the run's
-/// need, never for the need of a waiter ahead that no claim's end can admit: that waiter needs
-/// 30 GiB on a volume 16 GiB above its floor and reserves nothing, so the run's ask is the
-/// 31 GiB its own 27 GiB and the 4 GiB floor make, not 61 GiB. The run, as far beyond the room,
-/// is then refused, saying its relief ran. NEGATIVE CONTROL: once that waiter has left and
-/// room has come, the same run is admitted at once.
+/// The window's disk watch is asked for the floor, what the claims held on the volume have
+/// still to write and the run's need, never for what a waiter ahead asks: that waiter needs
+/// 30 GiB on a volume 16 GiB above its floor, so the run's ask is the 31 GiB its own 27 GiB and
+/// the 4 GiB floor make, not 61 GiB. The run, as far beyond the room, is then refused, saying
+/// its relief ran. NEGATIVE CONTROL: once that waiter has left and room has come, the same run
+/// is admitted at once.
 #[test]
 fn the_watch_is_not_asked_for_a_waiter_no_claims_end_can_admit() {
     let dir = aterm_tempfile::Builder::new()
@@ -708,87 +788,6 @@ fn a_relief_that_empties_the_runs_directories_sizes_its_claim_again() {
     }
 }
 
-/// A CLAIM IS SIZED AGAIN AS IT IS ADMITTED, AFTER ITS DIRECTORIES WENT WHILE IT WAITED. The same
-/// warm run claims 64 KiB on a volume 4 GiB above its floor, all of it held by a claim ahead;
-/// its relief removes nothing and no watch answers, so it waits for that claim. Then a pass that
-/// is not its own (another waiting run's, which keeps only that run's directories, or the
-/// window's watch's each minute) removes its build directory
-/// and room comes: at the look that admits it the claim is sized again from the emptied
-/// directories, says so, and is held at that figure in the ledger, and the run's writes are
-/// measured from empty. Negative control: sized only after its own relief, it is admitted
-/// claiming 64 KiB and records a growth of 0 (DISK4-3's figures).
-#[test]
-fn a_build_directory_emptied_while_it_waits_sizes_its_claim_again() {
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("admit-disk-emptied-waiting-")
-        .tempdir()
-        .expect("scratch");
-    let ledger = Ledger::at(dir.path().join("ledger"));
-    let (run, build, warm, then) = warm_run(dir.path());
-    let (record, dirs) = (run.record.clone(), run.dirs.clone());
-    let m = Arc::new(Fixed::new(image(40, 8)));
-    let ahead = held_beside(&ledger, &m, 4);
-    let (tx, rx) = mpsc::channel::<String>();
-    let (their_ledger, theirs) = (ledger.clone(), Arc::clone(&m));
-    let waiting = std::thread::spawn(move || {
-        let mut relief = Reclaim::of(
-            Box::new(|_mount, _stopped| (0, Vec::new(), Vec::new())),
-            Box::new(|_bytes, _mount, _stopped| None),
-            Box::new(|_, _| Vec::new()),
-        );
-        admit_on(
-            run,
-            &their_ledger,
-            &*theirs,
-            Admit::Wait,
-            Pace {
-                poll: Duration::from_millis(5),
-                line_every: Duration::from_secs(60),
-            },
-            &mut relief,
-            &mut |l| {
-                let _ = tx.send(l.to_owned());
-            },
-        )
-    });
-    let figure = rx.recv_timeout(MUST_HAPPEN).expect("the claim's figure");
-    names(&figure, &[&then.to_string()]);
-    let _nothing = rx.recv_timeout(MUST_HAPPEN).expect("the relief's line");
-    let wait = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(&wait, &["verify lint -p aterm-capacity"]);
-
-    std::fs::remove_dir_all(&build).expect("another pass removed it");
-    m.set(image(40, 20));
-    let admitted = joined(waiting, "its admission once room came").expect("admitted");
-    let now = warm.need(
-        aterm_capacity::allocated(&dirs),
-        27 * GIB,
-        dirs_tag(&dirs),
-        scope_tag(SCOPE),
-    );
-    assert!(now.bytes >= 8 << 20, "{now}");
-    assert_eq!(admitted.estimate, now);
-    let resized = rx
-        .recv_timeout(MUST_HAPPEN)
-        .expect("the line sizing it again");
-    names(&resized, &[&now.to_string()]);
-    let held: Vec<_> = ledger
-        .list()
-        .expect("listed")
-        .into_iter()
-        .filter(|r| r.need.what == "verify lint -p aterm-capacity")
-        .collect();
-    assert_eq!(held.len(), 1, "{held:?}");
-    assert_eq!(held[0].need.disk, now.bytes, "the claim holds it");
-    drop(ahead);
-
-    std::fs::create_dir_all(&build).expect("written again");
-    std::fs::write(build.join("lib.rlib"), vec![7u8; 8 << 20]).expect("written");
-    let took = admitted.finish();
-    assert!(took.grew >= 8 << 20, "grew from empty: {took:?}");
-    assert_eq!(Footprints::load(&record).runs().last(), Some(&took));
-}
-
 /// THE RUN'S OWN PASS KEEPS ITS DIRECTORIES AND FREES THE REST ([`super::recorder`]): over a
 /// scratch cache, 31 days on, when every build directory there is unwritten long enough to go
 /// whatever its workspace's state, the pass keeps the run's own build directory (named through
@@ -873,6 +872,7 @@ fn a_claims_relief_waits_the_hour_only_below_the_floor() {
                 above_floor,
                 floor: 10 * GIB,
                 reserved: GIB,
+                writing: GIB,
                 held: Vec::new(),
             }],
             holders: Vec::new(),
@@ -889,97 +889,10 @@ fn a_claims_relief_waits_the_hour_only_below_the_floor() {
     assert_eq!(after.stale, RECLAIM_STALE_UNDER_PRESSURE);
 }
 
-/// A RELIEF IS RENEWED BY A WORKSPACE REMOVED WHILE ITS RUN WAITS: a build directory the gone
-/// listing did not hold as its pass began renews it ([`aterm_capacity::Relief::renewed`]), one
-/// removed while that pass ran included; one it did hold (a build kept it) does not, and the next
-/// pass's listing is the new mark. NEGATIVE CONTROLS: a relief that watches no listing, or whose
-/// last call was short of no disk (memory alone), is never renewed, so no look relieves again.
-#[test]
-fn a_workspace_removed_while_a_run_waits_renews_its_relief() {
-    use aterm_capacity::Relief as _;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    type Shared<T> = Rc<RefCell<T>>;
-    let reclaim = |during: Shared<Option<PathBuf>>, listed: Shared<Vec<PathBuf>>| {
-        Reclaim::of(
-            Box::new(move |_room: super::Room<'_>, _stopped| {
-                if let Some(leaf) = during.borrow_mut().take() {
-                    listed.borrow_mut().push(leaf);
-                }
-                (0, Vec::new(), Vec::new())
-            }),
-            Box::new(|_, _, _| None),
-            Box::new(|_, _| Vec::new()),
-        )
-    };
-    let listed: Shared<Vec<PathBuf>> =
-        Rc::new(RefCell::new(vec![PathBuf::from("/c/held/.cargo-build")]));
-    let removing: Shared<Option<PathBuf>> = Rc::default();
-    let theirs = Rc::clone(&listed);
-    let mut relief = reclaim(Rc::clone(&removing), Rc::clone(&listed))
-        .watching(Box::new(move || theirs.borrow().iter().cloned().collect()));
-    let short = aterm_capacity::Shortfall {
-        shorts: vec![aterm_capacity::Short::Disk {
-            need: 20 * GIB,
-            mount: PathBuf::from("/Volumes/scratch"),
-            above_floor: 12 * GIB,
-            floor: 10 * GIB,
-            reserved: 0,
-            held: Vec::new(),
-        }],
-        holders: Vec::new(),
-    };
-    relief.relieve(&short, &mut |_| {}, &|| false);
-    assert!(!relief.renewed(&|| false), "what its pass left is no news");
-    listed
-        .borrow_mut()
-        .push(PathBuf::from("/c/removed/.cargo-build"));
-    assert!(
-        relief.renewed(&|| false),
-        "a workspace removed since renews it"
-    );
-    assert!(!relief.renewed(&|| true), "nor once its wait is stopped");
-    relief.relieve(&short, &mut |_| {}, &|| false);
-    assert!(!relief.renewed(&|| false), "the new pass is the new mark");
-    *removing.borrow_mut() = Some(PathBuf::from("/c/mid-pass/.cargo-build"));
-    relief.relieve(&short, &mut |_| {}, &|| false);
-    assert!(
-        relief.renewed(&|| false),
-        "a workspace removed while the pass ran renews the next look"
-    );
-
-    let memory = aterm_capacity::Shortfall {
-        shorts: vec![aterm_capacity::Short::Memory {
-            need: 8 * GIB,
-            margin: 0,
-            available: GIB,
-            reserved: 0,
-            passes: None,
-            stuck_ahead: 0,
-            stuck: false,
-        }],
-        holders: Vec::new(),
-    };
-    relief.relieve(&memory, &mut |_| {}, &|| false);
-    assert!(
-        !relief.renewed(&|| false),
-        "short of memory alone: never renewed"
-    );
-
-    let mut blind = reclaim(Rc::default(), Rc::default());
-    blind.relieve(&short, &mut |_| {}, &|| false);
-    assert!(!blind.renewed(&|| false), "watching nothing, never renewed");
-}
-
 /// Set, the test binary is [`standin_claims_disk_until_interrupted`], its ledger and run under
 /// this directory.
 #[cfg(unix)]
 const STANDIN: &str = "ATPKG_ADMIT_DISK_STANDIN";
-/// Set, the stand-in's relief asks the window's watch and the ask lasts until the wait is
-/// stopped, as `aterm ctl await sys` lasts up to a minute; else the ask answers at once and the
-/// stand-in is signalled in its wait.
-#[cfg(unix)]
-const STANDIN_ASK: &str = "ATPKG_ADMIT_DISK_STANDIN_ASK";
 /// Set, the interrupt comes while the stand-in's directories are measured, before its first
 /// look, for a run that would claim nothing (no record, no cold budget): it sends itself SIGTERM
 /// under a watch of its own, as a caller's wait would hold one, so the signal is noted before
@@ -999,10 +912,10 @@ extern "C" fn tool_handler(sig: libc::c_int) {
 /// Run by [`an_interrupt_ends_a_disk_claim_and_its_relief`] in a process of its own: catches
 /// SIGINT and SIGTERM in a handler of its own, as `ship trust run` and the lab do, then claims a
 /// first verify run's 27 GiB on a volume 36 GiB above its floor beside a held 10 GiB claim (it
-/// fits the room but not beside that claim, so it waits), looking every two minutes
-/// (twice the test's hang detector, so only a nap the interrupt ends ends in time), writing
-/// `waiting` once its wait (or its relief's ask) is under way, and exits 3, a tool's NOT RUN,
-/// naming the signal and what it was short of.
+/// fits the room but not beside that claim, so its relief runs), its relief's ask of the
+/// window's watch lasting until the claim is stopped, as `aterm ctl await sys` lasts up to a
+/// minute, writing `waiting` once that ask is under way, and exits 3, a tool's NOT RUN, naming
+/// the signal and what it was short of.
 #[cfg(unix)]
 #[test]
 fn standin_claims_disk_until_interrupted() {
@@ -1031,19 +944,15 @@ fn standin_claims_disk_until_interrupted() {
     let ledger = Ledger::at(dir.join("ledger"));
     let machine = Fixed::new(image(40, 40));
     let held = held_beside(&ledger, &machine, 10);
-    let waiting = dir.join("waiting");
-    let ask_lasts = std::env::var_os(STANDIN_ASK).is_some();
-    let asking = waiting.clone();
+    let asking = dir.join("waiting");
     let mut relief = Reclaim::of(
         Box::new(|_, _| (0, Vec::new(), Vec::new())),
         Box::new(move |_, _, stopped| {
-            if ask_lasts {
-                std::fs::write(&asking, "asking").expect("said asking");
-                let started = std::time::Instant::now();
-                while !stopped() {
-                    assert!(started.elapsed() < MUST_HAPPEN, "the ask was never stopped");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+            std::fs::write(&asking, "asking").expect("said asking");
+            let started = std::time::Instant::now();
+            while !stopped() {
+                assert!(started.elapsed() < MUST_HAPPEN, "the ask was never stopped");
+                std::thread::sleep(Duration::from_millis(10));
             }
             None
         }),
@@ -1059,11 +968,7 @@ fn standin_claims_disk_until_interrupted() {
             ..Pace::default()
         },
         &mut relief,
-        &mut |line| {
-            if line.contains(" waits ") {
-                std::fs::write(&waiting, line).expect("said waiting");
-            }
-        },
+        &mut |_| {},
     );
     drop(outer);
     drop(held);
@@ -1100,26 +1005,21 @@ impl Drop for Standin {
     }
 }
 
-/// A disk claim held up by what a claim ahead holds on its volume ends on SIGTERM, or SIGINT, as
-/// NOT RUN well inside
-/// the one-minute hang detector (the time is reported), whether the signal comes while it waits
-/// (its next look two minutes off) or while its relief asks the window's watch, which would
-/// last a minute; it names the signal and the need, and leaves nothing in the ledger. Negative
-/// control: with the wait unwatched (the claim before WAIT-INTERRUPT), the stand-in's own
-/// handler takes the signal and the claim waits on, and this test runs to its detector.
+/// A disk claim short of what a claim ahead holds on its volume ends on SIGTERM, or SIGINT, as
+/// NOT RUN well inside the one-minute hang detector (the time is reported), when the signal
+/// comes while its relief asks the window's watch, which would last a minute; it names the
+/// signal and the need, and leaves nothing in the ledger. Negative control: with the claim
+/// unwatched (the claim before WAIT-INTERRUPT), the stand-in's own handler takes the signal and
+/// the ask is never stopped, so the stand-in fails instead of exiting 3.
 #[cfg(unix)]
 #[test]
 fn an_interrupt_ends_a_disk_claim_and_its_relief() {
-    for (ask, sig, word) in [
-        (false, libc::SIGTERM, "SIGTERM"),
-        (true, libc::SIGTERM, "SIGTERM"),
-        (false, libc::SIGINT, "SIGINT"),
-    ] {
+    for (sig, word) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGINT, "SIGINT")] {
         let dir = aterm_tempfile::Builder::new()
             .prefix("admit-disk-int-")
             .tempdir()
             .expect("scratch");
-        let mut child = standin(dir.path(), if ask { &[STANDIN_ASK] } else { &[] });
+        let mut child = standin(dir.path(), &[]);
         let said = aterm_spec::wait::until_within(MUST_HAPPEN, "the stand-in's wait", || {
             std::fs::read_to_string(dir.path().join("waiting")).ok()
         });
@@ -1135,7 +1035,7 @@ fn an_interrupt_ends_a_disk_claim_and_its_relief() {
         if let Some(mut o) = child.0.stdout.take() {
             let _ = std::io::Read::read_to_string(&mut o, &mut out);
         }
-        let what = format!("{word} {}", if ask { "in the ask" } else { "in the wait" });
+        let what = format!("{word} in the ask");
         assert_eq!(
             status.code(),
             Some(3),
@@ -1211,6 +1111,97 @@ fn an_interrupt_while_the_run_is_measured_ends_its_claim() {
     names(&out, &["stopped by SIGTERM: ", "before its first look"]);
     let left = left_in(dir.path());
     assert!(left.is_empty(), "left {left:?}");
+}
+
+/// Set, the test binary is [`standin_never_answers`], writing under this directory.
+#[cfg(unix)]
+const SILENT: &str = "ATPKG_ADMIT_DISK_SILENT";
+
+/// Run by [`an_unanswered_ask_ends_at_its_deadline_with_its_child_reaped`] in a process of its
+/// own: an ask of a window that never answers (an older `aterm`, a hung one). It writes `asked`,
+/// then says nothing until a `die` file appears beside it, or the hang detector passes, and only
+/// then exits.
+#[cfg(unix)]
+#[test]
+fn standin_never_answers() {
+    let Some(dir) = std::env::var_os(SILENT).map(PathBuf::from) else {
+        return;
+    };
+    std::fs::write(dir.join("asked"), "asked").expect("said asked");
+    let started = std::time::Instant::now();
+    while !dir.join("die").exists() && started.elapsed() < MUST_HAPPEN {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Start [`standin_never_answers`] on `dir`, its stdout and stderr piped as an ask's are.
+#[cfg(unix)]
+fn silent(dir: &Path) -> Standin {
+    Standin(
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "admit_disk::tests::standin_never_answers",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(SILENT, dir)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .expect("the stand-in"),
+    )
+}
+
+/// AN ASK THE WINDOW NEVER ANSWERS ENDS AT ITS DEADLINE, ITS CHILD KILLED AND REAPED: the
+/// emergency hold lets its build start once its bound passes, so an ask left running would sit
+/// beside that build until its window answered, if ever. Here the ask is a stand-in that says
+/// nothing until told to die (or the hang detector passes); under a deadline 200 ms off,
+/// [`super::answer_of`] returns `None` well inside the hang detector (the time is reported) and
+/// the child is reaped when it returns. A `stopped` that says so ends it the same way.
+/// NEGATIVE CONTROL: the same stand-in told to die before it is asked, under a deadline a hang
+/// detector off, exits by itself and is answered (`Some`), reaped by the wait that read it.
+#[cfg(unix)]
+#[test]
+fn an_unanswered_ask_ends_at_its_deadline_with_its_child_reaped() {
+    for (what, deadline, stopped) in [
+        ("its deadline", Duration::from_millis(200), false),
+        ("its stop", MUST_HAPPEN * 2, true),
+    ] {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("admit-disk-silent-")
+            .tempdir()
+            .expect("scratch");
+        let mut child = silent(dir.path());
+        aterm_spec::wait::until_within(MUST_HAPPEN, "the ask under way", || {
+            dir.path().join("asked").exists().then_some(())
+        });
+        let started = std::time::Instant::now();
+        let got = super::answer_of(&mut child.0, started + deadline, &|| stopped);
+        let took = started.elapsed();
+        assert!(took < MUST_HAPPEN, "the ask outlasted {what}: {took:?}");
+        assert_eq!(got, None, "an ask ended by {what} gives no answer");
+        assert!(
+            child.0.is_reaped(),
+            "the ask ended by {what} left its child"
+        );
+        eprintln!("an unanswered ask ended at {what} in {took:?}");
+    }
+
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("admit-disk-silent-")
+        .tempdir()
+        .expect("scratch");
+    std::fs::write(dir.path().join("die"), "").expect("told to die");
+    let mut child = silent(dir.path());
+    let got = super::answer_of(
+        &mut child.0,
+        std::time::Instant::now() + MUST_HAPPEN * 2,
+        &|| false,
+    );
+    assert!(got.is_some(), "a stand-in that exits is answered");
+    assert!(child.0.is_reaped(), "the answered ask's child is reaped");
 }
 
 /// The build cache's pass runs on a thread of its own, so an interrupt ends the relief while a
@@ -1504,94 +1495,6 @@ fn a_runs_directories_are_tagged_by_what_they_are() {
         bytes.push(0);
     }
     assert_eq!(tag, aterm_hash::fnv1a_64(&bytes), "the stable digest");
-}
-
-/// A RUN THAT ASKS TO GIVE UP BEHIND A HOLDER THAT MAKES NO PROGRESS DOES (CW-WAIT-UNBOUNDED):
-/// on a volume another claim holds, its holder idle as the machine reads it, a run whose
-/// [`Run::stuck_ends`] is short gives up within the hang detector, naming the holder, and leaves
-/// the queue with the holder's claim still held. NEGATIVE CONTROL: the same run asking nothing
-/// waits on past three of those bounds, and is admitted once the holder lets go.
-#[test]
-fn a_run_that_asks_to_give_up_behind_a_stuck_holder_does() {
-    use aterm_capacity::{Need, Proc, Procs};
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("admit-disk-stuck-")
-        .tempdir()
-        .expect("scratch");
-    let ledger = Ledger::at(dir.path().join("ledger"));
-    let me = std::process::id();
-    let m = Arc::new(Fixed::new(image(40, 36)));
-    m.set_procs(Some(Procs::of(vec![Proc {
-        pid: me,
-        ppid: 1,
-        cpu_ns: 5,
-        ..Proc::default()
-    }])));
-    let held = aterm_capacity::admit_with(
-        &ledger,
-        &*m,
-        Need::new("lab windows boot").disk(30 * GIB, "/Volumes/scratch"),
-        Admit::Wait,
-        Pace::default(),
-        &mut |_| {},
-    )
-    .expect("the holder's claim");
-    let bound = Duration::from_millis(200);
-    let wait = |stuck_ends: Option<Duration>| {
-        let (ledger, m) = (ledger.clone(), Arc::clone(&m));
-        let run = Run {
-            stuck_ends,
-            ..verify_run(dir.path())
-        };
-        std::thread::spawn(move || {
-            let mut nothing = Reclaim::of(
-                Box::new(|_, _| (0, Vec::new(), Vec::new())),
-                Box::new(|_, _, _| None),
-                Box::new(|_, _| Vec::new()),
-            );
-            admit_on(
-                run,
-                &ledger,
-                &*m,
-                Admit::Wait,
-                Pace {
-                    poll: Duration::from_millis(5),
-                    line_every: Duration::from_secs(60),
-                },
-                &mut nothing,
-                &mut |_| {},
-            )
-        })
-    };
-    match joined(wait(Some(bound)), "the stuck wait's end") {
-        Err(e @ super::Error::Stuck { .. }) => names(
-            &e.to_string(),
-            &[
-                "gave up its wait",
-                &format!("pid {me} holds 30 GiB of disk"),
-                "which has made no progress for",
-            ],
-        ),
-        other => panic!("expected the wait to end behind the stuck holder, got {other:?}"),
-    }
-    let listed: Vec<String> = ledger
-        .list()
-        .expect("listed")
-        .into_iter()
-        .map(|r| r.need.what)
-        .collect();
-    assert_eq!(listed, ["lab windows boot"], "it left the queue");
-    let waiting = wait(None);
-    // Three bounds of the condition under test, not a wait for anything.
-    std::thread::sleep(bound * 3);
-    assert!(
-        !waiting.is_finished(),
-        "a run that asked nothing gave up: {:?}",
-        joined(waiting, "its end")
-    );
-    drop(held);
-    let admitted = joined(waiting, "the admission once the holder lets go").expect("admitted");
-    let _ = admitted.finish();
 }
 
 /// The machine's record, under `dir`, of [`verify_run`]'s kind, and what such a run builds.
@@ -1915,15 +1818,16 @@ fn a_sized_claim_is_held_unwalked_and_keeps_nothing() {
     assert!(ledger.list().expect("listed").is_empty());
 }
 
-/// A SIZED CLAIM ON A SHORT VOLUME IS RELIEVED, THEN WAITS, saying first what it claims: within
-/// the room but short of what a held claim reserves, the pass is asked for the short volume, and
-/// once room comes the claim is admitted, having waited. Beyond the room once relieved, it is
-/// refused at once (UNMET), naming how much to free, and leaves the ledger; the release has no
-/// way to start at once, so it is offered none.
+/// A SIZED CLAIM ON A SHORT VOLUME IS RELIEVED, THEN STARTS, saying first what it claims: 39 GiB,
+/// short of the 36 GiB a held 10 GiB claim leaves of the 46 above the floor, the pass is asked
+/// for the short volume once and frees 4 GiB, and the claim is admitted at the next look, within
+/// the room that claim leaves, with no wait line. Beyond the room once relieved, it is refused
+/// at once (UNMET), saying it ends now rather than wait for disk and naming no space to free by
+/// hand, and leaves the ledger; the release has no way to start at once, so it is offered none.
 /// NEGATIVE CONTROL: the claim admitted at once
 /// ([`a_sized_claim_is_held_unwalked_and_keeps_nothing`]) asks no relief.
 #[test]
-fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
+fn a_sized_claim_on_a_short_volume_is_relieved_then_starts() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("admit-sized-short-")
         .tempdir()
@@ -1936,13 +1840,18 @@ fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
         (Arc::clone(&m), Arc::clone(&passes), ledger.clone());
     let run = release_claim(dir.path(), 39 * GIB);
     let (tx, rx) = mpsc::channel::<String>();
-    let waiting = std::thread::spawn(move || {
-        let freed = Arc::clone(&theirs);
+    let starting = std::thread::spawn(move || {
+        let (freed, pass_m) = (Arc::clone(&theirs), Arc::clone(&theirs));
         let mut relief = Reclaim::of(
             Box::new(move |room: super::Room<'_>, _stopped| {
                 assert_eq!(room.mount, Path::new("/Volumes/scratch"));
                 *their_passes.lock().expect("passes") += 1;
-                (0, Vec::new(), Vec::new())
+                pass_m.set(image(100, 54));
+                (
+                    4 * GIB,
+                    vec![PathBuf::from("/Volumes/scratch/gone/.cargo-build")],
+                    Vec::new(),
+                )
             }),
             Box::new(|_, _, _| None),
             Box::new(|_, _| Vec::new()),
@@ -1961,19 +1870,17 @@ fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
                 let _ = tx.send(l.to_owned());
             },
         );
-        held.map(|h| h.waited)
+        held.map(drop)
     });
     let first = rx.recv_timeout(MUST_HAPPEN).expect("its first line");
     names(&first, &[&size(39 * GIB), "release 0.156.0"]);
-    aterm_spec::wait::until_within(MUST_HAPPEN, "the claim to wait", || {
-        let listed = ledger.list().ok()?;
-        let release = listed.iter().find(|r| r.need.what == "release 0.156.0")?;
-        release.held.is_none().then_some(())
-    });
-    m.set(image(100, 80));
-    let waited = joined(waiting, "the sized claim to be admitted").expect("admitted");
-    assert!(waited > Duration::ZERO);
+    joined(starting, "the sized claim to be admitted").expect("admitted");
     assert_eq!(*passes.lock().expect("passes"), 1, "relieved once");
+    let after: Vec<String> = rx.try_iter().collect();
+    assert!(
+        after.iter().all(|l| !l.contains(" waits (")),
+        "no wait line: {after:?}"
+    );
     drop(ahead);
 
     let short = Fixed::new(image(100, 30));
@@ -1991,13 +1898,19 @@ fn a_sized_claim_on_a_short_volume_is_relieved_then_waits() {
         &mut |l| said.push(l.to_owned()),
     );
     match refused {
-        Err(e @ aterm_capacity::Error::Unmet { .. }) => names(
-            &e.to_string(),
-            &[
-                "release 0.156.0",
-                "Free at least 13 GiB on /Volumes/scratch",
-            ],
-        ),
+        Err(e @ aterm_capacity::Error::Unmet { .. }) => {
+            let refused = e.to_string();
+            names(
+                &refused,
+                &[
+                    "release 0.156.0",
+                    "disk short by 13 GiB",
+                    "/Volumes/scratch",
+                    "ends now rather than wait for disk",
+                ],
+            );
+            assert!(!hand(&refused), "{refused}");
+        }
         other => panic!("refused as unmet, got {other:?}"),
     }
     names(&said[0], &[&size(39 * GIB), "release 0.156.0"]);

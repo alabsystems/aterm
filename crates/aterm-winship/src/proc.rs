@@ -6,9 +6,9 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::{Child, Command};
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 
 /// What a finished child said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +80,54 @@ pub fn run<S: AsRef<OsStr>>(
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     })
+}
+
+/// How long ending a job may take before it is left to its handle's close.
+const END_HANG: Duration = Duration::from_secs(60);
+
+/// Runs `program args…` with both streams written to `file` (made anew) as
+/// they come, in a kill-on-close job, at most `within`. `Ok(Some(code))`: it
+/// exited (`-1` when it ended without a code). `Ok(None)`: it ran past
+/// `within`, and it and everything it started were ended through the job.
+///
+/// # Errors
+/// `file` could not be made, the child did not start, or it could not be waited on
+/// (it is then ended through the job).
+pub fn run_to_file<S: AsRef<OsStr>>(
+    program: &Path,
+    args: &[S],
+    file: &Path,
+    within: Duration,
+) -> Result<Option<i32>, String> {
+    let named = |e: std::io::Error| format!("{}: {e}", program.display());
+    let sink = std::fs::File::create(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let errors = sink
+        .try_clone()
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut cmd = command(program, args, Place::default());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(sink))
+        .stderr(Stdio::from(errors));
+    let (mut child, job) = Job::start(&mut cmd).map_err(named)?;
+    let by = Instant::now() + within;
+    let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status.code().unwrap_or(-1))),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = job.end(END_HANG);
+                return Err(named(e));
+            }
+        }
+        let now = Instant::now();
+        if now >= by {
+            let _ = job.end(END_HANG);
+            let _ = child.try_wait();
+            return Ok(None);
+        }
+        exit.wait(by - now);
+    }
 }
 
 /// A kill-on-close job object and the child that was born in it. The smoke

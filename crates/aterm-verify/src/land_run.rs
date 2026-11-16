@@ -472,7 +472,7 @@ fn read_body(filed: &Filed, bytes: &[u8]) -> Result<Read, String> {
             filed.day
         ));
     }
-    let commit = |id: &str| id.is_empty() || aterm_types::land_trailer::object_id(id);
+    let commit = |id: &str| id.is_empty() || aterm_land_trailer::object_id(id);
     let mut commits = vec![record.head.as_str(), record.base.as_str()];
     if let Some(cause) = &record.cause {
         commits.push(&cause.tip);

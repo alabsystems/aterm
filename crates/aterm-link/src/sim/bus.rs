@@ -847,6 +847,11 @@ pub(crate) enum ArmMutant {
     NeverMints,
     /// Another log is minted a fresh id but keeps the generation and lineage it had.
     MintKeepsGeneration,
+    /// A log whose identity sidecar no longer reads keeps its id ([`Broker::lose_identity`]).
+    RemintKeepsTheId,
+    /// A log whose identity sidecar no longer reads is minted a fresh id holding no record, as
+    /// a log set aside is ([`Broker::lose_identity`]).
+    RemintForgetsTheRecords,
     /// A failed full flush is consumed but succeeds: nothing is poisoned ([`State::full_flush`]).
     NeverPoisons,
     /// The reopen of a run whose full flush failed keeps its identity, as a clean one does.
@@ -966,6 +971,8 @@ pub(crate) enum Event {
     /// The stopped log was set aside, as `aterm link broker --retire-log` does
     /// ([`Broker::retire_log`]).
     RetireLog,
+    /// The stopped log's identity sidecar no longer reads ([`Broker::lose_identity`]).
+    LoseIdentity,
 }
 
 /// The simulated broker every connection of a world reaches.
@@ -996,6 +1003,10 @@ pub(crate) struct Restart {
     /// The log was set aside while down ([`Broker::retire_log`]): what it held is not lost but
     /// moved away, and the next open starts another log.
     pub(crate) retired: bool,
+    /// The log's identity sidecar no longer read at the open ([`Broker::lose_identity`]):
+    /// another log that KEPT every record, under a fresh id, as astream settles
+    /// `Prior::Unreadable` ("every client re-reads it from scratch").
+    pub(crate) reminted: bool,
     /// Where the poison held a record out of sight ([`Poison::held_from`]): never acked, so a
     /// power loss may cut it whatever it escalated (P3e).
     pub(crate) held_from: Option<u64>,
@@ -1462,6 +1473,52 @@ impl Broker {
             another_log: true,
             lossy: false,
             retired: true,
+            reminted: false,
+            held_from: None,
+        })
+    }
+
+    /// THE STOPPED LOG'S IDENTITY SIDECAR NO LONGER READS (rot, or the format of a build that
+    /// wrote it this one cannot read): astream's `logid::settle` takes `Prior::Unreadable`'s arm
+    /// at the next open of a log that holds records and mints a fresh id at generation 0 with no
+    /// lineage, KEEPING EVERY RECORD ([`State::mint`]): its offsets, its dedup keys, its group
+    /// commits, its wills and its held store all stand, and its `Hello` names a lineage, as an
+    /// empty log's does. A log that holds none settles another log at any open anyway. On a broker
+    /// that is up, nothing: the sidecar is read at an open.
+    pub(crate) fn lose_identity(&self) -> Option<Restart> {
+        let mut s = lock(&self.state);
+        if s.up {
+            return None;
+        }
+        s.note_event(|| Event::LoseIdentity);
+        let before = s.log.clone();
+        let generation_before = s.generation;
+        if s.mutant == ArmMutant::RemintForgetsTheRecords {
+            s.log.clear();
+            s.durable = 0;
+            s.rebuild();
+        }
+        // An empty log's stop minted already (`stop_choosing`).
+        if !before.is_empty() && s.mutant != ArmMutant::RemintKeepsTheId {
+            s.mint();
+        }
+        let kept = s.log.len() as u64;
+        s.notes.push(format!(
+            "broker identity unreadable: {kept} records kept, another log"
+        ));
+        Some(Restart {
+            stop: Stop::Clean,
+            tier: s.tier,
+            before,
+            durable_before: s.durable,
+            kept,
+            generation_before,
+            generation_after: s.generation,
+            lineage_after: s.lineage.clone(),
+            another_log: true,
+            lossy: false,
+            retired: false,
+            reminted: true,
             held_from: None,
         })
     }
@@ -1596,6 +1653,7 @@ impl Broker {
             another_log: another,
             lossy,
             retired: false,
+            reminted: false,
             held_from,
         }
     }
@@ -3005,9 +3063,11 @@ impl State {
                     astream_broker::Lineage::from_steps(&self.lineage)
                 },
                 // astream's whole set, as its `Hello` says it: the broker times, the stats, the burst
-                // marks and the relay are asked for by no bridge, and answered here as not simulated.
+                // marks, the relay and the fresh publish are asked for by no bridge, and answered
+                // here as not simulated.
                 requests: Some(
                     astream_broker::REQUEST_RETIRE
+                        | astream_broker::REQUEST_FRESH_PUBLISH
                         | astream_broker::REQUEST_GAP_NOTICES
                         | astream_broker::REQUEST_TOLD_FETCH
                         | astream_broker::REQUEST_BROKER_TIMES
@@ -4004,9 +4064,11 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
     let moved = r.another_log || r.generation_after != r.generation_before;
     // Another log continues nothing a reader kept, so no lineage is owed; it is astream's
     // answer to an open that finds no record, since a reader that forgets its offsets would
-    // take each kept record again (P7); and its id is fresh, at generation 0 with no lineage.
+    // take each kept record again (P7), and to an open that cannot read the identity it had
+    // (`Prior::Unreadable`), which keeps every record and tells every reader to read it from
+    // scratch; and its id is fresh, at generation 0 with no lineage.
     if r.another_log {
-        if r.kept > 0 {
+        if r.kept > 0 && !r.reminted {
             bad.push(format!(
                 "P7: another log, {} records kept a reader would take again",
                 r.kept
@@ -4037,7 +4099,7 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
                     r.kept
                 ));
             }
-            if moved && !r.lossy && !r.retired && !(r.another_log && head == 0) {
+            if moved && !r.lossy && !r.retired && !r.reminted && !(r.another_log && head == 0) {
                 bad.push(format!("P5/P6: a {:?} moved the identity", r.stop));
             }
         }

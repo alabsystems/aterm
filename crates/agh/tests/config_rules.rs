@@ -275,7 +275,7 @@ fn a_long_name_is_carried_whole() {
     );
     let profile = "fixtureprofilewithalongname";
     assert_one(
-        &format!("[profiles.{profile}]\ntoken_file = \"/x.token\"\ntier = \"prod\"\n"),
+        &format!("[profiles.{profile}]\ntoken_file = \"{{root}}/x.token\"\ntier = \"prod\"\n"),
         "L1",
         &[profile],
     );

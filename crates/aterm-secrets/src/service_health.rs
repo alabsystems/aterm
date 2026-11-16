@@ -17,6 +17,10 @@ fn challenge(paths: &Paths) -> PathBuf {
 fn response(paths: &Paths) -> PathBuf {
     paths.dir.join("service-health-response.json")
 }
+/// The challenge a repair writes for a bound server ([`prepare_server`], [`bound_server`]).
+pub(crate) fn server_challenge(paths: &Paths) -> PathBuf {
+    paths.dir.join("server-health-challenge")
+}
 fn hex(bytes: &[u8]) -> String {
     aterm_codec::hex::encode_lower(bytes)
 }
@@ -223,18 +227,13 @@ pub fn prepare_server(paths: &Paths) -> Result<String> {
     let mut bytes = [0; 32];
     aterm_uds::rand::fill(&mut bytes).map_err(|e| Error::new(e.to_string()))?;
     let nonce = hex(&bytes);
-    crate::fsx::write_atomic(
-        &paths.dir.join("server-health-challenge"),
-        nonce.as_bytes(),
-        0o600,
-    )?;
+    crate::fsx::write_atomic(&server_challenge(paths), nonce.as_bytes(), 0o600)?;
     Ok(nonce)
 }
 
 /// Written only by a bound server's supervisor, never by a process waiting to bind.
 pub(crate) fn bound_server(paths: &Paths, address: std::net::SocketAddr) -> Result<()> {
-    let Some(nonce) = crate::fsx::read_private(&paths.dir.join("server-health-challenge"), 128)?
-    else {
+    let Some(nonce) = crate::fsx::read_private(&server_challenge(paths), 128)? else {
         return Ok(());
     };
     if already_answered(

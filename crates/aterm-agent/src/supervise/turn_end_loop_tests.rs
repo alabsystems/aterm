@@ -10775,6 +10775,7 @@ fn the_wall_cache_is_dropped_when_the_worker_has_worked() {
         inputs_before: None,
         inputs_after: None,
         title: None,
+        program_report: None,
     };
     let wall = of(memory_wall_in("3h"));
     let r = s.turn_end_reading(&wall, None, &opts);
@@ -11900,6 +11901,7 @@ fn read_screen(rows: Vec<String>) -> Screen {
         inputs_before: None,
         inputs_after: None,
         title: None,
+        program_report: None,
     }
 }
 
@@ -12970,6 +12972,17 @@ const CANARY_LOOK_GAP: Duration = Duration::from_secs(3600);
 /// `gaps` is the time before one look. The stall canary reads background work alone, the dialog
 /// one a screen no reader names, its first sight starting the clock. Both rest on the title.
 fn canary_looks(dialog: bool, gaps: &[Duration], world: impl FnOnce(&mut Mock)) -> CanaryLooks {
+    canary_looks_reported(dialog, gaps, None, world)
+}
+
+/// [`canary_looks`], each screen read with `report` standing (`text --json`'s
+/// `"program_report"`).
+fn canary_looks_reported(
+    dialog: bool,
+    gaps: &[Duration],
+    report: Option<&str>,
+    world: impl FnOnce(&mut Mock),
+) -> CanaryLooks {
     use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
     let host = Arc::new(LadderHost::default());
     let mut m = Mock::new(vec![busy_screen()]);
@@ -12982,10 +12995,14 @@ fn canary_looks(dialog: bool, gaps: &[Duration], world: impl FnOnce(&mut Mock)) 
     )))));
     s.setup.stuck_after = Duration::from_secs(180);
     s.stall_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
-    let background = read_screen(memory_scrolled());
-    let unread = read_screen(crate::supervise::prompt::fixtures::screen(
+    let reported = |mut screen: Screen| {
+        screen.program_report = report.map(str::to_string);
+        screen
+    };
+    let background = reported(read_screen(memory_scrolled()));
+    let unread = reported(read_screen(crate::supervise::prompt::fixtures::screen(
         crate::supervise::prompt::fixtures::AUTO_CLASSIFIER_BILLING_NOTICE_MEASURED,
-    ));
+    )));
     let since = s.fx.mono();
     let mut heard = Heard::default();
     if dialog {
@@ -13065,6 +13082,48 @@ fn the_canary_climbs_on_the_agents_own_title_under_a_renamed_tab() {
         assert_eq!(moved.rungs, [Said, Told, Quiet, Quiet], "{why}");
         assert_eq!(moved.told, ["unread:some", "unread:none"], "{why}");
         assert_eq!(moved.said, ["STUCK", "STALLED"], "{why}");
+    }
+}
+
+/// WITH ITS QUERY ANSWERED, CLAUDE CODE'S REPORT IS THE CANARY'S RUN SIGN: its title then carries
+/// no glyph, so it never rests on `✳`. A report at rest standing with the rows climbs the ladder
+/// with no `title` look, and a `working` one ends it. CONTROL: the same glyphless title with no
+/// report reads as a title that moves, and the canary never climbs.
+#[test]
+fn the_canary_rests_on_claude_codes_report_under_a_glyphless_title() {
+    use super::super::wall_memory::StuckRung::{Quiet, Raised, Said, Told};
+    let hourly = [CANARY_LOOK_GAP; 4];
+    let glyphless = |m: &mut Mock| m.title = Some("Claude Code".to_string());
+    for dialog in [false, true] {
+        let raised = canary_raised(dialog);
+        for rest in [
+            "state=idle:app=claude-code",
+            "state=done:app=claude-code",
+            "state=error:app=claude-code",
+        ] {
+            let looks = canary_looks_reported(dialog, &hourly, Some(rest), glyphless);
+            let why = format!("dialog={dialog}, {rest}");
+            assert_eq!(looks.rungs, [Said, Told, Raised, Raised], "{why}");
+            assert_eq!(looks.told, ["unread:some", raised], "{why}");
+            assert_eq!(looks.said, ["STUCK", "STALLED", "EXCEPTION"], "{why}");
+            assert_eq!(looks.titles, 0, "{why}: the report says, no `title` look");
+        }
+        let works = canary_looks_reported(
+            dialog,
+            &hourly,
+            Some("state=working:app=claude-code"),
+            glyphless,
+        );
+        assert_eq!(works.rungs, [Quiet; 4], "dialog={dialog}: a working report");
+        assert!(works.said.is_empty(), "dialog={dialog}: {:?}", works.said);
+        assert_eq!(works.titles, 0, "dialog={dialog}");
+        let control = canary_looks(dialog, &hourly, glyphless);
+        assert_eq!(control.rungs, [Quiet; 4], "CONTROL dialog={dialog}");
+        assert!(control.said.is_empty(), "CONTROL dialog={dialog}");
+        assert!(
+            control.titles > 0,
+            "CONTROL dialog={dialog}: the title is looked at"
+        );
     }
 }
 
@@ -34023,7 +34082,10 @@ fn fold_point_asks_host_agent_resumed_so_an_external_resume_banner_stays_in_sess
 /// seeds from the ledger reads it as left after work, as this one took it. NEGATIVE CONTROL: the
 /// ledger without that row still says the session's opening message was left, and the seeding
 /// reader keeps it the person's. CONTROL: a read naming a fresh program takes nothing back and
-/// writes no second row.
+/// writes no second row. THE EXCHANGE ENDED FIRST: where the exchange ended (a switch to Cruise
+/// takes it) before the read answered, the row is corrected all the same, so a loop that seeds
+/// from the ledger does not park on an opening message this loop has moved past. NEGATIVE CONTROL:
+/// the correction gated on the exchange still in hand left that row saying it opened the session.
 #[test]
 fn a_left_row_written_with_the_read_out_is_corrected_when_the_resume_takes_it_back() {
     #[derive(Debug)]
@@ -34043,7 +34105,7 @@ fn a_left_row_written_with_the_read_out_is_corrected_when_the_resume_takes_it_ba
         }
     }
 
-    let run = |resumed: bool, tag: &str| {
+    let run = |resumed: bool, ended: bool, tag: &str| {
         let mut said = rows(&["⏺ The test still passes.", ""]);
         said.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         let mut m = Mock::new(vec![said]);
@@ -34093,6 +34155,15 @@ fn a_left_row_written_with_the_read_out_is_corrected_when_the_resume_takes_it_ba
         assert!(s.turn_end.exchange_unread(), "judged with the read out");
         assert!(s.turn_end.left_to_person(), "left to the person");
         s.ledger_left(&screen, &opts, screen.seq);
+        if ended {
+            // A switch to Cruise takes the exchange while the read is still out.
+            s.turn_end.host_agent_resumed(HostAgent::Unread);
+            let mut cruise = reading(&mut s, None);
+            cruise.autopilot = Autopilot::Cruise;
+            s.turn_end
+                .observe(&cruise, relaunch + Duration::from_secs(45));
+            assert!(!s.turn_end.left_to_person(), "the exchange ended");
+        }
         let mut after = reading(&mut s, None);
         s.fold_point(
             &mut after,
@@ -34132,37 +34203,39 @@ fn a_left_row_written_with_the_read_out_is_corrected_when_the_resume_takes_it_ba
     }
     .to_json(1, Some("@s-1"));
 
-    let body = run(true, "left-taken-back");
-    let left = left_rows(&body);
-    assert_eq!(left.len(), 2, "the row and its correction: {body}");
-    let first = reason_of(&left[0]);
-    assert!(
-        first.contains(approvals::LEFT_UNREAD) && first.ends_with(approvals::LEFT_OPENS),
-        "the row as left: {first}"
-    );
-    let last = reason_of(&left[1]);
-    assert!(
-        last.ends_with(approvals::LEFT_TAKEN_BACK) && !last.contains(approvals::LEFT_OPENS),
-        "the correction: {last}"
-    );
-    assert_eq!(
-        (field(&left[0], "command"), left[0].contains("\"box_seq\"")),
-        (field(&left[1], "command"), left[1].contains("\"box_seq\"")),
-        "the same exchange"
-    );
-    assert!(!field(&left[0], "command").is_empty(), "{body}");
-    assert!(
-        approvals::left_after_work_in(&format!("{earlier}\n{body}"), Some("@s-1")),
-        "a loop that seeds from the corrected ledger takes the exchange back: {body}"
-    );
-    // NEGATIVE CONTROL: without the correction the ledger says the opening message was left.
-    assert!(
-        !approvals::left_after_work_in(&format!("{earlier}\n{}", left[0]), Some("@s-1")),
-        "the uncorrected row reads as the session's opening message"
-    );
+    for (ended, tag) in [(false, "left-taken-back"), (true, "left-taken-back-ended")] {
+        let body = run(true, ended, tag);
+        let left = left_rows(&body);
+        assert_eq!(left.len(), 2, "the row and its correction: {body}");
+        let first = reason_of(&left[0]);
+        assert!(
+            first.contains(approvals::LEFT_UNREAD) && first.ends_with(approvals::LEFT_OPENS),
+            "the row as left: {first}"
+        );
+        let last = reason_of(&left[1]);
+        assert!(
+            last.ends_with(approvals::LEFT_TAKEN_BACK) && !last.contains(approvals::LEFT_OPENS),
+            "the correction: {last}"
+        );
+        assert_eq!(
+            (field(&left[0], "command"), left[0].contains("\"box_seq\"")),
+            (field(&left[1], "command"), left[1].contains("\"box_seq\"")),
+            "the same exchange"
+        );
+        assert!(!field(&left[0], "command").is_empty(), "{body}");
+        assert!(
+            approvals::left_after_work_in(&format!("{earlier}\n{body}"), Some("@s-1")),
+            "a loop that seeds from the corrected ledger takes the exchange back: {body}"
+        );
+        // NEGATIVE CONTROL: without the correction the ledger says the opening message was left.
+        assert!(
+            !approvals::left_after_work_in(&format!("{earlier}\n{}", left[0]), Some("@s-1")),
+            "the uncorrected row reads as the session's opening message"
+        );
+    }
 
     // CONTROL: a read naming a fresh program keeps the exchange the person's.
-    let body = run(false, "left-kept-fresh");
+    let body = run(false, false, "left-kept-fresh");
     let left = left_rows(&body);
     assert_eq!(left.len(), 1, "nothing taken back: {body}");
     assert!(

@@ -57,7 +57,7 @@ fn run(tear: Tear) -> (Facts, Facts) {
     );
     app.redraw_window(wid);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         let now = Instant::now();
         ws.fx.cursor_mut().glow.note_typed_cells(now, 1);
         ws.fx.cursor_mut().trail.note_typed(now);

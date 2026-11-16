@@ -18,7 +18,7 @@ fn rainbow_window_with_a_lit_band(t0: Instant) -> (App, WindowId, Instant) {
     app.cursor_frame(wid, seed).expect("seed cursor engines");
     let typed = t0 + Duration::from_millis(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.last_key_at = Some(typed);
         ws.fx.cursor_mut().cadence.on_keystroke(typed);
         ws.fx.cursor_mut().glow.note_typed(typed);
@@ -92,7 +92,7 @@ fn a_coordinate_space_seam_curtains_the_rainbow_ribbon_over_a_quarter_second() {
 
     let fell = Instant::now();
     crate::metrics::pin_host_clock(Some(fell));
-    retire_torn_cursor_fx(app.windows.get_mut(&wid).expect("window"));
+    retire_torn_cursor_fx(&mut app.windows.get_mut(&wid).expect("window"));
     crate::metrics::pin_host_clock(None);
     assert!(
         app.windows[&wid]
@@ -166,10 +166,10 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
     let fell = Instant::now();
     crate::metrics::pin_host_clock(Some(fell));
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
-        super::sync_cursor_effect_coordinate_space(ws, 7, false);
+        let mut ws = app.windows.get_mut(&wid).expect("window");
+        super::sync_cursor_effect_coordinate_space(&mut ws, 7, false);
         assert!(
-            super::sync_cursor_effect_coordinate_space(ws, 7, true),
+            super::sync_cursor_effect_coordinate_space(&mut ws, 7, true),
             "the alt-screen edge is a coordinate-space change"
         );
     }
@@ -203,8 +203,10 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
     );
     assert_eq!(band_peak(&app, wid), 0, "gone at the curtain's end");
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
-        assert!(super::sync_cursor_effect_coordinate_space(ws, 7, false));
+        let mut ws = app.windows.get_mut(&wid).expect("window");
+        assert!(super::sync_cursor_effect_coordinate_space(
+            &mut ws, 7, false
+        ));
     }
     tick_at(
         &mut app,
@@ -234,18 +236,18 @@ fn every_coordinate_space_seam_curtains_the_band() {
     type Seam = fn(&mut App, WindowId);
     let rows: [(&str, Seam); 3] = [
         ("a terminal switch", |app, wid| {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            super::sync_cursor_effect_coordinate_space(ws, 7, false);
+            let mut ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_coordinate_space(&mut ws, 7, false);
             assert!(
-                super::sync_cursor_effect_coordinate_space(ws, 8, false),
+                super::sync_cursor_effect_coordinate_space(&mut ws, 8, false),
                 "a different terminal is a different coordinate space"
             );
         }),
         ("a content invalidation", |app, wid| {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
+            let mut ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_scroll(&mut ws, ContentScrollState::default());
             let change = super::sync_cursor_effect_scroll(
-                ws,
+                &mut ws,
                 ContentScrollState {
                     invalidation_epoch: 9,
                     ..ContentScrollState::default()

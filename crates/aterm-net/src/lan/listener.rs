@@ -19,13 +19,17 @@ use std::{
 
 /// A socket bound to one observed LAN attachment, or explicitly to loopback.
 /// Own this value for its whole service lifetime and drop it on withdrawal.
-/// It grants no membership, table access or terminal control.
+/// It grants no membership, table access or terminal control. A LAN listener hears its route
+/// and interface changes, for a server that waits on them ([`crate::fleet::serve_lan`]); an
+/// owner that rechecks its listener on a clock of its own binds a [`RecheckedListener`].
 pub struct Listener {
     pub(crate) tcp: TcpListener,
     local: SocketAddr,
     pub(crate) scope: Scope,
     attachment: Option<Attachment>,
     withdrawn: Arc<Stop>,
+    /// The route and interface changes a server waits on ([`Listener::bind`]): none for a
+    /// loopback listener or the one a [`RecheckedListener`] holds, whose owner waits on none.
     changes: Option<native::RouteChanges>,
     /// The one more look a heard change is owed ([`Listener::drain_changes`]), until a recheck
     /// at or after it gives it.
@@ -146,10 +150,18 @@ impl Listener {
         Ok(addresses)
     }
 
-    /// Bind exactly one source address. Wildcards, tunnels and ambiguous source
-    /// attachments are refused. LAN interface binding and one-hop limits are
+    /// Bind exactly one source address for a server that waits on this listener's route and
+    /// interface changes ([`Listener::changes_fd`]), as [`crate::fleet::serve_lan`] does: a LAN
+    /// listener subscribes to them before it first observes its attachment. Wildcards, tunnels
+    /// and ambiguous source attachments are refused. LAN interface binding and one-hop limits are
     /// established before listen, including the kernel's initial SYN-ACK.
     pub fn bind(local: SocketAddr, scope: Scope) -> io::Result<Self> {
+        Self::bind_heard(local, scope, true)
+    }
+
+    /// [`Listener::bind`], a LAN listener subscribing to its route and interface changes where
+    /// `heard` says a server waits on them ([`RecheckedListener::bind`] says none does).
+    fn bind_heard(local: SocketAddr, scope: Scope, heard: bool) -> io::Result<Self> {
         crate::loopback::check(crate::loopback::Reach::Listen(local))?;
         if scope == Scope::Lan && !remote_supported(local) {
             return Err(io::Error::new(
@@ -160,8 +172,8 @@ impl Listener {
         let until = native::deadline();
         // Subscribe before the first observation so changes during bind remain queued.
         let changes = match scope {
-            Scope::Lan => Some(native::RouteChanges::open()?),
-            Scope::Loopback => None,
+            Scope::Lan if heard => Some(native::RouteChanges::open()?),
+            Scope::Lan | Scope::Loopback => None,
         };
         let attachment = match scope {
             Scope::Lan => Some(
@@ -213,7 +225,8 @@ impl Listener {
         self.withdrawn.bell()
     }
 
-    /// This LAN listener's own route/interface notification descriptor. Loopback has none.
+    /// This LAN listener's own route/interface notification descriptor. A loopback listener has
+    /// none, nor has the one a [`RecheckedListener`] holds, whose owner waits on no change.
     pub(crate) fn changes_fd(&self) -> Option<BorrowedFd<'_>> {
         self.changes.as_ref().map(native::RouteChanges::fd)
     }
@@ -251,8 +264,10 @@ impl Listener {
     /// When a server that has heard nothing more must run [`Listener::recheck`] again: the look
     /// a heard change is still owed, and where the kernel can lose a change silently the instant
     /// the attachments this listener judges by are read again ([`unheard_look`]). `None` is no
-    /// timer: a loopback listener has no attachment to lose, and a listener's withdrawal bell
-    /// and change descriptor wake its server for everything else.
+    /// timer: a loopback listener has no attachment to lose, and a listener's withdrawal bell and
+    /// change descriptor wake its server for everything else. The only LAN listener with no
+    /// change descriptor is the one a [`RecheckedListener`] holds, and nothing asks for its
+    /// deadline: its owner rechecks it on a clock of its own.
     pub(crate) fn validity_deadline(&self) -> Option<Instant> {
         let settle = *self.settle.lock().unwrap_or_else(PoisonError::into_inner);
         let unheard = self
@@ -344,6 +359,72 @@ impl Listener {
     #[cfg(any(test, debug_assertions))]
     pub fn pending_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
         crate::slots::listener_pending_within(&self.tcp, timeout)
+    }
+}
+
+/// A [`Listener`] for an owner that rechecks it on a clock of its own and waits on none of its
+/// changes, as the Commons transport rechecks each link's listener at every turn: it subscribes
+/// to no route or interface change. A routing socket nobody reads is handed every routing
+/// message on the machine, the kernel copying each, until its room fills.
+/// [`RecheckedListener::recheck`] and [`RecheckedListener::accept`] judge its attachment as a
+/// [`Listener`]'s are judged, by the attachments as this process reads them
+/// (`local_attachments`), so an attachment that moved withdraws it at its owner's next recheck.
+///
+/// It is not a [`Listener`], because a server that waits on a listener's changes
+/// ([`crate::fleet::serve_lan`]) would hear nothing from it: with no change descriptor, and off
+/// macOS no timer either (`Listener::validity_deadline`), nothing would wake that server when
+/// this listener's address went away. Such a server takes a [`Listener`] only:
+///
+/// ```compile_fail,E0308
+/// # fn serve(
+/// #     listening: &aterm_net::fleet::Listening,
+/// #     stop: &aterm_uds::stop::Stop,
+/// # ) -> std::io::Result<()> {
+/// use aterm_net::{fleet, lan::{RecheckedListener, Scope}};
+/// let listener = RecheckedListener::bind("192.0.2.1:0".parse().unwrap(), Scope::Lan)?;
+/// fleet::serve_lan(listener, listening, stop, |_, _| Ok(()), |_| {});
+/// # Ok(())
+/// # }
+/// ```
+pub struct RecheckedListener(Listener);
+impl std::os::fd::AsFd for RecheckedListener {
+    /// Borrow readiness only: [`RecheckedListener::accept`] still rechecks the attachment.
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl RecheckedListener {
+    /// [`Listener::bind`], with no subscription to the listener's route and interface changes.
+    pub fn bind(local: SocketAddr, scope: Scope) -> io::Result<Self> {
+        Listener::bind_heard(local, scope, false).map(Self)
+    }
+
+    /// The exact bound address, including the assigned ephemeral port.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+
+    /// [`Listener::recheck`]: withdraw permanently if the socket or its attachment changed. The
+    /// owner must stop service and drop this listener on error, then bind a fresh one.
+    pub fn recheck(&self) -> io::Result<()> {
+        self.0.recheck()
+    }
+
+    /// [`Listener::accept`]: one connection without blocking, the listener and the actual
+    /// connected endpoints checked before it is returned.
+    pub fn accept(&self) -> io::Result<Connection> {
+        self.0.accept()
+    }
+
+    /// [`Listener::pending_within`]: whether a connection waits in this listener's queue within
+    /// `timeout`, without accepting it (tests).
+    ///
+    /// # Errors
+    /// The wait on the socket fails.
+    #[cfg(any(test, debug_assertions))]
+    pub fn pending_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        self.0.pending_within(timeout)
     }
 }
 

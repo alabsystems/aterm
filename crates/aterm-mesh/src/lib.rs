@@ -50,7 +50,7 @@ pub mod view;
 
 pub use flow::{Pushed, current};
 pub use logs::{Mesh, MeshConfig, MeshLog, Standings};
-pub use overlay::Attached;
+pub use overlay::{Attached, Waker, Woke};
 pub use relay::{Event, Published};
 pub use stores::Stores;
 

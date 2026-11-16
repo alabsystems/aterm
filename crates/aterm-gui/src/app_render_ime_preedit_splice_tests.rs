@@ -16,7 +16,7 @@ fn fill_scratch(app: &mut App, wid: WindowId) {
         .expect("front terminal")
         .term
         .clone();
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     let mut term = term_lock(&terminal);
     term.cell_frame_into(&mut ws.input_scratch, rows, cols);
 }
@@ -31,8 +31,8 @@ fn find_field_owns_the_preedit() {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .set_query("ab".to_string());
     app.on_ime_preedit(wid, "中".to_string(), Some((0, "中".len())));
@@ -90,12 +90,12 @@ fn native_view_composition_stays_out_of_the_find_well() {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .set_query("ab".to_string());
     fill_scratch(&mut app, wid);
-    let retained_find = app.windows.get_mut(&wid).unwrap().search.take();
+    let retained_find = app.windows.get_mut(&wid).unwrap().routing.take_search();
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
     app.dispatch_native_event(
         wid,
@@ -105,7 +105,11 @@ fn native_view_composition_stays_out_of_the_find_well() {
         }),
     )
     .unwrap();
-    app.windows.get_mut(&wid).unwrap().search = retained_find;
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .routing
+        .set_search(retained_find);
     app.on_ime_preedit(wid, "中".to_string(), Some((0, "中".len())));
     assert_eq!(
         app.preedit_owner(wid),

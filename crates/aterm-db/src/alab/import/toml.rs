@@ -693,7 +693,7 @@ impl Planner<'_> {
             }
         }
         for (mb, (list, at)) in domains {
-            self.want(&MAILBOX, &mb, "receives_domains", json!(list), &at);
+            self.texts(&MAILBOX, &mb, "receives_domains", list, &at);
         }
         Ok(())
     }

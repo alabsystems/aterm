@@ -18,6 +18,7 @@ pub(super) fn install(
         package: "codex",
         vendor: "codex",
         allows: &[],
+        source: contract::Source::Seed,
     }];
     launch.current()?;
     let policy = FixturePolicy::new(
@@ -55,7 +56,7 @@ pub(super) fn run(
     if !launch.guardian_peer_current(peer) {
         return Err("retained proof guardian changed".into());
     }
-    let header = aterm_json::to_vec(&aterm_json::json!({"schema":1,"sid":sid,"hostPid":std::process::id(),"pid":process.pid,"birth":process.birth,"retained":true}))
+    let header = aterm_json::to_vec(&aterm_json::json!({"schema":1,"sid":sid,"hostPid":std::process::id(),"pid":process.pid,"birth":process.birth,"retained":true,"resources":launch.resources_frontend()}))
         .map_err(|_| "retained proof header unavailable")?;
     // SAFETY: this actual fixture retains the owning PTY for the entire call.
     // Passing IO duplicates to its authenticated guardian is not foreground evidence.
@@ -85,9 +86,12 @@ pub(super) fn run(
     }
     // The frontend actually exited. Observe the native owner and genuine SDK
     // construction, not a child-reported PID or a saved startup-state string.
-    let expected_images = launch.retained_images()?;
+    let expected_images = launch.retained_backend_images()?;
     let backends = loop {
-        match ctx.native_policy.observe_retained_backends() {
+        match ctx
+            .native_policy
+            .observe_retained_backends(launch.resources_frontend())
+        {
             Ok(backends) if backend_images_match(&backends, &expected_images, process.pid) => {
                 eprintln!(
                     "Retained qualification native: backend survives frontend=true sdk_current=true"
@@ -128,12 +132,15 @@ fn backend_images_match(
                     .iter()
                     .any(|prior| prior.pid == backend.pid)
         })
-        && images.iter().enumerate().all(|(index, image)| {
-            !images[..index].contains(image)
-                && backends
-                    .iter()
-                    .filter(|backend| &backend.image == image)
-                    .count()
-                    == 1
+        && images.iter().all(|image| {
+            backends
+                .iter()
+                .filter(|backend| &backend.image == image)
+                .count()
+                == images.iter().filter(|expected| *expected == image).count()
         })
 }
+
+#[cfg(test)]
+#[path = "native_retained_proof_fixture_tests.rs"]
+mod tests;

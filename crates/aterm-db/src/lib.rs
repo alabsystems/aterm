@@ -21,6 +21,7 @@ pub mod alab;
 pub mod att;
 #[cfg(unix)]
 pub mod catalog;
+pub(crate) mod checkpoint;
 #[cfg(unix)]
 pub mod cli;
 #[cfg(unix)]

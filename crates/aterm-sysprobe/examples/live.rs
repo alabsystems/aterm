@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--links") {
+        links_check();
+        return;
+    }
     if args.iter().any(|a| a == "--cpu-accounting") {
         cpu_accounting_check();
         return;

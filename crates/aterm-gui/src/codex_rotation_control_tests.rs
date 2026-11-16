@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[path = "codex_rotation_complete_tests.rs"]
+mod complete;
+
 #[test]
 fn a_current_terminal_refusal_ends_rotation_but_stale_and_transient_results_retry() {
     let now = Instant::now();
@@ -39,6 +43,7 @@ fn job(proof: &crate::self_claim::Proven) -> Preparation {
             thread: "00000000-0000-0000-0000-000000000001".into(),
             wall: "00000000-0000-0000-0000-000000000002".into(),
             identity: renewal::Identity::from_native("source", "user"),
+            limit: None,
         },
         process: Process {
             pid: proof.pid,
@@ -152,6 +157,7 @@ fn receipt() -> Receipt {
             thread: "00000000-0000-0000-0000-000000000001".into(),
             wall: "00000000-0000-0000-0000-000000000002".into(),
             identity: renewal::Identity::from_native("source", "user"),
+            limit: None,
         },
         sid: "rotation-test".into(),
         old_pid: 4242,

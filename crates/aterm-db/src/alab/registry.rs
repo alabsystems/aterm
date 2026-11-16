@@ -217,12 +217,13 @@ crate::att_collection!(
 /// The machine statuses, safest first for a conflict.
 pub const MACHINE_STATUS: &[&str] = &["planned", "active", "parked", "lost"];
 
-crate::att_collection!(
-    /// One physical Mac across relabels and reinstalls, keyed `mc-<16hex>` from its birth
-    /// identity, minted once. No serial number and no IOPlatformUUID are stored.
-    pub MACHINE = Collection {
+macro_rules! machine_collection {
+    ($(#[$meta:meta])* $name:ident, $version:expr, $nickname_aliases:expr, $hosts:expr) => {
+        crate::att_collection!(
+            $(#[$meta])*
+            pub $name = Collection {
         name: "machine",
-        version: 3,
+        version: $version,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "mc",
@@ -246,12 +247,12 @@ crate::att_collection!(
             Column::new("ram_gb", Ty::Uint).null(),
             Column::new("disk_gb", Ty::Uint).null(),
             Column::new("nickname", Ty::Text(64)).null(),
-            Column::new("nickname_aliases", Ty::List(&Ty::Text(64), 8)).null(),
+            $nickname_aliases,
             Column::new("clis", Ty::Set(&Ty::Ref("cli"))),
             Column::new("location", Ty::Text(64)).null(),
             Column::new("fleet_node", Ty::Hex(32)).null().writer(Writer::Birth),
             Column::new("node", Ty::Hex(16)).null().since(2).claim(ClaimRule::One),
-            Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null().writer(Writer::Birth),
+            $hosts,
             // Display-only unless the merged Mac's own facts row names the same target (§6).
             Column::new("merged_into", Ty::Ref("machine")).null(),
             row().writer(Writer::Birth),
@@ -262,6 +263,31 @@ crate::att_collection!(
         unique: &[],
         max_row: 0,
     }
+        );
+    };
+}
+
+machine_collection!(
+    /// One physical Mac across relabels and reinstalls, keyed `mc-<16hex>` from its birth
+    /// identity, minted once. No serial number and no IOPlatformUUID are stored. Version 4 (the
+    /// fourth generation's) holds `nickname_aliases` and `hosts` as text sets, one element per
+    /// member (LT-15B), so two Macs adding a member at once keep both and a removal is one
+    /// element's.
+    MACHINE,
+    4,
+    Column::new("nickname_aliases", Ty::Set(&Ty::Text(64))),
+    Column::new("hosts", Ty::Set(&Ty::Text(64))).writer(Writer::Birth)
+);
+
+machine_collection!(
+    /// [`MACHINE`] as the registry's first three generations hold it: version 3, `nickname_aliases`
+    /// and `hosts` each one whole list, the shape every build that reads those generations knows.
+    LIST_MACHINE,
+    3,
+    Column::new("nickname_aliases", Ty::List(&Ty::Text(64), 8)).null(),
+    Column::new("hosts", Ty::List(&Ty::Text(64), 4))
+        .null()
+        .writer(Writer::Birth)
 );
 
 crate::att_collection!(
@@ -827,11 +853,12 @@ fn safe(pk: &str) -> &str {
     keys::safe_key(pk)
 }
 
-/// The `mailbox` collection of a registry generation: version 3 (the third generation's)
-/// with its secret columns typed as this build reads them, or version 2, sealed, as builds up to
-/// 0.200.0 read the first and second generations.
+/// The `mailbox` collection of a registry generation: version 4 (the fourth generation's), its
+/// secret columns naming secret-store entries and its domains a text set; version 3 (the
+/// third's), the same with the domains one list; or version 2, sealed, as builds up to 0.200.0
+/// read the first and second generations.
 macro_rules! mailbox_collection {
-    ($(#[$meta:meta])* $name:ident, $version:expr, $password:expr, $totp:expr) => {
+    ($(#[$meta:meta])* $name:ident, $version:expr, $password:expr, $totp:expr, $domains:expr) => {
         crate::att_collection!(
             $(#[$meta])*
             pub $name = Collection {
@@ -857,10 +884,7 @@ macro_rules! mailbox_collection {
             Column::new("mailbox_password", $password).null().since(2),
             Column::new("totp", $totp).null().since(2),
             Column::new("receives", Ty::Set(&Ty::Ref("address"))).since(2),
-            // A domain is no set element (its dots break the cell key's grammar): a list.
-            Column::new("receives_domains", Ty::List(&Ty::Text(253), 64))
-                .null()
-                .since(2),
+            $domains,
             // `imaps://imap.example.test:993`, a local Bridge's `imap://127.0.0.1:1143`, a mail
             // API's `http://127.0.0.1:8025`: `Url` takes only `https`, and the importer refuses
             // one naming a user.
@@ -882,11 +906,25 @@ mailbox_collection!(
     /// makes the names of their secret-store entries; and what `ai-mailbox.toml`'s `receives` said it receives: `receives`, the exact
     /// addresses, and `receives_domains`, each `*@<domain>` as its domain and `*` as itself
     /// (`harness/mailbox_routes.rs`); and its `imap_url` and `http_url`, `imap` and `http`, which
-    /// hold no user part. The version-1 `vault_ref` stays unwritten.
+    /// hold no user part. The version-1 `vault_ref` stays unwritten. Version 4 holds
+    /// `receives_domains` as a text set, one element per domain (LT-15B).
     MAILBOX,
+    4,
+    Ty::SecretRef,
+    Ty::SecretRef,
+    Column::new("receives_domains", Ty::Set(&Ty::Text(253))).since(2)
+);
+
+mailbox_collection!(
+    /// [`MAILBOX`] as the registry's third generation holds it: version 3, `receives_domains` one
+    /// whole list, the shape builds that read that generation know.
+    MAILBOX_3,
     3,
     Ty::SecretRef,
-    Ty::SecretRef
+    Ty::SecretRef,
+    Column::new("receives_domains", Ty::List(&Ty::Text(253), 64))
+        .null()
+        .since(2)
 );
 
 mailbox_collection!(
@@ -895,7 +933,10 @@ mailbox_collection!(
     SEALED_MAILBOX,
     2,
     Ty::Secret,
-    Ty::Secret
+    Ty::Secret,
+    Column::new("receives_domains", Ty::List(&Ty::Text(253), 64))
+        .null()
+        .since(2)
 );
 
 crate::att_collection!(
@@ -1354,6 +1395,39 @@ crate::att_collection!(
     }
 );
 
+/// The largest body one history row carries: its padded base64 and the row's key fit one
+/// record's 64 KiB body.
+pub const MAX_HISTORY_ENTRY: usize = 46 * 1024;
+
+crate::att_collection!(
+    /// One entry of an earlier generation's history, carried by a roll before the old
+    /// generation's storage goes (`alab::history`, docs/DESIGN-tables-app-2026-11-14.md §4): the
+    /// operation's digest, writer, machine, authored time, derived causal clock, request, what it
+    /// reverted and its changes, a secret's value withheld; or one roller's horizon, naming the
+    /// entries its bound left out. Keyed by a digest of the roller and the operation
+    /// (`keys::history_pk`) or of the generation and the roller (`keys::history_horizon_pk`),
+    /// each named in the row. Written by the roll alone and counted only from a Mac that wrote
+    /// its own cover row (`alab::roll::rollers`), or by a roll from its own Mac's; the grid
+    /// shows it read-only (`Writer::Mine`). Owner values, never automatic, so a roll spends no
+    /// quota, and a build that does not know the collection reads past it.
+    pub HISTORY = Collection {
+        name: "history",
+        version: 1,
+        kind: Kind::Cells,
+        writers: Writers::Owner,
+        prefix: "hy",
+        derive: Derive::BirthSha256,
+        columns: &[
+            Column::new("entry", Ty::Sealed(MAX_HISTORY_ENTRY))
+                .fixed()
+                .writer(Writer::Mine),
+            row(),
+        ],
+        unique: &[],
+        max_row: 0,
+    }
+);
+
 /// The most writers one cover row names.
 pub const MAX_COVER_WRITERS: usize = 512;
 
@@ -1406,7 +1480,7 @@ pub const COLLECTIONS: [&Collection; 16] = [
     &CLI,
     &PLAN,
     &MODEL,
-    &MACHINE,
+    &LIST_MACHINE,
     &MACHINE_FACTS,
     &SEALED_ADDRESS,
     &SEALED_MAILBOX,
@@ -1432,14 +1506,14 @@ pub const REGISTRY: Table = Table {
 /// The second generation's role (design §3.8, §11 step 13).
 pub const ROLE_2: &str = "registry.2";
 
-/// The second generation's collections: the first's, the rows a roll carries archived, and its
-/// cover rows.
-pub const COLLECTIONS_2: [&Collection; 18] = [
+/// The second generation's collections: the first's, the rows a roll carries archived, its cover
+/// rows and the history it carries.
+pub const COLLECTIONS_2: [&Collection; 19] = [
     &PROVIDER,
     &CLI,
     &PLAN,
     &MODEL,
-    &MACHINE,
+    &LIST_MACHINE,
     &MACHINE_FACTS,
     &SEALED_ADDRESS,
     &SEALED_MAILBOX,
@@ -1453,11 +1527,36 @@ pub const COLLECTIONS_2: [&Collection; 18] = [
     &SOURCE,
     &ARCHIVED,
     &ROLL,
+    &HISTORY,
 ];
 
 /// The third generation's collections: the second's, with `address`, `mailbox` and `phone` at
 /// version 3, each secret column naming a secret-store entry and a phone number ordinary data.
-pub const COLLECTIONS_3: [&Collection; 18] = [
+pub const COLLECTIONS_3: [&Collection; 19] = [
+    &PROVIDER,
+    &CLI,
+    &PLAN,
+    &MODEL,
+    &LIST_MACHINE,
+    &MACHINE_FACTS,
+    &ADDRESS,
+    &MAILBOX_3,
+    &MAILBOX_OBS,
+    &ACCOUNT_OBS,
+    &PHONE,
+    &ACCOUNT,
+    &SUBACCOUNT,
+    &AUTH_ROUTE,
+    &PREFERENCE,
+    &SOURCE,
+    &ARCHIVED,
+    &ROLL,
+    &HISTORY,
+];
+
+/// The fourth generation's collections: the third's, with `machine` and `mailbox` at version 4,
+/// `nickname_aliases`, `hosts` and `receives_domains` each a text set (LT-15B).
+pub const COLLECTIONS_4: [&Collection; 19] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1476,6 +1575,7 @@ pub const COLLECTIONS_3: [&Collection; 18] = [
     &SOURCE,
     &ARCHIVED,
     &ROLL,
+    &HISTORY,
 ];
 
 /// `alab/registry.2`: the registry restated by a roll, each writer's quota whole again. Readers
@@ -1493,8 +1593,7 @@ pub const ROLE_3: &str = "registry.3";
 
 /// `alab/registry.3`: the second's collections as a roll restates them once every sealed value
 /// earlier generations hold has moved into the secret store, under a table scope of its own, so
-/// its audience key opens nothing of theirs. This build declares it and refuses that roll
-/// ([`crate::alab::Registry::roll`]).
+/// its audience key opens nothing of theirs ([`crate::alab::Registry::roll`]).
 pub const REGISTRY_3: Table = Table {
     application: APPLICATION,
     role: ROLE_3,
@@ -1503,8 +1602,24 @@ pub const REGISTRY_3: Table = Table {
     ends: &["preference"],
 };
 
+/// The fourth generation's role: the first whose free-text lists are text sets (LT-15B).
+pub const ROLE_4: &str = "registry.4";
+
+/// `alab/registry.4`: the third's collections with a Mac's nickname aliases and hosts and a
+/// mailbox's domains as text sets, one element per member, under a table scope of its own. Only
+/// a build that reads text-set elements compiles it, so no build that writes those columns as
+/// one list ever reads or writes this generation; a roll into it restates each list as its
+/// members (`alab::roll`).
+pub const REGISTRY_4: Table = Table {
+    application: APPLICATION,
+    role: ROLE_4,
+    collections: &COLLECTIONS_4,
+    self_quota: SELF_QUOTA,
+    ends: &["preference"],
+};
+
 /// The registry's generations, oldest first: generation `n` is `GENERATIONS[n - 1]`.
-pub const GENERATIONS: [&Table; 3] = [&REGISTRY, &REGISTRY_2, &REGISTRY_3];
+pub const GENERATIONS: [&Table; 4] = [&REGISTRY, &REGISTRY_2, &REGISTRY_3, &REGISTRY_4];
 
 /// The key a new grid row of `collection` is born under (design §5, §8), from the typed values
 /// the owner gave its cells: a mailbox's from its login address's key; a random key for a

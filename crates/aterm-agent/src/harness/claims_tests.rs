@@ -57,6 +57,7 @@ impl Replica {
     }
 
     /// [`Self::new`], refusing every write at its commit with `why`.
+    #[cfg(unix)]
     pub(crate) fn refusing(me: &str, why: &str) -> Self {
         Self {
             refused: Some(why.to_owned()),

@@ -28,12 +28,14 @@ aterm-tempfile = { workspace = true }
 # dependency) and Zstandard decoders, because the engine greps a gzip or zstd
 # file in the export by what it decodes to, and aterm-codec's base64, because
 # the engine clears a hit in a base64 copy of an exported binary. aterm-hash
-# (astream-wire's FNV-1a its one dependency) gives the offset and prime the seals
-# fold with, and the FNV-1a the export scan keys the export's binaries by.
+# (astream-wire's FNV-1a its one dependency) gives the FNV-1a the export scan
+# keys the export's binaries by. aterm-seal (aterm-hash its one dependency) reads
+# the generated-file seals `generated-seal` checks.
 aterm-regex = { workspace = true }
 aterm-codec = { workspace = true }
 aterm-zstd = { workspace = true }
 aterm-hash = { workspace = true }
+aterm-seal = { workspace = true }
 # SHA-256, which fingerprints a reader's captured inputs (`inputs`).
 aterm-digest = { workspace = true }
 

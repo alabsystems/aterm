@@ -100,7 +100,7 @@
 //!    tree; and one that shares a lock, a root manifest, a toolchain or lint file or a submodule's
 //!    entry is judged in full, as is any merge that shares Markdown a file may read
 //!    ([`round_delta`]).
-//! 5. The landing merge states what ran ([`aterm_types::land_trailer`]), an interrupted judgment
+//! 5. The landing merge states what ran ([`aterm_land_trailer`]), an interrupted judgment
 //!    as interrupted. A branch whose head already merges the main it lands on is that merge,
 //!    restated with the trailers.
 //! 6. A judgment that passed is kept in the worktree ([`KEPT`]) until its landing is on main, so
@@ -142,7 +142,7 @@
 
 use crate::exit;
 use crate::land_run;
-use aterm_types::land_trailer::{Checked, Interrupted, Rechecked, Row, Stated};
+use aterm_land_trailer::{Checked, Interrupted, Rechecked, Row, Stated};
 use aterm_uds::spawnfd::Command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -158,6 +158,11 @@ mod issues;
 pub mod records;
 #[path = "land_resolve.rs"]
 mod resolve;
+#[path = "land_tab.rs"]
+pub mod tab;
+#[cfg(test)]
+#[path = "land_tab_tests.rs"]
+mod tab_tests;
 #[path = "land_version.rs"]
 mod version;
 
@@ -196,6 +201,12 @@ pub const COMPOSES: usize = 10;
 /// ([`COMPOSES`]): the branch is merged and judged, not pushed (`EX_TEMPFAIL`, as a yielding
 /// `verify watch --sample`).
 pub const STOPPED: i32 = 75;
+/// The exit of `verify land --tab` whose worker started ([`tab`]): nothing has landed yet, and
+/// the worker's task concludes the landing. Not 0, which says a landing landed.
+pub const STARTED: i32 = 5;
+/// The file in the checkout's own git directory whose lock a landing holds while it runs
+/// ([`Git::hold`]), so a second landing of the checkout refuses at once instead of racing it.
+pub const LOCK_FILE: &str = "aterm-land.lock";
 /// The exit a landing that panicked records ([`concluded`]): the one a Rust panic gives the
 /// process, which then dies of it as without the record.
 pub const PANICKED: i32 = 101;
@@ -582,6 +593,9 @@ pub struct Own<'a> {
     pub words: &'a [String],
     /// This process's own image's digest.
     pub image: &'a str,
+    /// The commit this landing was asked to land (`--at`, which `--tab` gives its worker): HEAD
+    /// that the landing reads must be it, or nothing lands. A resumed landing checked it already.
+    pub at: Option<&'a str>,
 }
 
 /// What a refused handoff leaves the person to do.
@@ -775,6 +789,29 @@ fn drive(
     let merged = git.fetch()?;
     seams.records.tally.base.clone_from(&merged);
     let start = git.head()?;
+    if let Some(at) = own.at {
+        let asked = git
+            .local(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{at}^{{commit}}"),
+            ])
+            .unwrap_or_default();
+        if asked != start {
+            say(
+                seams,
+                format!(
+                    "verify land: COULD NOT RUN — HEAD is {start}, not {at}, the commit this \
+                     landing was asked to land ({}): the checkout moved after the ask, and \
+                     nothing was landed. Fix: select the intended committed checkout before \
+                     running `targo --unverified verify land` again",
+                    tab::AT,
+                ),
+            );
+            return Ok(exit::COULD_NOT_RUN);
+        }
+    }
     if git.is_ancestor(&start, &merged)? {
         let _ = git.forget();
         say(
@@ -3081,6 +3118,33 @@ impl Git<'_> {
         Ok(PathBuf::from(self.local(&["rev-parse", "--absolute-git-dir"])?).join(handoff::FILE))
     }
 
+    /// Take the checkout's landing lock ([`LOCK_FILE`], in its own git directory), held until
+    /// the guard drops or the process ends or execs (the descriptor is close-on-exec, so a
+    /// handoff's receiver takes it again): else why not, a landing that holds it named first.
+    fn hold(&self) -> Result<aterm_toolchain::record_lock::RecordLock, String> {
+        let file = PathBuf::from(self.local(&["rev-parse", "--absolute-git-dir"])?).join(LOCK_FILE);
+        let open = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&file)
+            .map_err(|error| format!("{} could not be opened: {error}", file.display()))?;
+        aterm_toolchain::record_lock::RecordLock::try_lock(open, 0).map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => format!(
+                "another landing runs in {}: it holds {} until it ends (`aterm ctl board` names \
+                 the worker a `verify land {}` of this session started), and nothing was landed \
+                 here. Fix: wait for it to end, then run this again",
+                self.root.display(),
+                file.display(),
+                tab::FLAG
+            ),
+            std::fs::TryLockError::Error(error) => {
+                format!("{} could not be locked: {error}", file.display())
+            }
+        })
+    }
+
     /// The checkout's changes no commit holds (`status --porcelain`), submodules included.
     fn changes(&self) -> Result<String, String> {
         self.local(&[
@@ -3267,7 +3331,7 @@ impl Git<'_> {
         let mut fields = out.stdout.split(|b| *b == 0);
         let first = String::from_utf8_lossy(fields.next().unwrap_or_default()).into_owned();
         match out.status.code() {
-            Some(0) if aterm_types::land_trailer::object_id(&first) => Ok(Compose::Tree(first)),
+            Some(0) if aterm_land_trailer::object_id(&first) => Ok(Compose::Tree(first)),
             Some(1) => Ok(Compose::Conflict(
                 fields
                     .filter(|path| !path.is_empty())
@@ -3747,7 +3811,7 @@ impl Git<'_> {
             let (pin, stage) = meta
                 .split_once(' ')
                 .ok_or("git ls-files --stage: an entry has no stage")?;
-            if stage != "0" || !aterm_types::land_trailer::object_id(pin) {
+            if stage != "0" || !aterm_land_trailer::object_id(pin) {
                 return Err(format!("{path}: the index records no one merged commit"));
             }
             links.push((path.to_owned(), pin.to_owned()));
@@ -3977,9 +4041,27 @@ impl Git<'_> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "usage: targo --unverified verify land [--admit wait|now] [--timeout <seconds|off>] [--test-cores <n>]\n\
+        "usage: targo --unverified verify land [--tab | --at <commit>] [--admit wait|now] [--timeout <seconds|off>] [--test-cores <n>]\n\
                 {records_usage}\n\
                 {census_usage}\n\n\
+         Run directly with your shell/background command tools by default. Use --tab only\n\
+         on the person's explicit request or for a concrete persistence need those tools\n\
+         cannot meet, such as an actual restart or upgrade that will end the launching\n\
+         process. State that reason before spawning the tab.\n\
+         --tab, in a shell of an aterm session, starts this landing (its other\n\
+         words, with --at HEAD) as a program worker of that session in a tab of its own at the\n\
+         checkout's root, prints that nothing has landed yet, the line that waits for the\n\
+         worker however long it runs (aterm ctl --timeout 0 await task @<sid> since=0) and the\n\
+         one that reads its verdict (aterm ctl @<sid> result), and exits {started}: the landing\n\
+         outlives that session's agent, its restart, usage limit or upgrade. Leave the\n\
+         checkout's HEAD and files as they are until the worker ends. A checkout with changes\n\
+         no commit holds, or one a landing runs in, starts nothing (exit 3). With no aterm\n\
+         harness to run it (no aterm session, or ERR unsupervised) it lands here, as without\n\
+         the flag; any other answer lands nowhere and exits 3.\n\
+         --at <commit> lands that commit or nothing: a HEAD the landing reads that is not it\n\
+         could not run.\n\
+         One landing runs in a checkout at a time: it holds {lock} in the checkout's git\n\
+         directory while it runs, and another refuses at once (exit 3).\n\n\
          Land this checkout's branch on {REMOTE}/{MAIN}, judged: merge {REMOTE}/{MAIN} (M1),\n\
          apply census --fix and the formatter over what the branch changed and commit what they\n\
          wrote into that merge (each re-judge's merge too), run the dev set over the cone since\n\
@@ -4091,8 +4173,11 @@ pub fn usage() -> String {
          resolves resolves none, and the merge is left for the person.\n\n\
          Exit: 0 landed (or nothing to land), 1 a red (nothing pushed), 2 usage, 3 could not\n\
          run, {conflict} a conflict no rule resolves (nothing pushed; the merge is left for the\n\
-         person), {STOPPED} stopped after {COMPOSES} push races while {MAIN} kept moving\n\
-         (merged and judged, its judgment kept; not pushed).\n",
+         person), {started} --tab's worker started (nothing landed yet), {STOPPED} stopped after\n\
+         {COMPOSES} push races while {MAIN} kept moving (merged and judged, its judgment kept;\n\
+         not pushed).\n",
+        started = STARTED,
+        lock = LOCK_FILE,
         conflict = exit::CONFLICT,
         resume = handoff::RESUME,
         records_usage = records::RECORDS_USAGE
@@ -4193,7 +4278,8 @@ fn options(args: &[String]) -> Option<LandResources> {
     Some(options)
 }
 
-/// `verify land [--admit wait|now] [--timeout seconds|off] [--test-cores n] [--help]`, from `cwd`'s checkout.
+/// `verify land [--tab | --at commit] [--admit wait|now] [--timeout seconds|off] [--test-cores n]
+/// [--help]`, from `cwd`'s checkout.
 /// `verify land --resume <file>` is the landing's own handoff to another build of itself.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
     match args {
@@ -4215,19 +4301,15 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         }
         _ => {}
     }
-    let options = match options(args) {
-        Some(options) => options,
-        None => {
-            eprint!(
-                "verify land: takes only --admit wait|now, --timeout seconds|off and --test-cores n\n{}",
-                usage()
-            );
-            return exit::USAGE;
-        }
-    };
-    let Some(image) = crate::report::running_driver() else {
-        eprintln!("verify land: COULD NOT RUN — this landing's own image could not be read");
-        return exit::COULD_NOT_RUN;
+    let Some((options, (in_tab, at, words))) =
+        split(args).and_then(|split| Some((options(&split.2)?, split)))
+    else {
+        eprint!(
+            "verify land: takes only --tab or --at <commit>, --admit wait|now, --timeout \
+             seconds|off and --test-cores n\n{}",
+            usage()
+        );
+        return exit::USAGE;
     };
     if crate::git_provider::pin().is_none() {
         eprintln!("verify land: COULD NOT RUN — no absolute executable Git on PATH");
@@ -4240,11 +4322,105 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         );
         return exit::COULD_NOT_RUN;
     };
-    interruptible(|| {
-        with_live_seams(&root, &options, |seams| {
-            land(&root, &Own { words: args, image }, seams)
-        })
-    })
+    let git = Git {
+        root: &root,
+        make: &live_git,
+    };
+    if in_tab && let Some(code) = ask_for_worker(&git, &words) {
+        return code;
+    }
+    let Some(image) = crate::report::running_driver() else {
+        eprintln!("verify land: COULD NOT RUN — this landing's own image could not be read");
+        return exit::COULD_NOT_RUN;
+    };
+    let _held = match git.hold() {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("verify land: COULD NOT RUN — {why}");
+            return exit::COULD_NOT_RUN;
+        }
+    };
+    let own = Own {
+        words: &words,
+        image,
+        at: at.as_deref(),
+    };
+    interruptible(|| with_live_seams(&root, &options, |seams| land(&root, &own, seams)))
+}
+
+/// `run`'s words apart: whether `--tab` asks for a worker, the commit `--at` names, and the
+/// landing's other words, which a handoff carries; `None` where either is given twice, `--at`
+/// names nothing, or both are given (`--tab` names the commit itself).
+fn split(args: &[String]) -> Option<(bool, Option<String>, Vec<String>)> {
+    let (mut in_tab, mut at, mut words) = (false, None, Vec::new());
+    let mut rest = args.iter();
+    while let Some(word) = rest.next() {
+        let commit = if word == tab::AT {
+            Some(rest.next()?.clone())
+        } else {
+            word.strip_prefix("--at=").map(str::to_owned)
+        };
+        if let Some(commit) = commit {
+            if commit.is_empty() || at.replace(commit).is_some() {
+                return None;
+            }
+        } else if word == tab::FLAG {
+            if std::mem::replace(&mut in_tab, true) {
+                return None;
+            }
+        } else {
+            words.push(word.clone());
+        }
+    }
+    (!(in_tab && at.is_some())).then_some((in_tab, at, words))
+}
+
+/// `verify land --tab`'s ask ([`tab::start`]) for the checkout `git` holds, clean, with no
+/// landing in it, and its HEAD: `Some` exit where nothing lands here ([`STARTED`] once the
+/// worker runs it), `None` where the landing runs here.
+fn ask_for_worker(git: &Git<'_>, words: &[String]) -> Option<i32> {
+    // The lock first: a landing that runs is left alone, even by `git status`, whose index
+    // refresh may take the index lock a step of that landing needs.
+    let ready = || -> Result<String, String> {
+        drop(git.hold()?);
+        let dirty = git.changes()?;
+        if !dirty.is_empty() {
+            return Err(format!(
+                "the checkout has changes no commit holds:\n{dirty}\nFix: commit or remove them, \
+                 then run it again"
+            ));
+        }
+        git.head()
+    };
+    let head = match ready() {
+        Ok(head) => head,
+        Err(why) => {
+            eprintln!("verify land: COULD NOT RUN — {why}");
+            return Some(exit::COULD_NOT_RUN);
+        }
+    };
+    let env = |key: &str| std::env::var(key).ok();
+    match tab::start(git.root, words, &head, &env, &mut live_ctl) {
+        tab::Start::Worker(sid) => {
+            for line in tab::said(&sid, git.root) {
+                println!("{line}");
+            }
+            Some(STARTED)
+        }
+        tab::Start::Here(why) => {
+            println!("verify land: {why}: the landing runs here");
+            None
+        }
+        tab::Start::Unknown(why) => {
+            eprintln!(
+                "verify land: COULD NOT RUN — asked for the landing's worker, {why}; nothing was \
+                 landed here. `aterm ctl board` names a worker that started; without {} the \
+                 landing runs in this shell",
+                tab::FLAG
+            );
+            Some(exit::COULD_NOT_RUN)
+        }
+    }
 }
 
 /// Run `landing` under verify's own interrupt handling (`exec::group::kill_on_interrupt`): a
@@ -4318,6 +4494,14 @@ fn resume_cli(
             return refused(&git, run.as_ref(), records, refuse);
         }
     };
+    // The sender's lock ended with its exec: take it again before anything of the landing runs.
+    let _held = match git.hold() {
+        Ok(held) => held,
+        Err(why) => {
+            refuse(&format!("verify land: COULD NOT RUN — {why}; {RERUN}"));
+            return refused(&git, handoff.run.as_ref(), records, refuse);
+        }
+    };
     let Some(image) = crate::report::running_driver() else {
         refuse(&format!(
             "verify land: COULD NOT RUN — this landing's own image could not be read; {RERUN}"
@@ -4340,6 +4524,7 @@ fn resume_cli(
                 &Own {
                     words: &words,
                     image,
+                    at: None,
                 },
                 handoff,
                 seams,
@@ -4400,12 +4585,34 @@ fn taken() -> bool {
 
 /// A git command in the checkout at `root`, as every live landing step runs one.
 fn live_git(root: &Path) -> Command {
-    let mut cmd = crate::judged::command(root, &[]);
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let mut cmd = crate::git_provider::command();
+    cmd.current_dir(root)
+        .env_remove("GITHUB_TOKEN")
+        .env("GIT_TERMINAL_PROMPT", "0");
     for key in PATHSPEC_MODES {
         cmd.env_remove(key);
     }
     cmd
+}
+
+/// `aterm ctl <args>` from `PATH`, `stdin` its standard input: what it wrote to stdout and
+/// stderr ([`tab::start`]). A write the client did not take (it answered before reading) is no
+/// error: its answer says what it did.
+fn live_ctl(args: &[String], stdin: &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    use aterm_uds::spawnfd::Stdio;
+    use std::io::Write as _;
+    let mut child = aterm_uds::spawnfd::command("aterm")
+        .arg("ctl")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut input) = child.stdin.take() {
+        let _ = input.write_all(stdin);
+    }
+    let said = child.wait_with_output()?;
+    Ok((said.stdout, said.stderr))
 }
 
 /// Run `f` with the live seams under the person's resource controls `options`.

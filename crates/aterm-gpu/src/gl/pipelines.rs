@@ -6,6 +6,7 @@
 use super::device::{Current, GlDevice};
 use super::ffi::{self, GLenum, GLuint};
 use super::shaders;
+use super::source::compose;
 use crate::pipeline_table::{
     AttrFormat, Blend, BlendOp, Factor, PipelineSpec, Topology, VertexLayoutSpec, WriteMask,
 };
@@ -56,30 +57,6 @@ pub(crate) const fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
         gl_op(b.color.op),
         gl_op(b.alpha.op),
     ])
-}
-
-/// One stage of one row.
-pub(crate) fn compose(src: &str, vertex: bool, vs: &str, fs: &str) -> Result<String, String> {
-    let (version, body) = src
-        .split_once('\n')
-        .filter(|(v, _)| v.starts_with("#version 300 es"))
-        .ok_or("a GLSL twin starts with `#version 300 es`")?;
-    let stage = if vertex {
-        "ATERM_VERTEX"
-    } else {
-        "ATERM_FRAGMENT"
-    };
-    let main = if vertex {
-        format!(
-            "void main() {{\n    {vs}();\n    gl_Position.yz = vec2(-gl_Position.y, \
-             gl_Position.z * 2.0 - gl_Position.w);\n}}\n"
-        )
-    } else {
-        format!("void main() {{\n    {fs}();\n}}\n")
-    };
-    Ok(format!(
-        "{version}\n#define {stage} 1\n#define ATERM_VS_{vs} 1\n#define ATERM_FS_{fs} 1\n#line 2\n{body}\n{main}"
-    ))
 }
 
 /// A row as GL draws it.

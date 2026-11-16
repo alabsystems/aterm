@@ -159,7 +159,7 @@ fn ingest_refusals_preserve_the_journal_index_and_writer_usage() {
 /// A retained application payload needs no second cryptographic opening merely to find that it
 /// is not a removal cutoff. A real cutoff still opens, under the ordinary fresh key admission.
 #[test]
-fn retained_non_cut_payloads_avoid_decryption_but_cutoffs_still_open() {
+fn retained_non_control_payloads_avoid_decryption_but_cutoffs_still_open() {
     for body_budget in [64 * 1024, 2048] {
         journals::with_own(
             std::sync::Arc::new(journals::Journals::new(1, 64 * 1024, body_budget)),
@@ -262,7 +262,7 @@ fn payload_facts_require_the_current_key_and_exact_ciphertext() {
         .with_payload_key(scope, &envelope, false, None, |key, _| {
             let mut wrong = zeroize::Zeroizing::new(*key);
             wrong[0] ^= 1;
-            wire.remember_non_cut(crypto::payload_key_identity(&wrong));
+            wire.remember_non_control(crypto::payload_key_identity(&wrong));
             Ok(Some(()))
         })
         .unwrap()
@@ -300,7 +300,8 @@ fn payload_facts_require_the_current_key_and_exact_ciphertext() {
             Ok(decoded)
         })
         .unwrap();
-    assert_eq!(decoded, Some(cut));
+    assert_eq!(decoded.cut, Some(cut));
+    assert!(decoded.checkpoint.is_none());
     assert_eq!(crate::crypto::test_cipher_constructions() - before, 4);
 }
 

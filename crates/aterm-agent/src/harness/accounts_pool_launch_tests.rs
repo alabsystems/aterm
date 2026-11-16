@@ -69,6 +69,8 @@ pub(crate) fn launch_transition(
         (case == 10).then(|| Usage {
             sample: near_wall(),
             walls: vec![("five_hour", Some(NOW + HOUR))],
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let outcome = match super::super::launch_env(&world.seat(), cli, &read) {

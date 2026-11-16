@@ -870,11 +870,15 @@ fn admit_on(
     if !held_coordinator(home, &declaration) {
         return Err("package coordinator is not held by the producer guardian".into());
     }
+    // The package's root is read as the front reads a build's, from this process's variables
+    // and its actual working directory, against which a relative package home resolves.
     let cwd =
         std::env::current_dir().map_err(|_| "package working directory cannot be established")?;
     let workspace = super::with_machine(Some(&cwd), &|name| std::env::var_os(name), |machine| {
         super::workspace(home, args.manifest, &[], super::super::Tool::Targo, machine)
     })
+    .ok()
+    .flatten()
     .ok_or("package workspace cannot be established")?;
     let path = receipt_path(home, args.target).ok_or("package target cannot be addressed")?;
     let existing = super::read(&path);
@@ -895,7 +899,7 @@ fn admit_on(
             );
         }
         let (_, created) = super::create_with_policy(home, args.target, &workspace, None, false)
-            .map_err(|_| "legacy package cache owner publication refused")?;
+            .map_err(|error| format!("legacy package cache owner publication refused: {error}"))?;
         return Ok(legacy(args.target, created));
     }
     let producer = kernel
@@ -914,10 +918,10 @@ fn admit_on(
         && receipt.creating.is_some()
     {
         let gate = super::gate_path(&path).ok_or("creation receipt gate is unavailable")?;
-        let file = crate::metadata_io::open_regular(&gate)
-            .map_err(|_| "creation receipt gate cannot be opened")?;
+        let file =
+            super::gate::open(&gate).map_err(|_| "creation receipt gate cannot be opened")?;
         let _held =
-            crate::lock::Flock::try_lock(file).map_err(|_| "creation receipt gate is busy")?;
+            super::gate::try_exclusive(file).map_err(|_| "creation receipt gate is busy")?;
         super::creation::finish(home, &path, &receipt)
             .ok_or("interrupted package creation cannot be proved")?;
         true
@@ -986,10 +990,8 @@ fn admit_on(
             continue;
         }
         let gate = super::gate_path(&other_path).ok_or("package receipt gate is unavailable")?;
-        let file = crate::metadata_io::open_regular(&gate)
-            .map_err(|_| "package receipt gate cannot be opened")?;
-        let _held =
-            crate::lock::Flock::try_lock(file).map_err(|_| "package receipt gate is busy")?;
+        let file = super::gate::open(&gate).map_err(|_| "package receipt gate cannot be opened")?;
+        let _held = super::gate::try_exclusive(file).map_err(|_| "package receipt gate is busy")?;
         if super::read(&other_path).as_ref() != Some(&receipt)
             || !recover_active(home, &other_path, &mut receipt, &declaration, fence, kernel)
         {
@@ -1020,10 +1022,10 @@ fn admit_on(
         // receipt gate, but leave removal to the outside compactor after this guard returns.
         for (other_path, mut receipt) in supersede {
             let gate = super::gate_path(&other_path).ok_or("package receipt gate unavailable")?;
-            let file = crate::metadata_io::open_regular(&gate)
-                .map_err(|_| "package receipt gate cannot be opened")?;
+            let file =
+                super::gate::open(&gate).map_err(|_| "package receipt gate cannot be opened")?;
             let _held =
-                crate::lock::Flock::try_lock(file).map_err(|_| "package receipt gate is busy")?;
+                super::gate::try_exclusive(file).map_err(|_| "package receipt gate is busy")?;
             if super::read(&other_path).as_ref() != Some(&receipt)
                 || !super::same(home, &receipt)
                 || !held_coordinator(home, &declaration)
@@ -1076,16 +1078,15 @@ fn admit_on(
     };
     let (recorded, created) =
         super::create_with_policy(home, args.target, &workspace, Some(policy.clone()), false)
-            .map_err(|_| "package cache owner publication refused")?;
+            .map_err(|error| format!("package cache owner publication refused: {error}"))?;
     let created = created || recovered_creation;
     if !recorded {
         return Ok(legacy(args.target, false));
     }
-    let file = crate::metadata_io::open_regular(
-        &super::gate_path(&path).ok_or("package receipt gate is unavailable")?,
-    )
-    .map_err(|_| "package receipt gate cannot be opened")?;
-    let _held = crate::lock::Flock::try_lock(file).map_err(|_| "package receipt gate is busy")?;
+    let file =
+        super::gate::open(&super::gate_path(&path).ok_or("package receipt gate is unavailable")?)
+            .map_err(|_| "package receipt gate cannot be opened")?;
+    let _held = super::gate::try_exclusive(file).map_err(|_| "package receipt gate is busy")?;
     let mut receipt = super::read(&path).ok_or("package receipt cannot be read")?;
     let Some(current) = &receipt.package else {
         return Ok(legacy(args.target, created));
@@ -1182,11 +1183,10 @@ fn settled_with(
         if active.token != attempt {
             continue;
         }
-        let file = crate::metadata_io::open_regular(
-            &super::gate_path(&path).ok_or("package receipt gate unavailable")?,
-        )
-        .map_err(|_| "package receipt gate cannot be read")?;
-        let _held = crate::lock::Flock::try_lock(file).map_err(|_| "package receipt gate busy")?;
+        let file =
+            super::gate::open(&super::gate_path(&path).ok_or("package receipt gate unavailable")?)
+                .map_err(|_| "package receipt gate cannot be read")?;
+        let _held = super::gate::try_exclusive(file).map_err(|_| "package receipt gate busy")?;
         if super::read(&path).as_ref() != Some(&receipt)
             || receipt.pending.is_some()
             || receipt.owners_unknown

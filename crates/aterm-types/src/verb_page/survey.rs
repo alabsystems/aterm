@@ -15,7 +15,7 @@ pub(crate) const PAGE: Page = Page {
             "a digest of every session of every instance here (and of the fleet's Macs)",
         ),
         row(
-            "aterm ctl survey [--json] [--sid <s-…>] [--fleet | --host <h> [--holder \
+            "aterm ctl survey [--json] [--sid <sid>] [--fleet | --host <h> [--holder \
              <pid>.<boot>.<start>]]",
             "the rows themselves, one session (--sid), every Mac or one other Mac",
         ),
@@ -47,7 +47,7 @@ pub(crate) const PAGE: Page = Page {
             "--budget <chars>",
             "the digest's size (default 24000); --json, --sid and --host print whole",
         ),
-        row("--sid <s-…>", "one session's row"),
+        row("--sid <sid>", "one session's row"),
         row("--json", "JSON in place of the rows"),
     ],
     reply: &[
@@ -97,12 +97,15 @@ pub(crate) const PAGE: Page = Page {
                      <n>`, an `instance pid= host=<pct> \
                      version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> \
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
-                     s|-> ssh_host_key=<pct|-> home_free_mb=<MiB|-> accounts=<n> \
+                     s|-> ssh_host_key=<pct|-> home_free_mb=<MiB|-> home_total_mb=<MiB|-> \
+                     home_build_mb=<MiB|-> home_build_at_ms=<unix ms|-> \
+                     home_build_partial=<0|1|-> accounts=<n> \
                      accounts_unread=<cli>[,…]|-> \
                      moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1> \
                      [update=<word> update_at=<unix s|-> update_to=<version|build n|-> \
                      update_until=<unix s|-> update_why=<word|-> update_tries=<n|-> \
-                     update_checks=<on|off|->] access=<read|write|full>[ drive=1]` header \
+                     update_checks=<on|off|->] store_worst=<word|-> store_worst_pct=<n|-> \
+                     access=<read|write|full>[ drive=1]` header \
                      (`update=`: where this machine's updater stands, as `aterm update status` \
                      there decides it (on Windows, against the build staged there): off, \
                      installed, downloaded, cannot, held, refused, not-installing, unreadable, \
@@ -117,8 +120,21 @@ pub(crate) const PAGE: Page = Page {
                      words; `access=`: this machine's \
                      fleet access, what a driver may do here, `aterm fleet access`; `drive=1`: a \
                      fleet reader this machine lets drive it, as far as `access=` admits; \
-                     `home_free_mb=`: the free space on its home's volume, followed by the \
-                     machine's look, below; at \
+                     `home_free_mb=` and `home_total_mb=`: the free space on its home's volume \
+                     and that volume's size; `home_build_mb=`: the build output aterm sizes as \
+                     rebuildable there (its build caches and build folders) as the disk watch \
+                     last sized it, read from that sizing's record and never walked, \
+                     `home_build_at_ms=` when that sizing ended, on the clock `at_ms=` was read \
+                     on, and `home_build_partial=1` where it was cut short and the figure is a \
+                     floor; each `-` where unknown, and none from an aterm older than the key; \
+                     sizes and a time, no path; the machine's look follows them, below; \
+                     `store_worst=`: the fullest of the stores aterm itself keeps there that \
+                     refuse writes at a bound (the vault's records log, the lab journal's \
+                     outbox), by the fixed word `aterm ctl sys disk` names it, and \
+                     `store_worst_pct=` the share of that bound it holds, rounded down and past \
+                     100 where it stands past it, sized as the header was made by the store's \
+                     own files and never a walk; both `-` where no such store is kept, and \
+                     none from an aterm older than the keys; at \
                      `content`, `home= repos= repos_at= repos_cut=` before \
                      `accounts=`: the \
                      home, and how many checkouts the last read of it \
@@ -131,12 +147,13 @@ pub(crate) const PAGE: Page = Page {
                      its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say).",
                 ),
                 para(
-                    "The machine's look follows `home_free_mb=` on every header, at `facts` as \
-                     at `content`: `os=<macos|linux|windows|-> target=<triple|-> m_at_ms=<unix \
+                    "The machine's look follows `home_build_partial=` on every header, at \
+                     `facts` as at `content`: `os=<macos|linux|windows|-> target=<triple|-> \
+                     m_at_ms=<unix \
                      ms|-> cores= load1_x100= load5_x100= load15_x100= cpu_busy_x100= \
                      rate_win_ms= mem_total_mb= mem_used_mb= mem_avail_mb= \
                      mem_pressure=<normal|warn|critical|-> mem_psi60_x100= swap_used_mb= \
-                     swap_total_mb= home_total_mb= gpu_cores= gpu_busy_pct= net_link_kbps= \
+                     swap_total_mb= gpu_cores= gpu_busy_pct= net_link_kbps= \
                      net_rx_kbps= net_tx_kbps= net_other_kbps= up_since_ms=<unix ms|-> \
                      cpu_lim=<0|1|-> mem_lim= disk_lim= gpu_lim= load=<level>:<over|->|-`. Each \
                      figure is a whole number \
@@ -150,7 +167,6 @@ pub(crate) const PAGE: Page = Page {
                      the look (45 to 90 s; `-` where no survey read this machine in that time); \
                      `net_other_kbps`: its other links' traffic; `mem_psi60_x100`: on Linux, the \
                      share of the last minute some task stalled on memory, times 100; \
-                     `home_total_mb`: the size of the volume `home_free_mb` is free on; \
                      `up_since_ms`: the later of its boot and its last wake. The four `_lim` \
                      words are the machine's own verdicts that a resource is at its limit: the \
                      CPU with its 1-minute load over its cores and 95% of them busy, memory \
@@ -163,8 +179,9 @@ pub(crate) const PAGE: Page = Page {
                      from 12 for work waiting on busy cores, swapping or critical pressure), `-` \
                      where its CPU's busy share is unread, and the over `-` where its load \
                      average, its swap traffic or (with neither over) its memory pressure is. A \
-                     node service answering for a window \
-                     older than the look adds its own.",
+                     node service answering for a window older than the look adds its own, and \
+                     makes `home_free_mb=` and `home_total_mb=` the look's, saying the size \
+                     once.",
                 ),
                 para(
                     "`account pool=<cli> id=<pct> email=<pct|-> condition=<word> enrolled=<0|1> \
@@ -225,7 +242,8 @@ pub(crate) const PAGE: Page = Page {
                      last_bell=<ms>/<sound>/<program|->[,…]|-> turn=<1|0|-> turn_ms=<ms|-> \
                      turn_end_ms=<ms|-> step_ms=<ms|-> out_ms=<ms|-> \
                      out_src=<transcript|screen|-> tok_in=<n|-> tok_out=<n|-> \
-                     tok_for_ms=<ms|-> turns=<n|-> tools=<n|-> pinned=<0|1>`.",
+                     tok_for_ms=<ms|-> turns=<n|-> tools=<n|-> pinned=<0|1> \
+                     opened_ms=<unix ms|->`.",
                 ),
                 para(
                     "A row is read at its header's `at_ms=`, but for one the node service of a \
@@ -262,6 +280,17 @@ pub(crate) const PAGE: Page = Page {
                      @<sid> pin`), which the fleet band shows first among its Mac's agents; a \
                      worker it spawns says `0`. An older aterm sends no `pinned=`, which reads as \
                      unread, not as unpinned.",
+                ),
+                para(
+                    "`opened_ms=` is the Unix ms at which the session's lineage first opened, as \
+                     `status` prints it: a session a cold restore, a seamless update or a reopened \
+                     tab brought back keeps its first open's time, one an older aterm handed \
+                     over in a seamless update keeps the open of the log it carried, or the \
+                     update's own time where that log did not carry, one from a layout an older \
+                     aterm saved for a cold restore says when that restore opened it, and `-` is \
+                     a log not yet open. Its age is the reader's to compute: the `at_ms=` the \
+                     row was read at minus it. An older aterm sends no `opened_ms=`, which reads \
+                     as unread.",
                 ),
                 para(
                     "`upgrade=` is the harness upgrade word `aterm ctl @<sid> status` prints for \
@@ -372,7 +401,7 @@ pub(crate) const PAGE: Page = Page {
                     "Under it, quoted lines: `attention:`, `goal:`, `asked:` (the last prompt \
                      typed to it), `said:` (its agent's last words) and `work:` (`<branch> · <n> \
                      files · <n> behind <main> · <age> ago`). `--budget` folds what does not fit \
-                     into `+<n>` counts; `--sid <s-…>` shows one session whole.",
+                     into `+<n>` counts; `--sid <sid>` shows one session whole.",
                 ),
                 para(
                     "A `--fleet` digest leads, under the `#` line, with `upgrades held (stalled \

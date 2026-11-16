@@ -54,9 +54,12 @@ fn a_heard_source_rings_its_bell_and_ends_with_it() {
     let (looked, looks) = mpsc::channel::<()>();
     assert!(hear(
         &bell,
-        move |most| {
+        move |most, _| {
             let _ = looked.send(());
-            rx.recv_timeout(most).is_ok()
+            match rx.recv_timeout(most) {
+                Ok(()) => Heard::Change,
+                Err(_) => Heard::Failed,
+            }
         },
         Wake::Route,
     ));
@@ -73,5 +76,107 @@ fn a_heard_source_rings_its_bell_and_ends_with_it() {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => panic!("the hearer outlived its bell"),
         }
+    }
+}
+
+/// A hearer of route changes waits with no timer: each wait it makes is given
+/// [`Duration::MAX`], and dropping its bell, with no change, ends the thread at once, its route
+/// wait having heard the bell's [`Closing`] reach its end.
+/// NEGATIVE CONTROL: a hearer that waits in steps (`HEAR_STEP`, 5 s, the code before) is given
+/// 5 s; one that waits beside no [`Closing`] outlives its bell to the hang detector.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_route_hearer_waits_with_no_timer_and_ends_with_its_bell() {
+    let (heard, _kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let mut routes = route_waiter(crate::network::RouteChanges::over(heard.into()));
+    let bell = Arc::new(Bell::default());
+    let (gave, given) = mpsc::channel::<Duration>();
+    let mut first = true;
+    assert!(hear(
+        &bell,
+        move |most, closing| {
+            let _ = gave.send(most);
+            if std::mem::take(&mut first) {
+                return Heard::Change;
+            }
+            routes(most, closing)
+        },
+        Wake::Route,
+    ));
+    assert_eq!(bell.nap(HANG_DETECTOR), Wake::Route, "the change rang");
+    let waits: Vec<Duration> = (0..2)
+        .map(|_| given.recv_timeout(HANG_DETECTOR).expect("a wait began"))
+        .collect();
+    assert_eq!(
+        waits,
+        [Duration::MAX, Duration::MAX],
+        "every wait is unbounded"
+    );
+    drop(bell);
+    match given.recv_timeout(aterm_spec::wait::MUST_HAPPEN) {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Ok(most) => panic!("the hearer waited again ({most:?}) after its bell was dropped"),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("the hearer outlived its bell"),
+    }
+}
+
+/// A route hearer whose socket failed waits on it again after a pause beside its bell's
+/// [`Closing`] ([`route_waiter`]): a failure that passes (here an empty datagram, which a read
+/// takes for a failed socket) loses no later change, and the bell dropped during the pause ends
+/// the thread at once.
+/// NEGATIVE CONTROLS: end the hearer at a failure (`Heard::Failed`, the code before) and the
+/// later change never rings (`the change after a failure rang`); pause with a sleep that waits
+/// beside nothing and the thread outlives its bell (`the hearer outlived its bell`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_route_hearer_outlasts_a_failure_and_ends_with_its_bell_as_it_pauses() {
+    // An address change as the kernel words it on macOS; any message of it reads as a change on
+    // Linux.
+    let change: Vec<u8> = [24_u32, 1, 1, 1, 37, 1]
+        .into_iter()
+        .flat_map(u32::to_ne_bytes)
+        .collect();
+    let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let bell = Arc::new(Bell::default());
+    assert!(hear(
+        &bell,
+        route_waiter_pausing(
+            crate::network::RouteChanges::over(heard.into()),
+            Duration::ZERO
+        ),
+        Wake::Route,
+    ));
+    kernel.send(&[]).expect("an empty datagram");
+    kernel.send(&change).expect("a change");
+    assert_eq!(
+        bell.nap(HANG_DETECTOR),
+        Wake::Route,
+        "the change after a failure rang"
+    );
+    drop(bell);
+
+    // A pause past the hang detector: only the bell's end cuts it short.
+    let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let bell = Arc::new(Bell::default());
+    let (began, waits) = mpsc::channel::<()>();
+    let mut routes = route_waiter_pausing(
+        crate::network::RouteChanges::over(heard.into()),
+        Duration::MAX,
+    );
+    assert!(hear(
+        &bell,
+        move |most, closing| {
+            let _ = began.send(());
+            routes(most, closing)
+        },
+        Wake::Route,
+    ));
+    waits.recv_timeout(HANG_DETECTOR).expect("a wait began");
+    kernel.send(&[]).expect("an empty datagram");
+    drop(bell);
+    match waits.recv_timeout(aterm_spec::wait::MUST_HAPPEN) {
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Ok(()) => panic!("the hearer waited again after its bell was dropped"),
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("the hearer outlived its bell"),
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
+pub use crate::membership_log::Author;
 use crate::pass_counts::{self, Count, Phase};
 use crate::text::{self, Audience, Document, Entry};
 use crate::transport::{self, Fetched, Source};
@@ -56,6 +57,7 @@ mod lab_labels;
 mod ledger_publish;
 mod locker_skew;
 mod log_entries;
+mod log_fill;
 mod materialization_selection;
 mod member_authority;
 mod member_routes;
@@ -163,6 +165,7 @@ pub use log_entries::{
 #[cfg(any(test, debug_assertions))]
 pub use log_entries::{TestPassClaim, test_hold_pass_claim};
 pub(crate) use log_entries::{member_unset_names, member_waits_here, member_write};
+pub use log_fill::{LogFill, log_fill};
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
 };
@@ -5747,6 +5750,19 @@ pub fn test_sync_records_without_discovery(paths: &Paths) -> crate::Result<usize
     sync_records_inner(paths, None, &[], Some(&discovery), None)
 }
 
+/// Leave the state as an apply that began and did not finish: the mark an apply sets before it
+/// changes what this Mac holds, so the vault is not ready until a [`sync`] finishes one.
+///
+/// # Errors
+/// The state lock cannot be taken, or the state cannot be read or saved.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn test_interrupt_apply(paths: &Paths) -> crate::Result<()> {
+    let _lock = StateLock::take(paths)?;
+    let mut state = load_state(paths)?;
+    prepare_materialization(paths, &mut state)
+}
+
 /// [`sync_records`] with explicit `candidates` probed alongside policy and discovered peers when
 /// the primary fails or when polling immediately (`wait == None`).
 ///
@@ -5884,6 +5900,7 @@ impl PeerRecords {
             needs,
             boot,
             bound,
+            heads: _,
         } = answer;
         let records = if received.byte_len() > fan_out::RECORDS.peek {
             Brought::Judged(judge(received))
@@ -6167,6 +6184,7 @@ fn sync_records_until(
             needs,
             boot,
             bound,
+            heads: _,
         }) => {
             any_answered = true;
             if primary_named.heads > 0 {
@@ -9527,7 +9545,7 @@ fn subscriber_pass_saying(
     alab_join::resume(paths)?;
     let config = config(paths)?
         .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
-    let before = repaired.clone();
+    let before = *repaired;
     let synced = match config.source {
         Source::Url(_) => {
             let wait = (!repair_due(paths, repaired)).then_some(LONG_POLL);
@@ -11241,7 +11259,8 @@ fn auto_approve_listed(
         roster::maintain_swarm_roster_on_approve(&mut doc, &newly_named)?;
     }
     if !done.approved.is_empty() || unaddressed || rostered(&doc) != roster_before {
-        let published = publish_as(paths, admin, &doc, false, &admissions, false);
+        // It lets a Mac in, whether it records an admission or names one the log let in.
+        let published = publish_letting_in(paths, admin, &doc, &admissions);
         // A version the vault refused before storing it (another admin's publish came first)
         // cannot have landed; any other failed publish may have.
         *publishing =
@@ -14097,15 +14116,31 @@ pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Res
 /// this is not global consensus. A successful call upgrades an unparented vault
 /// to parented publication, which requires a reader that understands parents.
 ///
+///
+/// `author` is who publishes: the automatic writers call this (the repository inventory's
+/// upkeep, the account broker's publish), each by its name, and such a writer's batch is
+/// refused where a `Put` it changed is over
+/// [`crate::membership_log::budgets::AUTOMATIC_PUT_LIMIT`], at any fill, where the batch would
+/// pass the automatic stop in the membership log, or where its seat's `Put`s of the last 24
+/// hours and the batch pass [`crate::membership_log::budgets::AUTOMATIC_PUT_BUDGET`]. Such a
+/// writer is also refused, by an error of another kind, where what it publishes would not be
+/// asked: its `[everyone]` write would wait for a removal's new key, or this Mac's log cannot
+/// take its edit's records (it is behind the version edited, or this Mac signs none there). A
+/// person's own publish ([`Author::Person`]) is held to its class alone.
+///
 /// # Errors
 /// Missing opened head, expired deadline, lost admin custody, changed source,
 /// changed receiving head or the normal sealing/publication failures. A lost
-/// response may follow a stored publication and must not be treated as rollback.
+/// response may follow a stored publication and must not be treated as rollback. A refusal by
+/// the log's fill is [`crate::ErrorKind::MembershipCapacity`], its words the size and the
+/// limit, the class, the fill and what still fits, or what the seat signed in a day; nothing
+/// was signed or sent.
 pub fn admin_publish_conditional_until(
     paths: &Paths,
     admin: &Admin,
     doc: &Document,
     deadline: Instant,
+    author: Author<'_>,
 ) -> crate::Result<Published> {
     publish_as_with_removal(
         paths,
@@ -14119,6 +14154,7 @@ pub fn admin_publish_conditional_until(
         Some(deadline),
         None,
         true,
+        Some(log_entries::Ask::Edit(author)),
     )
 }
 
@@ -14178,6 +14214,9 @@ fn admin_publish_revocation(
         None,
         Some((recipients, &mut retired)),
         false,
+        // The removal's prepared batch, membership whole: its room was reserved before its
+        // `Remove` (`remove::RemovalFill`), and no class is asked of it.
+        None,
     );
     let published = outcome.map_err(|error| {
         if retired.is_some() {
@@ -14236,7 +14275,61 @@ fn publish_admitting(
         .iter()
         .map(|r| (r.clone(), method))
         .collect::<Vec<_>>();
-    publish_as(paths, admin, doc, false, &admissions, false)
+    publish_letting_in(paths, admin, doc, &admissions)
+}
+
+/// Publish `doc`, which lets a Mac in: it records each of `approved` an admission, or names in
+/// `[machines]` (and the swarm roster) a Mac the membership log let in. The control records it
+/// changes are membership with the keys it wraps ([`log_entries::Ask::LetsIn`]), so a lab whose
+/// log is past the stop of a person's write still lets a Mac in; any other entry it changed is a
+/// person's write.
+fn publish_letting_in(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    approved: &[(String, AdmissionMethod)],
+) -> crate::Result<Published> {
+    publish_as_with_removal(
+        paths,
+        admin,
+        doc,
+        false,
+        approved,
+        false,
+        &[],
+        None,
+        None,
+        None,
+        false,
+        Some(log_entries::Ask::LetsIn(Author::Person)),
+    )
+}
+
+/// Publish `doc`, the steward's tail of a removal the log already holds
+/// (`steward_finish_revokes`): the removal mirrored into `[machines]`, the removed Mac's label
+/// and node denied on the swarm roster, its slots taken out of the AI pool file. It is asked no
+/// class, as the cascade a revoke puts in its own batch is not (`admin_publish_revocation`): a
+/// removal is membership, which runs to the log's bound, and one whose roster still admits the
+/// removed Mac is half done. `doc` is the version published with only that tail on it.
+fn admin_publish_removal_tail(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+) -> crate::Result<Published> {
+    publish_as_with_removal(
+        paths,
+        admin,
+        doc,
+        false,
+        &[],
+        false,
+        &[],
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
 }
 
 /// Publish `doc`, which names `host` an admin. In a vault whose Commons control entry `host` is
@@ -14376,12 +14469,13 @@ fn publish_as_with(
         deadline,
         None,
         false,
+        Some(log_entries::Ask::Edit(Author::Person)),
     )
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the common publication path plus explicit revocation preparation"
+    reason = "the common publication path plus explicit revocation preparation and the author"
 )]
 fn publish_as_with_removal(
     paths: &Paths,
@@ -14395,6 +14489,7 @@ fn publish_as_with_removal(
     deadline: Option<Instant>,
     mut removing: Option<(&[Recipient], &mut Option<retirement::Retirement>)>,
     exact_parent: bool,
+    ask: Option<log_entries::Ask<'_>>,
 ) -> crate::Result<Published> {
     publication_current(deadline)?;
     let parent = if exact_parent || admin.parented {
@@ -14521,6 +14616,14 @@ fn publish_as_with_removal(
                         // writes over it (one-mesh W3).
                         Some(&admin.shown),
                         deadline,
+                        // A publish that records an admission lets a Mac in: the control
+                        // records it shares with that Mac are membership with its keys, so a lab
+                        // whose log is past the stop of a person's write still lets a Mac in,
+                        // and anything else it changed is its author's write.
+                        ask.map(|ask| match approved {
+                            [] => ask,
+                            _ => log_entries::Ask::LetsIn(ask.author()),
+                        }),
                     )?
                     .map_or(
                         (None, log_entries::EveryoneWrites::none()),
@@ -14534,6 +14637,52 @@ fn publish_as_with_removal(
                 }
             }
         };
+        // An automatic writer publishes only what it drafted into this Mac's log, where its
+        // class and its seat's budget were asked. A version it sent with no records (the log is
+        // behind the version it edits, or this Mac signs none there) would be imported later by
+        // a mirror, which asks nothing, as some seat's own `Put`s: the unasked way into the log.
+        // Nothing was signed or sent; it offers its write again. A vault with no log has no
+        // bound to keep.
+        if drafted.is_none()
+            && admin.log_base != log_entries::LogBase::NoLog
+            && let Some(Author::Automatic(writer)) = ask.map(log_entries::Ask::author)
+        {
+            return Err(Error::new(format!(
+                "{writer}'s write was not published: this Mac's vault log does not hold the \
+                 version it edits yet, or this Mac signs no record there, so its class and its \
+                 seat's budget could not be asked; it can be offered again once the log holds it"
+            )));
+        }
+        // A person's edit that goes out with no records is signed later by a mirror, which asks
+        // nothing. Its batch is not known here, but a log this Mac holds past the stop of a
+        // person's write has no room for any of it: it is refused, sending nothing, until the
+        // log holds the version it edits and the edit can be drafted and asked.
+        if drafted.is_none()
+            && admin.log_base != log_entries::LogBase::NoLog
+            && ask == Some(log_entries::Ask::Edit(Author::Person))
+            && let Some(local) = log_entries::trusted_local_log(paths, &admin.config)
+                .ok()
+                .flatten()
+            && local.held_bytes()
+                >= crate::membership_log::budgets::author_stop(crate::membership_log::Class::Person)
+        {
+            return Err(Error::of_kind(
+                crate::ErrorKind::MembershipCapacity,
+                format!(
+                    "this write was not published: this Mac's vault log does not hold the \
+                     version it edits yet, or this Mac signs no record there, so its records \
+                     would be signed later with no class asked, and the log holds {}, past the \
+                     {} a person's write stops at; it can be written again once this Mac's log \
+                     holds that version (`aterm secrets sync`)",
+                    crate::membership_log::budgets::size_words(local.held_bytes()),
+                    crate::membership_log::budgets::size_words(
+                        crate::membership_log::budgets::author_stop(
+                            crate::membership_log::Class::Person,
+                        )
+                    ),
+                ),
+            ));
+        }
         let stamp = drafted.as_ref().and_then(log_entries::Drafted::stamp);
         let (bytes, release, pairs) = if rotate {
             let mut seed = [0u8; 32];

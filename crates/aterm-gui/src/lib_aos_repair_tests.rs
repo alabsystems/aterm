@@ -46,7 +46,7 @@ pub(super) fn momentum_app_on(mut app: App, light: bool) -> App {
     app.kitty_cursor_enabled_cache = None;
     app.recompute_sparkle();
     {
-        let ws = app.windows.get_mut(&WID).expect("window");
+        let mut ws = app.windows.get_mut(&WID).expect("window");
         ws.focused = true;
         ws.frame_interval = Some(PANEL);
     }
@@ -153,7 +153,7 @@ pub(super) fn run_lane(app: &mut App, from: Instant) -> Parked {
         last_presented: false,
     };
     loop {
-        let ws = app.windows.get_mut(&WID).expect("window");
+        let mut ws = app.windows.get_mut(&WID).expect("window");
         let settling = ws.fx.cursor().momentum.settling();
         parked.saw_settling |= settling;
         let Some(deadline) = ws.plan_terminal_effect_lane(now, false, true) else {
@@ -171,6 +171,7 @@ pub(super) fn run_lane(app: &mut App, from: Instant) -> Parked {
             "the armed clock is due at its deadline"
         );
         parked.settle_wakes += usize::from(settling);
+        drop(ws);
         let commits = surface(app).commits();
         app.redraw_window_at(WID, deadline);
         parked.last_presented = surface(app).commits() > commits;

@@ -46,9 +46,14 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     use crate::native_settings::{SettingsRoute, SettingsViewState};
     use crate::tab_model::{SplitAxis, ViewId};
 
-    fn settings(app: &mut App, view: ViewId) -> &mut SettingsViewState {
-        match app.native_runtime.view_state_mut(view).unwrap() {
-            AppViewState::Settings(state) => state,
+    fn with_settings<R>(
+        app: &mut App,
+        view: ViewId,
+        run: impl FnOnce(&mut SettingsViewState) -> R,
+    ) -> R {
+        let mut guard = app.native_runtime.view_state_mut(view).unwrap();
+        match &mut *guard {
+            AppViewState::Settings(state) => run(state),
             _ => panic!("expected Settings"),
         }
     }
@@ -71,22 +76,20 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     app.native_runtime
         .attach_view(sibling, instance, AppViewState::Settings(Box::new(state)))
         .unwrap();
-    let tab = app
-        .windows
-        .get_mut(&wid)
-        .unwrap()
-        .tab_set
-        .active_mut()
-        .unwrap();
+    let mut window_guard = app.windows.get_mut(&wid).unwrap();
+    let tab = window_guard.tab_set.active_mut().unwrap();
     assert!(tab.root.split_leaf(first, SplitAxis::Horizontal, terminal));
     assert!(tab.root.split_leaf(terminal, SplitAxis::Vertical, sibling));
     let settings_tab = tab.id;
+    drop(window_guard);
 
     assert_eq!(
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_PUBLISH_TICK)
     );
-    settings(&mut app, sibling).show_transient_status_for_test("Copied");
+    with_settings(&mut app, sibling, |state| {
+        state.show_transient_status_for_test("Copied")
+    });
     assert_eq!(
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_PUBLISH_MIN_GAP),
@@ -97,7 +100,7 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_FEEDBACK_WAIT)
     );
-    settings(&mut app, first).navigate(SettingsRoute::Home);
+    with_settings(&mut app, first, |state| state.navigate(SettingsRoute::Home));
     assert_eq!(
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_FEEDBACK_WAIT)
@@ -126,7 +129,9 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
         app.settings_messages_quiet_gap(),
         Some(MESSAGES_FEEDBACK_WAIT)
     );
-    settings(&mut app, sibling).navigate(SettingsRoute::Home);
+    with_settings(&mut app, sibling, |state| {
+        state.navigate(SettingsRoute::Home)
+    });
     assert_eq!(
         app.settings_messages_quiet_gap(),
         None,
@@ -4066,7 +4071,7 @@ fn shared_native_model_edits_invalidate_sibling_presentations() {
     let mut app = App::headless_for_test();
     let first = WindowId(0);
     {
-        let window = app.windows.get_mut(&first).unwrap();
+        let mut window = app.windows.get_mut(&first).unwrap();
         window.rows = 90;
         window.cols = 160;
     }
@@ -4183,7 +4188,7 @@ fn native_compile_uses_each_window_font_for_its_stamp() {
     let (rows, cols) = (app.windows[&first].rows, app.windows[&first].cols);
     let second = app.insert_logical_window(crate::stub_session(next_session), rows, cols);
     {
-        let window = app.windows.get_mut(&second).unwrap();
+        let mut window = app.windows.get_mut(&second).unwrap();
         window.metrics.font_px = 24.0;
         window.scale = 2.0;
     }
@@ -6577,7 +6582,7 @@ fn old_hidden_output_without_present_ages_to_quiet() {
     let mut app = App::headless_for_test();
     app.config.cursor_blink = Some(false);
     app.serious_mode = true;
-    if let Some(window) = app.windows.get_mut(&crate::WindowId(0)) {
+    if let Some(mut window) = app.windows.get_mut(&crate::WindowId(0)) {
         window.focused = false;
         window.next_blink = None;
     }
@@ -12747,9 +12752,10 @@ fn tab_walks_the_whole_system_state_list() {
     // another vault under its row.
     let opened = |rows: u16| {
         let mut app = App::headless_for_test();
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = rows;
         window.cols = 100;
+        drop(window);
         assert!(app.open_system_state_tab());
         app.native_runtime.publish_system_state(
             crate::system_state::fixture_status("set-up").expect("a scenario"),
@@ -13141,7 +13147,7 @@ fn bare_return_activates_the_pages_primary_default_button() {
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.cols = 220;
         ws.rows = 60;
     }
@@ -13215,7 +13221,7 @@ fn an_unfocused_return_saves_this_mac_only_over_a_persons_typed_words() {
     };
     for person in [false, true] {
         let mut app = App::headless_for_test();
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.cols = 160;
             ws.rows = 60;
         }
@@ -14522,7 +14528,7 @@ fn tab_enters_the_theme_list_at_the_highlighted_row_and_leaves_in_one_step() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 160;
         window.rows = 50;
     }
@@ -14603,7 +14609,7 @@ fn a_segmented_control_is_one_tab_stop_and_one_arrow_model() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 150;
         window.rows = 48;
     }
@@ -14762,7 +14768,7 @@ fn editor_app(
 ) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 92;
         window.rows = 34;
     }
@@ -15092,7 +15098,7 @@ fn killing_a_buffer_behind_the_front_leaves_its_neighbours_failure_unseen() {
     let dir = aterm_tempfile::TempDir::new().unwrap();
     let (mut app, first_view, first_document, _) = editor_app(dir.path(), "first.txt", "one\n");
     let wid = WindowId(0);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.os_window_for_test = true;
         ws.focused = true;
     }
@@ -15465,7 +15471,7 @@ fn page_down_before_a_pages_first_frame_steps_by_that_page() {
     let shown = |from: SettingsRoute, drawn_first: bool| {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.cols = 80;
             ws.rows = 24;
         }
@@ -15499,13 +15505,13 @@ fn page_down_before_a_pages_first_frame_steps_by_that_page() {
     let resized = |drawn_first: bool| {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.cols = 80;
             ws.rows = 40;
         }
         assert!(app.open_settings_tab(SettingsRoute::Terminal));
         let _ = app.compiled_native_ui(wid).unwrap();
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.rows = 24;
         }
         if drawn_first {
@@ -15560,7 +15566,7 @@ fn every_page_down_on_cursor_styles_shows_something_new() {
         for cols in [100_u16, 102, 104] {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
-            if let Some(ws) = app.windows.get_mut(&wid) {
+            if let Some(mut ws) = app.windows.get_mut(&wid) {
                 ws.cols = cols;
                 ws.rows = rows;
             }
@@ -15646,7 +15652,7 @@ fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
     };
     let fresh = |route: SettingsRoute| {
         let mut app = App::headless_for_test();
-        if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+        if let Some(mut ws) = app.windows.get_mut(&WindowId(0)) {
             ws.cols = 220;
             ws.rows = 12;
         }
@@ -15767,7 +15773,7 @@ fn page_down_walks_the_read_page() {
     let wid = WindowId(0);
     let fresh = || {
         let mut app = App::headless_for_test();
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.cols = 220;
             ws.rows = 12;
         }
@@ -15866,7 +15872,7 @@ fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
         );
         assert_eq!(crate::native_appearance::text_scale(), 2.0);
         let wid = WindowId(0);
-        if let Some(ws) = app.windows.get_mut(&wid) {
+        if let Some(mut ws) = app.windows.get_mut(&wid) {
             ws.cols = 220;
             ws.rows = 14;
         }
@@ -15993,7 +15999,7 @@ fn tab_from_the_compact_search_field_goes_on_into_the_list() {
                 ),
             ] {
                 let mut app = App::headless_for_test();
-                if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+                if let Some(mut ws) = app.windows.get_mut(&WindowId(0)) {
                     ws.cols = cols;
                     ws.rows = 24;
                 }
@@ -16080,7 +16086,7 @@ fn the_packages_page_reads_the_store_again_when_it_comes_to_the_front() {
     );
 
     let (_, view) = app.active_native_view(wid).expect("the Settings tab");
-    match app.native_runtime.view_state_mut(view) {
+    match app.native_runtime.view_state_mut(view).as_deref_mut() {
         Some(crate::native_app::AppViewState::Settings(state)) => {
             state.navigate(SettingsRoute::Home);
         }

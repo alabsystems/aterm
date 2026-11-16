@@ -178,7 +178,7 @@ fn pool(root: &Path) -> (Pool, ExternalDebt, Retired) {
 
 fn request() -> Request {
     let job = Binding {
-        session: "s-0000000000000000ab12".into(),
+        session: "t000000ab12".into(),
         attempt: [1; 16],
     };
     Request {

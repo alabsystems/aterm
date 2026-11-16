@@ -14,8 +14,11 @@ use crate::harness::claims::{self, LeaseKey, tests::Replica};
 impl World {
     /// `cli`'s roster of two with an email on each row, on a Mac whose accounts sheet is
     /// `ai-pool.toml`'s, where claims apply.
+    #[cfg(unix)]
     fn claimed_two(&self, cli: Cli) {
         self.emailed_two(cli);
+        // Off Unix the vault is absent; the portable cases below judge the refused claim.
+        #[cfg(unix)]
         crate::vault_entry::put(
             &self.home,
             crate::harness::ai_pool::AI_POOL_FILE,
@@ -36,6 +39,7 @@ impl World {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn launch_claims_before_the_first_tap() {
     let (m1, m2) = (World::new("claims-m1"), World::new("claims-m2"));
@@ -52,14 +56,6 @@ fn launch_claims_before_the_first_tap() {
     let pick = claims::with_table(t1.clone(), || {
         launch_env(&m1.seat(), Cli::Claude, &no_usage)
     });
-    if cfg!(not(unix)) {
-        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
-        // the claim is unrecorded and a non-home lease is refused with no claim row written.
-        assert_eq!(pick, None);
-        assert!(m1.load(Cli::Claude).unrecorded);
-        assert_eq!(t1.row("aa01"), None);
-        return;
-    }
     assert_eq!(pick.expect("a pick").label, "main");
     let main = LeaseKey::new("claude", "main@example.test").expect("a key");
     let row = t1.row("aa01").expect("m1's launch wrote its row");
@@ -86,6 +82,7 @@ fn launch_claims_before_the_first_tap() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_launch_never_starts_on_a_lease_its_claim_could_not_record() {
     let m1 = World::new("claims-refused");
@@ -118,6 +115,7 @@ fn a_launch_never_starts_on_a_lease_its_claim_could_not_record() {
     assert_eq!(full.row("aa01"), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_codex_launch_claims_its_account() {
     let m1 = World::new("claims-codex");
@@ -125,11 +123,6 @@ fn a_codex_launch_claims_its_account() {
     m1.on_main(Cli::Codex, &[]);
     let t1 = Arc::new(Replica::new("aa01"));
     let pick = claims::with_table(t1.clone(), || launch_env(&m1.seat(), Cli::Codex, &no_usage));
-    if cfg!(not(unix)) {
-        assert!(pick.is_none());
-        assert!(t1.row("aa01").is_none());
-        return;
-    }
     assert_eq!(pick.expect("a pick").label, "main");
     assert!(
         t1.row("aa01")
@@ -204,6 +197,7 @@ fn native_quota_commit_claims_the_destination_and_refuses_a_senior_peer() {
 /// NEGATIVE CONTROL: in `launch_env_using`'s `Mode::Off` branch, drop the pin's `lease_verdict`
 /// check and keep claiming after `finish_launch` with the answer thrown away (as before), and m2
 /// starts on `work` beside m1, and the refusing table's launch starts on `work` unrecorded.
+#[cfg(unix)]
 #[test]
 fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
     let (m1, m2) = (World::new("claims-off-m1"), World::new("claims-off-m2"));
@@ -229,27 +223,6 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
     let pick = claims::with_table(t1.clone(), || {
         super::super::launch_env(&m1.seat(), Cli::Claude, &no_usage)
     });
-    if cfg!(not(unix)) {
-        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
-        // a non-home pin is refused until marked home, with no claim row written.
-        let why = pick.expect_err("off Unix a non-home pin's claim is unrecorded");
-        assert!(why.contains("cannot record a claim"), "{why}");
-        assert_eq!(t1.row("aa01"), None);
-        let mut note = None;
-        m1.seat()
-            .store(Cli::Claude)
-            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
-                state.home_accounts.insert("work".to_owned());
-                Ok(Vec::new())
-            })
-            .expect("a home account");
-        let home_pick = claims::with_table(t1.clone(), || {
-            super::super::launch_env(&m1.seat(), Cli::Claude, &no_usage)
-        });
-        assert_eq!(home_pick.expect("a launch").expect("a pick").label, "work");
-        assert_eq!(t1.row("aa01"), None);
-        return;
-    }
     assert_eq!(pick.expect("a launch").expect("a pick").label, "work");
     let row = t1.row("aa01").expect("m1's launch wrote its row");
     assert_eq!(
@@ -300,6 +273,7 @@ fn rotation_off_never_starts_on_a_pin_another_mac_holds() {
     assert_eq!(pick.expect("a launch").expect("a pick").label, "work");
 }
 
+#[cfg(unix)]
 #[test]
 fn cold_relaunch_claims_kept_row_and_moves_off_a_row_another_mac_holds() {
     let (m1, m2) = (World::new("claims-cold-m1"), World::new("claims-cold-m2"));
@@ -319,27 +293,6 @@ fn cold_relaunch_claims_kept_row_and_moves_off_a_row_another_mac_holds() {
     let pick = claims::with_table(t1.clone(), || {
         cold_launch_env(&m1.seat(), Cli::Claude, &[], &no_usage, None)
     });
-    if cfg!(not(unix)) {
-        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
-        // no claim row is written and cold relaunch moves only onto a home account.
-        assert_eq!(pick, None);
-        assert!(m1.load(Cli::Claude).unrecorded);
-        assert_eq!(t1.row("aa01"), None);
-        let mut note = None;
-        m1.seat()
-            .store(Cli::Claude)
-            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
-                state.home_accounts.insert("work".to_owned());
-                Ok(Vec::new())
-            })
-            .expect("a home account");
-        let moved = claims::with_table(t1.clone(), || {
-            cold_launch_env(&m1.seat(), Cli::Claude, &[], &no_usage, None)
-        });
-        assert_eq!(moved.expect("moved onto home work").label, "work");
-        assert_eq!(t1.row("aa01"), None);
-        return;
-    }
     assert_eq!(
         pick, None,
         "main still serves, so the cold relaunch keeps it"
@@ -366,14 +319,11 @@ fn cold_relaunch_claims_kept_row_and_moves_off_a_row_another_mac_holds() {
 
 /// A row another Mac's live claim holds is not taken on a session's asking: the relaunch keeps
 /// the row it ran on. CONTROL: the same ask on the Mac that holds the claim moves its session.
+#[cfg(unix)]
 #[test]
 fn a_relaunch_that_asked_for_a_row_another_mac_holds_keeps_its_own() {
     use super::usage_policy::{Reads, plain_usage};
     use crate::harness::restart_stamp::Wanted;
-    if cfg!(not(unix)) {
-        // Off Unix no claim activity is kept; the claims tests above say what a launch does there.
-        return;
-    }
     let (m1, m2) = (World::new("claims-asked-m1"), World::new("claims-asked-m2"));
     for world in [&m1, &m2] {
         world.claimed_two(Cli::Codex);
@@ -413,6 +363,7 @@ fn a_relaunch_that_asked_for_a_row_another_mac_holds_keeps_its_own() {
 
 /// A replica that takes `peer`'s rows from its `after`-th read on (counting from 0): a Commons
 /// exchange that lands between two reads of one admission.
+#[cfg(unix)]
 struct LandsAfter {
     inner: Arc<Replica>,
     peer: Arc<Replica>,
@@ -420,6 +371,7 @@ struct LandsAfter {
     reads: std::sync::atomic::AtomicUsize,
 }
 
+#[cfg(unix)]
 impl claims::Table for LandsAfter {
     fn read(&self, home: &Path) -> Result<claims::Tabled, String> {
         if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.after {
@@ -437,13 +389,11 @@ impl claims::Table for LandsAfter {
 /// is not taken either: the claim the asked row's admission makes is refused, and the relaunch
 /// keeps the row it ran on. CONTROL: the look alone saw no holder, so the records the ask is
 /// judged on refuse nothing.
+#[cfg(unix)]
 #[test]
 fn a_relaunch_whose_claim_on_the_asked_row_is_refused_keeps_its_own() {
     use super::usage_policy::{Reads, plain_usage};
     use crate::harness::restart_stamp::Wanted;
-    if cfg!(not(unix)) {
-        return;
-    }
     let (m1, m2) = (
         World::new("claims-asked-late-m1"),
         World::new("claims-asked-late-m2"),
@@ -496,13 +446,11 @@ fn a_relaunch_whose_claim_on_the_asked_row_is_refused_keeps_its_own() {
 /// Macs would read a row no session here starts on as held until its claim lapsed. The policy
 /// turned off while the asked row was read changes the routing the relaunch was judged on, so
 /// its admission, and the relaunch, wait for another observation.
+#[cfg(unix)]
 #[test]
 fn an_asked_row_whose_admission_fails_is_left_unclaimed() {
     use super::usage_policy::{Reads, plain_usage};
     use crate::harness::restart_stamp::Wanted;
-    if cfg!(not(unix)) {
-        return;
-    }
     let world = World::new("claims-asked-unadmitted");
     world.claimed_two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
@@ -597,7 +545,7 @@ fn a_home_with_no_pool_file_claims_its_account_and_the_borrower_yields() {
     use claims::Table;
     let (m1, m13) = (World::new("claims-home"), World::new("claims-borrower"));
     m1.emailed_two(Cli::Claude);
-    m13.claimed_two(Cli::Claude);
+    m13.emailed_two(Cli::Claude);
     for world in [&m1, &m13] {
         world.on_main(Cli::Claude, &[]);
     }
@@ -638,6 +586,8 @@ fn a_home_with_no_pool_file_claims_its_account_and_the_borrower_yields() {
         assert!(!m1.load(Cli::Claude).unrecorded);
         return;
     }
+    #[cfg(unix)]
+    m13.claimed_two(Cli::Claude);
     let row = t1.row("aa01").expect("m1's launch claims its home account");
     assert!(row.ranks_homes);
     assert_eq!(
@@ -744,4 +694,144 @@ fn a_home_with_no_pool_file_gives_its_claims_up_whatever_its_lab_names_by_then()
     });
     assert_eq!(off, claims::Touched::NotApplicable);
     assert_eq!(t3.row("cc03"), None);
+}
+
+/// A ROW ONLY ITS FLEET TOKEN RUNS HERE STARTS ONLY ON A CLAIM THIS MAC RECORDED (FL-135): no
+/// login of it was made here, so nothing but this Mac's claim keeps a second Mac off its account.
+/// Where `ai-pool.toml` is ([`claims::Scope::Every`]) the claims cover it
+/// ([`claims::covers`]): m1 claims `work` and starts on it, and m2, which heard that claim, reads
+/// it held elsewhere and is refused it. With no pool file ([`claims::Scope::Homes`]) a Mac claims
+/// only the accounts its lab names it a home of: m13, `work`'s home, claims it and starts on it,
+/// while m3 and m4, which borrow it, claim nothing ([`claims::Touched::NotApplicable`]), so each is
+/// refused it, and its claims do not cover it, so no reading puts it on its token there.
+///
+/// NEGATIVE CONTROLS: a row whose login was made here (`token_only` false) starts on the same
+/// `NotApplicable` touch, as before FL-135, and on an unrecorded claim only where it is a home
+/// account; a senior claim elsewhere and a preparation hold refuse any row. Admit a token-only
+/// row on `NotApplicable` (`claim_admits` returning `!token_only` there no longer), and m3 and m4
+/// both start on `work` at once (`borrowers start on nothing they cannot claim`).
+#[test]
+#[cfg(unix)]
+fn a_token_only_row_starts_only_on_a_claim_this_mac_recorded() {
+    use claims::{Holder, Kind, Touched};
+    let homed = accounts::State {
+        home_accounts: ["main".to_owned()].into(),
+        ..accounts::State::default()
+    };
+    let holder = Holder {
+        machine: "bb02".into(),
+        label: "m2".into(),
+        kind: Kind::Lease,
+        since: NOW,
+        until: NOW + HOUR,
+    };
+    for (claim, label, made_here, token_only) in [
+        (Touched::Claimed, "work", true, true),
+        (Touched::Held, "work", true, true),
+        (Touched::Looked, "work", true, true),
+        (Touched::NotApplicable, "work", true, false),
+        (Touched::Unrecorded("down".into()), "main", true, false),
+        (Touched::Unrecorded("down".into()), "work", false, false),
+        (Touched::HeldElsewhere(holder.clone()), "work", false, false),
+        (Touched::PreparationOnly, "work", false, false),
+    ] {
+        assert_eq!(
+            claim_admits(&claim, &homed, label, false),
+            made_here,
+            "a row made here: {claim:?} on {label}"
+        );
+        assert_eq!(
+            claim_admits(&claim, &homed, label, true),
+            token_only,
+            "a row only its token runs here: {claim:?} on {label}"
+        );
+    }
+    if cfg!(not(unix)) {
+        // Off Unix no claim activity can be kept, so no claim is recorded and no token-only row
+        // starts (the table above).
+        return;
+    }
+    let roster_of = |world: &World| {
+        accounts::Roster::load_for(
+            Cli::Claude,
+            &world.cfg.join(Cli::Claude.accounts().roster_file),
+        )
+        .expect("the roster")
+    };
+    let claim_work = |world: &World, table: &Arc<Replica>| {
+        claims::with_table(table.clone(), || {
+            world.seat().claim(Cli::Claude, claims::Act::Claim("work"))
+        })
+    };
+
+    // Every account: the first Mac's claim holds the account against the second.
+    let (m1, m2) = (World::new("token-only-m1"), World::new("token-only-m2"));
+    for world in [&m1, &m2] {
+        world.claimed_two(Cli::Claude);
+    }
+    let work = roster_of(&m1).row("work").expect("the row").clone();
+    assert!(claims::covers(&m1.home, Cli::Claude, &work));
+    let (t1, t2) = (
+        Arc::new(Replica::new("aa01")),
+        Arc::new(Replica::new("bb02")),
+    );
+    let first = claim_work(&m1, &t1);
+    assert_eq!(first, Touched::Claimed);
+    assert!(claim_admits(&first, &m1.load(Cli::Claude), "work", true));
+    t2.merge(&t1);
+    let second = claim_work(&m2, &t2);
+    assert!(matches!(second, Touched::HeldElsewhere(_)), "{second:?}");
+    assert!(!claim_admits(&second, &m2.load(Cli::Claude), "work", true));
+
+    // Homes only: the home claims its account; a borrower claims nothing and is refused it.
+    let (m13, m3, m4) = (
+        World::new("token-only-home"),
+        World::new("token-only-m3"),
+        World::new("token-only-m4"),
+    );
+    for world in [&m13, &m3, &m4] {
+        world.emailed_two(Cli::Claude);
+    }
+    let homes = || claims::Homes::of(&lab("mc-m13", "mc-m1"));
+    let (t3, t4) = (
+        Arc::new(Replica::with_homes("cc03", homes())),
+        Arc::new(Replica::with_homes("dd04", homes())),
+    );
+    let borrowers = [(&m3, &t3, "mc-m3"), (&m4, &t4, "mc-m4")].map(|(world, table, me)| {
+        crate::harness::alab_roster::with_lab(lab(me, "mc-m1"), || {
+            assert!(
+                !claims::covers(&world.home, Cli::Claude, &work),
+                "a borrower's claims do not cover the account"
+            );
+            claim_work(world, table)
+        })
+    });
+    for claim in &borrowers {
+        assert_eq!(*claim, Touched::NotApplicable);
+        assert!(
+            claim_admits(claim, &accounts::State::default(), "work", false),
+            "CONTROL: a row made here starts as before"
+        );
+    }
+    assert!(
+        borrowers.iter().all(|claim| !claim_admits(
+            claim,
+            &accounts::State::default(),
+            "work",
+            true
+        )),
+        "borrowers start on nothing they cannot claim"
+    );
+    let t13 = Arc::new(Replica::with_homes("bb02", homes()));
+    let home = crate::harness::alab_roster::with_lab(lab("mc-m13", "mc-m1"), || {
+        assert!(claims::covers(&m13.home, Cli::Claude, &work));
+        claim_work(&m13, &t13)
+    });
+    assert_eq!(home, Touched::Claimed);
+    assert!(claim_admits(&home, &m13.load(Cli::Claude), "work", true));
+    assert!(
+        t13.row("bb02")
+            .is_some_and(|row| row.claims.iter().any(|claim| claim.kind == Kind::Home)),
+        "the home's claim is a home's"
+    );
 }

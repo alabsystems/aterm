@@ -542,7 +542,7 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
         let remains = held.activity_owners.contains_key(key);
         assert_eq!(held.last_attempt.contains_key(key), remains);
         assert_eq!(held.parked.contains_key(key), remains);
-        assert_eq!(held.bot_checked.contains_key(key), remains);
+        assert_eq!(held.unrecorded_checks.contains_key(key), remains);
         remains
     };
     let ladder = |key: &str| {
@@ -699,11 +699,12 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
                 accounts::Event::new(NOW, accounts::Kind::SignIn, "account")
                     .because("provider browser bot-check"),
             );
+            accounts::note_check_stop(logins, &raw, NOW);
             Ok(events)
         })
         .unwrap();
     let logins = store.load_logins(NOW).unwrap().0;
-    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), Some(NOW));
+    assert_eq!(check_standing_at(&store, &raw, &logins), Some(NOW));
     fs::rename(store.ledger_path(), root.path().join("retained-ledger")).unwrap();
     fs::create_dir(store.ledger_path()).unwrap();
     assert!(
@@ -729,7 +730,7 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
     fs::rename(store.ledger_path(), root.path().join("obstruction")).unwrap();
     fs::rename(root.path().join("retained-ledger"), store.ledger_path()).unwrap();
     let logins = store.load_logins(NOW + 1).unwrap().0;
-    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), Some(NOW));
+    assert_eq!(check_standing_at(&store, &raw, &logins), Some(NOW));
     store
         .transact_logins(NOW + 1, &mut None, |state, logins| {
             Ok(accounts::note_signed_back(
@@ -741,7 +742,7 @@ fn sign_back_clears_persisted_bot_hold_only_after_a_committed_success() {
         })
         .unwrap();
     let logins = store.load_logins(NOW + 1).unwrap().0;
-    assert_eq!(bot_check_on_record_at(&store, &raw, &logins), None);
+    assert_eq!(check_standing_at(&store, &raw, &logins), None);
     assert_eq!(
         store
             .load_logins(NOW + 1)

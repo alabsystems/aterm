@@ -354,18 +354,25 @@ pub struct TreeMeter {
 
 impl TreeMeter {
     /// Start reading the tree rooted at `root`: once now, then every [`READ_EVERY`] on a thread of
-    /// its own until [`Self::stop`].
+    /// its own until [`Self::request_stop`], [`Self::stop`] or drop.
     #[must_use]
     pub fn start(root: u32) -> TreeMeter {
+        Self::start_with(root, read_into)
+    }
+
+    fn start_with(
+        root: u32,
+        mut read: impl FnMut(u32, &Mutex<Tally>) + Send + 'static,
+    ) -> TreeMeter {
         let tally = Arc::new(Mutex::new(Tally::default()));
-        read_into(root, &tally);
+        read(root, &tally);
         let (tx, rx) = mpsc::channel::<()>();
         let reading = Arc::clone(&tally);
         let reader = std::thread::Builder::new()
             .name("build-meter".to_owned())
             .spawn(move || {
                 while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(READ_EVERY) {
-                    read_into(root, &reading);
+                    read(root, &reading);
                 }
             })
             .ok();
@@ -374,6 +381,16 @@ impl TreeMeter {
             tally,
             stop: Some(tx),
             reader,
+        }
+    }
+
+    /// Request an end to periodic sampling without waiting for an in-flight read.
+    ///
+    /// This does not join the reader or establish child retirement. The tally remains
+    /// available, and explicit reads still work until the meter is stopped or dropped.
+    pub fn request_stop(&self) {
+        if let Some(stop) = &self.stop {
+            let _ = stop.send(());
         }
     }
 

@@ -95,6 +95,7 @@ fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
         app: scratch.path().join("fixture.app"),
         version: None,
         commit: None,
+        ..crate::MeasureArtifact::unnamed(scratch.path().join("fixture.app"))
     }));
     let ledger = Ledger::at(scratch.path().join("window-ledger"));
     let machine = machine();
@@ -189,11 +190,9 @@ fn appkit_now(root: &Path) -> Ctx {
         root.join("scratch"),
     )
     .with_quiet(Some(Admit::Now))
-    .with_measure_artifact(Some(crate::MeasureArtifact {
-        app: root.join("fixture.app"),
-        version: None,
-        commit: None,
-    }))
+    .with_measure_artifact(Some(crate::MeasureArtifact::unnamed(
+        root.join("fixture.app"),
+    )))
 }
 
 /// Set, the test binary is [`standin_window_holder`]: another run holding the per-user window

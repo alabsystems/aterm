@@ -13,6 +13,11 @@
 //! measurement, so every first read is a fresh process's. No network; a records file holds no
 //! key or secret value, only ciphertext nothing here opens.
 //!
+//! `log_census fill <records file> [vault]` reads the file the same way and prints only how full
+//! the log is, as `aterm secrets status` says it ([`Log::fill`]: its `log:` line, each class's
+//! stop and room, each kind's records and bytes), from the record headers; it opens no body and
+//! writes nothing.
+//!
 //! `log_census build <shape> <out file>` signs a log of `shape` (`live`, `keyed` or `full`:
 //! [`LIVE`], [`KEYED`], [`FULL`]) and writes its records file. Every key it signs with is derived
 //! from a fixed label: none is a live identity.
@@ -34,10 +39,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [build, shape, out] if build == "build" => build_log(shape, out),
+        [fill, path] if fill == "fill" => fill_of(path, "alab"),
+        [fill, path, vault] if fill == "fill" => fill_of(path, vault),
         [path] => read(path, "alab"),
         [path, vault] => read(path, vault),
         _ => Err(
-            "usage: log_census <records file> [vault] | log_census build <shape> <out file>".into(),
+            "usage: log_census <records file> [vault] | log_census fill <records file> \
+                  [vault] | log_census build <shape> <out file>"
+                .into(),
         ),
     }
 }
@@ -108,6 +117,43 @@ fn audience(a: &EpochAudience) -> String {
         EpochAudience::Commons => "commons".into(),
         EpochAudience::Hosts(_) => "hosts".into(),
     }
+}
+
+/// How full the log in the records file at `path` is, at this clock: the status line, then each
+/// class and each kind. Sizes, counts and seat labels only.
+fn fill_of(path: &str, vault: &str) -> Result<()> {
+    use aterm_secrets::membership_log::Class;
+    let bytes = std::fs::read(path)?;
+    let store = Store::recover(vault, &bytes)?;
+    let log = store.log().ok_or("the store holds no log")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok());
+    let fill = log.fill(now);
+    let membership = log.membership();
+    println!(
+        "{}",
+        fill.line(|seat| membership.label(seat).unwrap_or("a Mac").to_owned())
+    );
+    println!(
+        "file {} bytes, held {} records",
+        bytes.len(),
+        log.held_count()
+    );
+    for class in Class::ALL {
+        println!(
+            "class {} stop {} room {} open {}",
+            class.word(),
+            fill.stops[class.index()],
+            fill.room(class),
+            fill.open(class)
+        );
+    }
+    for (kind, records, bytes) in fill.by_kind {
+        println!("kind {} records {records} bytes {bytes}", kind.word());
+    }
+    Ok(())
 }
 
 /// Time what a member reads of the records file at `path`, then count its records.

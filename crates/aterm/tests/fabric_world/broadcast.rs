@@ -220,22 +220,22 @@ fn a_broadcast_task_is_demoted_unless_the_sender_is_accepted() {
     god.publish(
         7_200,
         1,
-        &format!("/f/{FLEET}/pub/n-rogue/s-stranger/say/r23.kind"),
-        b"v=1 t=1 kind=task from=s-stranger text=r23stranger",
+        &format!("/f/{FLEET}/pub/n-rogue/tsmdhf9nbb6/say/r23.kind"),
+        b"v=1 t=1 kind=task from=tsmdhf9nbb6 text=r23stranger",
     )
     .expect("publish as a stranger node");
     god.publish(
         7_201,
         2,
-        &format!("/f/{FLEET}/pub/h-andrew/s-person/say/r23.kind"),
-        b"v=1 t=1 kind=task from=s-person text=r23human",
+        &format!("/f/{FLEET}/pub/h-andrew/t04gev3aevq/say/r23.kind"),
+        b"v=1 t=1 kind=task from=t04gev3aevq text=r23human",
     )
     .expect("publish as a human");
     god.publish(
         7_202,
         3,
-        &format!("/f/{FLEET}/pub/n-rogue/s-stranger/say/r23.kind"),
-        b"v=1 t=1 kind=control from=s-stranger text=r23ctl",
+        &format!("/f/{FLEET}/pub/n-rogue/tsmdhf9nbb6/say/r23.kind"),
+        b"v=1 t=1 kind=control from=tsmdhf9nbb6 text=r23ctl",
     )
     .expect("publish a control as a stranger node");
 
@@ -302,8 +302,8 @@ fn a_restarted_bridge_resumes_the_topic_where_it_stopped() {
     god.publish(
         7_300,
         1,
-        &format!("/f/{FLEET}/pub/n-elsewhere/s-peer/say/r23.boot"),
-        b"v=1 t=1 kind=note from=s-peer text=r23gap",
+        &format!("/f/{FLEET}/pub/n-elsewhere/t00047txd4c/say/r23.boot"),
+        b"v=1 t=1 kind=note from=t00047txd4c text=r23gap",
     )
     .expect("publish into the window");
     until("the bridge to come back under a new pid", || {
@@ -414,8 +414,8 @@ fn an_irrelevant_checkpoint_gap_replays_safely_and_live_delivery_stays_durable()
         .publish(
             7_301,
             1,
-            &format!("/f/{FLEET}/pub/n-elsewhere/s-peer/say/r23.quiet"),
-            b"v=1 t=1 kind=note from=s-peer text=quiet-gap",
+            &format!("/f/{FLEET}/pub/n-elsewhere/t00047txd4c/say/r23.quiet"),
+            b"v=1 t=1 kind=note from=t00047txd4c text=quiet-gap",
         )
         .expect("publish matching record across restart");
     until("the replacement bridge", || {
@@ -486,8 +486,8 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
             (
                 8_000 + i / 64,
                 (i % 64) + 1,
-                format!("/f/{FLEET}/pub/{node}/s-bl/say/r23.deep"),
-                format!("v=1 t=1 kind=note from=s-bl text=r23bl-{i}").into_bytes(),
+                format!("/f/{FLEET}/pub/{node}/t000003zq0e/say/r23.deep"),
+                format!("v=1 t=1 kind=note from=t000003zq0e text=r23bl-{i}").into_bytes(),
             )
         })
         .collect();
@@ -496,8 +496,8 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
     god.publish(
         8_090,
         1,
-        &format!("/f/{FLEET}/pub/n-mark/s-mk/say/r23.mark"),
-        b"v=1 t=1 kind=note from=s-mk text=r23mark",
+        &format!("/f/{FLEET}/pub/n-mark/t000003zqbr/say/r23.mark"),
+        b"v=1 t=1 kind=note from=t000003zqbr text=r23mark",
     )
     .expect("publish the marker");
     until("the face to read past the backlog (s_a's marker)", || {
@@ -562,8 +562,8 @@ fn a_broadcast_the_lane_never_took_is_redelivered_by_the_replacement() {
         .publish(
             8_300,
             1,
-            &format!("/f/{FLEET}/pub/n-far/s-peer/say/r23.lose"),
-            b"v=1 t=1 kind=note from=s-peer text=r23lost",
+            &format!("/f/{FLEET}/pub/n-far/t00047txd4c/say/r23.lose"),
+            b"v=1 t=1 kind=note from=t00047txd4c text=r23lost",
         )
         .expect("publish the broadcast");
     until("the bridge to lose its verb lane", || {
@@ -579,7 +579,7 @@ fn a_broadcast_the_lane_never_took_is_redelivered_by_the_replacement() {
             .into_iter()
             .find(|r| r.contains("text=r23lost"))
     });
-    assert!(row.contains("from=s-peer@n-far"), "{row}");
+    assert!(row.contains("from=t00047txd4c@n-far"), "{row}");
 }
 
 /// `topic drop` then `topic add since=@<off>` back to back, with no roster round between,
@@ -630,8 +630,8 @@ fn a_quota_refused_broadcast_is_counted_as_dropped() {
             (
                 8_400,
                 i + 1,
-                format!("/f/{FLEET}/pub/n-loud/s-one/say/r23.quota"),
-                format!("v=1 t=1 kind=note from=s-one text=r23q-{i}").into_bytes(),
+                format!("/f/{FLEET}/pub/n-loud/t000043q5e2/say/r23.quota"),
+                format!("v=1 t=1 kind=note from=t000043q5e2 text=r23q-{i}").into_bytes(),
             )
         })
         .collect();
@@ -669,8 +669,8 @@ fn a_restarted_bridge_walks_the_unhandled_broadcasts_again_and_the_ring_takes_no
             (
                 8_700,
                 i + 1,
-                format!("/f/{FLEET}/pub/n-loud/s-one/say/r37.walk"),
-                format!("v=1 t=1 kind=note from=s-one text=r37w-{i}").into_bytes(),
+                format!("/f/{FLEET}/pub/n-loud/t000043q5e2/say/r37.walk"),
+                format!("v=1 t=1 kind=note from=t000043q5e2 text=r37w-{i}").into_bytes(),
             )
         })
         .collect();
@@ -716,8 +716,8 @@ fn a_restarted_bridge_walks_the_unhandled_broadcasts_again_and_the_ring_takes_no
         .publish(
             8_701,
             1,
-            &format!("/f/{FLEET}/pub/n-other/s-two/say/r37.walk"),
-            b"v=1 t=1 kind=note from=s-two text=r37w-barrier",
+            &format!("/f/{FLEET}/pub/n-other/t000043qb1t/say/r37.walk"),
+            b"v=1 t=1 kind=note from=t000043qb1t text=r37w-barrier",
         )
         .expect("publish the barrier");
     until("the barrier, after the walk", || row_of("r37w-barrier"));

@@ -18,11 +18,12 @@ fn tether_exe() -> PathBuf {
         .unwrap_or_else(|| aterm_tempfile::bin_exe("aterm-release"))
 }
 
-fn await_file(path: &Path) -> String {
-    aterm_spec::wait::within(HANG, Duration::from_millis(10), || {
-        std::fs::read_to_string(path).ok().filter(|s| !s.is_empty())
-    })
-    .unwrap_or_else(|| panic!("no handshake at {}", path.display()))
+fn await_file(path: &Path, owner: u32) -> String {
+    aterm_spec::wait::until_while_working(
+        owner,
+        &format!("handshake at {}", path.display()),
+        || std::fs::read_to_string(path).ok().filter(|s| !s.is_empty()),
+    )
 }
 
 fn actor(role: &str, root: &Path) -> Child {
@@ -64,7 +65,7 @@ fn slice_crash_actor() {
         pool.hand_to(&mut cmd);
         let _implicit = pool.acquire(&|| false).unwrap();
         let child = crate::interrupt::GroupChild::spawn(&mut cmd).unwrap();
-        await_file(&root.join("ready"));
+        await_file(&root.join("ready"), child.id());
         std::fs::write(root.join("cutter.ready"), child.id().to_string()).unwrap();
         wait_with_peak(child).unwrap();
         return;
@@ -87,13 +88,13 @@ fn slice_crash_actor() {
             .unwrap();
         // Build scripts do not acquire a wrapper tether. This member is the negative
         // control for mistaking Cargo's death (or its compiler's tether) for group drain.
-        let _build_script = command("/bin/sh")
+        let build_script = command("/bin/sh")
             .args(["-c", "echo $$ > \"$0\"; exec /bin/sleep 600"])
             .arg(root.join("build-script.pid"))
             .spawn()
             .unwrap();
-        await_file(&root.join("compiler.pid"));
-        await_file(&root.join("build-script.pid"));
+        await_file(&root.join("compiler.pid"), compiler.id());
+        await_file(&root.join("build-script.pid"), build_script.id());
         std::fs::write(root.join("ready"), b"cargo holds two GNU tokens").unwrap();
         compiler.wait().unwrap();
         return;
@@ -148,7 +149,7 @@ fn sigint_shared_and_serial_admission_leave_no_phantom_waiter() {
     for role in ["shared", "serial"] {
         let dir = aterm_tempfile::tempdir().unwrap();
         let mut child = actor(role, dir.path());
-        assert_eq!(await_file(&dir.path().join("ready")), role);
+        assert_eq!(await_file(&dir.path().join("ready"), child.id()), role);
         let ledger = Ledger::at(dir.path().join("ledger"));
         assert_eq!(ledger.list().unwrap().len(), 1);
         crate::interrupt::send(child.id().cast_signed(), crate::interrupt::SIGINT);
@@ -181,12 +182,12 @@ fn sigkill_cargo_drains_compiler_before_recovering_exactly_its_gnu_tokens() {
     // implicit token; its two workers draw directly from the same GNU FIFO.
     let implicit = pool.acquire(&|| false).unwrap();
     let mut child = crate::interrupt::GroupChild::spawn(&mut cmd).unwrap();
-    await_file(&root.join("ready"));
-    let compiler = await_file(&root.join("compiler.pid"))
+    await_file(&root.join("ready"), child.id());
+    let compiler = await_file(&root.join("compiler.pid"), child.id())
         .trim()
         .parse::<i32>()
         .unwrap();
-    let build_script = await_file(&root.join("build-script.pid"))
+    let build_script = await_file(&root.join("build-script.pid"), child.id())
         .trim()
         .parse::<i32>()
         .unwrap();
@@ -268,14 +269,14 @@ fn sigkill_cutter_mid_link_leaves_no_holder_for_the_next_cut() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut cutter = actor("cutter", root);
-    let cargo = await_file(&root.join("cutter.ready"))
+    let cargo = await_file(&root.join("cutter.ready"), cutter.id())
         .parse::<i32>()
         .unwrap();
-    let compiler = await_file(&root.join("compiler.pid"))
+    let compiler = await_file(&root.join("compiler.pid"), cutter.id())
         .trim()
         .parse::<i32>()
         .unwrap();
-    let build_script = await_file(&root.join("build-script.pid"))
+    let build_script = await_file(&root.join("build-script.pid"), cutter.id())
         .trim()
         .parse::<i32>()
         .unwrap();

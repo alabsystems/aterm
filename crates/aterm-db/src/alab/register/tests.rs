@@ -6,8 +6,11 @@
 
 use super::{
     super::{
-        Registry, checks,
-        registry::{MACHINE, MACHINE_FACTS, MODEL},
+        Registry,
+        checks,
+        // The fixtures write the generations that hold hosts as one list; the fourth's text set
+        // has its own test (`a_mac_born_and_adopted_on_registry_4_holds_its_hosts_as_members`).
+        registry::{LIST_MACHINE as MACHINE, MACHINE_FACTS, MODEL},
         tests::{apply, machine_of},
     },
     run::{Passes, Registrar, evidence, news, table_at},
@@ -299,7 +302,7 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
             },
             &other_holds,
             &held,
-            &cell::project(&MACHINE, &other_holds),
+            (&MACHINE, &cell::project(&MACHINE, &other_holds)),
             &|_, _| false,
         )
         .is_err()
@@ -320,7 +323,7 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
                 heard: true,
                 now_ms: NOW,
             },
-            &future,
+            (&MACHINE, &future),
             &held,
             &own
         )
@@ -379,17 +382,17 @@ fn an_adopted_mac_publishes_its_node_once_and_keeps_an_owner_correction() {
     let pk = "mc-0000000000000007";
     let cells = apply(&[machine(pk, &[("label", json!("m7"))])]);
     let machines = cell::project(&MACHINE, &cells);
-    let first = own_node(&input, &machines, pk).unwrap();
+    let first = own_node(&input, (&MACHINE, &machines), pk).unwrap();
     assert_eq!(first.len(), 1);
     let cells = apply(&[machine(pk, &[("label", json!("m7"))]), first]);
     assert!(
-        own_node(&input, &cell::project(&MACHINE, &cells), pk)
+        own_node(&input, (&MACHINE, &cell::project(&MACHINE, &cells)), pk)
             .unwrap()
             .is_empty()
     );
     let corrected = apply(&[machine(pk, &[("node", json!(OTHER_NODE))])]);
     assert!(
-        own_node(&input, &cell::project(&MACHINE, &corrected), pk)
+        own_node(&input, (&MACHINE, &cell::project(&MACHINE, &corrected)), pk)
             .unwrap()
             .is_empty()
     );
@@ -595,7 +598,7 @@ fn run_birth_saw(
         },
         cells,
         read,
-        &cell::project(&MACHINE, cells),
+        (&MACHINE, &cell::project(&MACHINE, cells)),
         saw,
     )
     .unwrap()
@@ -1174,7 +1177,7 @@ fn a_bound_rows_label_outlasts_a_conflicted_machine_label() {
         },
         &cells,
         &facts(&[(ME, stored)]),
-        &machines,
+        (&MACHINE, &machines),
         &|_, _| false,
     )
     .unwrap();
@@ -2471,7 +2474,7 @@ fn a_mac_adopts_the_row_merge_set_waiting() {
     );
     let cells = book.cells();
     let merged = crate::alab::merge::plan(
-        &cell::project(&MACHINE, &cells),
+        (&MACHINE, &cell::project(&MACHINE, &cells)),
         &cell::project(&crate::alab::registry::PREFERENCE, &cells),
         &crate::alab::merge::Facts::default(),
         &[("m7".to_owned(), Default::default())].into(),
@@ -2527,7 +2530,7 @@ fn a_mac_adopts_the_row_a_merge_kept() {
     );
     let cells = book.cells();
     let merged = crate::alab::merge::plan(
-        &cell::project(&MACHINE, &cells),
+        (&MACHINE, &cell::project(&MACHINE, &cells)),
         &cell::project(&crate::alab::registry::PREFERENCE, &cells),
         &crate::alab::merge::Facts::default(),
         &[("m7".to_owned(), Default::default())].into(),
@@ -4406,7 +4409,7 @@ fn a_folded_birth_is_closed_by_a_later_writer_of_its_chain() {
     );
     let merge = |cells: &Cells| {
         crate::alab::merge::plan(
-            &cell::project(&MACHINE, cells),
+            (&MACHINE, &cell::project(&MACHINE, cells)),
             &cell::project(&crate::alab::registry::PREFERENCE, cells),
             &crate::alab::merge::Facts::new(
                 read.rows
@@ -4913,4 +4916,80 @@ fn a_folded_birth_is_closed_beside_another_copy_of_its_home_bound_to_it() {
     );
     assert_eq!(follows.outcome, Outcome::Refreshed { mac: PRED.into() });
     assert_eq!(written_row(&follows)["merged_into"], json!(PRED));
+}
+
+/// On registry.4, whose `hosts` is a text set (LT-15B), a Mac's birth writes each host as its own
+/// member, which that generation takes, and a row holding one of the Mac's hosts as a member, in
+/// another spelling, is adopted by the host rule.
+/// NEGATIVE CONTROL (run 2026-11-15): with `machine_birth` writing the list whole
+/// (`cell::change` of `json!(hosts)`), the birth fails with `` machine.hosts: a set is written one
+/// element at a time ``.
+#[test]
+fn a_mac_born_and_adopted_on_registry_4_holds_its_hosts_as_members() {
+    use crate::alab::registry::{MACHINE as MACHINE_4, REGISTRY_4};
+    let none = facts(&[]);
+    let run_4 = |cells: &Cells| {
+        let live = BTreeSet::from([ME.to_owned()]);
+        plan_projected(
+            &Input {
+                me: &me(),
+                probe: &probe(),
+                live: &live,
+                heard: true,
+                now_ms: NOW,
+            },
+            cells,
+            &none,
+            (&MACHINE_4, &cell::project(&MACHINE_4, cells)),
+            &|_, _| false,
+        )
+        .unwrap()
+    };
+    let born = run_4(&Cells::new());
+    let pk = keys::machine_pk(ME);
+    assert_eq!(born.outcome, Outcome::Born { mac: pk.clone() });
+    let mut rows: Vec<Change> = born
+        .changes
+        .iter()
+        .filter(|c| c.collection == MACHINE_4.name)
+        .cloned()
+        .collect();
+    crate::att::conform(&REGISTRY_4, &mut rows).unwrap();
+    let cells = apply(&[rows]);
+    let machines = cell::project(&MACHINE_4, &cells);
+    assert_eq!(
+        cell::texts(machines.rows[&pk].fields.get("hosts")),
+        ["mac-seven"]
+    );
+
+    let by_host = "mc-1000000000000003";
+    let mut row: Vec<Change> = [("label", json!("m72")), ("status", json!("active"))]
+        .into_iter()
+        .map(|(col, x)| {
+            cell::change(
+                &MACHINE_4,
+                CellKey {
+                    pk: by_host,
+                    col,
+                    elem: None,
+                },
+                &CellValue::owner(MACHINE_4.version, x),
+            )
+            .unwrap()
+        })
+        .collect();
+    row.push(crate::typed::grid::tests::elem(
+        &MACHINE_4,
+        by_host,
+        "hosts",
+        "MAC-SEVEN",
+    ));
+    let adopted = run_4(&apply(&[row]));
+    assert_eq!(
+        adopted.outcome,
+        Outcome::Adopted {
+            rule: Rule::Host,
+            mac: by_host.into()
+        }
+    );
 }

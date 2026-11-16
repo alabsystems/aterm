@@ -93,10 +93,12 @@ fn the_actual_sys_left_json_is_a_doctor_measurement() {
         volume: None,
         roots: &[],
         disk: None,
+        stores: &[],
         home: None,
         events: &[],
         gap: None,
         head_seq: 0,
+        held: None,
     };
     let query = SysQuery::parse("left scope=aterm --json").unwrap();
     let measured = from_json(&render_json(&query, &ctx).to_text()).expect("producer's view");

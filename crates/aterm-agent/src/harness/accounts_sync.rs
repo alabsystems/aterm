@@ -3304,7 +3304,7 @@ impl VaultSource {
     /// Whether the entry holds its place in a precedence: present, usable or not. Source
     /// selection skips an absent entry, never one this Mac cannot read now.
     #[cfg_attr(
-        any(test, debug_assertions),
+        all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
             machine = "AccountSourcePresence",
             action = "Primary",
@@ -3312,7 +3312,7 @@ impl VaultSource {
         )
     )]
     #[cfg_attr(
-        any(test, debug_assertions),
+        all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
             machine = "AccountSourcePresence",
             action = "Fallback",
@@ -3320,7 +3320,7 @@ impl VaultSource {
         )
     )]
     #[cfg_attr(
-        any(test, debug_assertions),
+        all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
             machine = "AccountSourcePresence",
             action = "PrimaryUnavailable",
@@ -3328,7 +3328,7 @@ impl VaultSource {
         )
     )]
     #[cfg_attr(
-        any(test, debug_assertions),
+        all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
             machine = "AccountSourcePresence",
             action = "FallbackUnavailable",
@@ -8136,8 +8136,9 @@ type SpawnRenewal<'a> = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Syn
 /// `home`, `store` and `now`; `None` where the vault could not be read just now.
 type TokensRead = fn(&Path, &accounts::Store, &Roster, i64) -> Option<BTreeMap<String, u64>>;
 
-/// The live [`UpkeepEffects::tokens_here`]: one value-free read of the vault under `home`
-/// ([`super::accounts_tokens::rows_on_token_read`]). Where no launch starts on a token
+/// The live [`UpkeepEffects::tokens_here`]: one value-free read of the vault under `home`, which
+/// first settles every split pair whose turn is this Mac's, with no session of its account needed
+/// ([`super::accounts_tokens::rows_on_token_settled`]). Where no launch starts on a token
 /// ([`super::token_route::LAUNCHES_ON_TOKEN`]: the judgment's platform step), no row runs on its
 /// token here whatever the vault holds, so none is read and the reading names none (which removes
 /// a kept one). No vault runs off Unix, so none is read.
@@ -8153,7 +8154,7 @@ fn rows_on_token_live(
     }
     #[cfg(unix)]
     {
-        super::accounts_tokens::rows_on_token_read(
+        super::accounts_tokens::rows_on_token_settled(
             &aterm_secrets::client::Paths::for_home(home),
             store,
             roster,
@@ -11334,7 +11335,7 @@ fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
 /// Under the CLI's store lock, waited for on `ladder`.
 /// New labels require readable, unoccupied local state and an idle sign-in lock.
 #[cfg_attr(
-    any(test, debug_assertions),
+    all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
         machine = "AccountSyncNewLabels",
         action = "Sync",
@@ -11342,7 +11343,7 @@ fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
     )
 )]
 #[cfg_attr(
-    any(test, debug_assertions),
+    all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
         machine = "AccountProviderRealm",
         action = "Sync",
@@ -11350,7 +11351,7 @@ fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
     )
 )]
 #[cfg_attr(
-    any(test, debug_assertions),
+    all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
         machine = "AccountAliasAdmission",
         action = "Sync",
@@ -12772,7 +12773,13 @@ pub(super) fn run_cli_accounts_sync_with(
             unsigned.iter().copied().partition(|label| {
                 records.as_ref().is_some_and(|(store, records)| {
                     records.raw_roster.row(label).is_some_and(|raw| {
-                        page_row_signs_in_unattended(cli, store, raw, &records.logins)
+                        page_row_signs_in_unattended(
+                            cli,
+                            store,
+                            &records.raw_roster,
+                            raw,
+                            &records.logins,
+                        )
                     })
                 })
             });
@@ -13409,7 +13416,24 @@ struct MachineReads {
     /// Whether another Mac's fleet drive typed into the session this process runs in
     /// ([`super::cli::AccountsHost::driven_over_the_fleet`]).
     driven: fn() -> bool,
+    /// Whether this process's session is a desktop one aterm's sign-in window opens in
+    /// (`aterm_signin_window::desktop_session`): a token the upkeep makes with nobody there
+    /// opens a page only where it does ([`upkeep_tokens`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    graphic: fn() -> bool,
+    /// This machine's platform id ([`aterm_types::machine_name::PlatformId`]), which
+    /// spreads the token upkeep's starts over the fleet ([`token_delay_s`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    machine: fn() -> Option<String>,
+    /// The accounts host a token the upkeep makes runs under ([`upkeep_tokens`]); `None`: the
+    /// upkeep makes no token.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    tokens: Option<TokenHost>,
 }
+
+/// [`MachineReads::tokens`]: the accounts host of a token capture the upkeep starts, in the
+/// upkeep's account-work scope.
+type TokenHost = fn(Option<super::account_work::Scope>) -> Box<dyn super::cli::AccountsHost>;
 
 impl Default for MachineReads {
     fn default() -> Self {
@@ -13418,6 +13442,9 @@ impl Default for MachineReads {
             system_browsers: false,
             desk: false,
             driven: || false,
+            graphic: || false,
+            machine: || None,
+            tokens: None,
         }
     }
 }
@@ -13434,6 +13461,12 @@ impl MachineReads {
                 static DRIVEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 *DRIVEN.get_or_init(super::fleet_session::an_instance_says_another_mac_drives)
             },
+            #[cfg(target_os = "macos")]
+            graphic: aterm_signin_window::desktop_session,
+            #[cfg(not(target_os = "macos"))]
+            graphic: || false,
+            machine: || aterm_types::machine_name::PlatformId::Host.platform_id(),
+            tokens: Some(|scope| Box::new(super::cli::LiveAccounts::background(scope))),
         }
     }
 
@@ -13469,21 +13502,24 @@ struct AutoRenewGuard {
     /// ([`shared_renewal::prepare_native`]), so a lasting refusal is logged once per change.
     native_said: Option<String>,
     mailbox_mtimes: BTreeMap<String, std::time::SystemTime>,
-    /// The rows whose last background renewal stopped where only a person can go on
-    /// ([`super::cli::Renewal::NeedsPerson`]), and since when: none is tried again in the
-    /// background before [`PERSON_BACKOFF`] has passed.
+    /// The rows whose last background renewal stopped where only a person can go on and no bot
+    /// protection stopped it ([`super::cli::Renewal::NeedsPerson`]), and since when: none is
+    /// tried again in the background before [`PERSON_BACKOFF`] has passed. A bot protection's
+    /// stop holds on no clock, on record ([`left_to_a_person`]) or in this process
+    /// (`unrecorded_checks`).
     parked: BTreeMap<String, Instant>,
-    /// The rows whose last background renewal met Cloudflare's bot check
-    /// ([`super::cli::Renewal::BotCheck`]), and since when: none is tried again in the
-    /// background before [`PERSON_BACKOFF`] has passed, and nobody is asked (design R-13). Kept
-    /// apart from `parked`, which the vendor's gate releases where a binding has no sign-in task
-    /// (a bot check notes none).
-    bot_checked: BTreeMap<String, Instant>,
     /// The newest `(at, same_second_count)` signed-in `accounts browser` window event already used
     /// to lift a row's background hold once.
     browser_unparked: BTreeMap<String, (Option<accounts::WorkflowToken>, i64, usize)>,
     /// The automatic sign-in ladder's backoffs and vault clock ([`super::sign_in_ladder::Ladder`]).
     ladder: super::sign_in_ladder::Ladder,
+    /// The bot protections this process met whose record it could not write yet
+    /// ([`hold_for_a_person`]), by the renewal's key (a Claude row's label, another CLI's
+    /// `<cli>:<label>`): each holds its row, on no clock and at every admission
+    /// ([`AutoRenewPermit::claim_with_context`]), until the record is written, which every ladder
+    /// pass and every upkeep pass of the row tries again ([`write_check_stop`]), a login is
+    /// published for it, or a signed-in `accounts browser` window answers it.
+    unrecorded_checks: BTreeMap<String, PendingCheck>,
     /// The default row and the sign-out on record the default login's one check last ran for
     /// ([`heal_default_login_in_upkeep`]): it runs once per pair in this process.
     default_checked: Option<(String, i64)>,
@@ -13493,6 +13529,33 @@ struct AutoRenewGuard {
     active_login: Option<ActiveLogin>,
     /// Manual operation observations, partitioned by exact account namespace and subject.
     manual_selections: BTreeMap<(PathBuf, Cli, ManualSubject), QueuedOwner>,
+    /// What the token upkeep remembers in this process ([`upkeep_tokens`]).
+    #[cfg(unix)]
+    token_tier: TokenTier,
+}
+
+/// What the token upkeep (plan package FL-138, [`upkeep_tokens`]) remembers in this process.
+#[cfg(unix)]
+#[derive(Default)]
+struct TokenTier {
+    /// The gap each row was found with, by label, while it stands. Which gaps a capture already
+    /// ran for is on record, not here ([`super::token_steps::Tried`]): no restart runs one again.
+    found: BTreeMap<String, TokenGap>,
+    /// A capture the upkeep started runs now.
+    running: bool,
+    /// This Mac's vault route was not seated at the last look, and the log said so.
+    not_seated: bool,
+}
+
+/// A row's gap the token upkeep found ([`TokenTier::found`]).
+#[cfg(unix)]
+struct TokenGap {
+    finding: super::accounts_tokens::Finding,
+    /// When it was found (Unix seconds): its capture waits [`token_wait_s`] from then.
+    at: i64,
+    /// When a pass first found that wait over: only a vault refresh that started then or later
+    /// reads the vault fresh enough to make the token on.
+    ripe: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -13969,6 +14032,11 @@ fn login_activity_of(
         }
     };
     for (key, owner) in &guard.activity_owners {
+        // A bot protection this process met and has not recorded holds the row on no clock: it
+        // has no next try to show.
+        if guard.unrecorded_checks.contains_key(key) {
+            continue;
+        }
         // A claim is refused while any of these holds stands, so the row's next try is at the
         // latest of them.
         let held = [
@@ -13977,7 +14045,6 @@ fn login_activity_of(
                 .get(key)
                 .map(|at| *at + Duration::from_secs(900)),
             guard.parked.get(key).map(|at| *at + PERSON_BACKOFF),
-            guard.bot_checked.get(key).map(|at| *at + PERSON_BACKOFF),
         ]
         .into_iter()
         .flatten()
@@ -14233,7 +14300,7 @@ fn note_published_login(
     for key in &activity {
         state.last_attempt.remove(key);
         state.parked.remove(key);
-        state.bot_checked.remove(key);
+        state.unrecorded_checks.remove(key);
         state.activity_owners.remove(key);
     }
     for key in &ladder {
@@ -14330,10 +14397,11 @@ fn reconcile_workflow_retries_with_read(
         })
         .map(|(key, _)| key.clone())
         .collect();
+    // A bot protection met and not yet recorded is the account's, and outlasts the workflow
+    // ([`accounts::CheckStop`]): it stays.
     for key in &activity {
         state.last_attempt.remove(key);
         state.parked.remove(key);
-        state.bot_checked.remove(key);
         state.browser_unparked.remove(key);
         state.activity_owners.remove(key);
     }
@@ -14342,7 +14410,8 @@ fn reconcile_workflow_retries_with_read(
         state.ladder_owners.remove(key);
     }
     // Sleep can advance the task's wall clock while leaving Instant's person hold young.
-    // Only its still-current, pre-read owner may release that hold; bot and retry clocks remain.
+    // Only its still-current, pre-read owner may release that hold; a check and retry clocks
+    // remain.
     let expired: Vec<_> = if accounts::current_sign_in_task(raw, logins)
         .is_some_and(|task| now.saturating_sub(task.at) >= PERSON_BACKOFF_SECS)
     {
@@ -14646,10 +14715,12 @@ mod manual_queue_tests;
 #[path = "accounts_sync_login_activity_tests.rs"]
 mod login_activity_tests;
 
-/// How long a row whose background renewal stopped for a person, or met Cloudflare's bot check
-/// ([`AutoRenewGuard::bot_checked`]), is left alone by the background before it is tried again:
-/// a renewal that stops so (accounts.x.ai's block page, a page that waits on a person, a check
-/// that did not clear) starts a live device sign-in every time it runs.
+/// How long a row whose background renewal stopped for a person where no bot protection stopped
+/// it ([`AutoRenewGuard::parked`]: a page that waits on a person, its time run out; a Claude
+/// window a person closed, another account's consent, no desktop) is left alone by the
+/// background before it is tried again: a renewal that stops so starts a live device sign-in
+/// every time it runs. A bot protection's stop (Cloudflare's check, a block page, a human check)
+/// is held on no clock, whichever CLI's row it stopped ([`left_to_a_person`]).
 const PERSON_BACKOFF: Duration = Duration::from_secs(6 * 60 * 60);
 /// [`PERSON_BACKOFF`] in seconds.
 pub(crate) const PERSON_BACKOFF_SECS: i64 = 6 * 60 * 60;
@@ -14737,18 +14808,21 @@ fn kimi_row_signs_in_unattended(store: &accounts::Store, row: &accounts::Row) ->
     browser_window_token_where(store, i64::MIN, |event| event.account == row.label).is_some()
 }
 
-/// Whether a `cli` row whose route is its page signs in with nobody at this Mac: only where its
-/// ledger can say, and not where its newest try on record met a bot check that did not clear ([`bot_check_on_record_at`]), which the next try meets
-/// too: measured 2026-11-04, every automatic sign-in on record of the Codex rows of two Macs (8 of
-/// 8) ended there. Kimi Code CLI's asks more ([`kimi_row_signs_in_unattended`]).
+/// Whether a `cli` row of `raw_roster` whose route is its page signs in with nobody at this Mac:
+/// only where its ledger can say, and not where it is left to a person ([`person_hold`]: a bot
+/// protection stopped a sign-in of its account, or of another row of its pool here, which the
+/// next try meets too: measured 2026-11-04, every automatic sign-in on record of the Codex rows
+/// of two Macs, 8 of 8, ended at Cloudflare's check). Kimi Code CLI's asks more
+/// ([`kimi_row_signs_in_unattended`]).
 pub(crate) fn page_row_signs_in_unattended(
     cli: Cli,
     store: &accounts::Store,
+    raw_roster: &Roster,
     raw: &accounts::Row,
     logins: &accounts::Logins,
 ) -> bool {
     store.tail(1).is_ok()
-        && bot_check_on_record_at(store, raw, logins).is_none()
+        && person_hold(store, raw_roster, raw, logins).is_none()
         && (cli != Cli::Kimi || kimi_row_signs_in_unattended(store, raw))
 }
 
@@ -14791,46 +14865,6 @@ pub(crate) fn claude_browser_profile_ready(
 )]
 #[doc(hidden)]
 pub fn account_browser_rehabilitation_environment() {}
-
-/// When `label`'s newest try on record met Cloudflare's bot check, which did not clear (its
-/// ledger line ends `bot-check`, as [`super::cli::renew_one_for`] writes it), the second it
-/// ended; `None` once a later sign-in end, signed-in `accounts browser` window, renewal or
-/// wrong account is on record, or the ledger cannot be read. It holds the row's background
-/// renewal across a restart of aterm, which forgets [`AutoRenewGuard::bot_checked`].
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountWorkflowRuntime",
-        action = "Read",
-        project = "aterm_agent::harness::accounts_sync::workflow_runtime_tests::runtime_transition"
-    )
-)]
-pub(crate) fn bot_check_on_record_at(
-    store: &accounts::Store,
-    raw: &accounts::Row,
-    logins: &accounts::Logins,
-) -> Option<i64> {
-    let events = store.tail(accounts::LEDGER_KEEP_ROWS).ok()?;
-    let newest = events.iter().rev().find(|event| {
-        (event.account == raw.label
-            && matches!(
-                event.kind,
-                accounts::Kind::Renewed | accounts::Kind::SignedIn | accounts::Kind::WrongAccount
-            )
-            || accounts::workflow_event_matches(raw, logins, event))
-            && match event.kind {
-                accounts::Kind::SignIn => {
-                    !event.why.contains(" window ") || is_signed_in_browser_window_why(&event.why)
-                }
-                accounts::Kind::Renewed
-                | accounts::Kind::SignedIn
-                | accounts::Kind::WrongAccount => true,
-                _ => false,
-            }
-    })?;
-    (newest.kind == accounts::Kind::SignIn && newest.why.ends_with(" bot-check"))
-        .then_some(newest.t)
-}
 
 /// When the step a person owes `label` (its sign-in task, [`accounts::SignInAction`]) was noted,
 /// where one stands: a browser profile to sign in that no signed-in `accounts browser` window has
@@ -14919,7 +14953,7 @@ fn reconcile_browser_window_unpark_with_read(
         .any(|owner| !owner.matches(store, cli));
     let held = guard.last_attempt.contains_key(key)
         || guard.parked.contains_key(key)
-        || guard.bot_checked.contains_key(key);
+        || guard.unrecorded_checks.contains_key(key);
     if guard.in_flight || !same_claim || foreign || (held && !owns) {
         return;
     }
@@ -14935,17 +14969,20 @@ fn reconcile_browser_window_unpark_with_read(
             key.to_owned(),
             (accounts::current_workflow(raw, logins), token.0, token.1),
         );
+        // A signed-in window answers a check this process met and did not record, as it ends
+        // one on record ([`left_to_a_person`]).
         guard.parked.remove(key);
-        guard.bot_checked.remove(key);
+        guard.unrecorded_checks.remove(key);
         guard.last_attempt.remove(key);
     }
 }
 
-/// Notes how a background renewal of `label` ended: one that stopped for a person
-/// ([`super::cli::Renewal::NeedsPerson`]) parks the row until [`PERSON_BACKOFF`] has passed
-/// since `now`, and one that met Cloudflare's bot check ([`super::cli::Renewal::BotCheck`])
-/// holds it as long, asking no one; a contended lock leaves any hold as it was; any other end
-/// lifts both.
+/// Notes how a background renewal of `label` ended: one that stopped for a person where no bot
+/// protection stopped it ([`super::cli::Renewal::NeedsPerson`]) parks the row until
+/// [`PERSON_BACKOFF`] has passed since `now`; one a bot protection stopped
+/// ([`super::cli::Renewal::BotCheck`]) parks nothing on a clock, since the account's check holds
+/// it, on record or in this process ([`hold_for_a_person`]), until a person goes on from it; a
+/// contended lock leaves any hold as it was; any other end lifts the park.
 #[cfg(test)]
 fn note_background_end(
     state: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
@@ -14970,18 +15007,14 @@ fn apply_background_end(
         Renewal::NeedsPerson => {
             guard.parked.insert(label.to_owned(), now);
         }
-        Renewal::BotCheck => {
-            guard.parked.remove(label);
-            guard.bot_checked.insert(label.to_owned(), now);
-        }
         Renewal::SigninHeld | Renewal::Deferred => {}
-        Renewal::Renewed
+        Renewal::BotCheck
+        | Renewal::Renewed
         | Renewal::OtherRenewed
         | Renewal::AuthFailed
         | Renewal::WrongAccount
         | Renewal::Failed => {
             guard.parked.remove(label);
-            guard.bot_checked.remove(label);
         }
     }
 }
@@ -15215,9 +15248,10 @@ impl AutoRenewPermit {
                     || guard.parked.get(label).is_some_and(|since| {
                         now.saturating_duration_since(*since) < PERSON_BACKOFF
                     })
-                    || guard.bot_checked.get(label).is_some_and(|since| {
-                        now.saturating_duration_since(*since) < PERSON_BACKOFF
-                    })))
+                    // A bot protection this process met and has not recorded holds on no clock
+                    // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). A person's own
+                    // choice is judged by its door, which knows whether they are at this desk.
+                    || guard.unrecorded_checks.contains_key(label)))
         {
             return None;
         }
@@ -17179,7 +17213,330 @@ fn auto_renew_next_account(
             return true;
         }
     }
+    // A pass that started no sign-in makes, at most, one account's missing token.
+    #[cfg(unix)]
+    upkeep_tokens(home, state_dir, roster_path, now, fx);
     recovered
+}
+
+/// How long, in seconds, the token upkeep waits from finding the account `key`'s token missing
+/// to making it on the machine whose platform id is `machine` ([`upkeep_tokens`]): under an hour,
+/// fixed by the pair, so the Macs signed in to one account do not all start at the same pass
+/// after the vault changes.
+#[cfg(unix)]
+fn token_delay_s(key: &str, machine: &str) -> i64 {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-token-upkeep-delay-v1");
+    for field in [key.as_bytes(), machine.as_bytes()] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    let digest = hash.finalize();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    i64::try_from(u64::from_be_bytes(head) % 3600).unwrap_or(0)
+}
+
+/// THE HOME MAC'S TURN, IN SECONDS: how much longer than its own spread ([`token_delay_s`]) a Mac
+/// that is not the account's home Mac waits on a gap any signed-in Mac may find
+/// ([`super::accounts_tokens::Gap::any_mac`]), so the home Mac, which finds it too, has made the
+/// token and its write has reached the servers before this Mac's fresh read: the home Mac's whole
+/// spread (an hour), its own wait for a vault refresh after it plus the skew between the two Macs'
+/// refreshes that found the gap (two of the ladder's refresh periods,
+/// [`super::sign_in_ladder::BACKOFF_FIRST`]), another account's sign-in spacing it may wait behind
+/// ([`super::sign_in_ladder::SPACING_S`]), and its capture's whole bound in aterm's window
+/// ([`super::open_url::WINDOW_ROUTE_WITHIN`]): about an hour and 50 minutes. Two Macs that both
+/// make one account's token leave a register conflict every Mac reads `mismatched (draft)` until
+/// the vault settles it, and a second year-long token nobody uses.
+#[cfg(unix)]
+const HOME_TURN_S: i64 = 3_600
+    + 2 * super::sign_in_ladder::BACKOFF_FIRST.as_secs() as i64
+    + super::sign_in_ladder::SPACING_S
+    + super::open_url::WINDOW_ROUTE_WITHIN.as_secs() as i64;
+
+/// How long, in seconds, the token upkeep waits from finding `finding`'s gap to making its token
+/// on the machine whose platform id is `machine` ([`upkeep_tokens`]): its spread
+/// ([`token_delay_s`]), and before it the home Mac's turn ([`HOME_TURN_S`]) where the account has
+/// a home Mac that is not this one (`away`) and the gap is one any signed-in Mac may find. A Mac
+/// that is the account's home, or one where no pool names a home for it, waits its spread alone.
+#[cfg(unix)]
+fn token_wait_s(finding: &super::accounts_tokens::Finding, away: bool, machine: &str) -> i64 {
+    let turn = if away && finding.gap.any_mac() {
+        HOME_TURN_S
+    } else {
+        0
+    };
+    turn + token_delay_s(&finding.key, machine)
+}
+
+/// THE UPKEEP MAKES THE MISSING TOKEN OF EACH ROW SIGNED IN HERE, WITH NOBODY THERE (plan package
+/// FL-138): one account per pass, and only on a pass that started no sign-in. A row is looked at
+/// where it is Claude Code's, names its email, is held by no other Mac, and its login is made
+/// and signed in here ([`accounts::LoginHere::In`]); its token page needs a route no person
+/// finishes ([`super::accounts_tokens::NobodyRoutes`]: aterm's window, whose store holds the
+/// account's session ([`super::signin_window::store_holds_session`]) or which reads its mailbox
+/// ([`window_reads_mailbox_for_row_with`]), or the headless profile a sign-in proved), and this
+/// process runs at this Mac's own desk ([`super::cli::opens_sign_in_window_by`]) in a desktop
+/// session ([`MachineReads::graphic`]) with no sign-in running. What is missing, and whether it is
+/// this Mac's to make, is [`super::accounts_tokens::backfill_due`]'s; a Mac not seated in the
+/// vault's log makes none, and says so once in the log (`vault-not-seated`) while it stands.
+///
+/// A gap found waits [`token_wait_s`] from when it was found (on a Mac that is not the account's
+/// home Mac, a gap any signed-in Mac finds waits the home Mac's turn first), then for a vault
+/// refresh that started after that wait (the ladder's own, on its clock: [`Ladder::vault_turn`])
+/// and read the whole vault ([`super::sign_in_ladder::Vault::read_whole`]), and is judged again on
+/// what that refresh applied: another Mac may have made the token meanwhile. Its capture starts
+/// under the sign-in spacing ([`super::sign_in_ladder::space_token_capture`]), so a second
+/// account's waits [`super::sign_in_ladder::SPACING_S`] after the first's, off this thread, with
+/// the sign-in lock let go ([`super::accounts_tokens::backfill_run`]), and each gap runs once on
+/// record ([`super::token_steps::Tried`]), past a restart, until something that may let it pass
+/// changes. A page only a person can pass ends the run and is recorded where the account's step
+/// is held ([`super::token_steps`]); nothing presses, solves or retries it, and nobody is asked.
+/// The log gets one line per capture, with no address in it. Whether a capture started.
+///
+/// [`Ladder::vault_turn`]: super::sign_in_ladder::Ladder::vault_turn
+#[cfg(unix)]
+fn upkeep_tokens(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    fx: &UpkeepEffects<'_>,
+) -> bool {
+    use super::accounts_tokens::{Backfill, NobodyRoutes};
+    use super::sign_in_ladder::{TokenSpacing, VaultTurn};
+    fn lock(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ) -> std::sync::MutexGuard<'_, AutoRenewGuard> {
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    let reads = guard_reads(fx.renew_guard);
+    let Some(token_host) = reads.tokens else {
+        return false;
+    };
+    if fx
+        .scope
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
+        || !super::cli::opens_sign_in_window_by(reads.desk, &reads.var, &reads.driven)
+        || !(reads.graphic)()
+        || lock(fx.renew_guard).token_tier.running
+    {
+        return false;
+    }
+    let store = accounts::Store::at(state_dir);
+    if store.signing_in().is_some() {
+        return false;
+    }
+    let Ok(records) = store.read_account_records(Some(roster_path), now) else {
+        return false;
+    };
+    let enrolled = accounts::enrolled(&records.roster);
+    let config = config_beside(roster_path);
+    let env = quiet_env(home, state_dir, &config, now);
+    let host = token_host(fx.scope.clone());
+    let machine = (reads.machine)().unwrap_or_default();
+    // First every row's gap, and which gaps' waits are over; then, at most, one capture.
+    let mut found_here = BTreeSet::new();
+    let mut ripe = Vec::new();
+    for row in &records.roster.rows {
+        let Some(email) = row
+            .email
+            .as_deref()
+            .filter(|email| !email.trim().is_empty())
+        else {
+            continue;
+        };
+        if row.held_by.is_some()
+            || accounts::login_here(row, &records.state, enrolled.contains(&row.label), now)
+                != accounts::LoginHere::In
+        {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let holds_session = super::signin_window::store_holds_session(&store.dir, email);
+        #[cfg(not(target_os = "macos"))]
+        let holds_session = false;
+        let routes = NobodyRoutes {
+            window: holds_session
+                || window_reads_mailbox_for_row_with(
+                    &reads.var,
+                    Some(home),
+                    &store,
+                    Some(&row.label),
+                    Some(email),
+                ),
+            headless: super::headless_oauth::has_browser_profile(
+                &store.dir,
+                &row.label,
+                Some(email),
+            ),
+        };
+        let home_mac = records.state.home_accounts.contains(&row.label);
+        // A pool names this Mac (`swarm_label`), and the row, held by no other Mac, is warm
+        // here: its home Mac is the pool's `warm[0]`, here or on another Mac. With no pool, no
+        // Mac is its home.
+        let away = !home_mac && records.state.swarm_label.is_some();
+        let finding = match super::accounts_tokens::backfill_due(
+            &env,
+            host.as_ref(),
+            &row.label,
+            home_mac,
+            routes,
+        ) {
+            Backfill::Due(finding) => finding,
+            Backfill::NotSeated => {
+                let mut guard = lock(fx.renew_guard);
+                if !guard.token_tier.not_seated {
+                    guard.token_tier.not_seated = true;
+                    drop(guard);
+                    (fx.log)(
+                        "token upkeep: vault-not-seated: this Mac is not seated in the vault's \
+                         log, so it makes no account's token (`aterm secrets status` says vault \
+                         writes:)",
+                    );
+                }
+                return false;
+            }
+            Backfill::Nothing => continue,
+        };
+        found_here.insert(row.label.clone());
+        let mut guard = lock(fx.renew_guard);
+        let tier = &mut guard.token_tier;
+        tier.not_seated = false;
+        let gap = tier
+            .found
+            .entry(row.label.clone())
+            .and_modify(|gap| {
+                if gap.finding != finding {
+                    *gap = TokenGap {
+                        finding: finding.clone(),
+                        at: now,
+                        ripe: None,
+                    };
+                }
+            })
+            .or_insert_with(|| TokenGap {
+                finding: finding.clone(),
+                at: now,
+                ripe: None,
+            });
+        if now
+            >= gap
+                .at
+                .saturating_add(token_wait_s(&finding, away, &machine))
+        {
+            let since = *gap.ripe.get_or_insert_with(Instant::now);
+            ripe.push((row.label.clone(), finding, home_mac, routes, since));
+        }
+    }
+    lock(fx.renew_guard)
+        .token_tier
+        .found
+        .retain(|label, _| found_here.contains(label));
+    let Some((label, finding, home_mac, routes, since)) = ripe.into_iter().next() else {
+        return false;
+    };
+    // A fresh read of the vault: the ladder's refresh, on its own clock, started once the wait
+    // was over. Until one has ended, nothing runs.
+    let VaultInput::Read(key) = vault_input(home) else {
+        return false;
+    };
+    let at = Instant::now();
+    let turn = lock(fx.renew_guard).ladder.vault_turn(Some(key), at);
+    match turn {
+        VaultTurn::Running | VaultTurn::Unavailable => return false,
+        VaultTurn::Due => {
+            let _ = start_vault_refresh(
+                home,
+                key,
+                at,
+                fx.renew_guard,
+                &LadderCtx::of(fx, roster_path),
+            );
+        }
+        VaultTurn::Seen(_) => {}
+    }
+    let fresh = lock(fx.renew_guard).ladder.vault_seen_since(since);
+    if !fresh.is_some_and(|seen| seen.read_whole()) {
+        return false;
+    }
+    // What that refresh applied may hold the token another Mac made meanwhile.
+    match super::accounts_tokens::backfill_due(&env, host.as_ref(), &label, home_mac, routes) {
+        Backfill::Due(again) if again == finding => {}
+        Backfill::Due(_) | Backfill::NotSeated | Backfill::Nothing => return false,
+    }
+    match super::sign_in_ladder::space_token_capture(&store, &label, now) {
+        TokenSpacing::Started => {}
+        TokenSpacing::Until(_) | TokenSpacing::Busy => return false,
+    }
+    {
+        let mut guard = lock(fx.renew_guard);
+        guard.token_tier.found.remove(&label);
+        guard.token_tier.running = true;
+    }
+    let guard = std::sync::Arc::clone(fx.renew_guard);
+    let log = std::sync::Arc::clone(&fx.log);
+    let scope = fx.scope.clone();
+    let (home_owned, state_owned) = (home.to_path_buf(), state_dir.to_path_buf());
+    let work = Box::new(move || {
+        let env = quiet_env(&home_owned, &state_owned, &config, now);
+        let host = token_host(scope);
+        let (mut said, mut refused) = (Vec::new(), Vec::new());
+        if let Some(code) = super::accounts_tokens::backfill_run(
+            &env,
+            host.as_ref(),
+            &label,
+            &finding,
+            home_mac,
+            routes,
+            &mut said,
+            &mut refused,
+        ) {
+            log(&backfill_line(
+                &label,
+                &finding,
+                code,
+                &String::from_utf8_lossy(&refused),
+            ));
+        }
+        lock(&guard).token_tier.running = false;
+    });
+    if (fx.spawn_renewal)(work).is_err() {
+        lock(fx.renew_guard).token_tier.running = false;
+        return false;
+    }
+    true
+}
+
+/// The log's line for a token capture the upkeep ran with nobody there ([`upkeep_tokens`]), by
+/// the verb's exit `code`: where it succeeded, that the token was made, and where, followed by
+/// any warning the verb wrote (`said`: a table or record it could not write); otherwise what the
+/// verb refused. On one line, with each address in it written `<address>`.
+#[cfg(unix)]
+fn backfill_line(
+    label: &str,
+    finding: &super::accounts_tokens::Finding,
+    code: ExitCode,
+    said: &str,
+) -> String {
+    use super::accounts_tokens::Via;
+    let said = said.trim();
+    let said =
+        (!said.is_empty()).then(|| super::open_url::without_addresses(&super::one_line(said, 300)));
+    let what = if code == ExitCode::SUCCESS {
+        let made = match finding.via {
+            Via::Unattended => "made in the sign-in window with nobody there",
+            Via::Headless => "made on its headless browser profile",
+            Via::Desk => "made",
+        };
+        said.map_or_else(|| made.to_owned(), |said| format!("{made}; {said}"))
+    } else {
+        said.unwrap_or_else(|| "not made".to_owned())
+    };
+    format!("{label}: token ({}): {what}", finding.gap.word())
 }
 
 pub(super) fn recover_staging_renewals_for(
@@ -18561,25 +18918,171 @@ fn ladder_route_with_clock(
     ladder_route_in_context(home, store, (row, None), now, renew_guard, ctx, clock)
 }
 
-/// Whether a stop still holds `raw`'s background sign-in: its current workflow's last pass
-/// ended `blocked` ([`accounts::AttemptOutcome::Blocked`]: a page's check in the headless page
-/// or in aterm's sign-in window, a window a person closed, another account's consent) under
-/// [`PERSON_BACKOFF`] ago, with no signed-in `accounts browser` window on record since. A real change of address could change that page's answer sooner too, but nothing here
-/// can tell one from the rest of what counts as a move ([`super::sign_in_ladder::Ladder::moved`]).
-/// This holds across what the ladder's own wait does not: a restart forgets that wait, and a vault
-/// entry changing ends it as a new input, though a check judges neither.
-fn page_holds(
+/// The stops that stand on `raw`'s record ([`page_holds`]).
+#[derive(Clone, Copy)]
+struct Stops<'a> {
+    /// When a bot protection last stopped a sign-in of the row's account
+    /// ([`accounts::check_stopped_at`]: its [`accounts::CheckStop`], whatever its workflow, or a
+    /// current attempt that waits for a person), with no signed-in `accounts browser` window on
+    /// record since.
+    check: Option<i64>,
+    /// Its current workflow's last sign-in, the upkeep's or one run by hand, where it ended
+    /// `blocked` at a stop no bot protection made (a window a person closed, another account's
+    /// consent, no desktop), with no signed-in `accounts browser` window on record since.
+    page: Option<&'a accounts::SignInAttempt>,
+}
+
+/// What stands on `raw`'s record against its sign-in ([`Stops`]). A login made for the row clears
+/// both records, and with them the stops.
+fn standing_stops<'a>(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &'a accounts::Logins,
+) -> Stops<'a> {
+    let no_window_since = |at: i64| workflow_browser_window_token(store, raw, logins, at).is_none();
+    Stops {
+        check: accounts::check_stopped_at(raw, logins)
+            .max(ledger_check_at(store, raw, logins))
+            .filter(|at| no_window_since(*at)),
+        page: accounts::current_sign_in_attempt(raw, logins)
+            .filter(|attempt| {
+                attempt.outcome == accounts::AttemptOutcome::Blocked
+                    && !attempt.waits_for_a_person()
+            })
+            .filter(|attempt| no_window_since(attempt.tried_at)),
+    }
+}
+
+/// Whether `stops`, what stands on `raw`'s record ([`standing_stops`]), still hold its background
+/// sign-in. A bot protection's stop holds on no clock: nothing tries a sign-in again into a check,
+/// a block page or a human check with nobody there
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3), and only a person's own renewal, a
+/// signed-in `accounts browser` window or a bound login ends it; the row's token in use here
+/// ([`accounts::on_token_here`]) lifts it for the vault route alone, while it serves. Any other
+/// stop holds for [`PERSON_BACKOFF`] after the pass that met it. A real change of address could
+/// change a page's answer sooner, but nothing here can tell one from the rest of what counts as a
+/// move ([`super::sign_in_ladder::Ladder::moved`]). This holds across what the ladder's own wait
+/// does not: a restart forgets that wait, and a vault entry changing ends it as a new input,
+/// though a check judges neither.
+fn page_holds(stops: Stops<'_>, raw: &accounts::Row, state: &accounts::State, now: i64) -> bool {
+    (stops.check.is_some() && accounts::on_token_here(raw, state, now).is_none())
+        || stops
+            .page
+            .is_some_and(|attempt| now.saturating_sub(attempt.tried_at) < PERSON_BACKOFF_SECS)
+}
+
+/// Whether `raw`'s next sign-in is a person's at this Mac, whichever CLI's pool `store` keeps,
+/// so that no door with nobody there starts one (the upkeep, a saved pin request or Next
+/// selection a tick resumed, an agent's or another Mac's `accounts renew` or `accounts token`,
+/// a worker's launch): a bot protection stopped a sign-in of its account ([`check_standing_at`],
+/// [`page_holds`]' hold with no clock), or its renewal ended where only a person goes on and
+/// recorded that person's renewal as its task ([`accounts::SignInAction::Renew`]), with no
+/// signed-in `accounts browser` window since. The row's token in use here lifts neither: from a
+/// check only the ladder's vault route goes on, which loads no page, and every route these doors
+/// run loads one. A login made for the row ends both.
+pub(crate) fn left_to_a_person(
     store: &accounts::Store,
     raw: &accounts::Row,
     logins: &accounts::Logins,
-    now: i64,
 ) -> bool {
-    accounts::current_sign_in_attempt(raw, logins)
-        .filter(|attempt| attempt.outcome == accounts::AttemptOutcome::Blocked)
-        .is_some_and(|attempt| {
-            now.saturating_sub(attempt.tried_at) < PERSON_BACKOFF_SECS
-                && workflow_browser_window_token(store, raw, logins, attempt.tried_at).is_none()
+    check_standing_at(store, raw, logins).is_some()
+        || accounts::current_sign_in_task(raw, logins).is_some_and(|task| {
+            task.action == accounts::SignInAction::Renew
+                && workflow_browser_window_token(store, raw, logins, task.at).is_none()
         })
+}
+
+/// When a bot protection last stopped a sign-in of `raw`'s account on this Mac, of any CLI's pool,
+/// where that stands: its account's [`accounts::CheckStop`] (or a current attempt that waits for
+/// a person, [`accounts::check_stopped_at`]), or another CLI's row's ledger line of that stop
+/// ([`ledger_check_at`]), with no signed-in `accounts browser` window on record since. Nothing
+/// with nobody at this Mac signs the row in while it stands, on any clock ([`left_to_a_person`]);
+/// only a login made for the row or such a window ends it.
+pub(crate) fn check_standing_at(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+) -> Option<i64> {
+    standing_stops(store, raw, logins).check
+}
+
+/// When this Mac's ledger keeps a renewal of another CLI's row `raw` that a bot protection
+/// stopped (a `SignIn` line of the row's workflow whose word is `bot-check`, as
+/// [`super::login_drive::Drove::why`] writes it) with no login made for the row since (a
+/// `Renewed` or `SignedIn` line of its label or workflow): the second the newest such line
+/// ended. The line is the record of that stop as the account's [`accounts::CheckStop`] is, and
+/// holds as it does, on no clock: an earlier build wrote only it and a `login` task for a
+/// vendor's bot check, and this build writes it beside the check. A later stop no bot protection
+/// made and another account signed in leave it standing; [`standing_stops`] ends it at a
+/// signed-in `accounts browser` window since. `None` for a Claude row, whose sign-ins record
+/// their stops on the account ([`accounts::note_sign_in_stop`]), and where the ledger cannot be
+/// read.
+fn ledger_check_at(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+) -> Option<i64> {
+    if store.cli() == Cli::Claude {
+        return None;
+    }
+    let events = store.tail(accounts::LEDGER_KEEP_ROWS).ok()?;
+    let mut checked = None;
+    for event in &events {
+        let workflow = accounts::workflow_event_matches(raw, logins, event);
+        match event.kind {
+            accounts::Kind::Renewed | accounts::Kind::SignedIn
+                if workflow || event.account == raw.label =>
+            {
+                checked = None;
+            }
+            accounts::Kind::SignIn if workflow && event.why.ends_with(" bot-check") => {
+                checked = Some(event.t);
+            }
+            _ => {}
+        }
+    }
+    checked
+}
+
+/// What holds another CLI's row for a person at this Mac ([`person_hold`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersonHold {
+    /// Its own record ([`left_to_a_person`]).
+    Row,
+    /// Another row of its pool and realm whose sign-in a bot protection stopped on this Mac
+    /// ([`check_standing_at`]), by its label.
+    Pool(String),
+}
+
+/// What holds `raw`, a row of `raw_roster` (the pool `store` keeps), for a person at this Mac,
+/// so that no door with nobody there loads its sign-in page: its own record
+/// ([`left_to_a_person`]), or, for another CLI's row, a bot protection's stop of another row of
+/// the same pool and realm that stands ([`check_standing_at`]). A vendor's bot check answers this
+/// Mac's headless browser on the vendor's sign-in host, not one account (measured 2026-11-04:
+/// every automatic sign-in on record of the Codex rows of two Macs, 8 of 8, met Cloudflare's
+/// check), so the next row's page meets it too; the pool waits until a person answers each
+/// stop that stands, by a login made for its row or a signed-in `accounts browser` window
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3, and the owner's ruling of 2026-11-04
+/// against signing every account in from one machine). A Claude row's stop holds that row's
+/// account alone, as its ladder's routes are its account's ([`page_holds`]).
+pub(crate) fn person_hold(
+    store: &accounts::Store,
+    raw_roster: &Roster,
+    raw: &accounts::Row,
+    logins: &accounts::Logins,
+) -> Option<PersonHold> {
+    if left_to_a_person(store, raw, logins) {
+        return Some(PersonHold::Row);
+    }
+    if store.cli() == Cli::Claude {
+        return None;
+    }
+    raw_roster
+        .rows
+        .iter()
+        .filter(|other| other.label != raw.label && other.vendor.region == raw.vendor.region)
+        .find(|other| check_standing_at(store, other, logins).is_some())
+        .map(|other| PersonHold::Pool(other.label.clone()))
 }
 
 fn ladder_route_in_context(
@@ -18655,10 +19158,34 @@ fn ladder_route_in_context(
     };
     let mut inputs = inputs_of(&read, observed_vault);
     let at = clock();
+    let stops = if preparation.is_none() {
+        standing_stops(store, &raw, logins)
+    } else {
+        Stops {
+            check: None,
+            page: None,
+        }
+    };
+    // A bot protection's stop that the row's token in use here lifted ([`page_holds`]) lets the
+    // vault route record that token and nothing else: no route that loads a page goes on from it.
+    let only_the_vault =
+        stops.check.is_some() && accounts::on_token_here(&raw, &records.state, now).is_some();
+    // A bot protection this process met and could not record yet holds the row until it is on
+    // record, which this pass tries again ([`hold_for_a_person`]).
+    let pending = preparation
+        .is_none()
+        .then(|| lock(renew_guard).unrecorded_checks.get(&row.label).cloned())
+        .flatten();
+    if let Some(pending) = pending {
+        if write_check_stop(store, &pending) != CheckWrite::Busy {
+            lock(renew_guard).unrecorded_checks.remove(&row.label);
+        }
+        return LadderStep::Held;
+    }
     {
         let mut guard = lock(renew_guard);
         if preparation.is_none() {
-            if page_holds(store, &raw, logins, now) {
+            if page_holds(stops, &raw, &records.state, now) {
                 return LadderStep::Held;
             }
             guard.ladder.page_ended(&row.label);
@@ -18743,6 +19270,9 @@ fn ladder_route_in_context(
     {
         return step;
     }
+    if only_the_vault {
+        return LadderStep::Held;
+    }
     if let Some(route) = read.route() {
         return LadderStep::Go {
             route,
@@ -18754,7 +19284,7 @@ fn ladder_route_in_context(
     if !note_attempt(
         store,
         (&ctx.roster_path, row, logins),
-        accounts::AttemptOutcome::NoRoute,
+        (accounts::AttemptOutcome::NoRoute, None),
         &words,
         now,
     ) {
@@ -18858,10 +19388,12 @@ fn start_vault_refresh(
 /// ([`super::sign_in_ladder::on_token_words`]), and nothing opens ([`LadderStep::OnToken`]).
 /// [`LadderStep::Held`] while the refresh runs. `None`: the ladder goes on as before, as it does
 /// for a token another Mac minted at a person's terminal (or by a meta that names no route) and
-/// nobody verified, which serves only that Mac, and for a row whose login is not made here, which
-/// no reading names whatever its token ([`super::accounts_tokens::rows_on_token_of`]): no launch
-/// starts on such a row here until its sign-in makes its login. Nothing here asks another Mac
-/// anything: the refresh reads the shared vault.
+/// nobody verified, which serves only that Mac, and for a row whose login is not made here where
+/// this Mac's claims do not cover its account ([`super::claims::covers`]), which no reading names
+/// whatever its token ([`super::accounts_tokens::rows_on_token_of`]): no launch starts on such a
+/// row here until its sign-in makes its login. Where they cover it, its fleet token runs it here
+/// (FL-135, [`accounts::LoginHere::OnToken`]). Nothing here asks another Mac anything: the refresh
+/// reads the shared vault.
 ///
 /// [`Ladder::vault_turn`]: super::sign_in_ladder::Ladder::vault_turn
 fn ladder_vault_token(
@@ -18930,7 +19462,7 @@ fn ladder_vault_token(
     if !note_attempt(
         store,
         (&ctx.roster_path, row, logins),
-        accounts::AttemptOutcome::OnToken,
+        (accounts::AttemptOutcome::OnToken, None),
         Route::Vault.as_str(),
         now,
     ) {
@@ -19127,6 +19659,14 @@ fn with_current_attempt(
 
 /// Records an attempt only while its row and captured parent still match. A duplicate
 /// outcome is admitted without another history entry, so its retry clock can still advance.
+/// A [`accounts::AttemptOutcome::Blocked`] attempt keeps the page that stopped it (`stop`,
+/// [`accounts::note_sign_in_stop`]; `by_hand` where a person at this desk started the run), a
+/// bot protection's with the account's [`accounts::CheckStop`], and where only a person goes on
+/// from a bot protection ([`super::open_url::Met::takes_a_person`]) the same write records that
+/// person's renewal as the row's task ([`accounts::SignInAction::Renew`]), as a renewal run by hand
+/// does. A stop no bot protection made (no desktop, a window a person closed) records no task:
+/// it holds for [`PERSON_BACKOFF`] and is tried again after. Any other outcome short of a login
+/// keeps the check that stands ([`accounts::keep_check`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -19138,14 +19678,126 @@ fn with_current_attempt(
 fn note_attempt(
     store: &accounts::Store,
     captured: (&Path, &accounts::Row, &accounts::Logins),
-    outcome: accounts::AttemptOutcome,
+    (outcome, stop): (
+        accounts::AttemptOutcome,
+        Option<(&super::open_url::Met, bool)>,
+    ),
     routes: &str,
     now: i64,
 ) -> bool {
-    with_current_attempt(store, captured, now, |current| {
-        accounts::note_sign_in_attempt(current, &captured.1.label, outcome, routes, now)
+    let row = captured.1;
+    with_current_attempt(store, captured, now, |current| match stop {
+        Some((met, by_hand)) if outcome == accounts::AttemptOutcome::Blocked => {
+            let events = accounts::note_sign_in_stop(current, row, by_hand, met.word, routes, now);
+            if met.takes_a_person() && met.word.is_bot_protection() {
+                accounts::note_sign_in_task(
+                    current,
+                    &row.label,
+                    accounts::SignInAction::Renew,
+                    now,
+                );
+            }
+            events
+        }
+        _ => {
+            if outcome != accounts::AttemptOutcome::SignedIn {
+                accounts::keep_check(current, row);
+            }
+            accounts::note_sign_in_attempt(current, &row.label, outcome, routes, now)
+        }
     })
     .is_ok()
+}
+
+/// A bot protection's stop met and not recorded yet ([`write_check_stop`], and in this process
+/// [`AutoRenewGuard::unrecorded_checks`]).
+#[derive(Clone, Debug)]
+pub(super) struct PendingCheck {
+    /// The roster the run's row came from.
+    pub(super) roster_path: PathBuf,
+    /// The row the run signed in, which names the account the check stopped.
+    pub(super) row: accounts::Row,
+    /// The row's renewal generation when the run started: a login made since ends the check.
+    pub(super) generation: Option<u64>,
+    /// When the check stopped it (Unix seconds).
+    pub(super) at: i64,
+}
+
+/// What [`write_check_stop`] came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CheckWrite {
+    /// The account's [`accounts::CheckStop`] is on record.
+    Recorded,
+    /// It is no longer the row's to hold: the row left the roster, names another account, or
+    /// a login was made for it since the run started.
+    Moot,
+    /// The records could not be written (`accounts.lock` stayed held, a file could not be read).
+    Busy,
+}
+
+/// Records `check`'s bot protection as its account's [`accounts::CheckStop`] under no fence but
+/// the account's own: the row under its label still names that account in the same realm, or
+/// one of them names no address ([`accounts::checked_account`]), and no login was made for it
+/// since its run started. A run's own record (the upkeep's [`note_attempt`], a vendor renewal's
+/// in `cli::renew_one_for`) is fenced to the run's row, parent and workflow, and refuses a run
+/// another write overtook; a check met is a fact of this Mac and that account whatever else
+/// moved meanwhile, so every door that met one writes it alone where that record did not land.
+pub(super) fn write_check_stop(store: &accounts::Store, check: &PendingCheck) -> CheckWrite {
+    let moot = std::cell::Cell::new(false);
+    let written = store.transact_pool_logins_within(
+        &accounts::LOCK_LADDER,
+        &check.roster_path,
+        check.at,
+        &mut None,
+        |raw, _, logins| {
+            let Some(row) = raw.row(&check.row.label).filter(|row| {
+                accounts::checked_account(&accounts::check_of(&check.row, check.at), row)
+            }) else {
+                moot.set(true);
+                return Err("the row names another account".into());
+            };
+            // Only a login made for the row since its run started ends the check: its success
+            // is of a generation after the binding's then (the generation clock only rises), or
+            // it was bound after the check. Any other write since (the run's own admission that
+            // made the binding, a sign-out, a usage note) moves the generation and leaves the
+            // check standing.
+            let since = check.generation.unwrap_or(0);
+            if logins.get(&row.label).is_some_and(|binding| {
+                binding.last_success_generation > since
+                    || binding.renewed_at.is_some_and(|renewed| renewed > check.at)
+            }) {
+                moot.set(true);
+                return Err("a login was made for the row since".into());
+            }
+            accounts::note_check_stop(logins, row, check.at);
+            Ok(Vec::new())
+        },
+    );
+    match written {
+        Ok(_) => CheckWrite::Recorded,
+        Err(_) if moot.get() => CheckWrite::Moot,
+        Err(_) => CheckWrite::Busy,
+    }
+}
+
+/// Holds `check`'s row for a person where a bot protection stopped its run, of any CLI's pool,
+/// and the run's own record may not have landed: the check alone is recorded
+/// ([`write_check_stop`]), or, where the records cannot be written now, this process keeps it
+/// under the renewal's `key` ([`AutoRenewGuard::unrecorded_checks`]) and holds the row until a
+/// later pass has written it.
+fn hold_for_a_person(
+    guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    store: &accounts::Store,
+    key: String,
+    check: PendingCheck,
+) {
+    if write_check_stop(store, &check) == CheckWrite::Busy {
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unrecorded_checks
+            .insert(key, check);
+    }
 }
 
 #[expect(
@@ -19410,6 +20062,14 @@ fn spawn_row_renewal(
             LadderStep::NoRoute => return RenewalDispatch::Failed,
         },
         None => {
+            // A saved choice a tick resumed, or a Next selection, with nobody at this desk: a
+            // row a bot protection stopped, or whose renewal is a person's, is not signed in
+            // by one (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3), its token in use here
+            // or not, since every route here loads a page; failing retires the choice, and a Next
+            // selection goes on to its next row.
+            if !at_desk && left_to_a_person(&store, &raw_workflow, logins) {
+                return RenewalDispatch::Failed;
+            }
             let has_mailbox = mailbox_dir.is_some()
                 || has_configured_mailbox_for_row_with(
                     &reads.var,
@@ -19934,12 +20594,34 @@ fn spawn_row_renewal(
             {
                 return;
             }
+            // What stopped the run, where something did ([`super::open_url::Met::stopped`]), and,
+            // where a bot protection did, the check to hold the row's account on
+            // ([`hold_for_a_person`]): whoever started the run, the ladder, a person's click, a
+            // saved choice or a Next selection, the row waits for a person from here on
+            // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+            let stopped_by = met
+                .borrow()
+                .as_ref()
+                .filter(|met| !published && met.stopped())
+                .cloned();
+            let check = stopped_by
+                .as_ref()
+                .filter(|met| met.word.is_bot_protection())
+                .and_then(|_| {
+                    attempt_snapshot
+                        .borrow()
+                        .as_ref()
+                        .map(|observed| PendingCheck {
+                            roster_path: roster_owned.clone(),
+                            row: next_row.clone(),
+                            generation: observed
+                                .get(&next_label)
+                                .map(|binding| binding.renewal_generation),
+                            at: now_done,
+                        })
+                });
             if let Some((route, read, inputs, log)) = &unattended {
-                let failed = if met
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(super::open_url::Met::stopped)
-                {
+                let failed = if stopped_by.is_some() {
                     accounts::AttemptOutcome::Blocked
                 } else {
                     accounts::AttemptOutcome::Failed
@@ -19960,18 +20642,22 @@ fn spawn_row_renewal(
                 };
                 // A published login records both the matched success and any requested
                 // mismatch atomically. Unpublished failures and a scripted requested success
-                // still name their original parent.
+                // still name their original parent. A bot protection's stop is held whether or
+                // not its run's record lands.
                 if (!published || (run_seam.is_some() && renewed))
                     && let Some(observed) = attempt_snapshot.borrow().as_ref()
                     && !note_attempt(
                         &store,
                         (&roster_owned, &next_row, observed),
-                        outcome,
+                        (outcome, stopped_by.as_ref().map(|met| (met, false))),
                         &routes,
                         now_done,
                     )
                 {
-                    return;
+                    let Some(check) = check.clone() else {
+                        return;
+                    };
+                    hold_for_a_person(&ladder_guard, &store, next_label.clone(), check);
                 }
                 let mut guard = ladder_guard
                     .lock()
@@ -19988,13 +20674,15 @@ fn spawn_row_renewal(
                     );
                     log(&line);
                 } else {
-                    let mut wait = guard.ladder.failed(&next_label, inputs, Instant::now());
+                    let mut wait = Some(guard.ladder.failed(&next_label, inputs, Instant::now()));
                     let mut sooner = "when its inputs change";
-                    if failed == accounts::AttemptOutcome::Blocked {
+                    if let Some(met) = &stopped_by {
+                        // A bot protection's page is never tried again on a clock: the row waits
+                        // for a person (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+                        wait = (!met.word.is_bot_protection()).then_some(PERSON_BACKOFF);
                         guard
                             .ladder
-                            .page_stopped(&next_label, Instant::now() + PERSON_BACKOFF);
-                        wait = PERSON_BACKOFF;
+                            .page_stopped(&next_label, wait.map(|wait| Instant::now() + wait));
                         sooner = "when a person signs it in at this Mac";
                     }
                     guard.ladder_owners.insert(
@@ -20011,11 +20699,40 @@ fn spawn_row_renewal(
                     );
                     drop(guard);
                     login_activity_moved();
-                    log(&format!(
-                        "{line} (tried again in {} or {sooner})",
-                        super::upgrade::span(wait.as_secs())
-                    ));
+                    log(&match wait {
+                        Some(wait) => format!(
+                            "{line} (tried again in {} or {sooner})",
+                            super::upgrade::span(wait.as_secs())
+                        ),
+                        None => format!(
+                            "{line} (not tried again until a person signs it in at this Mac)"
+                        ),
+                    });
                 }
+            } else if let Some(met) = &stopped_by
+                && let Some(observed) = attempt_snapshot.borrow().as_ref()
+            {
+                // A sign-in the ladder did not start (a person's click, a saved choice a tick
+                // resumed, a Next selection) records where a page stopped it as the ladder's own
+                // does, by hand where a person at this desk asked for it, so the upkeep holds
+                // the row as it would have held its own.
+                let routes = how(terminal);
+                let routes = if at_desk {
+                    format!("by hand: {routes}")
+                } else {
+                    routes
+                };
+                if !note_attempt(
+                    &store,
+                    (&roster_owned, &next_row, observed),
+                    (accounts::AttemptOutcome::Blocked, Some((met, at_desk))),
+                    &routes,
+                    now_done,
+                ) && let Some(check) = check.clone()
+                {
+                    hold_for_a_person(&ladder_guard, &store, next_label.clone(), check);
+                }
+                login_activity_moved();
             }
             completion.complete();
             if let Some(request) = &pin_request {
@@ -20127,9 +20844,14 @@ fn spawn_vendor_renewal(
 /// in the background, where a headless browser can approve the CLI's page
 /// ([`Cli::renews_headlessly`]), one is installed, the row has an email and the CLI has a
 /// sign-in (one that opens the desk's browser runs under [`super::login_drive::NO_DESK`] there,
-/// [`crate::ai::connector::SignIn::no_desk`]). A row whose last one stopped for a person, or met
-/// Cloudflare's bot check, waits [`PERSON_BACKOFF`] ([`note_background_end`]; a bot check on
-/// record holds it across a restart, [`bot_check_on_record_at`]). A Grok row's never starts,
+/// [`crate::ai::connector::SignIn::no_desk`]). A row whose last one stopped for a person where no
+/// bot protection stopped it waits [`PERSON_BACKOFF`] ([`note_background_end`], and its sign-in
+/// task on record across a restart). A row a bot protection stopped (Cloudflare's check, a
+/// block page), or one of its pool and realm here, is left to a person on no clock
+/// ([`person_hold`], or the check this process met and could not record yet,
+/// [`hold_for_a_person`]): no door here starts it, the upkeep, a saved choice, a Next selection
+/// or a person's click at the desk, since each would run the same headless page; a person's
+/// `accounts login` at a terminal does. A Grok row's never starts,
 /// from the upkeep, a saved selection or a click alike: each would request a live xAI device
 /// code and then load accounts.x.ai's block page, which aterm never works around (design §5
 /// (g)). Its records checked as every CLI's are (unreadable ones fence, keeping a saved
@@ -20196,6 +20918,52 @@ fn spawn_vendor_renewal_with(
             .is_ok_and(|profile| profile.is_some());
     #[cfg(not(unix))]
     let native_profile = false;
+    let key = format!("{}:{}", cli.id(), next_row.label);
+    // A bot protection this process met and could not record holds the row until it is on
+    // record, which this pass tries again ([`hold_for_a_person`]), and holds as one on record
+    // does; the records read here predate that write. One met on another row of the pool and
+    // realm holds this row too ([`person_hold`]).
+    let (pending, pool_pending) = {
+        let guard = renew_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prefix = format!("{}:", cli.id());
+        (
+            guard.unrecorded_checks.get(&key).cloned(),
+            guard.unrecorded_checks.iter().any(|(other, check)| {
+                *other != key
+                    && other.starts_with(&prefix)
+                    && check.row.vendor.region == raw_workflow.vendor.region
+            }),
+        )
+    };
+    let pending_holds = pending.is_some_and(|pending| {
+        let written = write_check_stop(&store, &pending);
+        if written != CheckWrite::Busy {
+            renew_guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unrecorded_checks
+                .remove(&key);
+        }
+        written != CheckWrite::Moot
+    });
+    // A row a bot protection stopped, or one of its pool and realm here, is signed in by no door
+    // of this upkeep, on any clock (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3): not
+    // the upkeep, a saved choice or a Next selection a tick resumes, and not a person's click at
+    // this desk either, since the renewal it starts loads the same headless page the check
+    // answered and nobody can go on in it. Failing retires such a choice, and a Next selection
+    // goes on to its next row; the row's person's step is a terminal's `accounts login`
+    // ([`super::cli::left_step`]), which every surface names from its task. A Kimi Code CLI row's
+    // native refresh loads no page and goes on; its fall back to the page is held where it is
+    // chosen ([`super::cli::pool_kimi`]).
+    if !native_profile
+        && (pending_holds
+            || pool_pending
+            || person_hold(&store, &file_roster, &raw_workflow, logins).is_some())
+    {
+        return RenewalDispatch::Failed;
+    }
     if next_row.email.is_none() && cli != Cli::Kimi
         || cli.accounts().signin.as_ref().is_none()
         || (!native_profile && !reads.has_browser(home))
@@ -20236,15 +21004,6 @@ fn spawn_vendor_renewal_with(
         }
         None => workflow_browser_window_token(&store, &raw_workflow, logins, 0),
     };
-    // A bot check on record holds the row as long as a stop for a person, across a restart
-    // too, where the guard's own hold is gone. Its human task follows the same account wait.
-    if pin_request.is_none()
-        && !native_profile
-        && bot_check_on_record_at(&store, &raw_workflow, logins)
-            .is_some_and(|at| now.saturating_sub(at) < PERSON_BACKOFF_SECS)
-    {
-        return RenewalDispatch::Held;
-    }
     if scope.is_some_and(super::account_work::Scope::cancelled) {
         return RenewalDispatch::Held;
     }
@@ -20261,7 +21020,6 @@ fn spawn_vendor_renewal_with(
             Err(disposition) => return disposition,
         }
     }
-    let key = format!("{}:{}", cli.id(), next_row.label);
     reconcile_browser_window_unpark(
         renew_guard,
         &key,
@@ -20347,6 +21105,23 @@ fn spawn_vendor_renewal_with(
                 .is_some_and(super::account_work::Scope::cancelled)
             {
                 return;
+            }
+            // A bot protection stopped it: the account's check is held on no clock, whether or
+            // not the run's own record landed ([`hold_for_a_person`]).
+            if renewal == super::cli::Renewal::BotCheck {
+                hold_for_a_person(
+                    &parker,
+                    &store,
+                    key.clone(),
+                    PendingCheck {
+                        roster_path: roster_path.clone(),
+                        row: raw_workflow.clone(),
+                        generation: captured_logins
+                            .get(&next_row.label)
+                            .map(|binding| binding.renewal_generation),
+                        at: crate::supervise::limit::unix_now().max(now),
+                    },
+                );
             }
             note_vendor_renewal_end(
                 &parker,

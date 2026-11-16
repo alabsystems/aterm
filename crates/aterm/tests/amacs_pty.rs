@@ -312,7 +312,7 @@ fn amacs_edits_a_file_under_a_real_pty() {
             "tmux inside a window",
             &[
                 ("TMUX", "/tmp/tmux-1/default,1,0"),
-                ("ATERM_PARENT_SESSION_ID", "s-1"),
+                ("ATERM_PARENT_SESSION_ID", "t0000000001"),
             ][..],
         ),
     ] {

@@ -27,8 +27,8 @@ aterm-json = { workspace = true }
 aterm-toolchain = { workspace = true }
 aterm-tempfile = { workspace = true }
 aterm-uds = { workspace = true }
-# The seal each generated module carries (`aterm_census::seal`), std only.
-aterm-census = { workspace = true }
+# The seal each generated module carries (`aterm_seal`), std only.
+aterm-seal = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

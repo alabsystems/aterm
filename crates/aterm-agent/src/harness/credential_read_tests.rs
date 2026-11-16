@@ -4,6 +4,7 @@
 use super::*;
 
 /// A vault under `home` that delivers each of `names`, which this Mac reads in place.
+#[cfg(unix)]
 fn applied(home: &std::path::Path, names: &[&str]) {
     let entries: Vec<(&str, &[u8])> = names.iter().map(|name| (*name, &b"fixture"[..])).collect();
     crate::vault_entry::seed(home, &entries);
@@ -19,6 +20,7 @@ fn resolution<'a>(read: &'a CredentialRead, want: &str) -> &'a Resolution {
 /// FOUND: a want the registry holds an entry for resolves to that entry and its purpose,
 /// and nothing else, never a value; nothing is filed for it.
 #[test]
+#[cfg(unix)]
 fn a_held_want_resolves_to_its_registry_entry() {
     let home = aterm_tempfile::tempdir().unwrap();
     applied(
@@ -43,6 +45,7 @@ fn a_held_want_resolves_to_its_registry_entry() {
 /// NEGATIVE CONTROL: a want the registry holds no entry for, on a Mac that applied a registry
 /// or none, is never held: it is filed in the need ledger, or says why it could not be.
 #[test]
+#[cfg(unix)]
 fn a_missing_want_is_filed_never_held() {
     let home = aterm_tempfile::tempdir().unwrap();
     let read = resolve(home.path(), &["gh:release".to_owned()]);

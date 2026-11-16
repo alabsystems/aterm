@@ -12,8 +12,9 @@ description = "aterm — a native windowed terminal: winit presenting the aterm-
 [[bin]]
 name = "aterm-gui"
 path = "src/main.rs"
-# main.rs holds no tests; integration tests still get the binary.
+# The standalone entry has no tests or benchmarks; integration tests still get the binary.
 test = false
+bench = false
 
 # Owns main so the real fixed `harness native-launch` entry can run in this
 # original image before fixture arguments are parsed. No installed image is used.

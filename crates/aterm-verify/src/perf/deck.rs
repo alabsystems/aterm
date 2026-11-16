@@ -143,7 +143,7 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
     if !built.status.success() {
         return Err(format!("deck bench build exited {}", built.status).into());
     }
-    let executable = super::bench_build::built_executable(
+    let executable = super::driver::built_executable(
         &String::from_utf8_lossy(&built.stdout),
         "aterm_gui",
         "lib",
@@ -180,6 +180,7 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
 }
 
 /// Build an attested debug app and lab, then take `deck-motion idle`; its diagnostic summary.
+#[cfg(unix)]
 fn idle_take(dir: &Path) -> Result<String, String> {
     use super::bench_build::{self, Targo};
 
@@ -222,8 +223,8 @@ fn idle_take(dir: &Path) -> Result<String, String> {
         return Err(format!("the debug fixture build exited {}", built.status));
     }
     let messages = String::from_utf8_lossy(&built.stdout);
-    let aterm = bench_build::built_debug_app(&messages, "aterm")?;
-    let lab = bench_build::built_debug_app(&messages, "aterm-lab")?;
+    let aterm = super::driver::built_debug_app(&messages, "aterm")?;
+    let lab = super::driver::built_debug_app(&messages, "aterm-lab")?;
     let out = dir.join("takes");
     let json = dir.join("deck.json");
     let (aterm_s, out_s, json_s) = (
@@ -262,6 +263,16 @@ fn idle_take(dir: &Path) -> Result<String, String> {
     }
     crate::read_regular_text(out.join("deck-motion.txt"))
         .map_err(|e| format!("deck-motion wrote no summary: {e}"))
+}
+
+/// Off unix there is no idle take: its attested build is planned and audited by the unix-only
+/// bench helpers (`perf::bench_build`).
+#[cfg(not(unix))]
+fn idle_take(_dir: &Path) -> Result<String, String> {
+    Err(String::from(
+        "its attested debug build runs through the unix-only bench helpers; take it on macOS or \
+         Linux",
+    ))
 }
 
 #[cfg(test)]

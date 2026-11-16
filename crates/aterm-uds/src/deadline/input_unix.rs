@@ -10,7 +10,7 @@ use std::process::Output;
 use std::time::{Duration, Instant};
 
 use super::children::{PollFd, poll};
-use super::{ChildOutput, ExitWait, POLL_MAX, deadline_now};
+use super::{ChildOutput, ExitWait, OwnedInputTimeout, POLL_MAX, deadline_now};
 use crate::secret::Secret;
 use crate::spawnfd::{Child, Command, Stdio};
 
@@ -21,11 +21,18 @@ const REAP_TICK: Duration = Duration::from_millis(20);
 struct Capture {
     pipe: Option<File>,
     stream: ChildOutput,
+    observed: usize,
+    eof: bool,
 }
 
 impl Capture {
     const fn empty(stream: ChildOutput) -> Self {
-        Self { pipe: None, stream }
+        Self {
+            pipe: None,
+            stream,
+            observed: 0,
+            eof: false,
+        }
     }
 
     fn attach(&mut self, fd: OwnedFd) -> io::Result<()> {
@@ -43,8 +50,12 @@ impl Capture {
         };
         let mut chunk = [0_u8; 8192];
         match pipe.read(&mut chunk) {
-            Ok(0) => self.pipe = None,
+            Ok(0) => {
+                self.eof = true;
+                self.pipe = None;
+            }
             Ok(n) => {
+                self.observed = self.observed.saturating_add(n);
                 output(self.stream, &chunk[..n])?;
             }
             Err(why)
@@ -62,6 +73,7 @@ impl Capture {
 /// Cooperative retirement requests its owner's stop and retains the actual root through cleanup.
 struct Run<'retire, 'observe> {
     child: Child,
+    input_len: Option<usize>,
     input: Option<Secret>,
     to_child: Option<File>,
     sent: usize,
@@ -73,6 +85,17 @@ struct Run<'retire, 'observe> {
 }
 
 impl Run<'_, '_> {
+    fn timed_out(&self) -> io::Error {
+        timeout_observations(
+            self.input_len,
+            self.sent,
+            self.input.is_some(),
+            self.natural_exit,
+            &self.streams,
+        )
+        .into_io_error()
+    }
+
     fn settle(&mut self) {
         self.settle_with(Child::wait);
     }
@@ -189,6 +212,23 @@ impl Run<'_, '_> {
         }
         Ok(())
     }
+}
+
+fn timeout_observations(
+    input_len: Option<usize>,
+    sent: usize,
+    input_pending: bool,
+    natural_exit: bool,
+    streams: &[Capture; 2],
+) -> OwnedInputTimeout {
+    let mut observed = OwnedInputTimeout::spawned(input_len);
+    observed.natural_exit_observed = natural_exit;
+    observed.observe_stdin(input_len, sent, input_pending);
+    observed.stdout_eof = streams[0].eof;
+    observed.stderr_eof = streams[1].eof;
+    observed.stdout_bytes_observed = streams[0].observed;
+    observed.stderr_bytes_observed = streams[1].observed;
+    observed
 }
 
 impl Drop for Run<'_, '_> {
@@ -324,7 +364,7 @@ fn run_with_input_until_watching(
         ));
     }
     if deadline.is_some_and(|deadline| deadline_now() >= deadline) {
-        return Err(timed_out());
+        return Err(OwnedInputTimeout::before_start().into_io_error());
     }
     if stopped() {
         return Ok(None);
@@ -343,6 +383,7 @@ fn run_with_input_until_watching(
         .spawn()?;
     let mut run = Run {
         child,
+        input_len: input.as_ref().map(Secret::len),
         input,
         to_child: None,
         sent: 0,
@@ -405,7 +446,7 @@ fn run_with_input_until_watching(
             deadline.saturating_duration_since(deadline_now())
         });
         if left.is_zero() {
-            return Err(timed_out());
+            return Err(run.timed_out());
         }
         let mut fds = Vec::new();
         let mut owners = Vec::new();
@@ -449,13 +490,6 @@ fn run_with_input_until_watching(
             }
         }
     }
-}
-
-fn timed_out() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        "child input, execution or output exceeded its deadline",
-    )
 }
 
 fn missing_pipe() -> io::Error {

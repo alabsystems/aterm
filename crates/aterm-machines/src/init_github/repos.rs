@@ -772,7 +772,7 @@ fn no_room_beside(volume: Option<&Volume>, repo: &Repo, reserved: u64) -> Option
 }
 
 /// What a pass that left `left` uncloned for room ([`no_room`]) says, with `volume`'s free space,
-/// the free space it keeps and `then`, what to do once there is room; `None` when it left none.
+/// the free space it keeps and `then`, how the pass runs again; `None` when it left none.
 pub(super) fn short_of_room(
     volume: Option<&Volume>,
     left: &[String],
@@ -794,7 +794,7 @@ pub(super) fn short_of_room(
         n => format!("{n} repositories"),
     };
     Some(format!(
-        "{count} not cloned, for want of disk space: {}{disk}; free space, then {then}",
+        "{count} not cloned, for want of disk space: {}{disk}; {then}",
         left.join(", ")
     ))
 }

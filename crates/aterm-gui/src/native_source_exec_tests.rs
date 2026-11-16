@@ -101,7 +101,21 @@ fn resource_root(
     ctx: &Arc<crate::SessionCtx>,
     operation: &str,
 ) -> (Arc<Operation>, crate::session_timeline::NativeDrain) {
-    let source = Process::observe(std::process::id()).unwrap();
+    resource_root_of(
+        ctx,
+        operation,
+        Process::observe(std::process::id()).unwrap(),
+        aterm_agent::harness::native_act::monotonic_us().unwrap() + 60_000_000,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resource_root_of(
+    ctx: &Arc<crate::SessionCtx>,
+    operation: &str,
+    source: Process,
+    deadline: u64,
+) -> (Arc<Operation>, crate::session_timeline::NativeDrain) {
     let data = runtime_data::Slot::reserved(operation.into(), source.clone());
     let pin = data.pin(operation, &source).unwrap();
     let meta = ctx.meta.lock().unwrap();
@@ -129,7 +143,7 @@ fn resource_root(
         authority,
         human_seq: ctx.human_input.seq(),
         input_sealed: std::sync::atomic::AtomicBool::new(false),
-        deadline: aterm_agent::harness::native_act::monotonic_us().unwrap() + 60_000_000,
+        deadline,
         cancelled: std::sync::atomic::AtomicBool::new(false),
         state: Mutex::new(State {
             phase: Phase::Preparing,
@@ -140,6 +154,7 @@ fn resource_root(
             granted: false,
             snapshot: None,
             successor: None,
+            kept_claim: None,
         }),
         wake: std::sync::Condvar::new(),
     });
@@ -194,11 +209,11 @@ fn worker_panic_and_metadata_side_cancellation_leave_no_input_custody() {
         if panic {
             guarded(&op, || panic!("source preparation fixture"));
         } else {
-            let meta = ctx.meta.lock().unwrap();
+            let seen = Seen::of(ctx);
             assert!(cancel_owner(ctx));
             assert!(pending(ctx), "a metadata-side stop only requests closing");
-            assert!(!op.current(ctx, &meta.supervisor_authority(crate::metrics::now_us())));
-            drop(meta);
+            assert!(!op.current(ctx, &seen));
+            drop(seen);
             guarded(&op, || op.close());
         }
         assert!(!pending(ctx));
@@ -227,16 +242,16 @@ fn possible_execution_keeps_real_custody_after_abort_panic_and_claim_eof() {
     .unwrap();
     // Resource fixture only, no constructor or signed target is injected.
     let (op, drain) = resource_root(ctx, &"d".repeat(32));
-    assert!(!super::super::retain_exec_claim(ctx, 51));
+    assert!(!super::super::retain_exec_claim(ctx, 918044, 51));
     op.state.lock().unwrap().possible = true;
-    assert!(super::super::retain_exec_claim(ctx, 51));
-    assert!(!super::super::retain_exec_claim(ctx, 52));
+    assert!(super::super::retain_exec_claim(ctx, 918044, 51));
+    assert!(!super::super::retain_exec_claim(ctx, 918044, 52));
     op.close();
     guarded(&op, || panic!("possible execution fixture"));
     assert!(pending(ctx));
     assert!(!drain.is_drained());
     assert!(op.state.lock().unwrap().data.is_some());
-    assert!(super::super::retain_exec_claim(ctx, 51));
+    assert!(super::super::retain_exec_claim(ctx, 918044, 51));
 }
 
 #[cfg(target_os = "macos")]
@@ -252,12 +267,7 @@ fn source_input_seal_preserves_later_typing_without_granting_execution() {
         let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
         let operation = "d".repeat(32);
         let (op, drain) = resource_root(ctx, &operation);
-        let authority = ctx
-            .meta
-            .lock()
-            .unwrap()
-            .supervisor_authority(crate::metrics::now_us());
-        assert!(op.current(ctx, &authority));
+        assert!(op.current(ctx, &Seen::of(ctx)));
         if seal_first {
             let mut resume = |_: &str| panic!("input sealing cannot resume work");
             let reply = super::super::serve(
@@ -271,14 +281,14 @@ fn source_input_seal_preserves_later_typing_without_granting_execution() {
         }
         ctx.human_input
             .note(crate::metrics::now_us(), crate::human_input::Gesture::Typed);
-        assert_eq!(op.current(ctx, &authority), seal_first);
-        assert_eq!(op.seal_input(ctx, &authority), seal_first);
+        assert_eq!(op.current(ctx, &Seen::of(ctx)), seal_first);
+        assert_eq!(op.seal_input(ctx, &Seen::of(ctx)), seal_first);
         let state = op.state.lock().unwrap();
         assert!(!state.possible && !state.granted && state.snapshot.is_none());
         assert!(matches!(state.phase, Phase::Preparing));
         drop(state);
         op.close();
-        assert!(!op.seal_input(ctx, &authority));
+        assert!(!op.seal_input(ctx, &Seen::of(ctx)));
         assert!(drain.is_drained());
     }
 }
@@ -291,12 +301,7 @@ fn a_source_input_seal_does_not_bypass_a_hold_cancellation_or_source_generation(
         let handle = crate::session_store::test_handle_on(918052, -1);
         let ctx = &handle.ctx;
         let (mut op, drain) = resource_root(ctx, &"e".repeat(32));
-        let authority = ctx
-            .meta
-            .lock()
-            .unwrap()
-            .supervisor_authority(crate::metrics::now_us());
-        assert!(op.seal_input(ctx, &authority));
+        assert!(op.seal_input(ctx, &Seen::of(ctx)));
         match cause {
             "hold" => {
                 assert!(apply_hold_for_test(
@@ -315,15 +320,385 @@ fn a_source_input_seal_does_not_bypass_a_hold_cancellation_or_source_generation(
                 Arc::get_mut(&mut op).unwrap().generation += 1;
             }
         }
-        assert!(!op.seal_input(ctx, &authority), "{cause}");
+        assert!(!op.seal_input(ctx, &Seen::of(ctx)), "{cause}");
         if cause != "generation" {
-            assert!(!op.current(ctx, &authority), "{cause}");
+            assert!(!op.current(ctx, &Seen::of(ctx)), "{cause}");
         } else {
             assert!(!op.source_current());
         }
         op.close();
         assert!(drain.is_drained());
     }
+}
+
+/// The session's Meta is the ranked lock. Beneath it the hold is read from the copy each hold
+/// change stores, while a read through the fabric's Inbox is the reversed order, refused before
+/// it can block (`crate::fabric::lock_rank`).
+#[test]
+fn beneath_a_session_meta_guard_the_hold_is_read_without_the_inbox() {
+    let handle = crate::session_store::test_handle_on(918062, -1);
+    let ctx = &handle.ctx;
+    assert!(crate::fabric::apply_hold_for_test(
+        ctx,
+        Some(crate::fabric::Hold {
+            reason: "fixture-held".into(),
+            origin: "local".into(),
+        })
+    ));
+    let meta = ctx.meta.lock().unwrap();
+    assert_eq!(
+        ctx.fabric.hold().map(|hold| hold.reason),
+        Some("fixture-held".to_string())
+    );
+    let reversed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.fabric.hold_observation()
+    }));
+    assert!(
+        reversed.is_err(),
+        "Meta, then the Inbox, is the reversed order"
+    );
+    drop(meta);
+    assert!(Seen::of(ctx).held);
+}
+
+/// A source-exec verb served on a control connection's thread and a task mark on the same
+/// session, from two threads. The mark holds the session's fabric Inbox and has not yet taken
+/// Meta when the verb starts; the mark goes on once the verb has answered or waits on that
+/// Inbox. A verb that waited on the Inbox beneath Meta to read the hold would hold Meta waiting
+/// on the Inbox, while the mark holds the Inbox waiting on Meta: both would wait forever, and
+/// every later reader of the session's Meta with them.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_source_exec_verb_and_a_task_mark_on_one_session_never_deadlock() {
+    use aterm_spec::wait::MUST_HAPPEN;
+    let handle = crate::session_store::test_handle_on(918060, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let operation = "f".repeat(32);
+    let (op, drain) = resource_root(&ctx, &operation);
+    let (holds, go) = ctx.fabric.pause_next_unfenced();
+    let mark = {
+        let ctx = Arc::clone(&ctx);
+        std::thread::spawn(move || {
+            crate::task_record::mark_session_task_with_context(
+                &ctx,
+                918060,
+                None,
+                crate::task_record::AttentionEdit::Keep,
+                MUST_HAPPEN,
+                |_, _, _, _| false,
+            )
+            .is_ok()
+        })
+    };
+    holds
+        .recv_timeout(MUST_HAPPEN)
+        .expect("the task mark holds the session's Inbox");
+    let waits = ctx.fabric.inbox_waits();
+    let verb = {
+        let ctx = Arc::clone(&ctx);
+        let line = format!("seal-input operation={operation}");
+        std::thread::spawn(move || {
+            let (server, _client) = aterm_uds::CtlStream::pair().unwrap();
+            let _direct = crate::control::DirectPeer::enter();
+            let _serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+            serve(&ctx, -1, &line)
+        })
+    };
+    aterm_spec::wait::until_within(
+        MUST_HAPPEN,
+        "the verb answers or waits on the Inbox the task mark holds",
+        || (ctx.fabric.inbox_waits() > waits || verb.is_finished()).then_some(()),
+    );
+    go.send(()).unwrap();
+    let both = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+        (mark.is_finished() && verb.is_finished()).then_some(())
+    });
+    assert!(
+        both.is_some(),
+        "deadlock: the verb holds Meta waiting on the Inbox, the task mark the Inbox waiting on Meta"
+    );
+    assert!(verb.join().unwrap().contains("input=sealed"));
+    assert!(mark.join().unwrap());
+    op.close();
+    assert!(drain.is_drained());
+}
+
+/// Run [`hold_to_end`] as the operation's worker does once [`run`] returns.
+#[cfg(target_os = "macos")]
+fn worker_holds_to_end(
+    ctx: &Arc<crate::SessionCtx>,
+    op: &Arc<Operation>,
+) -> std::thread::JoinHandle<()> {
+    let session = Arc::downgrade(ctx);
+    let op = Arc::clone(op);
+    std::thread::spawn(move || hold_to_end(&op, &session))
+}
+
+/// A possible execution whose constructor was never granted sent no Go and can admit no
+/// successor: once its worker is done, its custody, DATA and the claim the EOF kept all end.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_ungranted_possible_execution_ends_its_custody_and_the_claim_kept_for_it() {
+    use aterm_spec::wait::MUST_HAPPEN;
+    let handle = crate::session_store::test_handle_on(918061, -1);
+    let ctx = &handle.ctx;
+    crate::session_timeline::claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(61),
+        None,
+        Some(crate::self_claim::Proven {
+            pid: std::process::id(),
+            start: "resource-fixture".into(),
+        }),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let (op, drain) = resource_root(ctx, &"a".repeat(32));
+    op.state.lock().unwrap().possible = true;
+    assert!(
+        super::super::retain_exec_claim(ctx, 918061, 61),
+        "the EOF keeps the claim"
+    );
+    op.close();
+    assert!(
+        pending(ctx),
+        "closing a possible execution keeps its custody"
+    );
+    let worker = worker_holds_to_end(ctx, &op);
+    let ended = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+        worker.is_finished().then_some(())
+    });
+    assert!(
+        ended.is_some(),
+        "the worker held an ungranted operation's custody"
+    );
+    worker.join().unwrap();
+    assert!(!pending(ctx));
+    assert!(drain.is_drained());
+    assert!(op.state.lock().unwrap().data.is_none());
+    assert!(op.status().contains("state=closed"));
+    assert!(!super::super::retain_exec_claim(ctx, 918061, 61));
+    assert!(
+        ctx.meta
+            .lock()
+            .unwrap()
+            .live_supervisor(crate::metrics::now_us())
+            .is_none(),
+        "the claim the EOF kept goes back with the custody"
+    );
+}
+
+/// A granted possible execution that can start nothing more (cancelled, or past its deadline
+/// before activation) stops holding the app handoff at once; its input position and DATA stay
+/// while its source process may still run a granted successor, and end once that process is gone,
+/// here before its close.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_granted_possible_execution_frees_the_handoff_then_ends_when_its_source_is_gone() {
+    use aterm_spec::wait::MUST_HAPPEN;
+    for (local, ending) in [(918063, "cancelled"), (918064, "expired")] {
+        let handle = crate::session_store::test_handle_on(local, -1);
+        let ctx = &handle.ctx;
+        let mut child = aterm_uds::spawnfd::command("/bin/cat")
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = aterm_uds::deadline::cat_echoes(&mut child);
+        let source = Process::observe(child.id()).unwrap();
+        let now = aterm_agent::harness::native_act::monotonic_us().unwrap();
+        let deadline = if ending == "expired" {
+            now
+        } else {
+            now + 60_000_000
+        };
+        let (op, drain) = resource_root_of(ctx, &"b".repeat(32), source, deadline);
+        {
+            let mut state = op.state.lock().unwrap();
+            state.possible = true;
+            state.granted = true;
+        }
+        if ending == "cancelled" {
+            op.close();
+        }
+        let worker = worker_holds_to_end(ctx, &op);
+        aterm_spec::wait::until_within(MUST_HAPPEN, "the app handoff is free", || {
+            op.state
+                .lock()
+                .unwrap()
+                .custody
+                .as_ref()
+                .is_some_and(|custody| custody.handoff_guard().is_none())
+                .then_some(())
+        });
+        assert!(pending(ctx), "{ending}: the input position stays");
+        assert!(!drain.is_drained(), "{ending}");
+        assert!(op.state.lock().unwrap().data.is_some(), "{ending}");
+        assert!(!worker.is_finished(), "{ending}");
+        drop(input);
+        aterm_spec::wait::until_within(MUST_HAPPEN, "cat exits once its input closes", || {
+            child.try_wait().unwrap().map(|_| ())
+        });
+        let ended = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
+            worker.is_finished().then_some(())
+        });
+        assert!(ended.is_some(), "{ending}: the worker outlived its source");
+        worker.join().unwrap();
+        assert!(!pending(ctx), "{ending}");
+        assert!(drain.is_drained(), "{ending}");
+        assert!(op.state.lock().unwrap().data.is_none(), "{ending}");
+    }
+}
+
+/// One pass of the worker over a possible execution: it ends at the close whatever is still to
+/// come, and before the close it stops holding the app handoff once nothing more can start,
+/// keeping it for an activated successor's settlement, which the close alone bounds.
+#[test]
+fn a_pass_ends_at_the_close_and_keeps_the_handoff_only_for_a_settlement_to_come() {
+    let fresh = Standing {
+        granted: true,
+        source_gone: false,
+        cancelled: false,
+        activated: false,
+        past_deadline: false,
+        past_close: false,
+    };
+    assert_eq!(fresh.pass(), Pass::Keep, "a Go may still go out");
+    let ungranted = Standing {
+        granted: false,
+        ..fresh
+    };
+    assert_eq!(ungranted.pass(), Pass::End, "no Go went out");
+    let gone = Standing {
+        source_gone: true,
+        ..fresh
+    };
+    assert_eq!(gone.pass(), Pass::End, "nothing of it runs on");
+    for activated in [false, true] {
+        for cancelled in [false, true] {
+            let closed = Standing {
+                cancelled,
+                activated,
+                past_deadline: true,
+                past_close: true,
+                ..fresh
+            };
+            assert_eq!(
+                closed.pass(),
+                Pass::End,
+                "past the close: activated={activated} cancelled={cancelled}"
+            );
+        }
+        let cancelled = Standing {
+            cancelled: true,
+            activated,
+            ..fresh
+        };
+        assert_eq!(
+            cancelled.pass(),
+            Pass::FreeHandoff,
+            "cancelled: activated={activated}"
+        );
+    }
+    let expired = Standing {
+        past_deadline: true,
+        ..fresh
+    };
+    assert_eq!(
+        expired.pass(),
+        Pass::FreeHandoff,
+        "past its deadline before activation, nothing more starts"
+    );
+    let settling = Standing {
+        activated: true,
+        past_deadline: true,
+        ..fresh
+    };
+    assert_eq!(
+        settling.pass(),
+        Pass::Keep,
+        "an activated successor may settle until the close"
+    );
+}
+
+/// A granted possible execution whose source still runs, past its close: nothing of it is
+/// admitted any more, so its worker ends it at once. Its custody, DATA and the claim the EOF kept
+/// go, and the window hears that the session's metadata moved.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_granted_possible_execution_ends_at_its_close_while_its_source_runs() {
+    let local = 918065;
+    let handle = crate::session_store::test_handle_on(local, -1);
+    let ctx = &handle.ctx;
+    crate::session_timeline::claim_supervisor_as(
+        ctx,
+        &format!("codex-alab@{}", std::process::id()),
+        Some(65),
+        None,
+        Some(crate::self_claim::Proven {
+            pid: std::process::id(),
+            start: "resource-fixture".into(),
+        }),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .unwrap();
+    let now = aterm_agent::harness::native_act::monotonic_us().unwrap();
+    let closed = now
+        .checked_sub(aterm_agent::harness::native_act::COMPLETION_US + 1)
+        .expect("the boot is older than a close");
+    let source = Process::observe(std::process::id()).unwrap();
+    let (op, drain) = resource_root_of(ctx, &"c".repeat(32), source, closed);
+    {
+        let mut state = op.state.lock().unwrap();
+        state.possible = true;
+        state.granted = true;
+    }
+    assert!(
+        super::super::retain_exec_claim(ctx, local, 65),
+        "the EOF keeps the claim"
+    );
+    let worker = {
+        let session = Arc::downgrade(ctx);
+        let op = Arc::clone(&op);
+        std::thread::spawn(move || {
+            hold_to_end(&op, &session);
+            crate::presence::take_meta_wakes()
+        })
+    };
+    let ended = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || worker.is_finished().then_some(()),
+    );
+    assert!(
+        ended.is_some(),
+        "the worker held a closed operation's custody"
+    );
+    assert_eq!(
+        worker.join().unwrap(),
+        vec![local],
+        "the window hears the session's metadata moved"
+    );
+    assert!(!runtime_data::gone(&op.source), "its source still runs");
+    assert!(!pending(ctx));
+    assert!(drain.is_drained());
+    assert!(op.state.lock().unwrap().data.is_none());
+    assert!(op.status().contains("state=closed"));
+    assert!(
+        op.cancelled.load(std::sync::atomic::Ordering::Acquire),
+        "a successor's settlement is refused from here on"
+    );
+    assert!(
+        ctx.meta
+            .lock()
+            .unwrap()
+            .live_supervisor(crate::metrics::now_us())
+            .is_none(),
+        "the claim the EOF kept goes back with the custody"
+    );
 }
 
 fn capability_fixture() -> aterm_json::Value {

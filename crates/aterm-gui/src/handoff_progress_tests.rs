@@ -248,9 +248,27 @@ fn the_proof_is_the_last_frame_a_racing_report_cannot_follow(
     let mut frames = Vec::new();
     loop {
         let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
-        // SAFETY: a bounded read into a fixed local buffer; the write end closed with the
-        // signal, so this ends at EOF.
-        let n = unsafe { libc::read(read.as_raw_fd(), wire.as_mut_ptr().cast(), wire.len()) };
+        // A sibling test's fork can hold a copy of the write end until exec on a kernel
+        // that ignores close-on-fork. Wait for its close instead of sampling the nonblocking
+        // read; a channel kept open still fails the descendants' progress-aware hang detector.
+        let n = aterm_spec::wait::until_while_descendants_work(
+            "the readiness channel's next frame or EOF",
+            || {
+                // SAFETY: a bounded read into a fixed local buffer on this test's live pipe.
+                let n =
+                    unsafe { libc::read(read.as_raw_fd(), wire.as_mut_ptr().cast(), wire.len()) };
+                if n < 0
+                    && matches!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    )
+                {
+                    None
+                } else {
+                    Some(n)
+                }
+            },
+        );
         if n != isize::try_from(wire.len()).unwrap_or(-1) {
             assert_eq!(n, 0, "whole frames, then EOF");
             break;

@@ -70,6 +70,11 @@ pub const ALPN_DATABASE_DELTA: &[u8] = b"atdb/5";
 /// database protocol with its original handoff framing.
 pub const ALPN_DATABASE_DUPLEX: &[u8] = b"atdb/6";
 
+/// [`ALPN_DATABASE_DUPLEX`]'s frames, with each table's operation inventory reconciled by range
+/// (astream-wire's RBSR) rather than traded as whole lists, and the difference drained in one
+/// round, parents first. Earlier peers negotiate [`ALPN_DATABASE_DUPLEX`] or an earlier protocol.
+pub const ALPN_DATABASE_RECONCILE: &[u8] = b"atdb/7";
+
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
 /// The mesh's ALPN protocol (`atm/1`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4): the
@@ -1155,6 +1160,9 @@ fn database_server_config() -> Arc<ServerConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_DUPLEX.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_RECONCILE.to_vec());
         Arc::new(config)
     }))
 }
@@ -1179,6 +1187,9 @@ fn database_client_config() -> Arc<ClientConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_DUPLEX.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_RECONCILE.to_vec());
         Arc::new(config)
     }))
 }
@@ -1409,7 +1420,7 @@ pub fn server_handshake_with_denied(
     )
 }
 
-/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_DUPLEX`]
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_RECONCILE`]
 /// and retaining the earlier database and fleet protocols for older dialers. This serves
 /// only [`FleetOp::Database`], with no terminal survey or drive capability.
 ///
@@ -1500,6 +1511,7 @@ fn database_version(alpn: &[u8]) -> Option<u8> {
         ALPN_DATABASE_FRONTIER,
         ALPN_DATABASE_DELTA,
         ALPN_DATABASE_DUPLEX,
+        ALPN_DATABASE_RECONCILE,
     ]
     .iter()
     .zip(2..)
@@ -1706,7 +1718,7 @@ pub fn client_handshake_as(
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
 }
 
-/// Authenticate a database dialer, preferring [`ALPN_DATABASE_DUPLEX`] and
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_RECONCILE`] and
 /// negotiating an earlier database or fleet protocol with an older listener. TLS pins,
 /// secret proofs and exporter-bound node proofs are unchanged.
 ///
@@ -1783,6 +1795,20 @@ pub fn test_client_handshake_database_v5_as(
     within: Duration,
 ) -> Result<Dialed, FleetError> {
     test_client_handshake_database_version_as(tcp, secret, me, within, 5)
+}
+
+/// A released `atdb/6` dialer (before range reconciliation) for cross-version protocol tests.
+///
+/// # Errors
+/// As [`client_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_client_handshake_database_v6_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Dialed, FleetError> {
+    test_client_handshake_database_version_as(tcp, secret, me, within, 6)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -3477,7 +3503,8 @@ const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
             | ALPN_DATABASE_CREDENTIALS
             | ALPN_DATABASE_FRONTIER
             | ALPN_DATABASE_DELTA
-            | ALPN_DATABASE_DUPLEX,
+            | ALPN_DATABASE_DUPLEX
+            | ALPN_DATABASE_RECONCILE,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
         Some(ALPN_MESH) => Some(Spoken::Mesh),

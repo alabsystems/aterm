@@ -534,13 +534,26 @@ impl BlitUniform {
     }
 
     #[inline]
-    fn with_bands(mut self, fw: u32, fh: u32, dst_w: u32, dst_h: u32, band_rgb: u32) -> Self {
+    fn with_bands(
+        mut self,
+        fw: u32,
+        fh: u32,
+        dst_w: u32,
+        dst_h: u32,
+        side_inset: u32,
+        band_rgb: u32,
+    ) -> Self {
         let chan = |s: u32| ((band_rgb >> s) & 0xff) as f32 / 255.0;
         self.dims = [fw as f32, fh as f32];
         self.visible_y = 0.0;
         self.visible_h = fh as f32;
-        let place =
-            aterm_render::frame_placement(dst_w as usize, dst_h as usize, fw as usize, fh as usize);
+        let place = aterm_render::frame_placement(
+            dst_w as usize,
+            dst_h as usize,
+            fw as usize,
+            fh as usize,
+            aterm_render::SideInsetPx(side_inset as usize),
+        );
         self.content_off = [place.x.origin as f32, place.y.origin as f32];
         self.band = [chan(16), chan(8), chan(0), 1.0];
         self
@@ -571,6 +584,7 @@ const MAX_TRAY_STACK_PX: u32 = 16_384;
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SubmitBShape {
+    side_inset: u32,
     invert: bool,
     overlay: Option<DropOverlay>,
     source_crop: Option<PresentCrop>,
@@ -3361,6 +3375,7 @@ fn present_blit_uniform(
     source_height: u32,
     destination_width: u32,
     destination_height: u32,
+    side_inset: u32,
     band_rgb: u32,
 ) -> BlitUniform {
     let visible_height = source_crop.map_or(source_height, |crop| crop.height);
@@ -3388,6 +3403,7 @@ fn present_blit_uniform(
         source_height,
         destination_width,
         destination_height,
+        side_inset,
         band_rgb,
     )
     .with_source_crop(source_crop)
@@ -3943,6 +3959,7 @@ type MetalApronSlots = [Option<(crate::device_layer::LayerTexture, u64)>; ARM_SU
 /// Per-window GPU state.
 #[derive(Default)]
 pub struct WindowGpu {
+    side_inset_px: u32,
     wallpaper_tex: Option<Arc<SpriteTex>>,
     last_present_work_ns: u64,
     last_present_encode_ns: u64,
@@ -4099,6 +4116,11 @@ impl CopySrcHold {
 }
 
 impl WindowGpu {
+    /// Set the side inset for this window’s next present.
+    pub const fn set_side_inset_px(&mut self, px: u32) {
+        self.side_inset_px = px;
+    }
+
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -9149,6 +9171,7 @@ impl GpuRenderer {
         }
         win.last_submit_b = Some(SubmitBRecord {
             shape: SubmitBShape {
+                side_inset: win.side_inset_px,
                 invert,
                 overlay,
                 source_crop,
@@ -9639,7 +9662,17 @@ impl GpuRenderer {
         );
         let run_sdr_glow = crate::format_plan::sdr_boost_pass(f16_dest, glow_present, sdr_budget);
 
-        let mut want = present_blit_uniform(invert, overlay, source_crop, fw, fh, dw, dh, live_bg);
+        let mut want = present_blit_uniform(
+            invert,
+            overlay,
+            source_crop,
+            fw,
+            fh,
+            dw,
+            dh,
+            win.side_inset_px,
+            live_bg,
+        );
         want.chrome_y0 = win.chrome_y0 as f32;
         want.chrome_y1 = win.chrome_y1 as f32;
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
@@ -10380,6 +10413,7 @@ impl GpuRenderer {
             .resident_present_crop(input, crop)
             .map_err(|()| OverlayRefusal::ShapeChanged)?;
         let shape = SubmitBShape {
+            side_inset: win.side_inset_px,
             invert,
             overlay,
             source_crop,

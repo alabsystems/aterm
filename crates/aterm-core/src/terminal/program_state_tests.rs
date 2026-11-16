@@ -43,17 +43,17 @@ fn a_body_this_reader_does_not_take_changes_nothing() {
         "state=",
         "state=sleeping:app=codex",
         "state=idle",
-        "state=idle:app=claude",
-        "state=working:app=grok",
+        "state=idle:app=",
+        "state=idle:app=Claude-Code",
         "state=idle:app=codex:state=working",
         "state=blocked:app=codex:kind=coffee",
         "app=codex",
         "garbage",
     ] {
         assert_eq!(parse(body), None, "{body:?}");
-        let mut report = ProgramStateReport::default();
+        let mut report = ProgramStateRecord::default();
         assert!(!report.accept(body), "{body:?}");
-        assert_eq!(report, ProgramStateReport::default(), "{body:?}");
+        assert_eq!(report, ProgramStateRecord::default(), "{body:?}");
     }
     assert_eq!(parse(&"x".repeat(MAX_BODY_BYTES + 1)), None);
 }
@@ -72,7 +72,7 @@ fn a_kind_is_kept_only_on_blocked_and_an_unknown_key_is_left_alone() {
 
 #[test]
 fn the_sequence_moves_with_every_report_a_clear_and_a_reset() {
-    let mut report = ProgramStateReport::default();
+    let mut report = ProgramStateRecord::default();
     assert!(report.accept("state=working:app=codex"));
     assert_eq!(report.seq, 1);
     assert!(report.accept("state=working:app=codex"));
@@ -91,7 +91,7 @@ fn the_sequence_moves_with_every_report_a_clear_and_a_reset() {
 /// anew. NEGATIVE CONTROL: the re-sends, whose `seq` moves while `began` does not.
 #[test]
 fn a_report_sent_again_keeps_where_it_began() {
-    let mut report = ProgramStateReport::default();
+    let mut report = ProgramStateRecord::default();
     let mut take = |body: &str| {
         assert!(report.accept(body), "{body:?}");
         (report.seq, report.began)
@@ -126,7 +126,7 @@ fn a_report_sent_again_keeps_where_it_began() {
 /// as a first report begins a turn.
 #[test]
 fn a_carried_report_stands_again_and_begins_no_turn() {
-    let mut live = ProgramStateReport::default();
+    let mut live = ProgramStateRecord::default();
     assert!(live.accept("state=blocked:app=codex:kind=permission"));
     assert_eq!(live.turns, 1, "CONTROL: a first report begins a turn");
     let body = live.carried();
@@ -134,8 +134,8 @@ fn a_carried_report_stands_again_and_begins_no_turn() {
         body.as_deref(),
         Some("state=blocked:app=codex:kind=permission")
     );
-    let mut restored = ProgramStateReport::default();
-    restored.restore(body.as_deref());
+    let mut restored = ProgramStateRecord::default();
+    restored.restore(body.as_deref(), None);
     assert_eq!(restored.state, live.state);
     assert_eq!((restored.seq, restored.began, restored.turns), (1, 1, 0));
     assert!(restored.accept("state=blocked:app=codex:kind=permission"));
@@ -145,29 +145,31 @@ fn a_carried_report_stands_again_and_begins_no_turn() {
         "a re-send of the carried box is the same box"
     );
     let numbering = (restored.seq, restored.began, restored.turns);
-    restored.restore(body.as_deref());
+    restored.restore(body.as_deref(), None);
     assert_eq!((restored.seq, restored.began, restored.turns), numbering);
-    restored.restore(body.as_deref());
+    restored.restore(body.as_deref(), None);
     assert_eq!((restored.seq, restored.began, restored.turns), numbering);
     assert!(restored.accept("state=working:app=codex"));
     assert_eq!(restored.turns, 0, "the carried turn goes on");
     for body in [None, Some("state=clear"), Some("state=sleeping:app=codex")] {
-        let mut none = ProgramStateReport::default();
-        none.restore(body);
-        assert_eq!(none, ProgramStateReport::default(), "{body:?}");
+        let mut none = ProgramStateRecord::default();
+        none.restore(body, None);
+        assert_eq!(none, ProgramStateRecord::default(), "{body:?}");
     }
-    let mut idle = ProgramStateReport::default();
+    let mut idle = ProgramStateRecord::default();
     assert!(idle.accept("state=idle:app=codex"));
     assert_eq!(idle.carried().as_deref(), Some("state=idle:app=codex"));
-    idle.restore(None);
+    idle.restore(None, None);
     assert_eq!((idle.seq, idle.began, idle.state), (2, 2, None));
 }
 
-/// What one report does to the turn edges ([`ProgramStateReport::turn_edges`]).
+/// What one report does to the turn edges ([`ProgramTurns`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Edge {
     /// Adds a turn it began.
     Begins,
+    /// Adds a turn it resumed, which the count does not move for.
+    Resumes,
     /// Ends the newest turn.
     Ends,
     /// Neither.
@@ -226,7 +228,7 @@ const TURN_ROWS: [(&str, u64, Edge, &str); 17] = [
     (
         "state=working:app=codex",
         4,
-        Edge::Neither,
+        Edge::Resumes,
         "the terminal taken back: resumed",
     ),
     ("state=done:app=codex", 4, Edge::Ends, "ended"),
@@ -254,7 +256,7 @@ const TURN_ROWS: [(&str, u64, Edge, &str); 17] = [
 /// CONTROLS: every line that begins none.
 #[test]
 fn the_turn_count_moves_only_where_a_turn_begins() {
-    let mut report = ProgramStateReport::default();
+    let mut report = ProgramStateRecord::default();
     let mut turns = |body: &str| {
         assert!(report.accept(body), "{body:?}");
         report.turns
@@ -269,15 +271,19 @@ fn the_turn_count_moves_only_where_a_turn_begins() {
     report.reset();
     assert!(report.accept("state=working:app=codex"));
     assert_eq!(report.turns, 6, "begun across a reset");
-    assert!(!report.accept("state=idle:app=claude"));
-    assert!(!report.accept("state=working:app=claude"));
-    assert_eq!(report.turns, 6);
+    assert!(
+        report.accept("state=idle:app=claude"),
+        "another program's report stands"
+    );
+    assert!(report.accept("state=working:app=claude"));
+    assert_eq!(report.turns, 6, "and begins no turn");
 }
 
 /// EACH TURN KEEPS THE BATCH TIMES OF ITS EDGES: a turn begins at its first `working`, dated
 /// at the wall clock of the batch it arrived in, and ends at the next rest, dated at that
-/// rest's batch and kept with its word. NEGATIVE CONTROLS: the re-send at 1005 and the box
-/// asked and answered at 1010 and 1012, none of which begins or ends a turn.
+/// rest's batch and kept with its word; each is numbered in the order it was kept. NEGATIVE
+/// CONTROLS: the re-send at 1005 and the box asked and answered at 1010 and 1012, none of
+/// which begins or ends a turn.
 #[test]
 fn each_turn_keeps_the_batch_times_of_its_edges() {
     use ProgramStateWord::*;
@@ -285,12 +291,14 @@ fn each_turn_keeps_the_batch_times_of_its_edges() {
         seq,
         wall_ms: Some(wall_ms),
     };
-    let turn = |began, ended| ProgramTurn {
+    let turn = |n, began, ended| ProgramTurn {
+        n,
         app: ProgramApp::Codex,
         began: Some(began),
+        resumed: false,
         ended,
     };
-    let mut report = ProgramStateReport::default();
+    let mut report = ProgramStateRecord::default();
     for (body, wall_ms) in [
         ("state=working:app=codex", 1_000),
         ("state=working:app=codex", 1_005),
@@ -300,8 +308,8 @@ fn each_turn_keeps_the_batch_times_of_its_edges() {
         assert!(report.accept_at(body, Some(wall_ms)), "{body}");
     }
     assert_eq!(
-        report.turn_edges().collect::<Vec<_>>(),
-        [turn(edge(1, 1_000), None)],
+        report.ring.iter().collect::<Vec<_>>(),
+        [turn(1, edge(1, 1_000), None)],
         "one turn runs, begun at its first report"
     );
     for (body, wall_ms) in [
@@ -312,24 +320,25 @@ fn each_turn_keeps_the_batch_times_of_its_edges() {
         assert!(report.accept_at(body, Some(wall_ms)), "{body}");
     }
     assert_eq!(
-        report.turn_edges().collect::<Vec<_>>(),
+        report.ring.iter().collect::<Vec<_>>(),
         [
-            turn(edge(1, 1_000), Some((Done, edge(5, 1_017)))),
-            turn(edge(6, 2_000), Some((Error, edge(7, 2_030)))),
+            turn(1, edge(1, 1_000), Some((Done, edge(5, 1_017)))),
+            turn(2, edge(6, 2_000), Some((Error, edge(7, 2_030)))),
         ]
     );
 }
 
 /// THE EDGES FOLLOW THE TURN COUNT: over the turn count's reports, each in a batch of its own
-/// time, a turn is added with its edge exactly where the count moves, and the rows that end a
-/// turn end the newest: the turn resumed across a `clear` ends on its own entry, the `clear`
-/// having ended nothing. After a full reset a resumed turn ends on its own entry too, one
-/// begun across a reset is added, and a report this reader does not take changes nothing; the
-/// newest four are kept. NEGATIVE CONTROLS: every `Neither` row, `clear`s among them.
+/// time, a turn is kept with its edge exactly where the count moves, a resumed one where an
+/// in-turn report comes while no report stands (the count still), and the rows that end a
+/// turn end the newest: the turn resumed across a `clear` ends on its resumed entry, the
+/// `clear` having ended nothing. After a full reset a resumed turn ends on its own resumed
+/// entry too, one begun across a reset is kept, and a report this reader does not take changes
+/// nothing. NEGATIVE CONTROLS: every `Neither` row, `clear`s among them.
 #[test]
 fn the_edges_follow_the_turn_count() {
     fn step(
-        report: &mut ProgramStateReport,
+        report: &mut ProgramStateRecord,
         want: &mut Vec<ProgramTurn>,
         body: &str,
         wall_ms: u64,
@@ -341,16 +350,19 @@ fn the_edges_follow_the_turn_count() {
         assert_eq!(
             moves == Edge::Begins,
             report.turns == turns + 1,
-            "a turn is added where the count moves: {why}: {body}"
+            "the count moves where a turn begins: {why}: {body}"
         );
         let edge = TurnEdge {
             seq: report.seq,
             wall_ms: Some(wall_ms),
         };
+        let n = want.len() as u64 + 1;
         match moves {
-            Edge::Begins => want.push(ProgramTurn {
+            Edge::Begins | Edge::Resumes => want.push(ProgramTurn {
+                n,
                 app: ProgramApp::Codex,
                 began: Some(edge),
+                resumed: moves == Edge::Resumes,
                 ended: None,
             }),
             Edge::Ends => {
@@ -361,14 +373,13 @@ fn the_edges_follow_the_turn_count() {
             }
             Edge::Neither => {}
         }
-        let kept = want.len().saturating_sub(TURN_EDGES_KEPT);
         assert_eq!(
-            report.turn_edges().collect::<Vec<_>>(),
-            want[kept..],
+            report.ring.iter().collect::<Vec<_>>(),
+            *want,
             "{why}: {body}"
         );
     }
-    let mut report = ProgramStateReport::default();
+    let mut report = ProgramStateRecord::default();
     let mut want = Vec::new();
     let mut wall_ms = 1_000;
     for (body, _, moves, why) in TURN_ROWS {
@@ -379,7 +390,7 @@ fn the_edges_follow_the_turn_count() {
     let after_reset = [
         (
             "state=working:app=codex",
-            Edge::Neither,
+            Edge::Resumes,
             "resumed after a reset",
         ),
         ("state=idle:app=codex", Edge::Ends, "the resumed turn ended"),
@@ -399,63 +410,176 @@ fn the_edges_follow_the_turn_count() {
         Edge::Begins,
         why,
     );
-    assert_eq!(want.len(), 6, "six turns ran");
-    let kept: Vec<_> = report.turn_edges().collect();
-    assert!(!report.accept_at("state=idle:app=claude", Some(wall_ms + 10)));
-    assert_eq!(report.turn_edges().collect::<Vec<_>>(), kept);
+    assert_eq!(want.len(), 8, "six turns ran, two of them resumed once");
+    let kept: Vec<_> = report.ring.iter().collect();
+    assert!(report.accept_at("state=idle:app=claude", Some(wall_ms + 10)));
+    assert_eq!(report.ring.iter().collect::<Vec<_>>(), kept);
 }
 
-/// THE NEWEST FOUR ARE KEPT, AND A RESTORED TURN ENDS UNBEGUN: of six turns the newest four
-/// are kept, oldest first. Restoring a different report clears them, and the turn it
-/// installed running ends on an entry with no beginning that begins no turn. NEGATIVE
-/// CONTROL: restoring the report standing keeps them.
+/// A TURN RE-ENTERED WHILE NO REPORT STANDS IS A RESUMED ENTRY: codex-alab clears its report
+/// before a job-control stop or an external program and sends it again after, so a `clear`
+/// mid-turn then `working` keeps a resumed entry at the `working`'s batch time, and the next
+/// rest ends that entry, the one that began the turn staying unended; a full reset mid-turn
+/// then `working` does the same. Neither moves the turn count. CONTROL: a `clear` at rest then
+/// `working` is a real beginning, which the count moves for.
 #[test]
-fn the_newest_four_are_kept_and_a_restored_turn_ends_unbegun() {
-    let mut report = ProgramStateReport::default();
-    for turn in 0..6_u64 {
+fn a_turn_reentered_while_no_report_stands_is_a_resumed_entry() {
+    use ProgramStateWord::*;
+    for reset in [false, true] {
+        let mut report = ProgramStateRecord::default();
+        assert!(report.accept_at("state=working:app=codex", Some(1_000)));
+        if reset {
+            report.reset();
+        } else {
+            assert!(report.accept_at("state=clear", Some(1_100)));
+        }
+        assert!(report.accept_at("state=working:app=codex", Some(1_200)));
+        assert!(report.accept_at("state=done:app=codex", Some(1_300)));
+        let kept: Vec<_> = report.ring.iter().collect();
+        assert_eq!(report.turns, 1, "{reset}: one turn counted");
+        assert!(
+            matches!(kept.as_slice(), [first, resumed]
+                if !first.resumed && first.ended.is_none()
+                    && first.began.and_then(|b| b.wall_ms) == Some(1_000)
+                    && resumed.resumed
+                    && resumed.began.and_then(|b| b.wall_ms) == Some(1_200)
+                    && resumed.ended.map(|(w, e)| (w, e.wall_ms)) == Some((Done, Some(1_300)))),
+            "{reset}: {kept:#?}"
+        );
+    }
+    let mut rest = ProgramStateRecord::default();
+    assert!(rest.accept_at("state=done:app=codex", Some(1_000)));
+    assert!(rest.accept_at("state=clear", Some(1_100)));
+    assert!(rest.accept_at("state=working:app=codex", Some(1_200)));
+    assert_eq!(
+        rest.turns, 1,
+        "CONTROL: a turn begun across a clear at rest"
+    );
+    assert!(
+        rest.ring.newest().is_some_and(|t| !t.resumed),
+        "CONTROL: {:?}",
+        rest.ring.newest()
+    );
+}
+
+/// A CLEAR IS NUMBERED SO A MOVE CAN SPLIT ITS WRITERS: `cleared` is the sequence of the
+/// latest `clear`, and of a full reset that took a report down; a reset with nothing standing
+/// leaves it. A reader's cursor reads only the edges past it, and the turns kept past it that
+/// rotated out are counted lost. NEGATIVE CONTROL: a reader at the head reads nothing and
+/// loses nothing.
+#[test]
+fn a_clear_is_numbered_so_a_move_can_split_its_writers() {
+    let mut report = ProgramStateRecord::default();
+    assert!(report.accept("state=working:app=codex"));
+    assert_eq!(report.cleared, 0);
+    assert!(report.accept("state=clear"));
+    assert_eq!(report.cleared, 2, "the clear's own sequence");
+    report.reset();
+    assert_eq!(report.cleared, 2, "a reset with nothing standing");
+    assert!(report.accept("state=working:app=codex"));
+    report.reset();
+    assert_eq!(report.cleared, 4, "a reset that took a report down");
+    let mut out = Vec::new();
+    let head = report.ring.head(report.seq);
+    assert_eq!(report.ring.after(Some(head), &mut out), 0, "CONTROL");
+    assert!(out.is_empty(), "CONTROL: {out:?}");
+    assert!(report.accept("state=done:app=codex"));
+    assert_eq!(report.ring.after(Some(head), &mut out), 0);
+    assert!(
+        matches!(out.as_slice(), [t] if t.resumed && t.ended.is_some()),
+        "the resumed entry, read for its new end: {out:?}"
+    );
+    let head = report.ring.head(report.seq);
+    for _ in 0..PROGRAM_TURNS_KEPT + 3 {
+        assert!(report.accept("state=working:app=codex"));
+        assert!(report.accept("state=done:app=codex"));
+    }
+    assert_eq!(
+        report.ring.after(Some(head), &mut out),
+        3,
+        "three rotated out"
+    );
+    assert_eq!(
+        out.len(),
+        PROGRAM_TURNS_KEPT,
+        "the newest kept, each past the cursor"
+    );
+    assert_eq!(
+        out.first().map(|t| t.n),
+        Some(head.n + 4),
+        "the oldest kept is the fourth past the cursor"
+    );
+}
+
+/// THE RING KEEPS THE NEWEST 32 AND NUMBERS EVERY TURN: of 40 turns the newest 32 are kept,
+/// oldest first, numbered 9 to 40. NEGATIVE CONTROL: restoring the report standing keeps them.
+#[test]
+fn the_ring_keeps_the_newest_32_and_numbers_every_turn() {
+    let mut report = ProgramStateRecord::default();
+    for turn in 0..40_u64 {
         assert!(report.accept_at("state=working:app=codex", Some(1_000 * turn)));
         assert!(report.accept_at("state=done:app=codex", Some(1_000 * turn + 17)));
     }
-    let began: Vec<_> = report
-        .turn_edges()
-        .map(|turn| turn.began.and_then(|edge| edge.wall_ms))
-        .collect();
+    let kept: Vec<_> = report.ring.iter().collect();
     assert_eq!(
-        began,
-        [Some(2_000), Some(3_000), Some(4_000), Some(5_000)],
-        "the newest four, oldest first"
+        kept.iter().map(|t| t.n).collect::<Vec<_>>(),
+        (9..=40).collect::<Vec<_>>(),
+        "the newest 32, oldest first"
     );
-    let kept: Vec<_> = report.turn_edges().collect();
+    assert!(
+        kept.iter()
+            .all(|t| t.began.and_then(|b| b.wall_ms) == Some(1_000 * (t.n - 1))),
+        "{kept:?}"
+    );
     let body = report.carried();
-    report.restore(body.as_deref());
+    report.restore(body.as_deref(), None);
     assert_eq!(
-        report.turn_edges().collect::<Vec<_>>(),
+        report.ring.iter().collect::<Vec<_>>(),
         kept,
         "CONTROL: the report standing restored keeps them"
     );
-    report.restore(Some("state=working:app=codex"));
+}
+
+/// A RESTORED IN-TURN REPORT IS A RESUMED ENTRY: restoring a different report drops the kept
+/// turns and, its report in a turn, keeps one resumed at the restore's sequence with no wall
+/// clock, which the next rest ends and which begins no turn. NEGATIVE CONTROL: a restored
+/// report at rest keeps none.
+#[test]
+fn a_restored_in_turn_report_is_a_resumed_entry() {
+    let mut report = ProgramStateRecord::default();
+    for turn in 0..3_u64 {
+        assert!(report.accept_at("state=working:app=codex", Some(1_000 * turn)));
+        assert!(report.accept_at("state=done:app=codex", Some(1_000 * turn + 17)));
+    }
+    report.restore(Some("state=working:app=codex"), None);
+    let restored = report.seq;
     assert_eq!(
-        report.turn_edges().count(),
-        0,
-        "a different report restored clears them"
+        report.ring.iter().collect::<Vec<_>>(),
+        [ProgramTurn {
+            n: 4,
+            app: ProgramApp::Codex,
+            began: Some(TurnEdge {
+                seq: restored,
+                wall_ms: None,
+            }),
+            resumed: true,
+            ended: None,
+        }],
+        "the kept turns dropped, the installed one resumed"
     );
     assert!(report.accept_at("state=done:app=codex", Some(7_017)));
-    assert_eq!(
-        report.turn_edges().collect::<Vec<_>>(),
-        [ProgramTurn {
-            app: ProgramApp::Codex,
-            began: None,
-            ended: Some((
-                ProgramStateWord::Done,
-                TurnEdge {
-                    seq: report.seq,
-                    wall_ms: Some(7_017),
-                },
-            )),
-        }],
-        "the restored turn ends on an entry with no beginning"
+    assert!(
+        report
+            .ring
+            .newest()
+            .is_some_and(|t| t.n == 4 && t.ended.map(|(_, e)| e.wall_ms) == Some(Some(7_017))),
+        "the rest ends it: {:?}",
+        report.ring.newest()
     );
-    assert_eq!(report.turns, 6, "and begins none");
+    assert_eq!(report.turns, 3, "and begins none");
+    let mut rest = ProgramStateRecord::default();
+    rest.restore(Some("state=done:app=codex"), None);
+    assert_eq!(rest.ring.iter().count(), 0, "CONTROL");
 }
 
 /// THE COUNT THROUGH THE PARSER, the bytes codex-alab writes: a turn
@@ -666,19 +790,19 @@ fn a_child_records_report_and_clear_leave_the_root_record_standing() {
 /// NEGATIVE CONTROL: codex's carries `app=codex`.
 #[test]
 fn a_carried_grok_build_report_restores_as_grok_builds() {
-    let mut live = ProgramStateReport::default();
+    let mut live = ProgramStateRecord::default();
     assert!(live.accept("state=blocked:kind=permission:app=grok-build:title=cGFyc2Vy"));
     let body = live.carried();
     assert_eq!(
         body.as_deref(),
         Some("state=blocked:app=grok-build:kind=permission")
     );
-    let mut restored = ProgramStateReport::default();
-    restored.restore(body.as_deref());
+    let mut restored = ProgramStateRecord::default();
+    restored.restore(body.as_deref(), None);
     assert_eq!(restored.state, live.state);
     assert!(restored.accept("state=blocked:kind=permission:app=grok-build"));
     assert_eq!((restored.began, restored.turns), (1, 0), "the same box");
-    let mut codex = ProgramStateReport::default();
+    let mut codex = ProgramStateRecord::default();
     assert!(codex.accept("state=working:app=codex"));
     assert_eq!(codex.carried().as_deref(), Some("state=working:app=codex"));
 }
@@ -706,6 +830,272 @@ fn a_report_with_a_title_and_message_at_the_protocols_caps_is_taken() {
     assert_eq!(parse(&format!("{edge}C")), None, "past it");
 }
 
+/// CLAUDE CODE'S OWN REPORTS ARE READ: the root records Claude Code 2.1.323
+/// writes once its query is answered (MEASURED 2026-11-12 in the real-Claude lab), through the
+/// real parser: `idle` at once, a turn `working` that failed (`error` with its base64 `msg`), a
+/// turn `working` to `done`, a turn `working` that stopped on a box (`blocked:kind=permission`
+/// with the box's `msg`) and went back to `idle` when it was denied, and `clear` at exit. Three
+/// turns. NEGATIVE CONTROL: `app=claude`, a word no program writes, is still not taken.
+#[test]
+fn the_reports_claude_code_writes_are_read_through_the_parser() {
+    use crate::terminal::Terminal;
+    use ProgramStateWord::*;
+    let claude = |state, kind| {
+        Some(ProgramState {
+            state,
+            kind,
+            app: ProgramApp::ClaudeCode,
+        })
+    };
+    let mut term = Terminal::new(24, 80);
+    let rows: [(&[u8], Option<ProgramState>); 9] = [
+        (
+            b"\x1b]7501;state=idle:app=claude-code\x07",
+            claude(Idle, None),
+        ),
+        (
+            b"\x1b]7501;state=working:app=claude-code\x07",
+            claude(Working, None),
+        ),
+        (
+            b"\x1b]7501;state=error:app=claude-code:msg=QVBJIEVycm9yOiBBUEkgcmV0dXJuZWQgYW4gZW1wdHkgb3IgbWFsZm9ybWVkIHJlc3BvbnNl\x07",
+            claude(Error, None),
+        ),
+        (
+            b"\x1b]7501;state=working:app=claude-code\x07",
+            claude(Working, None),
+        ),
+        (
+            b"\x1b]7501;state=done:app=claude-code\x07",
+            claude(Done, None),
+        ),
+        (
+            b"\x1b]7501;state=working:app=claude-code\x07",
+            claude(Working, None),
+        ),
+        (
+            b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSAtcmYgL3ByaXZhdGUvdG1wL2F0LkRkV1ovcHJvai9ub3RoaW5nLWhlcmU=\x07",
+            claude(Blocked, Some(ProgramBlockedKind::Permission)),
+        ),
+        (
+            b"\x1b]7501;state=idle:app=claude-code\x07",
+            claude(Idle, None),
+        ),
+        (b"\x1b]7501;state=clear\x07", None),
+    ];
+    for (bytes, want) in rows {
+        term.process(bytes);
+        assert_eq!(
+            term.program_state().state,
+            want,
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+    assert_eq!(
+        term.program_state().turns,
+        3,
+        "three turns, each ended at a rest"
+    );
+    let ends: Vec<_> = term
+        .program_turns()
+        .iter()
+        .map(|t| (t.app, t.ended.map(|(w, _)| w)))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            (ProgramApp::ClaudeCode, Some(Error)),
+            (ProgramApp::ClaudeCode, Some(Done)),
+            (ProgramApp::ClaudeCode, Some(Idle)),
+        ]
+    );
+    // NEGATIVE CONTROL: `app=claude` is another program's word, not Claude Code's: it stands
+    // apart and draws no turn.
+    let mut control = ProgramStateRecord::default();
+    assert!(control.accept("state=working:app=claude"));
+    assert_eq!((control.seq, control.turns, control.state), (0, 0, None));
+    assert!(control.other.state.is_some_and(|s| !s.app.is_known()));
+}
+
+/// A CHECKPOINT CARRIES CLAUDE CODE'S REPORT AS CLAUDE CODE'S: its standing box is carried as
+/// `app=claude-code` and restored as the same report, a re-send of it keeping where it began and
+/// beginning no turn, so a restore counts none of its turns twice.
+#[test]
+fn a_carried_claude_code_report_restores_as_claude_codes() {
+    let mut live = ProgramStateRecord::default();
+    assert!(live.accept("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZQ=="));
+    let body = live.carried();
+    assert_eq!(
+        body.as_deref(),
+        Some("state=blocked:app=claude-code:kind=permission")
+    );
+    let mut restored = ProgramStateRecord::default();
+    restored.restore(body.as_deref(), None);
+    assert_eq!(restored.state, live.state);
+    assert!(restored.accept("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZQ=="));
+    assert_eq!((restored.began, restored.turns), (1, 0), "the same box");
+}
+
+/// GROK BUILD 1.0.77 NAMES ITSELF `grok`: once its query is answered it writes
+/// `state=idle:app=grok` and, at exit, `state=clear` (MEASURED 2026-11-12), where 1.0.70's binary
+/// holds `app=grok-build`. Both are Grok Build's, carried under its one wire word.
+#[test]
+fn grok_build_1_0_77s_app_word_is_grok_builds() {
+    use crate::terminal::Terminal;
+    let mut term = Terminal::new(24, 80);
+    term.process(b"\x1b]7501;state=idle:app=grok\x1b\\");
+    assert_eq!(
+        term.program_state().state,
+        Some(ProgramState {
+            state: ProgramStateWord::Idle,
+            kind: None,
+            app: ProgramApp::GrokBuild,
+        })
+    );
+    let mut live = ProgramStateRecord::default();
+    assert!(live.accept("state=working:app=grok"));
+    assert_eq!(
+        live.carried().as_deref(),
+        Some("state=working:app=grok-build")
+    );
+    term.process(b"\x1b]7501;state=clear\x1b\\");
+    assert_eq!(term.program_state().state, None);
+}
+
+/// A REPORT IS A RUN SIGN ONLY WHILE ITS WRITER'S GROUP HOLDS THE FRONT: a Claude Code killed
+/// mid-turn leaves `working` standing, and nothing it starts after it overwrites it (a shell
+/// writes none, nor does a Claude Code whose title is off). Once the host says the bytes it
+/// parses are another group's, the report is no run sign, while a checkpoint still carries it; a
+/// program stopped and resumed holds the front again and its report is its sign again, and the
+/// next program's own report is one. A report taken before any group was said is the first
+/// group's said, and a restore installs its report as the group's in front.
+#[test]
+fn a_report_is_a_run_sign_only_while_its_writers_group_holds_the_front() {
+    use crate::terminal::Terminal;
+    let working = Some("state=working:app=claude-code");
+    let idle = Some("state=idle:app=claude-code");
+    let sign = |t: &Terminal| t.program_state().run_sign();
+    let mut term = Terminal::new(24, 80);
+    term.program_front_is(100);
+    term.process(b"\x1b]7501;state=working:app=claude-code\x07");
+    assert_eq!(sign(&term).as_deref(), working, "its writer's bytes");
+    term.program_front_is(100);
+    assert_eq!(sign(&term).as_deref(), working, "the same group");
+    term.program_front_is(0);
+    term.program_front_is(-1);
+    assert_eq!(sign(&term).as_deref(), working, "no group says nothing");
+    term.program_front_is(200);
+    assert_eq!(sign(&term), None, "another group in front");
+    assert_eq!(
+        term.program_state().carried().as_deref(),
+        working,
+        "a checkpoint still carries it"
+    );
+    term.program_front_is(100);
+    assert_eq!(
+        sign(&term).as_deref(),
+        working,
+        "its writer resumed in front"
+    );
+    term.program_front_is(300);
+    assert_eq!(sign(&term), None, "killed: a later group in front");
+    term.process(b"\x1b]7501;state=idle:app=claude-code\x07");
+    assert_eq!(
+        sign(&term).as_deref(),
+        idle,
+        "the next program's own report"
+    );
+    term.program_front_is(400);
+    assert_eq!(sign(&term), None, "its writer left in turn");
+    let mut control = Terminal::new(24, 80);
+    control.process(b"\x1b]7501;state=working:app=claude-code\x07");
+    assert_eq!(
+        sign(&control).as_deref(),
+        working,
+        "with no group said, the report standing is the sign"
+    );
+    control.program_front_is(100);
+    assert_eq!(
+        sign(&control).as_deref(),
+        working,
+        "taken before any group was said: the first group's said"
+    );
+    control.program_front_is(200);
+    assert_eq!(sign(&control), None, "another group in front");
+    let mut restored = ProgramStateRecord::default();
+    restored.front_is(100);
+    restored.accept("state=working:app=claude-code");
+    restored.front_is(200);
+    assert_eq!(restored.run_sign(), None, "its writer left");
+    restored.restore(Some("state=idle:app=claude-code"), None);
+    assert_eq!(
+        restored.run_sign().as_deref(),
+        idle,
+        "a restore installs its report as the group's in front"
+    );
+}
+
+/// A report's app owns its turn even when no clear separates two supported programs.
+/// The same state words from another app cannot end or resume the earlier app's turn.
+#[test]
+fn a_report_from_another_app_never_ends_or_resumes_the_previous_apps_turn() {
+    for (first, next) in [
+        ("codex", "grok-build"),
+        ("grok-build", "codex"),
+        ("codex", "claude-code"),
+        ("claude-code", "codex"),
+        ("grok-build", "claude-code"),
+        ("claude-code", "grok-build"),
+    ] {
+        for clear in [false, true] {
+            let began = format!("state=working:app={first}");
+            let mut record = ProgramStateRecord::default();
+            assert!(record.accept_at(&began, Some(10)));
+            if clear {
+                assert!(record.accept("state=clear"));
+            }
+            assert!(record.accept_at(&format!("state=error:app={next}"), Some(20)));
+            let turns: Vec<_> = record.turns().iter().collect();
+            assert_eq!(turns.len(), 1, "{first} to {next}, clear={clear}");
+            assert!(
+                turns[0].ended.is_none(),
+                "another app ended {first}: {turns:?}"
+            );
+
+            let mut record = ProgramStateRecord::default();
+            assert!(record.accept_at(&began, Some(10)));
+            if clear {
+                assert!(record.accept("state=clear"));
+            }
+            assert!(record.accept_at(&format!("state=working:app={next}"), Some(20)));
+            assert!(record.accept_at(&format!("state=done:app={next}"), Some(30)));
+            let turns: Vec<_> = record.turns().iter().collect();
+            assert_eq!(
+                turns.len(),
+                2,
+                "{first} to {next}, clear={clear}: {turns:?}"
+            );
+            assert_eq!(
+                record.report().turns,
+                2,
+                "a different app begins its own turn"
+            );
+            assert!(
+                turns[0].ended.is_none(),
+                "the earlier app has no reported end"
+            );
+            assert!(
+                !turns[1].resumed,
+                "the new app resumes no earlier app's turn"
+            );
+            assert_ne!(turns[0].app, turns[1].app);
+            assert_eq!(turns[1].began.and_then(|e| e.wall_ms), Some(20));
+            assert_eq!(turns[1].ended.map(|(_, e)| e.wall_ms), Some(Some(30)));
+        }
+    }
+}
+
 /// Claude Code's root lifecycle survives the real parser and checkpoint. Child reports,
 /// unknown app spellings and a query are negative controls: none changes the root.
 #[test]
@@ -721,16 +1111,212 @@ fn claude_code_root_reports_survive_parsing_and_checkpoint() {
         for body in [
             "state=working:app=claude-code:id=child",
             "state=clear:app=claude-code:id=child",
-            "state=working:app=claude",
+            "state=working:app=Claude",
             "?",
         ] {
             term.process(format!("\x1b]7501;{body}\x1b\\").as_bytes());
             assert_eq!(term.program_state(), report, "{body}");
         }
-        let mut restored = ProgramStateReport::default();
-        restored.restore(report.carried().as_deref());
-        assert_eq!(restored.state, Some(state));
+        let restored = Terminal::from_checkpoint(&term.checkpoint());
+        assert_eq!(restored.program_state().state, Some(state));
     }
     term.process(b"\x1b]7501;state=clear:app=claude-code\x1b\\");
     assert_eq!(term.program_state().state, None);
+}
+
+/// ANOTHER PROGRAM'S WORD IS KEPT TO BE SHOWN: a report naming a program this reader does not
+/// know (`app=kimi-code`, `app=claude`, a word at the 32-byte bound) stands apart with that word
+/// ([`ProgramStateReport::other`], its own sequence moving), and its checkpoint body restores it
+/// there; it moves none of the known programs' record, so a codex `working` it follows still
+/// stands and its turn runs on, and a known program's next report takes it away. A known word is
+/// never another program's. NEGATIVE CONTROL: the same reports from `app=codex` stand as the
+/// known report and draw their turn.
+#[test]
+fn an_unknown_app_word_is_kept_for_display() {
+    let at_bound = "a".repeat(AppWord::MAX);
+    for word in ["kimi-code", "claude", "my.agent_2", at_bound.as_str()] {
+        let other = ProgramApp::Other(AppWord::new(word).expect(word));
+        assert_eq!(other.as_str(), word);
+        assert!(!other.is_known(), "{word}");
+        let mut report = ProgramStateRecord::default();
+        assert!(
+            report.accept(&format!("state=working:app={word}")),
+            "{word}"
+        );
+        assert_eq!(
+            report.other.state,
+            Some(ProgramState {
+                state: ProgramStateWord::Working,
+                kind: None,
+                app: other,
+            }),
+            "{word}"
+        );
+        assert!(report.accept(&format!("state=blocked:app={word}:kind=question")));
+        assert_eq!(report.other.seq, 2, "{word}: its own sequence moves");
+        assert_eq!(report.carried(), None, "{word}: no known report stands");
+        let carried = report.carried_other();
+        assert_eq!(
+            carried.as_deref(),
+            Some(format!("state=blocked:app={word}:kind=question").as_str())
+        );
+        let mut restored = ProgramStateRecord::default();
+        restored.restore(None, carried.as_deref());
+        assert_eq!(restored.other.state, report.other.state, "{word}: carried");
+        assert!(report.accept(&format!("state=done:app={word}")));
+        let mut known = ProgramStateRecord::default();
+        known.report.other = report.other;
+        assert_eq!(
+            report, known,
+            "{word}: the known programs' record never moved"
+        );
+        assert_eq!(restored.state, None, "{word}: nor did the restored one's");
+    }
+    for known in ["claude-code", "codex", "grok-build"] {
+        assert_eq!(AppWord::new(known), None, "{known} is a known program");
+    }
+    let mut codex = ProgramStateRecord::default();
+    assert!(codex.accept("state=working:app=codex"));
+    let working = codex.state;
+    assert!(codex.accept("state=idle:app=kimi-code"));
+    assert_eq!(
+        codex.state, working,
+        "another program's rest leaves codex working"
+    );
+    assert_eq!(codex.seq, 1);
+    assert!(codex.accept("state=working:app=codex"));
+    assert_eq!(
+        codex.other.state, None,
+        "a known report takes another's away"
+    );
+    assert_eq!(codex.turns, 1, "the codex turn ran on");
+    assert!(codex.accept("state=done:app=codex"));
+    assert_eq!(
+        (codex.turns, codex.turns().iter().count()),
+        (1, 1),
+        "CONTROL: a known program's reports stand and draw their turn"
+    );
+    assert!(codex.accept("state=idle:app=kimi-code"));
+    let (known, other) = (codex.carried(), codex.carried_other());
+    assert_eq!(
+        (known.as_deref(), other.as_deref()),
+        (
+            Some("state=done:app=codex"),
+            Some("state=idle:app=kimi-code")
+        ),
+        "a checkpoint carries both"
+    );
+    let mut adopted = ProgramStateRecord::default();
+    adopted.restore(known.as_deref(), other.as_deref());
+    assert_eq!(
+        (adopted.state, adopted.other.state),
+        (codex.state, codex.other.state),
+        "each restored to its own slot"
+    );
+    let mut crossed = ProgramStateRecord::default();
+    crossed.restore(other.as_deref(), known.as_deref());
+    assert_eq!(
+        (crossed.state, crossed.other.state),
+        (None, None),
+        "a body in the other kind's slot is installed nowhere"
+    );
+    codex.reset();
+    assert_eq!(
+        (codex.state, codex.other.state),
+        (None, None),
+        "a reset takes both"
+    );
+}
+
+/// THE SHELL'S PROMPT ENDS ANOTHER PROGRAM'S WORD: a program that names itself (`app=kimi-code`)
+/// and exits without a `clear` leaves its report standing only until its shell draws a prompt (an
+/// OSC 133 or 633 `A`), which takes it away and moves its sequence; that prompt leaves the known
+/// programs' report as it was. NEGATIVE CONTROL: the command's own `C` and output take nothing
+/// away.
+#[test]
+fn a_shell_prompt_ends_another_programs_word() {
+    use crate::terminal::Terminal;
+    for prompt in ["\x1b]133;A\x07", "\x1b]633;A\x07"] {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+        term.process(b"\x1b]133;A\x07$ kimi\x1b]133;B\x07\r\n\x1b]133;C\x07");
+        term.process(b"\x1b]7501;state=working:app=kimi-code\x1b\\thinking\r\n");
+        let running = term.program_state();
+        assert!(running.other.state.is_some(), "CONTROL: {prompt:?}");
+        term.process(b"\x1b]133;D;0\x07");
+        term.process(prompt.as_bytes());
+        let after = term.program_state();
+        assert_eq!(after.other.state, None, "{prompt:?}");
+        assert!(after.other.seq > running.other.seq, "{prompt:?}");
+        assert_eq!(
+            (after.seq, after.state),
+            (running.seq, running.state),
+            "{prompt:?}: the known report stands"
+        );
+    }
+}
+
+/// A WORD PAST ITS BOUND IS NO REPORT: an `app=` word of 33 bytes, an empty one, and one with a
+/// byte outside `[a-z0-9._-]` drop the whole report, leaving the one standing as it was.
+/// NEGATIVE CONTROL: the 32-byte word is taken.
+#[test]
+fn an_app_word_past_the_bound_drops_the_report() {
+    let past = "a".repeat(AppWord::MAX + 1);
+    let mut report = ProgramStateRecord::default();
+    assert!(report.accept("state=working:app=codex"));
+    let standing = report;
+    for word in [
+        past.as_str(),
+        "",
+        "Kimi",
+        "kimi code",
+        "kimi/code",
+        "kimi=code",
+        "ki\u{e9}",
+    ] {
+        assert_eq!(AppWord::new(word), None, "{word:?}");
+        let body = format!("state=idle:app={word}");
+        assert_eq!(parse(&body), None, "{body:?}");
+        assert!(!report.accept(&body), "{body:?}");
+        assert_eq!(report, standing, "{body:?}");
+    }
+    let at_bound = "a".repeat(AppWord::MAX);
+    assert!(
+        report.accept(&format!("state=idle:app={at_bound}")),
+        "CONTROL: the word at its bound is taken"
+    );
+}
+
+#[test]
+fn an_unknown_report_and_prompt_preserve_the_numbered_turn_cursor() {
+    let mut record = ProgramStateRecord::default();
+    assert!(record.accept_at("state=working:app=codex", Some(10)));
+    assert!(record.accept_at("state=done:app=codex", Some(20)));
+    let cursor = record.turns().head(record.seq);
+    let before = record.turns().iter().collect::<Vec<_>>();
+    let known = (record.seq, record.began, record.state, record.turns);
+
+    assert!(record.accept_at("state=working:app=widget", Some(30)));
+    assert!(record.other.state.is_some());
+    assert_eq!(
+        (record.seq, record.began, record.state, record.turns),
+        known
+    );
+    assert_eq!(record.turns().iter().collect::<Vec<_>>(), before);
+    record.prompt_drawn();
+    assert!(record.other.state.is_none());
+    assert_eq!(
+        (record.seq, record.began, record.state, record.turns),
+        known
+    );
+    assert_eq!(record.turns().iter().collect::<Vec<_>>(), before);
+
+    assert!(record.accept_at("state=working:app=codex", Some(40)));
+    assert!(record.accept_at("state=done:app=codex", Some(50)));
+    let mut unread = Vec::new();
+    assert_eq!(record.turns().after(Some(cursor), &mut unread), 0);
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].n, cursor.n + 1);
+    assert_eq!(unread[0].began.unwrap().seq, known.0 + 1);
+    assert_eq!(unread[0].ended.unwrap().1.seq, known.0 + 2);
 }

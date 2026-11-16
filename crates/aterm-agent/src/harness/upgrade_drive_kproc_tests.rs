@@ -143,25 +143,36 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     );
     let slept = script.hosted("the pty host's sleep");
     let host = ps_name(script.id()).expect("the host, as ps names it");
-    let walk = |rows: &[kproc::Record]| -> BTreeMap<u32, Option<u32>> {
+    let owner = |pid: u32, t: &[(u32, u32, String, String)]| -> Fact<u32> {
+        terminal_owner(pid, t).map(|owner| owner.map(|(o, _)| o))
+    };
+    let walk = |rows: &[kproc::Record]| -> BTreeMap<u32, Fact<u32>> {
         let t: Vec<(u32, u32, String, String)> = rows
             .iter()
             .map(|r| (r.pid, r.ppid, tty_word(r.tty), String::new()))
             .collect();
-        rows.iter()
-            .map(|r| (r.pid, terminal_owner(r.pid, &t).map(|(o, _)| o)))
-            .collect()
+        rows.iter().map(|r| (r.pid, owner(r.pid, &t))).collect()
     };
     let rows_a = kproc::records().expect("records");
     let a = walk(&rows_a);
     let oracle = tty_table();
     let b = walk(&kproc::records().expect("records"));
     let fixtures = [led.id(), slept, plain.id(), me];
-    let live: Vec<_> = fixtures.iter().map(|p| (*p, Live.terminal(*p))).collect();
+    let live: Vec<_> = fixtures
+        .iter()
+        .map(|p| (*p, Live.terminal(*p).expect("the terminal read")))
+        .collect();
+    let read = |fact: Fact<String>| fact.expect("the opener read");
     let opened = [
-        (opener(led.id(), me), ps_opener(led.id(), me)),
-        (opener(slept, script.id()), ps_opener(slept, script.id())),
-        (opener(plain.id(), me), ps_opener(plain.id(), me)),
+        (read(opener(led.id(), me)), read(ps_opener(led.id(), me))),
+        (
+            read(opener(slept, script.id())),
+            read(ps_opener(slept, script.id())),
+        ),
+        (
+            read(opener(plain.id(), me)),
+            read(ps_opener(plain.id(), me)),
+        ),
     ];
     // Only the fixtures, held still across the reads, are compared: any other process may
     // start, exec or end between them, and its terminal's owner with it.
@@ -174,11 +185,13 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
             oracle.iter().any(|r| r.0 == pid),
             "fixture {pid}: in ps's table"
         );
-        let want = terminal_owner(pid, &oracle).map(|(o, _)| o);
-        assert_eq!(*x, want, "the owner of {pid}'s terminal");
+        assert!(x.is_ok(), "fixture {pid}: its walk read");
+        assert_eq!(*x, owner(pid, &oracle), "the owner of {pid}'s terminal");
     }
     for (pid, got) in &live {
-        let want = terminal_owner(*pid, &oracle).map(|(o, name)| (o, name.to_string()));
+        let want = terminal_owner(*pid, &oracle)
+            .expect("ps's table holds the fixture's walk")
+            .map(|(o, name)| (o, name.to_string()));
         assert_eq!(*got, want, "{pid} live");
     }
     for (got, want) in &opened {

@@ -31,8 +31,9 @@ pub use aterm_value_guard as guard;
 pub mod keys;
 pub mod owned;
 pub mod secret;
+pub mod values;
 pub mod view;
-pub use view::View;
+pub use view::{Awaiting, View};
 
 /// A table rule's refusal of an owner write: the collection, row, column and
 /// rule, never a value. It is portable metadata independent of a live table.
@@ -162,6 +163,25 @@ pub enum Ty {
     Uint,
     /// Free text of at most this many bytes, guarded (`guard::text`).
     Text(usize),
+    /// The lab tracker's prose of at most this many bytes (`guard::prose`): no control character
+    /// and no real secret, where an `@`, a commit and a long path stand (design
+    /// docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 13).
+    Prose(usize),
+    /// A shell command line of at most this many bytes (`guard::command`): prose's rules, and
+    /// something to run.
+    Command(usize),
+    /// A git commit: 7 to 40 (or 64) lower-case hex digits ([`values::commit`]).
+    Commit,
+    /// `sha256:` and 64 lower-case hex digits ([`values::digest`]).
+    Digest,
+    /// A path inside a repository ([`values::path`]).
+    Path,
+    /// A decimal number written exactly, kept as text ([`values::decimal`]).
+    Decimal,
+    /// Who made a change ([`values::Principal`]).
+    Principal,
+    /// One piece of evidence a change cites ([`values::Evidence`]).
+    Evidence,
     /// An account's owner-editable name of at most this many bytes: free text that names no
     /// machine (`guard::account_label`).
     AccountLabel(usize),
@@ -211,11 +231,13 @@ pub enum Ty {
 }
 
 impl Ty {
-    /// A text set's longest element, for `Set(&Text(max))`: free-text members whose element key
-    /// is a digest of the text and whose element cell carries it (`cell::element`).
-    pub const fn text_set(&self) -> Option<usize> {
+    /// A text set's member type, for a set of `Text`, `Prose` or `Path`: members whose element
+    /// key is a digest of the text (they hold characters a key cannot) and whose element cell
+    /// carries it (`cell::element`), in its normal form, white space collapsed. A command is no
+    /// member: collapsing its spaces would change what it runs.
+    pub const fn text_set(&self) -> Option<&'static Self> {
         match self {
-            Self::Set(Self::Text(max)) => Some(*max),
+            Self::Set(member @ (Self::Text(_) | Self::Prose(_) | Self::Path)) => Some(member),
             _ => None,
         }
     }
@@ -248,6 +270,14 @@ impl Ty {
             Self::Int { min, max } => json!({"int": [min, max]}),
             Self::Uint => json!("uint"),
             Self::Text(max) => json!({"text": max}),
+            Self::Prose(max) => json!({"prose": max}),
+            Self::Command(max) => json!({"command": max}),
+            Self::Commit => json!("commit"),
+            Self::Digest => json!("digest"),
+            Self::Path => json!("path"),
+            Self::Decimal => json!("decimal"),
+            Self::Principal => json!("principal"),
+            Self::Evidence => json!("evidence"),
             Self::AccountLabel(max) => json!({"account_label": max}),
             Self::Enum(words) => json!({"enum": words}),
             Self::Time => json!("time"),

@@ -218,13 +218,8 @@ fn glow_tick(
     caret: (u16, u16),
     at: std::time::Instant,
 ) -> u64 {
-    let glow = &mut app
-        .windows
-        .get_mut(&WindowId(0))
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow;
+    let mut payload_guard_glow = app.windows.get_mut(&WindowId(0)).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     glow.tick(Some(caret), at, cfg, glow_geom(), &mut Vec::new());
     glow.spawns()
 }
@@ -264,16 +259,12 @@ fn preedit_frame(app: &mut App, cfg: &crate::cursor_glow::GlowConfig, at: std::t
             row,
         )
     };
-    let glow = &mut app
-        .windows
-        .get_mut(&WindowId(0))
-        .unwrap()
-        .fx
-        .cursor_mut()
-        .glow;
+    let mut payload_guard_glow = app.windows.get_mut(&WindowId(0)).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     glow.observe_caret_drawn(visible);
     glow.observe_print_anchor_glyph(anchor, glyph);
     glow.observe_row(caret.0, caret.1, &row, at);
+    drop(payload_guard_glow);
     glow_tick(app, cfg, caret, at);
 }
 
@@ -363,7 +354,7 @@ fn real_preedit_start_and_active_clear_keep_their_generic_boundary() {
             // Establish a real active composition while its known owner is readable.
             // This case must create its own doubt, not inherit the start case's.
             app.on_ime_preedit(wid, "compose".into(), None);
-            let window = app.windows.get_mut(&wid).unwrap();
+            let mut window = app.windows.get_mut(&wid).unwrap();
             if !keep_preedit {
                 // Native fields retain the text outside the window projection.
                 window.preedit.clear();
@@ -907,7 +898,8 @@ fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
             row[0] = '>';
             let start = Instant::now();
             {
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 glow.note_context(true);
                 glow.observe_caret_drawn(true);
                 glow.observe_print_anchor_glyph(Some((3, 2, 1)), Some(' '));
@@ -918,7 +910,8 @@ fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
             term_lock(&term).process(b"\x1b[?2026h\x1b[1;1Hwork\x1b[4;3H\x1b[?2026l");
             let status_at = Instant::now();
             {
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 glow.observe_print_anchor_glyph(Some((0, 5, 2)), Some('k'));
                 glow.observe_row(3, 2, &row, status_at);
             }
@@ -929,7 +922,8 @@ fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
             term_lock(&term).process(b"\x1b[?2026h\x1b[1;1Hback\x1b[4;3H\x1b[?2026l");
             let focused_at = Instant::now();
             {
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 glow.observe_print_anchor_glyph(Some((0, 5, 3)), Some('k'));
                 glow.observe_row(3, 2, &row, focused_at);
             }
@@ -953,7 +947,8 @@ fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
                 let col = 2 + i as u16;
                 row[usize::from(col)] = glyph;
                 let echo = Instant::now();
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 glow.observe_print_anchor_glyph(Some((3, col + 1, 4 + i as u64)), Some(glyph));
                 glow.observe_row(3, col + 1, &row, echo);
                 glow.tick(Some((3, col + 1)), echo, &cfg, glow_geom(), &mut Vec::new());
@@ -982,7 +977,8 @@ fn focus_reports_preserve_composer_typing_without_unparking_program_output() {
         focus(&mut app, false, os_focus);
         for (row, col) in [(3, 2), (0, 6), (3, 2)] {
             let at = Instant::now();
-            let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+            let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+            let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
             glow.note_context(true);
             glow.observe_caret_drawn(true);
             glow.observe_print_anchor_glyph(Some((0, 6, 1)), Some('g'));
@@ -1475,7 +1471,8 @@ fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
         }
         let _ = drain(pipe);
         let later = Instant::now() + Duration::from_secs(3);
-        let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+        let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+        let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
         glow.note_typed_expected(later, 1, false, TypedClass::Glyph, 'x');
         frame(
             glow,
@@ -1552,7 +1549,8 @@ fn a_drag_into_a_tracking_app_keeps_the_composer_s_keys_lit() {
         // One frame: the app's last print ended at `print`; its caret is drawn at `caret`.
         let mut frame =
             |app: &mut App, print: Option<(u16, u16, char)>, caret: (u16, u16), at: Instant| {
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 if let Some((row, end, glyph)) = print {
                     seq += 1;
                     glow.observe_print_anchor_glyph(Some((row, end, seq)), Some(glyph));
@@ -1836,7 +1834,8 @@ fn an_escape_or_ctrl_c_in_an_agent_s_composer_keeps_its_keys_lit() {
                 let editable = observed.is_some_and(|frame| ctx.licence.vim.frame(frame))
                     && app.agent_composer_in_front(wid, false);
                 let entry = observed.and_then(|frame| ctx.licence.vim.entry_at(frame));
-                let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+                let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+                let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
                 if let Some((row, end, glyph)) = print {
                     if row == 0 && end > 0 {
                         echo_row[usize::from(end - 1)] = glyph;
@@ -3120,7 +3119,7 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
 fn a_bare_modifier_or_lock_key_is_inert() {
     use aterm_window::keyboard::NamedKey as WNamed;
     fn park(app: &mut App, wid: WindowId, deadline: std::time::Instant) -> std::time::Instant {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = false;
         ws.next_blink = Some(deadline);
         ws.scroll_frac_px = 7;

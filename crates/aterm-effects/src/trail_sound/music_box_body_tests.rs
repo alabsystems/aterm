@@ -112,8 +112,8 @@ fn room_gain(b: &Body, side: usize, w: f64) -> Cx {
         combs = combs.plus(comb.by(1.0 - fb));
     }
     let mut gain = low(b.send_k).times(combs.by(1.0 / COMBS as f64));
-    for k in 0..STAGES {
-        let zd = Cx::back(w, f64::from(b.stage_len[side][k]));
+    for &len in b.stage_len[side].iter().take(STAGES) {
+        let zd = Cx::back(w, f64::from(len));
         let g = f64::from(STAGE_GAIN);
         gain = gain.times(zd.plus(Cx(-g, 0.0)).over(Cx::ONE.plus(zd.by(-g))));
     }
@@ -158,10 +158,12 @@ fn every_tine_peaks_at_one_in_phase_on_its_own_note() {
 
 #[test]
 fn each_part_keeps_to_its_share_at_every_frequency_and_sample_rate() {
-    assert!(
-        DRY + COMB_GAIN * COMB_PEAK + BOARD_GAIN + ROOM_SEND <= 1.0 + 1e-6,
-        "the shares sum to more than one"
-    );
+    const {
+        assert!(
+            DRY + COMB_GAIN * COMB_PEAK + BOARD_GAIN + ROOM_SEND <= 1.0 + 1e-6,
+            "the shares sum to more than one"
+        );
+    }
     for sr in [SR, 44_100.0, 96_000.0, 22_050.0] {
         for rate in [SLOW, FAST] {
             let b = body_at(sr, rate);

@@ -262,7 +262,7 @@ fn publication_case_with_unread_policy(cli: Cli, case: i64, unread: u8) -> [bool
         let values = [
             held.last_attempt.contains_key(key),
             held.parked.contains_key(key),
-            held.bot_checked.contains_key(key),
+            held.unrecorded_checks.contains_key(key),
             held.activity_owners.contains_key(key),
         ];
         assert!(
@@ -470,7 +470,7 @@ fn vendor_completion_clears_only_the_successful_accounts_captured_retry() {
             );
             assert!(held.last_attempt.contains_key("foreign"));
             assert!(held.parked.contains_key("foreign"));
-            assert!(held.bot_checked.contains_key("foreign"));
+            assert!(held.unrecorded_checks.contains_key("foreign"));
             assert!(held.ladder.has_backoff("foreign"));
         }
     }

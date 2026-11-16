@@ -257,6 +257,11 @@ fn bot_check_page() -> Facts {
 }
 
 fn run(authorize: &str, desk: &mut Fake) -> Result<Done, Stop> {
+    run_as(authorize, desk, false)
+}
+
+/// [`run`], `unattended` where nobody started the sign-in ([`SignIn::unattended`]).
+fn run_as(authorize: &str, desk: &mut Fake, unattended: bool) -> Result<Done, Stop> {
     let flow = MailboxFlow::new(authorize).unwrap();
     drive(
         &SignIn {
@@ -264,6 +269,7 @@ fn run(authorize: &str, desk: &mut Fake) -> Result<Done, Stop> {
             flow: &flow,
             email: EMAIL,
             within: WITHIN,
+            unattended,
         },
         desk,
     )
@@ -809,6 +815,7 @@ fn continue_with_email_is_pressed_only_over_the_accounts_own_email() {
                 flow: &flow,
                 email: unusable,
                 within: WITHIN,
+                unattended: false,
             },
             &mut desk,
         )
@@ -1295,6 +1302,92 @@ fn a_code_is_verified_only_once_the_field_holds_it() {
     );
     assert!(desk.log.pressed.is_empty());
     assert_eq!(desk.log.polls, 0);
+}
+
+/// A SIGN-IN NOBODY STARTED ENDS WHERE ONLY A PERSON COULD GO ON (plan package FL-138): with no
+/// mailbox the window reads, it never presses `Continue with email` (no login email is sent
+/// that nobody reads), and a code page ends it at the read that finds it, recorded as the code
+/// page's stop that holds a token step; a mailbox it dropped ends it as that mailbox's failure.
+/// The consent page's human check ends it at the read that finds it, and Cloudflare's check
+/// once it stood for [`UNATTENDED_BOT_CHECK`], well before the deadline: nothing on either is
+/// pressed or set.
+/// CONTROL: a sign-in a person started waits on the same code page, and an unattended one with
+/// a mailbox reads it and goes on.
+/// NEGATIVE CONTROL: with `step` waiting on the human check whatever `unattended` says, the
+/// held page is read until the deadline: `` the human check was waited on ``; with it waiting on
+/// Cloudflare's check to the deadline, `` Cloudflare's check was waited on to the deadline ``.
+#[test]
+fn a_sign_in_nobody_started_ends_at_once_at_a_code_page_no_mailbox_answers() {
+    let mut desk = Fake::new(|log: &Log| {
+        Ok(if log.pressed.contains(&Button::ContinueWithEmail) {
+            code_page(false)
+        } else {
+            login_page()
+        })
+    });
+    assert_eq!(run_as(AUTHORIZE, &mut desk, true), Err(Stop::NobodyForCode));
+    assert!(desk.log.pressed.is_empty(), "{:?}", desk.log.pressed);
+    assert_eq!(desk.log.reads, 1, "it ends at the read that finds the page");
+    assert!(matches!(
+        VisibleStop::from(Stop::NobodyForCode),
+        VisibleStop::CodeNoMailbox(_)
+    ));
+
+    let mut desk = Fake::new(|_: &Log| Ok(code_page(false)));
+    assert_eq!(run_as(AUTHORIZE, &mut desk, true), Err(Stop::NobodyForCode));
+    assert_eq!(desk.log.reads, 1);
+
+    let mut desk = Fake::new(|_: &Log| Ok(code_page(false))).with_mail(|_| Err("refused"));
+    assert!(matches!(
+        run_as(AUTHORIZE, &mut desk, true),
+        Err(Stop::MailboxDropped("refused"))
+    ));
+    assert_eq!(desk.log.polls, MAX_MAILBOX_ERRORS);
+
+    // The consent page's human check: nobody would complete it.
+    const NAMED: &str = "Claude Code would like to connect. Logged in as one@example.com";
+    let mut desk = Fake::new(|_: &Log| Ok(held_consent_page(NAMED)));
+    assert_eq!(
+        run_as(AUTHORIZE, &mut desk, true),
+        Err(Stop::HumanCheck(Some("claude.ai".into())))
+    );
+    assert_eq!(desk.log.reads, 1, "the human check was waited on");
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    // Cloudflare's check: waited on as long as one that clears by itself takes, no longer.
+    let mut desk = Fake::new(|_: &Log| Ok(bot_check_page()));
+    let began = desk.now;
+    assert_eq!(
+        run_as(AUTHORIZE, &mut desk, true),
+        Err(Stop::BotCheck(Some("claude.ai".into())))
+    );
+    let waited = desk.now - began;
+    assert!(waited >= UNATTENDED_BOT_CHECK, "{waited:?}");
+    assert!(
+        waited < WITHIN,
+        "Cloudflare's check was waited on to the deadline"
+    );
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    // CONTROL: a person's sign-in waits for them on the code page until its deadline.
+    let mut desk = Fake::new(|_: &Log| Ok(code_page(false)));
+    assert_eq!(
+        run_as(AUTHORIZE, &mut desk, false),
+        Err(Stop::TimedOut(Phase::CodeNoMailbox))
+    );
+    assert!(desk.log.reads > 1);
+
+    // CONTROL: with a mailbox, an unattended sign-in signs in by itself.
+    let mut desk = Fake::new(whole_flow).with_mail(|_| Ok(MailboxCredential::Otp("123456".into())));
+    assert_eq!(run_as(AUTHORIZE, &mut desk, true), Ok(Done::Delivered));
+    assert_eq!(
+        desk.log.pressed,
+        [
+            Button::ContinueWithEmail,
+            Button::VerifyEmailAddress,
+            Button::Authorize
+        ]
+    );
 }
 
 /// A PAGE READ IS PARSED WHOLE OR REFUSED: the script's one JSON answer gives the document's
@@ -1825,11 +1918,15 @@ fn a_rows_google_grant_is_read_in_the_home_its_mailbox_was_discovered_in() {
     let store_dir = home.path().join("state/accounts");
     std::fs::create_dir_all(&store_dir).unwrap();
     let store = super::super::accounts::Store::at(&store_dir);
+    // The app password is the vault's; the environment names only the mailbox.
+    crate::vault_entry::put(
+        home.path(),
+        super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+        "password = \"apppw\"\n",
+    );
     let var = |name: &str| {
         (name == super::super::headless_oauth::IMAP_URL_ENV).then(|| {
-            std::ffi::OsString::from(
-                "imaps://fixture.person%40gmail.com:apppw@imap.gmail.com/INBOX",
-            )
+            std::ffi::OsString::from("imaps://fixture.person%40gmail.com@imap.gmail.com/INBOX")
         })
     };
     let ask = || {

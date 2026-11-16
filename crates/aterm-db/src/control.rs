@@ -780,6 +780,10 @@ pub struct Endpoint {
     /// Use the released `atdb/3` offer when a test specifically exercises that boundary.
     #[cfg(test)]
     pub(crate) legacy_credentials: bool,
+    /// Offer `atdb/6` and earlier, as the build before range reconciliation: a test of the
+    /// whole-list table round, one batch a round, which `atdb/6` peers still run.
+    #[cfg(test)]
+    pub(crate) duplex: bool,
     /// MUTANT: a worker's redial keeps what its first exchange left, as before CS1, so a redial
     /// that fails is recorded as the first attempt's probe failure.
     #[cfg(test)]
@@ -799,13 +803,14 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
-    /// `atdb/4`, `atdb/5` or `atdb/6`, as the wire names.
+    /// `atdb/4` to `atdb/7`, as the wire names.
     Frontier(frontier::Wire),
 }
 
 impl Protocol {
     fn from_alpn(alpn: Option<&[u8]>) -> Self {
         match alpn {
+            Some(fleet::ALPN_DATABASE_RECONCILE) => Self::Frontier(frontier::Wire::Reconcile),
             Some(fleet::ALPN_DATABASE_DUPLEX) => Self::Frontier(frontier::Wire::Duplex),
             Some(fleet::ALPN_DATABASE_DELTA) => Self::Frontier(frontier::Wire::Delta),
             Some(fleet::ALPN_DATABASE_FRONTIER) => Self::Frontier(frontier::Wire::Whole),
@@ -1320,9 +1325,19 @@ impl Endpoint {
                 #[cfg(test)]
                 legacy_credentials: false,
                 #[cfg(test)]
+                duplex: false,
+                #[cfg(test)]
                 redial_keeps_first_attempt: false,
             })
         })
+    }
+
+    /// This endpoint dials as an `atdb/6` build ([`Self::duplex`]).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn duplex(mut self) -> Self {
+        self.duplex = true;
+        self
     }
 
     pub(crate) const fn pending(&self) -> bool {
@@ -1424,6 +1439,8 @@ impl Endpoint {
             #[cfg(test)]
             legacy_credentials: false,
             #[cfg(test)]
+            duplex: false,
+            #[cfg(test)]
             redial_keeps_first_attempt: false,
         })
     }
@@ -1479,6 +1496,8 @@ impl Endpoint {
             #[cfg(test)]
             legacy_credentials: false,
             #[cfg(test)]
+            duplex: false,
+            #[cfg(test)]
             redial_keeps_first_attempt: false,
         })
     }
@@ -1519,6 +1538,8 @@ impl Endpoint {
                         fleet::test_client_handshake_database_v2_as
                     } else if self.legacy_credentials {
                         fleet::test_client_handshake_database_v3_as
+                    } else if self.duplex {
+                        fleet::test_client_handshake_database_v6_as
                     } else {
                         handshake
                     };
@@ -1998,6 +2019,9 @@ impl Endpoint {
                 repair.application = result.ok();
                 return;
             }
+            // Only `atdb/7` reconciles table inventories by range; every earlier wire trades them
+            // whole, as its released builds do.
+            repair.data.reconcile = protocol == Protocol::Frontier(frontier::Wire::Reconcile);
             let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier(_)) {
                 application.exchange(stream, actor, side, &mut repair.data)
             } else {

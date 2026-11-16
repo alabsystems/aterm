@@ -81,6 +81,12 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Int { .. }
             | Ty::Uint
             | Ty::Text(_)
+            | Ty::Prose(_)
+            | Ty::Command(_)
+            | Ty::Commit
+            | Ty::Digest
+            | Ty::Path
+            | Ty::Decimal
             | Ty::AccountLabel(_)
             | Ty::Enum(_)
             | Ty::Time
@@ -301,11 +307,16 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
         aterm_json::from_str::<Value>(text.trim()).map_err(|_| "this cell holds JSON of its type")
     };
     match ty {
-        Ty::Text(_) => Ok(Value::String(text.to_owned())),
-        Ty::AccountLabel(_) | Ty::Enum(_) | Ty::Url | Ty::Key | Ty::Ref(_) => {
-            Ok(Value::String(text.trim().to_owned()))
-        }
-        Ty::Hex(_) => Ok(Value::String(text.trim().to_ascii_lowercase())),
+        Ty::Text(_) | Ty::Prose(_) | Ty::Command(_) => Ok(Value::String(text.to_owned())),
+        Ty::AccountLabel(_)
+        | Ty::Enum(_)
+        | Ty::Url
+        | Ty::Key
+        | Ty::Ref(_)
+        | Ty::Digest
+        | Ty::Path
+        | Ty::Decimal => Ok(Value::String(text.trim().to_owned())),
+        Ty::Hex(_) | Ty::Commit => Ok(Value::String(text.trim().to_ascii_lowercase())),
         Ty::Digits(_) => Ok(Value::String(text.trim().to_owned())),
         Ty::Phone => super::cell::typed_phone(text)
             .map(Value::String)
@@ -342,10 +353,9 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
     }
 }
 
-/// The members a set cell's text names.
 /// A set cell's members: comma-separated, or a JSON list of texts (how a set whose member holds
 /// a comma shows), each in its normal form. `None` for a JSON list that is not one of texts.
-fn read_set(text: &str) -> Option<BTreeSet<String>> {
+pub(crate) fn read_set(text: &str) -> Option<BTreeSet<String>> {
     if text.trim_start().starts_with('[') {
         let Ok(Value::Array(items)) = aterm_json::from_str::<Value>(text.trim()) else {
             return None;

@@ -257,29 +257,16 @@ fn property(entry: u32, name: &CStr) -> Option<Cf> {
     Cf::property(entry, Cf::string(name)?.0)
 }
 
-/// Read the documented M1–M4 table layout. Unrecognized chips keep raw states
-/// and activity but no guessed frequency. The ordinal association is labelled,
-/// so a table out of order maps nothing.
+/// The tables the ordinal map reads a clock from: Efficiency, then Super, each only where
+/// [`ordinal`] can order it. No chip is named: a table the rule cannot order maps nothing, and
+/// its channels keep their raw states and activity with no guessed frequency.
 fn frequency_tables() -> (Option<Vec<f64>>, Option<Vec<f64>>) {
-    let brand = crate::machine_words().cpu.unwrap_or_default();
-    let named = |prefix: &str| {
-        brand
-            .strip_prefix(prefix)
-            .is_some_and(|tail| tail.is_empty() || tail.starts_with(' '))
-    };
-    if !["Apple M1", "Apple M2", "Apple M3", "Apple M4"]
-        .iter()
-        .any(|p| named(p))
-    {
-        return (None, None);
-    }
     let (e, p) = pmgr_tables();
     (e.and_then(ordinal), p.and_then(ordinal))
 }
 
 /// The chip's DVFS range: each table's lowest and highest state ([`super::DvfsRange`]). It
-/// needs no order, so it reads chips the ordinal map refuses (M5's Super table repeats a
-/// lower state: 4428 then 4416 MHz).
+/// needs no order, so it reads a table the ordinal map refuses ([`ordinal`]).
 pub(super) fn dvfs_range() -> Result<super::DvfsRange, &'static str> {
     let (e, p) = pmgr_tables();
     Ok(super::DvfsRange {
@@ -329,9 +316,26 @@ fn decode_table(bytes: &[u8]) -> Option<Vec<f64>> {
         .then(|| raw.iter().map(|v| v / scale).collect())
 }
 
-/// A table whose states rise with their ordinal, as the ordinal map needs.
+/// The deepest fall [`ordinal`] admits, as a share of the highest state before it.
+const DIP: f64 = 0.01;
+
+/// A table the ordinal map can read as written, row `i` for a channel's `i`th active state: no
+/// state falls more than [`DIP`] below the highest state before it. IOReport names those states
+/// by ordinal alone (`V{i}P{n-1-i}`, or `P{i}`), so the map rests on position. The power
+/// manager's order is not always rising frequency: M5's Super table ends 4428, 4416, 4464 MHz.
+/// Under the rule, the table as written and the same states in rising order differ at every
+/// ordinal by no more than `DIP / (1 - DIP)` of the state, so the clock the map gives, a
+/// residency-weighted mean, is the same within that share whichever order the states came in.
+/// A table with a deeper fall has no such bound: `None`, and it maps nothing.
 fn ordinal(table: Vec<f64>) -> Option<Vec<f64>> {
-    table.windows(2).all(|w| w[0] < w[1]).then_some(table)
+    let mut top = 0.0_f64;
+    for state in &table {
+        if *state < top * (1.0 - DIP) {
+            return None;
+        }
+        top = top.max(*state);
+    }
+    Some(table)
 }
 
 /// A decoded table's lowest and highest state.

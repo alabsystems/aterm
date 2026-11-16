@@ -257,6 +257,7 @@ fn words(s: &str) -> Vec<String> {
     s.split(' ').map(str::to_string).collect()
 }
 
+#[cfg(unix)]
 fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
     let tmp = tmp_dir(tag);
     let env = env_at(&tmp);
@@ -302,6 +303,7 @@ fn pending_import_uses_the_source_identity_and_explicit_region() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_import_requires_the_preferred_machine() {
     let (_tmp, env) = pending_kimi_env("import-preferred");
@@ -328,6 +330,7 @@ fn pending_import_requires_the_preferred_machine() {
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_import_does_not_guess_a_missing_region() {
     let (_tmp, env) = pending_kimi_env("import-region");
@@ -346,6 +349,7 @@ fn pending_import_does_not_guess_a_missing_region() {
     assert!(!env.accounts_roster_for(Cli::Kimi).unwrap().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_import_refuses_a_real_region_conflict() {
     let (_tmp, env) = pending_kimi_env("import-region-conflict");
@@ -397,6 +401,7 @@ fn kimi_adopts_its_existing_default_login_without_inventing_an_email() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_account_table_separates_assignment_readiness_and_local_logins() {
     let (_tmp, env) = pending_kimi_env("table-readiness");
@@ -5612,74 +5617,75 @@ fn an_unwatched_upgrade_says_so_and_a_switch_off_says_why() {
 }
 
 /// A tab held by another supervisor's claim reads so in `--status` (from the
-/// instance's `sessions` `supervisor=`), not `stalled=unwatched`.
+/// instance's `sessions` `supervisor=`), not `stalled=unwatched`, for either local ID form.
 #[cfg(unix)]
 #[test]
 fn a_tab_another_supervisor_claims_reads_so_unless_a_switch_is_off() {
     use crate::harness::upgrade_drive::pin_awake_since;
-    let tmp = tmp_dir("upgrade-claimed");
-    let tab = "s-b5cf2faabac5ce5127bd";
-    let short = aterm_tempfile::Builder::new()
-        .prefix("at-")
-        .tempdir_in("/tmp")
-        .expect("socket dir");
-    let (sock, asked) =
-        crate::harness::fake_instance(&short.path().join("a.sock"), "0badf00d", move |line| {
-            if line == "sessions" {
-                format!("OK 1\n1 {tab} - live claude supervisor=aterm-supervise:42 upgrade=-")
-            } else {
-                "ERR usage".to_string()
-            }
-        });
-    let env = Env {
-        sock: Some(sock),
-        ..env_at(&tmp)
-    };
-    let config = env.config.clone().expect("config path");
-    record_upgrade(&env, "03396a15", tab, "");
-    let mut agent = live_holder(&env.home.clone().expect("home"), "03396a15", tab, "2.1.281");
-    let status = Cmd::UpgradeOwner {
-        sid: String::new(),
-        ask: OwnerAsk::Status,
-        json: false,
-    };
-    let now = u64::try_from(env.now).expect("now");
-    pin_awake_since(now - 86_400);
-    aterm_uds::atomic_file::write(
-        &config,
-        ("[harness]\nenabled = true\nupgrade = true\n").as_ref(),
-        0o600,
-    )
-    .expect("config");
-    let (ok, out, err) = go(&status, &env);
-    assert!(ok, "{out}{err}");
-    for field in [
-        " wait=claimed wait_for=- ",
-        " stalled=overdue ",
-        " cause=person ",
-    ] {
-        assert!(out.contains(field), "{field}: {out}");
-    }
-    assert!(!err.contains("`[harness]"), "{err}");
-    assert_eq!(*asked.lock().expect("asked"), vec!["sessions"]);
-    for (toml, switch) in [
-        ("[harness]\nupgrade = false\n", "`[harness] upgrade`"),
-        ("[harness]\nenabled = false\n", "`[harness] enabled`"),
-    ] {
-        aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("config");
+    for tab in ["t0000000042", "s-b5cf2faabac5ce5127bd"] {
+        let tmp = tmp_dir("upgrade-claimed");
+        let short = aterm_tempfile::Builder::new()
+            .prefix("at-")
+            .tempdir_in("/tmp")
+            .expect("socket dir");
+        let (sock, asked) =
+            crate::harness::fake_instance(&short.path().join("a.sock"), "0badf00d", move |line| {
+                if line == "sessions" {
+                    format!("OK 1\n1 {tab} - live claude supervisor=aterm-supervise:42 upgrade=-")
+                } else {
+                    "ERR usage".to_string()
+                }
+            });
+        let env = Env {
+            sock: Some(sock),
+            ..env_at(&tmp)
+        };
+        let config = env.config.clone().expect("config path");
+        record_upgrade(&env, "03396a15", tab, "");
+        let mut agent = live_holder(&env.home.clone().expect("home"), "03396a15", tab, "2.1.281");
+        let status = Cmd::UpgradeOwner {
+            sid: String::new(),
+            ask: OwnerAsk::Status,
+            json: false,
+        };
+        let now = u64::try_from(env.now).expect("now");
+        pin_awake_since(now - 86_400);
+        aterm_uds::atomic_file::write(
+            &config,
+            ("[harness]\nenabled = true\nupgrade = true\n").as_ref(),
+            0o600,
+        )
+        .expect("config");
         let (ok, out, err) = go(&status, &env);
-        assert!(ok, "{toml}: {out}{err}");
-        assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
-        assert!(err.contains(switch), "{toml}: {err}");
-        assert_eq!(
-            asked.lock().expect("asked").len(),
-            1,
-            "{toml}: asked nothing"
-        );
+        assert!(ok, "{out}{err}");
+        for field in [
+            " wait=claimed wait_for=- ",
+            " stalled=overdue ",
+            " cause=person ",
+        ] {
+            assert!(out.contains(field), "{field}: {out}");
+        }
+        assert!(!err.contains("`[harness]"), "{err}");
+        assert_eq!(*asked.lock().expect("asked"), vec!["sessions"]);
+        for (toml, switch) in [
+            ("[harness]\nupgrade = false\n", "`[harness] upgrade`"),
+            ("[harness]\nenabled = false\n", "`[harness] enabled`"),
+        ] {
+            aterm_uds::atomic_file::write(&config, (toml).as_ref(), 0o600).expect("config");
+            let (ok, out, err) = go(&status, &env);
+            assert!(ok, "{toml}: {out}{err}");
+            assert!(out.contains(" stalled=unwatched "), "{toml}: {out}");
+            assert!(err.contains(switch), "{toml}: {err}");
+            assert_eq!(
+                asked.lock().expect("asked").len(),
+                1,
+                "{toml}: asked nothing"
+            );
+        }
+        pin_awake_since(0);
+        let _ = agent.kill();
+        let _ = agent.wait();
     }
-    pin_awake_since(0);
-    let _ = agent.kill();
-    let _ = agent.wait();
 }
 
 /// A conversation resumed outside aterm (`claude --resume` in another terminal) is never
@@ -9195,6 +9201,104 @@ fn a_survey_says_which_claude_row_a_worker_would_start_on() {
     };
     assert_eq!(launches("off"), ["main"], "rotation off stays, at its wall");
     assert_eq!(launches("wall"), ["work-2"], "CONTROL: rotation moves it");
+}
+
+/// A SURVEY READS A FULL FIGURE FROM BEFORE A LIFT AS NO WALL (FL-117): this Mac's five-hour figure
+/// read full alongside its wall stays on record when another Mac's lift lifts the wall here
+/// ([`accounts::note_peer_lift`]), since no read here replaced it. The survey, and the quota row
+/// it makes, no longer call the row limited until that figure's reset: as the store's own
+/// condition does, it reads the row as running, and the figure from before the lift no longer
+/// speaks for the window.
+/// NEGATIVE CONTROL: before the lift the row is limited, and a full figure read after the lift
+/// makes it limited again.
+#[test]
+fn a_survey_reads_a_full_figure_from_before_a_lift_as_no_wall() {
+    let tmp = tmp_dir("accounts-survey-peer-lift");
+    let env = env_at(&tmp);
+    three_accounts(&tmp, &env);
+    let now = env.now;
+    let reset = now + 2 * 3600;
+    let pk = "ac-00000000000000a1";
+    let config = env.config.clone().expect("a config path");
+    let store = env.accounts_store();
+    let full = |at: i64| accounts::Sample {
+        session_pct: Some(100),
+        session_reset: Some(reset),
+        session_read_at: Some(at),
+        at,
+        ..accounts::Sample::default()
+    };
+    store
+        .transact(now, &mut None, |state| {
+            let account = state.accounts.entry("main".to_owned()).or_default();
+            account.pk = Some(pk.to_owned());
+            account.sample = Some(full(now - 120));
+            Ok(accounts::note_wall(
+                state,
+                "main",
+                accounts::SESSION_LIMIT,
+                Some(reset),
+                now - 100,
+                now - 100,
+            ))
+        })
+        .expect("write the record");
+    let places = (config.as_path(), env.state.as_path(), env.home.as_deref());
+    let main = || {
+        let (rows, reads) = crate::harness::provider_read::captured(|| {
+            survey_accounts(Cli::Claude, places, now)
+                .expect("the pool reads")
+                .rows
+        });
+        assert_eq!(reads, [], "a survey asks no provider");
+        let row = rows
+            .into_iter()
+            .find(|row| row.label == "main")
+            .expect("main");
+        (row.condition, row.five_hour_pct)
+    };
+    let limited = accounts::Condition::Limited {
+        until: reset + accounts::RESET_GRACE_S,
+    };
+    assert_eq!(main(), (limited, Some(100)), "NEGATIVE CONTROL: walled");
+
+    let lifted = store
+        .transact(now, &mut None, |state| {
+            Ok(accounts::note_peer_lift(
+                state,
+                &accounts::PeerLift {
+                    peer: "n-00000000000000bb",
+                    pk,
+                    window: accounts::SESSION_LIMIT,
+                    at: now - 50,
+                    reset: Some(reset),
+                },
+                now - 10,
+            ))
+        })
+        .expect("the lift");
+    assert_eq!(lifted.len(), 1, "{lifted:?}");
+    let (condition, pct) = main();
+    assert!(
+        condition.runs() && !matches!(condition, accounts::Condition::Limited { .. }),
+        "{condition:?}"
+    );
+    assert_eq!(
+        pct, None,
+        "the full figure from before the lift says nothing of the window"
+    );
+
+    store
+        .transact(now, &mut None, |state| {
+            state.accounts.entry("main".to_owned()).or_default().sample = Some(full(now - 5));
+            Ok(Vec::new())
+        })
+        .expect("a newer reading");
+    assert_eq!(
+        main(),
+        (limited, Some(100)),
+        "NEGATIVE CONTROL: a full figure read after the lift"
+    );
 }
 
 /// THE REPORT SAYS WHAT A CLAUDE CODE WORKER TAKES, as a survey's `launch=` does, which `next:`
@@ -14592,6 +14696,54 @@ fn the_accounts_report_counts_other_macs_catalog_rows_and_its_json_keeps_them() 
         Some(2),
         "{json}"
     );
+}
+
+/// `ls` prints the registry of the store and aterm.toml it is given: the seed rows of a store
+/// that holds no record, nothing refused, and the strip list, which aterm.toml's
+/// `shell_env_strip` replaces and whose refusals it names.
+#[test]
+fn ls_prints_each_row_where_it_came_from_and_the_strip_list() {
+    let tmp = tmp_dir("ls");
+    let config = tmp.path().join("aterm.toml");
+    std::fs::write(&config, "shell_env_strip = [\"MINE_\", \"PATH\"]\n").expect("config");
+    let env = Env {
+        config: Some(config),
+        ..env_at(&tmp)
+    };
+    assert!(matches!(
+        parse(&words("ls")),
+        Ok((Cmd::Ls { json: false }, _))
+    ));
+    assert!(parse(&words("ls extra")).is_err());
+    let (ok, text, err) = go(&Cmd::Ls { json: false }, &env);
+    assert!(ok, "{err}");
+    for line in [
+        "harnesses\n",
+        "  grok-alab         Grok Build       leads grok; tool grok-alab; seed\n",
+        "  muse-alab         Muse Code        leads nothing; tool muse-alab; seed\n",
+        "refused\n  (none)\n",
+        "shell strip list\n  MINE_\n",
+        "  refused PATH from aterm.toml: ",
+    ] {
+        assert!(text.contains(line), "{line:?} in:\n{text}");
+    }
+    let (ok, json, err) = go(&Cmd::Ls { json: true }, &env);
+    assert!(ok, "{err}");
+    let v: aterm_json::Value = aterm_json::from_str(&json).expect("one JSON object");
+    let ids: Vec<&str> = v["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        ["claude-code-alab", "grok-alab", "kimi-alab", "muse-alab"]
+    );
+    assert_eq!(v["rows"][0]["origin"].as_str(), Some("seed"));
+    assert_eq!(v["rows"][0]["tool"].as_str(), Some("claude-alab"));
+    assert_eq!(v["env_strip"][0].as_str(), Some("MINE_"));
+    assert_eq!(v["env_refused"][0]["entry"].as_str(), Some("PATH"));
 }
 
 /// `upgrade` names a tab by its tab ID in either form: `t` and 10 Crockford base32 characters,

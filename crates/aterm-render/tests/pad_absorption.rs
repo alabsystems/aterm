@@ -51,7 +51,7 @@ fn pad_split_exact_cover_maximal_floor_near_even() {
                 );
                 let frame = s.cells * cell + 2 * pad;
                 assert_eq!(
-                    band_offset(w, frame),
+                    band_offset(w, frame, aterm_render::SideInsetPx(0)),
                     (s.pad_lo - pad) as i64,
                     "band_offset must equal pad_lo - pad (w={w} pad={pad} cell={cell})"
                 );
@@ -123,11 +123,33 @@ fn place_frame_bands_exact_fit_is_identity_and_invert_is_xor() {
     let (fw, fh) = (23usize, 11usize);
     let src = synth_frame(fw, fh);
     let mut dst = vec![0u32; fw * fh];
-    place_frame_bands(&mut dst, fw, fh, &src, fw, fh, false, BAND, 0..0);
+    place_frame_bands(
+        &mut dst,
+        fw,
+        fh,
+        &src,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        false,
+        BAND,
+        0..0,
+    );
     assert_eq!(dst, src, "exact fit must be the identity copy");
 
     let mut inv = vec![0u32; fw * fh];
-    place_frame_bands(&mut inv, fw, fh, &src, fw, fh, true, BAND, 0..0);
+    place_frame_bands(
+        &mut inv,
+        fw,
+        fh,
+        &src,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        true,
+        BAND,
+        0..0,
+    );
     for (i, (&a, &b)) in inv.iter().zip(src.iter()).enumerate() {
         assert_eq!(a, b ^ 0x00ff_ffff, "invert must be the bell XOR at {i}");
     }
@@ -140,8 +162,22 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
 
     let (dw, dh) = (15usize, 9usize);
     let mut dst = vec![0u32; dw * dh];
-    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0..0);
-    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    place_frame_bands(
+        &mut dst,
+        dw,
+        dh,
+        &src,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        false,
+        BAND,
+        0..0,
+    );
+    let (ox, oy) = (
+        band_offset(dw, fw, aterm_render::SideInsetPx(0)),
+        band_offset_y(dh, fh),
+    );
     assert!(ox < 0);
     if cfg!(target_os = "linux") {
         assert_eq!(oy, 0, "top-pinned crop keeps the frame's top rows");
@@ -161,8 +197,19 @@ fn place_frame_bands_crops_centred_and_handles_one_axis() {
 
     let (dw, dh) = (fw + 5, fh);
     let mut dst = vec![0u32; dw * dh];
-    place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND, 0..0);
-    let ox = band_offset(dw, fw);
+    place_frame_bands(
+        &mut dst,
+        dw,
+        dh,
+        &src,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        false,
+        BAND,
+        0..0,
+    );
+    let ox = band_offset(dw, fw, aterm_render::SideInsetPx(0));
     assert_eq!(ox, 2);
     for y in 0..dh {
         for x in 0..dw {
@@ -189,13 +236,13 @@ fn frame_placement_partitions_surface_and_frame() {
             axis.crop_after,
         )
     };
-    let banded = frame_placement(111, 111, 100, 100);
+    let banded = frame_placement(111, 111, 100, 100, aterm_render::SideInsetPx(0));
     assert_eq!(
         parts(banded.x),
         (5, 5, 100, 6, 0, 0),
         "odd spare pixel trails"
     );
-    let cropped = frame_placement(100, 100, 111, 111);
+    let cropped = frame_placement(100, 100, 111, 111, aterm_render::SideInsetPx(0));
     assert_eq!(parts(cropped.x), (-6, 0, 100, 0, 6, 5), "centred crop");
     if cfg!(target_os = "linux") {
         assert_eq!(parts(banded.y), (0, 0, 100, 11, 0, 0));
@@ -207,9 +254,13 @@ fn frame_placement_partitions_surface_and_frame() {
 
     for surface in 0..=24usize {
         for frame in 0..=24usize {
-            let place = frame_placement(surface, surface, frame, frame);
+            let place =
+                frame_placement(surface, surface, frame, frame, aterm_render::SideInsetPx(0));
             for (axis, offset) in [
-                (place.x, band_offset(surface, frame)),
+                (
+                    place.x,
+                    band_offset(surface, frame, aterm_render::SideInsetPx(0)),
+                ),
                 (place.y, band_offset_y(surface, frame)),
             ] {
                 let at = (surface, frame);
@@ -252,7 +303,10 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
     let (fw, fh) = (20usize, 12usize);
     let src = synth_frame(fw, fh);
     let (dw, dh) = (fw + 7, fh + 7);
-    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    let (ox, oy) = (
+        band_offset(dw, fw, aterm_render::SideInsetPx(0)),
+        band_offset_y(dh, fh),
+    );
     for (edge_rows, invert) in [(0..0, false), (0..5, false), (0..5, true), (2..5, false)] {
         let mut dst = vec![0u32; dw * dh];
         place_frame_bands(
@@ -262,6 +316,7 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
             &src,
             fw,
             fh,
+            aterm_render::SideInsetPx(0),
             invert,
             BAND,
             edge_rows.clone(),
@@ -304,6 +359,7 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
             &src,
             fw,
             fh,
+            aterm_render::SideInsetPx(0),
             false,
             BAND,
             edge_rows.clone(),
@@ -312,7 +368,15 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
         let frame = ox as usize..ox as usize + fw;
         dst[y * dw..y * dw + dw][frame.clone()].fill(rule);
         let before = dst.clone();
-        continue_chrome_edges(&mut dst, dw, dh, fw, fh, edge_rows.clone());
+        continue_chrome_edges(
+            &mut dst,
+            dw,
+            dh,
+            fw,
+            fh,
+            aterm_render::SideInsetPx(0),
+            edge_rows.clone(),
+        );
         let chrome = edge_rows.contains(&rule_row);
         for (i, (&d, &b)) in dst.iter().zip(&before).enumerate() {
             let (x, py) = (i % dw, i / dw);
@@ -328,10 +392,29 @@ fn chrome_rows_continue_their_edge_pixels_through_the_remainder_bands() {
         assert_eq!(dst != before, chrome, "{edge_rows:?}, rule on {rule_row}");
     }
     let mut exact = src.clone();
-    continue_chrome_edges(&mut exact, fw, fh, fw, fh, 0..fh);
+    continue_chrome_edges(
+        &mut exact,
+        fw,
+        fh,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        0..fh,
+    );
     assert_eq!(exact, src);
     let mut all = vec![0u32; dw * dh];
-    place_frame_bands(&mut all, dw, dh, &src, fw, fh, false, BAND, 0..usize::MAX);
+    place_frame_bands(
+        &mut all,
+        dw,
+        dh,
+        &src,
+        fw,
+        fh,
+        aterm_render::SideInsetPx(0),
+        false,
+        BAND,
+        0..usize::MAX,
+    );
     for y in 0..dh {
         let sy = y as i64 - oy;
         if sy < 0 || sy as usize >= fh {
@@ -363,4 +446,61 @@ fn drop_overlay_border_is_the_short_side_over_200_scaled_and_capped() {
     ] {
         assert_eq!(drop_overlay_border_px(w, h, q4), want, "{w}x{h} at {q4}/16");
     }
+}
+
+#[test]
+fn frame_placement_after_a_side_inset_partitions_inset_bands_and_frame() {
+    use aterm_render::{SideInsetPx, band_offset_after};
+    for inset in [1, 7, 40] {
+        for extra in [0, 1, 6] {
+            let w = 80 + inset + extra;
+            let p = frame_placement(w, 40, 80, 30, SideInsetPx(inset));
+            assert_eq!(p.x.origin, (inset + extra / 2) as i64);
+            assert_eq!(p.x.origin, band_offset_after(w, 80, SideInsetPx(inset)));
+            assert_eq!(p.x.band_before + p.x.visible + p.x.band_after, w);
+            for x in 0..inset {
+                assert_eq!(p.x.source(x), None);
+            }
+            assert_eq!(p.x.visible, 80);
+        }
+    }
+    let p = frame_placement(90, 30, 100, 30, SideInsetPx(20));
+    assert_eq!(
+        p.x.origin, 5,
+        "a transient oversized frame overlaps the inset"
+    );
+}
+
+#[test]
+fn place_frame_bands_paints_the_side_inset_as_band() {
+    use aterm_render::SideInsetPx;
+    let src = [0x112233, 0x223344, 0x334455, 0x445566];
+    let mut dst = [0; 14];
+    place_frame_bands(
+        &mut dst,
+        7,
+        2,
+        &src,
+        2,
+        2,
+        SideInsetPx(3),
+        false,
+        0xabcdef,
+        0..1,
+    );
+    assert_eq!(
+        &dst[..4],
+        &[0x112233; 4],
+        "chrome edges continue through the inset"
+    );
+    assert_eq!(
+        &dst[7..11],
+        &[0xabcdef; 4],
+        "outside edge rows the inset is band colour"
+    );
+    assert_eq!(&dst[4..6], &src[..2]);
+    assert_eq!(&dst[11..13], &src[2..]);
+    dst[..4].fill(0);
+    continue_chrome_edges(&mut dst, 7, 2, 2, 2, SideInsetPx(3), 0..1);
+    assert_eq!(&dst[..4], &[0x112233; 4]);
 }

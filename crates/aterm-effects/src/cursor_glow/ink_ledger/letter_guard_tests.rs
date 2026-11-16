@@ -231,6 +231,7 @@ fn a_stream_s_ramps_are_cut_as_their_quads_rails_included() {
                 x1: (col + 1) as f32 * 10.0,
                 y1: 60.0,
                 share,
+                hard: false,
             });
         }
         ledger
@@ -1845,6 +1846,7 @@ fn a_ramp_cut_reuses_its_near_dims_as_a_fresh_reading_reads_them() {
                 x1: (o + (col + 1) * cw + RING) as f32,
                 y1: (o + (row + 1) * ch + RING) as f32,
                 share: mix.below(128) as f32 / 128.0,
+                hard: false,
             });
         }
         let end = |mix: &mut Mix| -> (u32, u8) {
@@ -2049,7 +2051,12 @@ fn the_letter_guard_never_cuts_light_owned_glass() {
             style: GlowStyle::RainbowKitty,
             ..GlowConfig::default()
         };
-        let _ = glow.guard_letters(&mut over, (Some((row, 30)), true), (g, &cfg), (&[], 0));
+        let _ = glow.guard_letters(
+            &mut over,
+            (Some((row, 30)), true, None),
+            (g, &cfg),
+            (&[], 0),
+        );
         let mut got = Vec::new();
         glow.under_ramps.expand_into(&glow.under_out, &mut got);
         (laid, got, glass_n)
@@ -2187,7 +2194,7 @@ fn a_page_shade_is_held_to_the_letters_it_reaches() {
         };
         let _ = glow.guard_letters(
             &mut Vec::new(),
-            (Some((row, 30)), true),
+            (Some((row, 30)), true, None),
             (g, &cfg),
             (&[], 0),
         );
@@ -2380,7 +2387,7 @@ fn a_letter_under_its_raster_bar_keeps_a_shade_that_does_not_lower_it() {
             glow.under_ramps = ramps;
             let _ = glow.guard_letters(
                 &mut Vec::new(),
-                (Some((row, 30)), true),
+                (Some((row, 30)), true, None),
                 (g, &cfg),
                 (&[], 0),
             );
@@ -2534,7 +2541,12 @@ fn on_the_glass_the_theme_s_letters_keep_its_bar_by_each_solid_pixel() {
             ..GlowConfig::default()
         };
         let mut over = over.to_vec();
-        let _ = glow.guard_letters(&mut over, (Some((row, 30)), true), (g, &cfg), (&[], 0));
+        let _ = glow.guard_letters(
+            &mut over,
+            (Some((row, 30)), true, None),
+            (g, &cfg),
+            (&[], 0),
+        );
         over
     };
     // What the edge pixel reads under a light of `lift` against its ring, which the light lifts
@@ -2591,4 +2603,535 @@ fn on_the_glass_the_theme_s_letters_keep_its_bar_by_each_solid_pixel() {
             "control, {what}: held to its raster bar alone, the letter keeps the whole light"
         );
     }
+}
+
+/// A paper row of letters for the CT-51 tests: `echo hi` at columns 2 to 8 of row 2, on a
+/// grid of 8 by 16 px cells, 40 columns and 6 rows.
+fn ct51_row() -> (Geom, u16, Vec<Vec<aterm_core::terminal::RenderCell>>) {
+    let g = Geom {
+        cw: 8,
+        ch: 16,
+        rows: 6,
+        cols: 40,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 320,
+        win_h: 96,
+        head: 0,
+    };
+    let row = 2u16;
+    let paper = aterm_core::terminal::RenderCell {
+        fg: [0x2B, 0x2D, 0x33],
+        bg: [0xF6, 0xF7, 0xF9],
+        ..aterm_core::terminal::RenderCell::default()
+    };
+    let mut cells = vec![vec![paper; g.cols]; g.rows];
+    for (col, ch) in [(2, 'e'), (3, 'c'), (4, 'h'), (5, 'o'), (7, 'h'), (8, 'i')] {
+        cells[usize::from(row)][col].ch = ch;
+    }
+    (g, row, cells)
+}
+
+/// A LETTER UNDER A BAR OR UNDERLINE CARET IS GUARDED (CT-51 Rule D): a dark light laid in the
+/// under stream across a paper row of letters, with a bar caret on its `h`, is cut over that `h`
+/// as over its neighbours, so the letter the bar stands on keeps its bar as they do. NEGATIVE
+/// CONTROL ([`CursorGlow::set_letter_guard_thin_caret`] off): the guard passes over the caret's
+/// cell as under a block, and the light on its letter is laid stronger than on its neighbours.
+#[test]
+fn a_letter_under_a_thin_caret_is_guarded_as_any_other() {
+    let (g, row, cells) = ct51_row();
+    let page = 0x00F6_F7F9;
+    let light = GlowQuad {
+        row,
+        x: 0,
+        y: row * 16,
+        w: 96,
+        h: 16,
+        color: 0x0030_0838,
+        alpha: 0xC8,
+        color2: 0x0030_0838,
+        alpha2: 0xC8,
+    };
+    let run = |guarded: bool, thin: bool| {
+        let mut glow = CursorGlow::default();
+        glow.set_letter_guard_thin_caret(guarded);
+        glow.observe_frame_text(Some((row, 4)), &cells, Instant::now());
+        glow.under_out = vec![light];
+        let mut over = Vec::new();
+        let cfg = GlowConfig {
+            style: GlowStyle::RainbowKitty,
+            ..GlowConfig::default()
+        };
+        let _ = glow.guard_letters(
+            &mut over,
+            (Some((row, 4)), false, thin.then_some(true)),
+            (g, &cfg),
+            (&[], 0),
+        );
+        let mut got = Vec::new();
+        glow.under_ramps.expand_into(&glow.under_out, &mut got);
+        let at = |col: i32| {
+            crate::cursor_fx::light_at(page, (&got, &[]), (col * 8 + 4, i32::from(row) * 16 + 8))
+        };
+        (at(4), at(3), at(5))
+    };
+    let whole = crate::cursor_fx::light_at(page, (&[light], &[]), (36, i32::from(row) * 16 + 8));
+    let (caret, left, right) = run(true, true);
+    assert_ne!(left, whole, "the light on the caret's neighbours is cut");
+    assert_eq!(
+        (caret, caret),
+        (left, right),
+        "the caret's letter is cut as its neighbours are"
+    );
+    let (caret, left, _) = run(false, true);
+    let l = crate::color_math::relative_luminance;
+    assert!(
+        l(caret) < l(left) - 0.01,
+        "control: passed over, the caret's letter takes more light: {caret:06x} against {left:06x}"
+    );
+    // Any other caret (an unfocused one, which draws its outline over its letter, a block) is
+    // passed over as before CT-51.
+    let (caret, left, _) = run(true, false);
+    assert!(
+        l(caret) < l(left) - 0.01,
+        "an unfocused caret's cell is passed over: {caret:06x} against {left:06x}"
+    );
+}
+
+/// THE GUARD'S SPANS FOLLOW ITS CUTS (CT-51 W12): once the letter guard has cut a frame's
+/// streams, its light-owned glass still names the glass's quads and ramps, so a later cut of
+/// the frame (a thin caret's hold, `CursorGlow::hold_light_for_thin_caret`) leaves the glass
+/// whole as the guard did, laid as quads or as ramps. NEGATIVE CONTROL
+/// ([`InkLedger::spans_spent`]): spent by the guard's cut, as before, the spans name nothing and
+/// the later cut cuts the glass.
+#[test]
+fn the_guard_s_spans_follow_its_cuts() {
+    use aterm_render::{BeamRows, RampCost, RampSink};
+    let (g, row, cells) = ct51_row();
+    fn lay<S: BeamRows>(out: &mut S, row: u16) -> (S::Mark, S::Mark) {
+        let from = out.mark();
+        out.slab();
+        for y in row * 16..row * 16 + 16 {
+            out.row(
+                i32::from(row),
+                row,
+                (0, y, 96),
+                (0x0030_0838, 0xC8),
+                (0x0008_3030, 0xC0),
+            );
+        }
+        let to = out.mark();
+        out.slab();
+        out.rect(
+            i32::from(row),
+            row,
+            (8, row * 16 + 4, 64, 8),
+            (0x0020_2020, 0xB0),
+        );
+        (from, to)
+    }
+    let run = |spent: bool, ramped: bool| {
+        let mut glow = CursorGlow::default();
+        glow.ink_ledger.spans_spent = spent;
+        glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+        let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+        let (from, to) = if ramped {
+            let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+            lay(&mut sink, row)
+        } else {
+            let (from, to) = lay(&mut quads, row);
+            ((from, ramps.mark()), (to, ramps.mark()))
+        };
+        glow.ink_ledger.note_light_owned_laid(from, to);
+        let mut laid = Vec::new();
+        ramps.expand_into(&quads, &mut laid);
+        let glass_n = laid.len() - 1;
+        glow.under_out = quads;
+        glow.under_ramps = ramps;
+        let mut over = Vec::new();
+        let cfg = GlowConfig {
+            style: GlowStyle::RainbowKitty,
+            ..GlowConfig::default()
+        };
+        let _ = glow.guard_letters(
+            &mut over,
+            (Some((row, 30)), true, None),
+            (g, &cfg),
+            (&[], 0),
+        );
+        // A later cut over the whole row.
+        let ledger = &mut glow.ink_ledger;
+        ledger.grid = (0.0, 0.0, 8.0, 16.0);
+        ledger.dims.clear();
+        ledger.dims.push(Dim {
+            x0: 0.0,
+            y0: f32::from(row * 16),
+            x1: 96.0,
+            y1: f32::from(row * 16 + 16),
+            share: 0.3,
+            hard: false,
+        });
+        ledger.guard_mask_stream(&mut glow.under_out, &mut glow.under_ramps, true);
+        ledger.dims.clear();
+        let mut got = Vec::new();
+        glow.under_ramps.expand_into(&glow.under_out, &mut got);
+        (laid, got, glass_n)
+    };
+    for ramped in [false, true] {
+        let (laid, got, n) = run(false, ramped);
+        assert!(
+            got.len() >= n && got[..n] == laid[..n],
+            "ramped {ramped}: the later cut leaves the glass whole: {got:?}"
+        );
+        let (laid, got, n) = run(true, ramped);
+        assert!(
+            got.len() < n || got[..n] != laid[..n],
+            "ramped {ramped}, control: spent spans let the later cut cut the glass"
+        );
+    }
+}
+
+/// THE SPANS FOLLOW A FRAME THE MEMO LAYS AND THE NIGHT GROUNDS (CT-51 W12): the glass a frame
+/// owns stays whole under a later cut of the frame (a thin caret's hold) on a frame the letter
+/// guard lays again from its memo, and on one whose under stream the night grounds then move
+/// (`CursorGlow::ground_the_frame`). NEGATIVE CONTROLS ([`InkLedger::memo_spans_off`],
+/// [`InkLedger::night_shift_off`]): the memo's frame keeps the spans the frame noted, which name
+/// the quads before the guard's cuts, and the grounds leave the spans naming the grounds; either
+/// way the later cut cuts the glass.
+#[test]
+fn the_spans_follow_the_memo_and_the_night_grounds() {
+    let (g, row, cells) = ct51_row();
+    let glass: Vec<GlowQuad> = (row * 16..row * 16 + 16)
+        .map(|y| GlowQuad {
+            row,
+            x: 0,
+            y,
+            w: 96,
+            h: 1,
+            color: 0x0030_0838,
+            alpha: 0xC8,
+            color2: 0x0008_3030,
+            alpha2: 0xC0,
+        })
+        .collect();
+    let shade = GlowQuad {
+        row,
+        x: 8,
+        y: row * 16 + 4,
+        w: 64,
+        h: 8,
+        color: 0x0020_2020,
+        alpha: 0xB0,
+        color2: 0x0020_2020,
+        alpha2: 0xB0,
+    };
+    let cfg = GlowConfig {
+        style: GlowStyle::RainbowKitty,
+        ..GlowConfig::default()
+    };
+    // Lay the frame: a light the guard cuts into pieces, then the glass, light-owned.
+    let lay = |glow: &mut CursorGlow| {
+        glow.ink_ledger.clear_rails();
+        glow.observe_frame_text(Some((row, 30)), &cells, Instant::now());
+        let mut quads = vec![shade];
+        quads.extend_from_slice(&glass);
+        let m = GlowRamps::default().mark();
+        glow.ink_ledger
+            .note_light_owned_laid((1, m), (1 + glass.len(), m));
+        glow.under_out = quads;
+        glow.under_ramps = GlowRamps::default();
+        let _ = glow.guard_letters(
+            &mut Vec::new(),
+            (Some((row, 30)), true, None),
+            (g, &cfg),
+            (&[], 0),
+        );
+    };
+    // A later cut over the whole row, and whether it leaves the glass whole in the stream.
+    let later = |glow: &mut CursorGlow| {
+        let ledger = &mut glow.ink_ledger;
+        ledger.grid = (0.0, 0.0, 8.0, 16.0);
+        ledger.dims.clear();
+        ledger.dims.push(Dim {
+            x0: 0.0,
+            y0: f32::from(row * 16),
+            x1: 96.0,
+            y1: f32::from(row * 16 + 16),
+            share: 0.3,
+            hard: false,
+        });
+        ledger.guard_mask_stream(&mut glow.under_out, &mut glow.under_ramps, true);
+        ledger.dims.clear();
+        glow.under_out
+            .windows(glass.len())
+            .any(|w| w == glass.as_slice())
+    };
+    let memo = |off: bool| {
+        let mut glow = CursorGlow::default();
+        glow.ink_ledger.memo_spans_off = off;
+        lay(&mut glow);
+        lay(&mut glow);
+        assert!(
+            glow.under_out.len() > 1 + glass.len(),
+            "the guard cuts the light"
+        );
+        assert_eq!(glow.letter_guard.kept, 1, "the second frame is the memo's");
+        later(&mut glow)
+    };
+    assert!(memo(false), "the memo's frame keeps its glass");
+    assert!(!memo(true), "control: the memo's frame cuts its glass");
+    let night = |off: bool| {
+        let mut glow = CursorGlow::default();
+        glow.ink_ledger.night_shift_off = off;
+        lay(&mut glow);
+        // Two night grounds laid under the frame's stream.
+        let ground = GlowQuad {
+            color: 0x0008_0808,
+            color2: 0x0008_0808,
+            ..shade
+        };
+        glow.flame_night = vec![ground, ground];
+        glow.ground_the_frame(&cfg, g, &[]);
+        later(&mut glow)
+    };
+    assert!(night(false), "the grounded frame keeps its glass");
+    assert!(!night(true), "control: the grounded frame cuts its glass");
+}
+
+/// A HARD DIM HOLDS ITS BOX ALONE ([`Dim::hard`], a thin caret's held ring): a light across a
+/// row cut by a hard dim one pixel wide keeps its whole light on every other pixel, laid as a
+/// quad or as a ramp, and the held pixel keeps the dim's share of it; a light-owned light is cut
+/// by it only where the hold says so ([`InkLedger::owned_in_strip`]), and a foot rail (the
+/// trail's underline) and a page shade never, not even in the strip: the trail is not dimmed to
+/// buy the caret's reading. NEGATIVE CONTROL: the same dim soft feathers its cut into the pixels
+/// beside it, and the light-owned light in the strip is held where the foot rail is not.
+#[test]
+fn a_hard_dim_holds_its_box_alone() {
+    use aterm_render::{BeamRows, RampCost, RampSink};
+    /// What the light is: a light-owned light, a foot rail or a page shade.
+    #[derive(Clone, Copy)]
+    enum Laid {
+        Owned,
+        Foot,
+        Shade,
+    }
+    let page = 0x0028_2A36;
+    let cut = |hard: bool, ramped: bool, owned: Option<(Laid, bool)>| {
+        let mut ledger = InkLedger::EMPTY;
+        ledger.grid = (0.0, 0.0, 8.0, 16.0);
+        let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+        let span = if ramped {
+            let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+            let from = sink.mark();
+            sink.slab();
+            for y in 0..16u16 {
+                sink.row(0, 0, (0, y, 40), (0x0060_4060, 0xA0), (0x0060_4060, 0xA0));
+            }
+            (from, sink.mark())
+        } else {
+            let from = (quads.mark(), ramps.mark());
+            quads.push(GlowQuad {
+                row: 0,
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 16,
+                color: 0x0060_4060,
+                alpha: 0xA0,
+                color2: 0x0060_4060,
+                alpha2: 0xA0,
+            });
+            (from, (quads.mark(), ramps.mark()))
+        };
+        let mut whole = Vec::new();
+        ramps.expand_into(&quads, &mut whole);
+        if let Some((laid, strip)) = owned {
+            match laid {
+                Laid::Owned => ledger.note_light_owned_laid(span.0, span.1),
+                Laid::Foot => ledger.note_foot_rail_laid(span.0, span.1),
+                Laid::Shade => ledger.note_page_shade_laid(span.0, span.1),
+            }
+            ledger.owned_in_strip = strip;
+        }
+        ledger.dims.push(Dim {
+            x0: 15.0,
+            y0: 0.0,
+            x1: 16.0,
+            y1: 16.0,
+            share: 0.25,
+            hard,
+        });
+        ledger.guard_mask_stream(&mut quads, &mut ramps, true);
+        let mut got = Vec::new();
+        ramps.expand_into(&quads, &mut got);
+        let at = |q: &[GlowQuad], x: i32| crate::cursor_fx::light_at(page, (q, &[]), (x, 8));
+        let row: Vec<(u32, u32)> = (10..22).map(|x| (at(&whole, x), at(&got, x))).collect();
+        row
+    };
+    for ramped in [false, true] {
+        let row = cut(true, ramped, None);
+        for (i, &(w, g)) in row.iter().enumerate() {
+            let x = 10 + i;
+            if x == 15 {
+                assert_ne!(w, g, "ramped {ramped}: the held pixel is cut");
+                let l = crate::color_math::relative_luminance;
+                assert!(l(g) < l(w), "ramped {ramped}: {g:06x} of {w:06x}");
+            } else {
+                assert_eq!(w, g, "ramped {ramped}: x {x} keeps its whole light");
+            }
+        }
+        for laid in [Laid::Owned, Laid::Foot] {
+            let row = cut(true, ramped, Some((laid, false)));
+            assert!(
+                row.iter().all(|&(w, g)| w == g),
+                "ramped {ramped}: a light-owned light or a foot rail is not cut outside the strip"
+            );
+        }
+        let row = cut(true, ramped, Some((Laid::Owned, true)));
+        assert_ne!(
+            row[5].0, row[5].1,
+            "ramped {ramped}: in the strip a light-owned light is held"
+        );
+        assert_eq!(row[4].0, row[4].1, "ramped {ramped}: only there");
+        for laid in [Laid::Foot, Laid::Shade] {
+            let row = cut(true, ramped, Some((laid, true)));
+            assert!(
+                row.iter().all(|&(w, g)| w == g),
+                "ramped {ramped}: a foot rail or a page shade is not cut, even in the strip"
+            );
+        }
+        let row = cut(false, ramped, None);
+        assert!(
+            row[4].0 != row[4].1 || row[6].0 != row[6].1,
+            "ramped {ramped}, control: a soft dim feathers past its box"
+        );
+    }
+}
+
+/// A CUT AFTER THE VERIFY PASSES LAYS NO LIGHT THE GUARD DID NOT WEIGH ([`CutFit`]): the thin
+/// caret's hold cuts a gradient by a hard dim one pixel wide after the guard has read the frame,
+/// and every other pixel of it, laid as a quad or as a ramp, keeps no more of each channel and
+/// of its opacity than the uncut gradient laid there, and no less than a level under it. NEGATIVE
+/// CONTROL: the same cut made as the guard's own (`owned_in_strip` off) rounds a whole piece's
+/// ends, and some pixel of some gradient lays a level more than the uncut one (dark typing's `n`
+/// beside the bar read 4.55 where the guard laid 4.60).
+#[test]
+fn a_cut_after_the_verify_passes_lays_no_unweighed_light() {
+    use aterm_render::{RampCost, RampSink};
+    // Gradients whose ends do not fall on whole levels at the cut's knots.
+    /// A gradient's two ends (colour, opacity) and its width.
+    type Gradient = ((u32, u8), (u32, u8), u16);
+    const GRADIENTS: [Gradient; 4] = [
+        ((0x0010_3050, 0x40), (0x00F0_A0D0, 0xE0), 37),
+        ((0x0093_38DE, 0x9A), (0x00A2_34FE, 0xC1), 23),
+        ((0x0001_0203, 0x11), (0x00FE_FDFC, 0xFE), 41),
+        ((0x0060_4060, 0x31), (0x0091_7A13, 0x77), 29),
+    ];
+    let channels = |c: (u32, u8)| {
+        [
+            (c.0 >> 16) & 0xff,
+            (c.0 >> 8) & 0xff,
+            c.0 & 0xff,
+            u32::from(c.1),
+        ]
+    };
+    // The most any pixel off the dim lays over the uncut gradient, and the most it lays under.
+    let cut = |after_verify: bool, ramped: bool, (a, b, w): Gradient| {
+        let mut ledger = InkLedger::EMPTY;
+        ledger.grid = (0.0, 0.0, 8.0, 16.0);
+        ledger.owned_in_strip = after_verify;
+        let (mut quads, mut ramps) = (Vec::new(), GlowRamps::default());
+        if ramped {
+            let mut sink = RampSink::new(&mut quads, &mut ramps).costed(RampCost::ALWAYS);
+            sink.slab();
+            for y in 0..16u16 {
+                sink.row(0, 0, (0, y, w), a, b);
+            }
+        } else {
+            quads.push(GlowQuad {
+                row: 0,
+                x: 0,
+                y: 0,
+                w,
+                h: 16,
+                color: a.0,
+                alpha: a.1,
+                color2: b.0,
+                alpha2: b.1,
+            });
+        }
+        let mut whole = Vec::new();
+        ramps.expand_into(&quads, &mut whole);
+        ledger.dims.push(Dim {
+            x0: 15.0,
+            y0: 0.0,
+            x1: 16.0,
+            y1: 16.0,
+            share: 0.25,
+            hard: true,
+        });
+        ledger.guard_mask_stream(&mut quads, &mut ramps, true);
+        let mut got = Vec::new();
+        ramps.expand_into(&quads, &mut got);
+        let light = |q: &[GlowQuad], x: i32| {
+            let p = q
+                .iter()
+                .find(|p| {
+                    p.y <= 8 && 8 < p.y + p.h && i32::from(p.x) <= x && x < i32::from(p.x + p.w)
+                })
+                .map_or((0, 0), |p| quad_at(p, x, 1.0));
+            channels(p)
+        };
+        let (mut over, mut under) = (0i32, 0i32);
+        for x in (0..i32::from(w)).filter(|&x| x != 15) {
+            let (u, g) = (light(&whole, x), light(&got, x));
+            for k in 0..4 {
+                let d = g[k] as i32 - u[k] as i32;
+                over = over.max(d);
+                under = under.max(-d);
+            }
+        }
+        (over, under)
+    };
+    for ramped in [false, true] {
+        let mut control_bit = false;
+        for g in GRADIENTS {
+            let (over, under) = cut(true, ramped, g);
+            assert_eq!(
+                over, 0,
+                "ramped {ramped}, {g:x?}: no pixel lays more than it did"
+            );
+            assert!(
+                under <= 1,
+                "ramped {ramped}, {g:x?}: none lays a level under, {under}"
+            );
+            control_bit |= cut(false, ramped, g).0 > 0;
+        }
+        assert!(
+            control_bit,
+            "ramped {ramped}, control: the guard's own fit rounds a level up"
+        );
+    }
+}
+
+/// A THIN CARET'S LINE LIES IN EACH NEIGHBOUR'S RING BOX WHERE THE CARET DRAWS IT
+/// ([`caret_line_in_box`]): a bar in the judged cell lies on its two left columns, inside the
+/// ring; in the cell right of it, on the ring's last columns; an underline in the judged cell,
+/// on its last rows; in the cell above, on the ring's first rows; and the model a reading is
+/// kept by moves with it. NEGATIVE CONTROL:
+/// a caret two cells off, or no thin caret, lays no line and leaves the model as it is.
+#[test]
+fn a_thin_caret_s_line_lies_where_the_caret_draws_it() {
+    let (cw, ch) = (8, 16);
+    let at = |caret: (u16, u16), thin: Option<bool>| {
+        caret_line_in_box((Some(caret), thin), (2, 4), (cw, ch), 7)
+    };
+    let r = RING as u16;
+    assert_eq!(at((2, 4), Some(true)).1, Some([r, r, r + 2, r + 16]));
+    assert_eq!(at((2, 5), Some(true)).1, Some([r + 8, r, r + 10, r + 16]));
+    assert_eq!(at((2, 4), Some(false)).1, Some([r, r + 14, r + 8, r + 16]));
+    assert_eq!(at((1, 4), Some(false)).1, Some([r, 0, r + 8, r]));
+    assert_ne!(at((2, 4), Some(true)).0, 7, "the model moves with the line");
+    assert_eq!(at((2, 6), Some(true)), (7, None), "control: two cells off");
+    assert_eq!(at((2, 4), None), (7, None), "control: no thin caret");
 }

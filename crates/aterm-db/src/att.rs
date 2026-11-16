@@ -13,6 +13,8 @@
 //!   and the amacs grid round trip. A secret cell shows as the name of its secret-store entry
 //!   ([`typed::secret`]); nothing here holds a secret's value.
 
+#[cfg(unix)]
+pub(crate) mod checkpoint;
 pub mod command;
 mod diff;
 mod edit;
@@ -189,11 +191,25 @@ pub const REGISTRY_3: Compiled = Compiled {
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 3,
+    successor: Some(&REGISTRY_4),
+};
+
+/// `alab/registry.4`, the registry's fourth generation: the first whose free-text lists (a Mac's
+/// nickname aliases and hosts, a mailbox's domains) are text sets. The roll into it restates
+/// each whole list as its members, every list candidate's provenance kept (LT-15B,
+/// `alab::roll`).
+pub const REGISTRY_4: Compiled = Compiled {
+    table: &registry::REGISTRY_4,
+    version: registry::VERSION,
+    birth: registry::birth,
+    guard: registry::guard,
+    seeded: crate::alab::seeds::compiled,
+    generation: 4,
     successor: None,
 };
 
 /// Every typed catalog table this build compiles.
-pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2, REGISTRY_3];
+pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2, REGISTRY_3, REGISTRY_4];
 
 /// The generation of `chain` (oldest first) readers and writers use in `snapshot`: the oldest
 /// one subscribed here. A roll declares the next generation and restates into it while the old
@@ -283,12 +299,28 @@ pub fn sole_generation(paths: &Paths, first: &'static Compiled, at: &'static Com
 /// collection definition, its newest, while a generation it writes keeps the shape the builds
 /// reading it know: the registry's first two generations type a password and a phone's number
 /// as a sealed token, the shape builds up to 0.200.0 read, so a secret-store reference or a
-/// plain number there is refused here, whatever path wrote it, and only the third generation,
-/// which no older build reads, takes one.
+/// plain number there is refused here, whatever path wrote it, and only the third generation
+/// on, which no older build reads, takes one; and the first three hold a Mac's nickname aliases
+/// and hosts and a mailbox's domains as one whole list, so an element of them is refused there
+/// and a whole list is refused in the fourth, which holds them as text sets.
 ///
 /// # Errors
 /// A change is no typed cell value, or `table`'s collection refuses it; the error names the
 /// generation and the cell's column, never its value.
+/// Whether some generation of [`TABLES`] types `collection.column` otherwise than `column` does:
+/// a list or set column whose form a generation sets apart (a Mac's hosts, a mailbox's domains),
+/// which [`conform`] re-types, while a set or list every generation holds alike is carried as
+/// it is.
+fn set_apart(collection: &str, column: &typed::Column) -> bool {
+    TABLES.iter().any(|generation| {
+        generation
+            .table
+            .collection(collection)
+            .and_then(|known| known.column(column.name))
+            .is_some_and(|other| other.ty != column.ty)
+    })
+}
+
 pub fn conform(table: &Table, changes: &mut [Change]) -> Result<()> {
     for change in changes {
         let Some(collection) = table.collection(&change.collection) else {
@@ -302,14 +334,19 @@ pub fn conform(table: &Table, changes: &mut [Change]) -> Result<()> {
         };
         let key = cell::CellKey::parse(&change.key)?;
         // Only a column whose type a generation sets apart (a sealed token before the third, a
-        // reference or a number from it) is re-typed; every other column is the same in each.
+        // reference or a number from it; a whole list before the fourth, a text set's elements
+        // from it) is re-typed; every other column is the same in each.
         let Some(column) = collection.column(key.col) else {
             continue;
         };
-        if !matches!(
-            column.ty,
-            typed::Ty::Secret | typed::Ty::SecretRef | typed::Ty::Phone
-        ) {
+        let collection_form = matches!(column.ty, typed::Ty::List(..) | typed::Ty::Set(_))
+            && set_apart(&change.collection, column);
+        if !collection_form
+            && !matches!(
+                column.ty,
+                typed::Ty::Secret | typed::Ty::SecretRef | typed::Ty::Phone
+            )
+        {
             continue;
         }
         // One candidate as this generation types it; a roll's restatement carries a register's
@@ -323,8 +360,8 @@ pub fn conform(table: &Table, changes: &mut [Change]) -> Result<()> {
             held.r = held.r.min(collection.version);
             let checked = cell::change(collection, key, &held).map_err(|refused| {
                 Error::new(&format!(
-                    "{}: {refused}; this generation holds the column as builds up to 0.200.0 \
-                     read it",
+                    "{}: {refused}; this generation holds the column as the builds that read \
+                     it know it",
                     table.role
                 ))
             })?;
@@ -420,7 +457,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Command> {
 pub use crate::typed::View;
 
 impl View {
-    pub(crate) fn read(table: &Table, session: &Session<'_>, log: &Log) -> Self {
+    pub(crate) fn read(table: &'static Table, session: &Session<'_>, log: &Log) -> Self {
         let (eligible, merges) = log.eligible_and_merges();
         let ops: Vec<Op> = eligible
             .into_iter()
@@ -478,10 +515,17 @@ impl View {
             || cells
                 .keys()
                 .any(|(collection, _)| collection == registry::ROLL.name);
+        let awaiting = crate::typed::Awaiting {
+            records: awaited.len(),
+            rows: log.awaited_rows(&awaited),
+            restated,
+        };
         Self {
+            table: Some(table),
             causal: log.causal_index().clone(),
             cells,
             complete: awaited.is_empty() && restated,
+            awaiting,
             refused,
             ops,
             quota,
@@ -1017,6 +1061,27 @@ impl Handle {
         })
     }
 
+    /// The history a roll carried into this generation (`alab::history`): each entry of an
+    /// earlier generation's log with its operation, writer, machine, clocks and changes, a
+    /// secret's value withheld, and each horizon a roll's bound stated. Empty for a generation no
+    /// roll wrote into.
+    ///
+    /// # Errors
+    /// As [`Self::view`].
+    pub fn carried_history(&self) -> Result<crate::alab::history::Carried> {
+        let table = self.compiled.table;
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                Ok(crate::alab::history::carried(
+                    &View::read(table, session, &log),
+                    owned::commons::historical(session),
+                    None,
+                ))
+            })
+        })
+    }
+
     /// Write a grid save (design §8): under the store's writer, re-read the table and settle
     /// `plan` against it ([`grid::settle`]): each changed register is written only while its
     /// candidates are still the exported ones, a cell that changed meanwhile is left alone and
@@ -1026,9 +1091,9 @@ impl Handle {
     /// the grid to show at that row as it shows a problem.
     ///
     /// # Errors
-    /// No Commons writer; this Mac's history of the table is incomplete (an operation still
-    /// waiting on a causal parent could hold a candidate the comparison cannot see); or a record
-    /// cannot be written.
+    /// No Commons writer; a row the save writes is one an operation still waiting on a causal
+    /// parent writes, or such an operation cannot be read here (either could hold a candidate the
+    /// comparison cannot see, [`View::holds_back`]); or a record cannot be written.
     pub fn apply(&self, collection: &Collection, plan: &Plan) -> Result<Applied> {
         let table = self.compiled.table;
         application::with_store(
@@ -1040,11 +1105,6 @@ impl Handle {
                 let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
-                if !view.complete {
-                    return Err(Error::new(
-                        "this table's history here is incomplete; a grid save waits for a complete scan",
-                    ));
-                }
                 let mut settled = grid::settle(collection, plan, &view.cells);
                 if let Some(refused) = self.compiled.rules(&mut settled.rows, &view.cells)? {
                     return Ok(Applied {
@@ -1054,6 +1114,11 @@ impl Handle {
                 }
                 for row in &mut settled.rows {
                     conform(table, row)?;
+                }
+                if let Some(why) = view.holds_back(&settled.rows) {
+                    return Err(Error::new(&format!(
+                        "this table's {why}; a grid save of that row waits for it"
+                    )));
                 }
                 let mut applied = Applied {
                     unchanged: settled.unchanged,
@@ -1080,14 +1145,15 @@ impl Handle {
 
     /// Write rows `derive` computes from the table as it is under the store's writer (the lab
     /// importer's three-way plan, design §9), declaring and enrolling the table when `declare`:
-    /// the plan is made on a complete history only, so a withheld operation can never hide an
-    /// owner's edit from the comparison; its rows are packed into records of at most 64 changes,
-    /// each with a content-derived request id, so a retry returns its first receipt and a re-run
-    /// of the same plan writes nothing.
+    /// the plan is written only where no withheld operation writes a row it writes
+    /// ([`View::holds_back`]), so a withheld operation can never hide an owner's edit from the
+    /// comparison; its rows are packed into records of at most 64 changes, each with a
+    /// content-derived request id, so a retry returns its first receipt and a re-run of the same
+    /// plan writes nothing.
     ///
     /// # Errors
-    /// No Commons writer; this Mac's history of the table is incomplete; `derive` fails; or a
-    /// record cannot be written.
+    /// No Commons writer; a row the plan writes may still change under it here
+    /// ([`View::holds_back`]); `derive` fails; or a record cannot be written.
     pub(crate) fn commit_derived<T>(
         &self,
         declare: bool,
@@ -1204,14 +1270,14 @@ impl Handle {
                 let log = Log::read_with(session, store, scope, decode)?;
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
-                if !view.complete {
-                    return Err(Error::new(
-                        "this table's history here is incomplete; an import waits for a complete scan",
-                    ));
-                }
                 let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
                 if owner && let Some(refused) = self.compiled.rules(&mut rows, &view.cells)? {
                     return Err(refused.into());
+                }
+                if let Some(why) = view.holds_back(&rows) {
+                    return Err(Error::new(&format!(
+                        "this table's {why}; a write of that row waits for it"
+                    )));
                 }
                 for row in &mut rows {
                     conform(table, row)?;

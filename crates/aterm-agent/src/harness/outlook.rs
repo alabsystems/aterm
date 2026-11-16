@@ -1473,9 +1473,12 @@ fn seen_of(acct: &accounts::Account, w: Window, machine: &str, now: i64) -> Opti
     };
     // An invalid newer source cannot hide admissible history. If none is admitted,
     // retain clock-invalid evidence to distinguish it from an unread window. A
-    // reading before the refill barrier remains cut, as it was before fallback.
-    newer(admitted(tap), admitted(sample))
-        .or_else(|| admitted(warning))
+    // reading before the refill barrier remains cut, as it was before fallback. Of the
+    // admitted sources the newest speaks, Claude Code's warning included: the policy keeps
+    // a warning newer than the last reading ([`accounts::Account::week_warning`]), so a
+    // replay that modeled from the older reading would end it in its clone and forecast
+    // the row usable while the live policy holds it low.
+    newer(newer(admitted(tap), admitted(sample)), admitted(warning))
         .or_else(|| newer(clock_invalid(tap), clock_invalid(sample)))
         .or_else(|| clock_invalid(warning))
 }
@@ -1601,9 +1604,13 @@ fn rise(
             if last.at < a || first.at > now {
                 continue;
             }
+            // An epoch dated before its first figure (a limit reset spent, then read) is an instant
+            // the window was empty. One dated by its own first figure (a refill or a raised
+            // allowance read on that figure) says only that the change came before it, not when:
+            // starting it from 0 would charge all of that figure to the instant it was read.
             let empty_at = match run.began {
                 Began::Window => Some(last.reset - w.len_s()),
-                Began::Epoch(epoch) => Some(epoch),
+                Began::Epoch(epoch) => (epoch < first.at).then_some(epoch),
                 Began::Refill => None,
             };
             let (start_pct, start_at) = match run.figs.iter().rposition(|f| f.at <= a) {

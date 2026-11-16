@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
-use crate::floor::GIB;
-use crate::{Admit, Error, Fixed, Ledger, Need, Pace, Reading, Volume, admit_with};
+use crate::{Admit, Error, Fixed, Ledger, Need, Pace, Reading, admit_with};
 
 /// Set, the test binary is [`standin_waits_for_capacity`], its ledger under this directory.
 const STANDIN: &str = "ATERM_CAPACITY_INTERRUPT_STANDIN";
-/// What the stand-in waits for: `mem`, `disk`, `quiet` or `turn` ([`Kind`]).
+/// What the stand-in waits for: `mem`, `quiet` or `turn` ([`Kind`]). A need short of disk
+/// waits for nothing: it ends at the look after its one relief.
 const STANDIN_KIND: &str = "ATERM_CAPACITY_INTERRUPT_KIND";
 /// Set, the stand-in puts SIGINT back to its default action first, as a foreground process
 /// has it.
@@ -30,7 +30,6 @@ const STANDIN_TOOL: &str = "ATERM_CAPACITY_INTERRUPT_TOOL";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Mem,
-    Disk,
     Quiet,
     /// `--admit now`'s turn at the ledger's lock, which the test holds: its memory short of
     /// room, as [`Kind::Mem`]'s, which `now` overrides.
@@ -41,7 +40,6 @@ impl Kind {
     fn word(self) -> &'static str {
         match self {
             Kind::Mem => "mem",
-            Kind::Disk => "disk",
             Kind::Quiet => "quiet",
             Kind::Turn => "turn",
         }
@@ -49,7 +47,6 @@ impl Kind {
 
     fn of(word: &str) -> Kind {
         match word {
-            "disk" => Kind::Disk,
             "quiet" => Kind::Quiet,
             "turn" => Kind::Turn,
             _ => Kind::Mem,
@@ -65,18 +62,9 @@ impl Kind {
         }
     }
 
-    /// The machine both sides read: 48 GiB with 40 available, 14 idle cores, a volume with 90
-    /// GiB above its floor.
+    /// The machine both sides read: 48 GiB with 40 available, 14 idle cores.
     fn machine() -> Fixed {
-        let mut r = Reading::of_gib(48, 40, 14);
-        r.volume = Some(Volume {
-            mount: PathBuf::from("/vol"),
-            total: 200 * GIB,
-            free: 100 * GIB,
-            floor: 10 * GIB,
-            room: 2 * GIB,
-        });
-        Fixed::new(r)
+        Fixed::new(Reading::of_gib(48, 40, 14))
     }
 
     /// The claim this test holds, which leaves the stand-in's short by 10 GiB (or behind it on
@@ -84,7 +72,6 @@ impl Kind {
     fn held(self) -> Need {
         match self {
             Kind::Mem | Kind::Turn => Need::new("holder").mem_gib(30),
-            Kind::Disk => Need::new("holder").disk(80 * GIB, "/vol"),
             Kind::Quiet => Need::new("holder").quiet(28.0),
         }
     }
@@ -93,7 +80,6 @@ impl Kind {
     fn wants(self) -> Need {
         match self {
             Kind::Mem | Kind::Turn => Need::new("stand-in").mem_gib(20),
-            Kind::Disk => Need::new("stand-in").disk(20 * GIB, "/vol"),
             Kind::Quiet => Need::new("stand-in").quiet(28.0),
         }
     }
@@ -102,7 +88,6 @@ impl Kind {
     fn short(self) -> &'static str {
         match self {
             Kind::Mem => "memory short by 10 GiB",
-            Kind::Disk => "disk short by 10 GiB",
             Kind::Quiet => "the quiet machine",
             Kind::Turn => "holds the ledger's lock",
         }
@@ -297,7 +282,7 @@ fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
     }
 }
 
-/// Each kind of wait (memory, disk, the quiet machine), its next look two minutes off, and
+/// Each kind of wait (memory, the quiet machine), its next look two minutes off, and
 /// `--admit now`'s wait for the ledger's lock, which is never let go, ends on SIGTERM as NOT RUN
 /// well inside the one-minute hang detector (the time is reported), naming the signal and what
 /// it was short of, and leaves only the holder's claim in the ledger. SIGINT does the same where
@@ -309,10 +294,9 @@ fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
 fn an_interrupt_ends_each_kind_of_wait() {
     for (kind, env, sig, word) in [
         (Kind::Mem, &[][..], libc::SIGTERM, "SIGTERM"),
-        (Kind::Disk, &[][..], libc::SIGTERM, "SIGTERM"),
         (Kind::Quiet, &[][..], libc::SIGTERM, "SIGTERM"),
         (Kind::Mem, &[STANDIN_SIGINT][..], libc::SIGINT, "SIGINT"),
-        (Kind::Disk, &[STANDIN_TOOL][..], libc::SIGTERM, "SIGTERM"),
+        (Kind::Mem, &[STANDIN_TOOL][..], libc::SIGTERM, "SIGTERM"),
         (Kind::Quiet, &[STANDIN_TOOL][..], libc::SIGINT, "SIGINT"),
         (Kind::Turn, &[STANDIN_TOOL][..], libc::SIGTERM, "SIGTERM"),
         (Kind::Turn, &[STANDIN_SIGINT][..], libc::SIGINT, "SIGINT"),

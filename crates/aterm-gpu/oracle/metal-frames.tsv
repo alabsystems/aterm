@@ -151,3 +151,7 @@ aarch64	Apple M4 Pro	blit/chrome-below-strip	301x149	d51bd8ccef39dfd9ba76886f693
 aarch64	Apple M4 Pro	blit/edr-scrgb-bands	301x149	c01437acfd25efc11e84e1569653a3f843273b5abbd0cda08c5d433d0d3badb5
 aarch64	Apple M4 Pro	crown/hdr	20x14	4724d5d3457923487620bae689a7130314f93974fe3b7c218b8590e8de3ed32d
 aarch64	Apple M4 Pro	crown/sdr	20x14	e903ba05ea6f0404818f9a86502c0ada37c488b360d8d5cfb0a8819f231b2283
+
+# Added 2026-11-15: blit/side-inset drawn by first-party Metal on Apple M5 Max,
+# held to its CPU twin; existing recorded rows are unchanged.
+frame-record	aarch64	Apple M5 Max	blit/side-inset	311x129	8ecddae1943aaebcaf85926bc7c5c2734747409e34f1a87fc0f253faf68ae62b

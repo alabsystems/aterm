@@ -7,7 +7,12 @@ use super::*;
 fn no_vault_reads_every_entry_absent() {
     let root = aterm_tempfile::tempdir().unwrap();
     assert_eq!(read_text(root.path(), "ai-pool.toml", 64), Read::Absent);
+    assert_eq!(
+        read_set(root.path(), &["ai-pool.toml", "ai-accounts.csv"], 64),
+        [Read::Absent, Read::Absent]
+    );
     assert!(!configured(root.path()));
+    assert!(names(root.path()).is_empty());
 }
 
 #[cfg(unix)]

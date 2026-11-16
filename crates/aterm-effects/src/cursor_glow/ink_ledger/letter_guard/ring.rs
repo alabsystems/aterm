@@ -110,20 +110,28 @@ impl Levels {
 /// longest list [`median_of`] orders; a longer one (a core or a bed) it counts.
 const RING_MOST: usize = 8 * super::RING as usize;
 
-/// Everything [`RingCell::read`] reads a neighbourhood from, and so all a [`RingRead`] depends on
-/// but the face's table, which [`RingCell::reads`] are kept for.
+/// Everything [`RingCell::read_lined`] reads a neighbourhood from, and so all a [`RingRead`]
+/// depends on but the face's table, which [`RingCell::reads`] are kept for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ReadKey {
     /// The ring box's size, the cell's size, the ring, px.
     sizes: [u32; 5],
     corrected: bool,
     cells: [Neighbour; 9],
+    /// A bar or underline caret's line in the box ([`RingCell::read_lined`]).
+    line: Option<[u16; 4]>,
 }
 
 impl ReadKey {
     /// The slot of [`RingCell::reads`] this key lies in, the first of its [`READ_WAYS`].
     fn slot(&self) -> usize {
         let mut h = u64::from(self.corrected);
+        if let Some([x0, y0, x1, y1]) = self.line {
+            h = super::fold(
+                h,
+                u64::from(x0) | u64::from(y0) << 16 | u64::from(x1) << 32 | u64::from(y1) << 48,
+            );
+        }
         for v in self.sizes {
             h = super::fold(h, u64::from(v));
         }
@@ -232,7 +240,7 @@ impl RingRead {
 /// One lettered cell read as the judge reads it ([`self`]): the read of its neighbourhood, and the
 /// neighbourhoods kept read for the next.
 pub(super) struct RingCell {
-    /// The neighbourhood last read. [`Self::read`] comes first.
+    /// The neighbourhood last read. [`Self::read_lined`] comes first.
     current: Option<Arc<RingRead>>,
     /// The table every kept read's glyphs were read from: a read is only as good as its rasters,
     /// so another table starts them over.
@@ -288,17 +296,34 @@ impl RingCell {
         anew: 0,
     };
 
-    /// Read the cell whose ring box is `w` x `h` px, its cell `cw` x `ch` px at `(ring, ring)` in
-    /// it, from its neighbourhood `cells` (row by row from the row above, each row left to right:
-    /// the renderer's draw order), its own at `cells[4]`, their glyphs from the face's `table`,
-    /// and the renderer's blend (`corrected`). A neighbourhood read before from this table is
-    /// taken as it was read: a read depends on nothing else.
+    /// [`Self::read_lined`] with no caret line in the box (the tests' reading).
+    #[cfg(test)]
     pub(super) fn read(
         &mut self,
         (w, h): (usize, usize),
         (cw, ch): (usize, usize),
         ring: usize,
         cells: &[Neighbour; 9],
+        (table, corrected): (&RasterTable, bool),
+    ) {
+        self.read_lined((w, h), (cw, ch), ring, (cells, None), (table, corrected));
+    }
+
+    /// Read the cell whose ring box is `w` x `h` px, its cell `cw` x `ch` px at `(ring, ring)` in
+    /// it, from its neighbourhood `cells` (row by row from the row above, each row left to right:
+    /// the renderer's draw order), its own at `cells[4]`, their glyphs from the face's `table`,
+    /// and the renderer's blend (`corrected`), with a bar or underline caret's `line` in the box,
+    /// `[x0, y0, x1, y1)` box px: as the caret draws it over its cell, no pixel of it is the
+    /// letter's ground or its ink, as the judge reads a letter beside or under the line by the
+    /// clean frame, which draws it (a letter's ring that read the bar's column as the page's
+    /// ground left the meteor red in the `e` under glass dark jump's bar at 3.72). A neighbourhood
+    /// read before from this table is taken as it was read: a read depends on nothing else.
+    pub(super) fn read_lined(
+        &mut self,
+        (w, h): (usize, usize),
+        (cw, ch): (usize, usize),
+        ring: usize,
+        (cells, line): (&[Neighbour; 9], Option<[u16; 4]>),
         (table, corrected): (&RasterTable, bool),
     ) {
         if !self.table.as_ref().is_some_and(|t| Arc::ptr_eq(t, table)) {
@@ -312,6 +337,7 @@ impl RingCell {
             sizes: [w, h, cw, ch, ring].map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
             corrected,
             cells: *cells,
+            line,
         };
         let slot = key.slot();
         let held = self.reads[slot..slot + READ_WAYS]
@@ -325,7 +351,8 @@ impl RingCell {
             None => None,
         };
         let read = read.unwrap_or_else(|| {
-            let read = Arc::new(self.read_anew((w, h), (cw, ch), ring, cells, table, corrected));
+            let read =
+                Arc::new(self.read_anew((w, h), (cw, ch), ring, (cells, line), table, corrected));
             self.reads[slot..slot + READ_WAYS].rotate_right(1);
             self.reads[slot] = Some((key, Arc::clone(&read)));
             read
@@ -334,13 +361,13 @@ impl RingCell {
         self.current = Some(read);
     }
 
-    /// [`Self::read`]'s work.
+    /// [`Self::read_lined`]'s work.
     fn read_anew(
         &mut self,
         (w, h): (usize, usize),
         (cw, ch): (usize, usize),
         ring: usize,
-        cells: &[Neighbour; 9],
+        (cells, line): (&[Neighbour; 9], Option<[u16; 4]>),
         table: &RasterTable,
         corrected: bool,
     ) -> RingRead {
@@ -386,6 +413,13 @@ impl RingCell {
                         filled |= b != g;
                     }
                     Neighbour::Opaque => self.opaque[k] = true,
+                }
+            }
+        }
+        if let Some([x0, y0, x1, y1]) = line {
+            for y in usize::from(y0)..usize::from(y1).min(h) {
+                for x in usize::from(x0)..usize::from(x1).min(w) {
+                    self.opaque[y * w + x] = true;
                 }
             }
         }

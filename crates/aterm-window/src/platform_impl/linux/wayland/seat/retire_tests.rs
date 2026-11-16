@@ -92,8 +92,8 @@ struct Outcome {
 
 fn arm(lane: &Lane, turned: &RetireTurned, retire: bool) -> Outcome {
     turned.set(retire);
-    let mut event_loop =
-        EventLoop::<()>::on_display(Some(&lane.display)).expect("Mutter's display");
+    let connection = EventLoop::<()>::connect(Some(&lane.display)).expect("Mutter's display");
+    let mut event_loop = EventLoop::<()>::on_connection(connection).expect("a loop on Mutter");
     let window = {
         #[allow(irrefutable_let_patterns)]
         let PlatformActiveEventLoop::Wayland(target) = &event_loop.window_target().p

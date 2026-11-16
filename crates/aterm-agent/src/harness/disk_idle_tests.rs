@@ -45,6 +45,74 @@ fn nobody(_: &[PathBuf], _: &[u32]) -> std::io::Result<PathScan> {
     Ok(PathScan::default())
 }
 
+#[test]
+fn a_first_use_elsewhere_does_not_clear_another_candidates_use_or_unknown() {
+    let tmp = Tmp::new("idle-partial-probe");
+    let mut candidates = Vec::new();
+    for name in ["a", "b"] {
+        let checkout = tmp.path().join(name);
+        let target = checkout.join("target");
+        std::fs::create_dir_all(&target).expect("private candidate");
+        candidates.push((
+            checkout.canonicalize().expect("checkout"),
+            target.canonicalize().expect("target"),
+        ));
+    }
+    let scan = PathScan {
+        users: vec![PathUse {
+            pid: 4242,
+            how: "fd",
+            path: candidates[0].1.join("held-output"),
+        }],
+        unreadable: vec![(4242, Some(tmp.path().join("private-holder")))],
+        scanned: 1,
+    };
+    let mixed = |_: &[PathBuf], _: &[u32]| Ok(scan.clone());
+    assert!(
+        processes_clear(&candidates, &mixed, None)
+            .iter()
+            .all(Result::is_err)
+    );
+
+    let users = [
+        scan.users[0].clone(),
+        PathUse {
+            pid: 4242,
+            how: "fd",
+            path: candidates[1].1.join("other-held-output"),
+        },
+    ];
+    let first = |users: &[PathUse], dirs: &[PathBuf]| PathScan {
+        users: users
+            .iter()
+            .find(|user| dirs.iter().any(|dir| user.path.starts_with(dir)))
+            .cloned()
+            .into_iter()
+            .collect(),
+        scanned: 1,
+        ..PathScan::default()
+    };
+    let both = |dirs: &[PathBuf], _: &[u32]| Ok(first(&users, dirs));
+    assert!(
+        processes_clear(&candidates, &both, None)
+            .iter()
+            .all(Result::is_err),
+        "the batch reports the first file, but the other candidate is also in use"
+    );
+    let known = |dirs: &[PathBuf], _: &[u32]| Ok(first(&users[..1], dirs));
+    let clear = processes_clear(&candidates, &known, None);
+    assert!(clear[0].is_err(), "the first candidate has a known user");
+    assert!(
+        clear[1].is_ok(),
+        "the other candidate has no use or unknown"
+    );
+    assert!(
+        processes_clear(&candidates, &nobody, None)
+            .iter()
+            .all(Result::is_ok)
+    );
+}
+
 /// Survey `target` under `repo` for tier-3 reclamation at `now`.
 fn survey(
     tmp: &Tmp,

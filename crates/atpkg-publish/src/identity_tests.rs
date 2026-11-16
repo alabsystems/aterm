@@ -92,7 +92,7 @@ fn the_stores_release_ring_signs_before_the_minted_files() {
     use crate::channel::index::{RosterCandidate, newest_roster};
     let in_store = RosterCandidate::Store(home.to_path_buf());
     let mut log = crate::channel::Log::echo("test");
-    assert!(newest_roster(&ctx, &[in_store.clone()], &mut log).is_err());
+    assert!(newest_roster(&ctx, std::slice::from_ref(&in_store), &mut log).is_err());
     let admin = aterm_secrets::client::admin_open(&paths).unwrap();
     let mut doc = admin.doc.clone();
     let [roster, sig] = aterm_secrets::entry_class::PUBLIC_ROSTER;
@@ -104,7 +104,8 @@ fn the_stores_release_ring_signs_before_the_minted_files() {
             .unwrap();
     }
     aterm_secrets::client::admin_publish(&paths, &admin, &doc).unwrap();
-    let pair = newest_roster(&ctx, &[in_store.clone()], &mut log).expect("the store's pair");
+    let pair =
+        newest_roster(&ctx, std::slice::from_ref(&in_store), &mut log).expect("the store's pair");
     assert_eq!(pair.source, in_store);
     assert_eq!(pair.bytes, files.roster_bytes);
 }

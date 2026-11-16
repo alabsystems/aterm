@@ -3,7 +3,7 @@
 
 //! Agent CLI top-line brand marks, icons, and contrast-floored palettes.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use aterm_core::render::{
     FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxSpace, FxSprite, PxRect,
@@ -34,61 +34,132 @@ pub const AIR_PX: u16 = 2;
 /// Total cell span of the icon run before the CLI name.
 pub const ICON_RUN: usize = 2 + ICON_CELLS as usize;
 
-/// Agent CLI that wears a brand mark on its top line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CliMark {
-    /// Claude Code.
-    Claude,
-    /// OpenAI Codex (and `codex-alab`).
-    Codex,
-    /// Google Antigravity CLI.
-    Agy,
-    /// Meta Muse Code.
-    Muse,
-    /// xAI Grok.
-    Grok,
-    /// Moonshot Kimi Code.
-    Kimi,
+/// Agent CLI that wears a brand mark on its top line: a handle to its [`Brand`], one of the
+/// compiled seeds ([`CliMark::SEEDS`]) or a harness record's mark ([`CliMark::from_spec`]). Two
+/// handles are equal when they name the same brand.
+#[derive(Clone, Copy)]
+pub struct CliMark(&'static Brand);
+
+impl std::fmt::Debug for CliMark {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CliMark({})", self.0.word)
+    }
+}
+
+impl PartialEq for CliMark {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+}
+
+impl Eq for CliMark {}
+
+impl std::hash::Hash for CliMark {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(self.0, state);
+    }
 }
 
 impl CliMark {
-    /// All marks in declaration order.
-    pub const ALL: [CliMark; 6] = [
-        CliMark::Claude,
-        CliMark::Codex,
-        CliMark::Agy,
-        CliMark::Muse,
-        CliMark::Grok,
-        CliMark::Kimi,
+    /// Claude Code.
+    pub const CLAUDE: CliMark = CliMark(&CLAUDE);
+    /// OpenAI Codex (and `codex-alab`).
+    pub const CODEX: CliMark = CliMark(&CODEX);
+    /// Google Antigravity CLI.
+    pub const AGY: CliMark = CliMark(&AGY);
+    /// Meta Muse Code.
+    pub const MUSE: CliMark = CliMark(&MUSE);
+    /// xAI Grok.
+    pub const GROK: CliMark = CliMark(&GROK);
+    /// Moonshot Kimi Code.
+    pub const KIMI: CliMark = CliMark(&KIMI);
+
+    /// The compiled marks, the fallback for an agent whose harness record carries none, until
+    /// each harness ships its own (`docs/HARNESS-CONTRACT.md` §2).
+    pub const SEEDS: [CliMark; 6] = [
+        CliMark::CLAUDE,
+        CliMark::CODEX,
+        CliMark::AGY,
+        CliMark::MUSE,
+        CliMark::GROK,
+        CliMark::KIMI,
     ];
 
-    /// Look up the mark for a canonical lowercase CLI app id.
+    /// The compiled mark whose lockup word is `word`.
+    #[must_use]
+    pub fn seed(word: &str) -> Option<Self> {
+        Self::SEEDS.into_iter().find(|m| m.word() == word)
+    }
+
+    /// The mark a harness record spells, checked ([`MarkSpec::check`]) and interned: the same
+    /// spec gives the same handle for the life of the process, so reading the registry again
+    /// allocates nothing new.
+    ///
+    /// # Errors
+    /// The rule the spec breaks.
+    pub fn from_spec(spec: &MarkSpec) -> Result<Self, &'static str> {
+        static INTERNED: std::sync::Mutex<Vec<(MarkSpec, CliMark)>> =
+            std::sync::Mutex::new(Vec::new());
+        spec.check()?;
+        let mut interned = INTERNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, mark)) = interned.iter().find(|(kept, _)| kept == spec) {
+            return Ok(*mark);
+        }
+        fn leak<T: Clone>(v: &[T]) -> &'static [T] {
+            Box::leak(v.to_vec().into_boxed_slice())
+        }
+        fn rows(v: &[String]) -> &'static [&'static str] {
+            let rows: Vec<&'static str> = v
+                .iter()
+                .map(|r| &*Box::leak(r.clone().into_boxed_str()))
+                .collect();
+            Box::leak(rows.into_boxed_slice())
+        }
+        let brand: &'static Brand = Box::leak(Box::new(Brand {
+            word: Box::leak(spec.word.clone().into_boxed_str()),
+            alab_word: spec
+                .alab_word
+                .as_ref()
+                .map(|w| &*Box::leak(w.clone().into_boxed_str())),
+            name: Inks {
+                dark: leak(&spec.name[0]),
+                paper: leak(&spec.name[1]),
+            },
+            icon: Inks {
+                dark: leak(&spec.icon[0]),
+                paper: leak(&spec.icon[1]),
+            },
+            chars: leak(&spec.chars),
+            texels: leak(&spec.texels),
+            sd: rows(&spec.sd),
+            hd: spec.hd.as_deref().map(rows),
+        }));
+        let mark = CliMark(brand);
+        interned.push((spec.clone(), mark));
+        Ok(mark)
+    }
+
+    /// The brand this mark draws.
     #[inline]
     #[must_use]
-    pub const fn for_app(app_id: &str) -> Option<Self> {
-        match app_id.as_bytes() {
-            b"claude" => Some(Self::Claude),
-            b"codex" => Some(Self::Codex),
-            b"agy" => Some(Self::Agy),
-            b"muse" => Some(Self::Muse),
-            b"grok" => Some(Self::Grok),
-            b"kimi" => Some(Self::Kimi),
-            _ => None,
-        }
+    pub const fn brand(self) -> &'static Brand {
+        self.0
     }
 
     /// Canonical lowercase word for this CLI.
     #[inline]
     #[must_use]
     pub const fn word(self) -> &'static str {
-        brand(self).word
+        self.0.word
     }
 
     /// Display name printed by the lockup for `build`.
     #[inline]
     #[must_use]
     pub const fn name(self, build: Build) -> &'static str {
-        match (build, brand(self).alab_word) {
+        match (build, self.0.alab_word) {
             (Build::Alab, Some(word)) => word,
             _ => self.word(),
         }
@@ -117,16 +188,7 @@ impl Build {
     pub const ALL: [Build; 2] = [Build::Vendor, Build::Alab];
 }
 
-/// How a master character paints in the icon palette.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Texel {
-    /// Opaque icon ink `i` ([`Brand::icon`]), contrast-floored to [`ICON_CONTRAST`].
-    Ink(u8),
-    /// Contrast-floored icon ink `i` at [`HALF_ALPHA`].
-    Half(u8),
-    /// Unfloored exact `0x00RRGGBB` hole colour.
-    Hole(u32),
-}
+pub use aterm_types::mark::{MarkSpec, Texel};
 
 /// Dark-ground and paper-ground ink lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +238,7 @@ impl Master {
     }
 }
 
-/// Brand specification row for one [`CliMark`].
+/// Brand specification behind one [`CliMark`].
 #[derive(Debug, Clone, Copy)]
 pub struct Brand {
     /// Vendor lockup word.
@@ -209,18 +271,11 @@ impl Brand {
     }
 }
 
-/// Look up the [`Brand`] specification for `mark`.
+/// The [`Brand`] specification behind `mark`.
 #[inline]
 #[must_use]
 pub const fn brand(mark: CliMark) -> &'static Brand {
-    match mark {
-        CliMark::Claude => &CLAUDE,
-        CliMark::Codex => &CODEX,
-        CliMark::Agy => &AGY,
-        CliMark::Muse => &MUSE,
-        CliMark::Grok => &GROK,
-        CliMark::Kimi => &KIMI,
-    }
+    mark.brand()
 }
 
 /// Claude Code brand specification (`#D77757` mascot and `#000000` eye holes).
@@ -323,40 +378,21 @@ const KIMI: Brand = Brand {
     hd: Some(KIMI_HD),
 };
 
-const MAX_ICON_INKS: usize = 49;
-
 const _: () = {
     let mut m = 0;
-    while m < CliMark::ALL.len() {
-        let b = brand(CliMark::ALL[m]);
-        assert!(b.texels.len() == b.chars.len());
+    while m < CliMark::SEEDS.len() {
+        let b = CliMark::SEEDS[m].brand();
         assert!(
-            b.icon.dark.len() == b.icon.paper.len()
-                && !b.icon.dark.is_empty()
-                && b.icon.dark.len() <= MAX_ICON_INKS
+            aterm_types::mark::check(
+                b.word,
+                b.alab_word,
+                [b.name.dark, b.name.paper],
+                [b.icon.dark, b.icon.paper],
+                b.chars,
+                b.texels,
+            )
+            .is_ok()
         );
-        let mut k = 0;
-        while k < b.texels.len() {
-            match b.texels[k] {
-                Texel::Ink(i) | Texel::Half(i) => assert!((i as usize) < b.icon.dark.len()),
-                Texel::Hole(rgb) => assert!(rgb <= 0x00FF_FFFF),
-            }
-            if b.icon.dark.len() > 2 {
-                assert!(b.texels.len() == b.icon.dark.len());
-                assert!(matches!(b.texels[k], Texel::Ink(i) if i as usize == k));
-            }
-            k += 1;
-        }
-        let w = b.word.len();
-        assert!(w > 0);
-        assert!(b.name.dark.len() == 1 || b.name.dark.len() == w);
-        assert!(b.name.paper.len() == 1 || b.name.paper.len() == w);
-        if let Some(alab) = b.alab_word {
-            let a = alab.len();
-            assert!(a > 0);
-            assert!(b.name.dark.len() == 1 || b.name.dark.len() == a);
-            assert!(b.name.paper.len() == 1 || b.name.paper.len() == a);
-        }
         m += 1;
     }
 };
@@ -459,18 +495,25 @@ pub const fn fit(mark: CliMark, cw: u16, ch: u16) -> Option<Fit> {
 
 /// Interned `Index8` [`FxArt`] for `mark` and `master`.
 #[must_use]
-#[inline]
-pub fn art(mark: CliMark, master: Master) -> Option<&'static Arc<FxArt>> {
-    static ARTS: [OnceLock<[Option<Arc<FxArt>>; 2]>; CliMark::ALL.len()] =
-        [const { OnceLock::new() }; CliMark::ALL.len()];
-    let arts = ARTS[mark as usize].get_or_init(|| {
-        let b = brand(mark);
-        [Master::Sd, Master::Hd].map(|m| match b.master(m) {
-            Some(rows) => fx_art::indexed(rows, b.chars),
-            None => None,
-        })
-    });
-    arts[master as usize].as_ref()
+pub fn art(mark: CliMark, master: Master) -> Option<Arc<FxArt>> {
+    type Arts = [Option<Arc<FxArt>>; 2];
+    static ARTS: std::sync::Mutex<Vec<(CliMark, Arts)>> = std::sync::Mutex::new(Vec::new());
+    let mut arts = ARTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = match arts.iter().position(|(kept, _)| *kept == mark) {
+        Some(at) => at,
+        None => {
+            let b = mark.brand();
+            let built = [Master::Sd, Master::Hd].map(|m| match b.master(m) {
+                Some(rows) => fx_art::indexed(rows, b.chars),
+                None => None,
+            });
+            arts.push((mark, built));
+            arts.len() - 1
+        }
+    };
+    arts[at].1[master as usize].clone()
 }
 
 /// Unfloored ink for letter `letter` of `mark`'s name on ground polarity `dark`.
@@ -555,7 +598,7 @@ pub fn content(mark: CliMark, fit: Fit, ground: u32) -> Arc<FxContent> {
         dw: fit.dw,
         dh: fit.dh,
         flip_x: false,
-        art: Arc::clone(art),
+        art,
         ink: 0,
         clip: PxRect::EVERYWHERE,
     };

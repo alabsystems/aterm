@@ -200,7 +200,7 @@ fn a_since_a_second_off_is_the_since_last_sent() {
     let need = |word: &str, since: u64| aterm_metrics::row::NeedsRow {
         at: 0,
         needs: vec![NeedEntry {
-            sid: Sid::parse("s-00000000000000000001").expect("a sid"),
+            sid: Sid::parse("t0000000001").expect("a sid"),
             word: Word::new(word).expect("a word"),
             harness: false,
             worker_of: None,

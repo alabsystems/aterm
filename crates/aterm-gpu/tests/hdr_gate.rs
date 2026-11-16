@@ -160,7 +160,7 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     let (hdrpix, w, h) = gpu.present_hdr_sized_for_test(&mut win, &input, false, 7, 7);
     assert_eq!((w as usize, h as usize), (fw + 7, fh + 7));
     let (ox, oy) = (
-        aterm_render::band_offset(w as usize, fw),
+        aterm_render::band_offset(w as usize, fw, aterm_render::SideInsetPx(0)),
         aterm_render::band_offset_y(h as usize, fh),
     );
     assert_eq!(

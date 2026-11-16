@@ -309,7 +309,6 @@ fn a_kept_workers_later_exit_closes_its_task_once_through_the_real_event_loop() 
         &[
             ("ATERM_STATE_HOME", state_text),
             (DESK_SEAM, "1"),
-            (QUIET_SEAM, AN_HOUR_MS),
             ("ATERM_DEV_NO_PROCWATCH", "1"),
         ],
     );

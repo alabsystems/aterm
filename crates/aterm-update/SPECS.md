@@ -810,7 +810,7 @@ src/standing.rs	a_window_older_than_its_install_tells_the_installs_standing	upda
    - `linux/tests::a_start_that_waited_on_the_lock_rolls_no_healthy_build_back` and
      `linux/tests::whether_the_check_loop_runs_is_asked_without_hashing` assert behaviour only;
      no test in the crate scans a `.rs` file.
-   - Many github, install and lib tests also pin wording: "could not finish", "free some space"
+   - Many github, install and lib tests also pin wording: "could not finish", the full-disk remedy (`install::FREE_SPACE_REMEDY`)
      counted once, "retries" counted once, no "curl" or "ditto" in the body, no "aterm ctl".
 6. **Test hygiene**
    - **Resolved — `linux/tests` `fixture_parent`:** creates fixtures under `.ubd/aterm-linux-update-tests.noindex`

@@ -367,6 +367,9 @@ impl AtermTerminal {
     pub fn set_chrome(&mut self, pad: u16, head: u16) -> Result<(), String> {
         let (cw, ch) = self.renderer.cell_size();
         self.checked_surface_geometry(cw, ch, usize::from(pad), usize::from(head))?;
+        if self.renderer.pad() == usize::from(pad) && self.renderer.head() == usize::from(head) {
+            return Ok(());
+        }
         self.force_full_repaint = true;
         self.renderer.set_pad(pad as usize);
         self.renderer.set_head(head as usize);
@@ -481,30 +484,46 @@ impl AtermTerminal {
 
     /// Set the minimum glyph contrast ratio (`1.0..=21.0`).
     pub fn set_minimum_contrast(&mut self, ratio: f32) {
+        if ratio.is_finite() && self.renderer.minimum_contrast().to_bits() == ratio.to_bits() {
+            return;
+        }
         self.force_full_repaint = true;
         self.renderer.set_minimum_contrast(ratio);
     }
 
     /// Set the default-background opacity (`0.0..=1.0`).
     pub fn set_background_opacity(&mut self, opacity: f32) {
+        if opacity.is_finite() && self.renderer.background_opacity().to_bits() == opacity.to_bits()
+        {
+            return;
+        }
         self.force_full_repaint = true;
         self.renderer.set_background_opacity(opacity);
     }
 
     /// Set the cursor fill opacity (`0.0..=1.0`).
     pub fn set_cursor_opacity(&mut self, opacity: f32) {
+        if opacity.is_finite() && self.renderer.cursor_opacity().to_bits() == opacity.to_bits() {
+            return;
+        }
         self.force_full_repaint = true;
         self.renderer.set_cursor_opacity(opacity);
     }
 
     /// Mark the terminal pane unfocused (`true`) or focused (`false`) for selection styling.
     pub fn set_selection_inactive(&mut self, inactive: bool) {
+        if self.renderer.selection_inactive() == inactive {
+            return;
+        }
         self.force_full_repaint = true;
         self.renderer.set_selection_inactive(inactive);
     }
 
     /// Set or clear the unfocused selection background color (`0x00RRGGBB`).
     pub fn set_selection_inactive_bg(&mut self, bg: Option<u32>) {
+        if self.renderer.selection_inactive_bg() == bg {
+            return;
+        }
         self.force_full_repaint = true;
         self.renderer.set_selection_inactive_bg(bg);
     }
@@ -513,6 +532,9 @@ impl AtermTerminal {
     pub fn set_px(&mut self, px: f32) -> Result<(), String> {
         let (cw, ch, _) = self.renderer.cell_geometry(px);
         self.checked_surface_geometry(cw, ch, self.renderer.pad(), self.renderer.head())?;
+        if self.renderer.px() == px {
+            return Ok(());
+        }
         self.force_full_repaint = true;
         self.renderer.set_px(px);
         Ok(())

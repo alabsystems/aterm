@@ -9,6 +9,7 @@ pub(crate) mod ffi;
 pub(crate) mod pipelines;
 pub(crate) mod resources;
 pub(crate) mod shaders;
+mod source;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod glx;

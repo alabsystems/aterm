@@ -488,14 +488,17 @@ fn a_scoped_kimi_plan_reads_the_tabs_own_login_file() {
         argv: vec!["/opt/bin/kimi".into()],
         env: vec![format!("KIMI_CODE_HOME={}", home.display())],
     };
-    let seen = scoped_kimi_seen(&args, &seat.home);
+    let seen = scoped_seen(accounts::Cli::Kimi, &args, &seat.home, None);
     assert_eq!(seen.email(), Some(SIGHTED));
     assert_eq!(
         seen.seen().unwrap().path,
         home.join("credentials/kimi-code.json")
     );
     args.argv.extend(["-m".into(), "own".into()]);
-    assert_eq!(scoped_kimi_seen(&args, &seat.home), Observation::Unread);
+    assert_eq!(
+        scoped_seen(accounts::Cli::Kimi, &args, &seat.home, None),
+        Observation::Unread
+    );
 }
 
 /// A Muse Code tab keeps no pool and no roster: its account is the one its own `auth.json`

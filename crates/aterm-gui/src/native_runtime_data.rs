@@ -122,14 +122,7 @@ impl Slot {
         if self.operation == operation {
             return false;
         }
-        let gone = i32::try_from(self.owner.pid).ok().is_some_and(|pid| {
-            aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 != self.owner.birth)
-                || matches!(
-                    aterm_uds::process::process_presence(pid),
-                    aterm_uds::process::ProcessPresence::Absent
-                        | aterm_uds::process::ProcessPresence::Exited
-                )
-        });
+        let gone = gone(&self.owner);
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.pins == 0
             && !state.sending
@@ -168,6 +161,19 @@ impl Slot {
             ),
         }
     }
+}
+
+/// Whether `owner`'s kernel process is gone: its PID is absent or exited, or names a process
+/// born at another time. A failed read is not evidence either way.
+pub(super) fn gone(owner: &Process) -> bool {
+    i32::try_from(owner.pid).ok().is_some_and(|pid| {
+        aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 != owner.birth)
+            || matches!(
+                aterm_uds::process::process_presence(pid),
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            )
+    })
 }
 
 /// The native operation owns this custody, independently of request/ACK lifetime.

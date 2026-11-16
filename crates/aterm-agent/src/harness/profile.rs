@@ -4361,6 +4361,67 @@ impl<'de> Deserialize<'de> for FableEntries {
     }
 }
 
+/// The folder-trust allowlist [`trusted_folders`] reads: `projects` alone.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawTrust {
+    projects: TrustedFolders,
+}
+
+/// One `projects` entry, its `hasTrustDialogAccepted` alone.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawProject {
+    #[serde(rename = "hasTrustDialogAccepted")]
+    trusted: Leaf,
+}
+
+/// `projects`, as the one answer its reader needs: the keys whose entry says
+/// `hasTrustDialogAccepted: true`, in the file's order. Empty for a value that is not an object.
+#[derive(Default)]
+struct TrustedFolders(Vec<String>);
+
+impl<'de> Deserialize<'de> for TrustedFolders {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TrustedFolders;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TrustedFolders, A::Error> {
+                let mut trusted = Vec::new();
+                while let Some(folder) = map.next_key::<String>()? {
+                    let Obj(entry) = map.next_value::<Obj<RawProject>>()?;
+                    if entry.and_then(|e| e.trusted.flag()) == Some(true) {
+                        trusted.push(folder);
+                    }
+                }
+                Ok(TrustedFolders(trusted))
+            }
+            lenient_scalars!(TrustedFolders(Vec::new()));
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<TrustedFolders, A::Error> {
+                drain_seq(seq).map(|()| TrustedFolders(Vec::new()))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// The folders the profile at `path` records as trusted: each `projects` key whose entry says
+/// `hasTrustDialogAccepted: true`, spelled as Claude Code wrote it. Nothing else of the file is
+/// kept.
+///
+/// # Errors
+/// [`NoProfile`]: why nothing was read.
+pub fn trusted_folders(path: &Path) -> Result<Vec<String>, NoProfile> {
+    read_with(path, |bytes| {
+        let Obj(raw) =
+            aterm_json::from_slice::<Obj<RawTrust>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        Ok(raw.map(|raw| raw.projects.0).unwrap_or_default())
+    })
+}
+
 struct IsFable(bool);
 
 impl<'de> Deserialize<'de> for IsFable {

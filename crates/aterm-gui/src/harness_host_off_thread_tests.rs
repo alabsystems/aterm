@@ -249,10 +249,12 @@ fn a_failed_relaunch_read_leaves_the_agent_unread_not_absent() {
     for why in [
         "no-socket",
         "roster",
+        "ids",
+        "terminal-unread",
         "argv-unreadable",
         "start",
-        "terminal-unread",
         "exe-unreadable",
+        "records-unread",
         "files-unreadable",
     ] {
         assert_eq!(answer(why), HostAgent::Unread, "{why}: the read failed");
@@ -263,6 +265,7 @@ fn a_failed_relaunch_read_leaves_the_agent_unread_not_absent() {
         "no-lane",
         "tab-ambiguous",
         "terminal",
+        aterm_agent::harness::relaunch::ARGV_WITHHELD,
     ] {
         assert_eq!(answer(why), HostAgent::Absent, "{why}: the host answered");
     }
@@ -284,6 +287,41 @@ fn a_failed_relaunch_read_leaves_the_agent_unread_not_absent() {
             HostAgent::Read(AgentResumed { resumed: false, .. })
         ),
         "the read that lands names the agent"
+    );
+}
+
+/// A RELAUNCH READ OVERTAKEN BEFORE IT ANSWERED IS UNREAD, NOT NO AGENT (LS-15): a read whose
+/// account generation moved while it was in the kernel takes nothing of what it read, so the
+/// read the loop waited on ended unread ([`SnapshotEnd::Stale`]), whatever it would have said; it
+/// never leaves the outcome an earlier read left, nor the default, to answer for it. CONTROL: the
+/// same refusal from a read still current is the host's answer, [`HostAgent::Absent`]. NEGATIVE
+/// CONTROL: before this, a stale read left the outcome as it was (none: answered), so it said
+/// `Absent`.
+#[test]
+fn an_overtaken_relaunch_read_leaves_the_agent_unread_not_absent() {
+    let answer = |overtake: bool| {
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        let slot: Arc<Mutex<Option<Arc<Mutex<Kept>>>>> = Arc::new(Mutex::new(None));
+        let kept_of = Arc::clone(&slot);
+        h.acts.snapshot = Arc::new(move |_| {
+            if overtake && let Some(kept) = kept_of.lock().unwrap().as_ref() {
+                with_kept_of(kept, |k| k.account.landing = Arc::new(Mutex::new(())));
+            }
+            Err(SnapshotRefusal::of("not-claude"))
+        });
+        h.acts.follow = Arc::new(|_, _| Foreground::Agent);
+        h.acts.agent_resumed = Arc::new(|_, _| false);
+        let idle = idle_of(h, Program::Claude, None);
+        with_kept_of(&idle.kept, |k| k.snapshot = None);
+        *slot.lock().unwrap() = Some(Arc::clone(&idle.kept));
+        idle.agent_resumed()
+    };
+    assert_eq!(answer(true), HostAgent::Unread, "overtaken: not read");
+    assert_eq!(
+        answer(false),
+        HostAgent::Absent,
+        "CONTROL: current, answered"
     );
 }
 

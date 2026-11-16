@@ -3,6 +3,10 @@
 
 use super::{MetaField, apply_meta_value};
 
+/// Eight threads each write fifty distinct titles as a person, whose title write is never
+/// refused for rate and whose claim always stands: every one of the 400 writes moves the
+/// title and records its change, and the last `meta-change` row names the title that is
+/// finally stored.
 #[test]
 fn racing_meta_sets_keep_the_last_event_matching_final_state() {
     let ctx = crate::stub_session(0).ctx.clone();
@@ -10,19 +14,25 @@ fn racing_meta_sets_keep_the_last_event_matching_final_state() {
         .map(|i| {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                for j in 0..50 {
-                    apply_meta_value(
-                        &ctx,
-                        MetaField::Title,
-                        Some(format!("t{i}-{j}")),
-                        aterm_slog::Actor::Ctl,
-                    );
-                }
+                (0..50)
+                    .filter(|j| {
+                        apply_meta_value(
+                            &ctx,
+                            MetaField::Title,
+                            Some(format!("t{i}-{j}")),
+                            aterm_slog::Actor::Human,
+                        )
+                    })
+                    .count()
             })
         })
         .collect();
-    for t in threads {
-        t.join().unwrap();
+    for (i, t) in threads.into_iter().enumerate() {
+        assert_eq!(
+            t.join().unwrap(),
+            50,
+            "every write of thread {i} moved the title: none was refused or a no-op"
+        );
     }
     let final_title = ctx
         .meta

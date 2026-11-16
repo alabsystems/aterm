@@ -34,7 +34,7 @@ fn restated(
     carried: &Carried,
 ) -> Result<Vec<Vec<Change>>> {
     restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         source,
         held,
         target,
@@ -573,7 +573,12 @@ fn a_roll_restates_everything_and_releases_the_sealed_generation() {
     assert!(after.quota.spent.is_empty(), "{:?}", after.quota.spent);
 
     // The last generation compiled has nothing after it.
-    assert!(crate::att::REGISTRY_3.successor.is_none());
+    assert!(crate::att::REGISTRY_4.successor.is_none());
+    assert!(
+        crate::att::REGISTRY_3
+            .successor
+            .is_some_and(|next| next.generation == 4)
+    );
 
     // The other Mac reads the first generation until it hears the seal, then the second.
     assert_eq!(b.generation().generation, 1);
@@ -1071,7 +1076,7 @@ fn a_sealed_password_rolls_into_a_store_reference() {
     let held = BTreeSet::from([op(1), op(2), op(3)]);
     let store = Memory::default();
     let Restated { rows, puts, .. } = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &source,
         &held,
         &Cells::new(),
@@ -1118,7 +1123,7 @@ fn a_sealed_password_rolls_into_a_store_reference() {
         changes: vec![change],
     }]);
     let again = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &source,
         &held,
         &target,
@@ -1133,7 +1138,7 @@ fn a_sealed_password_rolls_into_a_store_reference() {
     let edited = Cells::from([(key.clone(), register(&[(op(8), reference(&entry))]))]);
     let late = Cells::from([(key.clone(), register(&[(op(4), sealed_at(&seal(two)))]))]);
     let beside = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &late,
         &BTreeSet::from([op(4)]),
         &edited,
@@ -1193,7 +1198,7 @@ fn a_late_roll_owes_what_it_drops_and_never_names_a_removed_entry_again() {
     let held = BTreeSet::from([op(1), op(2)]);
     let late = Cells::from([(key.clone(), register(&[(op(2), seal("synthetic-pass-2"))]))]);
     let rolled = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &late,
         &held,
         &target,
@@ -1209,7 +1214,7 @@ fn a_late_roll_owes_what_it_drops_and_never_names_a_removed_entry_again() {
     // An emptied register owes everything it named.
     let emptied = Cells::from([(key.clone(), register(&[(op(2), Value::Null)]))]);
     let rolled = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &emptied,
         &held,
         &target,
@@ -1224,7 +1229,7 @@ fn a_late_roll_owes_what_it_drops_and_never_names_a_removed_entry_again() {
         register(&[(op(1), reference(&at(1))), (op(3), reference(&at(1)))]),
     )]);
     let rolled = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &late,
         &BTreeSet::from([op(1), op(2)]),
         &shared,
@@ -1245,7 +1250,7 @@ fn a_late_roll_owes_what_it_drops_and_never_names_a_removed_entry_again() {
         ]),
     )]);
     let refused = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &beside,
         &held,
         &target,
@@ -1278,7 +1283,7 @@ fn a_roll_into_the_second_generation_reseals_and_writes_no_reference() {
     let held = BTreeSet::from([op(1)]);
     let store = Memory::default();
     let resealed = restate(
-        &REGISTRY_2,
+        (&crate::alab::registry::REGISTRY, &REGISTRY_2),
         &source,
         &held,
         &Cells::new(),
@@ -1305,7 +1310,7 @@ fn a_roll_into_the_second_generation_reseals_and_writes_no_reference() {
         "synthetic-pass-1"
     );
     let refused = restate(
-        &REGISTRY_2,
+        (&crate::alab::registry::REGISTRY, &REGISTRY_2),
         &source,
         &held,
         &Cells::new(),
@@ -1342,7 +1347,7 @@ fn a_sealed_phone_number_rolls_into_the_number() {
     let source = Cells::from([(key.clone(), register(&[(op(1), sealed_at(&token))]))]);
     let store = Memory::default();
     let restated = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &source,
         &BTreeSet::from([op(1)]),
         &Cells::new(),
@@ -1383,7 +1388,7 @@ fn a_token_that_does_not_open_stops_the_roll() {
         )]);
         let store = Memory::default();
         let Err(error) = restate(
-            &REGISTRY_3,
+            (&REGISTRY_2, &REGISTRY_3),
             &source,
             &BTreeSet::from([op(1)]),
             &Cells::new(),
@@ -1811,7 +1816,7 @@ fn a_roll_never_writes_over_a_value_the_store_or_a_reference_holds() {
     )]);
     let held = BTreeSet::from([op(1), op(2)]);
     let Restated { rows, puts, .. } = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &source,
         &held,
         &Cells::new(),
@@ -1838,7 +1843,7 @@ fn a_roll_never_writes_over_a_value_the_store_or_a_reference_holds() {
     let store = Memory::default();
     store.put(&at(3), &Secret::new(older.to_owned())).unwrap();
     let again = restate(
-        &REGISTRY_3,
+        (&REGISTRY_2, &REGISTRY_3),
         &lone,
         &BTreeSet::from([op(3)]),
         &Cells::new(),
@@ -1859,7 +1864,7 @@ fn a_roll_never_writes_over_a_value_the_store_or_a_reference_holds() {
         .unwrap();
     assert!(
         restate(
-            &REGISTRY_3,
+            (&REGISTRY_2, &REGISTRY_3),
             &lone,
             &BTreeSet::from([op(3)]),
             &Cells::new(),
@@ -1896,7 +1901,7 @@ fn a_roll_refuses_a_secret_cell_holding_a_plain_value_or_another_entry() {
             register(&[(op(1), CellValue::owner(2, x).encode())]),
         )]);
         restate(
-            &REGISTRY_3,
+            (&REGISTRY_2, &REGISTRY_3),
             &source,
             &BTreeSet::from([op(1)]),
             &Cells::new(),
@@ -2046,7 +2051,7 @@ fn no_mac_declares_a_store_generation_until_its_floor_admits() {
     let alone = Lab::new(&[Role::Writer]);
     let newest = Registry::at(alone.paths[0].clone());
     newest.open_newest(now_ms()).unwrap();
-    assert_eq!(newest.generation().generation, 3);
+    assert_eq!(newest.generation().generation, 4);
     let refused = newest.publish_schema().unwrap_err().to_string();
     assert!(refused.contains("schema is not published"), "{refused}");
 }
@@ -2344,4 +2349,506 @@ fn no_reference_is_written_before_its_value_reads_back_from_the_store() {
     a.roll_with(true, now_ms(), &holding).unwrap();
     assert_eq!(a.generation().generation, 3);
     assert_eq!(holding.every(), vec![value.to_owned()]);
+}
+
+/// What `aterm db table history` shows of generation `compiled` on Mac `n`, less a roll's own
+/// records and the schema rows, which restate rather than edit (`history::restates`).
+fn edits_of(lab: &Lab, n: usize, compiled: &'static Compiled) -> Vec<att::Entry> {
+    att::Handle::at(lab.paths[n].clone(), compiled)
+        .history()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| !history::restates(&entry.changes))
+        .collect()
+}
+
+/// The carried history of the generation Mac `n` reads now.
+fn carried_now(lab: &Lab, n: usize) -> history::Carried {
+    let compiled = Registry::at(lab.paths[n].clone()).generation();
+    att::Handle::at(lab.paths[n].clone(), compiled)
+        .carried_history()
+        .unwrap()
+}
+
+/// Every edit of `edits` is carried in `carried` as it was written: operation, writer, machine,
+/// authored time, causal clock, request, revert and each change's key, with each value as it
+/// was except a secret's, which is withheld. Returns how many changes were withheld.
+fn assert_carried(edits: &[att::Entry], carried: &history::Carried, generation: u32) -> usize {
+    let mut withheld = 0;
+    for edit in edits {
+        let entry = carried
+            .entries
+            .get(&edit.operation)
+            .unwrap_or_else(|| panic!("an entry of generation {generation} is not carried"));
+        assert_eq!(entry.generation, generation);
+        assert_eq!(
+            (entry.actor, entry.machine, entry.authored_ms, entry.hlc),
+            (edit.actor, edit.machine, edit.authored_ms, edit.hlc)
+        );
+        assert_eq!((entry.request, entry.reverts), (edit.request, edit.reverts));
+        assert_eq!(entry.changes.len(), edit.changes.len());
+        for (carried, written) in entry.changes.iter().zip(&edit.changes) {
+            assert_eq!(
+                (&carried.collection, &carried.key),
+                (&written.collection, &written.key)
+            );
+            if carried.withheld {
+                withheld += 1;
+                assert!(carried.value.is_none());
+            } else {
+                assert_eq!(carried.value, written.value);
+            }
+        }
+    }
+    withheld
+}
+
+/// LT-36: a roll carries the retired generation's history before it lets that generation go.
+/// A roll that carries none (an older build's, `copying_roll`: registers restated, a cover of
+/// every record, no history) is sealed, and this Mac's release keeps the first generation, since
+/// its history is not carried; this build's roll on the sealed generation then carries every
+/// edit of it as written (writer, machine, authored time, causal clock, request, each change),
+/// the password's value withheld, no token and no plaintext anywhere in what is carried, and the
+/// release lets the first generation go. Rolled on into the third generation, the history the
+/// second carried goes on with the second's own edits, and the second is released.
+/// NEGATIVE CONTROLS (each run 2026-11-15): with `covered` not asking `history::uncarried`, the
+/// release after the copying roll deletes the first generation and the `Kept::NotCarried`
+/// assertion fails; with the roll's `history::plan` rows dropped, nothing is carried and the
+/// roll's release keeps the first generation (`released` is empty); with neither a secret column
+/// nor a sealed token withheld (`secret_column` and `holds_sealed` false, which `written` and
+/// the plan's second judgment share), `` the password alone is withheld `` fails (0 withheld).
+#[test]
+fn a_roll_carries_every_entry_and_no_secret_value_before_release() {
+    let lab = Lab::new(&[Role::Writer]);
+    let a = Registry::at(lab.paths[0].clone());
+    a.open().unwrap();
+    a.seed().unwrap();
+    let pk = keys::address_pk("ann@example.test").unwrap();
+    let value = "synthetic-pass-7";
+    a.write(vec![address("ann@example.test"), facts(&lab, 0, "m1")])
+        .unwrap();
+    for site in ["https://one.example.test", "https://two.example.test"] {
+        a.write(vec![vec![provider("anthropic", "site", json!(site))]])
+            .unwrap();
+    }
+    let token = sealed_first(&lab, 0, ADDRESS.name, &pk, "password", value);
+    write_first_raw(
+        &lab,
+        0,
+        vec![Change {
+            collection: ADDRESS.name.to_owned(),
+            key: format!("{pk}.password"),
+            value: Some(CellValue::owner(ADDRESS.version, json!(token)).encode()),
+        }],
+    );
+    let first = edits_of(&lab, 0, &att::REGISTRY);
+    assert!(first.len() >= 5, "{}", first.len());
+
+    // A roll that carries no history: its cover carries every record, so only the history gate
+    // keeps the first generation here once it is sealed.
+    copying_roll(&lab, 0);
+    {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+        let first = att::REGISTRY.descriptor(bootstrap.trust()).unwrap();
+        assert!(directory.seal(&session, &first).unwrap());
+    }
+    assert_eq!(a.generation().generation, 2);
+    assert!(carried_now(&lab, 0).entries.is_empty());
+    assert!(
+        matches!(
+            first_kept(&lab, 0, first_id(&lab)).as_slice(),
+            [(_, Kept::NotCarried)]
+        ),
+        "{:?}",
+        first_kept(&lab, 0, first_id(&lab))
+    );
+    assert!(stores_first(&lab, 0));
+
+    // This build's roll on the sealed generation carries its history, and the release follows.
+    let store = Memory::default();
+    let rolled = a.roll_with(true, now_ms(), &store).unwrap();
+    assert_eq!((rolled.from, rolled.to), (1, 2), "{rolled:?}");
+    assert_eq!(
+        (rolled.history, rolled.history_left),
+        (first.len(), 0),
+        "{rolled:?}"
+    );
+    assert_eq!(rolled.released.released, vec![first_id(&lab)], "{rolled:?}");
+    assert!(!stores_first(&lab, 0));
+    let carried = carried_now(&lab, 0);
+    assert!(carried.horizons.is_empty());
+    assert_eq!(
+        assert_carried(&first, &carried, 1),
+        1,
+        "the password alone is withheld"
+    );
+    let text = aterm_json::to_string(
+        &carried
+            .entries
+            .values()
+            .flat_map(|entry| entry.changes.iter().map(|c| c.value.clone()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        !text.contains("sec1") && !text.contains(value) && !text.contains(&token),
+        "a carried entry holds a secret"
+    );
+    assert!(text.contains("https://one.example.test"));
+
+    // On into the third generation: the first's history goes on, with the second's own edit.
+    a.write(vec![vec![provider(
+        "anthropic",
+        "site",
+        json!("https://three.example.test"),
+    )]])
+    .unwrap();
+    let second = edits_of(&lab, 0, &att::REGISTRY_2);
+    assert_eq!(second.len(), 1, "a roll's own records are not edits");
+    for _ in 0..3 {
+        if a.generation().generation == 3 {
+            break;
+        }
+        a.roll_with(true, now_ms(), &store).unwrap();
+    }
+    assert_eq!(a.generation().generation, 3);
+    let carried = carried_now(&lab, 0);
+    assert_eq!(assert_carried(&first, &carried, 1), 1);
+    assert_eq!(assert_carried(&second, &carried, 2), 0);
+    assert_eq!(carried.entries.len(), first.len() + second.len());
+    assert!(!stores(&lab, 0, &att::REGISTRY_2));
+}
+
+/// A roll of Mac `n` from the first generation into the second cut short after its history
+/// rows: the second generation declared, and only the history this build's roll plans in it, no
+/// restatement and no cover.
+fn interrupted_roll(lab: &Lab, n: usize) {
+    let bootstrap = lab.bootstrap(n);
+    let session = Session::open(&bootstrap).unwrap();
+    let trust = bootstrap.trust();
+    let directory = Directory::new(&lab.paths[n], trust);
+    let (from, to) = (&att::REGISTRY, &att::REGISTRY_2);
+    let old_scope = from.descriptor(trust).unwrap().scope;
+    let old = directory
+        .observe_store_if_exists(&session, old_scope)
+        .unwrap()
+        .unwrap();
+    let old_log = Log::read_with(&session, &old, old_scope, decode).unwrap();
+    let old_view = View::read(from.table, &session, &old_log);
+    let (owed, stated) =
+        history::owed(&session, from.table, from.generation, old_log, &old_view).unwrap();
+    let planned = history::plan(
+        from.table,
+        owed,
+        &stated,
+        &history::Carried::default(),
+        from.generation,
+        &keys::uuid32(&lab.machine(n)),
+        history::Budget::MOST,
+    )
+    .unwrap();
+    assert!(planned.carried > 0 && planned.not_carried == 0);
+    let to_descriptor = to.descriptor(trust).unwrap();
+    directory.publish(&session, &to_descriptor).unwrap();
+    directory.endorse(&session, &to_descriptor).unwrap();
+    let mut store = Store::open(
+        &session,
+        &directory.path(to_descriptor.scope).unwrap(),
+        to_descriptor.scope,
+    )
+    .unwrap();
+    for changes in pack(planned.rows).unwrap() {
+        let request = typed::request_id(APPLICATION, to.table.role, &changes).unwrap();
+        let command = Command::Write { request, changes };
+        application::append(&session, &mut store, &command.encode().unwrap()).unwrap();
+    }
+}
+
+/// How many history entry rows Mac `n` holds written in `compiled`, every statement counted.
+fn history_rows(lab: &Lab, n: usize, compiled: &'static Compiled) -> usize {
+    att::Handle::at(lab.paths[n].clone(), compiled)
+        .history()
+        .unwrap()
+        .iter()
+        .flat_map(|entry| &entry.changes)
+        .filter(|change| {
+            change.collection == HISTORY.name
+                && CellKey::parse(&change.key).is_ok_and(|key| key.col == "entry")
+        })
+        .count()
+}
+
+/// LT-36: a roll cut short after its history and before its cover writes that history once.
+/// The rows this Mac wrote count for its own roll though no cover of its says so yet, so the
+/// roll run again carries nothing more, writes its restatement and cover, and releases the
+/// first generation with every entry carried once. NEGATIVE CONTROL (run 2026-11-15): with the
+/// roll's planner reading only rollers' rows (`history::carried(.., None)`), the rerun carries
+/// every entry again and the second generation holds two rows of each.
+#[test]
+fn a_roll_cut_short_after_its_history_writes_it_once() {
+    let lab = Lab::new(&[Role::Writer]);
+    let a = Registry::at(lab.paths[0].clone());
+    a.open().unwrap();
+    a.seed().unwrap();
+    a.write(vec![address("ann@example.test"), facts(&lab, 0, "m1")])
+        .unwrap();
+    for site in ["https://one.example.test", "https://two.example.test"] {
+        a.write(vec![vec![provider("anthropic", "site", json!(site))]])
+            .unwrap();
+    }
+    let first = edits_of(&lab, 0, &att::REGISTRY);
+    interrupted_roll(&lab, 0);
+    assert_eq!(history_rows(&lab, 0, &att::REGISTRY_2), first.len());
+
+    let store = Memory::default();
+    let planned = a.roll_with(false, now_ms(), &store).unwrap();
+    assert_eq!((planned.from, planned.to), (1, 2), "{planned:?}");
+    assert_eq!(
+        (planned.history, planned.history_left),
+        (0, 0),
+        "{planned:?}"
+    );
+    let rolled = a.roll_with(true, now_ms(), &store).unwrap();
+    assert_eq!((rolled.history, rolled.history_left), (0, 0), "{rolled:?}");
+    assert!(rolled.cover, "{rolled:?}");
+    assert_eq!(rolled.released.released, vec![first_id(&lab)], "{rolled:?}");
+    assert_eq!(history_rows(&lab, 0, &att::REGISTRY_2), first.len());
+    let carried = carried_now(&lab, 0);
+    assert_eq!(carried.entries.len(), first.len());
+    assert_eq!(assert_carried(&first, &carried, 1), 0);
+}
+
+/// The machine `hosts` register of row `pk`.
+fn hosts_at(pk: &str) -> (String, String) {
+    (
+        crate::alab::registry::MACHINE.name.to_owned(),
+        format!("{pk}.hosts"),
+    )
+}
+
+/// The element register of `member` in the `hosts` set of row `pk`.
+fn host_element(pk: &str, member: &str) -> (String, String) {
+    let elem = keys::text_elem(member);
+    let key = CellKey {
+        pk,
+        col: "hosts",
+        elem: Some(&elem),
+    }
+    .encode()
+    .unwrap();
+    (crate::alab::registry::MACHINE.name.to_owned(), key)
+}
+
+/// [`restate`] from the third generation into the fourth, into `target`.
+fn restated_4(
+    source: &Cells,
+    held: &BTreeSet<Digest>,
+    target: &Cells,
+    carried: &Carried,
+) -> Result<Vec<Vec<Change>>> {
+    restate(
+        (&REGISTRY_3, &crate::alab::registry::REGISTRY_4),
+        source,
+        held,
+        target,
+        carried,
+        (&OLD, None, &Memory::default()),
+    )
+    .map(|restated| restated.rows)
+}
+
+/// `rows` as the new generation holds them once written by the operation `by`, each register's
+/// carried candidates read back by origin.
+fn as_target(rows: &[Vec<Change>], by: Digest) -> Cells {
+    rows.iter()
+        .flatten()
+        .map(|change| {
+            (
+                (change.collection.clone(), change.key.clone()),
+                register(&[(by, change.value.clone().unwrap())]),
+            )
+        })
+        .collect()
+}
+
+/// The `hosts` field of row `pk` as the fourth generation projects `cells`.
+fn hosts_field(cells: &Cells, pk: &str) -> Field {
+    cell::project(&crate::alab::registry::MACHINE, cells).rows[pk].fields["hosts"].clone()
+}
+
+/// LT-15B: a roll into the fourth generation restates a Mac's `hosts` list as one element per
+/// member. Of two concurrent lists, an automatic one naming two hosts and an import naming one,
+/// the member both name reads as one value, each candidate keeping its own origin, source and
+/// automatic mark; the member only one names is an add beside a removal, a conflict, never a
+/// union; a member only spaces apart is one element, and a re-run writes nothing. A later list
+/// in the old generation that drops a member reaches the element a roll carried. NEGATIVE
+/// CONTROLS (each run 2026-11-15): with `as_members` writing only the adds (no `false` where a
+/// list lacks a member), `b.example.test`'s element holds the automatic add alone: `` left:
+/// [(…, {"a": true, …})] right: [(…, {"a": true, …}), (…, {"x": false, …})] ``; with the
+/// target's own elements left out of the universe, the later list's drop restates no element
+/// and `` the register is written `` fails.
+#[test]
+fn a_list_carries_into_registry_4_as_members_with_their_provenance() {
+    let pk = "mc-0123456789abcdef";
+    let automatic = CellValue {
+        r: 3,
+        x: json!(["a.example.test", "b.example.test", "  b.example.test "]),
+        s: None,
+        a: true,
+    };
+    let source_pk = keys::source_pk(b"computers");
+    let imported = CellValue::imported(3, json!(["a.example.test"]), &source_pk);
+    let source = Cells::from([(
+        hosts_at(pk),
+        register(&[(op(1), automatic.encode()), (op(2), imported.encode())]),
+    )]);
+    let held = BTreeSet::from([op(1), op(2)]);
+    let rows = restated_4(&source, &held, &Cells::new(), &Carried::new()).unwrap();
+    assert!(rows.iter().all(|row| row.len() == 1), "one change a row");
+    assert!(
+        !rows.iter().flatten().any(|c| c.key == hosts_at(pk).1),
+        "the list's own key writes nothing in the fourth generation"
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+
+    let a = written_at(&rows, &host_element(pk, "a.example.test"));
+    assert_eq!(
+        a,
+        vec![
+            (
+                op(1),
+                CellValue {
+                    x: json!("a.example.test"),
+                    ..automatic.clone()
+                }
+                .encode()
+            ),
+            (
+                op(2),
+                CellValue {
+                    x: json!("a.example.test"),
+                    ..imported.clone()
+                }
+                .encode()
+            ),
+        ]
+    );
+    let b = written_at(&rows, &host_element(pk, "b.example.test"));
+    assert_eq!(
+        b,
+        vec![
+            (
+                op(1),
+                CellValue {
+                    x: json!("b.example.test"),
+                    ..automatic.clone()
+                }
+                .encode()
+            ),
+            (
+                op(2),
+                CellValue {
+                    x: json!(false),
+                    ..imported.clone()
+                }
+                .encode()
+            ),
+        ]
+    );
+
+    // As the fourth generation reads it: `a` settled, `b` a conflict, and a reader that acts
+    // on a member takes `a` alone.
+    let target = as_target(&rows, op(9));
+    let Field::Set(elements) = hosts_field(&target, pk) else {
+        panic!("hosts is a set in the fourth generation");
+    };
+    assert!(matches!(
+        &elements[&keys::text_elem("a.example.test")],
+        Field::Value(_)
+    ));
+    assert!(
+        matches!(
+            &elements[&keys::text_elem("b.example.test")],
+            Field::Conflict { .. }
+        ),
+        "a concurrent removal is no union"
+    );
+    let field = hosts_field(&target, pk);
+    assert_eq!(
+        cell::settled_texts(Some(&field)),
+        vec!["a.example.test".to_owned()]
+    );
+
+    // A re-run once carried writes nothing.
+    let carried = carried_origins(
+        rows.iter()
+            .map(|changes| Command::Write {
+                request: [0; 16],
+                changes: changes.clone(),
+            })
+            .collect::<Vec<_>>()
+            .iter(),
+    );
+    assert!(
+        restated_4(&source, &held, &target, &carried)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A later list in the old generation, which saw both, names `a` alone: `b`'s carried
+    // candidates are superseded and the element reads removed.
+    let later = Cells::from([(
+        hosts_at(pk),
+        register(&[(
+            op(3),
+            CellValue::owner(3, json!(["a.example.test"])).encode(),
+        )]),
+    )]);
+    let held = BTreeSet::from([op(1), op(2), op(3)]);
+    let dropped = restated_4(&later, &held, &target, &carried).unwrap();
+    assert_eq!(
+        written_at(&dropped, &host_element(pk, "b.example.test")),
+        vec![(op(3), CellValue::owner(3, json!(false)).encode())]
+    );
+}
+
+/// A list the old generation reads raw is never promoted to set members: a value that is no list,
+/// one longer than its column allows, an item no text, or one no member can be (`‖`) stops the
+/// roll, and the refusal names coordinates, never a value. An empty list and an item of spaces
+/// write nothing.
+#[test]
+fn a_list_no_set_can_hold_stops_the_roll() {
+    let pk = "mc-0123456789abcdef";
+    let held = BTreeSet::from([op(1)]);
+    for raw in [
+        json!("one.example.test"),
+        json!(["h1", "h2", "h3", "h4", "h5"]),
+        json!([7]),
+        json!(["a‖b"]),
+    ] {
+        let source = Cells::from([(
+            hosts_at(pk),
+            register(&[(op(1), CellValue::owner(3, raw.clone()).encode())]),
+        )]);
+        let error = restated_4(&source, &held, &Cells::new(), &Carried::new())
+            .expect_err("a raw list stops the roll")
+            .to_string();
+        assert!(
+            error.contains(pk) && !error.contains("h1") && !error.contains("a‖b"),
+            "{error}"
+        );
+    }
+    for empty in [json!([]), json!(["   "]), Value::Null] {
+        let source = Cells::from([(
+            hosts_at(pk),
+            register(&[(op(1), CellValue::owner(3, empty).encode())]),
+        )]);
+        assert!(
+            restated_4(&source, &held, &Cells::new(), &Carried::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

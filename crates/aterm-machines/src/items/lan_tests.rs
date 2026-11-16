@@ -60,10 +60,6 @@ fn the_broker_is_cloned_sealed_swapped_then_started() {
             Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
         )
         .on(
-            "/bin/launchctl enable system/systems.alab.aterm-lan",
-            Ran::ok(""),
-        )
-        .on(
             "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist",
             Ran::ok(""),
         )
@@ -141,7 +137,6 @@ fn the_broker_is_cloned_sealed_swapped_then_started() {
         at(&format!("rename {staged} {}", lan::IMAGE_BUNDLE)),
         at(&format!("write {} 644", lan::PLIST_PATH)),
         at(&format!("chown 0:0 {}", lan::PLIST_PATH)),
-        at("/bin/launchctl enable"),
         at("/bin/launchctl bootstrap"),
         at("/bin/launchctl kickstart"),
     ];
@@ -211,10 +206,6 @@ fn the_broker_is_cloned_sealed_swapped_then_started() {
     let failed = from_app();
     failed
         .on(PRINT, Ran::exit(113, "Could not find service"))
-        .on(
-            "/bin/launchctl enable system/systems.alab.aterm-lan",
-            Ran::ok(""),
-        )
         .on(
             "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist",
             Ran::exit(5, "transient bootstrap failure"),
@@ -305,10 +296,6 @@ fn a_running_broker_is_replaced_by_exchange_and_restarted() {
         Ran::ok(""),
     )
     .on(
-        "/bin/launchctl enable system/systems.alab.aterm-lan",
-        Ran::ok(""),
-    )
-    .on(
         "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist",
         Ran::ok(""),
     )
@@ -371,6 +358,309 @@ fn a_running_broker_is_replaced_by_exchange_and_restarted() {
             calls.iter().filter(|call| call.starts_with(prefix)).count(),
             2,
             "the engine repairs the unready current install once: {calls:?}"
+        );
+    }
+}
+
+const PRINT_DISABLED: &str = "/bin/launchctl print-disabled system";
+const BOOTSTRAP: &str =
+    "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist";
+
+/// `launchctl print-disabled system`'s list with the broker's row saying `state`.
+fn disabled_list(state: &str) -> Ran {
+    Ran::ok(&format!(
+        "disabled services = {{\n\t\"com.openssh.sshd\" => disabled\n\t\"{}\" => {state}\n}}\n\
+         login item associations = {{\n}}\n",
+        lan::LABEL
+    ))
+}
+
+/// Every launchd call that would change the broker's job.
+fn job_changes(sys: &Fake) -> Vec<String> {
+    sys.calls()
+        .into_iter()
+        .filter(|call| {
+            ["bootout", "enable", "bootstrap", "kickstart"]
+                .iter()
+                .any(|verb| call.starts_with(&format!("/bin/launchctl {verb} ")))
+        })
+        .collect()
+}
+
+/// A broker's files in place, this build's.
+fn installed() -> Fake {
+    let sys = from_app();
+    sys.file(lan::IMAGE_EXECUTABLE, &this_build()).file(
+        lan::PLIST_PATH,
+        install::plist_text(Path::new(SOURCE)).as_bytes(),
+    );
+    sys
+}
+
+/// A hang detector, never a budget: far past any bound, a stop ends a retry loop that has none.
+fn stop_after_many_sleeps(sys: &Fake) {
+    let sleeps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    sys.on_sleep(move |sys, _| {
+        if sleeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 1000 {
+            sys.stop_now();
+        }
+    });
+}
+
+/// A broker job a person switched off (aterm's background item in Login Items, or `launchctl
+/// disable`), stopped with its files current or not yet installed, in macOS 13's and earlier
+/// spellings, is the person's: the item does not apply, and the root run clones, writes and
+/// launches nothing, in words that say how to put it back. NEGATIVE CONTROL: the same stopped
+/// job launchd lists enabled is a change. MUTANT: a probe that reads no switch restarts the job.
+#[test]
+fn a_broker_the_person_switched_off_is_left_off() {
+    let ctx = ctx(&[]);
+    for (files, state) in [(true, "disabled"), (false, "disabled"), (true, "true")] {
+        let sys = if files { installed() } else { from_app() };
+        sys.on(PRINT, Ran::exit(113, "Could not find service"))
+            .on(PRINT_DISABLED, disabled_list(state))
+            .on(BOOTSTRAP, Ran::ok(""))
+            .on(
+                "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            );
+        match LanBroker::default().probe(&sys, &ctx) {
+            Probe::NotApplicable { why } => {
+                assert!(why.contains("switched off"), "{why}");
+                assert!(
+                    why.contains("sudo launchctl enable system/systems.alab.aterm-lan"),
+                    "{why}"
+                );
+            }
+            other => panic!("files={files} {state}: {other:?}"),
+        }
+        let items: Vec<Box<dyn Item>> = vec![Box::new(LanBroker::default())];
+        let rows = crate::engine::run(
+            &items,
+            crate::model::Mode::Apply,
+            &sys,
+            &ctx,
+            &mut crate::engine::NoJournal,
+        );
+        assert_eq!(rows[0].outcome, crate::model::Outcome::NotApplicable);
+        assert!(job_changes(&sys).is_empty(), "{:?}", sys.calls());
+        assert!(
+            !sys.calls().iter().any(|call| call.starts_with("clone ")),
+            "{:?}",
+            sys.calls()
+        );
+    }
+    let enabled = installed();
+    enabled
+        .on(PRINT, Ran::exit(113, "Could not find service"))
+        .on(PRINT_DISABLED, disabled_list("enabled"));
+    assert!(matches!(
+        LanBroker::default().probe(&enabled, &ctx),
+        Probe::Change { .. }
+    ));
+}
+
+/// The root result waits on nothing for a job the person switched off, installed or not.
+/// NEGATIVE CONTROL: the same stopped job launchd lists enabled is not ready. MUTANT: a `ready`
+/// that reads no switch holds the result short of a broker that will never run.
+#[test]
+fn a_switched_off_broker_leaves_the_root_result_nothing_to_wait_on() {
+    for files in [true, false] {
+        for (state, wanted) in [("disabled", true), ("enabled", false)] {
+            let sys = if files { installed() } else { from_app() };
+            sys.on(PRINT, Ran::exit(113, "Could not find service"))
+                .on(PRINT_DISABLED, disabled_list(state));
+            assert_eq!(ready(&sys), Ok(wanted), "files={files} {state}");
+        }
+    }
+}
+
+/// A launch starts a stopped job launchd lists enabled with `bootstrap` and `kickstart` alone:
+/// no run of this item ever runs `launchctl enable` on the broker's job, so none undoes a
+/// person's switch. MUTANT: a launch that enables the job first.
+#[test]
+fn a_launch_never_enables_the_job() {
+    let enabled = installed();
+    enabled
+        .on(PRINT, Ran::exit(113, "Could not find service"))
+        .on(PRINT, Ran::exit(113, "Could not find service"))
+        .on(
+            PRINT,
+            Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+        )
+        .on(PRINT_DISABLED, disabled_list("enabled"))
+        // Answered, so a launch that ran it would be seen running it.
+        .on(
+            "/bin/launchctl enable system/systems.alab.aterm-lan",
+            Ran::ok(""),
+        )
+        .on(BOOTSTRAP, Ran::ok(""))
+        .on(
+            "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+            Ran::ok(""),
+        )
+        .on_lan_broker(Ok(lan::BrokerHello {
+            protocol: lan::PROTOCOL,
+            build: aterm_stamp::build_id(),
+            direct: None,
+        }));
+    let ctx = ctx(&[]);
+    assert_eq!(
+        LanBroker::default().probe(&enabled, &ctx),
+        Probe::Change {
+            from: "installed, not serving".into(),
+            to: format!(
+                "{} running in system from a root-owned clone of {SOURCE}",
+                lan::LABEL
+            ),
+        }
+    );
+    LanBroker::default().apply(&enabled, &ctx).unwrap();
+    assert_eq!(
+        job_changes(&enabled),
+        vec![
+            BOOTSTRAP.to_owned(),
+            "/bin/launchctl kickstart system/systems.alab.aterm-lan".to_owned()
+        ],
+    );
+}
+
+/// A person who switches the job off while the root run retries a refused launch ends that run
+/// at its next round, in words that say how to put it back, with no further launch and no
+/// further pause. MUTANT: a round that reads no switch before its launch launches again; one
+/// that retries a switched-off job pauses and reads the switch again, round after round.
+#[test]
+fn a_switch_off_during_the_root_run_ends_it() {
+    let ctx = ctx(&[]);
+    let during = from_app();
+    during
+        .on(PRINT, Ran::exit(113, "Could not find service"))
+        .on(PRINT_DISABLED, disabled_list("enabled"))
+        .on(PRINT_DISABLED, disabled_list("enabled"))
+        .on(PRINT_DISABLED, disabled_list("disabled"))
+        .on(
+            "/bin/launchctl enable system/systems.alab.aterm-lan",
+            Ran::ok(""),
+        )
+        .on(
+            BOOTSTRAP,
+            Ran::exit(5, "Bootstrap failed: 5: Input/output error"),
+        );
+    stop_after_many_sleeps(&during);
+    let item = LanBroker {
+        retained_root_run: true,
+        ..LanBroker::default()
+    };
+    assert!(matches!(item.probe(&during, &ctx), Probe::Change { .. }));
+    let why = item.apply(&during, &ctx).unwrap_err();
+    assert!(why.contains("switched off"), "{why}");
+    assert_eq!(job_changes(&during), vec![BOOTSTRAP.to_owned()]);
+    // The probe's read, the first round's and the second's, which reads it switched off: the run
+    // ends there.
+    let calls = during.calls();
+    let reads: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter_map(|(at, call)| (call == PRINT_DISABLED).then_some(at))
+        .collect();
+    assert_eq!(reads.len(), 3, "{calls:?}");
+    assert!(
+        !calls[reads[2]..]
+            .iter()
+            .any(|call| call.starts_with("sleep ")),
+        "{calls:?}"
+    );
+}
+
+/// A staging step that keeps failing in a way a retained root run retries (the app-copy check
+/// unanswered or not run) ends the run after [`ROUNDS`] rounds with that step's reason, as a
+/// refused launch does. MUTANT: a retried staging error that counts no round retries until the
+/// test's hang detector stops the run.
+#[test]
+fn a_staging_step_that_keeps_failing_ends_the_root_run_with_its_reason() {
+    for failed in [
+        CheckError::Unanswered("the trust service did not answer".into()),
+        CheckError::Unchecked("trust service unavailable".into()),
+    ] {
+        let sys = from_app();
+        let check = failed.clone();
+        sys.app_check(move |_, _| Err(check.clone()));
+        stop_after_many_sleeps(&sys);
+        let item = LanBroker {
+            retained_root_run: true,
+            ..LanBroker::default()
+        };
+        let why = item.apply(&sys, &ctx(&[])).unwrap_err();
+        assert!(why.contains(&failed.to_string()), "{failed:?}: {why}");
+        assert!(!why.contains("stopped"), "{why}");
+        let calls = sys.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("check staged app "))
+                .count(),
+            ROUNDS as usize,
+            "{calls:?}"
+        );
+        assert!(job_changes(&sys).is_empty(), "{calls:?}");
+    }
+}
+
+/// A launch launchd keeps refusing ends the root run after [`ROUNDS`] rounds, at the capped
+/// retry rate, with launchd's own reason, retained root custody or not: the Mac Setup tab's root
+/// run ends. MUTANT: the unbounded retry loop goes on until the test's hang detector stops it, so
+/// the run ends `stopped`, with more launches than the bound.
+#[test]
+fn a_launch_launchd_keeps_refusing_ends_the_root_run_with_its_reason() {
+    for retained_root_run in [false, true] {
+        let sys = from_app();
+        sys.on(PRINT, Ran::exit(113, "Could not find service"))
+            .on(PRINT_DISABLED, disabled_list("enabled"))
+            .on(
+                "/bin/launchctl enable system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            )
+            .on(
+                BOOTSTRAP,
+                Ran::exit(5, "Bootstrap failed: 5: Input/output error"),
+            );
+        stop_after_many_sleeps(&sys);
+        let item = LanBroker {
+            retained_root_run,
+            ..LanBroker::default()
+        };
+        let why = item.apply(&sys, &ctx(&[])).unwrap_err();
+        assert!(
+            why.contains("Bootstrap failed: 5: Input/output error"),
+            "launchd's reason: {why}"
+        );
+        assert!(!why.contains("stopped"), "{why}");
+        let calls = sys.calls();
+        assert_eq!(
+            calls.iter().filter(|call| *call == BOOTSTRAP).count(),
+            ROUNDS as usize,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("clone "))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        let slept: u128 = calls
+            .iter()
+            .filter_map(|call| {
+                call.strip_prefix("sleep ")?
+                    .strip_suffix("ms")?
+                    .parse::<u128>()
+                    .ok()
+            })
+            .sum();
+        assert!(
+            (5_000..=10 * 60 * 1000).contains(&slept),
+            "the rounds pause at the capped rate, in total {slept} ms"
         );
     }
 }

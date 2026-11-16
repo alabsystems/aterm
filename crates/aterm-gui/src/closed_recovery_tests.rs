@@ -9,6 +9,7 @@ fn terminal(label: &str) -> RestoredView {
         pinned: false,
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: Some(format!("/{label}")),
         title: label.to_string(),

@@ -813,3 +813,246 @@ fn a_system_without_coalitions_carries_the_chain_absent_and_its_own_watts() {
         "control: the chain's own"
     );
 }
+
+/// The strip's bucket (ten seconds) that holds reading `k` of [`reading`].
+fn box_of(k: u64) -> i64 {
+    (1_800_000_000_000 + i64::try_from(k * 1000).expect("small")).div_euclid(crate::ring::BUCKET_MS)
+}
+
+fn agg_at(ring: &crate::ring::SavedRing, k: i64) -> Option<crate::ring::Agg> {
+    ring.buckets
+        .iter()
+        .find(|(bk, _)| *bk == k)
+        .map(|(_, a)| *a)
+}
+
+/// A4 §4's strip, kept (N3): each ten-second box of compute watts comes with the share of its
+/// read time at thermal pressure Moderate or more and the worst level read in it, and the
+/// ten-minute box the boxes fold into keeps both. Readings 10 to 19 fill one box: five at
+/// Nominal, three at Moderate, two at Heavy, the first standing for the half second of its slot
+/// inside the box, so 5 s of 9.5 s read at pressure.
+/// CONTROL: the box read at Nominal throughout holds no share and Nominal as its worst; the box
+/// whose pressure went unread holds its watts and no pressure box at all, never a Nominal one.
+#[test]
+fn a_compute_watts_box_keeps_its_pressure_share_and_worst_level() {
+    let base = second(4.0, 4000.0, 3.0, 2500.0);
+    let mut v = crate::model::Vitals::new();
+    for k in 1..=41u64 {
+        let pressure = match k {
+            15..=17 => ThermalPressure::Moderate,
+            18..=19 => ThermalPressure::Heavy,
+            _ => ThermalPressure::Nominal,
+        };
+        let mut s = reading(k, base, pressure);
+        if (30..40).contains(&k) {
+            s.thermal_pressure = Some(Err("no_token"));
+        }
+        let _ = v.absorb(&s);
+    }
+    let kept = v.saved_strip(false);
+    let pressed = box_of(10);
+    let watts = agg_at(&kept.compute_w, pressed).expect("the box read watts");
+    assert!((watts.mean - 7.0).abs() < 1e-9, "{watts:?}");
+    assert!((watts.max - 7.0).abs() < 1e-9, "{watts:?}");
+    let cap = PressureBox::of(&agg_at(&kept.thermal, pressed).expect("the box read pressure"))
+        .expect("a pressure box");
+    assert!((cap.share - 5.0 / 9.5).abs() < 1e-9, "{cap:?}");
+    assert_eq!(cap.worst, ThermalPressure::Heavy);
+
+    // CONTROL: Nominal throughout.
+    let cool = box_of(20);
+    assert!(agg_at(&kept.compute_w, cool).is_some());
+    assert_eq!(
+        agg_at(&kept.thermal, cool)
+            .as_ref()
+            .and_then(PressureBox::of),
+        Some(PressureBox {
+            share: 0.0,
+            worst: ThermalPressure::Nominal
+        })
+    );
+    // CONTROL: pressure unread.
+    let unread = box_of(30);
+    assert!(
+        agg_at(&kept.compute_w, unread).is_some_and(|w| (w.mean - 7.0).abs() < 1e-9),
+        "the watts box stands without its pressure"
+    );
+    assert_eq!(agg_at(&kept.thermal, unread), None);
+    assert_eq!(PressureBox::of(&crate::ring::Agg::default()), None);
+
+    // The ten-minute box the closed boxes folded into: 5 s at pressure of the 28 s read with a
+    // pressure (readings 1 to 29: 9 s, 9.5 s and 9.5 s of their boxes), Heavy its worst.
+    let (_, long) = kept
+        .thermal
+        .long
+        .first()
+        .copied()
+        .expect("a ten-minute box");
+    let folded = PressureBox::of(&long).expect("a pressure box");
+    assert!(
+        (folded.share - 5.0 / 28.0).abs() < 1e-9,
+        "{folded:?} {long:?}"
+    );
+    assert_eq!(folded.worst, ThermalPressure::Heavy);
+    // Every level reads back as itself from the ring's largest reading.
+    for level in ThermalPressure::ALL {
+        let mut agg = crate::ring::Agg::default();
+        agg.add(
+            f64::from(level.level()),
+            1_000,
+            level >= ThermalPressure::Moderate,
+        );
+        assert_eq!(PressureBox::of(&agg).map(|b| b.worst), Some(level));
+    }
+}
+
+/// The usual clocks' saved form (N3): the deciles that read anything, each `(decile, seconds,
+/// MHz)`, restore the clocks they were taken from, and a checkpoint that holds an earlier state
+/// is brought up to date by the rows that differ alone.
+/// CONTROL: a row that names no decile, or whose seconds or clock is no positive number, changes
+/// nothing: it never stands in a usual clock.
+#[test]
+fn the_usual_clocks_restore_from_their_saved_rows() {
+    let mut clocks = UsualClocks::default();
+    assert_eq!(clocks.saved(), Vec::new());
+    clocks.note(9, 4_000.0, 45.0);
+    clocks.note(3, 2_800.0, 12.0);
+    let rows = clocks.saved();
+    assert_eq!(rows, vec![(3, 12.0, 2_800.0), (9, 45.0, 4_000.0)]);
+    assert_eq!(UsualClocks::restored(&rows), clocks);
+    assert_eq!(UsualClocks::restored(&rows).usual(9), Some(4_000.0));
+    assert_eq!(
+        UsualClocks::restored(&rows).usual(3),
+        None,
+        "12 s is not learned"
+    );
+
+    let held = clocks;
+    clocks.note(3, 2_900.0, 30.0);
+    let moved = clocks.rows_unlike(&held);
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0].0, 3);
+    let mut brought = held;
+    brought.put(&moved);
+    assert_eq!(brought, clocks);
+    assert_eq!(clocks.rows_unlike(&clocks), Vec::new());
+
+    // CONTROL
+    let mut damaged = clocks;
+    damaged.put(&[
+        (10, 60.0, 4_000.0),
+        (9, f64::NAN, 4_000.0),
+        (9, 60.0, f64::INFINITY),
+        (9, 60.0, f64::NAN),
+        (9, -1.0, 4_000.0),
+        (9, 60.0, 0.0),
+        (9, 0.0, 4_000.0),
+        (9, 60.0, 1e308),
+        (9, 60.0, USUAL_MAX_MHZ * 1.000_001),
+    ]);
+    assert_eq!(damaged, clocks);
+}
+
+/// No row a checkpoint holds can leave a usual clock that is not a number: a clock past
+/// [`USUAL_MAX_MHZ`] is refused, the fastest one taken reads on as a finite mean, and a reading
+/// never moves a decile to a clock that is not finite, so the writer never saves one (a
+/// non-finite number is written `null`, which no later start parses).
+/// CONTROL: the mean as a sum of clock times time over time, the form this replaced, passes
+/// the largest number from the row the bound now refuses.
+#[test]
+fn a_usual_clock_stays_a_number_whatever_the_checkpoint_held() {
+    let hostile = [(9, 60.0, 1e308)];
+    let mut clocks = UsualClocks::restored(&hostile);
+    assert_eq!(clocks, UsualClocks::default(), "refused");
+    clocks.note(9, 4_000.0, 1.0);
+    assert_eq!(
+        clocks.saved(),
+        vec![(9, 1.0, 4_000.0)],
+        "it learns from nothing"
+    );
+    // CONTROL: what the refused row would have done to the replaced mean.
+    let (held, kept) = (1e308_f64, 60.0_f64);
+    assert!(!((held * kept + 4_000.0 * 1.0) / (kept + 1.0)).is_finite());
+
+    // The fastest clock a row may give, read on for an hour of seconds.
+    let mut fast = UsualClocks::restored(&[(9, 3_600.0, USUAL_MAX_MHZ)]);
+    assert_eq!(fast.usual(9), Some(USUAL_MAX_MHZ));
+    for _ in 0..3_600 {
+        fast.note(9, 4_000.0, 1.0);
+    }
+    let read = fast.usual(9).expect("learned");
+    assert!(
+        read.is_finite() && read > 4_000.0 && read < USUAL_MAX_MHZ,
+        "{read}"
+    );
+    // A reading that is itself the largest number moves the mean to a number or not at all.
+    let mut wild = UsualClocks::restored(&[(9, 60.0, 4_000.0)]);
+    wild.note(9, f64::MAX, 1.0);
+    wild.note(9, f64::MAX, 1.0);
+    assert!(
+        wild.saved()
+            .iter()
+            .all(|&(_, s, mhz)| s.is_finite() && mhz.is_finite())
+    );
+}
+
+/// The model keeps what the heat chain learned across a relaunch (N3): a minute of readings at
+/// Nominal teaches decile 9 its usual clock, feeds the compute watts and work per joule peaks at
+/// each box's close, and the saved strip restores the clocks into a model that has read nothing.
+/// CONTROL: the model that restored nothing has learned nothing, and a strip that has read
+/// nothing restores nothing.
+#[test]
+fn the_model_keeps_its_usual_clocks_and_learns_the_heat_peaks() {
+    let base = second(4.0, 4000.0, 3.0, 2500.0);
+    let mut v = crate::model::Vitals::new();
+    for k in 1..=61u64 {
+        let _ = v.absorb(&reading(k, base, ThermalPressure::Nominal));
+    }
+    let learned = *v.usual_clocks();
+    assert!(
+        learned
+            .usual(9)
+            .is_some_and(|mhz| (mhz - 4000.0).abs() < 0.01),
+        "{learned:?}"
+    );
+    let today = crate::model::day_of(1_800_000_000_000);
+    let peaks = v.peaks();
+    assert!(
+        peaks
+            .compute_w
+            .peak(today)
+            .is_some_and(|w| (w - 7.0).abs() < 1e-9),
+        "{:?}",
+        peaks.compute_w
+    );
+    // 47e9 instructions a second on 7 W.
+    assert!(
+        peaks
+            .work_per_joule
+            .peak(today)
+            .is_some_and(|ipj| (ipj - 47e9 / 7.0).abs() < 1.0),
+        "{:?}",
+        peaks.work_per_joule
+    );
+    assert!(peaks.compute_w.read_s >= 30 && peaks.work_per_joule.read_s >= 30);
+
+    let saved = v.saved_strip(true);
+    assert_eq!(saved.usual, learned);
+    let mut relaunched = crate::model::Vitals::new();
+    relaunched.restore_strip_history(saved, 1_800_000_000_000 + 70_000);
+    assert_eq!(*relaunched.usual_clocks(), learned);
+    // CONTROL
+    assert_eq!(
+        *crate::model::Vitals::new().usual_clocks(),
+        UsualClocks::default()
+    );
+    let mut nothing = crate::model::Vitals::new();
+    nothing.restore_strip_history(
+        crate::model::SavedStrip {
+            usual: learned,
+            ..crate::model::SavedStrip::default()
+        },
+        1_800_000_000_000 + 70_000,
+    );
+    assert_eq!(*nothing.usual_clocks(), UsualClocks::default());
+}

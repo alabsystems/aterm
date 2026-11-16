@@ -87,6 +87,10 @@ pub const USUAL_LEARN_S: f64 = 30.0;
 /// mean of that span: an hour of readings in the decile.
 pub const USUAL_SPAN_S: f64 = 3_600.0;
 
+/// The fastest usual clock a checkpoint's row may give ([`UsualClocks::put`]): 100 GHz, many
+/// times any core's top, so no real clock is refused and a damaged number is.
+pub const USUAL_MAX_MHZ: f64 = 100_000.0;
+
 /// How far under its usual the Super clock runs before the cut is claimed: 5 % (A4 §3).
 pub const CUT_SHARE: f64 = 0.05;
 
@@ -537,6 +541,15 @@ pub enum ThermalPressure {
 }
 
 impl ThermalPressure {
+    /// Every level, least first.
+    pub const ALL: [Self; 5] = [
+        Self::Nominal,
+        Self::Moderate,
+        Self::Heavy,
+        Self::Trapping,
+        Self::Sleeping,
+    ];
+
     /// The level's posted state (`0..=4`); `None` for any other, never a guessed level.
     #[must_use]
     pub const fn of_state(state: u64) -> Option<Self> {
@@ -677,13 +690,17 @@ pub struct Usual {
 }
 
 /// The usual Super clock per Super busy decile, learned only at Nominal or Moderate, from the same
-/// derived clock the cut reads (A4 §4). The model keeps it in memory; N3 writes it to the strip's
-/// file beside the peaks.
+/// derived clock the cut reads (A4 §4). The model keeps it across readings and the strip's
+/// checkpoint across runs ([`Self::saved`], [`Self::restored`]), so a relaunch keeps what it
+/// learned.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsualClocks {
     /// Each decile's, 0 to 9.
     pub deciles: [Usual; DECILES],
 }
+
+/// One decile's usual clock as the strip's checkpoint keeps it: `(decile, seconds read, MHz)`.
+pub type UsualRow = (u8, f64, f64);
 
 impl UsualClocks {
     /// Notes a reading of `mhz` over `window_s` seconds in `decile`; nothing for a clock or window
@@ -695,9 +712,14 @@ impl UsualClocks {
         if !(mhz.is_finite() && mhz > 0.0 && window_s.is_finite() && window_s > 0.0) {
             return;
         }
+        // The mean moved toward the reading by its share of the time: no product of a clock and
+        // a time is formed, so no clock a checkpoint gave can take it past a finite number.
         let kept = u.read_s.min(USUAL_SPAN_S);
-        u.mhz = (u.mhz * kept + mhz * window_s) / (kept + window_s);
-        u.read_s += window_s;
+        let moved = u.mhz + (mhz - u.mhz) * (window_s / (kept + window_s));
+        if moved.is_finite() {
+            u.mhz = moved;
+            u.read_s += window_s;
+        }
     }
 
     /// `decile`'s usual clock, once [`USUAL_LEARN_S`] of readings taught it.
@@ -707,6 +729,72 @@ impl UsualClocks {
             .get(decile)
             .filter(|u| u.read_s >= USUAL_LEARN_S)
             .map(|u| u.mhz)
+    }
+
+    /// The deciles that have read anything, for the strip's checkpoint to keep.
+    #[must_use]
+    pub fn saved(&self) -> Vec<UsualRow> {
+        self.rows_unlike(&Self::default())
+    }
+
+    /// The deciles that differ from `held`'s, as [`Self::saved`] rows: what a checkpoint that
+    /// holds `held` lacks. A decile only gains readings, so one that differs has read some.
+    #[must_use]
+    pub fn rows_unlike(&self, held: &Self) -> Vec<UsualRow> {
+        (0u8..)
+            .zip(self.deciles.iter().zip(&held.deciles))
+            .filter(|(_, (now, then))| now != then)
+            .map(|(decile, (u, _))| (decile, u.read_s, u.mhz))
+            .collect()
+    }
+
+    /// Takes each of `rows` over the decile it names. A row naming a decile past 9, whose
+    /// seconds or clock is not a positive number, or whose clock is past [`USUAL_MAX_MHZ`]
+    /// changes nothing: a damaged row never stands in a usual clock, and the decile learns
+    /// again from what it holds.
+    pub fn put(&mut self, rows: &[UsualRow]) {
+        for &(decile, read_s, mhz) in rows {
+            let sound = read_s.is_finite() && read_s > 0.0 && mhz > 0.0 && mhz <= USUAL_MAX_MHZ;
+            if let Some(u) = self.deciles.get_mut(usize::from(decile)).filter(|_| sound) {
+                *u = Usual { read_s, mhz };
+            }
+        }
+    }
+
+    /// The clocks `rows` hold ([`Self::saved`], [`Self::put`]).
+    #[must_use]
+    pub fn restored(rows: &[UsualRow]) -> Self {
+        let mut clocks = Self::default();
+        clocks.put(rows);
+        clocks
+    }
+}
+
+/// What one strip box of the thermal pressure ring says (A4 §4: the Heat strip's cap). The ring
+/// takes each reading's level ([`ThermalPressure::level`]) as its value, over while the level
+/// is Moderate or more, so a box's over time is its share at pressure and its largest reading
+/// its worst level.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureBox {
+    /// The share of the box's read time at Moderate or more, 0 to 1: the cap's length.
+    pub share: f64,
+    /// The worst level read in the box: the cap's ink.
+    pub worst: ThermalPressure,
+}
+
+impl PressureBox {
+    /// What `agg`, a bucket of the pressure ring, says: its worst level is the worst whose
+    /// number its largest reading reaches. `None` for a bucket that read nothing.
+    #[must_use]
+    pub fn of(agg: &crate::ring::Agg) -> Option<Self> {
+        agg.is_sound().then(|| Self {
+            share: agg.cell().over_share(),
+            worst: ThermalPressure::ALL
+                .into_iter()
+                .rev()
+                .find(|p| agg.max >= f64::from(p.level()))
+                .unwrap_or(ThermalPressure::Nominal),
+        })
     }
 }
 

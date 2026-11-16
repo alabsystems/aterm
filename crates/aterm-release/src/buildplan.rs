@@ -23,6 +23,9 @@ pub mod linux;
 #[path = "windows_release.rs"]
 pub mod windows;
 
+#[path = "windows_pull.rs"]
+pub mod windows_pull;
+
 pub(crate) const ARM64: &str = "aarch64-apple-darwin";
 pub(crate) const X86_64: &str = "x86_64-apple-darwin";
 const NATIVE_SLICE: &str = "native";

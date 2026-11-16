@@ -287,10 +287,11 @@ const HELP_TAIL: &str = concat!(
     "              font_weight_dark_nudge, font_family_bold/_italic/\n",
     "              _bold_italic, font_synthetic_style, fallback_fonts [ordered],\n",
     "              symbol_font, emoji_font, line_height, font_size_scale.\n",
-    "  Behaviour   gpu, shell, shell_args, scrollback_lines, columns, lines,\n",
-    "              copy_on_select, confirm_multiline_paste, right_click,\n",
-    "              option_as_meta, search_history_lines, focus_boost (Windows;\n",
-    "              default on), conpty (Windows: bundled | inbox | auto | path),\n",
+    "  Behaviour   gpu, shell, shell_args, shell_env_strip, scrollback_lines,\n",
+    "              columns, lines, copy_on_select, confirm_multiline_paste,\n",
+    "              right_click, option_as_meta, search_history_lines, focus_boost\n",
+    "              (Windows; default on), conpty (Windows: bundled | inbox | auto |\n",
+    "              path),\n",
     "  Security    allow_window_ops, allow_notifications, allow_kitty_file_transfer,\n",
     "              allow_osc52_query, secure_keyboard_entry (macOS) (default off);\n",
     "              allow_palette_reconfigure (default on).\n",
@@ -365,6 +366,9 @@ macro_rules! starter_shell_block {
 #                       # \"wsl\" (bash login); \"cmd\" is partial (no command text or
 #                       # exit code); \"nu\" gets none.
 # shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (for \"wsl\", wsl.exe options)
+# shell_env_strip = [\"CLAUDE\", \"CODEX_\"]  # the prefixes every shell aterm spawns
+#                       # loses, in place of the default list; an installed harness adds
+#                       # its own (`aterm harness ls` prints the list in force)
 
 "
     };
@@ -380,6 +384,9 @@ macro_rules! starter_shell_block {
 #                       # Shell integration is injected for zsh, bash, fish and pwsh.
 # shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (macOS starts a login shell
 #                       # already; elsewhere aterm starts an interactive non-login shell)
+# shell_env_strip = [\"CLAUDE\", \"CODEX_\"]  # the prefixes every shell aterm spawns
+#                       # loses, in place of the default list; an installed harness adds
+#                       # its own (`aterm harness ls` prints the list in force)
 
 "
     };
@@ -608,7 +615,7 @@ const STARTER_CONFIG: &str = concat!(
 
 # --- system awareness: live Global / aterm / Tab stats bars (⌘I: Stats Lens)
 # [sys]
-# stats_bars = \"deck\"              # \"deck\" (default: under titlebar) | \"sill\" (bottom padding) | \"off\"
+# stats_bars = \"deck\"              # \"deck\" (default: under titlebar where a window shows System Resources, sill elsewhere) | \"sill\" (bottom padding) | \"off\"
 # stats_deck_size = \"auto\"         # \"auto\" (default: Folded at any height) | \"full\" | \"folded\"
 # disk_roots = []                  # ~/Library or protected folders the disk walker may size
 

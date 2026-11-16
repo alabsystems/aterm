@@ -229,7 +229,7 @@ impl App {
             .map(|st| (st.phase.as_str(), st.since));
         let program = self
             .session_status
-            .program_state(session)
+            .program_said(session)
             .map(|(state, since)| (crate::program_state::row_word(state), since));
         let (agent_seq, agent) = self.session_status.agent_reading(session);
         let now_unix = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
@@ -252,7 +252,7 @@ impl App {
         Some(Facts {
             attention,
             shell,
-            program_ctx_left: program.and(codex_ctx_left),
+            program_ctx_left: program.as_ref().and(codex_ctx_left),
             program,
             agent_seq: agent_seq + self.harness_wait_epoch,
             agent,
@@ -1641,7 +1641,8 @@ impl App {
 
     /// Note a rise of the chrome rows every window shares (the tab strip grew) on every window's regrow floor.
     pub(crate) fn note_chrome_rise_everywhere(&mut self, now: Instant) {
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             ws.regrow_floor.rose(now);
         }
     }
@@ -1662,7 +1663,8 @@ impl App {
         self.presence.retire(session);
         self.consent_observer.retire_session(session);
         self.consent_attention.retire_session(session);
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             ws.presence.watermarks.remove(&session);
         }
         self.done_seen.remove(&session);
@@ -1701,7 +1703,7 @@ impl Desk for App {
     }
 
     fn view_of_mut(&mut self, w: WindowId) -> Option<&mut WindowView> {
-        self.windows.get_mut(&w).map(|ws| &mut ws.presence)
+        self.windows.presence_mut(&w)
     }
 
     fn windows_showing(&self, session: u64) -> Vec<WindowId> {

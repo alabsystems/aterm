@@ -1280,7 +1280,7 @@ fn details_lead_with_kept_state_clauses() {
         sample: MemSample {
             total: 128 << 30,
             cached: (38.5 * GIB) as u64,
-            swap_used: (6.4 * GIB) as u64,
+            swap_used: Some((6.4 * GIB) as u64),
             pressure: Pressure::Warn,
             ..MemSample::default()
         },
@@ -1484,6 +1484,7 @@ fn details_lead_with_kept_state_clauses() {
     set(&mut s, Resource::Network, net);
     s.facts.net_read_s = 3_600;
     s.facts.link = Some(LinkSample {
+        byte_counter: crate::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: LinkKind::Wifi,
         counts: true,
@@ -1740,6 +1741,7 @@ fn row_sentences() {
     set(&mut s, Resource::Network, net);
     s.facts.net_read_s = 3_600;
     s.facts.link = Some(LinkSample {
+        byte_counter: crate::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: LinkKind::Wifi,
         counts: true,
@@ -2165,6 +2167,7 @@ fn the_cpu_brand_the_network_run_and_the_machines_totals_format_compactly() {
     let mut s = scenario_a();
 
     s.facts.link = Some(LinkSample {
+        byte_counter: crate::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: LinkKind::Wifi,
         up: true,

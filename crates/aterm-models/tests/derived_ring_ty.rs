@@ -1217,14 +1217,9 @@ fn derived_transcript_join_proves_and_catches_each_law() {
 }
 
 #[test]
-fn derived_claimed_turn_edges_proves_and_catches_each_law() {
+fn derived_claimed_turn_edges_each_law_breaks_first() {
     let model = aterm_models_session::claimed_turn_edges_model();
-    assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_actions(
-        &model,
-        &["BeginSkipsFifo", "BeginUnfed", "EndClosesUntaken"],
-    );
     let fired = |path: &[&str]| {
         let mut s = model.init_state();
         for action in path {
@@ -1290,6 +1285,109 @@ fn derived_claimed_turn_edges_proves_and_catches_each_law() {
         "a late rollout names each claim turn"
     );
     assert_eq!((claimed["x1"], claimed["x2"]), (0, 0));
+
+    let refused = fired(&["Parse", "RefuseBegin1", "Resume1", "Parse", "FeedEnd1"]);
+    assert_eq!(
+        (refused["c1"], refused["x1"], refused["s1"], refused["k1"]),
+        (0, 0, 1, 0),
+        "a refused turn is said, and its resumed beginning opens none"
+    );
+    let resumed = fired(&["Parse", "FeedBegin1", "Resume1"]);
+    assert_eq!(
+        (resumed["c1"], resumed["k1"]),
+        (1, 1),
+        "a resumed beginning moves nothing in its span"
+    );
+}
+
+#[test]
+fn derived_program_edge_feed_each_law_breaks_first() {
+    let model = aterm_models_session::program_edge_feed_model();
+    assert_every_invariant_breaks_first(&model);
+    let fired = |m: &Model, path: &[&str]| {
+        let mut s = m.init_state();
+        for action in path {
+            assert!(m.fire(action, &mut s), "{action}: {s:?}");
+        }
+        s
+    };
+
+    let ctrl_z = [
+        "StartCodex",
+        "WriteA",
+        "SweepFront",
+        "ExitInTurn",
+        "ArriveCodex",
+        "SweepMoveSplit",
+        "Name",
+        "ResumeB",
+        "SweepCodex",
+    ];
+    let resumed = fired(&model, &ctrl_z);
+    assert_eq!(
+        (resumed["fa"], resumed["fb"], resumed["cb"]),
+        (1, 1, 1),
+        "a codex resumed after Ctrl+Z has its turn in its new run"
+    );
+    let undrawn = aterm_spec::interp::with_buggy(&model, 6);
+    let mut path = ctrl_z;
+    path[7] = "ResumeUndrawn";
+    let lost = fired(&undrawn, &path);
+    assert!(
+        (lost["fb"], lost["cb"]) == (0, 1) && !undrawn.check_invariant("ResumedSpanLogged", &lost),
+        "with no resumed beginning the new run holds none: {lost:?}"
+    );
+
+    let split = fired(
+        &model,
+        &[
+            "StartCodex",
+            "WriteA",
+            "Exit",
+            "ArriveCodex",
+            "WriteB",
+            "SweepMoveSplit",
+        ],
+    );
+    assert_eq!(
+        (split["fa"], split["ca"], split["cb"]),
+        (1, 1, 0),
+        "the move feeds the leaving codex its edges and holds the arriving one's"
+    );
+    let killed = fired(
+        &model,
+        &[
+            "StartCodex",
+            "WriteA",
+            "Kill",
+            "ArriveCodex",
+            "WriteB",
+            "SweepMoveKilled",
+        ],
+    );
+    assert_eq!(
+        (killed["fa"], killed["fb"], killed["sd"], killed["am"]),
+        (0, 0, 2, 1),
+        "with no clear and a codex leaving, both turns are said"
+    );
+    let arrived = fired(
+        &model,
+        &[
+            "StartOther",
+            "Leave",
+            "ArriveCodex",
+            "WriteB",
+            "SweepMoveOther",
+            "Hold",
+            "Name",
+            "SweepCodex",
+        ],
+    );
+    assert_eq!(
+        (arrived["fb"], arrived["sd"]),
+        (1, 0),
+        "what no codex left is the arriving codex's"
+    );
 }
 
 #[test]

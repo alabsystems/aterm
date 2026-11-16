@@ -429,6 +429,10 @@ const EXEC_STAGE: &str = "ATERM_SYSPROBE_EXEC_STAGE";
 #[cfg(target_os = "macos")]
 const EXEC_STAND_IN: &str = "procs::tests::exec_stand_in";
 
+/// Deschedule only the owned stand-in immediately after its background request.
+#[cfg(target_os = "macos")]
+const EXEC_STOP_AFTER_BG: &str = "ATERM_SYSPROBE_STOP_AFTER_BG";
+
 /// The hang detector for what must happen (a child's line).
 #[cfg(target_os = "macos")]
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
@@ -441,34 +445,37 @@ fn exec_stand_in() {
     let Ok(stage) = std::env::var(EXEC_STAGE) else {
         return;
     };
-    if stage == "background" || stage == "foreground" {
-        // Darwin's public resource.h names selector 4 PRIO_DARWIN_PROCESS and 0x1000
-        // PRIO_DARWIN_BG. The stand-in changes only its own internal request.
-        // SAFETY: these are constant selectors and pid zero is this process.
-        let rc = unsafe { libc::setpriority(4, 0, if stage == "background" { 0x1000 } else { 0 }) };
-        assert_eq!(
-            rc,
-            0,
-            "set own requested-background state: {}",
-            std::io::Error::last_os_error()
-        );
+    if stage == "foreground" {
+        request_background(0, false).expect("drop its own background");
     }
     println!("\n{stage}");
     std::io::stdout().flush().expect("the stage's proof");
+    // Publish readiness before requesting background: a backgrounded process's CPU and
+    // page-ins can wait behind foreground work. The parent observes policy independently.
+    if stage == "background" {
+        request_background(0, true).expect("request its own background");
+        if std::env::var_os(EXEC_STOP_AFTER_BG).is_some() {
+            // SAFETY: SIGSTOP stops this child until its parent kills and reaps it.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) }, 0);
+        }
+    }
     let mut byte = [0; 1];
     match std::io::stdin().read(&mut byte) {
         Ok(1) if stage == "before" => {
-            let failed =
-                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
-                    .args([
-                        "--exact",
-                        EXEC_STAND_IN,
-                        "--ignored",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(EXEC_STAGE, "after")
-                    .exec();
+            let mut command =
+                aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
+            command
+                .args([
+                    "--exact",
+                    EXEC_STAND_IN,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(EXEC_STAGE, "after");
+            let _closed = crate::exec_gate::close(HANG)
+                .expect("the stand-in refuses exec while its process-table reads remain active");
+            let failed = command.exec();
             panic!("the exec: {failed}");
         }
         _ => aterm_uds::process::kill_self_now(),
@@ -506,35 +513,188 @@ fn stand_in(
             }
         }
     });
-    let saw = move |word: &str| loop {
-        match lines.recv_timeout(HANG) {
-            Ok(line) if line == word => break,
-            Ok(_) => {}
-            Err(e) => panic!("hang detector: the stand-in never wrote {word:?} ({e})"),
-        }
+    let pid = child.id();
+    let saw = move |word: &str| {
+        let saw = aterm_spec::wait::until_while_working(
+            pid,
+            &format!("the stand-in wrote {word:?}"),
+            || loop {
+                match lines.try_recv() {
+                    Ok(line) if line == word => return Some(true),
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return Some(false),
+                }
+            },
+        );
+        assert!(saw, "the stand-in closed its proof pipe before {word:?}");
     };
     (child, saw)
 }
 
-/// Target bits distinguish two children even when the observer's request stays the same.
+/// Request (`on`) or drop Darwin background for `pid` (`0`: this process) through
+/// `setpriority`, as Darwin's public resource.h names selector 4 `PRIO_DARWIN_PROCESS` and
+/// `0x1000` `PRIO_DARWIN_BG`. A process's request for itself is its internal bit; another
+/// process's request for it, its external one (XNU's `do_background_proc`).
+#[cfg(target_os = "macos")]
+fn request_background(pid: libc::id_t, on: bool) -> std::io::Result<()> {
+    // SAFETY: constant selectors; setpriority only writes the named process's policy.
+    let rc = unsafe { libc::setpriority(4, pid, if on { 0x1000 } else { 0 }) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// TARGET BITS DISTINGUISH CHILDREN (macOS, live) even when the observer's request stays the
+/// same: a child's request for itself reads as its internal bit, and this process's request
+/// for a child as that child's external bit. Nothing waits on a child once it is in the
+/// background, where a loaded Mac can keep it off every core and its page-ins behind every
+/// other I/O: the background child writes its line before its request, and the test waits
+/// for the request to read with its hang detector. NEGATIVE CONTROL: the foreground child,
+/// which drops any background it inherited, reads neither bit until this process asks.
 #[cfg(target_os = "macos")]
 #[test]
 fn scheduling_reads_each_childs_requested_background_bits() {
-    for (stage, expected) in [("foreground", false), ("background", true)] {
-        let (mut child, saw) = stand_in(EXEC_STAND_IN, (EXEC_STAGE, stage.as_ref()));
-        saw(stage);
-        let actual = processes().and_then(|s| {
+    let bits = |pid: u32| {
+        processes().and_then(|s| {
             s.procs
                 .into_iter()
-                .find(|p| p.pid == child.id())
+                .find(|p| p.pid == pid)
                 .and_then(|p| p.scheduling)
-        });
-        // Reap before assertions so a failed observation leaves no stand-in behind.
+                .map(|s| (s.background_internal, s.background_external))
+        })
+    };
+    let (mut foreground, saw) = stand_in(EXEC_STAND_IN, (EXEC_STAGE, "foreground".as_ref()));
+    saw("foreground");
+    let (mut background, saw) = stand_in(EXEC_STAND_IN, (EXEC_STAGE, "background".as_ref()));
+    saw("background");
+    let own = aterm_spec::wait::within_while_working(
+        background.id(),
+        HANG,
+        aterm_spec::wait::WORKING_GUARD,
+        std::time::Duration::from_millis(20),
+        || bits(background.id()).filter(|&(internal, _)| internal),
+    );
+    let neither = bits(foreground.id());
+    let request = request_background(foreground.id(), true);
+    let asked = bits(foreground.id());
+    // Reap before assertions so a failed observation leaves no stand-in behind.
+    for child in [&mut foreground, &mut background] {
         drop(child.stdin.take());
-        aterm_uds::deadline::kill_within(&mut child, HANG);
-        let actual = actual.expect("the stand-in's BSD info was read");
-        assert_eq!(actual.background_internal, expected, "{stage}: {actual:?}");
+        aterm_uds::deadline::kill_within(child, HANG);
     }
+    assert_eq!(
+        own,
+        Ok((true, false)),
+        "hang detector: the background child's own request never read as its internal bit"
+    );
+    assert_eq!(neither, Some((false, false)), "the foreground child");
+    request.expect("this process's request for the foreground child");
+    assert_eq!(
+        asked,
+        Some((false, true)),
+        "this process's request for the foreground child"
+    );
+}
+
+/// A child denied any execution after requesting background has already flushed its proof.
+/// The kernel stop fixes the scheduling boundary without loading the shared Mac: moving the
+/// proof below the background request leaves no proof in the pipe at this same boundary.
+#[cfg(target_os = "macos")]
+#[test]
+fn background_proof_precedes_a_descheduled_child() {
+    use aterm_uds::spawnfd::Stdio;
+    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
+
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            EXEC_STAND_IN,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(EXEC_STAGE, "background")
+        .env(EXEC_STOP_AFTER_BG, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the owned stand-in starts");
+    let pid = child.id();
+    let stopped = aterm_spec::wait::within_while_working(
+        pid,
+        HANG,
+        aterm_spec::wait::WORKING_GUARD,
+        std::time::Duration::from_millis(10),
+        || {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: pid names this test's child and info is a valid out-parameter.
+            // WNOWAIT leaves an exited child unreaped too, keeping its pid ours until
+            // the kill and reap below even when the requested stop fails.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WSTOPPED | libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                return (error.kind() != std::io::ErrorKind::Interrupted)
+                    .then_some(Err(error.raw_os_error()));
+            }
+            // SAFETY: siginfo_t is plain C data, valid zeroed and as the kernel wrote it.
+            let info = unsafe { info.assume_init() };
+            (info.si_signo == libc::SIGCHLD).then(|| {
+                // SAFETY: waitid reported this child's initialized SIGCHLD information.
+                Ok((info.si_code, unsafe { info.si_status() }))
+            })
+        },
+    );
+    let scheduling = processes().and_then(|s| {
+        s.procs
+            .into_iter()
+            .find(|p| p.pid == child.id())
+            .and_then(|p| p.scheduling)
+    });
+    let mut bytes = Vec::new();
+    let read = {
+        let out = std::fs::File::from(std::os::fd::OwnedFd::from(
+            child.stdout.take().expect("its proof pipe"),
+        ));
+        aterm_uds::ready::with_nonblocking(out.as_fd(), || {
+            (&out).take(4096).read_to_end(&mut bytes)
+        })
+    };
+    // Reap even on a failed stop, sweep or read before asserting any observation.
+    aterm_uds::deadline::kill_within(&mut child, HANG);
+    assert!(
+        stopped.is_ok_and(|event| event
+            .is_ok_and(|(code, status)| code == libc::CLD_STOPPED && status == libc::SIGSTOP)),
+        "the child's kernel stop: {stopped:?}"
+    );
+    assert!(
+        scheduling.is_some_and(|s| s.background_internal),
+        "the child's actual background request: {scheduling:?}"
+    );
+    assert!(
+        read.is_ok()
+            || read
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "the nonblocking proof read: {read:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .any(|line| line == "background"),
+        "proof must precede descheduling: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
 }
 
 /// AN EXEC MOVES THE PID VERSION, SO A KEPT COALITION IS READ AGAIN (macOS, live): a child
@@ -1065,12 +1225,17 @@ fn the_sweep_finds_this_process_and_its_parent() {
     }
     assert!(mine.read_at.is_some(), "{mine:?}");
     if cfg!(any(target_os = "macos", target_os = "linux")) {
-        // Running, so runnable: never less than its CPU time.
-        assert!(
-            mine.runnable_ns
-                .is_some_and(|r| r > 0 && mine.cpu_ns.is_some_and(|c| r >= c)),
-            "{mine:?}"
-        );
+        assert!(mine.runnable_ns.is_some_and(|r| r > 0), "{mine:?}");
+        if cfg!(target_os = "linux") {
+            // Linux constructs this value from CPU time plus scheduler wait time.
+            // macOS reads a separate scheduler timer and CPU accounting; their
+            // independently updated counters need not satisfy this ordering.
+            assert!(
+                mine.runnable_ns
+                    .is_some_and(|r| mine.cpu_ns.is_some_and(|c| r >= c)),
+                "{mine:?}"
+            );
+        }
     }
     if cfg!(target_os = "macos") {
         assert!(mine.peak_footprint.is_some_and(|p| p > 0), "{mine:?}");

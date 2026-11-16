@@ -157,7 +157,6 @@ impl Grid {
                 .absolute_row_counter
                 .saturating_add(added as u64),
         );
-        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.enforce_history_link_budget();
     }
 

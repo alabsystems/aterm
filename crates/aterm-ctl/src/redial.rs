@@ -36,7 +36,7 @@ pub(crate) enum Follow {
     Host {
         /// The socket the gone host was reached at.
         sock: String,
-        /// The session the request names (`@s-…`).
+        /// The session the request names (`@tqn5r6e0148`).
         sid: Option<String>,
     },
     /// No successor follows, for the reason given.

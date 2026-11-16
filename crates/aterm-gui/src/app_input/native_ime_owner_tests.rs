@@ -22,10 +22,11 @@ fn page(
 ) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = if split { 240 } else { 160 };
     window.a11y_active = true;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.set_system_state_handlers_for_test(
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
@@ -282,10 +283,11 @@ fn a_native_composition_retires_its_old_field_projection_after_focus_moves() {
 fn url_review() -> (App, WindowId, crate::native_app::AppInstanceId, ViewId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
     window.a11y_active = true;
+    drop(window);
     app.set_system_state_handlers_for_test(
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
     );

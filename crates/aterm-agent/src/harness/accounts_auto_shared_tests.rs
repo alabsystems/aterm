@@ -376,16 +376,17 @@ impl NativeRevisionFixture {
                 let mut guard = self.guard.lock().unwrap();
                 guard.in_flight = false;
                 guard.parked.clear();
-                guard.bot_checked.clear();
+                guard.unrecorded_checks.clear();
                 if action == "Person" {
                     guard
                         .parked
                         .insert("native:revision".into(), Instant::now());
                 }
                 if action == "Bot" {
-                    guard
-                        .bot_checked
-                        .insert("native:revision".into(), Instant::now());
+                    guard.unrecorded_checks.insert(
+                        "native:revision".into(),
+                        super::login_activity_tests::a_check_met("native:revision"),
+                    );
                 }
             }
             _ => panic!("unknown native revision action"),
@@ -405,7 +406,7 @@ impl NativeRevisionFixture {
             1
         } else if guard.parked.contains_key("native:revision") {
             2
-        } else if guard.bot_checked.contains_key("native:revision") {
+        } else if guard.unrecorded_checks.contains_key("native:revision") {
             3
         } else {
             0
@@ -1046,11 +1047,13 @@ fn shared_renewal_backoffs_preserve_admission_history() {
         {
             let mut history = fixture.guard.lock().unwrap();
             if bot {
-                &mut history.bot_checked
+                history.unrecorded_checks.insert(
+                    "shared".into(),
+                    super::login_activity_tests::a_check_met("shared"),
+                );
             } else {
-                &mut history.parked
+                history.parked.insert("shared".into(), fixture.start);
             }
-            .insert("shared".into(), fixture.start);
         }
         fixture.step("Start");
         assert_eq!(fixture.observe()["history"], 1);
@@ -1062,7 +1065,7 @@ fn shared_renewal_backoffs_preserve_admission_history() {
         {
             let mut history = fixture.guard.lock().unwrap();
             history.parked.clear();
-            history.bot_checked.clear();
+            history.unrecorded_checks.clear();
         }
         fixture.step("Start");
         assert_eq!(fixture.observe()["history"], 2);
@@ -2088,11 +2091,12 @@ fn held_shared_candidates_preserve_history_and_let_peers_run() {
                 .shared_preparations
                 .insert(key.clone(), (grant.source, [99; 32]));
             if bot {
-                &mut state.bot_checked
+                state
+                    .unrecorded_checks
+                    .insert(key.clone(), super::login_activity_tests::a_check_met(&key));
             } else {
-                &mut state.parked
+                state.parked.insert(key.clone(), start);
             }
-            .insert(key.clone(), start);
         }
         let discover = move |_: &Path| {
             Ok(vec![
@@ -2929,5 +2933,163 @@ fn shared_dispositions_conform_and_failure_on_policy_refusal_is_detected() {
     assert!(
         !model.successors("Run", stopped).contains(&legacy),
         "the former unconditional shared-failure backoff must fail conformance"
+    );
+}
+
+/// A shared candidate whose provider's page meets a bot protection, counting its runs.
+struct CheckedCandidate {
+    calls: Arc<AtomicUsize>,
+}
+
+impl super::super::cli::shared_provider::Provider for CheckedCandidate {
+    fn execute(
+        &self,
+        _: &super::super::cli::shared_provider::Context<'_>,
+        _: &Row,
+        _: &Path,
+        _: &RenewBrowser,
+    ) -> Result<(), String> {
+        panic!("typed execution required")
+    }
+
+    fn execute_attempt(
+        &self,
+        _: &super::super::cli::shared_provider::Context<'_>,
+        _: &Row,
+        _: &Path,
+        _: &RenewBrowser,
+    ) -> super::super::cli::shared_provider::Execution {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        super::super::cli::shared_provider::Execution::BotCheck(
+            "Cloudflare's bot check did not clear in 90 s".into(),
+        )
+    }
+
+    fn observe(
+        &self,
+        _: &super::super::cli::shared_provider::Context<'_>,
+        _: &Row,
+        _: &Path,
+    ) -> Result<
+        Option<Box<dyn super::super::cli::shared_provider::LoginProof>>,
+        super::super::cli::shared_provider::ObservationError,
+    > {
+        panic!("a sign-in a bot protection stopped has no credential to observe")
+    }
+}
+
+/// [`CandidateApproval`] that counts the recoveries asked of it.
+struct CountedApproval {
+    grant: Grant,
+    recoveries: Arc<AtomicUsize>,
+}
+
+impl Authority for CountedApproval {
+    fn prepare(&self, row: &Row) -> Result<Grant, String> {
+        CandidateApproval(self.grant.clone()).prepare(row)
+    }
+
+    fn current(&self, grant: &Grant, row: &Row) -> Result<(), String> {
+        CandidateApproval(self.grant.clone()).current(grant, row)
+    }
+
+    fn request_recovery(
+        &self,
+        _: &Grant,
+        _: &Row,
+        _: &accounts::shared::Intent,
+    ) -> Result<(), String> {
+        self.recoveries.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// A SHARED ADOPTION A BOT PROTECTION STOPPED IS A PERSON'S, ON NO CLOCK: the candidate's
+/// provider runs once, its account's check goes on record and no recovery is asked of the root;
+/// a grant the root reissues is not adopted, past the cooldown and a day on. CONTROL: once a
+/// person's login has ended the check, the next reissued grant runs the provider again.
+#[cfg(unix)]
+#[test]
+fn a_shared_adoption_a_bot_protection_stopped_waits_for_a_person() {
+    let bed = Bed::with_custody(None, false);
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let recoveries = Arc::new(AtomicUsize::new(0));
+    let generation = Arc::new(AtomicU64::new(0));
+    let discover = {
+        let (calls, recoveries, generation) =
+            (calls.clone(), recoveries.clone(), generation.clone());
+        move |_: &Path| {
+            let unused = Arc::new(Mutex::new(Vec::new()));
+            let mut candidate = unstarted_candidate(1, &unused);
+            let mut grant = candidate.authority.prepare(&candidate.row).unwrap();
+            let reissued = generation.load(Ordering::SeqCst);
+            grant.generation += reissued;
+            grant.decision = [11 + u8::try_from(reissued).unwrap(); 32];
+            candidate.authority = Arc::new(CountedApproval {
+                grant,
+                recoveries: recoveries.clone(),
+            });
+            candidate.provider = Arc::new(CheckedCandidate {
+                calls: calls.clone(),
+            });
+            Ok(vec![candidate])
+        }
+    };
+    let start = Instant::now();
+    let pass = |index: i64, seconds: u64| {
+        bed.with_preparations(&discover, &inline, &guard, |fx| {
+            shared_renewal::prepare_shared_with_clock(
+                &bed.home,
+                &bed.state,
+                &bed.roster,
+                NOW + crate::harness::sign_in_ladder::SPACING_S * index,
+                fx,
+                || start + Duration::from_secs(seconds),
+            );
+        });
+    };
+    pass(0, 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the first adoption runs");
+    assert_eq!(recoveries.load(Ordering::SeqCst), 0, "no recovery is asked");
+    let check = || {
+        bed.store
+            .load_logins(NOW)
+            .unwrap()
+            .0
+            .get("candidate-1")
+            .and_then(|binding| binding.check_stop.clone())
+    };
+    assert_eq!(
+        check().and_then(|check| check.account),
+        Some("candidate-1@example.test".to_owned()),
+        "the account's check is on record"
+    );
+    for (index, seconds) in [(1, 901), (2, 6 * 3_600 + 60), (3, 25 * 3_600)] {
+        generation.store(u64::try_from(index).unwrap(), Ordering::SeqCst);
+        pass(index, seconds);
+        assert_eq!(
+            (
+                calls.load(Ordering::SeqCst),
+                recoveries.load(Ordering::SeqCst)
+            ),
+            (1, 0),
+            "a reissued grant {seconds} s on"
+        );
+    }
+    bed.store
+        .transact_logins(NOW, &mut None, |_, logins| {
+            if let Some(binding) = logins.labels.get_mut("candidate-1") {
+                binding.check_stop = None;
+            }
+            Ok(Vec::new())
+        })
+        .unwrap();
+    generation.store(4, Ordering::SeqCst);
+    pass(4, 25 * 3_600 + 901);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "CONTROL: with the check ended, a reissued grant runs the provider"
     );
 }

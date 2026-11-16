@@ -7622,6 +7622,9 @@ struct Acting {
     /// The shell holding each tab at a crash no snapshot read reached
     /// ([`Acts::self_snapshot`]); none: no shell holds it.
     self_shells: Mutex<HashMap<String, u32>>,
+    /// The refusals the next reads of that shell end in, in order, before [`Self::self_shells`]
+    /// answers: a read that failed before the host answered (`terminal-unread`, `roster`).
+    self_shell_refusals: Mutex<VecDeque<&'static str>>,
     /// Every crash-rule relaunch asked ([`Acts::self_relaunch`]): the tab,
     /// the line, the cause.
     self_relaunched: Mutex<Vec<SelfRelaunched>>,
@@ -8107,7 +8110,8 @@ impl Acting {
             acts: Acts {
                 observe_snapshot: Arc::new(|_| {}),
                 scoped: Arc::new(|_| None),
-                scoped_account: Arc::new(|_, _, _| false),
+                scoped_restart: Arc::new(|_, _, _, _| false),
+                reprove_claims: Arc::new(|| {}),
                 tap_born: Arc::new(|_| None),
                 account_screen_wall: Arc::new(|_, _| None),
                 open: Arc::new(move |sid| {
@@ -8372,8 +8376,11 @@ impl Acting {
                 self_snapshot: {
                     let a = Arc::clone(&a25b);
                     Arc::new(move |sid, copy, resume| {
-                        let shell = *a.self_shells.lock().unwrap().get(sid)?;
-                        Some(relaunch::snapshot_of_copy(sid, copy, resume, shell, None))
+                        if let Some(why) = a.self_shell_refusals.lock().unwrap().pop_front() {
+                            return Err(SnapshotRefusal::of(why));
+                        }
+                        let shell = *a.self_shells.lock().unwrap().get(sid).ok_or(NO_AGENT)?;
+                        Ok(relaunch::snapshot_of_copy(sid, copy, resume, shell, None))
                     })
                 },
                 self_idle: {
@@ -11737,14 +11744,18 @@ fn a_scoped_kimi_wall_needs_no_builtin_snapshot() {
         })
     });
     let pid = std::process::id();
+    // An account move reaches only a claim granted `accounts` (contract 4).
+    let mut granted = crate::session_timeline::scoped_input_tests::scoped(&[
+        aterm_agent::harness::contract::Scope::Relaunch,
+        aterm_agent::harness::contract::Scope::Accounts,
+    ]);
+    granted.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
     let scoped = crate::harness_claim::Scoped {
         proven: crate::self_claim::Proven {
             pid,
             start: aterm_agent::harness::restart_stamp::kernel_start(pid).unwrap(),
         },
-        ..crate::session_timeline::scoped_input_tests::scoped(&[
-            aterm_agent::harness::contract::Scope::Relaunch,
-        ])
+        ..granted
     };
     kimi.hooks.acts.scoped = Arc::new(move |_| Some(scoped.clone()));
     a.wall(ACCT_TALK_A, ACCT_NOW - 10);
@@ -11765,7 +11776,11 @@ fn a_scoped_kimi_wall_needs_no_builtin_snapshot() {
         kimi.account(usage_wall()),
         Some(AccountAdvice::Move { to, .. }) if to == "work-2"
     ));
-    kimi.hooks.acts.scoped_account = Arc::new(|_, _, _| true);
+    kimi.hooks.acts.scoped_restart = Arc::new(
+        |_: &str, cause: &str, account: Option<&accounts_pool::LoginEnv>, model: Option<&str>| {
+            cause == "account" && account.is_some() && model.is_none()
+        },
+    );
     assert_eq!(
         kimi.restart_once(&Restart::Account {
             to: "work-2".to_string(),
@@ -11783,17 +11798,28 @@ fn a_scoped_account_move_waits_for_the_childs_login_claim() {
     let ctx = Arc::clone(&handle.ctx);
     let sid = handle.sid.as_str().to_string();
     store.write().unwrap().register(handle);
-    crate::session_timeline::scoped_input_tests::install(
+    // An account move reaches only a claim granted `accounts` (contract 4).
+    let granted = || {
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[
+            aterm_agent::harness::contract::Scope::Relaunch,
+            aterm_agent::harness::contract::Scope::Accounts,
+        ]);
+        scoped.claim.contract = aterm_agent::harness::contract::UNIVERSAL;
+        scoped
+    };
+    crate::session_timeline::claim_supervisor_scoped(
         &ctx,
-        71,
-        &[aterm_agent::harness::contract::Scope::Relaunch],
-    );
+        "grok-alab@4242",
+        Some(71),
+        granted(),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the harness's claim");
     let announced = ctx.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(25));
-        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(&[
-            aterm_agent::harness::contract::Scope::Relaunch,
-        ]);
+        let mut scoped = granted();
         scoped.claim.login = Some("work".to_string());
         crate::session_timeline::claim_supervisor_scoped(
             &announced,
@@ -11805,15 +11831,16 @@ fn a_scoped_account_move_waits_for_the_childs_login_claim() {
         )
         .expect("the child's account claim");
     });
-    assert!(scoped_account_now(
+    assert!(scoped_restart_now(
         &store,
         &sid,
         "account",
-        &accounts_pool::LoginEnv {
+        Some(&accounts_pool::LoginEnv {
             label: "work".to_string(),
             var: "KIMI_CODE_HOME",
             value: Some(crate::test_host::abs("/tmp/account home")),
-        }
+        }),
+        None,
     ));
     let rows = ctx.timeline.lock().unwrap().view_copy(None, 0).rows();
     let payload = format!(
@@ -11824,6 +11851,93 @@ fn a_scoped_account_move_waits_for_the_childs_login_claim() {
         rows.last().map(|row| (row.kind, row.payload.as_ref())),
         Some((crate::restart_act::RESTART_EVENT, payload.as_str()))
     );
+}
+
+/// HX-06 EXIT TEST: AN ACCOUNT MOVE AND A MODEL RESTART REACH ANY RELAUNCH CLAIMANT. A Grok
+/// Build tab whose harness holds a contract 4 claim of `accounts` alone (no `relaunch`) is moved
+/// between accounts by its harness (the scoped lane is the restart lane, as Kimi Code's was), and
+/// a model restart reaches it as `cause=model` with the model in its own word; with `relaunch`
+/// alone (contract 3) the same holds. NEGATIVE CONTROLS: a claim of `approvals` alone hears
+/// neither (the built-in lane stays), and before HX-06 only a Kimi Code tab's scoped harness heard
+/// an account move and no scoped harness heard a model.
+#[test]
+fn an_account_move_and_a_model_restart_reach_any_relaunch_claimant() {
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
+    /// Each restart the scoped lane heard: its cause, the account it moves to and its model.
+    type Heard = Vec<(String, Option<String>, Option<String>)>;
+    let told: Arc<Mutex<Heard>> = Arc::default();
+    let worker = |duties: &[Scope], contract: u32| {
+        let a = Accts::new();
+        let mut grok = a.worker("s-grok-scoped", &on());
+        grok.agent = Program::Grok;
+        let mut scoped = crate::session_timeline::scoped_input_tests::scoped(duties);
+        scoped.claim.contract = contract;
+        grok.hooks.acts.scoped = Arc::new(move |_| Some(scoped.clone()));
+        let heard = Arc::clone(&told);
+        grok.hooks.acts.scoped_restart = Arc::new(
+            move |_: &str,
+                  cause: &str,
+                  account: Option<&accounts_pool::LoginEnv>,
+                  model: Option<&str>| {
+                heard.lock().unwrap().push((
+                    cause.to_string(),
+                    account.map(|env| env.label.clone()),
+                    model.map(str::to_string),
+                ));
+                true
+            },
+        );
+        (a, grok)
+    };
+    let account = Restart::Account {
+        to: "work-2".to_string(),
+        at: AccountAt::Wall,
+    };
+    let model = Restart::Model {
+        to: "grok-4-fast".to_string(),
+    };
+    for (duties, contract) in [
+        (&[Scope::Accounts][..], UNIVERSAL),
+        (&[Scope::Relaunch][..], 3),
+    ] {
+        told.lock().unwrap().clear();
+        let (_a, grok) = worker(duties, contract);
+        assert!(
+            grok.can_restart(),
+            "{duties:?}: the scoped harness is the lane"
+        );
+        assert!(aterm_agent::supervise::IdleHost::scoped_restart(
+            &grok, &account
+        ));
+        assert!(aterm_agent::supervise::IdleHost::scoped_restart(
+            &grok, &model
+        ));
+        assert_eq!(grok.account_wall(), "scoped");
+        assert_eq!(
+            grok.restart_once(&model).as_deref(),
+            Some("relaunched:scoped-model"),
+            "{duties:?}"
+        );
+        assert_eq!(
+            told.lock().unwrap().as_slice(),
+            [("model".to_string(), None, Some("grok-4-fast".to_string()))],
+            "{duties:?}: the model rides in model=, never as an account"
+        );
+        let _ = grok.restart_once(&Restart::ModelBack { to: None });
+        assert_eq!(
+            told.lock().unwrap().len(),
+            1,
+            "{duties:?}: a move back naming no model is not sent"
+        );
+    }
+    let (_a, grok) = worker(&[Scope::Approvals], UNIVERSAL);
+    assert!(!aterm_agent::supervise::IdleHost::scoped_restart(
+        &grok, &account
+    ));
+    assert!(!aterm_agent::supervise::IdleHost::scoped_restart(
+        &grok, &model
+    ));
+    assert_ne!(grok.account_wall(), "scoped");
 }
 
 #[test]
@@ -17536,6 +17650,8 @@ fn accounts_use_lets_a_relaunch_that_never_read_read_once() {
                 ..Sample::default()
             },
             walls: vec![(accounts::WEEK_LIMIT, Some(wall_end))],
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let used = ColdUse::default();
@@ -31541,6 +31657,135 @@ impl Drop for RealAgent {
     }
 }
 
+/// HX-06 EXIT TEST: A RESTART IGNORED PAST THE STALL BOUND IS TERM THEN KILL
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2). A harness proven on its tab's real pty,
+/// holding `relaunch` under contract 3 (no kept child), is asked to restart: aterm sends it the
+/// `restart` event and nothing else. The stand-in ignores the event and its `SIGTERM` (`trap ''
+/// TERM`); past the policy's `stall_term_after_s` (shortened here) aterm sends `SIGTERM`, then, at
+/// the act's deadline, `SIGKILL`, which ends it. NEGATIVE CONTROLS: a harness that releases its
+/// claim within the bound, and one that announces the very same claim again within it (what an
+/// obeying harness does after its child restarts: a renewal in place that keeps the revision), are
+/// let go and still run past the bound and the deadline; a person's hold placed within the bound
+/// keeps the `SIGTERM` back while it stands, and the harness is ended once it lifts. Before HX-06's
+/// fixes the same-words claim, keeping the revision, read as ignoring the restart, and the hold was
+/// not read before the `SIGTERM`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_restart_ignored_past_the_stall_bound_is_term_then_kill() {
+    use std::os::unix::process::ExitStatusExt as _;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Case {
+        Ignores,
+        Releases,
+        ClaimsAgain,
+        Held,
+    }
+    let bound = Duration::from_millis(400);
+    let deadline = Duration::from_secs(2);
+    for (n, case) in [Case::Ignores, Case::Releases, Case::ClaimsAgain, Case::Held]
+        .into_iter()
+        .enumerate()
+    {
+        let n = n as u64;
+        let agent = RealAgent::spawn(true, 7390 + n);
+        let (a, _host) = agent.world();
+        let conn = 91 + n;
+        let holder = format!("grok-alab@{}", agent.pid);
+        let scoped = crate::harness_claim::Scoped {
+            proven: crate::self_claim::Proven {
+                pid: agent.upid(),
+                start: agent.start.clone(),
+            },
+            ..crate::session_timeline::scoped_input_tests::scoped(&[
+                aterm_agent::harness::contract::Scope::Relaunch,
+            ])
+        };
+        let claim = || {
+            crate::session_timeline::claim_supervisor_scoped(
+                &agent.ctx,
+                &holder,
+                Some(conn),
+                scoped.clone(),
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("the harness's claim")
+        };
+        let revision = || agent.ctx.meta.lock().unwrap().supervisor_revision;
+        claim();
+        let _bound = crate::restart_act::stall_bound_for_test(bound);
+        let _deadline = crate::restart_act::deadline_for_test(deadline);
+        let asked = Instant::now();
+        assert_eq!(
+            agent.restart(&a, &format!("pid={}", agent.pid)),
+            format!("OK restarting pid {} cause=asked\n", agent.pid),
+            "{case:?}"
+        );
+        let event = agent
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .view_copy(None, 0)
+            .rows()
+            .iter()
+            .rev()
+            .find(|row| row.kind == crate::restart_act::RESTART_EVENT)
+            .map(|row| row.payload.to_string());
+        assert_eq!(event.as_deref(), Some("cause=asked"), "{case:?}");
+        let let_go = |what: &str| {
+            std::thread::sleep(bound + deadline + Duration::from_millis(500));
+            assert!(agent.ended().is_none(), "{case:?}: {what}");
+            assert!(
+                !crate::restart_act::escalating(agent.pid),
+                "{case:?}: no watch stands for it"
+            );
+        };
+        match case {
+            Case::Ignores => {}
+            Case::Releases => {
+                assert!(crate::session_timeline::release_supervisor(
+                    &agent.ctx,
+                    Some(conn),
+                    crate::metrics::now_us(),
+                    aterm_slog::Actor::Ctl,
+                ));
+                let_go("a harness that obeyed by leaving is let go");
+                continue;
+            }
+            Case::ClaimsAgain => {
+                let before = revision();
+                claim();
+                assert_eq!(revision(), before, "the same words renew in place");
+                let_go("a harness that claimed again after its restart is let go");
+                continue;
+            }
+            Case::Held => {
+                assert!(crate::fabric::apply_hold_for_test(
+                    agent.ctx.as_ref(),
+                    Some(crate::fabric::Hold {
+                        reason: "-".into(),
+                        origin: "local".into(),
+                    })
+                ));
+                std::thread::sleep(bound + deadline + Duration::from_millis(500));
+                assert!(agent.ended().is_none(), "the hold keeps the SIGTERM back");
+                assert!(crate::fabric::apply_hold_for_test(agent.ctx.as_ref(), None));
+            }
+        }
+        until("the deaf harness ends", || agent.ended().is_some());
+        assert!(
+            asked.elapsed() >= bound,
+            "nothing is sent before the stall bound"
+        );
+        assert_eq!(
+            agent.ended().and_then(|status| status.signal()),
+            Some(libc::SIGKILL),
+            "{case:?}: its SIGTERM ignored, SIGKILL ends it"
+        );
+    }
+}
+
 /// Who an unasked `SIGTERM`'s exit is, in [`unasked_term`]'s world.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32407,6 +32652,7 @@ fn the_real_restart_verb_sends_claude_code_alab_a_restart_event_and_no_signal() 
                     start: agent.start.clone(),
                 },
                 claim,
+                child: None,
             },
             crate::metrics::now_us(),
             aterm_slog::Actor::Ctl,
@@ -47637,6 +47883,135 @@ fn a_self_supervised_crash_no_snapshot_read_reached_is_relaunched_at_the_tabs_sh
     );
 }
 
+/// LS-15: A CRASH'S SHELL NOT READ IS NOT "NO SHELL". The crash rule reads the shell holding the
+/// tab of a crashed codex-alab no snapshot read reached. A read that failed before the host
+/// answered (the process table held past its wait: `terminal-unread`; no roster: `roster`) says
+/// nothing of the tab: the relaunch's attempts read it again and type the copy's line once a
+/// shell is read, and nothing says the agent was its tab's own program. NEGATIVE CONTROL: every
+/// refusal of that read was taken for no shell, so the first unread one left the crashed agent
+/// for good with that word, and the first run's line was never typed. CONTROL: a read the host
+/// does answer with no shell, after one it did not, still ends the relaunch, by the refusal a
+/// tab's own program gets.
+#[test]
+fn a_self_supervised_crash_whose_shell_was_not_read_is_read_again_not_left() {
+    let line = vec![
+        "/u/.aterm/agents/codex".to_string(),
+        "resume".to_string(),
+        "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
+    ];
+    let dead = gone_pid();
+    let informed = |a: &Acting| {
+        a.notes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|n| match n {
+                HostNote::Inform { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+    };
+    let refused = |a: &Acting| {
+        a.notes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|n| match n {
+                HostNote::Relaunch {
+                    said: RelaunchSay::Cannot { reason, .. },
+                    ..
+                } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+    };
+    let run = |sid: &str, unread: &[&'static str], shell: Option<u32>| {
+        let a = Arc::new(Acting::default());
+        a.unreadable.store(true, Ordering::SeqCst);
+        a.open.lock().unwrap().insert(sid.to_string());
+        if let Some(shell) = shell {
+            a.self_shells.lock().unwrap().insert(sid.to_string(), shell);
+        }
+        a.self_shell_refusals
+            .lock()
+            .unwrap()
+            .extend(unread.iter().copied());
+        a.set(&[(sid, Program::Codex)]);
+        let copy = self_copy(&a, sid, self_claimed::Seen::Never, Ok(line.clone()));
+        a.self_copies.lock().unwrap().insert(sid.to_string(), copy);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("attached", || host.live() == [sid]);
+        a.claims
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), format!("codex-alab@{dead}"));
+        a.proven.lock().unwrap().insert(sid.to_string());
+        a.set(&[]);
+        until("the exit decided", || {
+            !a.self_relaunched.lock().unwrap().is_empty()
+                || !informed(&a).is_empty()
+                || !refused(&a).is_empty()
+        });
+        host.shutdown_and_join();
+        a
+    };
+    let a = run(
+        "s-selfclaim-shell-unread",
+        &["terminal-unread", "roster"],
+        Some(4141),
+    );
+    assert_eq!(
+        a.self_relaunched.lock().unwrap().as_slice(),
+        [("s-selfclaim-shell-unread".to_string(), line.clone(), None)],
+        "relaunched once its shell was read: {:?}",
+        informed(&a)
+    );
+    assert!(
+        a.self_shell_refusals.lock().unwrap().is_empty(),
+        "each unread read was asked again"
+    );
+    assert!(
+        informed(&a).iter().all(|text| !text.contains("no shell")) && refused(&a).is_empty(),
+        "an unread shell is never said to be none: {:?} {:?}",
+        informed(&a),
+        refused(&a)
+    );
+    let a = run("s-selfclaim-shell-unread-then-none", &["roster"], None);
+    assert!(a.self_relaunched.lock().unwrap().is_empty());
+    assert_eq!(
+        refused(&a),
+        ["it ran as its tab's own program, with no shell to come back in"],
+        "answered at the read after the unread one: {:?}",
+        informed(&a)
+    );
+    // The self-claimed read's own `no-shell` (its shell read and not holding the tab) is the
+    // host's answer: the crash settles at once and is told, as one with no shell always was,
+    // never read again for good (a `shell-unread`, its ids not read, is).
+    let a = run("s-selfclaim-no-shell", &["no-shell"], Some(4141));
+    assert!(a.self_relaunched.lock().unwrap().is_empty());
+    let told = informed(&a);
+    assert!(
+        told.len() == 1
+            && told[0].ends_with(
+                "crashed and is not relaunched: it was this tab's own program, with no shell \
+                 to start it again at"
+            ),
+        "settled at the answer: {told:?} {:?}",
+        refused(&a)
+    );
+    let a = run(
+        "s-selfclaim-shell-ids-unread",
+        &["shell-unread"],
+        Some(4141),
+    );
+    assert_eq!(
+        a.self_relaunched.lock().unwrap().as_slice(),
+        [("s-selfclaim-shell-ids-unread".to_string(), line, None)],
+        "a shell whose ids were not read is read again: {:?}",
+        informed(&a)
+    );
+}
+
 #[test]
 fn an_unread_initial_record_relaunches_only_with_its_validated_line_and_shell() {
     // The copy validates an absolute launch path: Windows' names a drive.
@@ -49084,14 +49459,6 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
     let step = claims::with_table(table.clone(), || {
         idle.restart_once(&move_to("work-2", AccountAt::Wall))
     });
-    if cfg!(not(unix)) {
-        // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
-        // the claim is unrecorded and the move onto a row this home never held is refused, with
-        // no claim row written: the rest is Unix's.
-        assert_eq!(step.as_deref(), Some("wait:account-changed"));
-        assert!(table.rows.lock().unwrap().is_empty(), "no claim row");
-        return;
-    }
     assert_eq!(step.as_deref(), Some("adopted"));
     let work2 = LeaseKey::new("claude", "work2@example.test").unwrap();
     let row = table

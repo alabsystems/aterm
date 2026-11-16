@@ -112,7 +112,8 @@ fn native_copy_readiness_uses_the_same_valid_unicode_ranges_as_copy() {
         (vec![1..4, 5..11, 0..usize::MAX], Some("needle")),
         (vec![0..0, 4..4], None),
     ] {
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.buffer.as_mut().unwrap().selections = ranges
@@ -123,6 +124,7 @@ fn native_copy_readiness_uses_the_same_valid_unicode_ranges_as_copy() {
             })
             .collect();
         crate::control::pbcopy("keep clipboard");
+        drop(route_native_guard);
         assert_eq!(app.native_has_selection(wid), expected.is_some());
         assert_eq!(app.native_selection_text(wid).as_deref(), expected);
         assert_eq!(app.copy_selection(), expected.is_some());
@@ -149,11 +151,13 @@ fn copy_in_a_sibling_editor_tracks_every_edit_of_a_keyboard_macro() {
     text(&mut app, a, "x");
     text(&mut app, a, "y");
     command(&mut app, a, EditorCommand::EndMacro);
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(other_view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(other_view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.buffer.as_mut().unwrap().selections =
         vec![crate::native_editor::Selection { anchor: 2, head: 8 }];
+    drop(route_native_guard);
     assert!(app.copy_selection_in(b));
     assert_eq!(crate::control::pbpaste().as_deref(), Some("needle"));
     command(&mut app, a, EditorCommand::BeginningOfBuffer);
@@ -251,11 +255,13 @@ fn selection_commands_cannot_reach_a_document_behind_an_overlay() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let (view, document) = editor(&mut app, wid, &dir.path().join("one.txt"));
-        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.buffer.as_mut().unwrap().selections =
             vec![crate::native_editor::Selection { anchor: 0, head: 6 }];
+        drop(route_native_guard);
         assert!(
             app.copy_selection(),
             "negative control: a real selection is available"

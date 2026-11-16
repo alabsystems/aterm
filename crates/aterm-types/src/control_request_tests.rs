@@ -15,8 +15,13 @@ fn read(line: &str) -> (Option<Selector<'_>>, &str, &str) {
 /// Of the `s-` words only the exact legacy form (`s-` and 20 lowercase hex digits) is a sid:
 /// the loose forms an earlier grammar took (`s-` and any hex) name nobody.
 #[test]
-fn a_loose_s_dash_word_is_no_sid() {
-    for good in ["s-abcdef0123456789abcd", "s-00000000000000000000"] {
+fn a_sid_is_an_exact_tab_or_legacy_id() {
+    for good in [
+        "tqn5r6e0148",
+        "s-00000000000000000000",
+        "s-0f1e0000000000000000",
+        "s-abcdef0123456789abcd",
+    ] {
         assert_eq!(Sid::parse(good).map(|s| s.as_str()), Some(good), "{good}");
     }
     for bad in [
@@ -24,8 +29,8 @@ fn a_loose_s_dash_word_is_no_sid() {
         "s-",
         "s-0",
         "s-0f1e",
-        "s-abcdef0123456789abc",
-        "s-abcdef0123456789abcde",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
         "S-1",
         "s1",
         "s-g",
@@ -83,8 +88,8 @@ fn selector_parses_the_wire_forms() {
     assert_eq!(Selector::parse("12"), Selector::Local(12));
     assert_eq!(Selector::parse("007"), Selector::Local(7));
     assert_eq!(
-        Selector::parse("t0f1e000000"),
-        Selector::Sid(Sid::parse("t0f1e000000").expect("a sid"))
+        Selector::parse("s-0f1e0000000000000000"),
+        Selector::Sid(Sid::parse("s-0f1e0000000000000000").expect("a sid"))
     );
     let huge = "99999999999999999999";
     assert_eq!(Selector::parse(huge), Selector::Invalid(huge));
@@ -130,7 +135,7 @@ fn send_payload_turns_one_trailing_line_end_into_enter_and_keeps_the_rest() {
 
 #[test]
 fn head_reads_separators_once() {
-    let sid = Selector::Sid(Sid::parse("t1a00000000").expect("a sid"));
+    let sid = Selector::Sid(Sid::parse("s-1a000000000000000000").expect("a sid"));
     assert_eq!(read("text"), (None, "text", ""));
     assert_eq!(read("text --json"), (None, "text", "--json"));
     assert_eq!(read("send  hello"), (None, "send", " hello"));
@@ -138,10 +143,13 @@ fn head_reads_separators_once() {
     assert_eq!(read("  feed-bin 5"), (None, "feed-bin", "5"));
     assert_eq!(read("\tfeed-bin\t5"), (None, "feed-bin", "5"));
     assert_eq!(
-        read("@t1a00000000\tfeed-bin 5"),
+        read("@s-1a000000000000000000\tfeed-bin 5"),
         (Some(sid), "feed-bin", "5")
     );
-    assert_eq!(read("@t1a00000000 \t screen x"), (Some(sid), "screen", "x"));
+    assert_eq!(
+        read("@s-1a000000000000000000 \t screen x"),
+        (Some(sid), "screen", "x")
+    );
     assert_eq!(read("@. text"), (Some(Selector::SelfTok), "text", ""));
     assert_eq!(read("@ text"), (None, "@", "text"));
     assert_eq!(read("@"), (None, "@", ""));
@@ -150,7 +158,7 @@ fn head_reads_separators_once() {
     assert_eq!(read("   "), (None, "", ""));
     assert_eq!(read("text\u{a0}x"), (None, "text\u{a0}x", ""));
     assert_eq!(read("feed-bin\x0b4"), (None, "feed-bin\x0b4", ""));
-    let line = "  @t1a00000000\tsend  hi\r";
+    let line = "  @s-1a000000000000000000\tsend  hi\r";
     let spans = Spans::of(line);
     assert_eq!(spans.head(line), head(line));
     assert_eq!(&line[spans.verb.clone()], "send");
@@ -168,13 +176,27 @@ fn words_split_where_the_head_does() {
 
 #[test]
 fn subscribe_names_one_session_only_by_a_sid() {
+    let (sid, tail) = subscribe_target("@s-1a000000000000000000 screen trim").expect("one sid");
+    assert_eq!(
+        (sid.as_str(), tail),
+        ("s-1a000000000000000000", " screen trim")
+    );
+    let (sid, tail) = subscribe_target("\t@s-1a000000000000000000\tcells").expect("one sid");
+    assert_eq!((sid.as_str(), tail), ("s-1a000000000000000000", "\tcells"));
+    let (sid, tail) = subscribe_target("@tqn5r6e0148 screen trim").expect("one sid");
+    assert_eq!((sid.as_str(), tail), ("tqn5r6e0148", " screen trim"));
+    let (sid, tail) = subscribe_target("\t@tqn5r6e0148\tcells").expect("one sid");
+    assert_eq!((sid.as_str(), tail), ("tqn5r6e0148", "\tcells"));
+    let (sid, tail) = subscribe_target("@t0123456789 screen trim").expect("another sid");
+    assert_eq!((sid.as_str(), tail), ("t0123456789", " screen trim"));
     let (sid, tail) = subscribe_target("@t1a00000000 screen trim").expect("one sid");
     assert_eq!((sid.as_str(), tail), ("t1a00000000", " screen trim"));
     let (sid, tail) = subscribe_target("\t@t1a00000000\tcells").expect("one sid");
     assert_eq!((sid.as_str(), tail), ("t1a00000000", "\tcells"));
     for local in [
         "@* screen",
-        "@t1a00000000,t2b00000000 screen",
+        "@tqn5r6e0148,t0123456789 screen",
+        "@s-1a000000000000000000,s-2b000000000000000000 screen",
         "@s-1a screen",
         "@. screen",
         "@ screen",
@@ -182,6 +204,8 @@ fn subscribe_names_one_session_only_by_a_sid() {
         "@self screen",
         "@T1A00000000 screen",
         "@t1A00000000 screen",
+        "@S-1A screen",
+        "@s-1A screen",
         "screen",
         "",
     ] {

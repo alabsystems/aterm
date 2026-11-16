@@ -342,6 +342,7 @@ impl App {
         let armed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .is_some_and(|card| card.arm_stop_on(session, controller));
         if !armed {
@@ -358,9 +359,11 @@ impl App {
         session: u64,
     ) -> Result<(), String> {
         self.open_overview_on(wid)?;
-        if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
-            && card.select_session(session)
-        {
+        let changed = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+            ws.overview_mut()
+                .is_some_and(|card| card.select_session(session))
+        });
+        if changed {
             self.repaint_overview_pointer(wid, true);
         }
         self.raise_window(wid);
@@ -409,11 +412,14 @@ impl App {
         self.agents.overview_read_at = Some(std::time::Instant::now());
         let mut moved = false;
         for wid in open {
-            if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
-                && (card.retarget(groups.clone(), manages.clone())
-                    | card.set_elsewhere(elsewhere)
-                    | card.set_fabric(fabric.clone()))
-            {
+            let changed = self.windows.get_mut(&wid).is_some_and(|mut ws| {
+                ws.overview_mut().is_some_and(|card| {
+                    card.retarget(groups.clone(), manages.clone())
+                        | card.set_elsewhere(elsewhere)
+                        | card.set_fabric(fabric.clone())
+                })
+            });
+            if changed {
                 moved = true;
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                     w.request_redraw();
@@ -446,7 +452,13 @@ impl App {
         let (groups, manages) = self.overview_parts();
         let elsewhere = self.sessions_elsewhere();
         let fabric = self.overview_fabric_group();
-        if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut()) {
+        if let Some(route_guard_card) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.overview_mut())
+        {
+            let card = &mut *route_guard_card;
             let _ = card.retarget(groups, manages);
             let _ = card.set_elsewhere(elsewhere);
             let _ = card.set_fabric(fabric);
@@ -459,7 +471,13 @@ impl App {
 
     /// Move the cursor by `delta` over the items.
     pub(crate) fn overview_move(&mut self, wid: WindowId, delta: isize) {
-        if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut()) {
+        if let Some(route_guard_card) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.overview_mut())
+        {
+            let card = &mut *route_guard_card;
             card.move_selection(delta);
         }
         self.repaint_overview_pointer(wid, true);
@@ -470,6 +488,7 @@ impl App {
         let close = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .is_some_and(OverviewState::escape);
         if close {
@@ -520,8 +539,13 @@ impl App {
                     .stop_worker_refusal(local)
                     .filter(|why| matches!(why, StopRefused::Halted(_)))
                 {
-                    if let Some(card) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
+                    if let Some(route_guard_card) = self
+                        .windows
+                        .get_mut(&wid)
+                        .as_deref_mut()
+                        .and_then(|ws| ws.overview_mut())
                     {
+                        let card = &mut *route_guard_card;
                         card.cancel_confirm();
                     }
                     self.stop_worker_refused(local, why);
@@ -537,6 +561,7 @@ impl App {
         let act = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .map(OverviewState::activate);
         if let Some(act) = act {
@@ -549,6 +574,7 @@ impl App {
         let act = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .map(|card| match key {
                 OverviewKey::TakeOver => card.take_over_pressed(),
@@ -770,6 +796,7 @@ impl App {
         let changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .is_some_and(|card| card.pointer_hover(hit));
         self.repaint_overview_pointer(wid, changed);
@@ -780,6 +807,7 @@ impl App {
         let changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .is_some_and(|card| card.pointer_press(hit));
         self.repaint_overview_pointer(wid, changed);
@@ -791,6 +819,7 @@ impl App {
         let (changed, activate) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .map_or((false, false), |card| card.pointer_release(hit));
         self.repaint_overview_pointer(wid, changed);
@@ -804,6 +833,7 @@ impl App {
         let changed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.overview_mut())
             .is_some_and(|card| card.scroll_by(delta));
         self.repaint_overview_pointer(wid, changed);

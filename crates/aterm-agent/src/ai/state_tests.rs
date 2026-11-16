@@ -579,6 +579,7 @@ fn a_row_aterm_cannot_sign_in_unattended_is_a_persons_with_the_step_only_a_perso
             outcome: "no-route",
             routes: "profile(none) mailbox(none configured)".into(),
             since: NOW - 7200,
+            for_a_person: false,
         }),
         ..accounts(Some("expired"))
     });
@@ -697,12 +698,12 @@ fn a_row_whose_sign_in_starts_nothing_names_what_a_person_does_instead() {
 /// agent's run never reloads the vendor's page. NEGATIVE: a `no-route` record (which a route
 /// found since makes stale), a bot check older than the hold, and no record hold nothing.
 #[test]
-fn a_failed_sign_in_or_a_bot_check_on_record_holds_the_row_for_the_upkeep() {
-    use crate::ai::connector::KIMI;
+fn a_failed_sign_in_on_record_holds_the_row_for_the_upkeep() {
     let tried = |outcome| crate::ai::facts::Tried {
         outcome,
         routes: "profile: the sign-in did not finish; profile(ready)".into(),
         since: NOW - 600,
+        for_a_person: false,
     };
     let mut claude = facts(&CLAUDE);
     claude.accounts = Some(ClaudeAccounts {
@@ -722,17 +723,81 @@ fn a_failed_sign_in_or_a_bot_check_on_record_holds_the_row_for_the_upkeep() {
     assert_eq!(held(&claude, NOW), None, "NEGATIVE: no-route");
     claude.accounts.as_mut().expect("view").tried = None;
     assert_eq!(held(&claude, NOW), None, "NEGATIVE: nothing on record");
+}
 
+/// A VENDOR ROW A BOT PROTECTION STOPPED IS PROMISED NO RETRY, ON ANY CLOCK: its account's check
+/// on record ([`crate::ai::facts::CliAccounts::check_at`]) holds it past the upkeep's six hours
+/// and a day on, and [`held`] names the person's step, the CLI's own sign-in, never the upkeep's
+/// backoff. NEGATIVE: with no check on record nothing is held.
+#[test]
+fn a_vendor_row_a_bot_protection_stopped_is_held_for_a_person_not_a_retry() {
+    use crate::ai::connector::KIMI;
     let hold = crate::harness::accounts_sync::PERSON_BACKOFF_SECS;
-    let mut kimi = facts(&KIMI);
-    kimi.pool = Some(crate::ai::facts::CliAccounts {
-        next: Some("kimi-one".to_string()),
-        bot_check_at: Some(NOW - hold + 60),
-        ..crate::ai::facts::CliAccounts::default()
+    for (connector, label, step) in [
+        (
+            &KIMI,
+            "kimi-one",
+            "a person runs `aterm harness accounts login kimi-one --cli kimi` in a terminal",
+        ),
+        (
+            &CODEX,
+            "codex-one",
+            "a person runs `aterm harness accounts login codex-one --cli codex` in a terminal",
+        ),
+    ] {
+        let mut vendor = facts(connector);
+        for ago in [60, hold + 60, 25 * 60 * 60] {
+            vendor.pool = Some(crate::ai::facts::CliAccounts {
+                next: Some(label.to_string()),
+                check_at: Some(NOW - ago),
+                ..crate::ai::facts::CliAccounts::default()
+            });
+            let said = held(&vendor, NOW).expect("held for a person");
+            assert!(said.contains(step), "{ago} s on: {said}");
+            assert!(
+                !said.contains("tries again") && !said.contains("retries"),
+                "{said}"
+            );
+        }
+        vendor.pool.as_mut().expect("pool").check_at = None;
+        assert_eq!(held(&vendor, NOW), None, "NEGATIVE: no check on record");
+    }
+}
+
+/// A CLAUDE ROW A BOT PROTECTION STOPPED IS PROMISED NO RETRY: nothing signs it in again with
+/// nobody at this Mac (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3), so [`held`] names
+/// the person's step, never the upkeep's backoff. CONTROL: a stop no bot protection made, and a
+/// plain failure, are still the upkeep's to retry.
+#[test]
+fn a_check_stopped_claude_row_is_held_for_a_person_not_a_retry() {
+    let tried = |outcome, for_a_person| crate::ai::facts::Tried {
+        outcome,
+        routes: "mailbox: it met Cloudflare's bot check".into(),
+        since: NOW - 600,
+        for_a_person,
+    };
+    let mut claude = facts(&CLAUDE);
+    claude.accounts = Some(ClaudeAccounts {
+        pool_picks: false,
+        tried: Some(tried("blocked", true)),
+        ..accounts(Some("expired"))
     });
-    assert!(held(&kimi, NOW).is_some());
-    kimi.pool.as_mut().expect("pool").bot_check_at = Some(NOW - hold);
-    assert_eq!(held(&kimi, NOW), None, "NEGATIVE: past the hold");
+    let said = held(&claude, NOW).expect("the row is held");
+    assert!(
+        said.contains(
+            "a person runs `aterm harness accounts renew main` in a terminal on this Mac"
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("retries"), "{said}");
+    for (outcome, for_a_person) in [("blocked", false), ("failed", false)] {
+        claude.accounts.as_mut().expect("view").tried = Some(tried(outcome, for_a_person));
+        let said = held(&claude, NOW).expect("CONTROL: held for the upkeep");
+        assert!(
+            said.ends_with("the window's upkeep retries it on its own backoff"),
+            "{outcome}: {said}"
+        );
+    }
 }
 
 /// A SIGNED-OUT ROW SAYS WHAT ATERM'S OWN SIGN-IN OF IT LAST CAME TO, where it failed and stands
@@ -746,6 +811,7 @@ fn a_signed_out_row_says_what_aterms_sign_in_tried() {
             outcome: "no-route",
             routes: "profile(none) mailbox(none configured) vault(sync failed: exit 1)".into(),
             since: NOW - 7200,
+            for_a_person: false,
         }),
         ..accounts(Some("expired"))
     });

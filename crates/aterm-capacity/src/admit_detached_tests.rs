@@ -17,6 +17,7 @@ fn held(accounting: Accounting) -> Record {
         accounting,
         pid: OWNER,
         start_ms: 1,
+        laid_at: None,
         seq: 0,
         checkout: "/original".into(),
         need: Need::new("original GUI memory").mem_gib(2),

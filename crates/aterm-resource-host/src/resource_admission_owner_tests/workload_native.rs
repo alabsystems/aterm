@@ -261,11 +261,12 @@ fn run_case(case: &str) {
         .env(ROLE, "host")
         .env(STORE, &path)
         .env(CASE, case);
-    // Setup, protocol execution, retirement and scratch removal are separate
-    // completed stages. Their aggregate is not a one-minute latency budget.
-    let result = deadline::output_while_progressing(&mut command, HANG, &mut || {
-        fs::metadata(path.join("progress")).map_or(0, |file| file.len())
-    });
+    // Include native work between completed fixture stages in the hang detector.
+    let result = deadline::output_while_process_progressing(
+        &mut command,
+        HANG,
+        format!("original workload host {case}"),
+    );
     let output = match result {
         Ok(output) => output,
         Err(error) => panic!(

@@ -13,10 +13,15 @@ use std::net::Shutdown;
 pub struct ServiceFrontend(Arc<Frontend>);
 struct Frontend {
     state: Weak<Mutex<State>>,
-    controller: frontend_control::FrontendIdentity,
+    controller: Arc<frontend_control::FrontendIdentity>,
     scope: crate::harness::account_work::Scope,
 }
 impl ServiceFrontend {
+    /// Comparison-only identity of this issued controller. It retains no App
+    /// request scope and supplies no currentness, foreground or SDK permission.
+    pub fn identity(&self) -> ServiceIdentity {
+        ServiceIdentity(Arc::clone(&self.0.controller))
+    }
     /// Recheck the independent control allocation and actual request scope.
     ///
     /// # Errors
@@ -34,6 +39,17 @@ impl ServiceFrontend {
     /// Only original connection closure permits disposal of replay custody.
     pub fn retired(&self) -> bool {
         self.0.controller.retired()
+    }
+}
+
+/// Opaque native identity for comparing constructor intents. Never a grant or a
+/// serialized principal; operations still require a current ServiceFrontend.
+#[derive(Clone)]
+pub struct ServiceIdentity(Arc<frontend_control::FrontendIdentity>);
+impl ServiceIdentity {
+    /// Compare original namespace, process incarnation, connection and allocation.
+    pub fn same(&self, other: &Self) -> bool {
+        self.0.same_requester(&other.0)
     }
 }
 impl Registry {
@@ -64,7 +80,7 @@ impl Registry {
         }
         let frontend = ServiceFrontend(Arc::new(Frontend {
             state: Arc::downgrade(&self.state),
-            controller: identity,
+            controller: Arc::new(identity),
             scope: scope.clone(),
         }));
         frontend.current()?;

@@ -36,7 +36,7 @@ impl History {
             ignored: 0,
         };
         for evidence in store.metadata_evidence(session)? {
-            if evidence.cutoff {
+            if evidence.is_table_control() {
                 continue;
             }
             let Some(record) = evidence.record else {

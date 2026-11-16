@@ -87,6 +87,135 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
     );
 }
 
+/// THE CLAUDE CODE LANE'S REFUSAL IS THE TAB'S ANSWER ONLY WHERE WHAT IT RESTS ON WAS READ
+/// (LS-15): a program not named Claude Code's whose image was not read is `exe-unreadable`, and
+/// one whose own session record was not read (a write in progress) is `records-unread`; both are
+/// unread, never `not-claude`. The reverse holds too: a process its own arguments or its image
+/// name is read as Claude Code with the other facts unread. CONTROLS: the same program with its
+/// image and record both read is the answer `not-claude` where nothing names it, and Claude
+/// Code where its record registers it.
+#[cfg(unix)]
+#[test]
+fn a_program_is_no_claude_code_only_where_its_image_and_record_were_read() {
+    let home = aterm_tempfile::tempdir().expect("scratch home");
+    let native = &super::super::agent_image::claude_versions(home.path());
+    let other = words(&["/s/cc-2.1", "--verbose"]);
+    let image = Path::new("/s/cc-2.1");
+    let program = |image: Option<&Path>, registered: Result<bool, NotRead>| {
+        claude_program(&other, image, native, registered).map(|(program, _)| program)
+    };
+    assert_eq!(
+        program(Some(image), Ok(false)),
+        Err("not-claude"),
+        "CONTROL: image and record read, and nothing names it"
+    );
+    assert_eq!(
+        program(Some(image), Ok(true)),
+        Ok(image.to_path_buf()),
+        "CONTROL: its record, read, registers it"
+    );
+    assert_eq!(program(Some(image), Err(NotRead)), Err(RECORDS_UNREAD));
+    for registered in [Ok(false), Ok(true), Err(NotRead)] {
+        assert_eq!(
+            program(None, registered),
+            Err(EXE_UNREADABLE),
+            "no image read ({registered:?}): no record names a program to run"
+        );
+    }
+    for why in [EXE_UNREADABLE, RECORDS_UNREAD] {
+        assert_eq!(SnapshotRefusal::of(why), SnapshotRefusal::Unread(why));
+    }
+    assert_eq!(
+        SnapshotRefusal::of("not-claude"),
+        SnapshotRefusal::Answered("not-claude")
+    );
+    let named = Path::new("/s/claude");
+    assert_eq!(
+        program(Some(named), Err(NotRead)),
+        Ok(named.to_path_buf()),
+        "its image names it: its record is not needed"
+    );
+    let npm = words(&["node", "/usr/local/bin/claude", "-c"]);
+    assert_eq!(
+        claude_program(&npm, None, native, Err(NotRead)).map(|(program, _)| program),
+        Ok(PathBuf::from("/usr/local/bin/claude")),
+        "its arguments name it: neither its image nor its record is needed"
+    );
+}
+
+/// THE ONE LAYOUT READ THAT NAMES THE PROGRAM ALSO SAYS WHY NONE IS NAMED (LS-72): a native
+/// install whose image is named by its version (not `claude`) and whose record does not
+/// register it is Claude Code only by its vendor layout. Where that read is not made, the lane
+/// refuses `layout-unread` (unread), never the answer `not-claude`, however a later read of the
+/// same layout would answer: the layout is read once. NEGATIVE CONTROL (by hand, run): with
+/// `claude_program_by` naming the program from one layout read and classifying its refusal
+/// from a second, a layout that fails once and then answers that it is Claude Code's gives
+/// `not-claude`, and the read count is 2. CONTROLS: the layout read and answering is the
+/// program, or `not-claude`; an image or record unread keeps its own code.
+#[test]
+fn a_layout_not_read_is_never_the_answer_that_a_program_is_no_claude_code() {
+    let native = Path::new("/s/home/.local/share/claude/versions");
+    let image = Path::new("/s/home/.local/share/claude/versions/2.1.399");
+    let argv = words(&["claude", "--verbose"]);
+    // A layout that fails its first read and answers every later one with `then`.
+    let program = |registered: Result<bool, NotRead>, then: bool| {
+        let mut reads = 0_usize;
+        let got = claude_program_by(&argv, Some(image), registered, &mut |exe| {
+            assert_eq!(exe, image, "the layout read is of the image");
+            reads += 1;
+            if reads == 1 { Err(NotRead) } else { Ok(then) }
+        })
+        .map(|(program, _)| program);
+        (got, reads)
+    };
+    assert_eq!(
+        program(Ok(false), true),
+        (Err(LAYOUT_UNREAD), 1),
+        "the first layout read failed: a later one that would name it is not made"
+    );
+    assert_eq!(program(Ok(false), false), (Err(LAYOUT_UNREAD), 1));
+    assert_eq!(program(Err(NotRead), true), (Err(RECORDS_UNREAD), 1));
+    assert_eq!(
+        SnapshotRefusal::of(LAYOUT_UNREAD),
+        SnapshotRefusal::Unread(LAYOUT_UNREAD)
+    );
+    let answered = |laid: bool| {
+        let mut reads = 0_usize;
+        let got = claude_program_by(&argv, Some(image), Ok(false), &mut |_| {
+            reads += 1;
+            Ok(laid)
+        })
+        .map(|(program, _)| program);
+        (got, reads)
+    };
+    assert_eq!(
+        answered(true),
+        (Ok(image.to_path_buf()), 1),
+        "CONTROL: the layout read says it is Claude Code's native install"
+    );
+    assert_eq!(
+        answered(false),
+        (Err("not-claude"), 1),
+        "CONTROL: image, record and layout read, and nothing names it"
+    );
+    let mut reads = 0_usize;
+    assert_eq!(
+        claude_program_by(&argv, Some(image), Ok(true), &mut |_| {
+            reads += 1;
+            Err(NotRead)
+        })
+        .map(|(program, _)| program),
+        Ok(image.to_path_buf()),
+        "CONTROL: its record registers it, so its layout is not read"
+    );
+    assert_eq!(reads, 0);
+    assert_eq!(
+        launched(&argv, Some(image), native, false),
+        None,
+        "CONTROL: no such install on disk: `launched` names nothing"
+    );
+}
+
 /// THE EXIT AN AUTOPILOT CARRIES ([`carried`]): tab 1's exit of 2026-10-27, a Cruise session's
 /// Claude Code ended in order by a `SIGTERM` nobody in aterm sent, its own background work's
 /// occupancy hold open, nobody typing, read off the `status` the tab answers once it publishes
@@ -768,6 +897,7 @@ fn a_snapshot_refusal_is_an_answer_only_where_the_tab_was_read() {
         NO_LANE,
         "not-claude",
         "not-a-tui",
+        "no-shell",
     ] {
         assert_eq!(
             SnapshotRefusal::of(why),
@@ -780,10 +910,13 @@ fn a_snapshot_refusal_is_an_answer_only_where_the_tab_was_read() {
         "no-socket",
         "roster",
         "ids",
+        TERMINAL_UNREAD,
         "argv-unreadable",
         "start",
-        TERMINAL_UNREAD,
         EXE_UNREADABLE,
+        RECORDS_UNREAD,
+        LAYOUT_UNREAD,
+        SHELL_UNREAD,
         "home-unreadable",
         "config-unreadable",
         "files-unreadable",

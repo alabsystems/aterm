@@ -176,12 +176,12 @@ impl App {
         };
         self.windows
             .get_mut(&wid)
-            .is_some_and(|ws| ws.tab_set.set_home(Some(tab)))
+            .is_some_and(|mut ws| ws.tab_set.set_home(Some(tab)))
     }
 
     fn retire_workers_tab(&mut self, wid: WindowId, home: TabId) {
         let views = &self.view_store;
-        let Some(tab) = self.windows.get_mut(&wid).and_then(|ws| {
+        let Some(tab) = self.windows.get_mut(&wid).as_deref_mut().and_then(|ws| {
             let tab = ws.tab_set.remove(home)?;
             align_terminal_projection_to_active(ws, views);
             Some(tab)
@@ -519,12 +519,14 @@ impl App {
             });
         }
         let views = &self.view_store;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         if !reorder_with_projection(ws, views, tab, |tabs| tabs.keep(tab).is_some()) {
             return false;
         }
+        drop(route_guard_ws);
         let sid = self.session_id_text(session).unwrap_or_default();
         aterm_log::info!(
             "workers: @{sid} ({}) kept as a person's tab: its task no longer owns the tab",

@@ -276,6 +276,9 @@ fn a_history_line_carries_its_events_window_figure_and_reset() {
             to: None,
             tab: None,
             harness: None,
+            op: None,
+            via: None,
+            program: None,
         },
         heard: false,
     };
@@ -349,6 +352,9 @@ fn week_quota(t: u64, reset: Option<u64>) -> aterm_db::alab::journal::Event {
         to: None,
         tab: None,
         harness: None,
+        op: None,
+        via: None,
+        program: None,
     }
 }
 

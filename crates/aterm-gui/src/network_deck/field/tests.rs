@@ -63,7 +63,7 @@ fn tally(busy: u16, waiting: u16, walled: u16) -> Option<AgentTally> {
 /// `n` seats shaped like the live lab: every 9th silent, every 13th carried (and so listed
 /// silent too, as [`crate::fleet_glance::carry`] lists it), every 7th busy, every 11th walled,
 /// every 17th waiting, every 19th an older aterm, every 23rd on another build.
-fn fleet(n: usize) -> FleetSnapshot {
+pub(crate) fn fleet(n: usize) -> FleetSnapshot {
     let mut snapshot = FleetSnapshot {
         read_at_ms: NOW,
         ..FleetSnapshot::default()
@@ -120,7 +120,7 @@ fn active() -> NetworkObservation {
     }
 }
 
-fn field_of(snapshot: FleetSnapshot, now_ms: u64) -> Field {
+pub(crate) fn field_of(snapshot: FleetSnapshot, now_ms: u64) -> Field {
     project(Some(&slot_of(snapshot)), &active(), now_ms)
 }
 

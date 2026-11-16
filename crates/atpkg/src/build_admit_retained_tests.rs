@@ -4,6 +4,7 @@
 //! Actual native custody, isolated from other tests' process-wide child policy.
 
 use super::*;
+use crate::build_admit::CancelRequest;
 use crate::build_admit::{self, Admission, Seat, service::Owner};
 use crate::build_cache::Tool;
 use aterm_capacity::{
@@ -415,6 +416,59 @@ fn uncertain_arm(world: &Path, seat: &Seat<'_>) {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
+fn dropped_intent_handles(world: &Path, seat: &Seat<'_>) {
+    let mut jobs = Jobs::new(1).unwrap();
+    let (retained, drops) = guard();
+    let ticket = jobs
+        .submit_retained(
+            held(world, seat),
+            &mut command("/usr/bin/true"),
+            Duration::ZERO,
+            retained,
+        )
+        .unwrap();
+    let copied_ticket = ticket.clone();
+    let copied_cancel = copied_ticket.cancel.clone();
+    drop(ticket);
+    drop(copied_ticket);
+    drop(copied_cancel);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let completed = until(&mut jobs, Jobs::is_empty).pop().unwrap();
+    let outcome = completed.result.unwrap();
+    assert_eq!(outcome.root_status().code(), Some(0));
+    assert!(outcome.succeeded());
+    assert!(!outcome.cancelled());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    for request in [CancelRequest::Terminate, CancelRequest::Kill] {
+        let mut target = command("/bin/cat");
+        target.stdin(Stdio::piped()).stdout(Stdio::piped());
+        let ticket = jobs
+            .submit_retained(held(world, seat), &mut target, Duration::ZERO, ())
+            .unwrap();
+        assert!(until(&mut jobs, |jobs| !jobs.jobs[&ticket.id.sequence].starting).is_empty());
+        let input = aterm_uds::deadline::cat_echoes(
+            jobs.jobs
+                .get_mut(&ticket.id.sequence)
+                .unwrap()
+                .owned
+                .as_mut()
+                .unwrap()
+                .child_mut(),
+        );
+        let cancel = ticket.cancel.clone();
+        drop(ticket);
+        cancel.request(request).unwrap();
+        drop(cancel);
+        let completed = until(&mut jobs, Jobs::is_empty).pop().unwrap();
+        let outcome = completed.result.unwrap();
+        assert!(outcome.cancelled());
+        assert!(!outcome.succeeded());
+        assert_eq!(outcome.cohort_settlement(), Some(CohortSettlement::Drained));
+        drop(input);
+    }
+}
+
 fn foreign_owner_keeps_resources(world: &Path, seat: &Seat<'_>) {
     let mut jobs = Jobs::new(1).unwrap();
     let (retained, drops) = guard();
@@ -758,6 +812,13 @@ fn retained_actor() {
     with_world(|world, seat| {
         match case.as_str() {
             "materialization-fetch" => materialization_tests::actual_offline_fetch(world, seat),
+            "drop-intent-handles" => dropped_intent_handles(world, seat),
+            "mailbox-errors" => crate::build_admit::live::tests::actual_mailbox_errors(),
+            "materialization-public-result" => {
+                materialization_tests::a_different_success_cannot_finish_materialization(
+                    world, seat,
+                )
+            }
             "materialization-refusal" => {
                 materialization_tests::revoked_input_starts_no_child(world, seat)
             }
@@ -809,6 +870,11 @@ fn actor(case: &str) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn materialization_completion_refuses_a_different_native_jobs_public_success() {
+    actor("materialization-public-result");
 }
 
 #[test]
@@ -893,4 +959,14 @@ fn actual_managed_sdk_and_cache_bundle_survives_root_reap_and_reaper_handoff() {
 #[test]
 fn actual_private_input_bundle_refuses_expired_preflight_and_survives_owner_loss() {
     actor("private-input-bundle");
+}
+
+#[test]
+fn dropping_all_ticket_and_cancel_handle_clones_preserves_native_custody() {
+    actor("drop-intent-handles");
+}
+
+#[test]
+fn actual_cancellation_mailbox_errors_never_become_success() {
+    actor("mailbox-errors");
 }

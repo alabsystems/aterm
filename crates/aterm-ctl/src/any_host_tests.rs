@@ -655,8 +655,8 @@ fn a_survey_reply_reads_as_a_member() {
          at_ms=1793130000000 accounts=1 accounts_unread=- drive=1",
         "account pool=claude id=main condition=usable enrolled=1 pct5=3 pct7=12 week_reset=- \
          walled_until=- last_used=- read_at=1793129900",
-        "session local=1 sid=s-a1 state=running program=claude program_kind=agent agent=busy",
-        "session local=2 sid=s-a2 state=running program=zsh program_kind=shell agent=-",
+        "session local=1 sid=ta1xxxxxxxx state=running program=claude program_kind=agent agent=busy",
+        "session local=2 sid=ta2xxxxxxxx state=running program=zsh program_kind=shell agent=-",
     ]
     .map(str::to_owned)
     .to_vec();

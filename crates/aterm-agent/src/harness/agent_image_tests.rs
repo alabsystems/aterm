@@ -301,3 +301,50 @@ fn the_gate_withholds_an_observed_agents_write_unless_its_lane_is_exempt() {
     assert!(!observe_refused("ERR busy sink"));
     assert!(!observe_refused("OK"));
 }
+
+/// LS-72: A VERSIONS ENTRY WHOSE STAT ANSWERS WITH A LASTING STATE IS NO INSTALL, NOT A READ NOT
+/// MADE. A versions directory nobody may search refuses every stat of the image's entry with
+/// `EACCES` (where the test runs as root it is searched, and holds no such entry): either way
+/// every later stat finds the same, so the read answers that the image is no native install,
+/// never [`NotRead`], which would leave the tab `layout-unread` on every look. CONTROL: the
+/// classifier keeps a stat not made (out of descriptors, an I/O fault) as [`NotRead`]'s, and a
+/// permission, a non-directory or a link loop as answers.
+#[cfg(unix)]
+#[test]
+fn a_versions_entry_in_a_lasting_state_is_no_install_not_unread() {
+    use super::super::upgrade_drive::read_not_made;
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = World::new();
+    let exe = world.root.join("2.1.0");
+    std::fs::write(&exe, "").expect("image");
+    std::fs::set_permissions(&world.versions, std::fs::Permissions::from_mode(0o000))
+        .expect("shut");
+    let read = claude_native_read(&Image::at(&exe), &world.versions);
+    std::fs::set_permissions(&world.versions, std::fs::Permissions::from_mode(0o755))
+        .expect("reopen");
+    assert_eq!(read, Ok(false));
+    for not_made in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::EIO,
+        libc::EINTR,
+        libc::ENOMEM,
+    ] {
+        assert!(
+            read_not_made(&std::io::Error::from_raw_os_error(not_made)),
+            "{not_made}"
+        );
+    }
+    for lasting in [
+        libc::EACCES,
+        libc::ENOTDIR,
+        libc::ELOOP,
+        libc::ENOENT,
+        libc::EISDIR,
+    ] {
+        assert!(
+            !read_not_made(&std::io::Error::from_raw_os_error(lasting)),
+            "{lasting}"
+        );
+    }
+}

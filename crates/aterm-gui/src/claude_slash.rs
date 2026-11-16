@@ -324,6 +324,9 @@ pub(crate) struct EngineRead {
     human: u64,
     /// The program's window title, read in the hold the rows were.
     pub(crate) title: std::sync::Arc<str>,
+    /// The program-status report standing, read in the hold the rows were, as the body that says
+    /// it (`ProgramStateReport::run_sign`); `None` while none stands as a run sign.
+    pub(crate) report: Option<String>,
 }
 
 impl EngineRead {
@@ -438,7 +441,8 @@ pub(crate) fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> boo
 /// THE CLICK'S CHECKS ON THE ENGINE, before the probe `/` is written.
 pub(crate) fn ready(read: &EngineRead) -> Result<usize, SlashRefusal> {
     let rows = &read.rows;
-    let screen = lights::read_screen(rows, Some(&read.title)).ok_or(SlashRefusal::Covered)?;
+    let screen = lights::read_screen(rows, Some(&read.title), read.report.as_deref())
+        .ok_or(SlashRefusal::Covered)?;
     if screen.mode.is_none() || screen.vim_insert {
         return Err(SlashRefusal::NotReady);
     }
@@ -496,7 +500,7 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
             _ => stop(SlashRefusal::NoAnswer, &press.text),
         };
     };
-    let screen = lights::read_screen(&read.rows, Some(&read.title));
+    let screen = lights::read_screen(&read.rows, Some(&read.title), read.report.as_deref());
     let composer = screen.as_ref().and_then(|_| composer_of(read));
     let busy = live_turn(screen.as_ref(), &read.rows);
     let survey = aterm_phase::survey_block(&read.rows).is_some();
@@ -663,6 +667,7 @@ impl App {
             generation: crate::control::screen_gen(&t),
             human,
             title: t.title_arc(),
+            report: t.program_state().run_sign(),
         })
     }
 

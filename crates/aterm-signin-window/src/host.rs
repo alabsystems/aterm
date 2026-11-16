@@ -473,7 +473,7 @@ fn is_uuid(text: &str) -> bool {
 
 /// Whether this process's audit session has the window server and was not made over the
 /// network (Security's `SessionGetInfo`, `AuthSession.h`): an SSH login's has neither.
-fn graphic_session() -> bool {
+pub(crate) fn graphic_session() -> bool {
     /// `callerSecuritySession`.
     const CALLER_SECURITY_SESSION: u32 = u32::MAX;
     /// `sessionHasGraphicAccess`.

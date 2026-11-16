@@ -299,14 +299,7 @@ impl App {
             app.pending_action_refusal = previous;
             refusal.map_or(Ok(()), Err)
         };
-        #[cfg(unix)]
-        {
-            crate::app_documents::with_headless_restore_admission_for_test(|| drive(self))
-        }
-        #[cfg(not(unix))]
-        {
-            drive(self)
-        }
+        crate::app_documents::with_headless_restore_admission_for_test(|| drive(self))
     }
 
     /// No yield or event dispatch occurs between freshness, custody, topology and consumption.

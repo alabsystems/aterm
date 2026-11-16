@@ -14,11 +14,12 @@ fn refused(holder: &str, words: &[&str]) -> bool {
     matches!(read(holder, words), Words::Refused(_))
 }
 
-/// THE HANDSHAKE: aterm serves codex-alab's contract 2 and the roster's contract 3, as a set.
+/// THE HANDSHAKE: aterm serves codex-alab's contract 2, the seed rows' contract 3 and every
+/// registry row's contract 4, as a set.
 #[test]
-fn the_served_contracts_are_two_and_three() {
-    assert_eq!(served_word(), "2,3");
-    assert!(SERVED.contains(&SCOPED));
+fn the_served_contracts_are_two_three_and_four() {
+    assert_eq!(served_word(), "2,3,4");
+    assert!(SERVED.contains(&SCOPED) && SERVED.contains(&UNIVERSAL));
 }
 
 /// grok-alab, muse-alab and kimi-alab may relaunch and upgrade; claude-code-alab may claim every
@@ -71,7 +72,7 @@ fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
         Some("claude-code-alab")
     );
     // Every row's id reads as its vendor (§8.1 item 5), so presence keeps the vendor's reader.
-    for row in ROSTER {
+    for row in super::super::registry::current().rows() {
         assert_eq!(
             aterm_phase::program_of(row.id),
             Some(row.program),
@@ -163,6 +164,10 @@ fn the_scope_parser_refuses_whole_and_admits_only_the_rows_words() {
         &["contract=3", "scope=relaunch", "vendor=1.0.70;rm"],
         &["contract=3", "scope=relaunch", "login=bad/slash"],
         &["contract=3", "scope=relaunch", "login=a", "login=b"],
+        &["contract=3", "scope=relaunch,state"],
+        &["contract=3", "scope=accounts"],
+        &["contract=3", "scope=relaunch", "child=4243:1"],
+        &["contract=5", "scope=relaunch"],
         &[],
         &["ttl=5000"],
     ] {
@@ -271,4 +276,291 @@ fn the_claim_version_is_major_minor_zero() {
     ] {
         assert_eq!(ClaimVersion::parse(bad), None, "{bad}");
     }
+}
+
+fn v4(holder: &str, words: &[&str]) -> Result<Claim, String> {
+    scoped(holder, words).and_then(|c| {
+        (c.contract == UNIVERSAL)
+            .then_some(c)
+            .ok_or_else(|| "not contract 4".to_string())
+    })
+}
+
+/// CONTRACT 4 (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2): `version=` is required, the
+/// words this aterm knows are kept and the rest dropped, the row's `allows` is ignored, the seed
+/// row's grant is its `allows` and the two words that type nothing, `child=` is
+/// `<pid>:<start_us>` in canonical decimals with a pid above 1, and an empty grant stands.
+#[test]
+fn a_contract_4_claim_keeps_its_known_words_and_is_granted_by_its_rows_source() {
+    let me = "kimi-alab@700";
+    let c = v4(
+        me,
+        &[
+            "contract=4",
+            "scope=walls,relaunch,teleport,state,accounts,upgrade",
+            "version=0.3.0",
+            "vendor=1.2.0",
+            "child=701:1763000000123456",
+            "login=work",
+        ],
+    )
+    .expect("a contract 4 claim");
+    assert_eq!(c.row.source, Source::Seed, "the index pins no record yet");
+    assert_eq!(
+        c.scopes.words(),
+        "relaunch,upgrade,state,accounts",
+        "unknown teleport dropped; walls outside a seed row's grant"
+    );
+    assert_eq!(
+        c.child,
+        Some(ChildWord {
+            pid: 701,
+            start_us: 1_763_000_000_123_456
+        })
+    );
+    assert_eq!(c.login.as_deref(), Some("work"));
+    assert_eq!(c.versions(), "kimi-alab 0.3.0 (kimi 1.2.0)");
+
+    let none =
+        v4(me, &["contract=4", "scope=walls,teleport", "version=0.3.0"]).expect("granted none");
+    assert!(none.scopes.is_empty());
+    assert_eq!(none.scopes.words(), "-");
+    assert_eq!(none.child, None);
+
+    for words in [
+        &["contract=4", "scope=relaunch"][..],
+        &["contract=4", "version=0.3.0"],
+        &["contract=4", "scope=", "version=0.3.0"],
+        &["contract=4", "scope=relaunch,,upgrade", "version=0.3.0"],
+        &["contract=4", "scope=relaunch,relaunch", "version=0.3.0"],
+        &["contract=4", "scope=teleport,teleport", "version=0.3.0"],
+        &["contract=4", "scope=Relaunch", "version=0.3.0"],
+        &["contract=4", "scope=-", "version=0.3.0"],
+        &["contract=4", "scope=relaunch", "version=0.3.1"],
+        &["contract=4", "scope=relaunch", "version=0.3.0", "child=701"],
+        &["contract=4", "scope=relaunch", "version=0.3.0", "child=1:5"],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "child=0701:5",
+        ],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "child=701:05",
+        ],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "child=701:+5",
+        ],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "child=701:",
+        ],
+        &["contract=4", "scope=relaunch", "version=0.3.0", "child=a:1"],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "child=7:1",
+            "child=7:1",
+        ],
+        &["contract=4", "scope=relaunch", "version=0.3.0", "ttl=5000"],
+        &[
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+            "vendor=1;rm",
+        ],
+        &["contract=4", "scope=relaunch", "version=0.3.0", "login=Bad"],
+        &["contract=4,3", "scope=relaunch", "version=0.3.0"],
+        &[
+            "contract=4",
+            "contract=4",
+            "scope=relaunch",
+            "version=0.3.0",
+        ],
+    ] {
+        assert!(refused(me, words), "{words:?}");
+    }
+    let ok = ["contract=4", "scope=relaunch", "version=0.3.0"];
+    assert_eq!(read("agy-alab@9", &ok), Words::Unregistered);
+    assert_eq!(read("codex-alab@9", &ok), Words::Unregistered);
+    assert!(
+        refused("agy-alab@9", &["contract=4", "scope=relaunch"]),
+        "grammar first"
+    );
+}
+
+/// The grant by source: a verified record is granted every word it claims, a seed row its
+/// `allows` with `state` and `accounts`, a development link every word but `accounts`.
+#[test]
+fn the_grant_follows_where_the_row_came_from() {
+    let row = |source| Row {
+        id: "kimi-alab",
+        program: Program::Kimi,
+        package: "kimi-alab",
+        vendor: "kimi",
+        allows: &[Scope::Relaunch, Scope::Upgrade],
+        source,
+    };
+    assert_eq!(grant(&row(Source::Signed), &Scope::ALL).words(), {
+        Scope::ALL.map(Scope::word).join(",")
+    });
+    assert_eq!(
+        grant(&row(Source::Seed), &Scope::ALL).words(),
+        "relaunch,upgrade,state,accounts"
+    );
+    assert_eq!(
+        grant(&row(Source::Linked), &Scope::ALL).words(),
+        "relaunch,upgrade,turn-end,approvals,questions,walls,state"
+    );
+    assert_eq!(grant(&row(Source::Signed), &[]).words(), "-");
+    for scope in Scope::ALL {
+        assert_eq!(
+            scope.since(),
+            if matches!(scope, Scope::State | Scope::Accounts) {
+                UNIVERSAL
+            } else {
+                SCOPED
+            }
+        );
+    }
+}
+
+/// CONTRACT 3 IS THE SEED IDS' (`docs/HARNESS-CONTRACT.md` §2, until HX-14b deletes it): a row
+/// whose id is a seed id is served a contract 3 claim whatever its source (a seed, a development
+/// link over one, a verified record over one), so a harness that speaks only contract 3
+/// (claude-code-alab) keeps its claim once it is dev-linked or its build carries a record; a row
+/// whose id is no seed id is refused contract 3 (`ERR usage`) and claims contract 4, granted by
+/// its source. A seed id with no row (its record failed, or its row was refused) is refused
+/// unregistered (`ERR unproven`, never stored) under contract 3 and without `contract=`, as under
+/// contract 4. NEGATIVE CONTROLS: before HX-05's review fix a linked or signed row over a seed was
+/// refused its contract 3 claim, and a seed id whose row was gone was read as a foreign claim (v3)
+/// or a v2 claim, either stored to take every duty with nothing proven; a holder no row or seed
+/// names stays foreign, a seed id's holder off the pid grammar is no holder, and codex-alab's
+/// contract 2 claim stays v2.
+#[test]
+fn contract_3_is_served_for_seed_ids_whatever_their_rows_source() {
+    const RELAUNCH_UPGRADE: &[Scope] = &[Scope::Relaunch, Scope::Upgrade];
+    static ROWS: [Row; 5] = [
+        Row {
+            id: "kimi-alab",
+            program: Program::Kimi,
+            package: "kimi-alab",
+            vendor: "kimi",
+            allows: RELAUNCH_UPGRADE,
+            source: Source::Seed,
+        },
+        Row {
+            id: "grok-alab",
+            program: Program::Grok,
+            package: "grok-alab",
+            vendor: "grok",
+            allows: RELAUNCH_UPGRADE,
+            source: Source::Signed,
+        },
+        Row {
+            id: "claude-code-alab",
+            program: Program::Claude,
+            package: "claude-code-alab",
+            vendor: "claude",
+            allows: &Scope::ALL,
+            source: Source::Linked,
+        },
+        Row {
+            id: "agy-alab",
+            program: Program::Agy,
+            package: "agy-alab",
+            vendor: "agy",
+            allows: RELAUNCH_UPGRADE,
+            source: Source::Signed,
+        },
+        Row {
+            id: "other-alab",
+            program: Program::Kimi,
+            package: "other-alab",
+            vendor: "kimi",
+            allows: RELAUNCH_UPGRADE,
+            source: Source::Linked,
+        },
+    ];
+    let v3 = ["contract=3", "scope=relaunch,upgrade", "version=0.2.0"];
+    let v4 = [
+        "contract=4",
+        "scope=relaunch,upgrade,accounts",
+        "version=0.2.0",
+    ];
+    for id in ["kimi-alab", "grok-alab", "claude-code-alab"] {
+        let holder = format!("{id}@4242");
+        let Words::Scoped(claim) = read_in(&ROWS, &holder, &v3) else {
+            panic!("{id}: a seed id's contract 3 claim is read, whatever its row's source");
+        };
+        assert_eq!(
+            (claim.row.id, claim.contract, claim.scopes.words().as_str()),
+            (id, SCOPED, "relaunch,upgrade")
+        );
+        assert!(
+            matches!(read_in(&ROWS, &holder, &[]), Words::Refused(_)),
+            "{id}: a rostered holder never claims under v2"
+        );
+    }
+    let typing = ["contract=3", "scope=turn-end,walls"];
+    assert!(
+        matches!(
+            read_in(&ROWS, "claude-code-alab@4242", &typing),
+            Words::Scoped(_)
+        ),
+        "a linked claude-code-alab keeps every duty its row allows"
+    );
+    assert!(
+        matches!(read_in(&ROWS, "grok-alab@4242", &typing), Words::Refused(_)),
+        "a signed grok-alab's contract 3 claim is still held to its row's allows"
+    );
+    for id in ["agy-alab", "other-alab"] {
+        let holder = format!("{id}@4242");
+        assert!(
+            matches!(read_in(&ROWS, &holder, &v3), Words::Refused(_)),
+            "{id}: no seed id, no contract 3"
+        );
+        let Words::Scoped(claim) = read_in(&ROWS, &holder, &v4) else {
+            panic!("{id}: contract 4 is read");
+        };
+        assert_eq!(claim.contract, UNIVERSAL);
+        assert_eq!(
+            claim.scopes.words(),
+            if id == "agy-alab" {
+                "relaunch,upgrade,accounts"
+            } else {
+                "relaunch,upgrade"
+            },
+            "{id}: granted by its source"
+        );
+    }
+    // muse-alab is a seed id with no row here: refused, never foreign, never v2.
+    for words in [&v3[..], &[], &["ttl=5000"], &v4] {
+        assert_eq!(
+            read_in(&ROWS, "muse-alab@4242", words),
+            Words::Unregistered,
+            "{words:?}"
+        );
+    }
+    assert!(
+        matches!(
+            read_in(&ROWS, "muse-alab@4242", &["contract=3", "scope=bogus"]),
+            Words::Refused(_)
+        ),
+        "the grammar first"
+    );
+    assert_eq!(read_in(&ROWS, "muse-alab@04242", &v3), Words::Foreign);
+    assert_eq!(read_in(&ROWS, "muse-alab@04242", &[]), Words::V2(&[]));
+    assert_eq!(read_in(&ROWS, "watcher-alab@4242", &v3), Words::Foreign);
+    assert_eq!(read_in(&ROWS, "codex-alab@4242", &[]), Words::V2(&[]));
+    assert_eq!(read_in(&ROWS, "codex-alab@4242", &v3), Words::Foreign);
 }

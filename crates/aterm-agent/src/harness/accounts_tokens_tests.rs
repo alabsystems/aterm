@@ -1408,7 +1408,7 @@ fn token_preflight_waits_for_its_native_vault_writer() {
                 &host,
                 "work",
                 TokenMode::Make,
-                Via::Desk,
+                (Via::Desk, None),
                 &mut out,
                 &mut err,
                 || Instant::now() - age,
@@ -2082,6 +2082,7 @@ fn the_table_round_trips() {
                 session_reset: Some(1_800_010_000),
             }),
             verdict: Some(Verdict::Shared),
+            shared_with: BTreeSet::from(["other-0".to_owned(), "other-1".to_owned()]),
         },
         removed_at: Some(NOW + 6),
     };
@@ -2124,6 +2125,8 @@ fn the_table_round_trips() {
         TokenEvent::Fallback,
         TokenEvent::Offered,
         TokenEvent::Removed,
+        TokenEvent::Differ,
+        TokenEvent::Stopped,
     ] {
         let note = journal::token_note(event, journal::Key::new(KEY).unwrap(), NOW, None);
         assert!(journal::KINDS.contains(&note.kind), "{}", note.kind);
@@ -2527,7 +2530,7 @@ fn a_refusal_marks_the_token_rejected_here_once() {
         panic!("a standing");
     };
     let _ = notes();
-    assert!(note_rejected(&paths, &store, &standing, NOW).expect("recorded"));
+    assert!(note_rejected(&paths, &store, &standing, 401, NOW).expect("recorded"));
     assert!(
         paths.dir.join("claude-token-refusals.json").is_file(),
         "kept beside the vault state"
@@ -2542,7 +2545,7 @@ fn a_refusal_marks_the_token_rejected_here_once() {
             EMAIL
         )
     );
-    assert!(!note_rejected(&paths, &store, &standing, NOW + 60).expect("read"));
+    assert!(!note_rejected(&paths, &store, &standing, 401, NOW + 60).expect("read"));
     assert_eq!(
         notes().iter().map(|n| n.kind).collect::<Vec<_>>(),
         ["token-rejected"]
@@ -2560,7 +2563,7 @@ fn a_refusal_marks_the_token_rejected_here_once() {
     if let Some(meta) = newer.meta.as_mut() {
         meta.minted_at = NOW;
     }
-    assert!(note_rejected(&paths, &store, &newer, NOW + 120).expect("recorded"));
+    assert!(note_rejected(&paths, &store, &newer, 401, NOW + 120).expect("recorded"));
     assert_eq!(
         notes().iter().map(|n| n.kind).collect::<Vec<_>>(),
         ["token-rejected"]
@@ -2860,6 +2863,8 @@ struct StepHost {
     token: Host,
     now: Cell<u64>,
     cli: RefCell<String>,
+    /// The capture's hang detector ([`AccountsHost::token_hang`]).
+    hang: Duration,
 }
 
 impl AccountsHost for StepHost {
@@ -2897,7 +2902,7 @@ impl AccountsHost for StepHost {
         Some((World::program(), self.cli.borrow().clone()))
     }
     fn token_hang(&self) -> Duration {
-        aterm_spec::wait::MUST_HAPPEN
+        self.hang
     }
     fn session_logins(&self, env: &Env) -> Vec<SessionLogin> {
         self.token.session_logins(env)
@@ -2912,7 +2917,9 @@ impl AccountsHost for StepHost {
 /// a new Claude Code build runs it once, and the next pass on that build nothing; a person's own
 /// run goes at once, one that ends on a stop that holds nothing (a browser that did not start)
 /// leaves the record as it was, and the capture that makes the token clears it.
-/// NEGATIVE CONTROL: with `step_due` reading no record (`steps.get(..)` as `None`), the pass a
+/// The pass is this Mac's token upkeep's (plan package FL-138: `backfill_due`, then
+/// `backfill_run`, by aterm's window with nobody there).
+/// NEGATIVE CONTROL: with `step_held` reading no record (`steps.get(..)` as `None`), the pass a
 /// day later runs: `` a pass 1 days later ran the step ``; with `mint` writing the record on
 /// every end, the browser that did not start clears it: `` a stop that holds nothing cleared
 /// the record ``.
@@ -2930,6 +2937,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         token: Host::minting(VaultOf::Real(lab.paths.clone()), &world),
         now: Cell::new(NOW),
         cli: RefCell::new("2.1.318".to_owned()),
+        hang: aterm_spec::wait::MUST_HAPPEN,
     };
     let env = scratch.env();
     let store = scratch.store();
@@ -2943,13 +2951,21 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
     };
     let tasks_before = tasks();
     // One pass nobody started: the step runs where it is due and no stop holds it.
+    let window = NobodyRoutes {
+        window: true,
+        headless: false,
+    };
     let pass = |host: &StepHost| -> Option<Ran> {
         journal::with_keyer(keyer, || {
-            if !step_due(&env, host, "work") {
+            let Backfill::Due(finding) = backfill_due(&env, host, "work", false, window) else {
                 return None;
-            }
+            };
+            assert_eq!(finding.gap, Gap::None);
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = run(&env, host, "work", TokenMode::Make, &mut out, &mut err);
+            let code = backfill_run(
+                &env, host, "work", &finding, false, window, &mut out, &mut err,
+            )
+            .expect("still due");
             Some(Ran {
                 ok: format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS),
                 out: String::from_utf8_lossy(&out).into_owned(),
@@ -3086,6 +3102,303 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
     assert_eq!(kinds, ["token-minted"]);
 }
 
+/// A standing of the account's token made at `minted_at` by Claude Code `cli` to end at
+/// `expires_at`, verified on m7.
+fn made_by(minted_at: u64, expires_at: u64, cli: &str) -> Lookup<Standing> {
+    let Answer::Found(mut found) = standing(Check::Readable, expires_at, true, false, &[]) else {
+        unreachable!("a standing")
+    };
+    let meta = found.meta.as_mut().expect("its meta");
+    meta.minted_at = minted_at;
+    meta.cli = cli.to_owned();
+    Lookup::Found(*found)
+}
+
+/// A SHORT-LIVED TOKEN IS NO GAP TO THE CLAUDE CODE BUILD THAT MADE IT, AND A TOKEN NEARS ITS END
+/// BY ITS OWN END (plan package FL-138, [`SHORT_LIVED_SECS`]): a 30-day token Claude Code
+/// 2.1.318 made, read with 20 days left on the account's home Mac, is no `soon` gap while a
+/// capture would run 2.1.318 (or a build nobody knows) again, nor once it ended; it is one once a
+/// capture would run 2.1.319, and its end is a gap to every Mac then. A year-long token in its
+/// last 10 days is `soon` on the home Mac whatever the build and on no other Mac, unverified
+/// (another Mac's window token) or handed to a removed Mac as much as verified; with more than
+/// 30 days left it is no gap.
+/// NEGATIVE CONTROL: with `gap_of` taking every `ended` reading for `Gap::Ended`, the 30-day
+/// token's end is a gap to the build that made it (`left: Some(Ended)`); with
+/// `SHORT_LIVED_SECS` three times `SOON_SECS`, a 61-day token is no gap at its end: `` a 61-day
+/// token's end ``; with `gap_of` reading `soon` off [`TokenState::Soon`] alone, the unverified
+/// token in its last 10 days is no gap: `` an unverified token's nearing end ``.
+#[test]
+fn a_short_lived_token_is_no_gap_to_the_build_that_made_it() {
+    let vault = FakeVault::new(Answer::Absent);
+    let gap = |state: &TokenState, found: &Lookup<Standing>, home: bool, cli: Option<&str>| {
+        gap_of(state, found, &vault, (home, NOW, cli))
+    };
+    const DAY: u64 = 86_400;
+    let (same, next) = (Some("2.1.318"), Some("2.1.319"));
+
+    let month = made_by(NOW - 10 * DAY, NOW + 20 * DAY, "2.1.318");
+    for cli in [same, Some(""), None] {
+        assert_eq!(gap(&TokenState::Soon, &month, true, cli), None, "{cli:?}");
+    }
+    assert_eq!(gap(&TokenState::Soon, &month, true, next), Some(Gap::Soon));
+    assert_eq!(gap(&TokenState::Soon, &month, false, next), None);
+    let ended = made_by(NOW - 31 * DAY, NOW - DAY, "2.1.318");
+    for home in [true, false] {
+        assert_eq!(gap(&TokenState::Ended, &ended, home, same), None);
+        assert_eq!(
+            gap(&TokenState::Ended, &ended, home, next),
+            Some(Gap::Ended)
+        );
+    }
+    let longer = made_by(NOW - 62 * DAY, NOW - DAY, "2.1.318");
+    assert_eq!(
+        gap(&TokenState::Ended, &longer, false, same),
+        Some(Gap::Ended),
+        "a 61-day token's end"
+    );
+
+    let year = made_by(NOW - 355 * DAY, NOW + 10 * DAY, "2.1.318");
+    let unverified = TokenState::Unverified {
+        minted_here: false,
+        minted_by: Some(MintedBy::Window),
+        why: Unverified::NoReadingYet,
+        minted_on: "m7".to_owned(),
+        exposed: Vec::new(),
+    };
+    let exposed = TokenState::Exposed(vec!["m9".to_owned()]);
+    for cli in [same, next] {
+        assert_eq!(gap(&TokenState::Soon, &year, true, cli), Some(Gap::Soon));
+    }
+    assert_eq!(
+        gap(&unverified, &year, true, same),
+        Some(Gap::Soon),
+        "an unverified token's nearing end"
+    );
+    assert_eq!(gap(&exposed, &year, true, same), Some(Gap::Soon));
+    for state in [&TokenState::Soon, &unverified, &exposed] {
+        assert_eq!(gap(state, &year, false, same), None, "{state:?}");
+    }
+    let fresh = made_by(NOW - DAY, NOW + A_YEAR, "2.1.318");
+    for state in [&TokenState::Active, &unverified, &exposed] {
+        assert_eq!(gap(state, &fresh, true, same), None, "{state:?}");
+    }
+}
+
+/// This Mac's upkeep's pass of `work` by `routes` (`backfill_due`, then `backfill_run`), under
+/// the test keyer: what it ran, `None` where nothing was due.
+fn upkeep_pass(env: &Env, host: &StepHost, routes: NobodyRoutes) -> Option<Ran> {
+    journal::with_keyer(keyer, || {
+        let Backfill::Due(finding) = backfill_due(env, host, "work", false, routes) else {
+            return None;
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = backfill_run(
+            env, host, "work", &finding, false, routes, &mut out, &mut err,
+        )
+        .expect("still due");
+        Some(Ran {
+            ok: code == ExitCode::SUCCESS,
+            out: String::from_utf8_lossy(&out).into_owned(),
+            err: String::from_utf8_lossy(&err).into_owned(),
+        })
+    })
+}
+
+/// An upkeep host on the stand-in `world`, on the scratch vault `lab`, at [`NOW`], running Claude
+/// Code 2.1.318.
+fn step_host(lab: &Lab, world: &World) -> StepHost {
+    std::fs::write(world.home().join("go"), b"go").unwrap();
+    StepHost {
+        token: Host::minting(VaultOf::Real(lab.paths.clone()), world),
+        now: Cell::new(NOW),
+        cli: RefCell::new("2.1.318".to_owned()),
+        hang: aterm_spec::wait::MUST_HAPPEN,
+    }
+}
+
+/// AN UPKEEP RUN OPENS NO PAGE WHERE A STOP HELD THE STEP AFTER IT LOOKED, OR WHERE IT CANNOT
+/// RECORD ITS RUN (plan package FL-138): between the upkeep's look (`backfill_due`) and its run,
+/// another run of the account's step met a human check and left its record: the run, judging the
+/// record again under the account's lock, refuses with nothing made, and Claude Code never runs.
+/// With the record cleared, but `tokens-tried.json` not writable (its lock held), it refuses too,
+/// before the capture. Once it can write, the same run makes the token, its record written before
+/// the capture.
+/// NEGATIVE CONTROL: with `run_with_clock` not reading `step_held` under the lock, the run opens
+/// the page: `` the held step ran ``; with it writing no record before the capture, `` a run
+/// this Mac could not record opened its page ``.
+#[test]
+fn an_upkeep_run_opens_no_page_where_a_stop_held_the_step_after_it_looked() {
+    use crate::harness::open_url::MetWord;
+    use crate::harness::token_steps::{self, Stopped};
+    let scratch = Scratch::new("step-raced");
+    let lab = Lab::new();
+    let world = World::new("renew-window-token", false);
+    let host = step_host(&lab, &world);
+    let (env, store) = (scratch.env(), scratch.store());
+    let window = NobodyRoutes {
+        window: true,
+        headless: false,
+    };
+    let run = |finding: &Finding| {
+        journal::with_keyer(keyer, || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_with_clock(
+                &env,
+                &host,
+                "work",
+                finding.gap.mode(),
+                (finding.via, Some(finding)),
+                &mut out,
+                &mut err,
+                Instant::now,
+            );
+            (code, String::from_utf8_lossy(&err).into_owned())
+        })
+    };
+    let Backfill::Due(finding) =
+        journal::with_keyer(keyer, || backfill_due(&env, &host, "work", false, window))
+    else {
+        panic!("no token is due");
+    };
+    let stopped = Stopped::new(
+        MetWord::WindowHumanCheck,
+        NOW + 1,
+        "2.1.318",
+        &aterm_stamp::build_id(),
+    )
+    .expect("a stop that holds");
+    token_steps::put(&store, KEY, Some(&stopped)).expect("the record");
+    let (code, err) = run(&finding);
+    assert_eq!(world.runs(), 0, "the held step ran");
+    assert_ne!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        err.contains("held after this Mac's upkeep found it missing"),
+        "{err}"
+    );
+
+    // The run's record goes before its capture: where it cannot be written (another holds
+    // `tokens.lock` past its ladder), no page opens.
+    token_steps::put(&store, KEY, None).expect("the record cleared");
+    let table_lock =
+        crate::harness::accounts::lock_at_within(&store.shared_dir().join(TABLE_LOCK), &[])
+            .expect("the lock opens")
+            .expect("the lock is free");
+    let (code, err) = run(&finding);
+    assert_eq!(
+        world.runs(),
+        0,
+        "a run this Mac could not record opened its page"
+    );
+    assert_ne!(code, ExitCode::SUCCESS, "{err}");
+    assert!(err.contains(token_steps::TRIED_FILE), "{err}");
+    drop(table_lock);
+
+    let (code, err) = run(&finding);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert_eq!(world.runs(), 1);
+    // The verb's own run leaves the record it wrote before the capture: `backfill_run` clears it.
+    let tried = token_steps::read_tried(&store).expect("the record reads");
+    assert_eq!(tried[KEY].gap, Gap::None, "{tried:?}");
+    assert_eq!(tried[KEY].minted_at, None);
+    assert!(tried[KEY].at >= NOW, "{tried:?}");
+}
+
+/// A GAP THE UPKEEP RAN IS HELD ON RECORD, WHATEVER ITS END AND ROUTE, UNTIL SOMETHING CHANGES
+/// (plan package FL-138): a capture in aterm's window whose browser did not start (a stop that
+/// holds nothing, so no stop record) leaves one record in `tokens-tried.json` (the gap's word, the
+/// token's `minted_at`, when, and the builds; no host, address, code or token byte). A pass a
+/// day later, or a month later, by the window or by the headless profile, runs nothing; a new
+/// Claude Code build runs it once, and the next pass on that build nothing; a mailbox
+/// configuration written after it runs it once more; the capture that makes the token clears
+/// the record.
+/// NEGATIVE CONTROL: with `step_held` reading no tried record (`tried.get(..)` as `None`), the
+/// pass a day later runs: `` a pass 1 days later by the window ran the gap again ``.
+#[test]
+fn a_gap_the_upkeep_ran_is_held_on_record_whatever_its_end_and_route_until_something_changes() {
+    use crate::harness::headless_oauth::MAILBOX_TOML_FILE;
+    use crate::harness::token_steps::{self, TRIED_FILE};
+    let scratch = Scratch::new("gap-tried");
+    let lab = Lab::new();
+    let world = World::new("window-browser-start", false);
+    let host = step_host(&lab, &world);
+    let (env, store) = (scratch.env(), scratch.store());
+    let window = NobodyRoutes {
+        window: true,
+        headless: false,
+    };
+    let headless = NobodyRoutes {
+        window: false,
+        headless: true,
+    };
+    let tried = || token_steps::read_tried(&store).expect("the tried file reads");
+
+    let ran = upkeep_pass(&env, &host, window).expect("a gap nobody ran is due");
+    assert!(!ran.ok, "{}", ran.err);
+    assert_eq!(world.runs(), 1);
+    assert!(
+        token_steps::read(&store)
+            .expect("the steps file")
+            .is_empty(),
+        "a browser that did not start left a stop record"
+    );
+    let record = tried();
+    assert_eq!(record.len(), 1, "{record:?}");
+    assert_eq!(record[KEY].gap, Gap::None);
+    assert_eq!(record[KEY].minted_at, None);
+    assert_eq!(record[KEY].cli, "2.1.318");
+    let at = record[KEY].at;
+
+    for days in [1, 30] {
+        host.now.set(NOW + days * 86_400);
+        for (routes, by) in [(window, "the window"), (headless, "headless")] {
+            assert!(
+                upkeep_pass(&env, &host, routes).is_none(),
+                "a pass {days} days later by {by} ran the gap again"
+            );
+        }
+    }
+    assert_eq!(world.runs(), 1, "a pass with no change reached the page");
+
+    host.cli.replace("2.1.319".to_owned());
+    let ran = upkeep_pass(&env, &host, window).expect("a new Claude Code build runs the gap");
+    assert!(!ran.ok, "{}", ran.err);
+    assert_eq!(world.runs(), 2);
+    assert_eq!(tried()[KEY].cli, "2.1.319");
+    assert!(upkeep_pass(&env, &host, headless).is_none());
+    assert_eq!(world.runs(), 2, "the same build ran the gap twice");
+
+    let at = tried()[KEY].at.max(at);
+    let mailbox = store.dir.join(MAILBOX_TOML_FILE);
+    std::fs::write(&mailbox, "").expect("the mailbox config");
+    std::fs::File::options()
+        .write(true)
+        .open(&mailbox)
+        .and_then(|file| file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at + 60)))
+        .expect("its time");
+    host.now.set(at + 120);
+    assert!(
+        upkeep_pass(&env, &host, window).is_some(),
+        "a mailbox configured after the run did not run the gap"
+    );
+    assert_eq!(world.runs(), 3);
+    assert!(upkeep_pass(&env, &host, window).is_none());
+    assert_eq!(world.runs(), 3);
+
+    let raw = std::fs::read_to_string(store.shared_dir().join(TRIED_FILE)).expect("the record");
+    let token = sentinel();
+    for held in ["://", "@", "claude.ai", "example.com", "why", &token[..24]] {
+        assert!(!raw.contains(held), "the record holds {held:?}: {raw}");
+    }
+
+    world.play("renew-window-token");
+    host.cli.replace("2.1.320".to_owned());
+    let ran = upkeep_pass(&env, &host, window).expect("a new build runs the gap");
+    assert!(ran.ok, "{}{}", ran.out, ran.err);
+    assert_eq!(world.runs(), 4);
+    assert!(tried().is_empty(), "the token's capture left the record");
+    assert!(upkeep_pass(&env, &host, window).is_none());
+}
+
 /// A HEADLESS LOGIN MAKES ITS TOKEN ON THE SAME PROFILE (plan package FL-137; sitting design
 /// S5): after a headless sign-in binds a row whose headless profile a sign-in proved, the run
 /// makes the row's token there. `claude setup-token` (the stand-in) hands its authorize request
@@ -3116,6 +3429,7 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
         token: Host::minting(VaultOf::Fake(vault), &world),
         now: Cell::new(NOW),
         cli: RefCell::new("2.1.318".to_owned()),
+        hang: aterm_spec::wait::MUST_HAPPEN,
     };
     let env = scratch.env();
     let store = scratch.store();
@@ -3236,8 +3550,18 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     assert_eq!(kinds, [("token-stopped", Some("human-check"))]);
     for days in [1, 30] {
         host.now.set(NOW + days * 86_400);
-        assert!(
-            !step_due(&env, &host, "work"),
+        assert_eq!(
+            backfill_due(
+                &env,
+                &host,
+                "work",
+                false,
+                NobodyRoutes {
+                    window: false,
+                    headless: true,
+                },
+            ),
+            Backfill::Nothing,
             "the human check's step was due {days} days later"
         );
     }
@@ -3301,6 +3625,154 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     let kinds: Vec<_> = notes().iter().map(|note| note.kind).collect();
     assert_eq!(kinds, ["token-minted"]);
     assert_eq!(bound(), bound_before, "the login moved");
+}
+
+/// A CAPTURE'S OWN HANG HOLDS NO STEP (FL-136): where the capture's hang detector runs out
+/// before Claude Code showed an address to open (so aterm's sign-in window never opened), the
+/// run says so and leaves no record and no `token-stopped` note: the hang is no page anyone met,
+/// and nothing of it is the window's deadline. A record an earlier stop left is kept as it was.
+/// The window's own deadline, which its opener records, still holds the step; the capture's
+/// hang holds nothing.
+/// NEGATIVE CONTROL: with `held_by` taking every hang on the window's route for its deadline,
+/// the run leaves a `deadline` record: `` a capture's own hang held the step ``.
+#[test]
+fn a_captures_own_hang_holds_no_step() {
+    use crate::harness::open_url::MetWord;
+    use crate::harness::token_steps::{self, Stopped};
+    let scratch = Scratch::new("step-hang");
+    let lab = Lab::new();
+    let world = World::new("silent", false);
+    let host = StepHost {
+        hang: Duration::ZERO,
+        ..step_host(&lab, &world)
+    };
+    let env = scratch.env();
+    let store = scratch.store();
+    let make = || {
+        journal::with_keyer(keyer, || {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run(&env, &host, "work", TokenMode::Make, &mut out, &mut err);
+            Ran {
+                ok: format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS),
+                out: String::from_utf8_lossy(&out).into_owned(),
+                err: String::from_utf8_lossy(&err).into_owned(),
+            }
+        })
+    };
+    let _ = notes();
+    let ran = make();
+    assert!(!ran.ok, "{}", ran.out);
+    assert!(ran.err.contains("hang detector"), "{}", ran.err);
+    assert!(
+        token_steps::read(&store)
+            .expect("the steps file reads")
+            .is_empty(),
+        "a capture's own hang held the step"
+    );
+    assert!(
+        !notes().iter().any(|note| note.kind == "token-stopped"),
+        "a capture's own hang was noted as a stop"
+    );
+    assert_eq!(world.runs(), 0, "the stand-in's page was reached");
+
+    let earlier =
+        Stopped::new(MetWord::WindowHumanCheck, NOW - 60, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&earlier)).expect("the record");
+    let ran = make();
+    assert!(!ran.ok && ran.err.contains("hang detector"), "{}", ran.err);
+    let steps = token_steps::read(&store).expect("the steps file reads");
+    assert_eq!(steps.get(KEY), Some(&earlier), "{steps:?}");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+
+    assert_eq!(held_by(&Err(setup_token::Error::Hang)), None);
+    assert_eq!(
+        held_by(&Err(setup_token::Error::Opener(MetWord::WindowDeadline))),
+        Some(MetWord::WindowDeadline)
+    );
+    assert_eq!(
+        held_by(&Err(setup_token::Error::Opener(MetWord::BrowserSignIn))),
+        None
+    );
+}
+
+/// A CODE PAGE'S STEP IS LET THROUGH ONCE THE VAULT DELIVERS THE ACCOUNT'S MAILBOX (FL-136): a
+/// step a code page stopped where aterm's window read no mailbox of the account stays held until
+/// the window reads one; the mailbox configurations are vault entries, read in place with no
+/// file under `~/.secrets` written or dated, and one the vault delivers after the stop lets the
+/// step through. A mailbox lets no other record through: the upkeep's record that it ran the
+/// gap, beside the stop (the run that met the code page leaves both), keeps the gap held, since
+/// the vault's entries date nothing; and a human check's step stays held.
+/// NEGATIVE CONTROLS: with `step_held` passing no `mailbox_read` (`None` for every word), the
+/// vault's mailbox is not seen: `` the vault's mailbox did not let the code page's step through ``;
+/// with `Tried::holds` let through by `mailbox_read` as a code page's stop is, `` the vault's
+/// mailbox let the upkeep's record of the run through ``.
+#[cfg(unix)]
+#[test]
+fn a_code_pages_step_is_let_through_once_the_vault_delivers_the_accounts_mailbox() {
+    use crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE;
+    use crate::harness::open_url::MetWord;
+    use crate::harness::token_steps::{self, Stopped, Tried};
+    let scratch = Scratch::new("step-mailbox");
+    let lab = Lab::new();
+    let world = World::new("silent", false);
+    let host = step_host(&lab, &world);
+    let env = scratch.env();
+    let store = scratch.store();
+    let home = env.home.clone().expect("the scratch home");
+    let window = NobodyRoutes {
+        window: true,
+        headless: false,
+    };
+    let found =
+        || match journal::with_keyer(keyer, || backfill_due(&env, &host, "work", false, window)) {
+            Backfill::Due(finding) => Some(finding),
+            Backfill::NotSeated | Backfill::Nothing => None,
+        };
+    let due = || found().is_some();
+    let finding = found().expect("CONTROL: a step with no record");
+    let stopped = Stopped::new(MetWord::WindowCodeNoMailbox, NOW, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&stopped)).expect("the record");
+    assert!(!due(), "a code page's step was due with no mailbox");
+
+    crate::vault_entry::put(
+        &home,
+        SECRETS_MAILBOX_TOML_FILE,
+        "imap_url = \"imaps://imap.example.test/INBOX\"\nuser = \"person@example.com\"\n\
+         password = \"a fixture's word\"\n",
+    );
+    assert!(
+        !home.join(".secrets").exists(),
+        "the vault's entry was written as a file"
+    );
+    assert_eq!(
+        token_steps::route_at(&store, Some(&home), EMAIL),
+        None,
+        "a file dated the vault's entry"
+    );
+    assert!(
+        due(),
+        "the vault's mailbox did not let the code page's step through"
+    );
+    assert_eq!(world.runs(), 0, "a due step ran with no pass");
+
+    // The upkeep's record of the run that met the code page, beside the stop.
+    let ran = Tried::new(
+        (finding.gap, finding.minted_at),
+        NOW,
+        "2.1.318",
+        &aterm_stamp::build_id(),
+    );
+    token_steps::put_tried(&store, KEY, Some(&ran)).expect("the record");
+    assert!(
+        !due(),
+        "the vault's mailbox let the upkeep's record of the run through"
+    );
+    token_steps::put_tried(&store, KEY, None).expect("the record cleared");
+    assert!(due(), "CONTROL: the stop alone, the vault's mailbox read");
+
+    let human = Stopped::new(MetWord::WindowHumanCheck, NOW, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&human)).expect("the record");
+    assert!(!due(), "a mailbox let a human check's step through");
 }
 
 #[path = "accounts_renew_token_tests.rs"]

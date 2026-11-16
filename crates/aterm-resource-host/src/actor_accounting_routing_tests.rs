@@ -15,9 +15,16 @@ fn a_valid_owner_reply_survives_scheduling_delay() {
 }
 #[test]
 fn accounted_routing_is_exact_and_does_not_relax_legacy_handshake() {
-    let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"s-0000000000000000000a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});
+    let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"t000000000a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});
     assert!(proxy_binding_accounted(&hello).is_ok());
     assert!(proxy_binding(&hello).is_err());
+    let mut legacy = hello.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .insert("session".into(), "s-0000000000000000000a".into());
+    assert!(proxy_binding_accounted(&legacy).is_ok());
+    assert!(proxy_binding(&legacy).is_err());
     for key in ["version", "role", "session", "attempt", "accounting"] {
         let mut missing = hello.clone();
         missing.as_object_mut().unwrap().remove(key);

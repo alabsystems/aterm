@@ -26,6 +26,8 @@ aterm-toml = { workspace = true }
 # The shared source walk, the [patch] classification and the fork ledger's reader
 # (`reviewed_forks`, read from vendor/forge.toml), so each has one definition.
 aterm-census = { workspace = true }
+# The seal `abrew_help` stamps on the help texts it writes (`aterm_seal`).
+aterm-seal = { workspace = true }
 # Parses cargo's metadata JSON and the crates.io index's rows.
 aterm-json = { workspace = true }
 # Descriptor-safe children, delegated to verify's cancellation scope when embedded.

@@ -139,10 +139,11 @@ fn add_tab(app: &mut App, id: u64, (master, pid): (i32, i32)) {
     let tree = pane::PaneTree::new(id);
     let tab = crate::register_terminal_tab(&mut app.tab_ids, &mut app.view_store, &tree)
         .expect("tab identity");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
     ws.layouts.push(tree);
     ws.tabs.add();
     ws.tab_set.push(tab).expect("fresh tab id");
+    drop(ws);
     app.resync_active_or_window(WindowId(0));
 }
 

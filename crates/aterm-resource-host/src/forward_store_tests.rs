@@ -60,7 +60,7 @@ fn child() {
 
     let request = Submission {
         binding: aterm_types::resource_admission::Binding {
-            session: "s-0000000000000000acde".into(),
+            session: "t000000acde".into(),
             attempt: [46; 16],
         },
         peer_pid: peer.pid,

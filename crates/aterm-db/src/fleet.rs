@@ -158,6 +158,10 @@ pub struct Folder {
     /// What starts this folder's fold thread, on the first ask ([`folder`] sets it; a folder
     /// without one is folded by its holder, [`Self::fold_now`]).
     fold_thread: OnceLock<Starter>,
+    /// A start of this folder's fold thread was made ([`Self::start_folding`]), which happens
+    /// once: set before the thread is spawned, and left set where the spawn fails, which leaves
+    /// the folder with no fold thread.
+    folding: AtomicBool,
 }
 
 impl Default for Folder {
@@ -178,6 +182,7 @@ impl Folder {
             asked: AtomicBool::new(false),
             lab_reader: OnceLock::new(),
             fold_thread: OnceLock::new(),
+            folding: AtomicBool::new(false),
         }
     }
 
@@ -379,26 +384,35 @@ impl Folder {
         self.fold_now(now_ms())
     }
 
-    /// The fold thread: [`Self::turn`] after turn.
-    fn run(&self, now_ms: &dyn Fn() -> u64) -> ! {
-        let mut due: Option<u64> = None;
-        loop {
-            due = self.turn(due, now_ms);
+    /// Start this folder's fold thread (`aterm-fleet-fold`), [`Self::turn`] after turn, unless
+    /// a start was made before: a folder has one at most. [`Self::folding`] says a start was
+    /// made, from before the thread is spawned; a spawn that fails is not made again, and the
+    /// folder then has no fold thread.
+    fn start_folding(&'static self) {
+        if self.folding.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let _ = std::thread::Builder::new()
+            .name("aterm-fleet-fold".into())
+            .spawn(move || {
+                let now_ms = || aterm_time::unix_millis().unwrap_or(0);
+                let mut due: Option<u64> = None;
+                loop {
+                    due = self.turn(due, &now_ms);
+                }
+            });
     }
 }
 
 /// This process's folder, once [`folder`] made it.
 static FOLDER: OnceLock<Folder> = OnceLock::new();
 
-/// Start this process's fold thread (`aterm-fleet-fold`): the folder's first ask calls it, once.
+/// Start this process's fold thread ([`Folder::start_folding`]): the folder's first ask calls
+/// it, once.
 fn start_fold_thread() {
-    let Some(folder) = FOLDER.get() else {
-        return;
-    };
-    let _ = std::thread::Builder::new()
-        .name("aterm-fleet-fold".into())
-        .spawn(move || folder.run(&|| aterm_time::unix_millis().unwrap_or(0)));
+    if let Some(folder) = FOLDER.get() {
+        folder.start_folding();
+    }
 }
 
 /// This process's folder. Making it starts nothing: its fold thread starts on the first ask for

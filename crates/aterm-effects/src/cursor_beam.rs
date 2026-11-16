@@ -257,7 +257,13 @@ impl CursorBeamRod {
         BeamRodFrame { fill, fp }
     }
 
-    /// The bar treatment: a vertical rod of light on the bar's own x.
+    /// The bar treatment: a vertical rod of light on the bar's own x. Its two narrow layers (the
+    /// white-hot axis and the inner sleeve) lie exactly on the bar's columns (the renderer's bar,
+    /// [`crate::cursor_glow::bar_width`] px from the cell's left) and reach past its cell only by
+    /// the rod's overshoot caps, straight above and below it: they show while a blinking bar is
+    /// off and never fringe the column left of it or right of it. Laid round the rod's anchor a tenth of a
+    /// cell in, the sleeve's edge rounded down onto that column, where it read as the bar's own
+    /// light against the band beside it (`#432a43` over `#1d1824` at rest on the dark page, CT-51).
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -294,6 +300,8 @@ impl CursorBeamRod {
         ];
         let (y0_i, h_i) = (y0 as i32, h as i32);
         let (cell_y, ch_i) = (oy as i32 + (cr as i32) * ch as i32, ch as i32);
+        let bar_x = i32::from(geom.origin_x) + i32::from(cc) * geom.cw as i32;
+        let bar_w = crate::cursor_glow::bar_width(geom.cw as i32);
         let mut i = 0;
         while i < layers.len() {
             let (hw, cmul, target, mix) = layers[i];
@@ -303,8 +311,11 @@ impl CursorBeamRod {
             if cov == 0 {
                 break;
             }
-            let w = ((cw * hw * 2.0) as i32).max(1);
-            let x = (ax - cw * hw) as i32;
+            let (x, w) = if is_core {
+                (bar_x, bar_w)
+            } else {
+                ((ax - cw * hw) as i32, ((cw * hw * 2.0) as i32).max(1))
+            };
             let color = lerp_rgb(cfg.color, target, mix);
             let premul = premul_rgb(color, cov);
             if is_core {
@@ -317,7 +328,9 @@ impl CursorBeamRod {
         }
     }
 
-    /// The bar on a light ground.
+    /// The bar on a light ground: a wide band round the rod's anchor and a narrow one exactly on
+    /// the bar's line ([`Self::emit_rod`]'s narrow layers), which never fringes the column left of
+    /// the bar: at rest its edge there read `#ebacd7` beside GitHub Light's `#0969da` bar, 2.83:1.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
@@ -361,26 +374,25 @@ impl CursorBeamRod {
             }
         };
         let ch_i = geom.ch as i32;
+        let bar_x = i32::from(geom.origin_x) + i32::from(cc) * geom.cw as i32;
+        let bar_w = crate::cursor_glow::bar_width(geom.cw as i32);
+        // The wide band, then the narrow one on the bar's line.
         const BANDS: [(f32, f32); 2] = [(0.30, 0.45), (0.11, 1.0)];
         let mut bi = 0;
         while bi < BANDS.len() {
             let (hw, share) = BANDS[bi];
+            let narrow = bi == 1;
             bi += 1;
             let a = (LIGHT_BODY_ALPHA_CAP * share * strength) as u8;
             if a == 0 {
                 continue;
             }
-            let w = ((cw * hw * 2.0) as i32).max(1);
-            crate::effect_util::push_fx_quad(
-                under,
-                geom,
-                (ax - cw * hw) as i32,
-                y,
-                w,
-                ch_i,
-                premul_rgb(ink, a),
-                a,
-            );
+            let (x, w) = if narrow {
+                (bar_x, bar_w)
+            } else {
+                ((ax - cw * hw) as i32, ((cw * hw * 2.0) as i32).max(1))
+            };
+            crate::effect_util::push_fx_quad(under, geom, x, y, w, ch_i, premul_rgb(ink, a), a);
         }
     }
 

@@ -36,17 +36,30 @@ fn scratch_admit(
             )),
             aterm_capacity::Pace::default(),
             need,
-            // Unit tests record Background admission but need not own their harness's
-            // process group. The directly spawned candidate verifier exercises that real
-            // precondition.
-            if mode == aterm_capacity::Admit::Preemptible {
-                aterm_capacity::Admit::Wait
-            } else {
-                mode
-            },
+            mode,
             &mut |_| {},
         )
     })
+}
+
+/// How a dispatch enters a request in `ledger` on `machine`: at its place where it has one
+/// ([`aterm_capacity::admit::Waiter::enter_at`]), else at now.
+fn entering<'a>(
+    ledger: &'a aterm_capacity::Ledger,
+    machine: &'a dyn aterm_capacity::Machine,
+) -> impl Fn(
+    aterm_capacity::Need,
+    Option<&aterm_capacity::admit::Place>,
+) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>
++ 'a {
+    use aterm_capacity::admit::Waiter;
+    move |need, place| {
+        match place {
+            Some(place) => Waiter::enter_at(ledger, machine, need, place),
+            None => Waiter::enter(ledger, machine, need),
+        }
+        .map_err(aterm_capacity::Error::Ledger)
+    }
 }
 
 /// Retrying a memory-starved binary retains its durable queue identity ahead of later work.
@@ -72,12 +85,11 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     machine.set(aterm_capacity::Reading::of_gib(48, 0, 14));
     let waiters = BinaryWaiters::default();
     let need = || aterm_capacity::Need::new("waiting binary").mem(64 << 20);
-    let enter =
-        |need| Waiter::enter(&ledger, &machine, need).map_err(aterm_capacity::Error::Ledger);
+    let enter = entering(&ledger, &machine);
     assert!(
         waiters
-            .poll_noting(7, need(), &machine, enter,
-                &mut |_| panic!("the first blocked binary must enter the fair queue, regardless of a cached shortfall"),
+            .poll_noting(7, need(), &machine, &enter,
+                &mut |_, _| panic!("the first blocked binary must enter the fair queue, regardless of a cached shortfall"),
                 &mut None)
             .expect("entering the first waiting request")
             .is_none()
@@ -100,7 +112,7 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     assert!(original.2 < later.record().seq);
     assert!(
         waiters
-            .poll_with(8, need(), &machine, enter)
+            .poll_with(8, need(), &machine, &enter)
             .unwrap()
             .is_none()
     );
@@ -112,7 +124,7 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     for _ in 0..3 {
         assert!(
             waiters
-                .poll_with(7, need(), &machine, |_| {
+                .poll_with(7, need(), &machine, |_, _| {
                     panic!("a retry must poll the original waiter")
                 })
                 .expect("polling the retained request")
@@ -133,8 +145,8 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
                 8,
                 need(),
                 &machine,
-                |_| panic!("a cached rejection must not create a temporary waiter"),
-                &mut |_| Some(aterm_capacity::admit::ProbeRejection::Unreachable(
+                |_, _| panic!("a cached rejection must not create a temporary waiter"),
+                &mut |_, _| Some(aterm_capacity::admit::ProbeRejection::Unreachable(
                     "observed shortfall".into()
                 )),
                 &mut reason,
@@ -149,8 +161,8 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
                 7,
                 need(),
                 &machine,
-                |_| panic!("the retained waiter must keep its original queue identity"),
-                &mut |_| panic!(
+                |_, _| panic!("the retained waiter must keep its original queue identity"),
+                &mut |_, _| panic!(
                     "the retained waiter must poll fresh instead of consulting a stale rejection"
                 ),
                 &mut None,
@@ -167,7 +179,7 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     );
     machine.set(aterm_capacity::Reading::of_gib(48, 40, 14));
     let claim = waiters
-        .poll_with(7, need(), &machine, |_| {
+        .poll_with(7, need(), &machine, |_, _| {
             panic!("admission must retain the original waiter")
         })
         .expect("polling after memory becomes available")
@@ -177,7 +189,7 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     machine.set(aterm_capacity::Reading::of_gib(48, 0, 14));
     assert!(
         waiters
-            .poll_with(11, need(), &machine, enter)
+            .poll_with(11, need(), &machine, &enter)
             .unwrap()
             .is_none()
     );
@@ -189,6 +201,447 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
     );
     drop(holder);
     assert!(ledger.of_pid(std::process::id()).unwrap().is_empty());
+}
+
+/// How [`dispatch_behind_later_claims`] enters the request of the dispatch's next binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Successor {
+    /// At the dispatch's place, before the running binary's claim is released: the law.
+    AtThePlace,
+    /// Before the release, laid at now: every request after the first laid at now, as before.
+    AtNow,
+    /// At the place, once the running binary's claim is gone: nothing stands there by then.
+    AfterTheRelease,
+}
+
+/// One dispatch of `binaries` 2 GiB binaries, one at a time, in a scratch ledger on a fixed
+/// machine (36 GiB, 10 of it available), among other processes' claims laid at chosen stamps:
+/// a 16 GiB claim laid an hour before the dispatch's first request, then, after that request,
+/// `later` pairs of 16 GiB claims that cannot fit beside the dispatch (one that does not ask to
+/// run alone, one that does), and last a later dispatch's 2 GiB binary. Every other process
+/// looks while each binary runs and again the moment its claim is released, and one admitted
+/// ends at once. The order in which the claims and the binaries were admitted.
+///
+/// With the successor entered at the place it also holds THE LAW's invariant at every scan:
+/// from the first entry until the last binary is admitted, a record of the dispatch stands in
+/// the ledger, and each of its records carries the first entry's order stamp.
+fn dispatch_behind_later_claims(
+    binaries: usize,
+    later: usize,
+    successor: Successor,
+) -> Vec<String> {
+    dispatch_among_claims(binaries, later, successor, Duration::ZERO).0
+}
+
+/// [`dispatch_behind_later_claims`] where each other process's admitted claim runs for `hold`
+/// before it ends: the order of admissions, and the wall from the dispatch's first pass to its
+/// last binary's start.
+fn dispatch_among_claims(
+    binaries: usize,
+    later: usize,
+    successor: Successor,
+    hold: Duration,
+) -> (Vec<String>, Duration) {
+    use aterm_capacity::admit::{Polled, Waiter};
+    const HOUR: u64 = 3_600_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let ledger = aterm_capacity::Ledger::at(tmp.path().join("ledger"));
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(36, 10, 14));
+    let me = std::process::id();
+    let began = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // The dispatch's first request is laid a day ago, so every stamp below is in the past and
+    // a request laid at now is behind them all.
+    let t0 = began - 24 * HOUR;
+    let other = |name: String, pid: u32, at_ms: u64, need: aterm_capacity::Need| {
+        let waiter = Waiter::enter_stand_in(&ledger, &machine, need, Some(pid), at_ms)
+            .expect("another process's claim is laid");
+        (name, Some(waiter))
+    };
+    let large = |what: &str| aterm_capacity::Need::new(what).mem_gib(16);
+    let mut events: Vec<String> = Vec::new();
+    // Each other process looks once, in the order they asked; one admitted runs and ends.
+    let look = |others: &mut Vec<(String, Option<Waiter>)>, events: &mut Vec<String>| {
+        for (name, slot) in others.iter_mut() {
+            let Some(waiter) = slot.take() else { continue };
+            match waiter.poll(&machine) {
+                Polled::Admitted(claim) => {
+                    events.push(name.clone());
+                    std::thread::sleep(hold);
+                    drop(claim);
+                }
+                Polled::Waiting(waiter, _) => *slot = Some(waiter),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    };
+    let plan = Plan {
+        share: 1,
+        target: Duration::ZERO,
+        order: (0..binaries)
+            .map(|index| Planned {
+                index,
+                width: 1,
+                charge: 1,
+                peak: 2 << 30,
+                predicted: None,
+            })
+            .collect(),
+    };
+    let need_of = |b: &Planned| {
+        aterm_capacity::Need::new(crate::test_share::BINARY_CLAIM)
+            .mem(b.peak)
+            .cores(b.charge)
+    };
+    let mut d = Dispatcher::new(&plan, None);
+    let waiters = BinaryWaiters::default();
+    let enter = |need: aterm_capacity::Need, place: Option<&aterm_capacity::admit::Place>| {
+        match place {
+            // The dispatch's first request: laid at its own stamp, which mints the place.
+            None => Waiter::enter_stand_in(&ledger, &machine, need, None, t0),
+            Some(_) if successor == Successor::AtNow => Waiter::enter(&ledger, &machine, need),
+            Some(place) => Waiter::enter_at(&ledger, &machine, need, place),
+        }
+        .map_err(aterm_capacity::Error::Ledger)
+    };
+    // One pass of the dispatch: the first queued binary whose claim is admitted starts.
+    let pass = |d: &mut Dispatcher| {
+        let mut claim = None;
+        let started = d.next_with(0.0, &mut |b| {
+            claim = waiters
+                .poll_with(b.index, need_of(b), &machine, &enter)
+                .expect("the dispatch's request is polled");
+            claim.is_some()
+        });
+        started.map(|b| (b, claim.expect("a started binary holds its claim")))
+    };
+    // THE LAW's invariant, where the successor is entered at the place.
+    let stands = |when: &str| {
+        if successor != Successor::AtThePlace {
+            return;
+        }
+        let mine = ledger.of_pid(me).expect("the ledger reads");
+        assert!(
+            !mine.is_empty() && mine.iter().all(|r| r.start_ms == t0),
+            "{when}: a record of the dispatch stands, each at its first entry's stamp {t0}: \
+             {mine:?}"
+        );
+    };
+
+    // A claim laid before the dispatch's first request is admitted before the dispatch: alone,
+    // so the dispatch's first request waits behind it, retained.
+    let earlier =
+        Waiter::enter_stand_in(&ledger, &machine, large("earlier"), Some(me + 1), t0 - HOUR)
+            .expect("another process's earlier claim is laid");
+    let Polled::Admitted(held_alone) = earlier.poll(&machine) else {
+        panic!("nothing was ahead of the earlier claim");
+    };
+    events.push("an earlier claim".to_owned());
+    let first_pass = std::time::Instant::now();
+    let mut last_start = Duration::ZERO;
+    assert!(pass(&mut d).is_none(), "the dispatch waits behind it");
+    stands("after the first entry");
+    // The claims laid after the dispatch's first request.
+    let mut others = Vec::new();
+    for pair in 0..later {
+        let at = t0 + HOUR * (1 + 2 * pair as u64);
+        let pid = me + 2 + 2 * pair as u32;
+        others.push(other(
+            format!("large claim {pair}"),
+            pid,
+            at,
+            large("cold build"),
+        ));
+        others.push(other(
+            format!("alone claim {pair}"),
+            pid + 1,
+            at + HOUR,
+            large("lint").alone(),
+        ));
+    }
+    others.push(other(
+        "a later dispatch's binary".into(),
+        me + 1000,
+        t0 + HOUR * 20,
+        aterm_capacity::Need::new("later binary").mem_gib(2),
+    ));
+    look(&mut others, &mut events);
+    drop(held_alone);
+    look(&mut others, &mut events);
+    for _ in 0..binaries {
+        let (b, claim) = pass(&mut d).expect("the dispatch's next binary is admitted");
+        events.push(format!("binary {}", b.index));
+        last_start = first_pass.elapsed();
+        stands("as a binary starts");
+        // It runs; every other process looks.
+        look(&mut others, &mut events);
+        if successor != Successor::AfterTheRelease {
+            waiters.hand_over(&d, b.index, false, &need_of, &machine, &enter);
+        }
+        stands("before the release");
+        if successor == Successor::AtThePlace && d.queued().next().is_some() {
+            assert!(
+                ledger
+                    .of_pid(me)
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.held.is_none() && r.start_ms == t0),
+                "the next binary's request waits at the place before the claim is released"
+            );
+        }
+        drop(claim);
+        if d.queued().next().is_some() {
+            stands("after the release");
+        }
+        // The gap a look of another process falls in.
+        look(&mut others, &mut events);
+        if successor == Successor::AfterTheRelease {
+            waiters.hand_over(&d, b.index, false, &need_of, &machine, &enter);
+        }
+        d.finish(b.index).expect("it ran");
+    }
+    assert!(!d.waiting(), "every binary started");
+    look(&mut others, &mut events);
+    assert!(
+        others.iter().all(|(_, waiter)| waiter.is_none()),
+        "every claim is admitted once the dispatch has ended"
+    );
+    (events, last_start)
+}
+
+/// A MEASUREMENT, which prints and judges no time: the wall from a dispatch's first pass to its
+/// last binary's start, among later large claims that each hold the machine's memory for
+/// 50 ms once admitted, with the successor laid at now (the code before the place) and at the
+/// place. Laid at now, the dispatch's second binary starts after every claim laid meanwhile has
+/// run; at the place, those claims run after its last binary.
+#[test]
+#[ignore = "measurement: prints a dispatch's wall among later large claims; run with --ignored --nocapture"]
+fn measure_a_dispatch_among_later_large_claims() {
+    const BINARIES: usize = 10;
+    const PAIRS: usize = 10;
+    const HOLD: Duration = Duration::from_millis(50);
+    let last = format!("binary {}", BINARIES - 1);
+    for (arm, successor) in [
+        ("at-now", Successor::AtNow),
+        ("at-the-place", Successor::AtThePlace),
+    ] {
+        let (events, wall) = dispatch_among_claims(BINARIES, PAIRS, successor, HOLD);
+        let served = events
+            .iter()
+            .take_while(|event| **event != last)
+            .filter(|event| event.contains("claim "))
+            .count();
+        println!(
+            "DISPATCH-PLACE arm={arm} binaries={BINARIES} later_large_claims={} hold_ms={} \
+             later_claims_served_before_last_binary={served} wall_ms={}",
+            2 * PAIRS,
+            HOLD.as_millis(),
+            wall.as_millis()
+        );
+    }
+}
+
+/// THE LAW OF A DISPATCH'S PLACE, in a scratch ledger on a fixed machine
+/// with chosen stamps and no clock waited on. From a dispatch's first entry until its last
+/// queued binary is admitted, every scan finds a record of the dispatch, held with memory or
+/// waiting, whose order stamp is the first entry's ([`dispatch_behind_later_claims`] asserts it
+/// at each step). Hence a claim laid after that entry that cannot fit beside the dispatch, one
+/// that asks memory alone and one that does not, is admitted only after the dispatch's last
+/// binary, for any number of binaries and of such claims; a claim laid before the first entry
+/// is admitted before the dispatch; and a later dispatch's binary stays behind the large
+/// waiters laid before it. THE COST is in that order: each later claim waited for the whole
+/// dispatch.
+///
+/// And a second binary the share allows is entered at the place: it is admitted beside the
+/// running one, ahead of a large waiter laid since, where the retained request still waits.
+///
+/// NEGATIVE CONTROLS. The successor stamped at now (the code before this law): a later large
+/// claim is admitted before binary 1. A successor entered after the claim's release: the look
+/// in that gap admits the large claim, and the place is gone. A one-shot stamped at now is
+/// not admitted behind the large waiter. A halted or stopping dispatch hands nothing on, a
+/// binary started another way leaves no request behind, and a hand-over while another binary
+/// of the dispatch still holds its claim enters nothing.
+#[test]
+fn a_dispatch_keeps_its_place_from_its_first_binary_to_its_last() {
+    use aterm_capacity::admit::{Polled, Waiter};
+    for binaries in [1, 2, 5] {
+        for later in [1, 3] {
+            let mut expected = vec!["an earlier claim".to_owned()];
+            expected.extend((0..binaries).map(|index| format!("binary {index}")));
+            for pair in 0..later {
+                expected.push(format!("large claim {pair}"));
+                expected.push(format!("alone claim {pair}"));
+            }
+            expected.push("a later dispatch's binary".to_owned());
+            assert_eq!(
+                dispatch_behind_later_claims(binaries, later, Successor::AtThePlace),
+                expected,
+                "{binaries} binaries, {later} pairs of later claims"
+            );
+        }
+    }
+    for control in [Successor::AtNow, Successor::AfterTheRelease] {
+        let events = dispatch_behind_later_claims(3, 1, control);
+        let at = |what: &str| {
+            events
+                .iter()
+                .position(|event| event == what)
+                .unwrap_or_else(|| panic!("{what} in {events:?}"))
+        };
+        assert!(
+            at("binary 0") < at("large claim 0") && at("large claim 0") < at("binary 1"),
+            "{control:?}: the later large claim goes ahead of the dispatch's second binary: \
+             {events:?}"
+        );
+    }
+
+    // A SECOND BINARY THE SHARE ALLOWS, and the dispatch's ends.
+    const HOUR: u64 = 3_600_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let ledger = aterm_capacity::Ledger::at(tmp.path().join("ledger"));
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(36, 10, 14));
+    let me = std::process::id();
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 24 * HOUR;
+    let waiters = BinaryWaiters::default();
+    let binary = |gib: u64| aterm_capacity::Need::new(crate::test_share::BINARY_CLAIM).mem_gib(gib);
+    let at_now = |need: aterm_capacity::Need, _: Option<&aterm_capacity::admit::Place>| {
+        Waiter::enter(&ledger, &machine, need).map_err(aterm_capacity::Error::Ledger)
+    };
+    let enter = entering(&ledger, &machine);
+    let running = waiters
+        .poll_with(0, binary(2), &machine, |need, place| {
+            assert!(place.is_none(), "the first request mints the place");
+            Waiter::enter_stand_in(&ledger, &machine, need, None, t0)
+                .map_err(aterm_capacity::Error::Ledger)
+        })
+        .unwrap()
+        .expect("the first binary fits");
+    assert_eq!(waiters.place_ms(), Some(t0));
+    let large = Waiter::enter_stand_in(
+        &ledger,
+        &machine,
+        aterm_capacity::Need::new("cold build").mem_gib(16),
+        Some(me + 1),
+        t0 + HOUR,
+    )
+    .unwrap();
+    let Polled::Waiting(large, _) = large.poll(&machine) else {
+        panic!("the large claim waits for the running binary");
+    };
+    // The retained request: 9 GiB does not fit beside the running 2 of 10.
+    assert!(
+        waiters
+            .poll_with(1, binary(9), &machine, &enter)
+            .unwrap()
+            .is_none()
+    );
+    // NEGATIVE CONTROL: a one-shot laid at now is behind the large waiter, which spares nothing.
+    assert!(
+        waiters
+            .poll_with(2, binary(1), &machine, at_now)
+            .unwrap()
+            .is_none(),
+        "laid last, it does not start though it fits"
+    );
+    let beside = waiters
+        .poll_with(2, binary(1), &machine, &enter)
+        .unwrap()
+        .expect("entered at the place, it starts beside the running binary");
+    assert_eq!(beside.record().start_ms, t0);
+    assert!(
+        beside.record().laid_ms() > t0 + HOUR,
+        "and is as old as its own laying: {:?}",
+        beside.record()
+    );
+    let Polled::Waiting(large, _) = large.poll(&machine) else {
+        panic!("the large claim still waits");
+    };
+
+    // A HALTED OR STOPPING DISPATCH HANDS NOTHING ON, and its clearing leaves no request.
+    let plan = Plan {
+        share: 3,
+        target: Duration::ZERO,
+        order: [2_u64, 9, 1, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, gib)| Planned {
+                index,
+                width: 1,
+                charge: 1,
+                peak: gib << 30,
+                predicted: None,
+            })
+            .collect(),
+    };
+    let need_of = |b: &Planned| binary(b.peak >> 30);
+    let waiting = || {
+        ledger
+            .of_pid(me)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.held.is_none())
+            .count()
+    };
+    let mut d = Dispatcher::new(&plan, None);
+    assert_eq!(waiting(), 1, "the retained request of binary 1");
+    waiters.clear();
+    assert_eq!(waiting(), 0, "a stop or a halt clears it");
+    waiters.hand_over(&d, 3, true, &need_of, &machine, &enter);
+    assert_eq!(waiting(), 0, "a stopping dispatch hands nothing on");
+    // Live, it enters the first queued binary's request at the place.
+    waiters.hand_over(&d, 3, false, &need_of, &machine, &enter);
+    let standing = ledger.of_pid(me).unwrap();
+    assert!(
+        standing
+            .iter()
+            .any(|r| r.held.is_none() && r.start_ms == t0 && r.need.mem == 2 << 30),
+        "binary 0, the plan's first still queued, stands at the place: {standing:?}"
+    );
+    // A second hand-over enters nothing more: one request stands.
+    waiters.hand_over(&d, 3, false, &need_of, &machine, &enter);
+    assert_eq!(waiting(), 1);
+    // A binary started another way leaves no request behind it.
+    waiters.forget(0);
+    assert_eq!(waiting(), 0);
+    waiters.hand_over(&d, 3, false, &need_of, &machine, &enter);
+    assert_eq!(waiting(), 1);
+    // One whose binary is no longer queued is dropped at the next hand-over, which enters the
+    // next binary still queued.
+    assert_eq!(d.next(0.0).map(|b| b.index), Some(0));
+    // ONLY THE LAST CLAIM HANDS ON. While binary 0 runs and has not reached its own
+    // hand-over, another's enters nothing: binary 0's claim keeps the place, and a request
+    // entered now could stand unpolled for as long as binary 0 runs.
+    waiters.hand_over(&d, 3, false, &need_of, &machine, &enter);
+    assert_eq!(
+        waiting(),
+        0,
+        "the started binary's request is dropped, none is entered"
+    );
+    waiters.hand_over(&d, 0, false, &need_of, &machine, &enter);
+    let standing = ledger.of_pid(me).unwrap();
+    assert!(
+        standing
+            .iter()
+            .any(|r| r.held.is_none() && r.start_ms == t0 && r.need.mem == 9 << 30)
+            && waiting() == 1,
+        "binary 1's request replaced the started binary's: {standing:?}"
+    );
+    d.halt();
+    waiters.clear();
+    waiters.hand_over(&d, 3, false, &need_of, &machine, &enter);
+    assert_eq!(waiting(), 0, "a halted dispatch hands nothing on");
+    // With every record of the dispatch gone, so is its place.
+    drop((running, beside));
+    assert_eq!(waiters.place_ms(), None);
+    let Polled::Admitted(_) = large.poll(&machine) else {
+        panic!("the large claim is admitted once the dispatch has left the queue");
+    };
 }
 
 /// A decisive red closes the dispatch under the same mutex as a start, before its event is
@@ -567,41 +1020,6 @@ fn a_run_under_the_releases_pool_claims_its_memory_and_no_cores() {
     let claims =
         claim_both(&unpooled, "t", None, 2 * gib, "one", 5, scratch_admit).expect("admitted");
     assert_eq!(asked(), [(2 * gib, 5, aterm_capacity::Admit::Wait, false)]);
-    drop(claims);
-    SCRATCH.set(None);
-}
-
-/// A repeatable tree's recording pass asks once for memory and cores together, at
-/// Background rank, and uses that one claim's actual core grant. NEGATIVE CONTROL: restoring
-/// the split ordinary path is caught by `a_test_run_claims_memory_and_cores_atomically`.
-#[test]
-fn a_background_test_run_claims_memory_and_cores_once() {
-    let tmp = aterm_tempfile::tempdir().expect("scratch");
-    SCRATCH.set(Some((
-        aterm_capacity::Ledger::at(tmp.path().join("ledger")),
-        Vec::new(),
-    )));
-    let mut ctx = crate::Ctx::new(
-        tmp.path().to_path_buf(),
-        crate::Scope::workspace(),
-        crate::EnvSnapshot::default(),
-        tmp.path().join("scratch"),
-    );
-    ctx.background = true;
-    ctx.memory = Some(crate::memory::Book::at(
-        None,
-        Some(48 << 30),
-        Some(40 << 30),
-    ));
-    let gib = 1_u64 << 30;
-    let claims = claim_both(&ctx, "t", None, 2 * gib, "one", 6, scratch_admit).expect("admitted");
-    assert!(claims.resources.is_some());
-    assert_eq!(claims.granted, 6);
-    let asked = SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.as_mut().expect("scratch").1));
-    assert_eq!(
-        asked,
-        [(2 * gib, 6, aterm_capacity::Admit::Preemptible, false)]
-    );
     drop(claims);
     SCRATCH.set(None);
 }
@@ -1077,51 +1495,6 @@ fn a_core_grant_event_names_the_ask_the_grant_and_the_load() {
             (Some(24.0), Some(24.0), Some(12))
         );
     }
-}
-
-/// A background dispatch retains cancellation authority even with no binary running,
-/// without reserving a single byte or core. The ordinary control retains no such claim.
-#[test]
-fn a_background_dispatch_lifetime_holds_no_memory_or_cpu() {
-    let tmp = aterm_tempfile::tempdir().unwrap();
-    SCRATCH.set(Some((
-        aterm_capacity::Ledger::at(tmp.path().join("ledger")),
-        Vec::new(),
-    )));
-    let mut ctx = crate::Ctx::new(
-        tmp.path().to_path_buf(),
-        crate::Scope::workspace(),
-        crate::EnvSnapshot::default(),
-        tmp.path().join("scratch"),
-    );
-    ctx.memory = Some(crate::memory::Book::at(
-        None,
-        Some(48 << 30),
-        Some(40 << 30),
-    ));
-    ctx.background = true;
-    let guard = dispatch_lifetime(&ctx, scratch_admit).unwrap().unwrap();
-    assert_eq!((guard.record().need.mem, guard.record().need.cores), (0, 0));
-    SCRATCH.with_borrow(|s| {
-        assert_eq!(
-            s.as_ref().unwrap().1,
-            [(0, 0, aterm_capacity::Admit::Preemptible, false)]
-        )
-    });
-    drop(guard);
-    ctx.background = false;
-    assert!(dispatch_lifetime(&ctx, scratch_admit).unwrap().is_none());
-    SCRATCH.with_borrow(|s| {
-        assert!(
-            s.as_ref()
-                .unwrap()
-                .0
-                .of_pid(std::process::id())
-                .unwrap()
-                .is_empty()
-        )
-    });
-    SCRATCH.set(None);
 }
 
 #[test]
@@ -2286,7 +2659,6 @@ fn a_spent_ceiling_starts_nothing_more() {
 }
 
 /// Binaries of `charges`, all unseen, each its charge wide, in a plan on `share` cores.
-#[cfg(unix)]
 fn charged(charges: &[u32], share: u32) -> (Vec<Binary>, Plan) {
     let bins = (0..charges.len())
         .map(|i| Binary {

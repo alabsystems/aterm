@@ -6698,18 +6698,34 @@ const SUBMIT_INPUT_HELPERS_JS: &str = r#"
 "#;
 
 /// Build the JavaScript expression evaluated inside the OAuth page to inspect and advance the
-/// flow. Cloudflare's block page answers `block_page` and its bot check `bot_check`
-/// ([`block_page`], [`bot_check`]), read before anything on the page is pressed or filled, and
-/// then nothing is.
+/// flow. Cloudflare's block page answers `block_page`, its bot check `bot_check` ([`block_page`],
+/// [`bot_check`]), and a page that holds a human check's widget anywhere in it
+/// ([`HUMAN_CHECK_WIDGETS`]: hCaptcha, reCAPTCHA or Turnstile, whether the button it is bound
+/// to stands enabled or not) `human_check`. All three are read before anything on the page is
+/// pressed or filled, and then nothing is: nobody is at this profile to answer a check, and an
+/// invisible one runs on the press of the button it is bound to.
+///
+/// A consent control (`Authorize`, `Allow`, `Continue as …`, an approval form's own enabled
+/// submit button) is pressed only while it is enabled (neither `disabled` nor
+/// `aria-disabled`), and at most once per page load: `consent_pressed` names the page
+/// address and the document (`performance.timeOrigin`) the drive's one press was made in, as a
+/// `clicked_consent` answer's `url` and `doc` said, and that document answers
+/// `consent_pressed` with nothing pressed again. An approval form is never submitted past its
+/// own controls, so a disabled `Authorize` stays unpressed.
 #[must_use]
 pub fn oauth_step_js(
     email: Option<&str>,
     otp: Option<&str>,
-    email_submitted: bool,
-    otp_submitted: bool,
+    (email_submitted, otp_submitted): (bool, bool),
+    consent_pressed: Option<(&str, &str)>,
 ) -> String {
-    let email_json = aterm_json::to_string(&email.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
-    let otp_json = aterm_json::to_string(&otp.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let literal = |value: &str| aterm_json::to_string(&value).unwrap_or_else(|_| "\"\"".into());
+    let email_json = literal(email.unwrap_or(""));
+    let otp_json = literal(otp.unwrap_or(""));
+    let (pressed_at, pressed_doc) = consent_pressed.map_or_else(
+        || ("null".to_owned(), "null".to_owned()),
+        |(at, doc)| (literal(at), literal(doc)),
+    );
     format!(
         r#"(() => {{
   const rawHref = String(window.location && window.location.href || "");
@@ -6730,6 +6746,15 @@ pub fn oauth_step_js(
   const pageText = String(document.body && document.body.innerText || "");
   if (blockPageOf(pageText)) return {{ state: "block_page", url: href }};
   if (botCheckOf(document.title, pageText, botCheckMarkers())) return {{ state: "bot_check", url: href }};
+  if (document.querySelector("{HUMAN_CHECK_WIDGETS}")) return {{ state: "human_check", url: href }};
+  const pageDoc = String(window.performance && window.performance.timeOrigin || "");
+  const consentSpent = href === {pressed_at} && pageDoc === {pressed_doc};
+  const pressConsent = (control, target) => {{
+    if (consentSpent) return {{ state: "consent_pressed", url: href }};
+    if (control.disabled || String(control.getAttribute("aria-disabled") || "").toLowerCase() === "true") return {{ state: "loading", url: href }};
+    control.click();
+    return {{ state: "clicked_consent", url: href, doc: pageDoc, target }};
+  }};
   const setNativeValue = (el, val) => {{
     if (typeof el.focus === "function") el.focus();
     const proto = Object.getPrototypeOf(el);
@@ -6796,8 +6821,7 @@ pub fn oauth_step_js(
       hrefAttr.includes("localhost:") ||
       hrefAttr.includes("127.0.0.1:")
     )) {{
-      btn.click();
-      return {{ state: "clicked_consent", url: href, target: hrefAttr || text }};
+      return pressConsent(btn, hrefAttr || text);
     }}
   }}
   const explicitOtp = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i], input[data-testid*='otp' i]")).filter(visibleControl);
@@ -6830,12 +6854,16 @@ pub fn oauth_step_js(
     return !act.includes("deny") && !act.includes("cancel") && !act.includes("reject") && !act.includes("decline") && !act.includes("revoke") && !act.includes("logout") && !act.includes("signout") && !act.includes("sign-out") && !act.includes("access_denied") && !act.includes("?error=") && !act.includes("&error=");
   }}) : null;
   if (approveForm) {{
-    if (typeof approveForm.requestSubmit === "function") {{
-      approveForm.requestSubmit();
-    }} else {{
-      approveForm.submit();
-    }}
-    return {{ state: "clicked_consent", url: href }};
+    // Only the form's own enabled, shown submit button: a submit of the form itself would go
+    // past an `Authorize` the page holds disabled.
+    const ownerForm = (control) => "form" in control ? control.form : control.closest("form");
+    const submits = (control) => (control.tagName === "BUTTON" && control.type === "submit") ||
+      (control.tagName === "INPUT" && ["submit", "image"].includes(control.type));
+    const declines = (text) => text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("revoke") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
+    const approve = buttons.find(control => ownerForm(control) === approveForm && submits(control) &&
+      visibleControl(control) && control.getClientRects().length > 0 && !declines(btnText(control)));
+    if (!approve) return {{ state: "loading", url: href }};
+    return pressConsent(approve, btnText(approve));
   }}
   if (bodyText.includes("check your email") || bodyText.includes("magic link") || bodyText.includes("sent a link") || bodyText.includes("verification code") || bodyText.includes("link has expired") || bodyText.includes("link expired") || bodyText.includes("invalid link") || bodyText.includes("already been used")) {{
     return {{ state: "needs_mailbox", url: href }};
@@ -6846,8 +6874,7 @@ pub fn oauth_step_js(
       const text = btnText(btn);
       const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject") || text.includes("do not ") || text.includes("don't ") || text.includes("dont ") || text.includes("not allow") || text.includes("not authorize");
       if (!isCancel && text.startsWith("continue as ") && hasTargetEmail(text)) {{
-        btn.click();
-        return {{ state: "clicked_consent", url: href, target: text }};
+        return pressConsent(btn, text);
       }}
     }}
   }}
@@ -6862,8 +6889,7 @@ pub fn oauth_step_js(
       text.startsWith("continue as ") ||
       (href.includes("/oauth/") && (text === "continue" || text === "confirm" || text === "select"))
     )) {{
-      btn.click();
-      return {{ state: "clicked_consent", url: href, target: text }};
+      return pressConsent(btn, text);
     }}
   }}
   return {{ state: "loading", url: href }};
@@ -7832,6 +7858,13 @@ pub const BOT_CHECK_UNCLEARED: &str =
 pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
+/// A headless Claude sign-in's end where a page of it carried a human check's widget
+/// (hCaptcha, reCAPTCHA or Turnstile, [`HUMAN_CHECK_WIDGETS`]) until the drive's deadline
+/// ([`MetWord::HumanCheck`]): nothing on that page was pressed or filled.
+pub const HUMAN_CHECK_MET: &str = "a page of the sign-in carried a human check (hCaptcha, \
+                                   reCAPTCHA or Turnstile); aterm never operates one, and \
+                                   pressed nothing there";
+
 /// A token consent page's end on the account's headless profile where it carried a human
 /// check's widget (hCaptcha, reCAPTCHA or Turnstile) until the drive's deadline
 /// ([`MetWord::HumanCheck`]): nothing was pressed.
@@ -7907,7 +7940,8 @@ pub const WINDOW_BOT_CHECK: &str = "Cloudflare's check in aterm's sign-in window
                                     complete it";
 
 /// A Claude sign-in's end on a consent page in aterm's sign-in window whose `Authorize` a
-/// human check (hCaptcha) held until the sign-in's deadline ([`VisibleStop::HumanCheck`]).
+/// human check (hCaptcha) held until the sign-in's deadline, or at all in a sign-in nobody
+/// started ([`VisibleStop::HumanCheck`]).
 pub const WINDOW_HUMAN_CHECK: &str = "the consent page in aterm's sign-in window held Authorize \
                                       behind a human check (hCaptcha); aterm never operates \
                                       it, and a person at this Mac may complete it there";
@@ -7987,25 +8021,33 @@ pub(super) enum VisibleStop {
 /// no sign-in window. Whether it may run is its caller's to have established: the opener's
 /// grant ([`super::open_url::WINDOW_ENV`]), which only a sign-in this Mac started for its own
 /// rows carries. `scope` is the caller's account-work scope, which ends the wait when
-/// cancelled; the opener process (`aterm-open-url`) has none. A test gets its thread's
+/// cancelled; the opener process (`aterm-open-url`) has none. `unattended`: nobody started the
+/// sign-in ([`super::open_url::UNATTENDED_ENV`]), so a code page no mailbox answers ends it at
+/// once. A test gets its thread's
 /// substituted result instead ([`set_visible_sign_in_for_tests`]) and opens nothing.
 pub(super) fn visible_sign_in(
     authorize_url: &str,
     email: Option<&str>,
     scope: Option<&super::account_work::Scope>,
+    unattended: bool,
 ) -> Option<Result<VisibleDone, VisibleStop>> {
     #[cfg(test)]
     {
-        let _ = scope;
+        let _ = (scope, unattended);
         Some(substituted_visible_sign_in(authorize_url, email))
     }
     #[cfg(all(not(test), target_os = "macos"))]
     {
-        Some(super::signin_window::authorize(authorize_url, email, scope))
+        Some(super::signin_window::authorize(
+            authorize_url,
+            email,
+            scope,
+            unattended,
+        ))
     }
     #[cfg(all(not(test), not(target_os = "macos")))]
     {
-        let _ = (authorize_url, email, scope);
+        let _ = (authorize_url, email, scope, unattended);
         None
     }
 }
@@ -8138,7 +8180,10 @@ pub(super) fn finish_deadline<T>(
 /// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
 /// [`BotCheckClock`]) not counted against the drive's steps. Software never operates that
 /// challenge, no other browser is opened after it and no other machine is asked: the drive
-/// ends on the page it met ([`BOT_CHECK_UNCLEARED`], [`BLOCK_PAGE_MET`]). Page outcomes are
+/// ends on the page it met ([`BOT_CHECK_UNCLEARED`], [`BLOCK_PAGE_MET`]). A page that holds a
+/// human check's widget is pressed and filled nothing, and waited on, its reads uncounted,
+/// until the deadline, which names it ([`HUMAN_CHECK_MET`]); a consent control is pressed at
+/// most once per page load ([`oauth_step_js`]). Page outcomes are
 /// noted for [`take_met`], as is a drive that reached no callback in time. (On macOS a Claude
 /// sign-in this Mac started runs in aterm's own window instead and never reaches this drive:
 /// [`visible_sign_in`].)
@@ -8177,14 +8222,33 @@ fn oauth_out_of_time(bot: &BotCheckClock, last_host: Option<&str>, now: Instant)
     "timed out waiting for headless browser OAuth completion"
 }
 
+/// How the headless sign-in's drive whose deadline came at `now` ends, noted for [`take_met`]:
+/// on the human check its last read stood on (`human`, [`HUMAN_CHECK_MET`]), else as
+/// [`oauth_out_of_time`] ends it.
+fn sign_in_out_of_time(
+    bot: &BotCheckClock,
+    human: bool,
+    last_host: Option<&str>,
+    now: Instant,
+) -> &'static str {
+    if human {
+        note_met(MetWord::HumanCheck, last_host);
+        return HUMAN_CHECK_MET;
+    }
+    oauth_out_of_time(bot, last_host, now)
+}
+
+/// What is left of the headless sign-in's `deadline`, or how its drive ends where nothing is
+/// ([`sign_in_out_of_time`]).
 fn oauth_time_left(
     deadline: Deadline<'_>,
     bot: &BotCheckClock,
+    human: bool,
     last_host: Option<&str>,
 ) -> Result<Duration, &'static str> {
     deadline
         .remaining()
-        .map_err(|_| oauth_out_of_time(bot, last_host, deadline.now()))
+        .map_err(|_| sign_in_out_of_time(bot, human, last_host, deadline.now()))
 }
 
 /// [`drive_cdp_oauth_with_webmail`] within `timeout`, reading every `poll_interval`, with
@@ -8425,6 +8489,11 @@ fn drive_cdp_oauth_flow_until(
     let result = (|| {
         let mut steps = 0usize;
         let mut bot = BotCheckClock::default();
+        // Whether the last read stood on a human check, which only the deadline ends.
+        let mut human = false;
+        // Where the one consent press of the page load it was made in was made: its address
+        // and its document, as the page answered them ([`oauth_step_js`]).
+        let mut consent_at: Option<(String, String)> = None;
         let mut last_host: Option<String> = None;
         let pause = || {
             let _ = deadline.pause(poll_interval);
@@ -8432,7 +8501,7 @@ fn drive_cdp_oauth_flow_until(
         loop {
             let now = deadline.now();
             if deadline.expired() {
-                return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
+                return Err(sign_in_out_of_time(&bot, human, last_host.as_deref(), now));
             }
             if steps >= MAX_OAUTH_STEPS {
                 note_met(MetWord::Stall, last_host.as_deref());
@@ -8443,8 +8512,10 @@ fn drive_cdp_oauth_flow_until(
             let expr = oauth_step_js(
                 email.as_deref(),
                 otp_code.as_deref(),
-                email_submitted,
-                otp_submitted,
+                (email_submitted, otp_submitted),
+                consent_at
+                    .as_ref()
+                    .map(|(at, doc)| (at.as_str(), doc.as_str())),
             );
             let expr = if google {
                 google_mail_auth::step_js(
@@ -8457,7 +8528,7 @@ fn drive_cdp_oauth_flow_until(
             } else {
                 expr
             };
-            let within = oauth_time_left(deadline, &bot, last_host.as_deref())?;
+            let within = oauth_time_left(deadline, &bot, human, last_host.as_deref())?;
             let eval = match cdp.call(
                 Some(&session),
                 "Runtime.evaluate",
@@ -8469,18 +8540,18 @@ fn drive_cdp_oauth_flow_until(
                 within,
             ) {
                 Ok(eval) => eval,
-                // A read cut short while a bot check stood (the deadline came, or the check
-                // replaced its page under the read) is part of that wait.
+                // A read cut short while a bot check or a human check stood (the deadline came,
+                // or the check replaced its page under the read) is part of that wait.
                 Err(why) => {
                     let now = deadline.now();
-                    if bot.held(now).is_none() {
+                    if bot.held(now).is_none() && !human {
                         return Err(browser_control_failed(why));
                     }
                     if deadline.expired() {
-                        return Err(oauth_out_of_time(&bot, last_host.as_deref(), now));
+                        return Err(sign_in_out_of_time(&bot, human, last_host.as_deref(), now));
                     }
                     bot.unread(now);
-                    if bot.held(now).is_none() {
+                    if bot.held(now).is_none() && !human {
                         return Err(browser_control_failed(why));
                     }
                     pause();
@@ -8488,8 +8559,9 @@ fn drive_cdp_oauth_flow_until(
                 }
             };
             if deadline.expired() {
-                return Err(oauth_out_of_time(
+                return Err(sign_in_out_of_time(
                     &bot,
+                    human,
                     last_host.as_deref(),
                     deadline.now(),
                 ));
@@ -8536,6 +8608,7 @@ fn drive_cdp_oauth_flow_until(
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
+                    human = false;
                     if bot.check(url, deadline.now()) >= bot_stall {
                         note_met(MetWord::BotCheck, last_host.as_deref());
                         return Err(BOT_CHECK_UNCLEARED);
@@ -8543,12 +8616,23 @@ fn drive_cdp_oauth_flow_until(
                     pause();
                     continue;
                 }
-                // A page that did nothing (`loading`) between two reads of a bot check, on its
-                // host and within its gap, is part of that wait and none of the drive's steps:
-                // the check reloading itself, read half-parsed.
+                // A human check's widget in the page: nothing on it was pressed or filled, and
+                // nothing is. It is waited on, its reads none of the drive's steps, until the
+                // deadline, which then names it ([`sign_in_out_of_time`]).
+                "human_check" => {
+                    human = true;
+                    bot.other(url, false, deadline.now());
+                    pause();
+                    continue;
+                }
+                // A page that did nothing (`loading`, or a consent page whose one press was made)
+                // between two reads of a bot check, on its host and within its gap, is part of
+                // that wait and none of the drive's steps: the check reloading itself, read
+                // half-parsed.
                 _ => {
+                    human = false;
                     let now = deadline.now();
-                    bot.other(url, state == "loading", now);
+                    bot.other(url, matches!(state, "loading" | "consent_pressed"), now);
                     if bot.held(now).is_some() {
                         pause();
                         continue;
@@ -8561,6 +8645,9 @@ fn drive_cdp_oauth_flow_until(
                 "clicked_consent" | "switched_account" => {
                     if state == "switched_account" {
                         email_submitted = false;
+                    } else if let Some(doc) = val.get("doc").and_then(Value::as_str) {
+                        // Pressed in this document; it is pressed nothing again.
+                        consent_at = Some((url.to_owned(), doc.to_owned()));
                     }
                     needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
@@ -9333,6 +9420,12 @@ pub enum Step {
     Done,
     /// Only the person can go on from here: why, without the URL or code.
     Stop(String),
+    /// A bot protection's block page answered ([`block_page`]): only a person past it goes on,
+    /// and the sign-in ends as a bot protection's stop
+    /// ([`super::login_drive::Approval::BotCheck`]), which holds the row's account for a person
+    /// on no clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): why, without the
+    /// page's text.
+    Blocked(String),
     /// The page wants the person's own sign-in to the vendor's site (another identity provider,
     /// a password): why, without the URL or code, naming [`Gate::sign_in_once`] where it is set.
     SignIn(String),
@@ -9714,6 +9807,22 @@ macro_rules! bot_check_helpers_js {
 /// [`bot_check_helpers_js`] as a string.
 pub(super) const BOT_CHECK_JS: &str = bot_check_helpers_js!();
 
+/// The widgets of the human checks a page holds an action behind, as aterm's sign-in window
+/// reads them (`signin_window`'s `humanCheck`): hCaptcha's, reCAPTCHA's and Cloudflare
+/// Turnstile's response field or frame, as one CSS selector list ([`HUMAN_CHECK_WIDGETS`]).
+/// A page that holds any of them is pressed and filled nothing on a headless profile, by the
+/// sign-in's drive ([`oauth_step_js`]) and by a token's consent page (`token_consent`) alike.
+macro_rules! human_check_widgets {
+    () => {
+        "textarea[name='h-captcha-response'], iframe[src*='hcaptcha.com'], \
+         textarea[name='g-recaptcha-response'], iframe[src*='recaptcha'], \
+         input[name='cf-turnstile-response'], iframe[src*='challenges.cloudflare.com']"
+    };
+}
+
+/// [`human_check_widgets`] as a string.
+pub(super) const HUMAN_CHECK_WIDGETS: &str = human_check_widgets!();
+
 /// Where `page` is: its host and path, without its query (which may carry a code or a
 /// challenge's token) or fragment.
 pub(super) fn url_place(url: &str) -> String {
@@ -9860,7 +9969,7 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
         };
     }
     if block_page(page) {
-        return Step::Stop(
+        return Step::Blocked(
             "the vendor's site answered this browser with a bot-protection block page, so only \
              a person can go on"
                 .to_owned(),
@@ -10484,6 +10593,7 @@ pub(super) fn drive_cdp_vendor_within(
                 break Approval::Approved { page: page_proved };
             }
             Step::Stop(why) => break Approval::NeedsYou(why.clone()),
+            Step::Blocked(why) => break Approval::BotCheck(why.clone()),
             Step::SignIn(why) => break Approval::NeedsSignIn(why.clone()),
             Step::Refuse(why) => break Approval::Refused(why.clone()),
             Step::Wait => {
@@ -11058,6 +11168,10 @@ pub(super) mod vendor_tests;
 #[cfg(all(test, unix))]
 #[path = "headless_cdp_scope_tests.rs"]
 mod cdp_scope_tests;
+
+#[cfg(all(test, unix))]
+#[path = "headless_oauth_human_check_tests.rs"]
+mod human_check_tests;
 
 #[cfg(all(test, unix))]
 #[path = "headless_oauth_browser_start_tests.rs"]

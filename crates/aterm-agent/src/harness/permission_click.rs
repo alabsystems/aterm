@@ -100,8 +100,9 @@ pub enum Refusal {
     Shell,
     /// The tab's agent is one no restart lane reads.
     NoLane,
-    /// The agent's arguments cannot be read.
-    ArgvUnread,
+    /// The agent's arguments are withheld from aterm for as long as it runs: another user's
+    /// process, as `sudo claude` is (`relaunch::ARGV_WITHHELD`).
+    ArgvWithheld,
     /// Another supervisor (not a window's own host) claims the tab.
     Claimed,
     /// The tab is a credit-claim worker's (its trusted folder is the claim folder).
@@ -310,16 +311,21 @@ fn own_record(opts: &Opts, click: &Click, st: &St) -> Option<Look> {
     }
 }
 
-/// The look's answer to the snapshot's word `word`, with no restart in flight.
-fn snapshot_word(word: &str, relaunch_due: bool) -> Look {
-    match word {
-        "not-a-shell-job" => Look::Refused(Refusal::NotAShellJob),
-        "shell-dialect" => Look::Refused(Refusal::Shell),
-        "argv-unreadable" => Look::Refused(Refusal::ArgvUnread),
-        w if w == NO_LANE => Look::Refused(Refusal::NoLane),
-        "not-claude" if relaunch_due => Look::Waits(Wait::Relaunch),
-        "not-claude" => Look::Ended(End::NotClaude),
-        w => Look::Waits(Wait::Other(w.to_string())),
+/// The look's answer to the snapshot's word `word`, with no restart in flight, by the one
+/// classifier of snapshot refusals ([`relaunch::SnapshotRefusal::of`]): only a word the host's
+/// read answered refuses or ends a click (arguments withheld for good among them). A fact not
+/// read (argv, terminal, image, records, …) keeps the click standing until a read answers (LS-15): it never ends it.
+fn snapshot_word(word: &'static str, relaunch_due: bool) -> Look {
+    match relaunch::SnapshotRefusal::of(word) {
+        relaunch::SnapshotRefusal::Unread(w) => Look::Waits(Wait::Other(w.to_string())),
+        relaunch::SnapshotRefusal::Answered(w) => match w {
+            "not-a-shell-job" => Look::Refused(Refusal::NotAShellJob),
+            w if w == NO_LANE => Look::Refused(Refusal::NoLane),
+            relaunch::ARGV_WITHHELD => Look::Refused(Refusal::ArgvWithheld),
+            "not-claude" if relaunch_due => Look::Waits(Wait::Relaunch),
+            "not-claude" => Look::Ended(End::NotClaude),
+            w => Look::Waits(Wait::Other(w.to_string())),
+        },
     }
 }
 

@@ -221,6 +221,7 @@ fn save_as(label: &str, fig: Option<i64>, walled: bool) {
                 by: "m22".into(),
                 attempts: 0,
                 cleared: false,
+                seen: None,
             },
         );
     }
@@ -1201,6 +1202,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             by: "m22".into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     assert_eq!(words(&walled), (true, None));

@@ -15,6 +15,7 @@ use crate::control_verbs::ENTRY_WRAP_COLUMNS;
 
 pub(crate) mod aos;
 pub(crate) mod await_;
+pub(crate) mod described;
 pub(crate) mod harness;
 pub(crate) mod log;
 pub(crate) mod meta;

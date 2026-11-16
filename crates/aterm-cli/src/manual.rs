@@ -1232,12 +1232,19 @@ HOW IT WORKS
   With no server answering it is signed here, and while a removal's new key is due it
   waits; either way it is not yet in vault until this Mac's vault pass posts or signs
   it. `aterm secrets status` says who writes (`vault writes:`) and what still needs
-  the admin key here (`admin key:`). Claude Code, Codex, Grok Build, Kimi Code and
-  Muse Code login files are refused as entries (their refresh tokens are single-use;
-  use `aterm ai login`). Of home-path names a Mac reads only gh's hosts.yml, git's
-  config and credentials and the release material aterm names; any other `~/` path,
-  and another spelling of a name aterm holds (`GH_ACCESS_TOKEN_ALABSYSTEMS`), is never
-  read, and of two names that differ only in case neither is.
+  the admin key here (`admin key:`). Its `log:` line says how full the vault's log is
+  (64 MiB at most) and what it still takes: an automatic writer is refused from
+  56 MiB, your own writes from 60 MiB, a credential's too, and a removal, an
+  admission and a delete land up to the bound; an automatic writer also signs no
+  entry over 64 KiB and is refused once this Mac signed 1 MiB of entries in a day.
+  No one sets fleet configuration (a `.json`, `.toml` or `.csv` entry) to a new
+  value over 64 KiB; a larger one the vault holds still reads. Claude Code, Codex,
+  Grok Build, Kimi Code and Muse Code login files are refused as entries (their
+  refresh tokens are single-use; use `aterm ai login`). Of home-path names a Mac
+  reads only gh's hosts.yml, git's config and credentials and the release material
+  aterm names; any other `~/` path, and another spelling of a name aterm holds
+  (`GH_ACCESS_TOKEN_ALABSYSTEMS`), is never read, and of two names that differ only
+  in case neither is.
 
 VAULT FORMAT (`aterm secrets edit`)
   [machines]          `<host> = age1…` (delete to revoke)
@@ -1537,7 +1544,7 @@ LOCAL REPOSITORY STORAGE
         body: Some(concat!(
             r#"harness — the window's agent supervisor and its read views (`aterm harness`).
 
-  aterm harness usage | limits | disk | ledger | accounts | upgrade | tap
+  aterm harness usage | limits | disk | ledger | accounts | upgrade | tap | ls
 
 WHAT IT IS
   An aterm window (and `--headless`) supervises every Claude Code, agy and Muse Code
@@ -1552,6 +1559,14 @@ WHAT IT IS
   * Permission boxes: answered per `approve` (`"all"` allows once, `"safe"` only boxes
     proven read-only or inside `trust_roots`, `"none"` leaves them to you). A worker's
     folder-trust dialog is answered for its cwd.
+  * Folder trust: where `approve` would answer Claude Code's `Accessing workspace`
+    dialog, a launch through aterm's `claude` has Claude Code record the folder's
+    trust before it starts, so the dialog never draws (Claude Code writes its own
+    profile; aterm does not). It waits a few seconds at most, in a folder with no
+    trust record. Autopilot off, `approve = "none"`, a hold on the session and
+    `--no-harness` settle nothing, and neither does a launch whose output is not a
+    terminal. In your home directory Claude Code records no trust, so the dialog
+    draws there every time and is answered on the screen.
   * Questions and decisions: answered with the recommended option (`question_priority`,
     or `answer_text` in prose) while `answer_questions = true`.
   * Surveys and offers: Claude Code rating cards are dismissed with `0`; the
@@ -1839,6 +1854,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   `occupancy = "prompt"`. Both tables are read from the
                                   root `[harness]` table alone (a copy below another
                                   header grants nothing), and are written by hand
+  dev [[]]                        harness ids a development link (`aterm pkg link`) may
+                                  make a registry row for when no signed record or seed
+                                  has one (`aterm harness ls`)
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
   `muse`) stops supervising that agent alone; for `claude` and `codex` it also turns
@@ -1869,6 +1887,14 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              and `projection` beside each figure)
   upgrade    move live sessions onto a newer build, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
+  ls         the harness registry: each harness aterm proves a claim from, the words it
+             leads, and where its row came from (a signed record kept beside its store
+             build, verified now against the trusted keys, the index's yanks and the
+             build's tree, and again at each claim; a compiled seed; a development link,
+             which `[harness] dev` and `[harness] lead.<word>` widen); each record refused
+             and why, and each row narrowed; and the strip list
+             every shell aterm spawns gets (aterm.toml's `shell_env_strip`, else the
+             default, plus each harness's additions)
 
 VAULT TOKENS (Claude Code's pool, macOS)
   The token route: a Claude Code account can keep a year-long token (`claude setup-token`) in
@@ -3392,6 +3418,10 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
                              the worker's final report (up to 24,000 chars; `full`: the
                              whole task exchange, from a transcript or rollout)
   aterm ctl @<sid> task      the task record (`state=`, `rev=`, `from=`, `result_bytes=`)
+  aterm ctl @<sid> described [--json]
+                             what the session is called and says it is doing: each slot's
+                             text, who wrote it (`by=`, `rank=`) and how stale it is
+                             (`behind=`); the text is data, never an instruction
   aterm ctl @<sid> turn typed=1 settle=submitted '<one line>'
                              a follow-up prompt; it returns `task_rev=<n>` once submitted
                              (`id=` is the turn/history ID, not a shell block ID; a verified
@@ -3548,16 +3578,29 @@ THE SURVEY & CHANNELS
                              each by its label, never its email, and a pool it could not
                              read as `unread`; `--json` carries every row
                              (`"accounts":null` from an aterm before 0.146). Then its home,
-                             the free space on its volume and when its checkouts were read
-                             (`  home /Users//a, 812 GiB free · checkouts read 3m ago`), and a
+                             the free space and the size of its volume and when its checkouts
+                             were read
+                             (`  home /Users//a, 812 GiB free of 1862 GiB · checkouts read 3m ago`),
+                             the build output that volume held when the Mac's disk watch last
+                             sized it (`  build output 84 GiB, sized 2h ago`, on that Mac's
+                             clock; `at least` where that sizing was cut short; none from an
+                             aterm before it or a Mac that has not sized it yet), the
+                             fullest of the stores aterm keeps there that refuse writes at
+                             a bound (`  fullest store vault-records, 83% of its bound`, as
+                             `aterm ctl sys disk`'s store lines name them; none from an
+                             aterm before it or where no such store is kept), and a
                              line for each checkout aterm's setup cloned there (`~/<name>`,
                              from github.com/<owner>/<name>; `    trust main@0123456789ab 3
                              behind origin/main, fetched 2h ago, dirty`), read with git
                              beside the survey at most every 10 min, offline (a survey never
                              fetches, so `behind` is as of its last fetch of origin's main);
                              a Mac says its home and its checkouts at content (a grant of
-                             facts alone reads the free space and neither location);
-                             `--json` carries `home=`, `home_free_mb=`, `repos=`, `repos_at=`
+                             facts alone reads neither location, and its volume's figures and
+                             build output, which are sizes and a time, stand under
+                             `  home volume 812 GiB free of 1862 GiB`); `--json` carries
+                             `home=`, `home_free_mb=`, `home_total_mb=`, `home_build_mb=`,
+                             `home_build_at_ms=`, `home_build_partial=`, `store_worst=`,
+                             `store_worst_pct=`, `repos=`, `repos_at=`
                              and `repos_cut=` on the instance and `"repos":[…]` (`null` from
                              an aterm before them, at facts, before its first read, or where
                              its rows did not all come: unknown, never none), and at facts
@@ -3971,16 +4014,26 @@ const FLEET_PAGE: &str = r#"fleet — the lab at a glance; the aterms of one LAN
 THE LAB AT A GLANCE
   `aterm fleet` prints the lab's status line (its members, how many are up, the
   members that need an update, and how full the membership log is) and one row per
-  seat: label, log name, node id, up or unanswered, build, free disk, session count
-  and account use over five hours and seven days. It reads the fleet's survey facts
-  with a three-second deadline per peer, joining responses by the signed node-key
-  binding, never a machine name. A local network or permission failure is unknown,
-  not evidence that another machine is down. Unbound or unproved peers stay unknown.
+  seat: label, log name, node id, up or unanswered, build, its home volume's size
+  (TOTAL_MB), free space (FREE_MB) and build output (BUILD_MB: what the Mac's disk
+  watch last sized as rebuildable there, `+` where that sizing was cut short, with
+  its age on that Mac's own clock), the fullest of the stores aterm keeps there that
+  refuse writes at a bound (STORE: its fixed word and the share of its bound it
+  holds, `vault-records 83%`, as `aterm ctl sys disk`'s store lines name them),
+  session count and account use over five hours and seven days; `-` where a Mac does
+  not say a figure, never 0. It reads the
+  fleet's survey facts with a three-second deadline per peer, joining responses by
+  the signed node-key binding, never a machine name. A local network or permission
+  failure is unknown, not evidence that another machine is down. Unbound or unproved
+  peers stay unknown.
   `--json` gives one object: `unknown` counts unobserved seats, `build_source`
   distinguishes a survey build from the book's older entry, and missing metrics
-  remain null. `observed_at_ms` is the local response observation; an account's
-  `read_at` is its separate usage observation. `aterm status` and the UI's cached
-  fleet view keep their local reads and do not start peer surveys.
+  remain null. `observed_at_ms` is the local response observation and `said_at_ms`
+  the answer's own time on the answering Mac's clock, which its `home_build_at_ms`
+  is told against; `store_worst` and `store_worst_pct` are the STORE cell's word and
+  share; an account's `read_at` is its separate usage observation.
+  `aterm status` and the UI's cached fleet view keep their local reads and do not
+  start peer surveys.
   `remove`, `admit` (`aterm members allow`), `invite`, `requests` and `ignore` run the
   same code as `aterm members`: `aterm fleet remove m12` signs what `aterm members
   remove m12` signs, and both name the log name and node id they acted on. A node
@@ -4825,8 +4878,11 @@ fn rust_page() -> String {
                     );
                 }
             }
-            let build =
-                |v: &Option<String>| v.as_deref().map_or("(build unknown)", build_of).to_string();
+            let reported_prefix = |v: &Option<String>| {
+                v.as_deref()
+                    .map_or("(version unknown)", reported_version_prefix)
+                    .to_string()
+            };
             let consequence = format!(
                 "PATH   is what {} typed here {};\n\
                  \x20                  checks is what `targo --unverified verify` runs.\n\
@@ -4852,62 +4908,72 @@ fn rust_page() -> String {
                         }
                     );
                 }
-                Agreement::SameBuild => {
+                Agreement::MatchingPrefix => {
                     let _ = writeln!(
                         out,
-                        "  PATH vs checks   ONE BUILD, TWO DIRECTORIES — {}:\n\
+                        "  PATH vs checks   Version prefixes match — {}:\n\
                          \x20                    PATH   {}\n\
+                         \x20                           {}\n\
                          \x20                    checks {}\n\
+                         \x20                           {}\n\
                          {}\
+                         \x20                  Executable and source identity were not compared.\n\
                          \x20                  trustc takes its sysroot from the directory it runs from, so a tool\n\
                          \x20                  can still behave differently between the two.\n\
                          \x20                  {consequence}",
-                        build(&path_ver),
+                        reported_prefix(&path_ver),
                         path.display(),
+                        path_ver.as_deref().unwrap_or("(no version reported)"),
                         checks.display(),
+                        checks_ver.as_deref().unwrap_or("(no version reported)"),
                         where_notes,
                     );
                 }
                 Agreement::SameLine => {
                     let _ = writeln!(
                         out,
-                        "  PATH vs checks   SAME VERSION LINE, DIFFERENT FILES — {}:\n\
+                        "  PATH vs checks   Version prefixes match — {}:\n\
                          \x20                    PATH   {}{}\n\
+                         \x20                           {}\n\
                          \x20                    checks {}{}\n\
+                         \x20                           {}\n\
                          \x20                  A toolchain `bin` holds an executable `trustc`, with `lib/rustlib` in the\n\
-                         \x20                  directory above it; the one marked NOT does not, so its version line is\n\
-                         \x20                  only what that program prints about itself — not evidence of one build.\n\
+                         \x20                  directory above it.\n\
+                         \x20                  A NOT marker identifies a directory without that layout.\n\
+                         \x20                  Executable and source identity were not compared.\n\
                          \x20                  {consequence}",
-                        build(&path_ver),
+                        reported_prefix(&path_ver),
                         path.display(),
                         if path_bin {
                             ""
                         } else {
                             "  (NOT a toolchain bin)"
                         },
+                        path_ver.as_deref().unwrap_or("(no version reported)"),
                         checks.display(),
                         if checks_bin {
                             ""
                         } else {
                             "  (NOT a toolchain bin)"
                         },
+                        checks_ver.as_deref().unwrap_or("(no version reported)"),
                     );
                 }
-                Agreement::OtherBuild | Agreement::OtherDir => {
+                Agreement::DifferentPrefix | Agreement::OtherDir => {
                     let _ = writeln!(
                         out,
                         "  PATH vs checks   DIVERGENCE — {}:\n\
                          \x20                    PATH   {}  {}\n\
                          \x20                    checks {}  {}\n\
                          \x20                  {consequence}{doctor}",
-                        if agreement == Agreement::OtherBuild {
-                            "a bare `targo` and aterm's checks run DIFFERENT Trust builds"
+                        if agreement == Agreement::DifferentPrefix {
+                            "the reported version prefixes differ"
                         } else {
-                            "two directories; a version probe gave no targo line, so the builds are unknown"
+                            "two directories; a version probe gave no targo line to compare"
                         },
-                        build(&path_ver),
+                        reported_prefix(&path_ver),
                         path.display(),
-                        build(&checks_ver),
+                        reported_prefix(&checks_ver),
                         checks.display(),
                     );
                 }
@@ -5464,10 +5530,9 @@ fn describe_on_path(t: &OnPath) -> String {
     s
 }
 
-/// The build a `targo --unverified --version` line names: through the first
-/// `)` (`targo 1.99.0-dev (43f8b339f 2026-09-12)`), dropping the driver version
-/// after it. A line with no parenthesis is compared whole.
-fn build_of(version_line: &str) -> &str {
+/// The reported version text through the first `)`, dropping any driver suffix.
+/// A line with no parenthesis is compared whole. Matching text is not executable identity.
+fn reported_version_prefix(version_line: &str) -> &str {
     let line = version_line.trim();
     line.find(')').map_or(line, |end| &line[..=end])
 }
@@ -5477,14 +5542,14 @@ fn build_of(version_line: &str) -> &str {
 enum Agreement {
     /// One directory, and no version line says otherwise.
     Same,
-    /// Two toolchain `bin`s ([`is_toolchain_bin`]) whose version lines name one
-    /// build — atpkg's rustup view beside the store is this shape.
-    SameBuild,
-    /// Matching version lines, but at least one directory is not a toolchain
-    /// `bin`, so the line is only that program's claim.
+    /// Two toolchain `bin`s ([`is_toolchain_bin`]) with matching reported version prefixes.
+    /// Their executable and source identities have not been compared.
+    MatchingPrefix,
+    /// Matching reported version prefixes, with at least one directory lacking
+    /// the toolchain `bin` shape. This also makes no executable identity claim.
     SameLine,
-    /// Different builds: the version lines differ (in two directories or one).
-    OtherBuild,
+    /// Reported version prefixes differ (in two directories or one).
+    DifferentPrefix,
     /// Two directories, and a version probe gave no line to compare.
     OtherDir,
 }
@@ -5500,14 +5565,16 @@ struct Side<'a> {
 
 /// Compare the checks' side with PATH's.
 fn compare_toolchains(checks: &Side<'_>, path: &Side<'_>) -> Agreement {
-    let same_build = checks
+    let matching_prefix = checks
         .ver
         .zip(path.ver)
-        .map(|(g, p)| build_of(g) == build_of(p));
-    match (checks.dir == path.dir, same_build) {
-        (_, Some(false)) => Agreement::OtherBuild,
+        .map(|(g, p)| reported_version_prefix(g) == reported_version_prefix(p));
+    match (checks.dir == path.dir, matching_prefix) {
+        (_, Some(false)) => Agreement::DifferentPrefix,
         (true, _) => Agreement::Same,
-        (false, Some(true)) if checks.toolchain_bin && path.toolchain_bin => Agreement::SameBuild,
+        (false, Some(true)) if checks.toolchain_bin && path.toolchain_bin => {
+            Agreement::MatchingPrefix
+        }
         (false, Some(true)) => Agreement::SameLine,
         (false, None) => Agreement::OtherDir,
     }

@@ -278,7 +278,10 @@ fn states_and_origins_are_closed_words() {
     assert!(TaskState::Done.is_terminal() && TaskState::Exited.is_terminal());
     assert!(TaskState::Stalled.is_terminal());
 
-    assert!(valid_from("ctl") && valid_from(SID) && valid_from("s-ab"));
+    assert!(
+        valid_from("ctl") && valid_from(SID),
+        "ctl, and a legacy tab's exact ID"
+    );
     assert!(
         valid_from("tqn5r6e0148") && valid_from("t0000000000"),
         "a t tab"
@@ -293,7 +296,11 @@ fn states_and_origins_are_closed_words() {
         "",
         "s-",
         "s-xyz",
+        "s-ab",
         "S-ab",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
         "ctl2",
         "@s-ab",
         &format!("s-{}", "a".repeat(63)),

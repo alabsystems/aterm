@@ -65,6 +65,18 @@ pub fn without_addresses(text: &str) -> String {
         .join(" ")
 }
 
+/// Set to `1` beside [`WINDOW_ENV`] by an account's token capture this Mac's upkeep started with
+/// nobody there (plan package FL-138; `setup_token::OpenerRoute::unattended`): the window's code
+/// page, where no mailbox the window reads gives the code, ends the sign-in at once instead of
+/// waiting for a person to type it, and the window sends no login email nobody would read.
+pub const UNATTENDED_ENV: &str = "ATERM_OPEN_URL_UNATTENDED";
+
+/// Whether nobody started the sign-in this opener runs: `var` holds [`UNATTENDED_ENV`] as `1`.
+#[must_use]
+pub fn unattended_by(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    var(UNATTENDED_ENV).is_some_and(|value| value == "1")
+}
+
 /// Whether the sign-in that started this opener lets it open aterm's sign-in window: `var`
 /// holds [`WINDOW_ENV`] as `1`.
 #[must_use]
@@ -122,15 +134,16 @@ pub enum MetWord {
     /// The sign-in had no desktop session to open aterm's window on
     /// ([`super::headless_oauth::WINDOW_NO_DESKTOP`]).
     WindowNoDesktop,
-    /// Cloudflare's check stood in aterm's sign-in window until the sign-in's deadline
+    /// Cloudflare's check stood in aterm's sign-in window until the sign-in's deadline, or, in a
+    /// sign-in nobody started, for the wait one that clears by itself takes
     /// ([`super::headless_oauth::WINDOW_BOT_CHECK`]).
     WindowBotCheck,
     /// Cloudflare's block page answered in aterm's sign-in window
     /// ([`super::headless_oauth::WINDOW_BLOCK_PAGE`]).
     WindowBlockPage,
     /// The consent page in aterm's sign-in window held its `Authorize` behind a human check
-    /// (hCaptcha) until the sign-in's deadline
-    /// ([`super::headless_oauth::WINDOW_HUMAN_CHECK`]).
+    /// (hCaptcha) until the sign-in's deadline, or, in a sign-in nobody started, at the read that
+    /// found it ([`super::headless_oauth::WINDOW_HUMAN_CHECK`]).
     WindowHumanCheck,
     /// A person closed aterm's sign-in window before the sign-in finished
     /// ([`super::headless_oauth::WINDOW_CLOSED`]).
@@ -143,9 +156,11 @@ pub enum MetWord {
     BotCheck,
     /// Cloudflare's block page ([`super::headless_oauth::BLOCK_PAGE_MET`]).
     BlockPage,
-    /// A token's consent page on the account's headless profile carried a human check's widget
-    /// (hCaptcha, reCAPTCHA or Turnstile) until the drive's deadline, so nothing was pressed
-    /// ([`super::headless_oauth::TOKEN_HUMAN_CHECK`]).
+    /// A page in aterm's headless browser, a token's consent page on the account's profile or a
+    /// page of a headless sign-in, carried a human check's widget (hCaptcha, reCAPTCHA or
+    /// Turnstile) until the drive's deadline, so nothing on it was pressed
+    /// ([`super::headless_oauth::TOKEN_HUMAN_CHECK`],
+    /// [`super::headless_oauth::HUMAN_CHECK_MET`]).
     HumanCheck,
     /// A token's consent page on the account's headless profile did not show the account's
     /// email as the one signed in, or reached its callback with nothing pressed, so nothing was
@@ -188,9 +203,9 @@ impl MetWord {
         }
     }
 
-    /// The word `word` is, as [`Self::as_str`] writes it.
+    /// The word [`Self::as_str`] spells `word`; `None` for any other text.
     #[must_use]
-    pub fn parse(word: &str) -> Option<MetWord> {
+    pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|w| w.as_str() == word)
     }
 
@@ -227,6 +242,101 @@ impl MetWord {
                 | Self::WindowCodeNoMailbox
                 | Self::WindowDeadline
         )
+    }
+
+    /// Whether the word is a bot protection's answer: Cloudflare's check or block page, in the
+    /// headless page or in aterm's window, or a human check: the consent page's in that window
+    /// ([`Self::WindowHumanCheck`]), or any page in aterm's headless browser that carried one's
+    /// widget (hCaptcha, reCAPTCHA or Turnstile; [`Self::HumanCheck`]), a page of a headless
+    /// sign-in as well as a token's consent page on the account's profile. aterm passes none of
+    /// them, and nothing tries again on a clock a sign-in one stopped
+    /// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): the row waits for a person. Every
+    /// word is named, so a word added to [`MetWord`] is judged here before anything builds.
+    #[must_use]
+    pub const fn is_bot_protection(self) -> bool {
+        match self {
+            MetWord::BotCheck
+            | MetWord::BlockPage
+            | MetWord::HumanCheck
+            | MetWord::WindowBotCheck
+            | MetWord::WindowBlockPage
+            | MetWord::WindowHumanCheck => true,
+            MetWord::BrowserStart
+            | MetWord::BrowserControl
+            | MetWord::BrowserSignIn
+            | MetWord::WindowCodeNoMailbox
+            | MetWord::WindowDeadline
+            | MetWord::WindowNoDesktop
+            | MetWord::WindowClosed
+            | MetWord::WindowWrongAccount
+            | MetWord::ConsentUnproven
+            | MetWord::ConsentWrongAccount
+            | MetWord::Stall
+            | MetWord::NotAuthorized => false,
+        }
+    }
+
+    /// Whether what the word names stops a sign-in until something changes that another try
+    /// does not change ([`Met::stopped`]): every bot protection ([`Self::is_bot_protection`]),
+    /// and a session with no desktop, a window a person closed, or a consent page that named
+    /// another account, in the window or on the account's headless profile, or did not show the
+    /// account's own there. Every word is named, and a bot protection is a stop whatever else
+    /// this says, so a sign-in one met is recorded `blocked`, never as a plain failure retried
+    /// on a clock.
+    #[must_use]
+    pub const fn stops(self) -> bool {
+        self.is_bot_protection()
+            || match self {
+                MetWord::WindowNoDesktop
+                | MetWord::WindowClosed
+                | MetWord::WindowWrongAccount
+                | MetWord::ConsentUnproven
+                | MetWord::ConsentWrongAccount => true,
+                MetWord::BotCheck
+                | MetWord::BlockPage
+                | MetWord::HumanCheck
+                | MetWord::WindowBotCheck
+                | MetWord::WindowBlockPage
+                | MetWord::WindowHumanCheck
+                | MetWord::BrowserStart
+                | MetWord::BrowserControl
+                | MetWord::BrowserSignIn
+                | MetWord::WindowCodeNoMailbox
+                | MetWord::WindowDeadline
+                | MetWord::Stall
+                | MetWord::NotAuthorized => false,
+            }
+    }
+
+    /// Whether a person at this Mac's desk can clear what the word names ([`Met::takes_a_person`]):
+    /// Cloudflare's check, in the headless page or in aterm's window (where they may complete
+    /// it), a human check, the consent page's in that window or one on any page of aterm's
+    /// headless browser (hCaptcha, reCAPTCHA or Turnstile, on a headless sign-in's page or a
+    /// token's consent page on the account's profile; they may complete it in the window), or a
+    /// session with no desktop (theirs has one). A block page is no step of theirs. Every word is
+    /// named.
+    #[must_use]
+    pub const fn takes_a_person(self) -> bool {
+        match self {
+            MetWord::BotCheck
+            | MetWord::HumanCheck
+            | MetWord::WindowNoDesktop
+            | MetWord::WindowBotCheck
+            | MetWord::WindowHumanCheck => true,
+            MetWord::BlockPage
+            | MetWord::WindowBlockPage
+            | MetWord::WindowClosed
+            | MetWord::WindowWrongAccount
+            | MetWord::ConsentUnproven
+            | MetWord::ConsentWrongAccount
+            | MetWord::BrowserStart
+            | MetWord::BrowserControl
+            | MetWord::BrowserSignIn
+            | MetWord::WindowCodeNoMailbox
+            | MetWord::WindowDeadline
+            | MetWord::Stall
+            | MetWord::NotAuthorized => false,
+        }
     }
 
     /// Whether the word leaves the reason unsaid, so the opener's own reason goes with it
@@ -469,23 +579,11 @@ impl Met {
     /// session with no desktop; a window a person closed. No retry by itself passes one, where a
     /// stall may clear and a sign-in in the window that failed for any other reason
     /// ([`MetWord::BrowserSignIn`]: a page that did not load, a mailbox that did not answer;
-    /// [`MetWord::WindowCodeNoMailbox`]; [`MetWord::WindowDeadline`]) may not fail the next time.
+    /// [`MetWord::WindowCodeNoMailbox`]; [`MetWord::WindowDeadline`]) may not fail the next time
+    /// ([`MetWord::stops`]).
     #[must_use]
     pub const fn stopped(&self) -> bool {
-        matches!(
-            self.word,
-            MetWord::BotCheck
-                | MetWord::BlockPage
-                | MetWord::HumanCheck
-                | MetWord::ConsentUnproven
-                | MetWord::ConsentWrongAccount
-                | MetWord::WindowNoDesktop
-                | MetWord::WindowBotCheck
-                | MetWord::WindowBlockPage
-                | MetWord::WindowHumanCheck
-                | MetWord::WindowClosed
-                | MetWord::WindowWrongAccount
-        )
+        self.word.stops()
     }
 
     /// Whether the sign-in ended at aterm's own window, which had no desktop to open on or
@@ -507,20 +605,15 @@ impl Met {
     }
 
     /// Whether a person at this Mac's desk can clear what the sign-in met: Cloudflare's
-    /// check, in the headless page or in aterm's window (where they may complete it), the
-    /// consent page's human check, in that window or on the headless profile (they may complete
-    /// it in the window), or a session with no desktop (theirs has one). The renewal records the row's sign-in as theirs to run
-    /// (`accounts::SignInAction::Renew`).
+    /// check, in the headless page or in aterm's window (where they may complete it), a human
+    /// check, the consent page's in that window or one on any page of aterm's headless browser
+    /// (hCaptcha, reCAPTCHA or Turnstile, a headless sign-in's page included; they may complete
+    /// it in the window), or a session with no desktop (theirs has one). The renewal records the
+    /// row's sign-in as theirs to run (`accounts::SignInAction::Renew`)
+    /// ([`MetWord::takes_a_person`]).
     #[must_use]
     pub const fn takes_a_person(&self) -> bool {
-        matches!(
-            self.word,
-            MetWord::BotCheck
-                | MetWord::HumanCheck
-                | MetWord::WindowNoDesktop
-                | MetWord::WindowBotCheck
-                | MetWord::WindowHumanCheck
-        )
+        self.word.takes_a_person()
     }
 
     /// Its words in a renewal's record: a local browser failure or what the page met,
@@ -576,9 +669,8 @@ impl Met {
             }
             MetWord::BlockPage => format!("it met Cloudflare's block page{on}"),
             MetWord::HumanCheck => format!(
-                "the token's consent page{on} carried a human check (hCaptcha, reCAPTCHA or \
-                 Turnstile) on the account's headless browser profile; aterm never operates one, \
-                 and pressed nothing there"
+                "a page{on} carried a human check (hCaptcha, reCAPTCHA or Turnstile) in aterm's \
+                 headless browser; aterm never operates one, and pressed nothing there"
             ),
             MetWord::ConsentUnproven => format!(
                 "the token's consent page{on} did not show the account as the one signed in, so \
@@ -4550,7 +4642,7 @@ impl MailboxFlow {
     }
 
     /// The port of the waiting sign-in's loopback listener; none for a hosted flow.
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(all(unix, any(test, target_os = "macos")))]
     pub(super) fn loopback_port(&self) -> Option<u16> {
         (!self.hosted && self.callback_port != 0).then_some(self.callback_port)
     }
@@ -5428,6 +5520,7 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
                 .or_else(|| extract_login_hint(url))
                 .as_deref(),
             None,
+            unattended_by(&|name| std::env::var_os(name)),
         )
     {
         return finish_window_sign_in(signed_in, outcome_path);

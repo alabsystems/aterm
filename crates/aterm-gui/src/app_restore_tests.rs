@@ -168,7 +168,7 @@ fn capture_reflects_the_live_layout() {
         .insert_terminal(1)
         .expect("split view identity");
     {
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
         assert!(ws.layouts[0].split_focused(pane::SplitDir::Vertical, 1));
     }
     assert!(app.sync_tab_model_from_layout(WindowId(0), 0));
@@ -176,10 +176,11 @@ fn capture_reflects_the_live_layout() {
     let tree = pane::PaneTree::new(2);
     let tab = crate::register_terminal_tab(&mut app.tab_ids, &mut app.view_store, &tree)
         .expect("second tab identity");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
     ws.layouts.push(tree);
     ws.tabs.add();
     ws.tab_set.push(tab).expect("fresh tab id");
+    drop(ws);
     app.resync_active_or_window(WindowId(0));
     assert!(app.structural_invariants_ok());
 
@@ -227,9 +228,10 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
         let seed = CarriedFrame::cold_first_seed(&layout.windows[0], None, None)
             .expect("window 0 was not maximized");
         let (rows, cols) = seed.grid;
-        let ws = next.windows.get_mut(&w0).expect("window 0");
+        let mut ws = next.windows.get_mut(&w0).expect("window 0");
         ws.take_carried_frame(seed.frame);
         let carried = ws.carried_inner_px.take();
+        drop(ws);
         let first = next.attach_frame_px(w0, rows, cols, carried);
         size_to(&mut next, w0, first);
         let row = CarriedFrame::of(&layout.windows[1]);
@@ -238,9 +240,10 @@ fn a_cold_restore_brings_every_window_back_at_its_own_grid_and_size() {
             next.insert_logical_window(crate::stub_session(1), rows, cols),
             w1
         );
-        let ws = next.windows.get_mut(&w1).expect("window 1");
+        let mut ws = next.windows.get_mut(&w1).expect("window 1");
         ws.take_carried_frame(inner);
         let carried = ws.carried_inner_px.take();
+        drop(ws);
         let frame = next.attach_frame_px(w1, rows, cols, carried);
         size_to(&mut next, w1, frame);
         (next, first, frame)
@@ -1663,8 +1666,8 @@ fn markdown_workspace_restore_keeps_modes_and_independent_pane_positions() {
             .open_document_tab(AppKind::Markdown, &file_uri(&path))
             .unwrap();
         let (_, view) = original.active_native_view(wid).unwrap();
-        let Some(AppViewState::Editor(editor)) = original.native_runtime.view_state_mut(view)
-        else {
+        let mut route_native_guard = original.native_runtime.view_state_mut(view);
+        let Some(AppViewState::Editor(editor)) = route_native_guard.as_deref_mut() else {
             panic!("Markdown opens in the editor workspace");
         };
         let buffer = editor.buffer.as_mut().unwrap();
@@ -1685,6 +1688,7 @@ fn markdown_workspace_restore_keeps_modes_and_independent_pane_positions() {
         workspace.reader.selection = Some(26..32);
         workspace.reader_entry_anchor = Some(9);
         workspace.split_per_mille = 650;
+        drop(route_native_guard);
         let restore::RestoredView::Native(descriptor) =
             original.view_restore_descriptor(view).unwrap()
         else {
@@ -2064,6 +2068,7 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         pinned: false,
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: None,
         title: String::new(),
@@ -5209,10 +5214,11 @@ impl Successor {
         let tree = pane::PaneTree::new(1);
         let tab = crate::register_terminal_tab(&mut app.tab_ids, &mut app.view_store, &tree)
             .expect("tab identity");
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
         ws.layouts.push(tree);
         ws.tabs.add();
         ws.tab_set.push(tab).expect("fresh tab id");
+        drop(ws);
         app.resync_active_or_window(WindowId(0));
 
         let pid = cj::reaped_pid();
@@ -7033,14 +7039,19 @@ fn captured_leaf(app: &App, wid: WindowId, index: usize) -> (restore::TerminalLe
 
 #[test]
 fn a_cold_restore_opens_with_prev_and_lineage() {
+    // Tabs saved before the t form: a cold restore gives each a minted ID and records the
+    // legacy one as the ID it had.
+    const WAS_A: &str = "s-000000000000000000a0";
+    const WAS_B: &str = "s-000000000000000000b1";
+    const BEGAN: &str = "s-000000000000000000f0";
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.restore_into_window(
         wid,
         restore::WindowLayout {
             restored_tabs: vec![
-                lineage_tab(0, Some("s-a0"), None),
-                lineage_tab(1, Some("s-b1"), Some("s-f0")),
+                lineage_tab(0, Some(WAS_A), None),
+                lineage_tab(1, Some(WAS_B), Some(BEGAN)),
                 lineage_tab(2, None, None),
             ],
             ..single_leaf_window(bare_leaf())
@@ -7053,15 +7064,15 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
     let amend = slog_lines(&app, boot);
     assert!(
         amend.iter().any(|l| l.contains(" amend - restore ")
-            && l.contains(" prev=s-a0 ")
-            && l.contains(" lineage=s-a0 ")),
+            && l.contains(&format!(" prev={WAS_A} "))
+            && l.contains(&format!(" lineage={WAS_A} "))),
         "{amend:?}"
     );
     let opened = slog_lines(&app, new);
     assert!(
         opened[0].contains(" open - restore ")
-            && opened[0].contains(" prev=s-b1 ")
-            && opened[0].contains(" lineage=s-f0 "),
+            && opened[0].contains(&format!(" prev={WAS_B} "))
+            && opened[0].contains(&format!(" lineage={BEGAN} ")),
         "{opened:?}"
     );
     let plain = slog_lines(&app, older);
@@ -7073,9 +7084,17 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
     );
     let sid_of = |s: u64| app.pool.get(s).unwrap().ctx.self_id.as_str().to_string();
     assert_eq!(boot_leaf.sid, Some(sid_of(boot)));
-    assert_eq!(boot_leaf.lineage.as_deref(), Some("s-a0"));
+    assert_eq!(boot_leaf.lineage.as_deref(), Some(WAS_A));
     assert_eq!(new_leaf.sid, Some(sid_of(new)));
-    assert_eq!(new_leaf.lineage.as_deref(), Some("s-f0"));
+    assert_eq!(new_leaf.lineage.as_deref(), Some(BEGAN));
+    for leaf in [&boot_leaf, &new_leaf] {
+        assert!(
+            leaf.sid
+                .as_deref()
+                .is_some_and(aterm_types::tab_id::is_tab_id),
+            "a legacy leaf restores under a canonical tab ID: {leaf:?}"
+        );
+    }
     assert_eq!(bare.sid, Some(sid_of(older)));
     assert_eq!(bare.lineage, None, "it began its chain");
 
@@ -7103,7 +7122,7 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
     let opened = slog_lines(&again, second);
     assert!(
         opened[0].contains(&format!(" prev={} ", sid_of(new)))
-            && opened[0].contains(" lineage=s-f0 "),
+            && opened[0].contains(&format!(" lineage={BEGAN} ")),
         "{opened:?}"
     );
 }
@@ -7221,14 +7240,20 @@ fn a_seamless_update_keeps_a_sessions_lineage_for_its_next_restore() {
         let ctx = old.pool.get(0).expect("session 0").ctx.clone();
         let mut tl = ctx.timeline.lock().unwrap();
         let at = tl.slog().now();
-        tl.slog_mut()
-            .note_restored(Some("s-0abc"), Some("s-0001"), at);
+        tl.slog_mut().note_restored(
+            Some("s-00000000000000000abc"),
+            Some("s-00000000000000000001"),
+            at,
+        );
     }
     let captured = old.capture_restore_manifest();
     let wire = captured
         .to_toml()
         .expect("the parent serializes its layout");
-    assert!(wire.contains("lineage = \"s-0001\""), "{wire}");
+    assert!(
+        wire.contains("lineage = \"s-00000000000000000001\""),
+        "{wire}"
+    );
     let carried = restore::RestoreManifest::from_toml(&wire).expect("the child reads it");
     let mut new = App::headless_for_test();
     new.handoff_successor = true;
@@ -7252,7 +7277,7 @@ fn a_seamless_update_keeps_a_sessions_lineage_for_its_next_restore() {
         carried.windows.into_iter().next().expect("window 0"),
     );
     assert_eq!(new.focused_session_id(WindowId(0)), Some(0));
-    assert_eq!(lineage(&new).as_deref(), Some("s-0001"));
+    assert_eq!(lineage(&new).as_deref(), Some("s-00000000000000000001"));
     let after = slog_lines(&new, 0);
     assert_eq!(
         after.len(),
@@ -7260,7 +7285,356 @@ fn a_seamless_update_keeps_a_sessions_lineage_for_its_next_restore() {
         "the same session: no record: {after:?}"
     );
     let (leaf, _) = captured_leaf(&new, WindowId(0), 0);
-    assert_eq!(leaf.lineage.as_deref(), Some("s-0001"));
+    assert_eq!(leaf.lineage.as_deref(), Some("s-00000000000000000001"));
+}
+
+/// The `opened_ms=` that `status`, the `sessions` row `ls` relays, and the survey's session row
+/// at `facts` print for `session`, in that order.
+fn printed_opened_ms(app: &App, session: u64) -> [String; 3] {
+    let value = |line: &str| {
+        line.split_whitespace()
+            .find_map(|word| word.strip_prefix("opened_ms="))
+            .unwrap_or_else(|| panic!("no opened_ms= in {line}"))
+            .to_string()
+    };
+    let sid = app
+        .pool
+        .get(session)
+        .expect("live session")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    let status = app.session_status_record(session).expect("a status line");
+    let roster = crate::control::cmd_sessions_store(&app.store, None);
+    let listed = roster
+        .lines()
+        .skip(1)
+        .find(|row| row.split_whitespace().nth(1) == Some(sid.as_str()))
+        .unwrap_or_else(|| panic!("{sid} in {roster}"));
+    let here = crate::survey::Here {
+        host: None,
+        instances: 1,
+        access: aterm_types::fleet_access::FleetAccess::ReadOnly,
+        drive: false,
+        facts: None,
+    };
+    let survey = crate::survey::survey_rows(
+        &app.store,
+        crate::survey::SurveyLevel::Facts,
+        usize::MAX,
+        &here,
+    );
+    let surveyed = survey
+        .lines()
+        .find(|row| {
+            row.starts_with("session ") && row.split_whitespace().any(|w| w == format!("sid={sid}"))
+        })
+        .unwrap_or_else(|| panic!("{sid} in {survey}"));
+    [value(&status), value(listed), value(surveyed)]
+}
+
+/// The one time [`printed_opened_ms`]'s three surfaces agree on, as a number.
+fn number(printed: &[String; 3]) -> u64 {
+    assert!(
+        printed.iter().all(|p| p == &printed[0]),
+        "status, ls and survey say one time: {printed:?}"
+    );
+    printed[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("a number: {printed:?}"))
+}
+
+/// A tab of one terminal leaf for shell `local`, saved under `sid` with the first open
+/// `opened_ms`.
+fn carried(local: u64, sid: Option<&str>, opened_ms: Option<u64>) -> restore::RestoredTab {
+    restore::RestoredTab {
+        root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                sid: sid.map(str::to_string),
+                opened_ms,
+                local_id: Some(local),
+                ..bare_leaf()
+            },
+        )),
+        focused_path: Vec::new(),
+        zoomed: false,
+        parked: false,
+        ephemeral: false,
+        fleet: false,
+    }
+}
+
+/// CX-05's exit test: `status`, `ls` and survey print `opened_ms=`, the Unix ms of the session
+/// lineage's first open, and a cold restore carries it. The layout a quit writes holds it, and a
+/// session a cold restore brings back says the time it carried, not its new shell's open: the
+/// boot shell, which opened before the layout reached it and stands in for a legacy session
+/// (`prev=`), and a new shell under the leaf's own tab ID; then again after a second restore of
+/// the layout the first one wrote and read back. CONTROLS: a session no restore reached says its
+/// own open (between the clock readings around it), and one from a leaf an older aterm wrote,
+/// with no `opened_ms`, says its restore's open, never `0` or `-`.
+#[test]
+fn opened_ms_is_printed_and_survives_a_cold_restore() {
+    const FIRST: u64 = 1_794_673_960_000;
+    const EARLIER: u64 = 1_794_000_000_000;
+    const WAS: &str = "s-000000000000000000c5";
+    const KEPT: &str = "tcx05kept01";
+    let control = aterm_tempfile::tempdir().expect("scratch control dir");
+    let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
+    let wall = || aterm_time::unix_millis().expect("a readable clock");
+
+    let before = wall();
+    let mut app = App::headless_for_test();
+    let after = wall();
+    let fresh = number(&printed_opened_ms(&app, 0));
+    assert!(
+        (before..=after).contains(&fresh),
+        "CONTROL: a session nothing restored says its own open: {before} <= {fresh} <= {after}"
+    );
+
+    // What an earlier aterm's quit wrote, read as a launch reads it.
+    let written = restore::RestoreManifest::new(vec![restore::WindowLayout {
+        restored_tabs: vec![
+            carried(0, Some(WAS), Some(FIRST)),
+            carried(1, Some(KEPT), Some(EARLIER)),
+            carried(2, None, None),
+        ],
+        ..single_leaf_window(bare_leaf())
+    }])
+    .to_toml()
+    .expect("a layout serializes");
+    assert!(
+        written.contains(&format!("opened_ms = {FIRST}")),
+        "the layout holds the first open: {written}"
+    );
+    let read = restore::RestoreManifest::from_toml(&written).expect("a launch reads it");
+    let wid = WindowId(0);
+    let restoring = wall();
+    app.restore_into_window(wid, read.windows.into_iter().next().expect("window 0"));
+    let restored = wall();
+    let (_, boot) = captured_leaf(&app, wid, 0);
+    let (_, kept) = captured_leaf(&app, wid, 1);
+    let (_, older) = captured_leaf(&app, wid, 2);
+    assert_eq!(boot, 0, "PRECONDITION: the bootstrap filled the first leaf");
+    assert!(
+        slog_lines(&app, boot)
+            .iter()
+            .any(|l| l.contains(" amend - restore ") && l.contains(&format!(" prev={WAS} "))),
+        "PRECONDITION: the boot shell stands in for the legacy session: {:?}",
+        slog_lines(&app, boot)
+    );
+    assert_eq!(
+        app.pool.get(kept).unwrap().ctx.self_id.as_str(),
+        KEPT,
+        "PRECONDITION: the new shell runs under the leaf's own tab ID"
+    );
+    assert_eq!(
+        number(&printed_opened_ms(&app, boot)),
+        FIRST,
+        "the boot shell opened at {fresh}, and says its lineage's first open"
+    );
+    assert_eq!(number(&printed_opened_ms(&app, kept)), EARLIER);
+    let own = number(&printed_opened_ms(&app, older));
+    assert!(
+        (restoring..=restored).contains(&own),
+        "CONTROL: a leaf with no opened_ms says its restore's open: {restoring} <= {own} <= \
+         {restored}"
+    );
+
+    // The layout this aterm's quit writes carries each, and the next launch says them again.
+    let rewritten = app
+        .capture_restore_manifest()
+        .to_toml()
+        .expect("the layout serializes");
+    for ms in [FIRST, EARLIER, own] {
+        assert!(
+            rewritten.contains(&format!("opened_ms = {ms}")),
+            "{ms} in {rewritten}"
+        );
+    }
+    let reread = restore::RestoreManifest::from_toml(&rewritten).expect("the next launch reads it");
+    let mut next = App::headless_for_test();
+    next.restore_into_window(wid, reread.windows.into_iter().next().expect("window 0"));
+    for (index, ms) in [(0, FIRST), (1, EARLIER), (2, own)] {
+        let (_, session) = captured_leaf(&next, wid, index);
+        assert_eq!(
+            number(&printed_opened_ms(&next, session)),
+            ms,
+            "tab {index} after a second cold restore"
+        );
+    }
+}
+
+/// CX-05, the adopted branch of `carry_restored_lineage`: the window's bootstrap was adopted as
+/// shell 1 and fills a leaf that names shell 0, whose adopted session runs elsewhere. That
+/// adopted session takes the leaf's first open and lineage. CONTROL: the shell filling the leaf
+/// is another session and keeps its own.
+#[test]
+fn opened_ms_reaches_the_adopted_session_its_leaf_names() {
+    const FIRST: u64 = 1_794_673_960_000;
+    const BEGAN: &str = "s-000000000000000000f0";
+    let control = aterm_tempfile::tempdir().expect("scratch control dir");
+    let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
+    let mut app = App::headless_for_test();
+    app.handoff_successor = true;
+    adopt_as(&mut app, 0, 1);
+    let mut named = crate::stub_session(1);
+    named.handoff_local_id = Some(0);
+    App::register_session(&app.store, &named, None);
+    app.pool.insert(named);
+    app.next_session_id = app.next_session_id.max(2);
+    let boot_own = number(&printed_opened_ms(&app, 0));
+    assert_ne!(
+        number(&printed_opened_ms(&app, 1)),
+        FIRST,
+        "PRECONDITION: its own open"
+    );
+    let mut tab = carried(0, None, Some(FIRST));
+    if let restore::RestoredSplitTree::Leaf {
+        view: restore::RestoredView::Terminal(leaf),
+    } = &mut tab.root
+    {
+        leaf.lineage = Some(BEGAN.to_string());
+    }
+    app.restore_into_window(
+        WindowId(0),
+        restore::WindowLayout {
+            restored_tabs: vec![tab],
+            ..single_leaf_window(bare_leaf())
+        },
+    );
+    let (_, filled) = captured_leaf(&app, WindowId(0), 0);
+    assert_eq!(
+        filled, 0,
+        "PRECONDITION: the bootstrap, adopted as shell 1, filled leaf 0"
+    );
+    assert_eq!(
+        number(&printed_opened_ms(&app, 1)),
+        FIRST,
+        "the adopted session the leaf names takes its first open"
+    );
+    assert_eq!(
+        app.pool
+            .get(1)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .lineage()
+            .map(|l| l.as_str().to_string())
+            .as_deref(),
+        Some(BEGAN),
+        "and its lineage"
+    );
+    assert_eq!(
+        number(&printed_opened_ms(&app, 0)),
+        boot_own,
+        "CONTROL: the filling shell keeps its own open"
+    );
+}
+
+/// CX-05 on a held pane (its command exited, its final screen kept read-only) that a seamless
+/// update carries: rebuilt under the sid it had, it is the same session and keeps its leaf's
+/// first open and lineage, not the update's open. CONTROL: a pane whose sid a session here
+/// already holds is rebuilt under a minted one, stands in for the old sid (its lineage, a
+/// first-generation leaf carrying none) and still says the first open.
+#[test]
+fn a_held_pane_keeps_its_first_open_across_a_seamless_update() {
+    const HELD: u64 = 7;
+    const FIRST: u64 = 1_794_673_960_000;
+    const SID: &str = "tcx05hed701";
+    const BEGAN: &str = "s-000000000000000000f0";
+    let control = aterm_tempfile::tempdir().expect("scratch control dir");
+    let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
+    for minted in [false, true] {
+        let mut new = App::headless_for_test();
+        new.handoff_successor = true;
+        adopt_as(&mut new, 0, 0);
+        let (was, lineage) = if minted {
+            (
+                new.pool.get(0).unwrap().ctx.self_id.as_str().to_string(),
+                None,
+            )
+        } else {
+            (SID.to_string(), Some(BEGAN.to_string()))
+        };
+        let held_leaf = restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+            restore::TerminalLeafRestore {
+                sid: Some(was.clone()),
+                lineage: lineage.clone(),
+                opened_ms: Some(FIRST),
+                local_id: Some(HELD),
+                ..bare_leaf()
+            },
+        ));
+        let wire = restore::RestoreManifest::new(vec![
+            window_of(vec![leaf_naming(0)]),
+            window_of(vec![held_leaf]),
+        ])
+        .to_toml()
+        .expect("the parent serializes its layout");
+        let placed = restore::RestoreManifest::from_toml(&wire)
+            .expect("the successor parses it")
+            .placed_for_handed(&[0])
+            .expect("a held pane's leaf is a placeholder, not a refusal");
+        let checkpoint = {
+            let mut t = aterm_core::terminal::Terminal::new(24, 80);
+            t.process(b"build finished\r\n");
+            t.checkpoint_carry_abandoning_partial(0).0
+        };
+        new.seamless_held = vec![crate::seamless::HeldPane {
+            local_id: HELD,
+            sid: Some(aterm_session::SessionId::parse(&was).expect("a tab ID")),
+            checkpoint,
+            exit: Some(aterm_pty::ChildExit::Code(0)),
+            history: crate::handoff_history::AdoptedHistory::default(),
+            control: None,
+            failure_seen: false,
+        }];
+        let mut windows = placed.windows.into_iter();
+        new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
+        let layout = windows.next().expect("the held pane's window");
+        let wid = new.create_native_restore_window(layout.rows, layout.cols);
+        new.restore_into_window(wid, layout);
+        let session = new
+            .window_terminal_sessions(wid)
+            .first()
+            .copied()
+            .expect("the window shows the held pane");
+        assert_eq!(
+            new.store.read().unwrap().by_local(session).map(|h| h.state),
+            Some(crate::session_store::SessionState::Exited),
+            "minted = {minted}: PRECONDITION: the held pane, registered and ended"
+        );
+        assert_eq!(
+            number(&printed_opened_ms(&new, session)),
+            FIRST,
+            "minted = {minted}: the held pane says its first open, not the update's"
+        );
+        let pane = new.pool.get(session).expect("pooled");
+        let now = pane.ctx.self_id.as_str().to_string();
+        let kept = pane
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .lineage()
+            .map(|l| l.as_str().to_string());
+        if minted {
+            assert_ne!(now, was, "PRECONDITION: a session here holds {was}");
+            assert_eq!(
+                kept.as_deref(),
+                Some(was.as_str()),
+                "CONTROL: the minted pane stands in for {was}"
+            );
+        } else {
+            assert_eq!(now, was, "PRECONDITION: the pane keeps its sid");
+            assert_eq!(kept, lineage, "the same session keeps its leaf's lineage");
+        }
+    }
 }
 
 #[test]
@@ -7270,11 +7644,29 @@ fn a_reopened_closed_tab_names_the_session_it_was() {
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     let closing = app.next_session_id - 1;
     let sid = app.pool.get(closing).unwrap().ctx.self_id.clone();
+    let opened_ms = |app: &App, session: u64| {
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .opened_ms()
+    };
+    let first = opened_ms(&app, closing);
     assert!(!app.close_tab_at(wid, 1));
     assert!(app.pool.get(closing).is_none(), "PRECONDITION: it closed");
     app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.focused_session_id(wid).expect("the reopened tab");
     assert_ne!(reopened, closing);
+    assert!(first.is_some(), "PRECONDITION: the closed tab's log opened");
+    assert_eq!(
+        opened_ms(&app, reopened),
+        first,
+        "the reopened tab keeps its first open"
+    );
     let opened = slog_lines(&app, reopened);
     assert!(
         opened[0].contains(" open - restore ")
@@ -8611,7 +9003,7 @@ fn a_headless_maximized_row_is_regridded_at_the_close() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut ws = app.windows.get_mut(&wid).expect("the window");
         (ws.rows, ws.cols) = (27, 80);
     }
     let mut layout = window_of(vec![

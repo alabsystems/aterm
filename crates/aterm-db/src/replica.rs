@@ -32,6 +32,7 @@ use std::{
 };
 
 mod mesh_access;
+pub use astream_wire::sync::rbsr::Snapshot;
 pub use mesh_access::MeshAccess;
 
 /// The bound of a table-ID list: the tables one Mac selects, and a round's clock mark.
@@ -504,6 +505,10 @@ impl Listing {
 /// Volatile fairness hints. Inventory and durable receipts decide what is missing.
 #[derive(Clone, Default, Debug)]
 pub struct Repair {
+    /// This session speaks `atdb/7`: each table's operation inventory is reconciled by range and
+    /// its whole difference drained in one round, parents first ([`reconcile_inventory`]). Set
+    /// by the control session for each connection, from the protocol it negotiated.
+    pub(crate) reconcile: bool,
     history: Option<Digest>,
     table: Option<Digest>,
     table_follow_up: Option<(Digest, usize)>,
@@ -1648,19 +1653,38 @@ impl Replica {
         Ok(verdicts)
     }
 
-    /// The digests of `table`'s operations this Mac holds (`store.inventory`), `None` for a table
+    /// The digests of `table`'s operations this Mac holds (`store.inventory`), as a range
+    /// reconciliation snapshot over its causal index ([`reconcile_inventory`]), `None` for a table
     /// it does not hold.
     ///
     /// # Errors
     /// Custody, admission or the store's read fails, other than the table being absent.
-    pub fn mesh_inventory(&self, table: Digest) -> Result<Option<BTreeSet<Digest>>> {
+    pub fn mesh_inventory(&self, table: Digest) -> Result<Option<Snapshot>> {
         let Some(round) = self.mesh_round(table)? else {
             return Ok(None);
         };
         round.local(None, |session| match round.store(session, table) {
-            Ok(store) => Ok(Some(store.inventory_unchecked().copied().collect())),
+            Ok(store) => {
+                let ids: BTreeSet<Digest> = store.inventory_unchecked().copied().collect();
+                store.snapshot_of(&ids).map(Some)
+            }
             Err(error) if error.is_busy() => Err(error),
             Err(_) => Ok(None),
+        })
+    }
+
+    /// `ids` of `table` in causal order: a record follows every parent of it among `ids`, so a
+    /// neighbour sent them in this order never receives a child before a parent it is also being
+    /// sent. An id this store does not hold keeps its place among the rest.
+    ///
+    /// # Errors
+    /// Custody, admission or the store's read fails.
+    pub fn mesh_order(&self, table: Digest, ids: &[Digest]) -> Result<Vec<Digest>> {
+        let Some(round) = self.mesh_round(table)? else {
+            return Ok(ids.to_vec());
+        };
+        round.local(None, |session| {
+            Ok(round.store(session, table)?.causal_order_of(ids))
         })
     }
 
@@ -1851,6 +1875,9 @@ enum OfferedIds {
 
 struct Inventory {
     known: BTreeSet<Digest>,
+    /// On `atdb/7`, the reconciliation snapshot of `known` over the store's causal index, read in
+    /// the same open ([`reconcile_inventory`]).
+    snapshot: Option<astream_wire::sync::rbsr::Snapshot>,
     offered: OfferedIds,
     offered_count: usize,
     observation: InventoryObservation,
@@ -1887,6 +1914,7 @@ impl Inventory {
         };
         Self {
             known,
+            snapshot: None,
             offered,
             offered_count,
             observation,
@@ -1912,6 +1940,15 @@ impl Inventory {
             self.observation.inventory
         } else {
             InventorySummary::of(peer)
+        }
+    }
+
+    /// Whether this side offers `id` to a peer that lacks it.
+    fn offers(&self, id: &Digest) -> bool {
+        match &self.offered {
+            OfferedIds::All => self.known.contains(id),
+            OfferedIds::Only(ids) => ids.contains(id),
+            OfferedIds::Except(excluded) => self.known.contains(id) && !excluded.contains(id),
         }
     }
 
@@ -3209,6 +3246,20 @@ impl Round<'_> {
         refusal: &mut Option<String>,
         cause: &mut Option<aterm_types::network_state::RepairCause>,
     ) -> Result<Option<Inventory>> {
+        self.inventory_read_gated(peer, id, gate, false, refusal, cause)
+    }
+
+    /// [`Self::inventory_gated`], with the reconciliation snapshot read in the same open where
+    /// `reconcile` ([`Inventory::snapshot`]).
+    fn inventory_read_gated(
+        &self,
+        peer: Actor,
+        id: Digest,
+        gate: Gate,
+        reconcile: bool,
+        refusal: &mut Option<String>,
+        cause: &mut Option<aterm_types::network_state::RepairCause>,
+    ) -> Result<Option<Inventory>> {
         let read = self.local_gated(peer, gate, |session| {
             let sampled_at = Instant::now();
             let observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
@@ -3231,12 +3282,19 @@ impl Round<'_> {
                 observed_at_ms,
                 sampled_at,
             };
-            Ok(Some(Inventory::new(
+            let snapshot = if reconcile {
+                Some(store.snapshot_of(&known)?)
+            } else {
+                None
+            };
+            let mut inventory = Inventory::new(
                 known,
                 store.quarantine_closure(),
                 observation,
                 store.fence(),
-            )))
+            );
+            inventory.snapshot = snapshot;
+            Ok(Some(inventory))
         });
         Self::table_read(read, refusal, cause)
     }
@@ -3524,16 +3582,32 @@ impl Round<'_> {
         let mut local_cause = None;
         // Sent only after the authorize that `exchange_inventory` runs first, which checks the
         // table's subscription (`Gate`).
-        let local = self
-            .inventory_gated(peer, id, Gate::Policy, &mut local_error, &mut local_cause)
+        let mut local = self
+            .inventory_read_gated(
+                peer,
+                id,
+                Gate::Policy,
+                repair.reconcile,
+                &mut local_error,
+                &mut local_cause,
+            )
             .map_err(|error| at("operation inventory", error))?;
-        let remote = exchange_inventory(
-            stream,
-            side,
-            local.as_ref().map(|inventory| &inventory.known),
-            MAX_RECORDS,
-            || self.local(peer, |_| Ok(())),
-        )
+        let remote = if repair.reconcile {
+            // The snapshot's headers are physical facts read with the inventory; the batches
+            // below recheck access as they always do.
+            let snapshot = local
+                .as_mut()
+                .and_then(|inventory| inventory.snapshot.take());
+            reconcile_inventory(stream, side, snapshot, || self.local(peer, |_| Ok(())))
+        } else {
+            exchange_inventory(
+                stream,
+                side,
+                local.as_ref().map(|inventory| &inventory.known),
+                MAX_RECORDS,
+                || self.local(peer, |_| Ok(())),
+            )
+        }
         .map_err(|error| at("inventory exchange", error))?;
         let peer_unavailable = remote.is_none();
         let (Some(local), Some(remote)) = (local, remote) else {
@@ -3559,6 +3633,63 @@ impl Round<'_> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .observe(id, &local.known, &remote);
+        if repair.reconcile {
+            // The whole difference, parents first, in receipted batches until neither side has
+            // anything left to send: no per-round cap.
+            let ids: Vec<Digest> = local
+                .known
+                .iter()
+                .filter(|id| !remote.contains(*id) && local.offers(id))
+                .copied()
+                .collect();
+            self.inventory_read
+                .replace(Some((local.observation, local.fence)));
+            // Ordered parents first in the first batch's own store open, so the drain opens the
+            // store no more than its batches do.
+            let ordered = std::cell::RefCell::new(None::<Vec<Digest>>);
+            let sent = report.sent;
+            let mut next = 0;
+            loop {
+                let take = BATCH.min(ids.len() - next);
+                let prepare = |session: &Session<'_>| {
+                    if take == 0 {
+                        return Ok(Vec::new());
+                    }
+                    let store = self
+                        .store(session, id)
+                        .map_err(|error| at("batch preparation", error))?;
+                    let mut ordered = ordered.borrow_mut();
+                    let order = ordered.get_or_insert_with(|| store.causal_order_of(&ids));
+                    let wires = store.replication_wires_unchecked(&order[next..next + take]);
+                    if wires.len() != take {
+                        return Err(at("batch preparation", Error::snapshot_changed()));
+                    }
+                    Ok(wires)
+                };
+                let received = match side {
+                    Side::Initiator => {
+                        self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
+                            .map_err(|error| at("operation send", error))?;
+                        self.receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
+                            .map_err(|error| at("operation receive", error))?
+                    }
+                    Side::Responder => {
+                        let received = self
+                            .receive_batch(stream, peer, id, BatchKind::Operation, repair, report)
+                            .map_err(|error| at("operation receive", error))?;
+                        self.send_batch(stream, peer, prepare, BatchKind::Operation, report)
+                            .map_err(|error| at("operation send", error))?;
+                        received
+                    }
+                };
+                next += take;
+                if take == 0 && received == 0 {
+                    break;
+                }
+            }
+            report.caught_up = report.sent - sent == ids.len();
+            return Ok(());
+        }
         let mut ids: Vec<_> = local
             .offered_cycle(repair.records.get(&id).copied())
             .filter(|v| !remote.contains(*v))
@@ -3665,7 +3796,7 @@ impl Round<'_> {
         kind: BatchKind,
         repair: &mut Repair,
         report: &mut Report,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let n = control::read_u32(stream)? as usize;
         if n > BATCH {
             return Err(Error::repair(
@@ -3693,7 +3824,7 @@ impl Round<'_> {
             // (`Gate`).
             self.local_policy_only(peer, |_| Ok(()))?;
             stream.flush()?;
-            return Ok(());
+            return Ok(0);
         }
         let batch = match kind {
             BatchKind::Operation => "operations",
@@ -3784,7 +3915,7 @@ impl Round<'_> {
         }
         stream.write_all(&receipts)?;
         stream.flush()?;
-        Ok(())
+        Ok(n)
     }
 }
 
@@ -3931,6 +4062,115 @@ pub fn exchange_inventory<const N: usize>(
             Ok(remote)
         }
     }
+}
+
+/// The remote inventory count one range reconciliation admits ([`reconcile_inventory`]): an
+/// explicit budget for this exchange's memory, never a cap on what a table holds, which no list
+/// here bounds.
+pub const RECONCILE_REMOTE_RECORDS: u64 = 1 << 22;
+/// The most request/reply messages one range reconciliation takes: setup, the frontier pages,
+/// the range rounds and the difference pages ([`astream_wire::sync::rbsr::codec::PAGE`] ids
+/// each), for a difference of up to this many pages.
+pub const RECONCILE_MESSAGES: u64 = 1 << 17;
+
+/// [`exchange_inventory`] on `atdb/7`: each side first says whether its inventory is available,
+/// as there, and then, where both are, the initiator reconciles the two snapshots with the
+/// responder: each writer's dense unforked prefix first, by its frontier, then the rest by range
+/// (astream-wire's RBSR, frames of at most
+/// [`astream_wire::sync::rbsr::codec::MAX_FRAME_BYTES`]). The bytes track the difference, not
+/// the inventories: two equal tables trade one root each way. Both sides learn the exact
+/// difference and return the peer's set, `local` without what only this side holds and with what
+/// only the peer holds, so everything after the inventory reads as it does on the whole-list wire.
+///
+/// # Errors
+/// `authorize` refuses, a frame is malformed or past its budget, the two sides' sums disagree
+/// (the reconciliation conserves nothing it cannot account for), or the stream fails.
+pub fn reconcile_inventory(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    local: Option<astream_wire::sync::rbsr::Snapshot>,
+    authorize: impl Fn() -> Result<()>,
+) -> Result<Option<BTreeSet<Digest>>> {
+    use astream_wire::sync::rbsr::{
+        codec::{MAX_FRAME_BYTES, Message},
+        exchange::{ExchangeError, Limits, Responder, reconcile},
+    };
+    fn ready(stream: &mut impl Read) -> Result<bool> {
+        let mut ready = [0];
+        stream.read_exact(&mut ready)?;
+        match ready[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::repair(
+                "invalid table inventory state",
+                aterm_types::network_state::RepairCause::Decode,
+            )),
+        }
+    }
+    let peer_ready = match side {
+        Side::Initiator => {
+            authorize()?;
+            stream.write_all(&[u8::from(local.is_some())])?;
+            stream.flush()?;
+            ready(stream)?
+        }
+        Side::Responder => {
+            let peer = ready(stream)?;
+            authorize()?;
+            stream.write_all(&[u8::from(local.is_some())])?;
+            stream.flush()?;
+            peer
+        }
+    };
+    let (Some(local), true) = (local, peer_ready) else {
+        return Ok(None);
+    };
+    fn refused(error: astream_wire::sync::rbsr::Error) -> Error {
+        Error::repair(
+            &format!("table inventory reconciliation refused: {error:?}"),
+            aterm_types::network_state::RepairCause::Decode,
+        )
+    }
+    fn send(stream: &mut impl Write, message: &Message) -> Result<()> {
+        control::write_frame(stream, &message.encode().map_err(refused)?)?;
+        stream.flush()?;
+        Ok(())
+    }
+    fn receive(stream: &mut impl Read) -> Result<Message> {
+        Message::decode(&control::receive_frame(stream, MAX_FRAME_BYTES)?).map_err(refused)
+    }
+    let limits = Limits {
+        remote_records: RECONCILE_REMOTE_RECORDS,
+        messages: RECONCILE_MESSAGES,
+    };
+    let held: BTreeSet<Digest> = local.ids().copied().collect();
+    let snapshot = std::sync::Arc::new(local);
+    let difference = match side {
+        Side::Initiator => reconcile(snapshot, limits, |message| {
+            send(stream, &message)?;
+            receive(stream)
+        })
+        .map_err(|error| match error {
+            ExchangeError::Protocol(error) => refused(error),
+            ExchangeError::Transport(error) => error,
+        })?,
+        Side::Responder => {
+            let mut responder = Responder::new(snapshot, limits).map_err(refused)?;
+            loop {
+                let answer = responder.answer(receive(stream)?).map_err(refused)?;
+                send(stream, &answer)?;
+                if let Some(difference) = responder.difference() {
+                    break difference.clone();
+                }
+            }
+        }
+    };
+    let mut remote = held;
+    for id in &difference.send {
+        remote.remove(id);
+    }
+    remote.extend(difference.want.iter().copied());
+    Ok(Some(remote))
 }
 
 fn send_inventory<const N: usize>(

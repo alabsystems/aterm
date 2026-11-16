@@ -511,8 +511,8 @@ fn unmoved(
 /// # Errors
 /// Could-not-run when the text does not read back as `lock` or its seal does not hold.
 pub fn lock_text(lock: &TrustLock) -> Result<String> {
-    let head = aterm_census::seal::line("#", GENERATOR);
-    let text = aterm_census::seal::stamp(&format!("{head}\n{}", trust_lock::render_body(lock)))
+    let head = aterm_seal::line("#", GENERATOR);
+    let text = aterm_seal::stamp(&format!("{head}\n{}", trust_lock::render_body(lock)))
         .map_err(Error::cannot_run)?;
     match trust_lock::parse(&text) {
         Ok(back) if back == *lock => {}
@@ -527,8 +527,8 @@ pub fn lock_text(lock: &TrustLock) -> Result<String> {
             )));
         }
     }
-    match aterm_census::seal::check(&text) {
-        aterm_census::seal::Seal::Holds { .. } => Ok(text),
+    match aterm_seal::check(&text) {
+        aterm_seal::Seal::Holds { .. } => Ok(text),
         other => Err(Error::cannot_run(format!(
             "the lock's seal does not hold: {other:?}"
         ))),

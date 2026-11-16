@@ -6,6 +6,7 @@
 //! join requests, under per-server and per-address caps.
 
 mod heard;
+mod held;
 #[path = "server/records_input.rs"]
 mod records_input;
 
@@ -29,6 +30,13 @@ mod takes_over_tests;
 #[path = "server/round_counts_tests.rs"]
 mod round_counts_tests;
 
+#[cfg(test)]
+#[path = "server/peer_gate_tests.rs"]
+mod peer_gate_tests;
+#[cfg(test)]
+#[path = "server/txt_rec_tests.rs"]
+mod txt_rec_tests;
+
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::serve_counts::{Count, Phase, ServeCounts};
 use crate::transport::{JoinRequest, parse_join_line};
@@ -36,7 +44,7 @@ use crate::wake::{Bell, Wake};
 use crate::{Error, fsx};
 use aterm_mesh_core::no_lost_edit as nle;
 use aterm_uds::power::Power;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
@@ -95,8 +103,6 @@ const WRITE_CHUNK: usize = 64 * 1024;
 const REFUSAL_DEADLINE: Duration = Duration::from_secs(1);
 /// How many answered refusals may wait to be closed gently.
 const REFUSALS_QUEUED: usize = 64;
-/// How often a held long-poll looks whether its client went away.
-const LIVENESS_EVERY: Duration = Duration::from_secs(5);
 /// The largest join request body.
 pub const MAX_JOIN_BODY: usize = 1024;
 /// The most queued join requests per vault.
@@ -135,7 +141,9 @@ pub const ALAB_FALLBACK_AFTER: Duration = Duration::from_secs(90);
 /// What a closing connection drains so its answer is not lost to a reset.
 const LINGER_BYTES: usize = 1 << 20;
 const LINGER_DEADLINE: Duration = Duration::from_secs(2);
-/// How often [`serve`] looks whether its program was replaced on disk.
+/// How often [`serve`] looks whether its program was replaced on disk where no file watch tells
+/// it: while it waits to bind ([`bind_when_free`]), and while it serves where its watch could
+/// not start ([`supervise`]), when it looks for a health challenge too.
 const PROGRAM_EVERY: Duration = Duration::from_secs(5);
 /// How long a server stopping for a new program waits for the answers in flight.
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
@@ -197,11 +205,18 @@ pub struct AlabNameInput<'a> {
 ///
 /// - Every server probes `alab-secrets.local` itself and takes the name only after
 ///   [`ALAB_FALLBACK_AFTER`] (90 s) in which nothing answered there with a verified ALab envelope
-///   at least as new as its own, so a returning server leaves an up-to-date holder in place.
+///   at least as new as its own, so a returning server leaves an up-to-date holder in place. A
+///   probe reads and verifies each version a URL answers with once, and afterwards asks only
+///   whether it still holds that one ([`probe_verified`]).
 /// - When two `>= 0.146` holders collide after a partition heal, every server settles them by one
 ///   strict order of verified envelope sequence descending, then discovery label ascending;
 ///   the loser withdraws and serves under its own label. TXT sequence is not evidence, and a
 ///   verified public envelope does not authenticate the serving device or its label.
+/// - TXT never decides the name, but it gates which peers a round pulls ([`VaultTxt`]): the
+///   holder's server is pulled as its TXT makes due and swept as every other server is, so a
+///   forged or lost TXT holds nothing back from it for longer than [`ANTI_ENTROPY_EVERY`] ±20%
+///   past the round that last swept it ([`PullGate::sweep_due`]). The probe here only verifies
+///   what the holder answers; a round's pull stores it.
 /// - mDNS lets only one of two holders keep the name, and hides the other's instance from the
 ///   order above: a holder whose registration ends that way lets the name go
 ///   ([`Self::lost_name`]).
@@ -452,8 +467,9 @@ pub fn serve(options: Options) -> crate::Result<()> {
 }
 
 /// Per-tick callback deciding which host label `serve` advertises (and updating its pins when
-/// policy or the store changes).
-pub type RoleDecider = Box<dyn FnMut(&mut Vec<(String, [u8; 32])>) -> Option<String> + Send>;
+/// policy or the store changes), told whether the running server holds the ALab vault
+/// ([`Shared::holds_alab`]: what it serves, not a read of its store file).
+pub type RoleDecider = Box<dyn FnMut(&mut Vec<(String, [u8; 32])>, bool) -> Option<String> + Send>;
 
 /// [`serve`], also following `aterm-swarm-lease` from `client_paths` when advertising a steward's
 /// own `<label>.local` on the ALab network (`DESIGN-alab-swarm` §8.3).
@@ -523,7 +539,7 @@ pub fn serve_with_role(
             Arc::clone(&running.shared),
         )),
         (None, Some(name)) => {
-            let decide: RoleDecider = Box::new(move |_| Some(name.clone()));
+            let decide: RoleDecider = Box::new(move |_, _| Some(name.clone()));
             Some((
                 decide,
                 own_names,
@@ -538,7 +554,19 @@ pub fn serve_with_role(
     let health_paths = client_paths.clone();
     let health_address = running.addr;
     children.tend_with_role(options.keep_awake, advertise, client_paths);
-    let result = supervise(running, PROGRAM_EVERY, &|| {
+    // What wakes the supervisor besides a stop signal and the accept loop's end: the program file
+    // the service starts next, and the challenge a repair writes for a bound server's health.
+    let watched: Vec<PathBuf> = program
+        .path()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(
+            health_paths
+                .as_ref()
+                .map(crate::service_health::server_challenge),
+        )
+        .collect();
+    let result = supervise(running, &watched, &|| {
         if let Some(paths) = &health_paths {
             let _ = crate::service_health::bound_server(paths, health_address);
         }
@@ -613,13 +641,33 @@ fn stop_reason(signalled: &AtomicBool, replaced: bool) -> Option<&'static str> {
 
 /// Run until the accept loop ends or the startup watch says to stop. The same watch covers
 /// binding and supervision, so an update between them cannot establish a new baseline.
+///
+/// It looks (`stopping`) at its start and each time its thread is unparked, and parks with no
+/// timeout between: a stop signal unparks it ([`serve_with_role`]'s handler), the accept loop's
+/// end does ([`AcceptEnded`]), and a file watch does when one of `watched` (the program file the
+/// service starts next, the server's health challenge) or a link on the way to it changes
+/// ([`SupervisorWatch`]). Where that watch cannot start it looks every [`PROGRAM_EVERY`]
+/// instead, as it did before.
 fn supervise(
     running: Running,
-    every: Duration,
+    watched: &[PathBuf],
     stopping: &dyn Fn() -> Option<&'static str>,
 ) -> crate::Result<()> {
+    let main = std::thread::current();
+    let (mut watch, every) = match SupervisorWatch::start(watched, &main) {
+        Ok(watch) => (watch, None),
+        Err(error) => {
+            note(&format!(
+                "looking for a replaced program and a health challenge every {}s: {error}",
+                PROGRAM_EVERY.as_secs()
+            ));
+            (None, Some(PROGRAM_EVERY))
+        }
+    };
     loop {
-        if running.accept.as_ref().is_none_or(JoinHandle::is_finished) {
+        if running.accept.as_ref().is_none_or(JoinHandle::is_finished)
+            || running.shared.accept_ended(&main)
+        {
             return running.wait();
         }
         if let Some(why) = stopping() {
@@ -632,7 +680,102 @@ fn supervise(
             }
             return Ok(());
         }
-        std::thread::park_timeout(every);
+        #[cfg(test)]
+        running
+            .shared
+            .supervise_parks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(every);
+        match every {
+            Some(every) => std::thread::park_timeout(every),
+            None => std::thread::park(),
+        }
+        if let Some(watch) = &mut watch {
+            watch.follow();
+        }
+    }
+}
+
+/// The file watch that unparks a supervising thread ([`supervise`]): each watched file's path
+/// and every link a lookup of it passes ([`aterm_uds::file_watch::link_chain`]), so a program
+/// reached through a link is heard where it is, as is the link changed.
+struct SupervisorWatch {
+    watch: aterm_uds::file_watch::FileWatch,
+    files: Vec<PathBuf>,
+    /// The paths watched now, each keyed by its place in the list.
+    chain: Vec<PathBuf>,
+}
+
+impl SupervisorWatch {
+    /// Watch `files` for `thread`, unparking it at each change; `None` when there is nothing
+    /// to watch, since then nothing but a signal or the accept loop's end can move it.
+    ///
+    /// # Errors
+    /// When the platform's file events or the watch's thread cannot start.
+    fn start(files: &[PathBuf], thread: &std::thread::Thread) -> io::Result<Option<Self>> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let thread = thread.clone();
+        let watch = aterm_uds::file_watch::FileWatch::platform(
+            "vault-supervise",
+            Box::new(move |_| thread.unpark()),
+        )?;
+        let mut watch = Self {
+            watch,
+            files: files.to_vec(),
+            chain: Vec::new(),
+        };
+        watch.follow();
+        Ok(Some(watch))
+    }
+
+    /// Watch what each file's path passes through now, where that changed since the last look
+    /// (a link that names another file now). A path's first watch tells at once, so a change
+    /// between this look and the watch arming is heard too.
+    fn follow(&mut self) {
+        let chain: Vec<PathBuf> = self
+            .files
+            .iter()
+            .flat_map(|file| aterm_uds::file_watch::link_chain(file))
+            .collect();
+        if chain == self.chain {
+            return;
+        }
+        for (key, _) in (0_u64..).zip(&self.chain) {
+            self.watch.unwatch(key);
+        }
+        for (key, path) in (0_u64..).zip(&chain) {
+            self.watch.watch(key, path.clone());
+        }
+        self.chain = chain;
+    }
+}
+
+/// Whether a server's accept loop ended, and the thread to unpark when it does
+/// ([`Shared::accept_ended`]).
+#[derive(Default)]
+struct AcceptEnd {
+    ended: bool,
+    waiter: Option<std::thread::Thread>,
+}
+
+/// Held by the accept loop's thread: dropped as that thread returns or unwinds, it marks the
+/// loop ended and unparks the thread waiting for that ([`supervise`]).
+struct AcceptEnded(Arc<Shared>);
+
+impl Drop for AcceptEnded {
+    fn drop(&mut self) {
+        let mut end = self
+            .0
+            .accept_end
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        end.ended = true;
+        if let Some(waiter) = end.waiter.take() {
+            waiter.unpark();
+        }
     }
 }
 
@@ -643,6 +786,8 @@ pub struct Running {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shared: Arc<Shared>,
     cancel: Option<io::PipeWriter>,
+    /// Ends the `vault-held` thread when dropped ([`held::start`]).
+    held_cancel: Option<io::PipeWriter>,
     accept: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -656,6 +801,9 @@ impl Running {
             for slot in state.vaults.values() {
                 slot.wake.notify_all();
             }
+            for slot in state.records.values() {
+                slot.wake.notify_all();
+            }
             flush_all_heard(&self.shared, &mut state);
             if let Some(coverage) = state.heard_coverage.take()
                 && let Err(error) = coverage.finish(&state.heard, (self.shared.tuning.now)())
@@ -664,6 +812,7 @@ impl Running {
             }
         }
         drop(self.cancel.take());
+        drop(self.held_cancel.take());
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
@@ -678,11 +827,19 @@ impl Running {
         }
     }
 
-    /// Pull newer verified envelopes from `peers` (`?after=<held seq>`) and store those accepted
-    /// by this server's admission rules (`DESIGN-fluid-swarm` §4.1 F6). Returns how many vaults
-    /// advanced.
+    /// Pull newer verified envelopes (`?after=<held seq>`) and missing records from `peers`,
+    /// whatever their TXT says ([`Pass::Whole`]), and store those accepted by this server's
+    /// admission rules (`DESIGN-fluid-swarm` §4.1 F6). Returns how many peers' pulls stored
+    /// anything.
     pub fn pull_from_peers(&self, peers: &[crate::discover::DiscoveredVault]) -> usize {
-        pull_from_peers_shared(&self.shared, peers, self.addr.port(), None, &[])
+        pull_pass(
+            &self.shared,
+            peers,
+            self.addr.port(),
+            None,
+            &[],
+            Pass::Whole,
+        )
     }
 
     /// Probe `target` (a host label or URL) for a verified ALab vault envelope accepted under this
@@ -786,6 +943,12 @@ impl Running {
     pub(crate) fn join_gets(&self) -> usize {
         self.shared.join_gets.load(Ordering::SeqCst)
     }
+
+    /// How many GETs of a vault's records it has answered.
+    #[cfg(test)]
+    pub(crate) fn records_gets(&self) -> usize {
+        self.shared.records_gets.load(Ordering::SeqCst)
+    }
 }
 
 /// Start serving on `listener` in background threads (no mDNS, no caffeinate).
@@ -878,12 +1041,15 @@ struct Tuning {
     body_stall: Duration,
     write_stall: Duration,
     answer_deadline: Duration,
-    liveness_every: Duration,
     join_change_gap: Duration,
     /// How long a closing connection drains what its client still sends ([`linger`]).
     linger: Duration,
     /// How long a pull from a `>= 0.146` peer may take ([`PEER_PULL_BUDGET`]).
     peer_pull: Duration,
+    /// The addresses a host name resolves to within a budget, `None` for none
+    /// ([`resolve_peer_host`]): where a pass pulls a peer named by its host
+    /// ([`peer_endpoints`]).
+    resolve: fn(&str, Duration) -> Option<Vec<IpAddr>>,
     /// The wall clock the join queue is kept by, in unix seconds ([`now`]).
     now: fn() -> u64,
     /// Whether a connection from a peer address, arriving on one of this machine's addresses
@@ -905,10 +1071,10 @@ impl Default for Tuning {
             body_stall: BODY_STALL,
             write_stall: WRITE_STALL,
             answer_deadline: ANSWER_DEADLINE,
-            liveness_every: LIVENESS_EVERY,
             join_change_gap: JOIN_CHANGE_GAP,
             linger: LINGER_DEADLINE,
             peer_pull: PEER_PULL_BUDGET,
+            resolve: resolve_peer_host,
             now,
             is_local: this_machine,
             retired: envelope::Retired::compiled,
@@ -916,6 +1082,20 @@ impl Default for Tuning {
             before_lock: |_, _| {},
         }
     }
+}
+
+/// [`Tuning::resolve`]: [`aterm_uds::lan::resolve`], which on macOS has the root LAN broker
+/// resolve a local name, as a pull by that name would have had it resolved.
+#[cfg(not(test))]
+fn resolve_peer_host(name: &str, within: Duration) -> Option<Vec<IpAddr>> {
+    aterm_uds::lan::resolve(name, within).ok()
+}
+
+/// A unit test's [`Tuning::resolve`] resolves nothing: its peers are its own loopback stand-ins,
+/// named by address, and a test that names one by a host gives the resolver it answers with.
+#[cfg(test)]
+fn resolve_peer_host(_: &str, _: Duration) -> Option<Vec<IpAddr>> {
+    None
 }
 
 fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Result<Running> {
@@ -956,6 +1136,10 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         conn_ended: Mutex::new(None),
         untaken: crate::membership_log::untaken::Untaken::new(),
         advertiser: Mutex::new(None),
+        probed: Mutex::new(Vec::new()),
+        gate: Mutex::new(PullGate::default()),
+        holds: held::Holds::new(),
+        accept_end: Mutex::new(AcceptEnd::default()),
         records_boot: aterm_uds::rand::hex_token::<16>()?,
         #[cfg(any(test, debug_assertions))]
         waiting: AtomicUsize::new(0),
@@ -966,9 +1150,19 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         #[cfg(test)]
         join_gets: AtomicUsize::new(0),
         #[cfg(test)]
+        records_gets: AtomicUsize::new(0),
+        #[cfg(test)]
         record_wakes: AtomicUsize::new(0),
         #[cfg(test)]
         record_looks: AtomicUsize::new(0),
+        #[cfg(test)]
+        vault_looks: AtomicUsize::new(0),
+        #[cfg(test)]
+        probe_verifies: AtomicUsize::new(0),
+        #[cfg(test)]
+        park_waits: Mutex::new(Vec::new()),
+        #[cfg(test)]
+        supervise_parks: Mutex::new(Vec::new()),
         #[cfg(test)]
         post_clones: AtomicUsize::new(0),
         #[cfg(test)]
@@ -984,6 +1178,15 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         #[cfg(test)]
         writes_fail: AtomicBool::new(false),
     });
+    // Before the first connection, so every long-poll is watched from its start; a server whose
+    // thread did not start has each long-poll look for itself ([`held::UNWATCHED_EVERY`]).
+    let (held_cancelled, held_cancel) = aterm_uds::pipe()?;
+    if let Err(error) = held::start(&shared, held_cancelled) {
+        note(&format!(
+            "held long-polls look for their clients' end every {}s: {error}",
+            held::UNWATCHED_EVERY.as_secs()
+        ));
+    }
     let (refusals, refused) = sync_channel::<TcpStream>(REFUSALS_QUEUED);
     std::thread::Builder::new()
         .name("vault-refuse".to_owned())
@@ -999,13 +1202,17 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("vault-accept".to_owned())
-            .spawn(move || accept_loop(&listener, &cancelled, &shared, &stop, &refusals))?
+            .spawn(move || {
+                let _ended = AcceptEnded(Arc::clone(&shared));
+                accept_loop(&listener, &cancelled, &shared, &stop, &refusals)
+            })?
     };
     Ok(Running {
         addr,
         stop,
         shared,
         cancel: Some(cancel),
+        held_cancel: Some(held_cancel),
         accept: Some(accept),
     })
 }
@@ -1029,11 +1236,39 @@ struct Held {
     /// The held envelope's handoff chain ([`envelope::Retired::gives_way`]).
     handoff: Vec<([u8; 32], [u8; 64])>,
     bytes: Arc<Vec<u8>>,
+    /// Whether it is a version of the ALab vault by [`holds_alab`]'s rule, judged once as it is
+    /// taken: where the store file is what this server holds, whether that file is one is this
+    /// ([`Slot::file_alab`]), with no read and verification of the file again.
+    alab: bool,
+}
+
+impl Held {
+    /// What the server holds once it takes `envelope`, read as `bytes`, whose signature its
+    /// caller verified.
+    fn taken(envelope: &envelope::Envelope, bytes: Vec<u8>) -> Held {
+        Held {
+            seq: envelope.seq,
+            signer: envelope.signer,
+            head: envelope.digest(),
+            parented: !envelope.parents.is_empty(),
+            handoff: envelope.handoff.clone(),
+            bytes: Arc::new(bytes),
+            alab: is_alab_line(envelope),
+        }
+    }
 }
 
 /// One vault and the condition its long-polls wait on.
 struct Slot {
     held: Held,
+    /// The vault's store file as this server last read or wrote it: a look that finds the same
+    /// stamp reads nothing ([`take_from_store`]). `None` until this server read or wrote one,
+    /// once a look found nothing at the path or a file it could not read, or when a write's
+    /// stamp could not be read back.
+    stamp: Option<fsx::FileStamp>,
+    /// Whether the file of [`Self::stamp`] is a version of the ALab vault by [`holds_alab`]'s
+    /// rule, judged as it was read or written; false while `stamp` is `None`.
+    file_alab: bool,
     wake: Arc<Condvar>,
     /// Verdicts kept on this vault's join requests since the start: each one ends the
     /// long-polls held then, so a refused Mac waiting on one reads it at once.
@@ -1049,6 +1284,8 @@ impl Slot {
     fn new(held: Held) -> Slot {
         Slot {
             held,
+            stamp: None,
+            file_alab: false,
             wake: Arc::new(Condvar::new()),
             verdicts: 0,
             joins: queue_epoch(),
@@ -1103,10 +1340,17 @@ struct RecordSlot {
     /// those records into the store and verify the whole file under `server_state`. The POST
     /// stamps the slot when its write is done.
     writing: bool,
+    /// Requests parked on this slot; notification references may outlive their watches.
+    polls: usize,
     wake: Arc<Condvar>,
 }
 
 impl RecordSlot {
+    /// A file stamp keeps the read cache; active polls and writers keep their shared slot.
+    fn can_retire(&self) -> bool {
+        self.store.is_empty() && self.stamp.is_none() && self.polls == 0 && !self.writing
+    }
+
     /// A slot for `store` that knows no records file.
     fn new(store: crate::membership_log::Store) -> Self {
         Self::stamped(store, None, None)
@@ -1123,6 +1367,7 @@ impl RecordSlot {
             stamp,
             on_file,
             writing: false,
+            polls: 0,
             wake: Arc::new(Condvar::new()),
         }
     }
@@ -1146,8 +1391,12 @@ impl<'a> Writing<'a> {
 
 impl Drop for Writing<'_> {
     fn drop(&mut self) {
-        if let Some(slot) = self.shared.lock_server_state().records.get_mut(self.name) {
+        let mut state = self.shared.lock_server_state();
+        if state.records.get_mut(self.name).is_some_and(|slot| {
             slot.writing = false;
+            slot.can_retire()
+        }) {
+            state.records.remove(self.name);
         }
     }
 }
@@ -1203,6 +1452,17 @@ struct Shared {
     /// The bell the `vault-tend` thread naps on when advertising, rung so a new version updates
     /// its TXT at once.
     advertiser: Mutex<Option<Arc<Bell>>>,
+    /// The ALab version each holder URL a probe asked last answered with, verified, oldest
+    /// first, at most [`PROBES_KEPT`] ([`probe_verified`]).
+    probed: Mutex<Vec<Probed>>,
+    /// What a round's pulls remember: the records digests answering servers proved, and when
+    /// each endpoint was last pulled ([`PullGate`]).
+    gate: Mutex<PullGate>,
+    /// The held long-polls the `vault-held` thread watches for their clients' end and their
+    /// vaults' store files ([`held`]).
+    holds: held::Holds,
+    /// Whether the accept loop ended, for a supervisor parked until it does ([`AcceptEnded`]).
+    accept_end: Mutex<AcceptEnd>,
     #[cfg(any(test, debug_assertions))]
     waiting: AtomicUsize,
     /// Connections admitted since the start.
@@ -1219,12 +1479,30 @@ struct Shared {
     /// GETs of a vault's join queue (`/v1/<name>/join`, long-polls among them) since the start.
     #[cfg(test)]
     join_gets: AtomicUsize,
+    /// GETs of a vault's records (`/v1/<name>/records`, long-polls among them) since the start.
+    #[cfg(test)]
+    records_gets: AtomicUsize,
     /// The records long-polls an application woke ([`apply_records`]) since the start.
     #[cfg(test)]
     record_wakes: AtomicUsize,
     /// The looks at a records file ([`look_for_records`]) since the start.
     #[cfg(test)]
     record_looks: AtomicUsize,
+    /// The reads of a vault's store file ([`take_from_store`]) since the start.
+    #[cfg(test)]
+    vault_looks: AtomicUsize,
+    /// The ALab versions a holder probe read whole and verified ([`probe_verified`]) since the
+    /// start.
+    #[cfg(test)]
+    probe_verifies: AtomicUsize,
+    /// For each wait a held long-poll armed ([`park_until_news`]) since the start: whether it
+    /// was armed with all that was left of its hold.
+    #[cfg(test)]
+    park_waits: Mutex<Vec<bool>>,
+    /// The timeout of each park a supervisor made ([`supervise`]) since the start; `None` for
+    /// a park with no timeout.
+    #[cfg(test)]
+    supervise_parks: Mutex<Vec<Option<Duration>>>,
     /// The copies of a records slot's store an application took ([`apply_records`]) since the start.
     #[cfg(test)]
     post_clones: AtomicUsize,
@@ -1257,6 +1535,24 @@ impl Shared {
         self.server_state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_gate(&self) -> MutexGuard<'_, PullGate> {
+        self.gate.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the accept loop ended; while it has not, `waiter` is the thread its end unparks
+    /// ([`AcceptEnded`]). Asked and marked under one lock, so an end is either seen here or
+    /// unparks `waiter`.
+    fn accept_ended(&self, waiter: &std::thread::Thread) -> bool {
+        let mut end = self
+            .accept_end
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !end.ended {
+            end.waiter = Some(waiter.clone());
+        }
+        end.ended
     }
 
     /// [`fsx::append_at_with`] of an application's new records ([`apply_records`]), which a test's
@@ -1466,6 +1762,92 @@ impl Shared {
         Ok(())
     }
 
+    /// Whether this running server holds the ALab vault, by [`holds_alab`]'s rule: whether its
+    /// store file is a version of the ALab vault, after a look at it ([`take_from_store`], which
+    /// reads it only once its stamp moved and judges it as it reads it, [`Slot::file_alab`]). A
+    /// file removed, replaced by another or made one this server refuses holds none from the
+    /// next look, as a read of it each round found. The role decider asks this each round
+    /// ([`RoleDecider`]), which read and verified the whole store file each time.
+    fn holds_alab(&self) -> bool {
+        let mut state = self.lock_server_state();
+        take_from_store(self, &mut state, ALAB_VAULT);
+        state
+            .vaults
+            .get(ALAB_VAULT)
+            .is_some_and(|slot| slot.stamp.is_some() && slot.file_alab)
+    }
+
+    /// The seq a probe last verified at `url` under the ALab pin `pin`, and whether `url`
+    /// answers a probe that asks after it ([`probe_verified`], [`Probed::asks`]).
+    fn probed_seq(&self, url: &str, pin: Option<[u8; 32]>) -> Option<(u64, bool)> {
+        self.probed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|probed| probed.url == url && probed.pin == pin)
+            .map(|probed| (probed.seq, probed.asks))
+    }
+
+    /// The seq of `bytes`, a probe's whole read at `url`, when they verify
+    /// ([`verify_probed_alab_envelope`]), kept as what `url` answers under `pin`, with whether
+    /// `url` answers a probe that asks after it (`asks`); what `url` was kept answering goes
+    /// either way.
+    fn verified_probe(
+        &self,
+        url: &str,
+        bytes: &[u8],
+        pin: Option<[u8; 32]>,
+        asks: bool,
+    ) -> Option<u64> {
+        #[cfg(test)]
+        self.probe_verifies.fetch_add(1, Ordering::SeqCst);
+        let verified = verify_probed_alab_envelope(bytes, self);
+        let mut probed = self.probed.lock().unwrap_or_else(PoisonError::into_inner);
+        probed.retain(|probed| probed.url != url);
+        let (seq, head) = verified?;
+        if probed.len() >= PROBES_KEPT {
+            probed.remove(0);
+        }
+        probed.push(Probed {
+            url: url.to_owned(),
+            seq,
+            head,
+            pin,
+            asks,
+        });
+        Some(seq)
+    }
+
+    /// Forget what probes verified at `url`.
+    fn forget_probe(&self, url: &str) {
+        self.probed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|probed| probed.url != url);
+    }
+
+    /// Forget what probes verified at each of `holders`' URLs whose TXT names an ALab version of
+    /// another head: that instance says it holds another version now, which the next probe
+    /// there reads whole and verifies ([`probe_verified`]). TXT is a hint, never evidence: a
+    /// forged one only costs that probe the whole read every probe made before.
+    fn forget_probes_unlike(&self, holders: &[crate::discover::DiscoveredVault]) {
+        self.probed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|probed| {
+                !holders.iter().any(|holder| {
+                    holder.url == probed.url
+                        && holder
+                            .txt
+                            .as_ref()
+                            .is_some_and(|txt| txt.vault == ALAB_VAULT && txt.head != probed.head)
+                })
+            });
+    }
+
+    /// Ring the `vault-tend` thread's bell ([`Wake::Put`]) where this server advertises: a new
+    /// version was stored ([`put_vault`], a store file published), or the held records grew
+    /// ([`apply_records`]), so the advert's TXT names what it holds now.
     fn wake_advertiser(&self) {
         if let Some(bell) = self
             .advertiser
@@ -1829,15 +2211,7 @@ fn load_vault(path: &Path, name: &str) -> crate::Result<Held> {
         )));
     }
     envelope.verify_signature()?;
-    let head = envelope.digest();
-    Ok(Held {
-        seq: envelope.seq,
-        signer: envelope.signer,
-        head,
-        parented: !envelope.parents.is_empty(),
-        handoff: envelope.handoff,
-        bytes: Arc::new(bytes),
-    })
+    Ok(Held::taken(&envelope, bytes))
 }
 
 use crate::ALAB_VAULT;
@@ -1880,11 +2254,16 @@ pub(crate) fn held_vaults(store: &Path) -> crate::Result<Vec<String>> {
 /// Whether `bytes` are a version of the ALab vault by [`holds_alab`]'s rule: one that verifies,
 /// signed by a key this build names for it or one reached from such a key by verified handoffs.
 pub(crate) fn is_alab_vault(bytes: &[u8]) -> bool {
-    envelope::parse(bytes).is_ok_and(|envelope| {
-        envelope.name == ALAB_VAULT
-            && envelope.verify_signature().is_ok()
-            && envelope::Retired::compiled().lineage(&envelope.signer, &envelope.reached_from())
-    })
+    envelope::parse(bytes)
+        .is_ok_and(|envelope| envelope.verify_signature().is_ok() && is_alab_line(&envelope))
+}
+
+/// Whether `envelope`, whose signature verified, is a version of the ALab vault
+/// ([`is_alab_vault`]): it names the ALab vault and is signed by a key this build names for it
+/// or one reached from such a key by verified handoffs.
+fn is_alab_line(envelope: &envelope::Envelope) -> bool {
+    envelope.name == ALAB_VAULT
+        && envelope::Retired::compiled().lineage(&envelope.signer, &envelope.reached_from())
 }
 
 /// Drop requests queued more than [`JOIN_TTL_SECS`] from now either way.
@@ -2208,6 +2587,10 @@ struct Reply {
     /// ([`crate::crossing::RecordsBound::here`]). Whether crossed alone, for the same reason
     /// `records_boot` is a flag.
     records_bound: Option<bool>,
+    /// The heads digest of the records a records GET reply answered from
+    /// ([`crate::transport::RECORDS_HEADS_HEADER`]), taken from the store the reply's records came
+    /// from, under the same lock. Boxed for the reason `records_boot` is a flag.
+    records_heads: Option<Box<[u8; 32]>>,
 }
 
 enum Body {
@@ -2231,6 +2614,7 @@ impl Reply {
             records_need: false,
             records_boot: false,
             records_bound: None,
+            records_heads: None,
         }
     }
 
@@ -2252,6 +2636,7 @@ impl Reply {
             records_need: false,
             records_boot: false,
             records_bound: None,
+            records_heads: None,
         }
     }
 }
@@ -2366,6 +2751,13 @@ fn write_reply_to(
             "{}: {}\r\n",
             crate::transport::RECORDS_BOUND_HEADER,
             crate::crossing::RecordsBound::here(crossed).value()
+        ));
+    }
+    if let Some(heads) = &reply.records_heads {
+        head.push_str(&format!(
+            "{}: {}\r\n",
+            crate::transport::RECORDS_HEADS_HEADER,
+            hex32_encode(heads)
         ));
     }
     if let Some(secs) = reply.retry_after {
@@ -3095,6 +3487,7 @@ fn envelope_reply(held: &Held) -> Reply {
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_heads: None,
     }
 }
 
@@ -3118,42 +3511,71 @@ fn after_query(query: Option<&str>) -> Result<Option<u64>, Reply> {
     }
 }
 
-/// Hold a long-poll on `wake` until `done` says so, the server stops, [`Shared::hold`] runs
-/// out or the client goes away ([`gone`]), and return the state then. `done` is asked first,
-/// and again after each wake, under `server_state`.
+/// Hold a long-poll on `vault`'s `wake` until `done` says so, the server stops, [`Shared::hold`]
+/// runs out or the client goes away ([`gone`]), and return the state then. `done` is asked
+/// first, and again after each wake, under `server_state`.
+///
+/// It parks until news, its client stirring or a change of `vault`'s store files wakes it
+/// (all heard by the `vault-held` thread, [`held`]) or its hold ends, with no other timer. A
+/// long-poll nothing watches for those looks every [`held::UNWATCHED_EVERY`] instead.
 fn park_until_news<'s>(
     shared: &'s Shared,
     stream: &TcpStream,
+    vault: &str,
     mut state: MutexGuard<'s, State>,
-    wake: &Condvar,
+    wake: &Arc<Condvar>,
     mut done: impl FnMut(&mut State) -> bool,
 ) -> MutexGuard<'s, State> {
     let deadline = Instant::now().checked_add(shared.hold);
-    let every = shared.tuning.liveness_every;
     #[cfg(any(test, debug_assertions))]
     shared.waiting.fetch_add(1, Ordering::SeqCst);
+    let watched = shared.holds.watch(stream, vault, wake);
     loop {
         if done(&mut state) || shared.stopping.load(Ordering::SeqCst) {
             break;
         }
-        let slice = match deadline {
+        if watched.stirred() && gone(stream) {
+            break;
+        }
+        let left = match deadline {
             Some(deadline) => match deadline
                 .checked_duration_since(Instant::now())
                 .filter(|left| !left.is_zero())
             {
-                Some(left) => left.min(every),
+                Some(left) => Some(left),
                 None => break,
             },
-            None => every,
+            None => None,
         };
-        let (next, waited) = wake
-            .wait_timeout(state, slice)
-            .unwrap_or_else(PoisonError::into_inner);
-        state = next;
-        if waited.timed_out() && gone(stream) {
+        let every = watched.look_every();
+        let wait = match (left, every) {
+            (Some(left), Some(every)) => Some(left.min(every)),
+            (left, every) => left.or(every),
+        };
+        #[cfg(test)]
+        shared
+            .park_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(wait == left);
+        let timed_out = match wait {
+            Some(wait) => {
+                let (next, waited) = wake
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(PoisonError::into_inner);
+                state = next;
+                waited.timed_out()
+            }
+            None => {
+                state = wake.wait(state).unwrap_or_else(PoisonError::into_inner);
+                false
+            }
+        };
+        if timed_out && every.is_some() && gone(stream) {
             break;
         }
     }
+    drop(watched);
     #[cfg(any(test, debug_assertions))]
     shared.waiting.fetch_sub(1, Ordering::SeqCst);
     state
@@ -3202,7 +3624,7 @@ fn get_vault(
     }
     let wake = Arc::clone(&slot.wake);
     let verdicts = slot.verdicts;
-    let state = park_until_news(shared, stream, state, &wake, |state| {
+    let state = park_until_news(shared, stream, name, state, &wake, |state| {
         take_from_store(shared, state, name);
         state
             .vaults
@@ -3220,21 +3642,19 @@ fn get_vault(
     }
 }
 
-/// Whether a held long-poll's client went away.
+/// Whether a held long-poll's client went away, asked by a zero-timeout poll and one
+/// `recv(MSG_PEEK | MSG_DONTWAIT)` with the stream's own mode left as it is
+/// ([`aterm_uds::hangup::fd_peer_state`]): the client closed both halves, shut its writes with
+/// nothing left to read, or the peek failed on an error the stream holds (`SO_ERROR`, which a
+/// peek leaves pending) rather than finding bytes.
 fn gone(stream: &TcpStream) -> bool {
-    if stream.set_nonblocking(true).is_err() {
-        return true;
+    use aterm_uds::hangup::PeerState;
+    use std::os::fd::AsRawFd as _;
+    match aterm_uds::hangup::fd_peer_state(stream.as_raw_fd()) {
+        PeerState::Gone | PeerState::HalfClosed => true,
+        PeerState::Idle => false,
+        PeerState::Readable => !matches!(stream.take_error(), Ok(None)),
     }
-    let mut byte = [0u8; 1];
-    let gone = match stream.peek(&mut byte) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(e) => !matches!(
-            e.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ),
-    };
-    stream.set_nonblocking(false).is_err() || gone
 }
 
 fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
@@ -3332,21 +3752,17 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
             ));
         }
     }
-    if let Err(e) = fsx::write_atomic(&shared.vault_path(name), body, 0o600) {
-        note(&format!(
-            "{name}: could not store seq {}: {e}",
-            envelope.seq
-        ));
-        return Reply::text(500, "the server could not store the envelope");
-    }
-    let held = Held {
-        seq: envelope.seq,
-        signer: envelope.signer,
-        head: envelope.digest(),
-        parented: !envelope.parents.is_empty(),
-        handoff: envelope.handoff.clone(),
-        bytes: Arc::new(body.to_vec()),
+    let placed = match fsx::write_atomic_stamped(&shared.vault_path(name), body, 0o600) {
+        Ok(placed) => placed,
+        Err(e) => {
+            note(&format!(
+                "{name}: could not store seq {}: {e}",
+                envelope.seq
+            ));
+            return Reply::text(500, "the server could not store the envelope");
+        }
     };
+    let held = Held::taken(&envelope, body.to_vec());
     let first = !state.vaults.contains_key(name);
     let slot = state.vaults.entry(name.to_owned()).or_insert_with(|| {
         Slot::new(Held {
@@ -3356,8 +3772,13 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
             parented: false,
             handoff: Vec::new(),
             bytes: Arc::new(Vec::new()),
+            alab: false,
         })
     });
+    // What it wrote is what it holds: the next look at the file reads it only once another
+    // writer replaced it (or when the stamp of this write could not be read back).
+    slot.stamp = placed;
+    slot.file_alab = placed.is_some() && held.alab;
     slot.held = held;
     slot.wake.notify_all();
     if let Some(records) = state.records.get(name)
@@ -3460,26 +3881,53 @@ fn takes_over(
 }
 
 /// Hold a newer version an admin published at the vault's store file itself (an admin whose
-/// vault is that path), checked at each read of the vault or of its join queue, each slice of a
-/// held long-poll, each PUT and each join request. Without it the server serves what it read at
+/// vault is that path), checked at each read of the vault or of its join queue, each wake of a
+/// held long-poll (a change of the file wakes it, [`held`]), each PUT and each join request. Without it the server serves what it read at
 /// launch and judges join requests by that version's seq, and the next publish built on that
 /// overwrites the path's version, a revoke included. A version there is held only as a PUT of it
 /// would be ([`takes_over`]); any other file changes nothing.
+///
+/// A look stats the file (`lstat`) and reads it only when its stamp differs from the one this
+/// server last read or wrote ([`Slot::stamp`]): a store file is up to [`MAX_ENVELOPE`], and a
+/// look runs on every request, every wake of a held long-poll and every round of the advert,
+/// each of which read and compared the whole file under `server_state`. Every writer of the file
+/// (this server's PUT, a publish at the path) replaces it by rename, which moves its stamp, and
+/// whether a file's version is taken depends only on its bytes and on what is held, which moves
+/// only with a write of the file. Only a file read is remembered: one gone, one the read refuses
+/// (a symlink, another owner, an access list, past the bound) and a read that failed leave
+/// [`Slot::stamp`] `None`, so the next look reads again. A refusal reads no byte of the file,
+/// and it need not stand while the stamp does: a `chown` or `chmod` that lifts it can leave the
+/// stamp where a filesystem's clock ticks coarsely ([`fsx::FileStamp`]).
 fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
     let Some(slot) = state.vaults.get_mut(name) else {
         return;
     };
-    let Ok(Some(bytes)) = fsx::read_owned(&shared.vault_path(name), MAX_ENVELOPE) else {
+    let path = shared.vault_path(name);
+    let seen = fsx::stamp(&path);
+    if seen == slot.stamp {
+        return;
+    }
+    slot.stamp = None;
+    slot.file_alab = false;
+    if seen.is_none() {
+        return;
+    }
+    #[cfg(test)]
+    shared.vault_looks.fetch_add(1, Ordering::SeqCst);
+    let Ok(Some((stamp, bytes))) = fsx::read_owned_stamped(&path, MAX_ENVELOPE) else {
         return;
     };
+    slot.stamp = Some(stamp);
     if bytes.as_slice() == slot.held.bytes.as_slice() {
+        slot.file_alab = slot.held.alab;
         return;
     }
     let Ok(envelope) = envelope::parse(&bytes) else {
         return;
     };
-    let publishable = envelope.name == name
-        && envelope.verify_signature().is_ok()
+    let verified = envelope.name == name && envelope.verify_signature().is_ok();
+    slot.file_alab = verified && is_alab_line(&envelope);
+    let publishable = verified
         && envelope.check_signer(&shared.retired).is_ok()
         && matches!(
             takes_over(&envelope, &bytes, &slot.held, &shared.retired),
@@ -3492,14 +3940,7 @@ fn take_from_store(shared: &Shared, state: &mut State, name: &str) {
         "{name}: holds seq {}, which an admin published at the store file",
         envelope.seq
     ));
-    slot.held = Held {
-        seq: envelope.seq,
-        signer: envelope.signer,
-        head: envelope.digest(),
-        parented: !envelope.parents.is_empty(),
-        handoff: envelope.handoff.clone(),
-        bytes: Arc::new(bytes),
-    };
+    slot.held = Held::taken(&envelope, bytes);
     slot.wake.notify_all();
     if let Some(records) = state.records.get(name)
         && records.store.log().is_none()
@@ -3568,7 +4009,7 @@ fn look_for_records(shared: &Shared, state: &mut State, name: &str) -> Result<()
 /// [`record_keys`]; `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 3). It stats the file
 /// (`lstat`) and reads it only when the slot's stamp differs, or when a store with no genesis
 /// now follows other keys (a new envelope may name the key that signed the file's genesis):
-/// each long-poll looks on every wake and every liveness tick, and reading and comparing the
+/// each long-poll looks on every wake, and reading and comparing the
 /// whole file each time cost up to [`crate::membership_log::MAX_RECORDS_STREAM`] a look. A
 /// rooted store takes the file's records in place (what it refuses changes nothing); a store
 /// with no genesis keeps them only when they root it. The slot keeps the
@@ -3754,7 +4195,13 @@ fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId
     Ok(out)
 }
 
-fn records_reply(records: Vec<crate::membership_log::Record>, records_need: bool) -> Reply {
+/// A records GET reply bringing `records`, from a store whose heads digest is `heads`
+/// ([`Reply::records_heads`]).
+fn records_reply(
+    records: Vec<crate::membership_log::Record>,
+    records_need: bool,
+    heads: Option<[u8; 32]>,
+) -> Reply {
     Reply {
         status: 200,
         body: Body::Records(records),
@@ -3765,7 +4212,20 @@ fn records_reply(records: Vec<crate::membership_log::Record>, records_need: bool
         records_need,
         records_boot: false,
         records_bound: None,
+        records_heads: heads.map(Box::new),
     }
+}
+
+/// The digest of the records `state` holds of `name` ([`Reply::records_heads`],
+/// [`crate::membership_log::Store::records_digest`]): the empty log's where it holds no genesis
+/// of it, or no records slot at all.
+fn records_digest_of(state: &State, name: &str) -> [u8; 32] {
+    state
+        .records
+        .get(name)
+        .map_or_else(crate::membership_log::empty_heads_digest, |slot| {
+            slot.store.records_digest()
+        })
 }
 
 fn server_lacks_have(state: &State, name: &str, have: &[crate::membership_log::RecordId]) -> bool {
@@ -3796,6 +4256,8 @@ struct RecordsGet<'a> {
 /// crossed, also where they crossed while it waited, and the failed look's `500` where this
 /// server cannot look for whether they crossed ([`Shared::crossed`]).
 fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet<'_>) -> Reply {
+    #[cfg(test)]
+    shared.records_gets.fetch_add(1, Ordering::SeqCst);
     let &RecordsGet {
         query,
         subscriber,
@@ -3834,7 +4296,7 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
                     .get(name)
                     .map_or_else(Vec::new, |slot| slot.store.missing(&have));
                 first.truncate(crate::membership_log::LEGACY_RECORDS);
-                return records_reply(first, false);
+                return records_reply(first, false, None);
             }
             if let Some(reply) = records_fence(crossed, stated) {
                 return reply;
@@ -3854,13 +4316,15 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
         let missing = slot.store.missing(&have);
         if !missing.is_empty() {
             let need = server_lacks_have(&state, name, &have);
+            let heads = slot.store.records_digest();
             drop(state);
-            return records_reply(missing, need);
+            return records_reply(missing, need, Some(heads));
         }
     }
     if no_wait {
         let mut reply = Reply::empty(204);
         reply.records_need = server_lacks_have(&state, name, &have);
+        reply.records_heads = Some(Box::new(records_digest_of(&state, name)));
         return reply;
     }
     if !state.records.contains_key(name) {
@@ -3878,11 +4342,12 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
             .records
             .insert(name.to_owned(), RecordSlot::new(store));
     }
-    let Some(slot) = state.records.get(name) else {
+    let Some(slot) = state.records.get_mut(name) else {
         return Reply::empty(204);
     };
+    slot.polls += 1;
     let wake = Arc::clone(&slot.wake);
-    let mut state = park_until_news(shared, stream, state, &wake, |state| {
+    let mut state = park_until_news(shared, stream, name, state, &wake, |state| {
         take_records_from_store(shared, state, name);
         state
             .records
@@ -3898,15 +4363,17 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     let reply = if let Some(fence) = fence {
         fence
     } else {
+        let heads = Some(records_digest_of(&state, name));
         match state
             .records
             .get(name)
             .map(|slot| slot.store.missing(&have))
         {
-            Some(missing) if !missing.is_empty() => records_reply(missing, lacks),
+            Some(missing) if !missing.is_empty() => records_reply(missing, lacks, heads),
             _ => {
                 let mut reply = Reply::empty(204);
                 reply.records_need = lacks;
+                reply.records_heads = heads.map(Box::new);
                 reply
             }
         }
@@ -3914,8 +4381,9 @@ fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet
     drop(wake);
     // A slot that read a records file stays though it keeps nothing: taken
     // out, the next look would read the whole file again.
-    if state.records.get(name).is_some_and(|slot| {
-        slot.store.is_empty() && slot.stamp.is_none() && Arc::strong_count(&slot.wake) == 1
+    if state.records.get_mut(name).is_some_and(|slot| {
+        slot.polls -= 1;
+        slot.can_retire()
     }) {
         state.records.remove(name);
     }
@@ -4374,6 +4842,9 @@ fn apply_records(
         }
     }
     drop(state);
+    // The held log grew, so its heads digest moved: the advert's `rec` names it at the next
+    // round ([`advertised_vault`]).
+    shared.wake_advertiser();
     #[cfg(test)]
     if (from_crossed || past_legacy)
         && let Err(reply) = mutant_mark_after_take(shared, name)
@@ -4691,7 +5162,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
     }
     if let Some(after) = after.filter(|after| *after == slot.joins) {
         let (wake, seq) = (Arc::clone(&slot.wake), slot.held.seq);
-        state = park_until_news(shared, stream, state, &wake, |state| {
+        state = park_until_news(shared, stream, name, state, &wake, |state| {
             take_from_store(shared, state, name);
             state
                 .vaults
@@ -4720,6 +5191,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_heads: None,
     }
 }
 
@@ -4813,6 +5285,7 @@ fn list_heard(shared: &Shared, name: &str) -> Reply {
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_heads: None,
     }
 }
 
@@ -4837,12 +5310,28 @@ fn list_verdicts(shared: &Shared, name: &str) -> Reply {
         records_need: false,
         records_boot: false,
         records_bound: None,
+        records_heads: None,
     }
 }
 
-/// What a server's `_alab-vault._tcp` TXT record says of the vault it advertises: hints for
-/// choosing which server to ask first, never a trust grant (envelopes still verify against the
-/// pinned signer).
+/// What a server's `_alab-vault._tcp` TXT record says of the vault it advertises: hints, never a
+/// trust grant (envelopes still verify against the pinned signer, records against their keys).
+///
+/// It is also a suppression signal: a vault-tend round pulls a peer's envelope only while its TXT
+/// names a `seq` above the one held, and its records only while it names a `rec` this server
+/// neither holds nor proved by a pull it finished ([`pull_due`]). Anyone on the LAN can send a
+/// TXT, so one that copies an instance's name with an equal `seq` and this server's own `rec`
+/// (both public) keeps those gated pulls from that instance. What bounds it:
+/// - each server, the holder's included, is swept (pulled whatever its TXT's seq, rec and label
+///   say) by the first round that resolves it once [`ANTI_ENTROPY_EVERY`] (±20%) passed since a
+///   round last swept it whole, or since a catch-up (this server's first round, a wake, a change
+///   of its addresses, sharing back on) came after that sweep ([`PullGate::sweep_due`]); a round
+///   resolves a rotating batch of at most [`crate::discover::MAX_CANDIDATES`] names, so a forged
+///   or lost TXT holds a version or record back at most that period plus the rounds a batch
+///   takes to reach that server, and a sweep its pull did not finish is made again by the next
+///   round past [`PULL_SPACING`];
+/// - peers are told apart, and this server from them, by the addresses they resolve to, never by
+///   a TXT's `label`, and an instance only adds to what its endpoints are pulled for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultTxt {
     /// Vault name (`[a-z0-9][a-z0-9-]{0,62}`).
@@ -4855,6 +5344,13 @@ pub struct VaultTxt {
     pub head: [u8; 32],
     /// Optional canonical label of the server advertising this instance (`label=<mN>`, F7).
     pub label: Option<String>,
+    /// The digest of the records it holds of the vault (`rec=<64 hex>`,
+    /// [`crate::membership_log::Store::records_digest`], the empty log's while its store holds no
+    /// genesis): on a server's own-label instance alone, never on `alab-secrets`
+    /// ([`advertised_vault`]), since a TXT changes only by ending its registration and starting
+    /// another, and records grow with every secret written. `None` from a server before it, or
+    /// from the `alab-secrets` instance: it says nothing of what that server holds.
+    pub rec: Option<[u8; 32]>,
 }
 
 impl VaultTxt {
@@ -4870,13 +5366,17 @@ impl VaultTxt {
         if let Some(label) = &self.label {
             pairs.push(format!("label={label}"));
         }
+        if let Some(rec) = &self.rec {
+            pairs.push(format!("rec={}", hex32_encode(rec)));
+        }
         pairs
     }
 
     /// Parse a `_alab-vault._tcp` TXT record's `key=value` strings (RFC 6763 §6.4: keys are
     /// ASCII case-insensitive and the first occurrence of a key wins). Requires `path=/v1` and a
     /// well-formed `vault`, `signer`, `seq` (`>= 1`) and `head`; an older server's `path=/v1`
-    /// alone yields `None`.
+    /// alone yields `None`. A `rec` that is not 64 lowercase hex digits is none, as an older
+    /// server's TXT without one is.
     pub fn from_txt<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Option<Self> {
         let mut path = None;
         let mut vault = None;
@@ -4884,6 +5384,7 @@ impl VaultTxt {
         let mut seq = None;
         let mut head = None;
         let mut label = None;
+        let mut rec = None;
         for pair in pairs {
             let Some((raw_key, value)) = pair.split_once('=') else {
                 continue;
@@ -4900,6 +5401,8 @@ impl VaultTxt {
                 head.get_or_insert(value);
             } else if raw_key.eq_ignore_ascii_case("label") {
                 label.get_or_insert(value);
+            } else if raw_key.eq_ignore_ascii_case("rec") {
+                rec.get_or_insert(value);
             }
         }
         if path != Some("/v1") {
@@ -4920,6 +5423,7 @@ impl VaultTxt {
             seq,
             head,
             label,
+            rec: rec.and_then(hex32_decode),
         })
     }
 }
@@ -4968,15 +5472,39 @@ fn hex32_decode(text: &str) -> Option<[u8; 32]> {
 
 /// Which held vault's TXT record an advertisement named `advertised` carries (`None` while the
 /// store holds none or holds several unrelated vaults none of which `advertised` or a single pin
-/// singles out).
+/// singles out). The server's own name carries its records' digest ([`VaultTxt::rec`]), the
+/// empty log's where it holds no genesis; `alab-secrets` never does: its TXT changes only with
+/// a new version, so the registrations members reach the vault through are not ended and
+/// started again at each record written.
 fn advertised_vault(
     state: &State,
     advertised: &str,
     own_label: Option<&str>,
     pins: &[(String, [u8; 32])],
 ) -> Option<VaultTxt> {
-    let chosen = if advertised == crate::alab_advertised() && state.vaults.contains_key(ALAB_VAULT)
-    {
+    let chosen = advertised_choice(state, advertised, pins)?;
+    let held = &state.vaults.get(chosen)?.held;
+    let label = own_label
+        .filter(|name| *name != crate::alab_advertised() && crate::text::valid_machine_name(name))
+        .map(str::to_owned);
+    let rec = (advertised != crate::alab_advertised()).then(|| records_digest_of(state, chosen));
+    (held.seq >= 1).then(|| VaultTxt {
+        vault: chosen.to_owned(),
+        signer: envelope::fingerprint(&held.signer),
+        seq: held.seq,
+        head: held.head,
+        label,
+        rec,
+    })
+}
+
+/// The held vault whose TXT an advertisement named `advertised` carries ([`advertised_vault`]).
+fn advertised_choice<'a>(
+    state: &'a State,
+    advertised: &'a str,
+    pins: &'a [(String, [u8; 32])],
+) -> Option<&'a str> {
+    if advertised == crate::alab_advertised() && state.vaults.contains_key(ALAB_VAULT) {
         Some(ALAB_VAULT)
     } else if state.vaults.contains_key(advertised) {
         Some(advertised)
@@ -4990,18 +5518,7 @@ fn advertised_vault(
         Some(pinned.as_str())
     } else {
         None
-    }?;
-    let held = &state.vaults.get(chosen)?.held;
-    let label = own_label
-        .filter(|name| *name != crate::alab_advertised() && crate::text::valid_machine_name(name))
-        .map(str::to_owned);
-    (held.seq >= 1).then(|| VaultTxt {
-        vault: chosen.to_owned(),
-        signer: envelope::fingerprint(&held.signer),
-        seq: held.seq,
-        head: held.head,
-        label,
-    })
+    }
 }
 
 /// Where one registration of the vault's advert is made: the address it names and, on a Mac on
@@ -5447,6 +5964,30 @@ struct AdvertSlot {
     /// What woke the round that last started a registration (`None`: the first round, as the
     /// server started), so a test can tell which source moved the advert.
     started_by: Option<Option<Wake>>,
+    /// When a round last started a registration here ([`REC_REREGISTER_GAP`]).
+    started_at: Option<Instant>,
+}
+
+/// The least time between two starts of a server's own-name registrations for a change of its
+/// TXT's `rec` alone ([`reregister_slot`]): records grow with every secret written, and each
+/// TXT change ends the registration (its `<name>.local` host record with it) and starts
+/// another, which probes and announces before the name answers again. A change held back is
+/// made by the first round past the gap (a round runs at least every [`ADVERTISE_EVERY`]); a
+/// new `seq` or `head`, an address or a name is registered at once.
+const REC_REREGISTER_GAP: Duration = Duration::from_secs(10);
+
+/// Whether `held`, a registration's TXT, differs from `want` in `rec` alone.
+fn differs_in_rec_alone(want: Option<&VaultTxt>, held: Option<&VaultTxt>) -> bool {
+    match (want, held) {
+        (Some(want), Some(held)) => {
+            want.rec != held.rec
+                && VaultTxt {
+                    rec: held.rec,
+                    ..want.clone()
+                } == *held
+        }
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -5500,9 +6041,6 @@ const PEER_PULL_BUDGET: Duration = Duration::from_secs(2);
 /// (`tests/` lifts it through [`start_with_peer_pull`]).
 #[cfg(test)]
 const PEER_PULL_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
-/// Budget for a pull from a `0.145` peer (`txt == None`), which ignores `X-Aterm-No-Wait` and
-/// parks when it holds nothing newer.
-const LEGACY_PEER_PULL_BUDGET: Duration = Duration::from_millis(750);
 
 fn is_self_addr(addr: SocketAddr, own_port: u16, here: &[Target]) -> bool {
     let ip = addr.ip().to_canonical();
@@ -5629,180 +6167,880 @@ impl Drop for PullSlot<'_> {
     }
 }
 
-/// Pull from each of `peers` on a thread of its own ([`pull_from_peer`]): a peer that takes a
-/// pull and never answers (a Mac asleep mid-answer, a server that stalls) holds only its own
-/// pull, not the pulls of every peer after it on the vault-tend thread. Their records bodies
-/// are read [`RECORDS_PULLS_AT_ONCE`] at a time, and their envelopes longer than
-/// [`ENVELOPE_PEEK`] [`ENVELOPE_PULLS_AT_ONCE`] at a time. Returns how many vaults advanced.
+/// What a pass pulls of one vault a peer names ([`pull_due`]): its envelope (`?after=<held seq>`),
+/// its records (`?have=<frontier>`), both or neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Due {
+    /// The envelope.
+    pub(crate) envelope: bool,
+    /// The records.
+    pub(crate) records: bool,
+}
+
+impl Due {
+    /// Neither.
+    pub(crate) const NONE: Due = Due {
+        envelope: false,
+        records: false,
+    };
+    /// Both: what an ungated pull asks ([`Pass::Whole`], a sweep, [`PullGate::sweep_due`]).
+    pub(crate) const BOTH: Due = Due {
+        envelope: true,
+        records: true,
+    };
+
+    /// Whether it pulls anything.
+    const fn any(self) -> bool {
+        self.envelope || self.records
+    }
+
+    /// What either pulls.
+    const fn or(self, other: Due) -> Due {
+        Due {
+            envelope: self.envelope || other.envelope,
+            records: self.records || other.records,
+        }
+    }
+}
+
+/// What this server holds of one vault, as a gated pass reads it before it pulls
+/// ([`pull_due`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Own {
+    /// The held envelope's seq (`None`: none held).
+    pub(crate) seq: Option<u64>,
+    /// The held records' digest ([`crate::membership_log::Store::records_digest`]: the empty
+    /// log's where no genesis is held).
+    pub(crate) rec: [u8; 32],
+    /// Whether this server takes the vault's envelopes: it holds one or pins the vault.
+    pub(crate) takes_envelope: bool,
+    /// Whether it takes the vault's records: it takes its envelopes, holds records of it, or it
+    /// is ALab's.
+    pub(crate) takes_records: bool,
+    /// The keys its records store follows ([`record_keys`]), digested ([`follows_digest`]): a
+    /// digest proven while the store held no genesis stays proven only while they do not change
+    /// ([`Proof::follows`]).
+    pub(crate) follows: [u8; 32],
+}
+
+/// What a gated pass pulls of a vault a peer's TXT names, given what this server holds of it
+/// (`own`) and whether a pull it finished proved a records digest (`proven`, [`PullGate`]):
 ///
-/// Each pull that stored anything is counted, and each thread started here adds its CPU time
-/// to the server's counts as it ends ([`crate::serve_counts`]); a pull this thread makes itself,
-/// for want of a thread, stays in this thread's time.
-fn pull_from_peers_shared(
+/// - its envelope when this server takes the vault's envelopes and holds none, or the TXT names
+///   a higher `seq` than the one held: exactly when the `?after=<held seq>` ask would answer a
+///   body;
+/// - its records when this server takes them and the TXT names a `rec` other than the one held
+///   and other than every digest the server at the endpoints pulled proved; a TXT with no `rec`
+///   (a server before it: since it, a server with no genesis names the empty log's) says nothing
+///   of its records, and has them pulled at every visit, as every peer's were before.
+///
+/// A peer with no TXT (an empty store, several unrelated vaults and no single pin) is pulled by
+/// sweeps alone. The TXT is a suppression signal, bounded as [`VaultTxt`] says.
+pub(crate) fn pull_due(
+    txt: Option<&VaultTxt>,
+    own: &Own,
+    proven: impl Fn(&[u8; 32]) -> bool,
+) -> Due {
+    let Some(txt) = txt else {
+        return Due::NONE;
+    };
+    let envelope = own.takes_envelope && own.seq.is_none_or(|held| txt.seq > held);
+    let records = own.takes_records
+        && txt
+            .rec
+            .as_ref()
+            .is_none_or(|rec| *rec != own.rec && !proven(rec));
+    Due { envelope, records }
+}
+
+/// How many proofs [`PullGate`] keeps: one for each endpoint whose digest differs from this
+/// server's (a peer behind it, or one holding records it refused) across a fleet of the size
+/// [`crate::membership_log::untaken::UNTAKEN_URLS`] is chosen for, with a few versions of the log
+/// to spare. Past it the oldest goes, and that endpoint is pulled once more.
+const PROVEN_KEPT: usize = crate::membership_log::untaken::UNTAKEN_URLS;
+
+/// A records digest the server at one endpoint stated on an answer this server judged whole
+/// ([`PullGate::prove`], [`crate::transport::RECORDS_HEADS_HEADER`]): a log with that digest holds
+/// nothing this server has not taken or refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Proof {
+    vault: String,
+    digest: [u8; 32],
+    /// The endpoint that answered. A server's statement binds only itself: like a TXT it is a
+    /// claim anyone on the LAN can make, so one made at an address of its own suppresses no
+    /// pull of another server.
+    at: SocketAddr,
+    /// The keys the records store followed ([`Own::follows`]) where it held no genesis after the
+    /// verdict, and the proof holds only while it still follows them: such a store refuses a
+    /// genesis signed by a key it does not follow, which a later version may name. `None`: it
+    /// held one, and what it refused then it refuses for good (its complete part only grows,
+    /// and a record is judged against its own causal past).
+    follows: Option<[u8; 32]>,
+}
+
+/// The least time between two pulls of one group (its exact list of endpoints) by vault-tend
+/// rounds ([`PullGate::pace`]): a round runs on each ring as well as each [`ADVERTISE_EVERY`], and
+/// anyone on the LAN can ring one (a browse Add, a TXT that cycles its `rec`), so no group is
+/// pulled at the rate rings come. A pull held back is made by the first round past it whose gate still says it is due.
+const PULL_SPACING: Duration = Duration::from_secs(5);
+
+/// How often a vault-tend round sweeps each server it resolves, pulling it whatever its TXT says
+/// ([`PullGate::sweep_due`]), within ±20% drawn afresh at each sweep ([`sweep_after`]): with the
+/// rounds a rotating batch takes to reach a server, the bound on how long a forged or lost TXT
+/// holds a version or record back ([`VaultTxt`]).
+const ANTI_ENTROPY_EVERY: Duration = Duration::from_secs(15 * 60);
+
+/// How many groups' sweeps [`PullGate`] keeps ([`PullGate::swept`]): a fleet of the size
+/// [`crate::membership_log::untaken::UNTAKEN_URLS`] is chosen for. Past it the group whose sweep
+/// comes due first goes, and is swept again the next time a round resolves it.
+const SWEPT_KEPT: usize = crate::membership_log::untaken::UNTAKEN_URLS;
+
+/// What a round's pulls remember ([`pull_pass`]): the records digests a pull it finished proved,
+/// when each group was last pulled, and when each is next swept.
+#[derive(Default)]
+pub(crate) struct PullGate {
+    /// The digests answering servers stated on records answers this server judged whole, each
+    /// with the endpoint that stated it ([`Proof`]), newest last, at most [`PROVEN_KEPT`]. Each
+    /// is what the server that answered stated, never what a TXT claimed.
+    proven: VecDeque<Proof>,
+    /// When a round last pulled each group, by its exact list of endpoints ([`PULL_SPACING`],
+    /// [`Group`]).
+    pulled: HashMap<Vec<SocketAddr>, Instant>,
+    /// When each group, by its exact list of endpoints, comes due for its next sweep, set as a
+    /// round's sweep of it finished ([`Self::swept`]), at most [`SWEPT_KEPT`].
+    swept: HashMap<Vec<SocketAddr>, Swept>,
+    /// How many catch-ups the rounds made ([`Self::catch_up`]): a group last swept before the
+    /// latest is due again.
+    catch_ups: u64,
+}
+
+/// When a group's next sweep comes due ([`PullGate::swept`]).
+#[derive(Clone, Copy, Debug)]
+struct Swept {
+    /// Its period past the sweep ([`sweep_after`]).
+    next: Instant,
+    /// The catch-ups made by the sweep ([`PullGate::catch_ups`]).
+    catch_ups: u64,
+}
+
+impl PullGate {
+    /// Whether a records pull of `vault` this server finished at one of `endpoints` proved
+    /// `digest`, with the records store following what `follows` digests ([`Proof::follows`]).
+    fn proved(
+        &self,
+        vault: &str,
+        digest: &[u8; 32],
+        endpoints: &[SocketAddr],
+        follows: &[u8; 32],
+    ) -> bool {
+        self.proven.iter().any(|proof| {
+            proof.vault == vault
+                && proof.digest == *digest
+                && endpoints.contains(&proof.at)
+                && proof.follows.is_none_or(|then| then == *follows)
+        })
+    }
+
+    /// A records pull finished as `proof` says, replacing one the same endpoint made of the same
+    /// digest.
+    fn prove(&mut self, proof: Proof) {
+        self.proven.retain(|held| {
+            !(held.vault == proof.vault && held.digest == proof.digest && held.at == proof.at)
+        });
+        if self.proven.len() >= PROVEN_KEPT {
+            self.proven.pop_front();
+        }
+        self.proven.push_back(proof);
+    }
+
+    /// Whether a round may pull the group at exactly `endpoints` at `now`: no round pulled that
+    /// list less than [`PULL_SPACING`] before. It is marked pulled at `now` when it may. The key
+    /// is the whole list, as [`grouped`] tells groups apart: an instance whose host resolves to a
+    /// list sharing only some endpoints with another's (a forged one resolving to an address of
+    /// its own beside the server it copies) is paced apart from it, so its pull never takes the
+    /// other's away.
+    fn pace(&mut self, endpoints: &[SocketAddr], now: Instant) -> bool {
+        self.pulled
+            .retain(|_, at| now.saturating_duration_since(*at) < PULL_SPACING);
+        if self.pulled.contains_key(endpoints) {
+            return false;
+        }
+        self.pulled.insert(endpoints.to_vec(), now);
+        true
+    }
+
+    /// Whether a round sweeps the group at exactly `endpoints` at `now`: no round's sweep of it
+    /// finished, or the period drawn as the last one did passed, or a catch-up came since.
+    fn sweep_due(&self, endpoints: &[SocketAddr], now: Instant) -> bool {
+        self.swept
+            .get(endpoints)
+            .is_none_or(|swept| swept.catch_ups < self.catch_ups || now >= swept.next)
+    }
+
+    /// A round's sweep of the group at exactly `endpoints` finished at `now` (an endpoint
+    /// answered every request it made, [`PeerPull::whole`]): its next comes due
+    /// [`sweep_after`]`(unit)` later, or at the next catch-up. A sweep a pull did not finish
+    /// (nothing answered, or a request failed) leaves the group due, for the next round past
+    /// [`PULL_SPACING`].
+    fn swept(&mut self, endpoints: &[SocketAddr], now: Instant, unit: u64) {
+        let catch_ups = self.catch_ups;
+        self.swept
+            .retain(|_, swept| swept.catch_ups == catch_ups && now < swept.next);
+        if self.swept.len() >= SWEPT_KEPT
+            && !self.swept.contains_key(endpoints)
+            && let Some(first) = self
+                .swept
+                .iter()
+                .min_by_key(|(_, swept)| swept.next)
+                .map(|(list, _)| list.clone())
+        {
+            self.swept.remove(&first);
+        }
+        self.swept.insert(
+            endpoints.to_vec(),
+            Swept {
+                next: now + sweep_after(unit),
+                catch_ups,
+            },
+        );
+    }
+
+    /// A round caught up ([`CatchUp`]): every group is swept again the next time a round resolves
+    /// it. After this Mac woke (`woke`) the pacing is forgotten too: an [`Instant`] does not move
+    /// while the Mac sleeps, so a pull just before the sleep would otherwise hold back the
+    /// catch-up after it.
+    fn catch_up(&mut self, woke: bool) {
+        self.catch_ups += 1;
+        if woke {
+            self.pulled.clear();
+        }
+    }
+
+    /// Whether `url` names a holder's `alab-secrets` instance (its host is `alab-secrets.local`,
+    /// every collision rename's too), whose TXT never names its server's records
+    /// ([`VaultTxt::rec`]): a TXT there with no `rec` says nothing of them, where it is an older
+    /// build's on any other instance ([`group_wants`]).
+    fn alab_instance(url: &str) -> bool {
+        aterm_http::Uri::parse(url).is_some_and(|uri| {
+            strip_local_suffix(uri.host()).eq_ignore_ascii_case(crate::alab_advertised())
+        })
+    }
+}
+
+/// How long after a sweep the next one comes ([`ANTI_ENTROPY_EVERY`] ±20%), `unit` a uniform
+/// draw over `u64`.
+fn sweep_after(unit: u64) -> Duration {
+    let low = ANTI_ENTROPY_EVERY.as_millis() * 4 / 5;
+    let span = ANTI_ENTROPY_EVERY.as_millis() * 2 / 5;
+    let millis = low + u128::from(unit) * span / u128::from(u64::MAX);
+    Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
+}
+
+/// A uniform draw over `u64` ([`sweep_after`]); 0 where the system's generator fails, which only
+/// brings the sweep to its earliest.
+fn draw() -> u64 {
+    let mut bytes = [0u8; 8];
+    if aterm_uds::rand::fill(&mut bytes).is_err() {
+        return 0;
+    }
+    u64::from_le_bytes(bytes)
+}
+
+/// What a pass pulls of its peers ([`pull_pass`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Every vault each peer names, whatever its TXT says, unpaced ([`Running::pull_from_peers`]).
+    Whole,
+    /// A round's at the instant given: each group a sweep is due of ([`PullGate::sweep_due`]) as
+    /// a whole pass pulls it, whatever its TXT, seq, rec and label say, every other as its TXT
+    /// makes it due ([`pull_due`]), each at most once per [`PULL_SPACING`].
+    Gated(Instant),
+}
+
+/// When a vault-tend round catches up ([`PullGate::catch_up`]): at the first round, after this
+/// Mac woke and when its addresses changed (what it missed meanwhile its mDNS cache may not
+/// show), and at the first round with sharing on again ([`Tending::round`] starts it afresh).
+#[derive(Debug, Default)]
+struct CatchUp {
+    /// The addresses the last round saw (`None`: before the first).
+    here: Option<Vec<Target>>,
+}
+
+impl CatchUp {
+    /// Whether a round after a nap that `why` ended (`None`: the first), with this Mac at `here`,
+    /// catches up. Addresses are compared as a set: the order [`advert_targets`] lists them in
+    /// (the routed one first) moves when the route flips, and that is no move.
+    fn due(&mut self, why: Option<Wake>, here: &[Target]) -> bool {
+        let moved = self.here.as_ref().is_none_or(|was| {
+            was.len() != here.len()
+                || !here.iter().all(|target| was.contains(target))
+                || !was.iter().all(|target| here.contains(target))
+        });
+        self.here = Some(here.to_vec());
+        moved || matches!(why, None | Some(Wake::Resumed))
+    }
+}
+
+/// One vault a pull asks a peer for ([`pull_from_peer`]): what is due of it, and the highest
+/// `seq` a TXT that made its envelope due named (`None`: an ungated pull), which the pull checks
+/// against what is held before it asks and again once it holds a slot for a whole read, so a
+/// version another pull of the pass stored is not read again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Want {
+    vault: String,
+    due: Due,
+    named_seq: Option<u64>,
+}
+
+/// Add `want` to `wants`, joining one of the same vault: what either pulls, after the higher
+/// named seq, or none where either is ungated.
+fn add_want(wants: &mut Vec<Want>, want: Want) {
+    if !want.due.any() {
+        return;
+    }
+    match wants.iter_mut().find(|held| held.vault == want.vault) {
+        Some(held) => {
+            held.named_seq = match (held.due.envelope, want.due.envelope) {
+                (true, true) => held.named_seq.zip(want.named_seq).map(|(a, b)| a.max(b)),
+                (true, false) => held.named_seq,
+                (false, true) => want.named_seq,
+                (false, false) => None,
+            };
+            held.due = held.due.or(want.due);
+        }
+        None => wants.push(want),
+    }
+}
+
+/// The peers of a pass that resolved to one list of endpoints, in order ([`pull_pass`]): one
+/// server, or a name several answer to, pulled at the first of them that answers.
+struct Group<'a> {
+    endpoints: Vec<(SocketAddr, String)>,
+    peers: Vec<&'a crate::discover::DiscoveredVault>,
+}
+
+/// The peers of a pass by the endpoints each resolved to ([`Group`]): those resolving to the same
+/// endpoints in the same order are one group, in the order they came; a peer with none to dial
+/// is in none. A peer resolving to a list another's shares only part of (a forged instance whose
+/// host resolves to an address of its own as well) is a group of its own, so it never takes a
+/// pull from the server it copies.
+fn grouped<'a>(
+    resolved: impl IntoIterator<
+        Item = (
+            &'a crate::discover::DiscoveredVault,
+            Vec<(SocketAddr, String)>,
+        ),
+    >,
+) -> Vec<Group<'a>> {
+    let mut groups: Vec<Group<'a>> = Vec::new();
+    for (peer, endpoints) in resolved {
+        if endpoints.is_empty() {
+            continue;
+        }
+        match groups.iter_mut().find(|group| {
+            group.endpoints.len() == endpoints.len()
+                && group
+                    .endpoints
+                    .iter()
+                    .zip(&endpoints)
+                    .all(|((a, _), (b, _))| a == b)
+        }) {
+            Some(group) => group.peers.push(peer),
+            None => groups.push(Group {
+                endpoints,
+                peers: vec![peer],
+            }),
+        }
+    }
+    groups
+}
+
+/// Pull from `peers` as `pass` says: every vault each names in a whole pass, and in a round's of
+/// each group a sweep is due of ([`PullGate::sweep_due`]); of every other group what its peers'
+/// TXT makes due ([`pull_due`]). A sweep an endpoint of the group answered whole is marked
+/// ([`PullGate::swept`]). Returns how many peers' pulls stored anything.
+///
+/// A peer is pulled at the addresses its host resolves to ([`peer_endpoints`]), never at one of
+/// this server's own ([`is_self_addr`]): the `alab-secrets` instance this server holds resolves
+/// to this server's address, and is not pulled. Peers resolving to the same endpoints in the
+/// same order are one group ([`Group`]), pulled once for every vault and part any of them makes
+/// due: the holder's own-label and `alab-secrets` instances are one server. An instance (a forged
+/// one) only adds to what its group pulls, never takes a pull away, and one resolving elsewhere
+/// is a group of its own; peers are told apart by address, never by a TXT's label. A round's
+/// passes pull a group only where no round pulled that exact list of endpoints within
+/// [`PULL_SPACING`] ([`PullGate::pace`]); a sweep held back so stays due.
+///
+/// Each group is pulled on a thread of its own ([`pull_from_peer`]): a peer that takes a pull and
+/// never answers (a Mac asleep mid-answer, a server that stalls) holds only its own pull, not the
+/// pulls of every peer after it on the vault-tend thread. Their records bodies are read
+/// [`RECORDS_PULLS_AT_ONCE`] at a time, and their envelopes longer than [`ENVELOPE_PEEK`]
+/// [`ENVELOPE_PULLS_AT_ONCE`] at a time, each first read holding no slot, so a server slow to
+/// answer holds only its own pull; an envelope pull a TXT made due reads nothing more where,
+/// once it holds a slot, what is held is that TXT's version or newer, so a version one stored is
+/// read whole from no other. Each thread started here adds its CPU
+/// time to the server's counts as it ends ([`crate::serve_counts`]); a pull this thread makes
+/// itself, for want of a thread, stays in this thread's time.
+fn pull_pass(
     shared: &Shared,
     peers: &[crate::discover::DiscoveredVault],
     own_port: u16,
     own_label: Option<&str>,
     here: &[Target],
+    pass: Pass,
 ) -> usize {
-    let pull = |peer: &crate::discover::DiscoveredVault| {
-        let stored = pull_from_peer(shared, peer, own_port, own_label, here);
-        if stored != 0 {
-            shared.counts.add(Count::PullsStored);
+    let mut unique: Vec<&crate::discover::DiscoveredVault> = Vec::new();
+    for peer in peers {
+        if !unique.contains(&peer) {
+            unique.push(peer);
         }
-        stored
+    }
+    let resolve = |peer: &crate::discover::DiscoveredVault| {
+        peer_endpoints(shared, peer, own_port, own_label, here)
     };
-    std::thread::scope(|scope| {
-        let pulls: Vec<_> = peers
+    // A peer named by its host is resolved on a thread of its own, within a pull's budget.
+    let resolved: Vec<Vec<(SocketAddr, String)>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = unique
             .iter()
             .map(|peer| {
+                named_by_host(&peer.url).then(|| {
+                    std::thread::Builder::new()
+                        .name("vault-peer-resolve".to_owned())
+                        .spawn_scoped(scope, move || {
+                            shared.counts.pull_threads.ending(|| resolve(peer))
+                        })
+                })
+            })
+            .collect();
+        unique
+            .iter()
+            .zip(threads)
+            .map(|(peer, thread)| match thread {
+                Some(Ok(thread)) => thread.join().unwrap_or_default(),
+                Some(Err(_)) | None => resolve(peer),
+            })
+            .collect()
+    });
+    let groups = grouped(unique.into_iter().zip(resolved));
+    let round = match pass {
+        Pass::Whole => None,
+        Pass::Gated(now) => Some(now),
+    };
+    // Each group with what is due of it, and whether this is its sweep.
+    let mut pulls: Vec<(Vec<(SocketAddr, String)>, Vec<Want>, bool)> = Vec::new();
+    {
+        let mut owns: Vec<(String, Own)> = Vec::new();
+        for group in groups {
+            let at: Vec<SocketAddr> = group.endpoints.iter().map(|(at, _)| *at).collect();
+            let sweep = round.is_some_and(|now| shared.lock_gate().sweep_due(&at, now));
+            let wants = group_wants(shared, &group, round.is_none() || sweep, &mut owns);
+            if !wants.is_empty() {
+                pulls.push((group.endpoints, wants, sweep));
+            }
+        }
+    }
+    if let Some(now) = round {
+        let mut gate = shared.lock_gate();
+        pulls.retain(|(endpoints, _, _)| {
+            let at: Vec<SocketAddr> = endpoints.iter().map(|(at, _)| *at).collect();
+            gate.pace(&at, now)
+        });
+    }
+    let pull = |(endpoints, wants, sweep): &(Vec<(SocketAddr, String)>, Vec<Want>, bool)| {
+        let pulled = pull_endpoints(
+            endpoints,
+            shared.tuning.peer_pull,
+            Instant::now,
+            |at, url| pull_from_peer(shared, at, url, wants),
+        );
+        if pulled.stored != 0 {
+            shared.counts.add(Count::PullsStored);
+        }
+        if *sweep
+            && pulled.whole
+            && let Some(now) = round
+        {
+            let at: Vec<SocketAddr> = endpoints.iter().map(|(at, _)| *at).collect();
+            shared.lock_gate().swept(&at, now, draw());
+        }
+        pulled.stored
+    };
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = pulls
+            .iter()
+            .map(|one| {
                 std::thread::Builder::new()
                     .name("vault-peer-pull".to_owned())
                     .spawn_scoped(scope, move || {
-                        shared.counts.pull_threads.ending(|| pull(peer))
+                        shared.counts.pull_threads.ending(|| pull(one))
                     })
             })
             .collect();
-        peers
+        pulls
             .iter()
-            .zip(pulls)
-            .map(|(peer, handle)| match handle {
-                Ok(handle) => handle.join().unwrap_or(0),
+            .zip(threads)
+            .map(|(one, thread)| match thread {
+                Ok(thread) => thread.join().unwrap_or(0),
                 // No thread to spare: this one pulls once the others are under way.
-                Err(_) => pull(peer),
+                Err(_) => pull(one),
             })
             .sum()
     })
 }
 
-/// Pull newer envelopes and missing records of each vault `peer` serves (`?after=<held seq>`,
-/// `?have=<frontier>`), storing what this server's admission rules accept. A pull that fails
-/// (no answer within its budget, a refused or dropped connection, an answer no server gives)
-/// ends this pass's pulls from `peer`: one more would cost the same budget to hear the same
-/// silence. Returns how many vaults advanced.
-///
-/// A records pull states what this server holds of the vault's records, as a member's does
-/// ([`crate::crossing`]): once they crossed, it takes nothing from a peer whose answer states no
-/// bound, and records from a peer that states it crossed are taken as a crossed poster's
-/// ([`apply_records`] stores the mark first). A vault whose crossing this server cannot look for
-/// is not pulled this pass.
-fn pull_from_peer(
+/// Whether `url` names its server by a host, which a pull resolves first ([`peer_endpoints`]).
+fn named_by_host(url: &str) -> bool {
+    aterm_http::Uri::parse(url).is_some_and(|uri| uri.host().parse::<IpAddr>().is_err())
+}
+
+/// What a pass asks `group` for ([`pull_pass`]): each vault its peers name, all of it where the
+/// pull is `ungated` (a whole pass, a sweep), else what each peer's TXT makes due ([`pull_due`]);
+/// `owns` keeps what this server holds of each vault the pass looked at. An `alab-secrets`
+/// instance's TXT names no `rec` by design ([`PullGate::alab_instance`]), so it makes its
+/// server's records due by none: they come with that server's own-label instance, which
+/// resolves to the same group, and with its sweeps.
+fn group_wants(
+    shared: &Shared,
+    group: &Group<'_>,
+    ungated: bool,
+    owns: &mut Vec<(String, Own)>,
+) -> Vec<Want> {
+    let mut wants = Vec::new();
+    for peer in &group.peers {
+        match (&peer.txt, ungated) {
+            (Some(txt), true) => add_want(
+                &mut wants,
+                Want {
+                    vault: txt.vault.clone(),
+                    due: Due::BOTH,
+                    named_seq: None,
+                },
+            ),
+            (None, true) => {
+                for vault in known_vaults(shared) {
+                    add_want(
+                        &mut wants,
+                        Want {
+                            vault,
+                            due: Due::BOTH,
+                            named_seq: None,
+                        },
+                    );
+                }
+            }
+            (Some(txt), false) => {
+                let own = own_of(shared, &txt.vault, owns);
+                let at: Vec<SocketAddr> = group.endpoints.iter().map(|(at, _)| *at).collect();
+                let mut due = {
+                    let gate = shared.lock_gate();
+                    pull_due(Some(txt), &own, |rec| {
+                        gate.proved(&txt.vault, rec, &at, &own.follows)
+                    })
+                };
+                if txt.rec.is_none() && PullGate::alab_instance(&peer.url) {
+                    due.records = false;
+                }
+                add_want(
+                    &mut wants,
+                    Want {
+                        vault: txt.vault.clone(),
+                        due,
+                        named_seq: due.envelope.then_some(txt.seq),
+                    },
+                );
+            }
+            (None, false) => {}
+        }
+    }
+    wants
+}
+
+/// Every vault this server knows: those it pins, holds an envelope of, or holds records of. A
+/// peer with no TXT names none, so an ungated pull asks it for each.
+fn known_vaults(shared: &Shared) -> Vec<String> {
+    let mut names: Vec<String> = shared
+        .pins_snapshot()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let state = shared.lock_server_state();
+    for name in state.vaults.keys().chain(
+        state
+            .records
+            .iter()
+            .filter(|(_, slot)| !slot.store.is_empty())
+            .map(|(name, _)| name),
+    ) {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// What this server holds of `vault` ([`Own`]), as its store files stand now, read once a pass
+/// (`owns`).
+fn own_of(shared: &Shared, vault: &str, owns: &mut Vec<(String, Own)>) -> Own {
+    if let Some((_, own)) = owns.iter().find(|(name, _)| name == vault) {
+        return *own;
+    }
+    let pinned = shared.pinned_key(vault).is_some();
+    let own = {
+        let mut state = shared.lock_server_state();
+        take_from_store(shared, &mut state, vault);
+        take_records_from_store(shared, &mut state, vault);
+        let seq = state.vaults.get(vault).map(|slot| slot.held.seq);
+        let takes_envelope = seq.is_some() || pinned;
+        Own {
+            seq,
+            rec: records_digest_of(&state, vault),
+            takes_envelope,
+            takes_records: takes_envelope
+                || holds_records(&state, vault)
+                || vault == crate::ALAB_VAULT,
+            follows: follows_digest(record_keys(shared, &state, vault).as_deref()),
+        }
+    };
+    owns.push((vault.to_owned(), own));
+    own
+}
+
+/// What this server holds of `vault`'s envelope now: its seq and head.
+fn held_now(shared: &Shared, vault: &str) -> (Option<u64>, Option<[u8; 32]>) {
+    let mut state = shared.lock_server_state();
+    take_from_store(shared, &mut state, vault);
+    state.vaults.get(vault).map_or((None, None), |slot| {
+        (Some(slot.held.seq), Some(slot.held.head))
+    })
+}
+
+/// Pull one peer at each of its `endpoints` in turn until one answers ([`pull_pass`],
+/// [`PeerPull::silent`]), with `pull` the pull at one endpoint and its URL: how many vaults
+/// advanced, whether every endpoint was silent, and whether one answered every request its pull
+/// made ([`PeerPull::whole`]).
+/// Another endpoint is dialled only while less than `budget` (a pull's own, [`Tuning::peer_pull`])
+/// passed by `now` since the first was: a silent one costs at most its one failed request's
+/// budget, so the silent endpoints of a host, however many it resolves to, hold its pull at most
+/// two budgets, where a pull by the host's name shared one connect bound among its addresses.
+fn pull_endpoints(
+    endpoints: &[(SocketAddr, String)],
+    budget: Duration,
+    now: impl Fn() -> Instant,
+    mut pull: impl FnMut(SocketAddr, &str) -> PeerPull,
+) -> PeerPull {
+    let first = now();
+    let mut all = PeerPull {
+        stored: 0,
+        silent: true,
+        whole: false,
+    };
+    for (tried, (at, url)) in endpoints.iter().enumerate() {
+        if tried > 0 && now().saturating_duration_since(first) >= budget {
+            break;
+        }
+        let pulled = pull(*at, url);
+        all.stored += pulled.stored;
+        all.whole |= pulled.whole;
+        if !pulled.silent {
+            all.silent = false;
+            break;
+        }
+    }
+    all
+}
+
+/// Where a pass pulls `peer` ([`pull_pass`]): each endpoint, with the URL a pull
+/// there asks, in the order they are tried. A peer named by an address is pulled at its URL
+/// unless the address is this server's ([`is_obviously_self_url`]). A peer named by a host is
+/// pulled by address at what the host resolves to ([`Tuning::resolve`], within a pull's budget,
+/// [`dialled`]). None: the peer is this server (its own label, or each address it resolves to),
+/// or its host resolves to nothing a pull can dial, where a pull by the host name, which the
+/// same resolver answers, would have reached nothing either.
+fn peer_endpoints(
     shared: &Shared,
     peer: &crate::discover::DiscoveredVault,
     own_port: u16,
     own_label: Option<&str>,
     here: &[Target],
-) -> usize {
-    let mut stored = 0usize;
+) -> Vec<(SocketAddr, String)> {
     let Some(uri) = aterm_http::Uri::parse(&peer.url) else {
-        return stored;
+        return Vec::new();
     };
     if is_obviously_self_url(&uri, own_port, own_label, here) {
-        return stored;
+        return Vec::new();
     }
-    shared.counts.add(Count::Pulls);
-    let vault_names: Vec<String> = match &peer.txt {
-        Some(txt) => vec![txt.vault.clone()],
-        None => {
-            let mut names: Vec<String> = shared
-                .pins_snapshot()
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
-            {
-                let state = shared.lock_server_state();
-                for name in state.vaults.keys().chain(
-                    state
-                        .records
-                        .iter()
-                        .filter(|(_, slot)| !slot.store.is_empty())
-                        .map(|(name, _)| name),
-                ) {
-                    if !names.contains(name) {
-                        names.push(name.clone());
-                    }
-                }
-            }
-            names
+    if let Ok(ip) = uri.host().parse::<IpAddr>() {
+        return vec![(
+            SocketAddr::new(ip.to_canonical(), uri.port()),
+            peer.url.clone(),
+        )];
+    }
+    let Some(addrs) =
+        (shared.tuning.resolve)(trimmed_dns_host(uri.host()), shared.tuning.peer_pull)
+    else {
+        return Vec::new();
+    };
+    dialled(&addrs, uri.port(), own_port, here)
+        .into_iter()
+        .map(|at| (at, format!("http://{at}{}", uri.path_and_query())))
+        .collect()
+}
+
+/// The endpoints on `port` a pull dials of `addrs`, the addresses a host resolved to, in their
+/// order and once each ([`peer_endpoints`]): its IPv4 ones that are not this server's
+/// ([`is_self_addr`]: this server's port at one of its addresses), or, for a host with no IPv4
+/// address, its IPv6 ones that are not this server's and need no interface scope, which a
+/// resolved address does not carry. The IPv4 ones are judged alone because this server knows
+/// only its IPv4 addresses ([`Target`]), as its adverts register no other.
+fn dialled(addrs: &[IpAddr], port: u16, own_port: u16, here: &[Target]) -> Vec<SocketAddr> {
+    let has_v4 = addrs.iter().any(|ip| ip.to_canonical().is_ipv4());
+    let mut dialled: Vec<SocketAddr> = Vec::new();
+    for ip in addrs {
+        let at = SocketAddr::new(ip.to_canonical(), port);
+        let scoped = matches!(at.ip(), IpAddr::V6(v6) if v6.is_unicast_link_local());
+        if at.is_ipv4() == has_v4
+            && !scoped
+            && !is_self_addr(at, own_port, here)
+            && !dialled.contains(&at)
+        {
+            dialled.push(at);
         }
+    }
+    dialled
+}
+
+/// What one [`pull_from_peer`] did.
+struct PeerPull {
+    /// How many vaults advanced.
+    stored: usize,
+    /// A request failed before any was answered: the server may answer at another of the
+    /// addresses its host resolves to ([`pull_pass`]).
+    silent: bool,
+    /// Every request it made was answered and judged: no request failed, no records answer was
+    /// left unjudged by a store that could not write (`500`, `507`, `403`), and the crossing
+    /// could be read. A sweep marked swept is one so finished ([`PullGate::swept`]).
+    whole: bool,
+}
+
+/// Pull from the server at `url` what `wants` names of each vault: a newer envelope
+/// (`?after=<held seq>`) and missing records (`?have=<frontier>`), storing what this server's
+/// admission rules accept. A pull that fails (no answer within its budget, a refused or dropped
+/// connection, an answer no server gives) ends this pass's pulls at that URL: one more would cost
+/// the same budget to hear the same silence. Returns how many vaults advanced, and whether no
+/// request was answered ([`PeerPull`]).
+///
+/// Its first read of an envelope holds no slot; a longer answer is read whole under a slot of
+/// [`ENVELOPE_PULLS_AT_ONCE`]. An envelope a TXT made due ([`Want::named_seq`]) is not asked where
+/// what is held is that TXT's version or newer, before its first read and again once it holds a
+/// slot: another pull of the pass stored it.
+///
+/// A records pull states what this server holds of the vault's records, as a member's does
+/// ([`crate::crossing`]): once they crossed, it takes nothing from a peer whose answer states no
+/// bound, and records from a peer that states it crossed are taken as a crossed poster's
+/// ([`apply_records`] stores the mark first). A vault whose crossing this server cannot look for
+/// is not pulled this pass. A records answer this server judged whole (it brought nothing, or
+/// its records got a `204` or `400` verdict) proves the digest the server at `at` stated
+/// ([`PullGate::prove`]), so no gated pass pulls that server again while its TXT names that
+/// digest.
+fn pull_from_peer(shared: &Shared, at: SocketAddr, url: &str, wants: &[Want]) -> PeerPull {
+    let mut stored = 0usize;
+    let mut answered = false;
+    shared.counts.add(Count::Pulls);
+    let mut whole = true;
+    let Some((base_prefix, _)) = url.rsplit_once('/') else {
+        return PeerPull {
+            stored,
+            silent: false,
+            whole: false,
+        };
     };
-    let Some((base_prefix, _)) = peer.url.rsplit_once('/') else {
-        return stored;
-    };
-    let budget = if peer.txt.is_some() {
-        shared.tuning.peer_pull
-    } else {
-        LEGACY_PEER_PULL_BUDGET
-    };
-    for vault_name in vault_names {
+    let budget = shared.tuning.peer_pull;
+    for want in wants {
+        let vault_name = want.vault.as_str();
         let vault_url = format!("{base_prefix}/{vault_name}");
         let (mut held_seq, mut held_head, accepted_envelope, accepted_records) = {
             let mut state = shared.lock_server_state();
-            take_from_store(shared, &mut state, &vault_name);
-            take_records_from_store(shared, &mut state, &vault_name);
-            let pinned = shared.pinned_key(&vault_name).is_some();
-            let (seq, head, accepted_env) = match state.vaults.get(&vault_name) {
+            take_from_store(shared, &mut state, vault_name);
+            take_records_from_store(shared, &mut state, vault_name);
+            let pinned = shared.pinned_key(vault_name).is_some();
+            let (seq, head, accepted_env) = match state.vaults.get(vault_name) {
                 Some(slot) => (Some(slot.held.seq), Some(slot.held.head), true),
                 None => (None, None, pinned),
             };
             let accepted_rec = accepted_env
-                || holds_records(&state, &vault_name)
+                || holds_records(&state, vault_name)
                 || vault_name == crate::ALAB_VAULT;
             (seq, head, accepted_env, accepted_rec)
         };
-        if accepted_envelope {
+        if want.due.envelope && accepted_envelope {
             use crate::transport::{Fetched, Pulled, observe_after_nowait_within};
-            // Every peer's answer is read under a small limit at once; a longer one is asked
-            // again and read whole under a slot, held until it is stored.
-            let mut slot = None;
-            let mut pulled =
-                observe_after_nowait_within(&vault_url, held_seq, budget, ENVELOPE_PEEK);
-            if matches!(pulled, Ok(Pulled::Larger)) {
-                shared.counts.add(Count::EnvelopeWholeReads);
-                slot = Some(shared.envelope_pulls.take());
-                // A pull that held a slot before this one may have stored a newer version (one a
-                // publish spread to several peers): ask after what is held now, so a peer holding
-                // nothing newer answers with no body.
-                (held_seq, held_head) = {
-                    let mut state = shared.lock_server_state();
-                    take_from_store(shared, &mut state, &vault_name);
-                    state.vaults.get(&vault_name).map_or((None, None), |slot| {
-                        (Some(slot.held.seq), Some(slot.held.head))
-                    })
-                };
-                pulled = observe_after_nowait_within(&vault_url, held_seq, budget, MAX_ENVELOPE);
-            }
-            match pulled {
-                Ok(Pulled::Fetched(Fetched::Body(bytes))) => {
-                    shared.counts.add(Count::EnvelopeBodies);
-                    let reply = put_vault(shared, &vault_name, &bytes, false);
-                    if reply.status == 204 {
-                        let advanced = {
-                            let state = shared.lock_server_state();
-                            state.vaults.get(&vault_name).is_some_and(|slot| {
-                                Some(slot.held.seq) != held_seq || Some(slot.held.head) != held_head
-                            })
-                        };
-                        if advanced {
-                            shared.counts.add(Count::EnvelopesStored);
-                            stored += 1;
+            // A version a TXT named that is held by now (another pull of the pass stored it) is
+            // read from no other server.
+            let stale = |held: Option<u64>| {
+                want.named_seq
+                    .is_some_and(|named| held.is_some_and(|held| held >= named))
+            };
+            'envelope: {
+                if stale(held_seq) {
+                    break 'envelope;
+                }
+                // Every answer is read under a small limit first, holding no slot, so a server
+                // slow to answer holds only its own pull; a longer one is asked again and read
+                // whole under a slot, held until it is stored.
+                let mut slot = None;
+                let mut pulled =
+                    observe_after_nowait_within(&vault_url, held_seq, budget, ENVELOPE_PEEK);
+                answered |= pulled.is_ok();
+                if matches!(pulled, Ok(Pulled::Larger)) {
+                    slot = Some(shared.envelope_pulls.take());
+                    // A pull that held a slot before this one may have stored that version or a
+                    // newer one (one a publish spread to several peers): it is not read again,
+                    // and anything else is asked after what is held now, so a peer holding
+                    // nothing newer answers with no body.
+                    (held_seq, held_head) = held_now(shared, vault_name);
+                    if stale(held_seq) {
+                        break 'envelope;
+                    }
+                    shared.counts.add(Count::EnvelopeWholeReads);
+                    pulled =
+                        observe_after_nowait_within(&vault_url, held_seq, budget, MAX_ENVELOPE);
+                }
+                match pulled {
+                    Ok(Pulled::Fetched(Fetched::Body(bytes))) => {
+                        shared.counts.add(Count::EnvelopeBodies);
+                        let reply = put_vault(shared, vault_name, &bytes, false);
+                        if reply.status == 204 {
+                            let advanced = {
+                                let state = shared.lock_server_state();
+                                state.vaults.get(vault_name).is_some_and(|slot| {
+                                    Some(slot.held.seq) != held_seq
+                                        || Some(slot.held.head) != held_head
+                                })
+                            };
+                            if advanced {
+                                shared.counts.add(Count::EnvelopesStored);
+                                stored += 1;
+                            }
                         }
                     }
+                    Ok(Pulled::Fetched(Fetched::NoNewer(_))) => {
+                        shared.counts.add(Count::Envelope204);
+                    }
+                    Ok(Pulled::Fetched(Fetched::Missing)) => {
+                        shared.counts.add(Count::EnvelopeMissing);
+                    }
+                    Ok(Pulled::Larger) | Err(_) => {
+                        shared.counts.add(Count::EnvelopeUnanswered);
+                        return PeerPull {
+                            stored,
+                            silent: !answered,
+                            whole: false,
+                        };
+                    }
                 }
-                Ok(Pulled::Fetched(Fetched::NoNewer(_))) => {
-                    shared.counts.add(Count::Envelope204);
-                }
-                Ok(Pulled::Fetched(Fetched::Missing)) => {
-                    shared.counts.add(Count::EnvelopeMissing);
-                }
-                Ok(Pulled::Larger) | Err(_) => {
-                    shared.counts.add(Count::EnvelopeUnanswered);
-                    return stored;
-                }
+                drop(slot);
             }
-            drop(slot);
         }
-        if accepted_records {
+        if want.due.records && accepted_records {
             let _slot = shared.records_pulls.take();
             let now = Instant::now();
             // The ids this pull names and the frontier of the store they came from: what the peer
@@ -5810,20 +7048,21 @@ fn pull_from_peer(
             // that frontier.
             let (have_records, named_from) = {
                 let state = shared.lock_server_state();
-                match state.records.get(&vault_name) {
+                match state.records.get(vault_name) {
                     Some(slot) => {
                         let have = slot.store.have();
                         let named =
                             shared
                                 .untaken
-                                .have(&vault_name, &vault_url, &slot.store, &have, now);
+                                .have(&want.vault, &vault_url, &slot.store, &have, now);
                         (named.ids, slot.store.frontier())
                     }
                     None => (Vec::new(), Vec::new()),
                 }
             };
             // A pull that cannot say whether the records crossed takes nothing this pass.
-            let Ok(crossed) = shared.records_crossed(&vault_name) else {
+            let Ok(crossed) = shared.records_crossed(vault_name) else {
+                whole = false;
                 continue;
             };
             let answer = match crate::transport::fetch_record_frames_with_known(
@@ -5833,7 +7072,7 @@ fn pull_from_peer(
                 budget,
                 None,
                 crate::crossing::RecordsBound::here(crossed),
-                |id| records_input::known_record(shared, &vault_name, id),
+                |id| records_input::known_record(shared, vault_name, id),
             ) {
                 Ok(answer) => {
                     shared.counts.add(Count::RecordsFetches);
@@ -5841,33 +7080,41 @@ fn pull_from_peer(
                 }
                 Err(_) => {
                     shared.counts.add(Count::RecordsUnanswered);
-                    return stored;
+                    return PeerPull {
+                        stored,
+                        silent: !answered,
+                        whole: false,
+                    };
                 }
             };
+            answered = true;
             let stated = answer.bound.stated();
             // A crossed server takes nothing from a peer of a build before the fence.
             if crossed && stated.is_none() {
                 continue;
             }
+            let heads = answer.heads;
             let received = answer.received;
             if received.byte_len() == 0 {
+                prove(shared, vault_name, at, heads);
                 continue;
             }
             let before_len = shared
                 .lock_server_state()
                 .records
-                .get(&vault_name)
+                .get(vault_name)
                 .map_or(0, |slot| slot.store.len());
-            let (stream, reply) = apply_pulled_records(shared, &vault_name, received, stated);
+            let (stream, reply) = apply_pulled_records(shared, vault_name, received, stated);
             // Only a verdict says what the store cannot take: a `204` (it took what it could), or
             // a `400` (every record refused, or none this build reads). A `500` (it could not
             // write its store), `507` or `403` judged none of it, and the same pull may land
             // next pass.
+            whole &= matches!(reply.status, 204 | 400);
             if matches!(reply.status, 204 | 400) {
                 let state = shared.lock_server_state();
-                if let Some(slot) = state.records.get(&vault_name) {
+                if let Some(slot) = state.records.get(vault_name) {
                     shared.untaken.note(
-                        vault_name.clone(),
+                        vault_name.to_owned(),
                         &vault_url,
                         &stream,
                         &crate::membership_log::untaken::Noted {
@@ -5878,12 +7125,14 @@ fn pull_from_peer(
                         },
                     );
                 }
+                drop(state);
+                prove(shared, vault_name, at, heads);
             }
             if reply.status == 204 {
                 let after_len = shared
                     .lock_server_state()
                     .records
-                    .get(&vault_name)
+                    .get(vault_name)
                     .map_or(0, |slot| slot.store.len());
                 if after_len > before_len {
                     shared
@@ -5894,10 +7143,58 @@ fn pull_from_peer(
             }
         }
     }
-    stored
+    PeerPull {
+        stored,
+        silent: false,
+        whole,
+    }
 }
 
-fn verify_probed_alab_envelope(bytes: &[u8], shared: &Shared) -> Option<u64> {
+/// A records pull of `vault` this server judged whole was answered by the server at `at`, which
+/// stated `heads` ([`PullGate::prove`]); one that stated none (a build before the header)
+/// proves nothing. Where the records store holds no genesis after the verdict, the proof holds
+/// only while the store follows the keys it follows now ([`Proof::follows`]).
+fn prove(shared: &Shared, vault: &str, at: SocketAddr, heads: Option<[u8; 32]>) {
+    let Some(digest) = heads else {
+        return;
+    };
+    let follows = {
+        let state = shared.lock_server_state();
+        let rooted = state
+            .records
+            .get(vault)
+            .is_some_and(|slot| slot.store.heads_digest().is_some());
+        (!rooted).then(|| follows_digest(record_keys(shared, &state, vault).as_deref()))
+    };
+    shared.lock_gate().prove(Proof {
+        vault: vault.to_owned(),
+        digest,
+        at,
+        follows,
+    });
+}
+
+/// The keys a records store follows ([`record_keys`]: `None`, none in particular), digested
+/// ([`Own::follows`]).
+fn follows_digest(keys: Option<&[[u8; 32]]>) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm vault record keys/1\0");
+    match keys {
+        Some(keys) => {
+            digest.update([1]);
+            for key in keys {
+                digest.update(key);
+            }
+        }
+        None => digest.update([0]),
+    }
+    digest.finalize()
+}
+
+/// The `seq` and head of `bytes` when they are a version of the ALab vault this server takes as
+/// ALab's: it verifies, under the ALab pin where one is held, else from a key of the line
+/// [`envelope::Retired::lineage`] names.
+fn verify_probed_alab_envelope(bytes: &[u8], shared: &Shared) -> Option<(u64, [u8; 32])> {
     let env = envelope::parse(bytes).ok()?;
     if env.name != crate::ALAB_VAULT || env.seq < 1 {
         return None;
@@ -5909,7 +7206,81 @@ fn verify_probed_alab_envelope(bytes: &[u8], shared: &Shared) -> Option<u64> {
     } else if !shared.retired.lineage(&env.signer, &env.reached_from()) {
         return None;
     }
-    Some(env.seq)
+    Some((env.seq, env.digest()))
+}
+
+/// How many URLs' verified versions [`probe_verified`] keeps ([`Shared::probed`]): twice the
+/// holders one round probes ([`crate::discover::MAX_CANDIDATES`]), so a rotating batch of them
+/// keeps its own. The oldest goes first, and the next probe there reads its version whole.
+const PROBES_KEPT: usize = 2 * crate::discover::MAX_CANDIDATES;
+
+/// The verified ALab version a probe last read whole at one URL ([`probe_verified`]).
+struct Probed {
+    url: String,
+    seq: u64,
+    head: [u8; 32],
+    /// The ALab pin it was verified under: a probe under another pin reads it whole again.
+    pin: Option<[u8; 32]>,
+    /// Whether the server at `url` answers a probe that asks after `seq`: false once one such
+    /// probe was held past its budget or answered naming no seq, as a `0.145` server, which
+    /// ignores `X-Aterm-No-Wait` and parks while it holds nothing newer, does. Each later probe
+    /// there reads its version whole, as every probe did before, rather than spend its budget on
+    /// a request that is held.
+    asks: bool,
+}
+
+/// The `seq` of the verified ALab version the server at `url` answers with, for
+/// [`probe_alab_endpoint`]. Its version is read whole and verified once; each later probe asks
+/// `?after=<that seq>` without waiting, and a `204` whose `ETag` names that seq answers that it
+/// still holds it, with no body read and nothing verified again. A newer version comes as the
+/// answer's body and is verified in turn. Any other answer (a `204` naming another seq, an older
+/// one after a failover included, or none, a request held past the budget, a `404`) gets the
+/// version read whole and verified, as a first probe does, so what a probe returns is always a
+/// seq some answer of that server verified. A request that failed unanswered ends the probe
+/// with none, as no answer to a whole read did before.
+///
+/// A server that held such a request past its budget, or answered it naming no seq, is a
+/// `0.145` one, which ignores `X-Aterm-No-Wait` and parks while it holds nothing newer: from
+/// then on each probe there reads its version whole at once ([`Probed::asks`]), so it costs the
+/// whole read every probe made before and never a held request's budget again.
+///
+/// The `204` is no weaker evidence than the body it replaces: an ALab envelope is public, so any
+/// server can replay the newest one, and a verified envelope never authenticated who serves it
+/// ([`AlabNameWatcher`]).
+fn probe_verified(url: &str, shared: &Shared) -> Option<u64> {
+    probe_verified_by(url, shared, |after| {
+        crate::transport::observe_after_nowait(url, after, ALAB_PROBE_BUDGET)
+    })
+}
+
+/// [`probe_verified`], with `fetch` asking `url` after the seq it is given, or for its version
+/// whole.
+fn probe_verified_by(
+    url: &str,
+    shared: &Shared,
+    mut fetch: impl FnMut(Option<u64>) -> crate::Result<crate::transport::Fetched>,
+) -> Option<u64> {
+    use crate::transport::Fetched;
+    let pin = shared.pinned_key(crate::ALAB_VAULT);
+    let mut asks = true;
+    match shared.probed_seq(url, pin) {
+        Some((known, true)) => match fetch(Some(known)) {
+            Ok(Fetched::NoNewer(Some(seq))) if seq == known => return Some(known),
+            Ok(Fetched::Body(bytes)) => return shared.verified_probe(url, &bytes, pin, true),
+            Ok(Fetched::NoNewer(None)) => asks = false,
+            Ok(_) => {}
+            Err(_) => return None,
+        },
+        Some((_, false)) => asks = false,
+        None => {}
+    }
+    match fetch(None) {
+        Ok(Fetched::Body(bytes)) => shared.verified_probe(url, &bytes, pin, asks),
+        _ => {
+            shared.forget_probe(url);
+            None
+        }
+    }
 }
 
 fn probe_alab_endpoint(
@@ -5943,20 +7314,13 @@ fn probe_alab_endpoint(
                 continue;
             }
             let direct = format!("http://{addr}/v1/{}", crate::ALAB_VAULT);
-            if let Ok(crate::transport::Fetched::Body(bytes)) =
-                crate::transport::observe_after_nowait(&direct, None, ALAB_PROBE_BUDGET)
-                && let Some(seq) = verify_probed_alab_envelope(&bytes, shared)
-            {
+            if let Some(seq) = probe_verified(&direct, shared) {
                 best = Some(best.map_or(seq, |prev| prev.max(seq)));
             }
         }
         return best;
     }
-    let Ok(crate::transport::Fetched::Body(bytes)) =
-        crate::transport::observe_after_nowait(&raw_url, None, ALAB_PROBE_BUDGET)
-    else {
-        return None;
-    };
+    let seq = probe_verified(&raw_url, shared)?;
     if !ip_literal
         && !here.is_empty()
         && let Ok(addrs) = aterm_uds::lan::resolve(trimmed_dns_host(uri.host()), ALAB_PROBE_BUDGET)
@@ -5973,7 +7337,7 @@ fn probe_alab_endpoint(
             return None;
         }
     }
-    verify_probed_alab_envelope(&bytes, shared)
+    Some(seq)
 }
 
 type AdvertiseTarget = (String, u16, Option<(Vec<Target>, Option<VaultTxt>)>);
@@ -5995,15 +7359,20 @@ fn tend_role_targets(
     peers: &[crate::discover::DiscoveredVault],
     holders: &[crate::discover::DiscoveredVault],
     pull: PullPeers,
+    pass: Pass,
     probe_alab: impl FnMut(&str) -> Option<u64>,
 ) -> RoleTargets {
     let at = |txt| (!here.is_empty()).then(|| (here.to_vec(), txt));
     let mut pins = shared.pins_snapshot();
-    let decided = decide(&mut pins);
+    let decided = decide(&mut pins, shared.holds_alab());
     shared.merge_pins(&mut pins);
     let alab_name = crate::alab_advertised().to_owned();
-    if !peers.is_empty() {
-        let _ = pull(shared, peers, port, decided.as_deref(), here);
+    // The holders too, whatever the round's cut of its peers: each is pulled as its TXT makes
+    // due and swept as every server is ([`PullGate::sweep_due`]).
+    let round_peers: Vec<crate::discover::DiscoveredVault> =
+        peers.iter().chain(holders).cloned().collect();
+    if !round_peers.is_empty() {
+        let _ = pull(shared, &round_peers, port, decided.as_deref(), here, pass);
     }
     let Some(name) = decided else {
         // A revoked or unavailable role cannot retain an earlier claim across a later grant.
@@ -6013,6 +7382,10 @@ fn tend_role_targets(
     let (primary_txt, own_alab_seq) = {
         let mut state = shared.lock_server_state();
         take_from_store(shared, &mut state, ALAB_VAULT);
+        // The records the TXT's `rec` names are the store's as its file stands now.
+        if let Some(chosen) = advertised_choice(&state, &name, &pins).map(str::to_owned) {
+            take_records_from_store(shared, &mut state, &chosen);
+        }
         let txt = advertised_vault(&state, &name, Some(&name), &pins);
         let seq = shared
             .pinned_key(ALAB_VAULT)
@@ -6021,6 +7394,7 @@ fn tend_role_targets(
     };
     let primary = Some((name.clone(), port, at(primary_txt)));
     let secondary = if name != alab_name {
+        shared.forget_probes_unlike(holders);
         let mut probe_alab = probe_alab;
         let want_alab = alab_watcher.decide(
             &AlabNameInput {
@@ -6055,10 +7429,10 @@ fn tend_role_targets(
     (primary, secondary)
 }
 
-/// Pull from each of a round's peers, as [`pull_from_peers_shared`] does ([`Seams::pull`]): how
-/// many vaults advanced.
+/// Pull from a round's peers as the pass given says, as [`pull_pass`] does ([`Seams::pull`]):
+/// how many peers' pulls stored anything.
 type PullPeers =
-    fn(&Shared, &[crate::discover::DiscoveredVault], u16, Option<&str>, &[Target]) -> usize;
+    fn(&Shared, &[crate::discover::DiscoveredVault], u16, Option<&str>, &[Target], Pass) -> usize;
 
 /// Probe a host label or holder URL for a verified ALab envelope, as [`probe_alab_endpoint`]
 /// does ([`Seams::probe`]).
@@ -6088,12 +7462,16 @@ type StartBrowse = dyn Fn(&Arc<Bell>, &[&str]) -> Arc<crate::discover::Watch> + 
 /// most 30 s for every process it told before it sleeps.
 const SLEEP_YIELD_BOUND: Duration = Duration::from_secs(2);
 
+/// A waiter for [`crate::wake::hear`]: [`Seams::routes`].
+type HearRoutes = dyn FnMut(Duration, &crate::wake::Closing) -> crate::wake::Heard + Send;
+
 /// What the `vault-tend` thread reads and starts ([`Children::tend_seamed`]): this Mac's own,
 /// or a test's.
 struct Seams {
-    /// Waits at most the time it is given for a change of this Mac's addresses or links, and
-    /// says whether one came ([`crate::wake::route_changes`]). `None`: none is heard.
-    routes: Option<Box<dyn FnMut(Duration) -> bool + Send>>,
+    /// Waits at most the time it is given for a change of this Mac's addresses or links or for
+    /// its bell's end, and says which came ([`crate::wake::route_changes`]). `None`: none is
+    /// heard.
+    routes: Option<Box<HearRoutes>>,
     /// Start a standing `_alab-vault._tcp` browse while sharing is on; none starts no browse.
     /// The worker drops it while sharing is off or unreadable, and starts afresh once on.
     browse: Option<Box<StartBrowse>>,
@@ -6113,8 +7491,8 @@ struct Seams {
     /// Probes `alab-secrets.local` and the holders heard for a verified ALab envelope
     /// ([`probe_alab_endpoint`]); a test's arm hears none.
     probe: ProbeAlab,
-    /// Pulls from the peers a round resolved ([`pull_from_peers_shared`]); a test's arm records
-    /// what it was handed.
+    /// Pulls from the peers a round resolved as its pass says ([`pull_pass`]); a test's arm
+    /// records what it was handed.
     pull: PullPeers,
     /// Whether a device other than this Mac answers to a name ([`name_answered_here`]), asked
     /// when a registration of `alab-secrets` this server holds ended by itself.
@@ -6124,6 +7502,9 @@ struct Seams {
     /// what it registered and pulls from or probes no other server
     /// (`docs/DESIGN-alab-swarm-2026-10-27.md` §9).
     sharing: Box<dyn FnMut() -> bool + Send>,
+    /// The instant a round starts at ([`PullGate::sweep_due`], [`PullGate::pace`]): the clock, or
+    /// a test's.
+    now: Box<dyn FnMut() -> Instant + Send>,
 }
 
 impl Seams {
@@ -6132,7 +7513,7 @@ impl Seams {
     fn this_mac() -> Seams {
         Seams {
             routes: crate::wake::route_changes()
-                .map(|changes| Box::new(changes) as Box<dyn FnMut(Duration) -> bool + Send>),
+                .map(|changes| Box::new(changes) as Box<HearRoutes>),
             browse: Some(Box::new(|bell, own| {
                 Arc::new(crate::discover::Watch::start(bell, own))
             })),
@@ -6145,7 +7526,7 @@ impl Seams {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: probe_alab_endpoint,
-            pull: pull_from_peers_shared,
+            pull: pull_pass,
             name_answered: Box::new(|name, own| name_answered_here(name, own, NAME_CHECK_BUDGET)),
             sharing: Box::new(|| {
                 #[cfg(unix)]
@@ -6158,6 +7539,7 @@ impl Seams {
                     true
                 }
             }),
+            now: Box::new(Instant::now),
         }
     }
 }
@@ -6170,7 +7552,13 @@ const NAME_CHECK_BUDGET: Duration = Duration::from_secs(1);
 /// How long [`probe_alab_endpoint`] gives each of its acts: a resolve of the name it probes
 /// (through the LAN broker for a local name, where a sleeping holder's mDNS answer can take
 /// seconds) and each fetch of the vault there.
+#[cfg(not(test))]
 const ALAB_PROBE_BUDGET: Duration = Duration::from_secs(3);
+/// A unit test's is its one-minute hang detector, as its [`PEER_PULL_BUDGET`] is: the holders
+/// it probes are its own loopback stand-ins, whose answer is waited for rather than taken for a
+/// holder gone from the LAN.
+#[cfg(test)]
+const ALAB_PROBE_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Whether a device other than this Mac (whose addresses are `own`) answers to `<name>.local`
 /// now: the LAN broker resolves the name within `budget` to an address that is not this Mac's. A
@@ -6341,7 +7729,7 @@ impl Children {
     ) {
         let advertise = advertise.map(|(name, port, shared)| {
             let own = vec![name.clone()];
-            let decide: RoleDecider = Box::new(move |_| Some(name.clone()));
+            let decide: RoleDecider = Box::new(move |_, _| Some(name.clone()));
             (decide, own, port, shared)
         });
         self.tend_with_role(keep_awake, advertise, client_paths);
@@ -6382,7 +7770,7 @@ impl Children {
     ) {
         let advertise = advertise.map(|(name, port, shared)| {
             let own = vec![name.clone()];
-            let decide: RoleDecider = Box::new(move |_| Some(name.clone()));
+            let decide: RoleDecider = Box::new(move |_, _| Some(name.clone()));
             (decide, own, port, shared)
         });
         self.tend_role_seamed(keep_awake, advertise, client_paths, seams);
@@ -6497,6 +7885,8 @@ struct Tending {
     alab_watcher: AlabNameWatcher,
     /// What ended the nap before the round to come: none before the first round.
     why: Option<Wake>,
+    /// When the rounds catch up ([`CatchUp`]).
+    catch_up: CatchUp,
     held_said: bool,
     /// The server's counts ([`crate::serve_counts`]), which its connections count into too.
     counts: Arc<ServeCounts>,
@@ -6548,6 +7938,7 @@ impl Tending {
             watch: None,
             alab_watcher,
             why: None,
+            catch_up: CatchUp::default(),
             held_said: false,
             counts,
             cpu: aterm_uds::cpu::ThreadCpu::born(),
@@ -6581,12 +7972,13 @@ impl Tending {
             && self.advertise.is_some()
             && let Some(start) = seams.browse.as_ref()
         {
-            // Its own names' Adds come back with each registration it starts.
+            // Its own names' Adds come back with each registration it starts. `alab-secrets` is
+            // its own only while it holds the name (noted each round below): another holder's
+            // Add rings, as any peer's does.
             let own: Vec<&str> = self
                 .advertise
                 .iter()
                 .flat_map(|(_, names, _, _)| names.iter().map(String::as_str))
-                .chain([crate::alab_advertised()])
                 .collect();
             self.watch = Some(start(&self.bell, &own));
         }
@@ -6616,6 +8008,15 @@ impl Tending {
             _ => (Vec::new(), Vec::new()),
         };
         self.cpu.add_to(counts.tend_cpu(Phase::Resolve));
+        // A round with sharing off pulls nothing, and the first with it on again catches up.
+        let pass = Pass::Gated((seams.now)());
+        let catch_up = if sharing {
+            self.catch_up.due(self.why, &here)
+        } else {
+            self.catch_up = CatchUp::default();
+            false
+        };
+        let woke = self.why == Some(Wake::Resumed);
         let role_targets = self.advertise.as_mut().map(|(decide, _, port, shared)| {
             if !sharing {
                 // Ends both registrations ([`reregister_roles`]) and decides nothing.
@@ -6625,6 +8026,9 @@ impl Tending {
                 );
             }
             after_sleep(&self.held, &mut self.alab_watcher);
+            if catch_up {
+                shared.lock_gate().catch_up(woke);
+            }
             let port = *port;
             let holding = self.alab_watcher.is_holding();
             let targets = tend_role_targets(
@@ -6637,13 +8041,25 @@ impl Tending {
                 &peers,
                 &holders,
                 pull,
+                pass,
                 |target| {
                     counts.add(Count::AlabProbes);
                     probe(target, port, None, &here, holding, shared)
                 },
             );
-            if let (Some((name, _, _)), Some(w)) = (&targets.0, &self.watch) {
-                w.note_own(name);
+            if let Some(w) = &self.watch {
+                let alab = crate::alab_advertised();
+                let primary = targets.0.as_ref().map(|(name, _, _)| name.as_str());
+                if let Some(name) = primary {
+                    w.note_own(name);
+                }
+                // `alab-secrets` is this server's own exactly while a round registers it: as its
+                // own name, or beside it while it holds the name.
+                if primary == Some(alab) || matches!(&targets.1, Some((_, _, Some(_)))) {
+                    w.note_own(alab);
+                } else {
+                    w.forget_own(alab);
+                }
             }
             targets
         });
@@ -6732,14 +8148,15 @@ fn reregister_roles(
     spawn: &SpawnAdvert,
     alab_answered: Option<bool>,
 ) {
+    let now = Instant::now();
     match primary {
         Some((name, port, target)) => {
-            reregister_slot(&mut set.dns, &name, target, why, &|at, txt| {
+            reregister_slot(&mut set.dns, &name, target, why, now, &|at, txt| {
                 spawn(&name, port, at, txt)
             });
         }
         None => {
-            reregister_slot(&mut set.dns, "", None, why, &|_, _| {
+            reregister_slot(&mut set.dns, "", None, why, now, &|_, _| {
                 Err(io::Error::other("advertising disabled"))
             });
         }
@@ -6782,6 +8199,7 @@ fn reregister_roles(
         &alab_name,
         alab_target,
         why,
+        now,
         &|at, txt| spawn(&alab_name, port, at, txt),
     );
 }
@@ -6845,25 +8263,33 @@ fn wanted_ended(
 
 /// Keep `slot`'s registrations (each started by `spawn`) at `want`'s targets and
 /// TXT: a live registration at a target still wanted with the same TXT stays, and every other
-/// one is replaced cleanly. One that ended by itself gave the name up to another device on the
-/// network, which new Macs may then reach in place of this vault: the log says so once, and
-/// again once every registration stays up. A round that starts one names `why` it ran (`None`:
-/// the first, as the server started) in its log line, and keeps it ([`AdvertSlot::started_by`]).
+/// one is replaced cleanly. One whose TXT differs in `rec` alone stays too while less than
+/// [`REC_REREGISTER_GAP`] passed by `now` since a round last started one here. One that ended by
+/// itself gave the name up to another device on the network, which new Macs may then reach in
+/// place of this vault: the log says so once, and again once every registration stays up. A
+/// round that starts one names `why` it ran (`None`: the first, as the server started) in its
+/// log line, and keeps it ([`AdvertSlot::started_by`]).
 fn reregister_slot(
     slot: &mut AdvertSlot,
     name: &str,
     want: Option<(Vec<Target>, Option<VaultTxt>)>,
     why: Option<Wake>,
+    now: Instant,
     spawn: &dyn Fn(&Target, Option<&VaultTxt>) -> io::Result<Registered>,
 ) {
     let same_name = slot.held_name.as_deref() == Some(name);
+    let recent = slot
+        .started_at
+        .is_some_and(|at| now.saturating_duration_since(at) < REC_REREGISTER_GAP);
     let mut gave_up = false;
     let mut kept = Vec::new();
     for (target, held_txt, mut held) in std::mem::take(&mut slot.held) {
         let wanted = same_name
-            && want
-                .as_ref()
-                .is_some_and(|(targets, txt)| targets.contains(&target) && *txt == held_txt);
+            && want.as_ref().is_some_and(|(targets, txt)| {
+                targets.contains(&target)
+                    && (*txt == held_txt
+                        || (recent && differs_in_rec_alone(txt.as_ref(), held_txt.as_ref())))
+            });
         if wanted {
             if !held.ended() {
                 kept.push((target, held_txt, held));
@@ -6914,6 +8340,7 @@ fn reregister_slot(
     }
     slot.held_name = (!slot.held.is_empty()).then(|| name.to_owned());
     slot.started_by = Some(why);
+    slot.started_at = Some(now);
     let ips: Vec<Ipv4Addr> = slot.held.iter().map(|(target, _, _)| target.ip).collect();
     if !slot.lost && !ips.is_empty() && slot.logged != ips {
         note(&advertising_line(name, &ips, why));

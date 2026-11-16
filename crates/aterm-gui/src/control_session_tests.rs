@@ -455,7 +455,7 @@ fn assert_roster_fields(line: &str, expected: &[(&str, &str)]) {
     }
 }
 
-const AGENT_COLUMNS: [&str; 31] = [
+const AGENT_COLUMNS: [&str; 32] = [
     "program=",
     "agent=",
     "agent_detail=",
@@ -487,6 +487,7 @@ const AGENT_COLUMNS: [&str; 31] = [
     "pause=",
     "task_state=",
     "task_rev=",
+    "opened_ms=",
 ];
 
 fn tail(line: &str) -> String {
@@ -580,11 +581,11 @@ fn the_roster_carries_each_sessions_task_record() {
     );
     let rows: Vec<&str> = out.lines().skip(1).collect();
     assert!(
-        rows[0].ends_with(" task=- pause=- task_state=done task_rev=2"),
+        rows[0].ends_with(" task=- pause=- task_state=done task_rev=2 opened_ms=-"),
         "{out}"
     );
     assert!(
-        rows[1].ends_with(" task=- pause=- task_state=- task_rev=0"),
+        rows[1].ends_with(" task=- pause=- task_state=- task_rev=0 opened_ms=-"),
         "{out}"
     );
 }
@@ -960,6 +961,7 @@ fn the_roster_says_whether_the_live_claim_is_proven() {
                     start: "stand-in".to_string(),
                 },
                 claim,
+                child: None,
             }),
         });
     }
@@ -987,12 +989,12 @@ fn the_roster_says_whether_the_live_claim_is_proven() {
         (
             rows[0],
             "2",
-            "relaunch,upgrade,turn-end,approvals,questions,walls",
+            "relaunch,upgrade,turn-end,approvals,questions,walls,state,accounts",
         ),
         (
             rows[1],
             "-",
-            "relaunch,upgrade,turn-end,approvals,questions,walls",
+            "relaunch,upgrade,turn-end,approvals,questions,walls,state,accounts",
         ),
         (rows[2], "-", "-"),
         (rows[3], "3", "relaunch,upgrade"),
@@ -1085,6 +1087,7 @@ fn a_roster_row_keeps_its_fixed_column_order() {
             "pause",
             "task_state",
             "task_rev",
+            "opened_ms",
         ],
         "{row}"
     );
@@ -1782,7 +1785,8 @@ fn the_roster_path_is_measured_where_a_child_of_the_shell_was_read() {
     assert!(carried.contains(" path=frozen program=- "), "{carried}");
     assert!(
         carried.ends_with(
-            " path_evidence=carried copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0"
+            " path_evidence=carried copy=- upgrade=- land_at=- task=- pause=- task_state=- task_rev=0 \
+             opened_ms=-"
         ),
         "{carried}"
     );
@@ -1796,7 +1800,7 @@ fn the_roster_path_is_measured_where_a_child_of_the_shell_was_read() {
         late.contains(" path=frozen program=- ")
             && late.ends_with(
                 " path_evidence=carried copy=- upgrade=- land_at=- task=- pause=- task_state=- \
-                 task_rev=0"
+                 task_rev=0 opened_ms=-"
             ),
         "a late reading for another group changes nothing: {late}"
     );
@@ -1822,7 +1826,7 @@ fn the_roster_path_is_measured_where_a_child_of_the_shell_was_read() {
     assert!(
         measured.ends_with(
             " copy=foreign upgrade=pending/2.1.282/not-idle:busy/2m land_at=- task=- \
-             pause=- task_state=- task_rev=0"
+             pause=- task_state=- task_rev=0 opened_ms=-"
         ),
         "{measured}"
     );

@@ -680,3 +680,45 @@ fn prefix_path_resolves_absolute_and_tilde_and_refuses_relative() {
         "a CWD-dependent prefix is not a prefix"
     );
 }
+
+/// A `shell_env_strip` ITEM aterm CANNOT READ IS REFUSED, NOT SKIPPED: an item that is not a
+/// string is kept as words no strip entry matches, so the strip list refuses it and `aterm
+/// harness ls` names it, and the list's strings stand; a value that is not a list is refused
+/// whole and leaves the default list. NEGATIVE CONTROL (2026-11-14): while a non-string item was
+/// skipped, `["MINE_", 1]` read as `["MINE_"]` and a string read as unset, both with no word.
+#[test]
+fn a_shell_env_strip_item_aterm_cannot_read_is_refused_not_skipped() {
+    use super::parse_harness;
+    let mixed = parse_harness("shell_env_strip = [\"MINE_\", 1, { prefix = \"CLAUDE\" }]\n");
+    let list = mixed.env_strip.expect("a list");
+    assert_eq!(list.len(), 3, "{list:?}");
+    assert_eq!(list[0], "MINE_");
+    assert_eq!(list[1], "1 (an integer)");
+    assert!(
+        list[2].contains("CLAUDE") && list[2].ends_with("(a table)"),
+        "{list:?}"
+    );
+    assert_eq!(mixed.env_strip_unread, None);
+    for unread in &list[1..] {
+        assert!(
+            aterm_types::domain::admit_env_strip_entry(unread).is_err(),
+            "{unread} is refused"
+        );
+    }
+
+    let string = parse_harness("shell_env_strip = \"CLAUDE\"\n");
+    assert_eq!(string.env_strip, None, "the default list applies");
+    let unread = string.env_strip_unread.expect("refused whole");
+    assert!(
+        unread.contains("CLAUDE") && unread.ends_with("(a string)"),
+        "{unread}"
+    );
+
+    let unset = parse_harness("font_px = 12\n");
+    assert_eq!((unset.env_strip, unset.env_strip_unread), (None, None));
+    assert_eq!(
+        parse_harness("shell_env_strip = []\n").env_strip,
+        Some(Vec::new()),
+        "an empty list is the person's own: it strips nothing"
+    );
+}

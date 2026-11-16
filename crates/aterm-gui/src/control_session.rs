@@ -21,7 +21,7 @@ use crate::session_timeline::{
 use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
 
-/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|-> program_state=<word[:kind]|-> … supervisor=<holder|-> supervisor_proven=<0|1> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n>`.
+/// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0> nonce=<hex32> window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|-> agent_fp=<hex16|-> wait=<memory|-> wait_gib=<GiB|-> wait_ahead=<n|-> program_state=<word[:kind]|-> … supervisor=<holder|-> supervisor_proven=<0|1> autopilot=<off|cruise|land|-> path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>> land_at=<unix s|-> task=<open|landed|theirs|-> pause=<unix s|-> task_state=<working|done|exited|stalled|-> task_rev=<n> opened_ms=<unix ms|->` (`opened_ms=` the session lineage's first open, `SessionLog::opened_ms`).
 pub(crate) fn cmd_sessions_store(store: &Store, proxy: Option<&EventLoopProxy<Wake>>) -> String {
     let (snapshot, frozen, posture) = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -205,6 +205,7 @@ pub(crate) fn sessions_lines(
             (supervised_agent, group),
             face,
             pause,
+            opened,
         ) = {
             let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -222,6 +223,10 @@ pub(crate) fn sessions_lines(
                 ),
                 timeline.task_face().map(|(face, _)| face),
                 timeline.pause(),
+                timeline
+                    .slog()
+                    .opened_ms()
+                    .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
             )
         };
         let supervised_agent = crate::harness_host::admitted_as(&h.ctx, supervised_agent, group);
@@ -239,7 +244,7 @@ pub(crate) fn sessions_lines(
              {authority} supervisor={supervisor} supervisor_proven={proven} \
              supervisor_version={claim_version} supervisor_vendor={claim_vendor} \
              autopilot={autopilot} {owner} \
-             land_at={land_at} task={task} pause={pause} {task_record}",
+             land_at={land_at} task={task} pause={pause} {task_record} opened_ms={opened}",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -252,7 +257,7 @@ pub(crate) fn sessions_lines(
     out
 }
 
-/// `who` -> the presence readout for the whole instance: one line per session naming who is driving it and how many peers are watching it, so a human or an orchestrator can always see the hand and the eye on a fleet.
+/// `who` -> the presence readout for the whole instance: one line per session naming who is driving it and how many peers are watching it, so a human or an orchestrator can always see the hand and the eye on a fleet; `agent=<pid>` follows where a contract 4 claim keeps a live child (`crate::harness_claim::agent_pid`).
 pub(crate) fn cmd_who(store: &Store) -> String {
     let snapshot = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -263,12 +268,18 @@ pub(crate) fn cmd_who(store: &Store) -> String {
         .map(|h| crate::quit_safety::foreground_pgrp(h.master))
         .collect();
     let mut out = format!("OK {}\n", snapshot.len());
-    for (h, fgpgid) in snapshot.iter().zip(foreground_groups) {
-        let fgpgid = if fgpgid > 0 {
-            fgpgid.to_string()
+    for (h, group) in snapshot.iter().zip(foreground_groups) {
+        let fgpgid = if group > 0 {
+            group.to_string()
         } else {
             "-".to_string()
         };
+        // The agent a live contract 4 claim's kept child names, where it still reads at the
+        // birth aterm kept (`crate::harness_claim::agent_pid`): what reads the agent reads it.
+        let agent = (group > 0)
+            .then(|| crate::harness_claim::agent_pid(&h.ctx, group))
+            .filter(|pid| *pid != group)
+            .map_or_else(String::new, |pid| format!(" agent={pid}"));
         let driving = h
             .ctx
             .turn_lease
@@ -280,7 +291,7 @@ pub(crate) fn cmd_who(store: &Store) -> String {
         let watchers = h.ctx.watchers.count();
         let turns = h.ctx.turns.lock().unwrap_or_else(|p| p.into_inner()).len();
         out.push_str(&format!(
-            "{} {} driving={driving} watchers={watchers} turns={turns} {} nonce={nonce} fgpgid={fgpgid}\n",
+            "{} {} driving={driving} watchers={watchers} turns={turns} {} nonce={nonce} fgpgid={fgpgid}{agent}\n",
             h.local_id,
             h.sid.as_str(),
             h.state.as_str(),
@@ -2672,7 +2683,7 @@ fn fenced_submit(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static BEFORE_SUBMIT_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
@@ -2680,7 +2691,7 @@ thread_local! {
 
 /// A test's hand at this thread's turns: run before each press of a submit key, after every
 /// look the turn takes before that press, by its route or [`fenced_submit`] (`None`: no hand).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_before_submit_for_test(hand: Option<Box<dyn Fn()>>) {
     BEFORE_SUBMIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
 }
@@ -3562,7 +3573,7 @@ fn turn_attempt(
             };
             note_ctl_input();
             let first = !wrote.replace(true);
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             BEFORE_SUBMIT_FOR_TEST.with(|slot| {
                 if let Some(hand) = slot.borrow().as_ref() {
                     hand();
@@ -4291,6 +4302,20 @@ fn meta_write_reply(field: MetaField, result: Result<bool, MetaWriteError>) -> (
             format!("ERR {} too long (max {cap} bytes)\n", field.wire_name()),
             false,
         ),
+        Err(MetaWriteError::TooLongEncoded { cap }) => (
+            format!(
+                "ERR {} too long (max {cap} bytes percent-encoded)\n",
+                field.wire_name()
+            ),
+            false,
+        ),
+        Err(MetaWriteError::Credential) => (
+            format!("ERR {} reads as a credential\n", field.wire_name()),
+            false,
+        ),
+        Err(MetaWriteError::Busy { retry_ms }) => {
+            (format!("ERR busy retry_ms={retry_ms}\n"), false)
+        }
     }
 }
 
@@ -4447,8 +4472,14 @@ fn attention_owned_reply(
                 .to_string(),
             false,
         ),
-        Err(AttentionWriteError::Meta(MetaWriteError::TooLong { cap })) => {
-            (format!("ERR attention too long (max {cap} bytes)\n"), false)
+        Err(AttentionWriteError::Meta(
+            MetaWriteError::TooLong { cap } | MetaWriteError::TooLongEncoded { cap },
+        )) => (format!("ERR attention too long (max {cap} bytes)\n"), false),
+        Err(AttentionWriteError::Meta(MetaWriteError::Credential)) => {
+            ("ERR attention reads as a credential\n".to_string(), false)
+        }
+        Err(AttentionWriteError::Meta(MetaWriteError::Busy { retry_ms })) => {
+            (format!("ERR busy retry_ms={retry_ms}\n"), false)
         }
         Err(AttentionWriteError::OwnersFull) => (
             format!(
@@ -4465,7 +4496,8 @@ pub(crate) fn cmd_meta_supervisor(
     ctx: &SessionCtx,
     scope: Scope,
     conn: Option<u64>,
-    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    prove: &ProveClaim<'_>,
+    keep_child: &KeepChild<'_>,
     rest: &str,
 ) -> Option<(String, bool)> {
     cmd_meta_supervisor_serving(
@@ -4473,10 +4505,33 @@ pub(crate) fn cmd_meta_supervisor(
         scope,
         conn,
         prove,
+        keep_child,
         rest,
         crate::harness_claim::served().is_some(),
     )
 }
+
+/// The kernel's proof of a claim being made: `holder`'s process, under the image rule of the
+/// contract the claim names (`None`: a claim without `contract=`), as
+/// [`crate::control::prove_claim_for`] reads it in production; a seed id's contract 3 claim is
+/// proven by the rule contract 3 always had, whatever row the registry composed for the id.
+pub(crate) type ProveClaim<'a> =
+    dyn Fn(&str, Option<u32>) -> Option<crate::self_claim::Proven> + 'a;
+
+/// The kernel's look at a contract 4 claim's child for its just-proven claimant
+/// ([`crate::harness_claim::keep_child`] with the session's foreground group and the live
+/// lineage reader, in production).
+pub(crate) type KeepChild<'a> = dyn Fn(
+        &crate::self_claim::Proven,
+        aterm_agent::harness::contract::ChildWord,
+    ) -> Option<crate::harness_claim::KeptChild>
+    + 'a;
+
+/// The usage of a scoped claim, both contracts.
+const SCOPED_CLAIM_USAGE: &str = "ERR usage: meta set supervisor <id>@<pid> contract=3 \
+     scope=<word>[,<word>…] [version=<MAJOR.MINOR.0>] [vendor=<version>] [login=<account>] | \
+     meta set supervisor <id>@<pid> contract=4 scope=<word>[,<word>…] version=<MAJOR.MINOR.0> \
+     [vendor=<version>] [child=<pid>:<start_us>] [login=<account>]";
 
 /// [`cmd_meta_supervisor`] by an aterm that serves contract 3 (`serves`) or answers as one
 /// predating it (the negative control's seam, [`crate::harness_claim::served`]): then a claim
@@ -4485,7 +4540,8 @@ pub(crate) fn cmd_meta_supervisor_serving(
     ctx: &SessionCtx,
     scope: Scope,
     conn: Option<u64>,
-    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    prove: &ProveClaim<'_>,
+    keep_child: &KeepChild<'_>,
     rest: &str,
     serves: bool,
 ) -> Option<(String, bool)> {
@@ -4538,11 +4594,16 @@ pub(crate) fn cmd_meta_supervisor_serving(
     let words = match ctx.native_policy.read(holder, &words) {
         aterm_agent::harness::contract::Words::V2(words) => words,
         aterm_agent::harness::contract::Words::Refused(why) => {
+            return Some((format!("{SCOPED_CLAIM_USAGE}: {why}\n"), false));
+        }
+        aterm_agent::harness::contract::Words::Unregistered => {
+            aterm_log::info!(
+                "harness @{}: {holder}'s claim names no registry row (a contract 4 claim, or a \
+                 seed id whose row is gone); nothing is claimed",
+                ctx.self_id
+            );
             return Some((
-                format!(
-                    "ERR usage: meta set supervisor <id>@<pid> contract=3 scope=<word>[,<word>…] \
-                     [version=<MAJOR.MINOR.0>] [vendor=<version>]: {why}\n"
-                ),
+                "ERR unproven: no registry row proves this holder\n".to_string(),
                 false,
             ));
         }
@@ -4554,37 +4615,60 @@ pub(crate) fn cmd_meta_supervisor_serving(
                     ctx, holder, conn, None, None, now, by,
                 ),
                 None,
+                None,
             ));
         }
         aterm_agent::harness::contract::Words::Scoped(claim) => {
-            let Some(proven) = prove(holder) else {
+            let contract = claim.contract;
+            let Some(proven) = prove(holder, Some(contract)) else {
                 aterm_log::info!(
-                    "harness @{}: {}'s contract 3 claim is unproven (the kernel's peer, the \
-                     foreground group or the image rule); nothing is claimed",
+                    "harness @{}: {}'s contract {contract} claim is unproven (the kernel's peer, \
+                     the foreground group or the image rule); nothing is claimed",
                     ctx.self_id,
                     holder
                 );
                 return Some((
-                    "ERR unproven: a contract 3 claim needs its own direct connection, the \
-                     session's foreground group and a build of its program from atpkg\n"
-                        .to_string(),
+                    format!(
+                        "ERR unproven: a contract {contract} claim needs its own direct \
+                         connection, the session's foreground group and a build of its program \
+                         from atpkg\n"
+                    ),
                     false,
                 ));
             };
+            // The child is read after the proof, on the kernel's facts alone: a child that fails
+            // is not kept, and the claim stands without one.
+            let child = claim
+                .child
+                .and_then(|word| keep_child(&proven, word).map(|kept| (word, kept)));
+            if let (Some(word), None) = (claim.child, child) {
+                aterm_log::info!(
+                    "harness @{}: {holder} named child={} that aterm's reads do not keep (not its \
+                     descendant in the foreground group, or another start); the claim stands \
+                     without it",
+                    ctx.self_id,
+                    word.word()
+                );
+            }
             let versions = claim.versions();
             let scope = claim.scopes.words();
-            let scoped = crate::harness_claim::Scoped { proven, claim };
+            let scoped = crate::harness_claim::Scoped {
+                proven,
+                claim,
+                child: child.map(|(_, kept)| kept),
+            };
             let claimed = crate::session_timeline::publish_claim_supervisor_scoped(
                 ctx, holder, conn, scoped, now, by,
             );
             if claimed.as_ref().is_ok_and(|c| c.published_ref().changed) {
                 aterm_log::info!(
-                    "harness @{}: {versions} holds the session under contract 3, scope={scope}; \
-                     aterm's built-in engine stands down from exactly that",
+                    "harness @{}: {versions} holds the session under contract {contract}, \
+                     scope={scope}; aterm's built-in engine stands down from exactly that",
                     ctx.self_id
                 );
             }
-            return Some(claim_reply(ctx, conn, claimed, None));
+            let granted = (contract == aterm_agent::harness::contract::UNIVERSAL).then_some(scope);
+            return Some(claim_reply(ctx, conn, claimed, None, granted));
         }
     };
     let ttl_ms = match words.first() {
@@ -4606,17 +4690,19 @@ pub(crate) fn cmd_meta_supervisor_serving(
     let proven = if ttl_ms.is_some() {
         None
     } else {
-        prove(holder)
+        prove(holder, None)
     };
     let proof = proven.clone();
     let claimed = crate::session_timeline::publish_claim_supervisor_as(
         ctx, holder, bound, expires_us, proven, now, by,
     );
-    Some(claim_reply(ctx, bound, claimed, proof))
+    Some(claim_reply(ctx, bound, claimed, proof, None))
 }
 
 /// A claim's reply: `OK` (noting a connection-bound claim, and a proven self-claim's record
-/// copy), or `ERR busy supervisor=<holder>`.
+/// copy), or `ERR busy supervisor=<holder>`. A contract 4 claim's (`granted`, its grant's words)
+/// names its grant and the revision it stands at: `OK scope=<words|-> revision=<n>`; contracts 2
+/// and 3 keep the bare `OK`.
 fn claim_reply(
     ctx: &SessionCtx,
     bound: Option<u64>,
@@ -4625,6 +4711,7 @@ fn claim_reply(
         String,
     >,
     proof: Option<crate::self_claim::Proven>,
+    granted: Option<String>,
 ) -> (String, bool) {
     match claimed.map(crate::session_timeline::SupervisorTransition::acknowledge) {
         Ok(claimed) => {
@@ -4640,7 +4727,11 @@ fn claim_reply(
                     claimed.replaced.as_deref(),
                 );
             }
-            ("OK\n".to_string(), claimed.changed)
+            let reply = granted.map_or_else(
+                || "OK\n".to_string(),
+                |scope| format!("OK scope={scope} revision={}\n", claimed.revision),
+            );
+            (reply, claimed.changed)
         }
         Err(other) => (
             format!("ERR busy supervisor={}\n", pct_encode(&other)),
@@ -4696,7 +4787,7 @@ fn harness_act_request(rest: &str) -> Option<Result<HarnessActRequest<'_>, &'sta
     Some(parsed.ok_or(HARNESS_ACT_USAGE))
 }
 
-/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session: admitted only from the session's standing claim under its act proof ([`crate::session_timeline::SupervisorClaim::act_proof`]: codex-alab's proven self-claim, or a rostered harness's proven contract 3 claim whose scope names `turn-end`), on that claim's connection or one its very process proves. AN ADMITTED ACT IS THE HOLDER'S, SHOWN AND BOOKED AS ITS OWN: queued for the window's glass (`SessionTimeline::queue_self_act`: the chip's act and the trail, worded as the holder's) and booked in the session's ledger once the session's locks are let go (`crate::self_claim::book_act`), which Settings ▸ Harness counts under the holder and `aterm harness ledger` lists; a standing face's act told again (`SessionTimeline::self_act_resent`) is answered as before and neither shown nor booked twice. A refusal (`ERR denied`, an expired or busy act) and a lease (`meta prepare harness_act`) do neither.
+/// `meta set harness_act <act> [until_us=<n>]` — a harness records an act it took on the session, so who is driving a session is seen per session: admitted only from the session's standing claim under its proof for the duty the act reports on ([`crate::session_timeline::SupervisorClaim::act_proof_for`] of [`aterm_agent::harness::acts::act_scope`]; the `meta prepare harness_act` lease reports on `turn-end`): codex-alab's proven contract 2 self-claim, which writes every act, one naming no duty included, or a registered harness's proven scoped claim (contract 3 or 4) whose scope takes that duty, never an act no duty names; on that claim's connection or one its very process proves. AN ADMITTED ACT IS THE HOLDER'S: for every claim it is on the session's timeline (`SessionTimeline::note_harness_act`) and tells its task face where it has one (`SessionTimeline::queue_self_task`), and, for codex-alab's self-claim alone, queued for the window's glass (`SessionTimeline::queue_self_act`: the chip's act and the trail, worded as the holder's) and booked in the session's ledger once the session's locks are let go (`crate::self_claim::book_act`), which Settings ▸ Harness counts under the holder and `aterm harness ledger` lists: that glass and ledger row are the self-claim's bookkeeping, so a scoped claim's act is neither. A standing face's act told again (`SessionTimeline::self_act_resent`) is answered as before and neither shown nor booked twice. A refusal (`ERR denied`, an expired or busy act) and a lease do none of this.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
     snapshot: Option<HarnessActSnapshot>,
@@ -4729,29 +4820,38 @@ pub(super) fn cmd_meta_harness_act_with_clock(
         Ok(request) => request,
         Err(usage) => return Some((usage.to_string(), false)),
     };
+    // The duty the act reports on: a lease (`prepare`) is for the bounded publication of a face
+    // that stands until another turn, `turn-end`'s; a set names its act's
+    // ([`aterm_agent::harness::acts::act_scope`]), and an act no duty names is codex-alab's
+    // contract 2 alone.
+    let duty = match request {
+        HarnessActRequest::Prepare => Some(aterm_agent::harness::contract::Scope::TurnEnd),
+        HarnessActRequest::Set { act, .. } => aterm_agent::harness::acts::act_scope(act),
+    };
     let holder = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(now_us()).and_then(|claim| {
-            let proven = claim.act_proof()?;
+            let proven = claim.act_proof_for(duty)?;
             let bound = conn.is_some() && claim.conn == conn;
             Some((
                 claim.holder.clone(),
                 proven.clone(),
                 bound,
                 meta.supervisor_revision,
+                claim.scoped.is_some(),
             ))
         })
     };
     let allowed = holder
-        .filter(|(holder, proven, bound, _)| *bound || prove(holder).as_ref() == Some(proven));
-    let Some((holder, proven, _, revision)) = allowed else {
+        .filter(|(holder, proven, bound, _, _)| *bound || prove(holder).as_ref() == Some(proven));
+    let Some((holder, proven, _, revision, scoped)) = allowed else {
         return Some(("ERR denied\n".to_string(), false));
     };
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     if meta.supervisor_revision != revision
         || meta
             .live_claim(now_us())
-            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
+            .and_then(|claim| claim.act_proof_for(duty))
             != Some(&proven)
     {
         return Some(("ERR denied\n".to_string(), false));
@@ -4771,7 +4871,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
         let now = now_us();
         if meta
             .live_claim(now)
-            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
+            .and_then(|claim| claim.act_proof_for(duty))
             != Some(&proven)
         {
             return Some(("ERR denied\n".to_string(), false));
@@ -4802,7 +4902,10 @@ pub(super) fn cmd_meta_harness_act_with_clock(
             snapshot.map(|point| point.mark.program_turns),
         );
         timeline.note_harness_act(act, &holder, by);
-        if !resent {
+        // The glass's self-act and the ledger's self-claim row are codex-alab's bookkeeping (its
+        // chip words and counts, Settings ▸ Harness under the self-claim): a scoped claim's act
+        // is on the timeline and its face, not there.
+        if !resent && !scoped {
             timeline.queue_self_act(crate::session_timeline::SelfAct {
                 act: aterm_agent::harness::acts::self_claim_sort(act).act,
                 holder: holder.clone(),
@@ -4845,7 +4948,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
         let _ = timeline.slog_take_wake();
     }
     drop(meta);
-    if !resent {
+    if !resent && !scoped {
         crate::self_claim::book_act(ctx.self_id.as_str(), &holder, act);
     }
     Some(("OK\n".to_string(), true))
@@ -4882,6 +4985,14 @@ pub(crate) fn harness_act_reads_counts(rest: &str) -> bool {
     }
 }
 
+/// The duty a stop, a Land hold and a NEEDS YOU set report on ([`self_claim_write`]).
+const TURN_END: aterm_agent::harness::contract::Scope =
+    aterm_agent::harness::contract::Scope::TurnEnd;
+
+/// The duty the continuation report and `harness fact` report on ([`self_claim_write`]).
+pub(crate) const STATE: aterm_agent::harness::contract::Scope =
+    aterm_agent::harness::contract::Scope::State;
+
 const HARNESS_HELD_USAGE: &str =
     "ERR usage: meta set harness_held same-reply|no-work | meta unset harness_held\n";
 
@@ -4908,7 +5019,7 @@ fn harness_held_request(
     )
 }
 
-/// `meta set harness_held <same-reply|no-work>` / `meta unset harness_held` — an agent that supervises itself tells that ITS OWN TYPING STOPPED, by which arm of ruling F's hold ([`aterm_agent::harness::acts::HeldBy::word`]), or goes on again, so `status held=` says its stop as it says aterm's own. THE STOP IS ITS CLAIM'S: admitted only from the session's standing claim under its act proof ([`self_claim_write`]: by the proof `meta set harness_act` takes, that claim's connection or a connection its very process proves), else `ERR denied`; kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_held`]) and gone wherever a wait written under it lapses (the claim released, replaced or gone with its process, its connection closed), so a new claim starts with none; said while the claim stands ([`crate::App::shown_stop`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+/// `meta set harness_held <same-reply|no-work>` / `meta unset harness_held` — an agent that supervises itself tells that ITS OWN TYPING STOPPED, by which arm of ruling F's hold ([`aterm_agent::harness::acts::HeldBy::word`]), or goes on again, so `status held=` says its stop as it says aterm's own. THE STOP IS ITS CLAIM'S: admitted only from the session's standing claim under its proof for `turn-end` ([`self_claim_write`]: on that claim's connection or a connection its very process proves), else `ERR denied`; kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_held`]) and gone wherever a wait written under it lapses (the claim released, replaced or gone with its process, its connection closed), so a new claim starts with none; said while the claim stands ([`crate::App::shown_stop`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
 pub(crate) fn cmd_meta_harness_held(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -4919,7 +5030,7 @@ pub(crate) fn cmd_meta_harness_held(
         Ok(held) => held,
         Err(usage) => return Some((usage.to_string(), false)),
     };
-    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
+    let Some((holder, moved)) = self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
         meta.tell_self_held(proven, held)
     }) else {
         return Some(("ERR denied\n".to_string(), false));
@@ -4976,7 +5087,7 @@ pub(crate) fn cmd_meta_harness_activity(
         ));
     }
     let now = aterm_time::unix_millis().unwrap_or(0);
-    let Some((_, changed)) = self_claim_write(ctx, conn, prove, |meta, _| {
+    let Some((_, changed)) = self_claim_write(ctx, conn, STATE, prove, |meta, _| {
         let activity = crate::autopilot_activity::Activity {
             sequence: sequence.unwrap_or(0),
             reason: reason.unwrap_or("waiting").into(),
@@ -5007,17 +5118,18 @@ pub(crate) fn cmd_meta_harness_activity(
     Some(("OK\n".into(), changed))
 }
 
-/// A WRITE ONLY THE SESSION'S STANDING CLAIM MAKES UNDER ITS ACT PROOF (`meta set harness_held`, `meta set harness_activity`, `meta set harness_land`, `meta set harness_needs`, `harness fact`): admitted by the proof `meta set harness_act` takes ([`crate::session_timeline::SupervisorClaim::act_proof`]: codex-alab's proven self-claim, or a rostered harness's proven contract 3 claim whose scope names `turn-end`; `harness fact` takes codex-alab's alone) — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's act proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and what `write` returned (for a `meta set`, whether it moved what it keeps); `None` for anything else, which the verb answers `ERR denied`.
+/// A WRITE ONLY THE SESSION'S STANDING CLAIM MAKES UNDER ITS PROOF FOR THE WRITE'S `duty` (`meta set harness_held`, `meta set harness_land` and `meta set harness_needs` report on `turn-end`; `meta set harness_activity` and `harness fact`, which stays codex-alab's, on `state`, [`STATE`]): admitted by the proof the claim writes `duty` under ([`crate::session_timeline::SupervisorClaim::act_proof_for`], as `meta set harness_act` is: codex-alab's proven contract 2 self-claim, which takes every duty, or a registered harness's proven scoped claim, contract 3 or 4, whose scope takes `duty`; contract 3 knows no `state`) — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's proof for `duty` moved since the look (a claim that moved between the look and the write admits nothing). The holder and what `write` returned (for a `meta set`, whether it moved what it keeps); `None` for anything else, which the verb answers `ERR denied`.
 pub(crate) fn self_claim_write<T>(
     ctx: &SessionCtx,
     conn: Option<u64>,
+    duty: aterm_agent::harness::contract::Scope,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     write: impl FnOnce(&mut crate::session_timeline::SessionMeta, &crate::self_claim::Proven) -> T,
 ) -> Option<(String, T)> {
     let standing = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
-            let proven = claim.act_proof()?;
+            let proven = claim.act_proof_for(Some(duty))?;
             let bound = conn.is_some() && claim.conn == conn;
             Some((
                 claim.holder.clone(),
@@ -5033,7 +5145,7 @@ pub(crate) fn self_claim_write<T>(
     if meta.supervisor_revision != revision
         || meta
             .live_claim(crate::metrics::now_us())
-            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
+            .and_then(|claim| claim.act_proof_for(Some(duty)))
             != Some(&proven)
     {
         return None;
@@ -5134,7 +5246,7 @@ pub(crate) fn cmd_meta_harness_land(
         Ok(held) => held,
         Err(usage) => return Some((usage.to_string(), false)),
     };
-    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
+    let Some((holder, moved)) = self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
         meta.tell_self_land(proven, held)
     }) else {
         return Some(("ERR denied\n".to_string(), false));
@@ -5229,7 +5341,7 @@ pub(crate) fn cmd_meta_harness_needs(
     };
     let count = told.as_ref().map(|told| told.needs().len());
     let Some((holder, (read, credentials, shown))) =
-        self_claim_write(ctx, conn, prove, |meta, proven| {
+        self_claim_write(ctx, conn, TURN_END, prove, |meta, proven| {
             meta.tell_self_needs(proven, told)
         })
     else {

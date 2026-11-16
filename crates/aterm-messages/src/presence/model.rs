@@ -285,8 +285,9 @@ pub struct Facts<V: Host> {
     pub attention: Option<String>,
     /// The shell status word (`running`, `idle`, `quiet`, …) and when it was published.
     pub shell: Option<(&'static str, Instant)>,
-    /// The program's own state report (OSC 7501) the host honours now.
-    pub program: Option<(&'static str, Instant)>,
+    /// The program's own state report (OSC 7501) the host honours now, as its words: a known
+    /// program's borrowed, another program's (aterm-core's `ProgramApp::Other`) its own.
+    pub program: Option<(std::borrow::Cow<'static, str>, Instant)>,
     /// The context the program in front has left, in per cent, as it counts it itself (codex's
     /// rollout), shown beside [`Self::program`] where its reader names no phase.
     pub program_ctx_left: Option<u8>,
@@ -423,7 +424,7 @@ pub struct Slot<V: Host> {
     /// [`Facts::shell`].
     pub shell: Option<(&'static str, Instant)>,
     /// [`Facts::program`].
-    pub program: Option<(&'static str, Instant)>,
+    pub program: Option<(std::borrow::Cow<'static, str>, Instant)>,
     /// [`Facts::program_ctx_left`].
     pub program_ctx_left: Option<u8>,
     /// [`Facts::agent`].
@@ -572,7 +573,7 @@ impl<V: Host> Slot<V> {
             changed = true;
         }
         self.shell = facts.shell;
-        if self.program.map(|p| p.0) != facts.program.map(|p| p.0) {
+        if self.program.as_ref().map(|p| &p.0) != facts.program.as_ref().map(|p| &p.0) {
             changed = true;
         }
         self.program = facts.program;

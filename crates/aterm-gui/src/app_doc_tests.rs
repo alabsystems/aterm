@@ -91,7 +91,8 @@ fn document_of(app: &App, view: ViewId) -> DocumentId {
 }
 
 fn set_selection(app: &mut App, view: ViewId, anchor: usize, head: usize) {
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(AppViewState::Editor(state)) = route_native_guard.as_deref_mut() else {
         panic!("an Editor view");
     };
     let buffer = state.buffer.as_mut().unwrap();

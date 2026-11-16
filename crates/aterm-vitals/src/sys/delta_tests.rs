@@ -15,6 +15,7 @@ fn line(key: &str, text: &str) -> Line {
 fn reply(lines: Vec<Line>) -> Reply {
     Reply {
         view: View::Overview,
+        form: None,
         scope: None,
         subject: None,
         lines,

@@ -1236,8 +1236,13 @@ fn read_log_line(log: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<b
 
 /// Read an optional execution mark. A present but unreadable mark is unavailable input.
 fn optional_receipt(path: &Path) -> std::io::Result<Option<String>> {
+    optional_text(path).map(|text| text.map(|text| text.trim().to_string()))
+}
+
+/// Read optional text without changing its contents. Only a missing path is absence.
+fn optional_text(path: &Path) -> std::io::Result<Option<String>> {
     match crate::durable::read_text(path) {
-        Ok(text) => Ok(Some(text.trim().to_string())),
+        Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(std::io::Error::new(
             e.kind(),
@@ -4700,6 +4705,20 @@ pub fn backstops_beside(ratchet: &Path) -> PathBuf {
     ratchet.with_file_name(BACKSTOPS.rsplit('/').next().unwrap_or(BACKSTOPS))
 }
 
+struct FloorInputs {
+    ratchet: Option<String>,
+    backstops: Option<String>,
+}
+
+impl FloorInputs {
+    fn read(ratchet: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            ratchet: optional_text(ratchet)?,
+            backstops: optional_text(&backstops_beside(ratchet))?,
+        })
+    }
+}
+
 /// Writes the floor files a judge rewrote (each `Some` text to its path): stage every write in
 /// a fresh private directory beside its target before moving any into place. A staging write
 /// that fails leaves every target as it was, and cleanup touches only the directories this
@@ -4753,6 +4772,11 @@ pub fn conclude(
     plan: &mut Plan,
     update: Update<'_>,
 ) -> Result<Concluded> {
+    let FloorInputs {
+        ratchet: ratchet_text,
+        backstops: backstops_text,
+    } = FloorInputs::read(&plan.ratchet)
+        .map_err(|e| Error::new(format!("proof floor inputs could not be read: {e}")))?;
     plan.measure().map_err(|e| {
         Error::new(format!(
             "compiler execution receipts could not be measured: {e}"
@@ -4788,9 +4812,7 @@ pub fn conclude(
             }
         }
     }
-    let ratchet_text = crate::durable::read_text(&plan.ratchet).ok();
     let backstops_path = backstops_beside(&plan.ratchet);
-    let backstops_text = crate::durable::read_text(&backstops_path).ok();
     let mut verdict = judge(
         &facts,
         ratchet_text.as_deref(),
@@ -5350,9 +5372,19 @@ pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
                 }
             };
             let path = repo.join(RATCHET);
-            let text = crate::durable::read_text(&path).ok();
             let backstops_path = repo.join(BACKSTOPS);
-            let backstops = crate::durable::read_text(&backstops_path).ok();
+            let FloorInputs {
+                ratchet: text,
+                backstops,
+            } = match FloorInputs::read(&path) {
+                Ok(inputs) => inputs,
+                Err(e) => {
+                    eprintln!(
+                        "aterm-release trust judge: proof floor inputs could not be read: {e}"
+                    );
+                    return 2;
+                }
+            };
             let verdict = judge(
                 &facts,
                 text.as_deref(),

@@ -467,7 +467,7 @@ fn size_window(
 }
 
 fn set_chrome(app: &mut crate::App, wid: WindowId, font_px: u32) {
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     ws.metrics.pad = 24;
     ws.metrics.pad_top = 4;
     ws.metrics.head = 80;

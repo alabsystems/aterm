@@ -1068,7 +1068,14 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
         host.flow_after_first = Some(0);
         let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");
-        assert_eq!(host.flows.borrow().len(), 1);
+        if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
+            // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is
+            // refused before its provider runs, and the refusal, too, records nothing.
+            assert!(err.contains("the sign-in lock could not be taken"), "{err}");
+            assert!(host.flows.borrow().is_empty());
+        } else {
+            assert_eq!(host.flows.borrow().len(), 1);
+        }
         if cached {
             assert!(a_persons_headless_run(&host, &host.flows.borrow()[0].2));
         }
@@ -1721,7 +1728,9 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
 /// there is no window: a person signs a stopped row in in its own browser profile, or with
 /// none named their default browser. What the provider's environment carries is the browser's
 /// alone to say: the window's grant is set for the window and for no other, whatever the
-/// renewal itself inherited.
+/// renewal itself inherited. Each stop here is a sign-in window a person closed: one a check
+/// made leaves nothing to run with nobody there
+/// (`a_claude_row_a_check_stopped_waits_for_a_person_at_every_door`).
 #[cfg(unix)]
 #[test]
 fn only_a_sign_in_this_mac_started_for_itself_opens_the_sign_in_window() {
@@ -1970,11 +1979,20 @@ fn only_a_sign_in_this_mac_started_for_itself_opens_the_sign_in_window() {
                 &env.accounts_roster().unwrap(),
                 at,
                 &mut None,
-                |_, _, logins| {
+                |raw, _, logins| {
                     accounts::admit_workflow(logins, "main")?;
-                    Ok(accounts::note_sign_in_attempt(
-                        logins, "main", outcome, "mailbox", at,
-                    ))
+                    Ok(if outcome == Blocked {
+                        accounts::note_sign_in_stop(
+                            logins,
+                            raw.row("main").expect("the row"),
+                            false,
+                            crate::harness::open_url::MetWord::WindowClosed,
+                            "window: a person closed it",
+                            at,
+                        )
+                    } else {
+                        accounts::note_sign_in_attempt(logins, "main", outcome, "mailbox", at)
+                    })
                 },
             )
             .expect("recorded");
@@ -3092,6 +3110,16 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
     );
     let mut host = RenewHost::new();
     host.flow = 1;
+    if accounts::manual_signin_capability() == accounts::ManualSigninCapability::Unavailable {
+        // No manual admission on this platform (ATERM-KI-1105-14): a renewal by hand is refused
+        // before its provider runs, and a refusal is no sign-in of the row's to record.
+        let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+        assert_eq!(code, exit(1), "{out}{err}");
+        assert!(err.contains("the sign-in lock could not be taken"), "{err}");
+        assert!(host.flows.borrow().is_empty());
+        assert!(!store.logins_file().exists() && store.tail(10).expect("ledger").is_empty());
+        return;
+    }
     for run in 0..2 {
         let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
         assert_eq!(code, exit(1), "{out}{err}");

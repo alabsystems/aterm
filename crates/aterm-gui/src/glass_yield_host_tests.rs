@@ -119,8 +119,10 @@ fn a_windowed_composed_capture_yields_its_glass() {
             ComposedCursorFxClock::Retain { observed_at: last },
         )
         .expect("the composed capture grid");
-        let ws = app.windows.get_mut(&wid).expect("the window");
+        let mut field_guard_ws = app.windows.get_mut(&wid).expect("the window");
+        let ws = &mut **field_guard_ws;
         ws.fx.publish_words(&mut ws.input_scratch);
+        drop(field_guard_ws);
         streams(app, wid).0
     });
     assert_eq!(
@@ -185,12 +187,8 @@ fn the_heterogeneous_route_yields_its_glass() {
     let mut last = t0;
     for k in 1..=10u64 {
         rig.with_app(at(100 * k), |app, wid| {
-            let fx = app
-                .windows
-                .get_mut(&wid)
-                .expect("the window")
-                .fx
-                .cursor_mut();
+            let mut payload_guard_fx = app.windows.get_mut(&wid).expect("the window");
+            let fx = payload_guard_fx.fx.cursor_mut();
             fx.glow.note_synthetic_typed(at(100 * k), 1);
             fx.trail.note_synthetic_typed(at(100 * k));
         });

@@ -2540,6 +2540,32 @@ mod rule {
             "the back-off doubled"
         );
     }
+
+    /// A wake or a network path change ends every dial's back-off: a seat whose dials failed
+    /// while this Mac had no network is dialed again at the next step, not minutes on.
+    /// NEGATIVE CONTROL: without `woke`, the same step dials nothing (within the back-off).
+    #[test]
+    fn a_wake_ends_every_dials_back_off() {
+        let mut overlay = Overlay::new(3);
+        let seats = seats(2);
+        let none = BTreeSet::new();
+        let plan = overlay.step(&sight(Duration::ZERO, &seats, &none, &none));
+        for node in &plan.dial {
+            overlay.failed(node, Duration::ZERO);
+        }
+        let mut kept = overlay.clone();
+        let within = Duration::from_millis(500);
+        assert!(
+            kept.step(&sight(within, &seats, &none, &none))
+                .dial
+                .is_empty(),
+            "the control waits out its back-off"
+        );
+        overlay.woke();
+        assert_eq!(overlay.next_wake(within), None, "no back-off is left");
+        let plan = overlay.step(&sight(within, &seats, &none, &none));
+        assert_eq!(plan.dial.len(), 2, "both seats are dialed again at once");
+    }
 }
 
 #[path = "tables_tests.rs"]

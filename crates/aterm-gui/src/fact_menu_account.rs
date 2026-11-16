@@ -2080,6 +2080,9 @@ pub(crate) fn details_report(facts: &FactMenuFacts) -> String {
         if let Some(mac) = &token.made_on {
             lines.push(format!("Token made on: {mac}"));
         }
+        if let Some(mac) = &token.verified_on {
+            lines.push(format!("Token verified on: {mac}"));
+        }
         if let Some(vault) = &token.vault_words {
             lines.push(format!("Vault: {vault}"));
         }

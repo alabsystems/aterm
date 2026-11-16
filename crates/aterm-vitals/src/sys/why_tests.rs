@@ -70,10 +70,12 @@ fn ctx<'a>(w: &'a World, s: &'a Snapshot, owner: bool) -> Ctx<'a> {
         volume: None,
         roots: &[],
         disk: None,
+        stores: &[],
         home: None,
         events: &[],
         gap: None,
         head_seq: 0,
+        held: None,
     }
 }
 
@@ -456,6 +458,8 @@ fn mem_1142() -> Scene {
         compressed: Some(0),
         cached: 27_967_258_624,
         free: 89_733_971_968,
+        swap_used: Some(0),
+        swap_total: Some(0),
         exact: true,
         pressure: Pressure::Normal,
         counters: Some(MemCounters::default()),

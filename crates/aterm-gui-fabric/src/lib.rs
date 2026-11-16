@@ -23,6 +23,7 @@ use aterm_gui_timing::now_ms;
 pub mod fleet_mail;
 pub mod handler_tally;
 mod hold_clock;
+pub mod lock_rank;
 pub mod report;
 
 pub use hold_clock::HoldObservation;
@@ -1580,19 +1581,104 @@ pub struct TopicPost {
 /// whole text, and the head of a longer one.
 pub const TOPIC_POST_KEPT: usize = POST_INLINE_MAX;
 
+/// What hears that a session's fabric moved ([`on_carry_moved`]).
+static CARRY_MOVED: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Call `heard` after every ring of any session's [`SessionFabric`] condvar, the rings that
+/// follow every change to its ring, holds, ids, posts, receipts and counts, and after every
+/// change to its topics (which no ring follows when made outside the `topic` verb): so after
+/// every change to what [`SessionFabric::keeper_carry`] reads. Set once per process; a later
+/// call changes nothing.
+pub fn on_carry_moved(heard: fn()) {
+    let _ = CARRY_MOVED.set(heard);
+}
+
+/// The condvar of a session's ring ([`aterm_control::park::Changed`]), whose every ring also
+/// tells [`on_carry_moved`]'s listener: a change to the ring rings it, so the listener hears
+/// every change of the carry without a poll.
+#[derive(Default)]
+struct InboxChanged(aterm_control::park::Changed<Inbox>);
+
+impl InboxChanged {
+    /// [`aterm_control::park::Changed::ring`], then tell the listener.
+    fn ring(&self, held: std::sync::MutexGuard<'_, Inbox>) {
+        self.0.ring(held);
+        carry_moved();
+    }
+
+    /// [`aterm_control::park::Changed::ring_after`], then tell the listener.
+    fn ring_after<'a>(
+        &self,
+        lock: &'a Mutex<Inbox>,
+        held: std::sync::MutexGuard<'a, Inbox>,
+        unlocked: impl FnOnce(),
+    ) {
+        self.0.ring_after(lock, held, unlocked);
+        carry_moved();
+    }
+
+    fn park<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, Inbox>,
+        until: std::time::Instant,
+        lane: aterm_control::park::Lane,
+    ) -> std::sync::MutexGuard<'a, Inbox> {
+        self.0.park(guard, until, lane)
+    }
+
+    fn wait<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, Inbox>,
+    ) -> std::sync::MutexGuard<'a, Inbox> {
+        self.0.wait(guard)
+    }
+
+    fn wait_timeout<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, Inbox>,
+        bound: std::time::Duration,
+    ) -> (
+        std::sync::MutexGuard<'a, Inbox>,
+        std::sync::WaitTimeoutResult,
+    ) {
+        self.0.wait_timeout(guard, bound)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread told the carry's listener ([`carry_moved`]): a ring of a session's
+    /// condvar ([`InboxChanged`]) or a change to its topics.
+    static CARRY_RINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tell [`on_carry_moved`]'s listener, if any, that a session's fabric moved.
+fn carry_moved() {
+    #[cfg(test)]
+    CARRY_RINGS.with(|rings| rings.set(rings.get() + 1));
+    if let Some(heard) = CARRY_MOVED.get() {
+        heard();
+    }
+}
+
 /// The per-session fabric state, hung on aterm-gui's `SessionCtx` ([`FabricSession`]).
 #[derive(Default)]
 pub struct SessionFabric {
     #[cfg(unix)]
     mesh: fleet_mail::MeshPolicy,
     inbox: Mutex<Inbox>,
-    changed: aterm_control::park::Changed<Inbox>,
+    changed: InboxChanged,
     direct_epoch: AtomicU64,
     topics: Mutex<std::collections::BTreeMap<String, TopicEntry>>,
     /// [`Self::last_topic_post`]. Not carried by a seamless update: the successor's rows read the
     /// screen until the session posts on a topic again.
     last_topic: Mutex<Option<TopicPost>>,
     hold_serial: std::sync::atomic::AtomicU64,
+    /// The Inbox's holds as of their latest change, stored under the Inbox lock with each change
+    /// and read by [`Self::holds`] and [`Self::hold`] alone. It is a leaf: no thread takes another
+    /// lock while it holds this one, so a hold is read beneath a session's metadata, which ranks
+    /// after the Inbox ([`lock_rank`]), without waiting on the Inbox.
+    published_holds: Mutex<Holds>,
     person_refusals: AtomicU64,
     #[cfg(any(test, debug_assertions))]
     fence_wait: Mutex<Option<std::time::Duration>>,
@@ -1600,6 +1686,18 @@ pub struct SessionFabric {
     fence_waits: AtomicU64,
     #[cfg(any(test, debug_assertions))]
     fence_bound: Mutex<Option<Option<std::time::Duration>>>,
+    /// How often a thread found this session's Inbox held and waited for it ([`Self::lock`]).
+    #[cfg(any(test, debug_assertions))]
+    inbox_waits: AtomicU64,
+    /// The next [`Self::run_unfenced`]'s pause with the Inbox held, before its change runs: the
+    /// first sender says it holds the Inbox, the receiver lets it go on.
+    #[cfg(any(test, debug_assertions))]
+    unfenced_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// How often an `await inbox` parked on [`Self::changed`]: counted under the ring's lock
     /// before the park, so a test that reads it and then takes the lock knows the waiter waits.
     #[cfg(test)]
@@ -1611,7 +1709,40 @@ pub struct SessionFabric {
 
 impl SessionFabric {
     fn lock(&self) -> std::sync::MutexGuard<'_, Inbox> {
+        lock_rank::before_inbox();
+        #[cfg(any(test, debug_assertions))]
+        match self.inbox.try_lock() {
+            Ok(inbox) => return inbox,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.inbox_waits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         self.inbox.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How often a thread found this session's Inbox held and waited for it.
+    #[cfg(any(test, debug_assertions))]
+    pub fn inbox_waits(&self) -> u64 {
+        self.inbox_waits.load(Ordering::SeqCst)
+    }
+
+    /// Pause the next [`Self::run_unfenced`] once it holds the Inbox, before its change runs.
+    /// The receiver hears when it holds the Inbox; a send on the sender lets it go on.
+    #[cfg(any(test, debug_assertions))]
+    pub fn pause_next_unfenced(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (holds, held) = std::sync::mpsc::sync_channel(1);
+        let (go, gone) = std::sync::mpsc::sync_channel(1);
+        *self
+            .unfenced_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((holds, gone));
+        (held, go)
     }
 
     /// Whether this session's direct fleet mail enters its ring (§11 C6): the mesh switch as the
@@ -1842,6 +1973,8 @@ impl SessionFabric {
             since: Some(since),
         };
         record("topic", fact);
+        drop(set);
+        carry_moved();
         Ok(true)
     }
 
@@ -1870,6 +2003,8 @@ impl SessionFabric {
                 since: None,
             };
             record("topic", fact);
+            drop(set);
+            carry_moved();
         }
         dropped
     }
@@ -1878,6 +2013,8 @@ impl SessionFabric {
     pub fn set_topics(&self, topics: impl IntoIterator<Item = (String, TopicEntry)>) {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         *set = topics.into_iter().collect();
+        drop(set);
+        carry_moved();
     }
 
     /// Whether broker offset `off` names mail this session holds (what `cause=@<off>` may name).
@@ -1888,9 +2025,9 @@ impl SessionFabric {
             || inbox.posts.iter().any(|p| p.off == Some(off) && !p.dead)
     }
 
-    /// The session's standing halt, if any.
+    /// The session's standing halt, if any, read as [`Self::holds`] reads it, without the Inbox.
     pub fn hold(&self) -> Option<Hold> {
-        self.lock().holds.first()
+        self.holds().first()
     }
 
     /// The aggregate hold and its release history, read in one transaction.
@@ -1900,9 +2037,38 @@ impl SessionFabric {
         inbox.hold_history.observation(inbox.holds.is_held())
     }
 
-    /// Every standing halt on the session, one slot per origin.
+    /// Every standing halt on the session, one slot per origin, as of the latest change to them.
+    /// It is read from the copy each change stores under the Inbox lock, never through the Inbox,
+    /// so a caller that holds a session's metadata may read it ([`lock_rank`]).
     pub fn holds(&self) -> Holds {
-        self.lock().holds.clone()
+        // With debug assertions, an Inbox free at this moment holds no change in progress, so its
+        // holds must be the copy. `try_lock` never waits, so the check adds no lock order.
+        #[cfg(debug_assertions)]
+        if let Ok(inbox) = self.inbox.try_lock() {
+            let published = self.published_holds();
+            debug_assert!(
+                inbox.holds == published,
+                "a change to the session's holds was not published"
+            );
+            return published;
+        }
+        self.published_holds()
+    }
+
+    fn published_holds(&self) -> Holds {
+        self.published_holds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Store `holds`, the Inbox's after a change, as the copy [`Self::holds`] reads. Called with
+    /// the Inbox held, so a reader that holds the Inbox reads the copy of that change.
+    fn publish_holds(&self, holds: &Holds) {
+        *self
+            .published_holds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = holds.clone();
     }
 
     /// How many acts the person's hold refused since it was set ([`halt_refusal`]).
@@ -2017,13 +2183,25 @@ impl SessionFabric {
 
     /// Run `change`, a change the handoff carries that lives off this endpoint (a task mark,
     /// `task_record::mark_session_task`), with its locked aggregate hold observation once no
-    /// update fences the session; `None` past `wait`.
+    /// update fences the session; `None` past `wait`. `change` runs holding the Inbox, so it may
+    /// take a session's metadata and then its timeline, never the reverse ([`lock_rank`]).
     pub fn run_unfenced<T>(
         &self,
         wait: std::time::Duration,
         change: impl FnOnce(HoldObservation) -> T,
     ) -> Option<T> {
         let unfenced = self.wait_unfenced(self.lock(), wait)?;
+        #[cfg(any(test, debug_assertions))]
+        let pause = self
+            .unfenced_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        #[cfg(any(test, debug_assertions))]
+        if let Some((holds, go)) = pause {
+            let _ = holds.send(());
+            let _ = go.recv();
+        }
         let out = change(unfenced.hold_history.observation(unfenced.holds.is_held()));
         drop(unfenced);
         Some(out)
@@ -2373,6 +2551,7 @@ impl SessionFabric {
             return;
         }
         let held = inbox.holds.is_held();
+        self.publish_holds(&inbox.holds);
         inbox
             .hold_history
             .moved(before.is_held(), held, std::time::Instant::now());
@@ -4393,6 +4572,7 @@ fn apply_hold_as(
         drop(inbox);
         return Applied::Unchanged { held };
     }
+    ctx.fabric().publish_holds(&inbox.holds);
     inbox
         .hold_history
         .moved(before.is_held(), held, std::time::Instant::now());
@@ -4949,6 +5129,7 @@ fn deliver_receipt(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     inbox.receipts.retain(|r| r.rid != rid);
     if inbox.receipts.len() != before {
         inbox.outbox_moves += 1;
+        ctx.fabric().changed.ring(inbox);
     }
     "OK\n".to_string()
 }
@@ -5602,6 +5783,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         if topic.is_some() {
             inbox.dropped += 1;
             remember_offset(&mut inbox, off, false);
+            ctx.fabric().changed.ring(inbox);
         }
         return "ERR quota\n".to_string();
     }
@@ -6897,3 +7079,7 @@ mod topic_tests;
 #[cfg(test)]
 #[path = "lib_inbox_hold_tests.rs"]
 mod inbox_hold;
+
+#[cfg(all(test, unix))]
+#[path = "lib_carry_ring_tests.rs"]
+mod carry_ring;

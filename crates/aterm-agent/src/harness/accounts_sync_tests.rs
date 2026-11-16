@@ -1455,13 +1455,14 @@ fn a_background_renewal_that_stopped_for_a_person_is_left_alone_for_its_backoff(
     );
 }
 
-/// A background renewal that met Cloudflare's bot check holds its row as long as one that
-/// stopped for a person, though nobody is asked (design R-13): not past the 15-minute
-/// cooldown, nor a minute before [`PERSON_BACKOFF`], and again once that has passed; the
-/// row's activity says when. A renewal by hand is admitted through it, and the row's next end
-/// decides: a plain failure lifts it. CONTROL: that failure waits out the cooldown alone.
+/// A background renewal that met a bot protection, held in this process until its check is
+/// recorded ([`AutoRenewGuard::unrecorded_checks`]), holds its row on no clock: not past the
+/// 15-minute cooldown, nor past [`PERSON_BACKOFF`], nor a day on, and the row's activity shows
+/// no next try. A renewal by hand is admitted through it, and that run's end leaves the check
+/// standing: only a login made for the row ends it. CONTROL: a plain failure waits out the
+/// cooldown alone.
 #[test]
-fn a_background_renewal_that_met_a_bot_check_is_left_alone_for_the_person_backoff() {
+fn a_background_renewal_that_met_a_bot_check_holds_its_row_with_no_clock() {
     use super::super::cli::Renewal;
     use std::sync::{Arc, Mutex};
     let state = Arc::new(Mutex::new(AutoRenewGuard::default()));
@@ -1478,37 +1479,45 @@ fn a_background_renewal_that_met_a_bot_check_is_left_alone_for_the_person_backof
     );
     drop(permit);
     note_background_end(&state, key, Renewal::BotCheck, now);
-    let cooled = now + Duration::from_secs(901);
-    for later in [cooled, now + PERSON_BACKOFF - Duration::from_secs(60)] {
+    state
+        .lock()
+        .unwrap()
+        .unrecorded_checks
+        .insert(key.into(), super::login_activity_tests::a_check_met(key));
+    let day = Duration::from_secs(25 * 3_600);
+    for later in [
+        now + Duration::from_secs(901),
+        now + PERSON_BACKOFF + Duration::from_secs(60),
+        now + day,
+    ] {
         assert!(
             AutoRenewPermit::claim(&state, key, later, false).is_none(),
             "{:?} later",
             later - now
         );
-    }
-    for ago in [60, 901] {
-        let activity = login_activity_of(
-            &state.lock().unwrap(),
-            &store,
-            Cli::Kimi,
-            1_000,
-            now + Duration::from_secs(ago),
-        );
+        let activity = login_activity_of(&state.lock().unwrap(), &store, Cli::Kimi, 1_000, later);
         assert_eq!(
             activity.first().and_then(|row| row.next_at),
-            Some(1_000 + PERSON_BACKOFF_SECS - i64::try_from(ago).unwrap()),
-            "{ago} s later, inside the cooldown too: {activity:?}"
+            None,
+            "{:?} later, no next try is shown: {activity:?}",
+            later - now
         );
     }
-    let by_hand = AutoRenewPermit::claim(&state, key, cooled, true);
+    let by_hand = AutoRenewPermit::claim(&state, key, now + day, true);
     assert!(by_hand.is_some(), "a renewal by hand is no background one");
     drop(by_hand);
-    let past = now + PERSON_BACKOFF;
-    drop(AutoRenewPermit::claim(&state, key, past, false).expect("backed off"));
-    note_background_end(&state, key, Renewal::Failed, past);
-    assert!(state.lock().unwrap().bot_checked.is_empty(), "lifted");
+    note_background_end(&state, key, Renewal::Failed, now + day);
     assert!(
-        AutoRenewPermit::claim(&state, key, past + Duration::from_secs(901), false).is_some(),
+        state.lock().unwrap().unrecorded_checks.contains_key(key),
+        "a run's end is no login made for the row"
+    );
+    assert!(AutoRenewPermit::claim(&state, key, now + day + day, false).is_none());
+
+    let other = "kimi:kimi-2";
+    drop(AutoRenewPermit::claim(&state, other, now, false).expect("admitted"));
+    note_background_end(&state, other, Renewal::Failed, now);
+    assert!(
+        AutoRenewPermit::claim(&state, other, now + Duration::from_secs(901), false).is_some(),
         "CONTROL: a plain failure waits out the cooldown alone"
     );
 }
@@ -2879,6 +2888,7 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
 }
 
 #[test]
+#[cfg(unix)]
 fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_out_login() {
     let w = World::new();
     // The mailbox's accounts are m27's: the world says it is m27 rather
@@ -3320,6 +3330,7 @@ fn recovery_refuses_unproven_or_stale_checkpoints_without_changing_accounts() {
                                         by: "aa".into(),
                                         attempts: 0,
                                         cleared: false,
+                                        seen: None,
                                     },
                                 );
                             }
@@ -4598,7 +4609,7 @@ fn automatic_attempt_summary_refuses_a_replacement_binding() {
         note_attempt(
             &store,
             (&w.roster(), &captured_row, &captured),
-            accounts::AttemptOutcome::Failed,
+            (accounts::AttemptOutcome::Failed, None),
             "fixture route",
             UPKEEP_NOW,
         );
@@ -6082,6 +6093,7 @@ fn vault_ladder_fixture() -> (World, Row) {
 
 /// [`vault_ladder_fixture`] with a real vault in place of its stand-in `source.toml`: a file vault
 /// the home administers, so what a refresh delivers ([`deliver`]) reads in place from the store.
+#[cfg(unix)]
 fn vault_ladder_fixture_in_store() -> (World, Row) {
     let (w, row) = vault_ladder_fixture();
     fs::remove_file(w.home.join(".config/aterm/secrets/source.toml")).unwrap();
@@ -6090,6 +6102,7 @@ fn vault_ladder_fixture_in_store() -> (World, Row) {
 }
 
 /// A refresh delivering entry `name` holding `value` to the store under `home`.
+#[cfg(unix)]
 fn deliver(home: &Path, name: &str, value: &str) {
     crate::vault_entry::seed(home, &[(name, value.as_bytes())]);
 }
@@ -6748,9 +6761,10 @@ fn a_sign_in_takes_an_unverified_window_minted_vault_token_another_mac_minted_be
         );
     }
 
-    // A row whose login is not made here runs on no token here, whatever the vault holds: no
-    // launch here could start on it (it has no login of its own to start in), so its sign-in is
-    // not held for the token. It starts, and makes the login.
+    // A row whose login is not made here runs on no token here where this Mac's claims do not
+    // cover its account (the desk has no pool file and no lab: FL-135's
+    // `claims::covers`), whatever the vault holds: nothing would keep a second Mac off it, so its
+    // sign-in is not held for the token. It starts, and makes the login.
     let (desk, bench) = case(WINDOW, true);
     fs::remove_file(made(&desk)).unwrap();
     assert!(
@@ -7106,11 +7120,14 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
         CALLS.fetch_add(1, Ordering::SeqCst);
         if home.join("bring-mailbox").is_file() {
             // A real store: the version the refresh applies is its own publication.
+            #[cfg(unix)]
             deliver(
                 home,
                 super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
                 "http_url = \"http://127.0.0.1:9/inbox\"\n",
             );
+            #[cfg(not(unix))]
+            panic!("the delivered mailbox fixture requires the Unix vault");
         } else {
             fs::write(
                 home.join(".config/aterm/secrets/state.toml"),
@@ -7120,10 +7137,21 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
         }
         Vault::Applied(83)
     }
-    for with_mailbox in [false, true] {
+    for with_mailbox in [
+        false,
+        #[cfg(unix)]
+        true,
+    ] {
         CALLS.store(0, Ordering::SeqCst);
         let (w, row) = if with_mailbox {
-            vault_ladder_fixture_in_store()
+            #[cfg(unix)]
+            {
+                vault_ladder_fixture_in_store()
+            }
+            #[cfg(not(unix))]
+            {
+                panic!("the delivered mailbox fixture requires the Unix vault")
+            }
         } else {
             vault_ladder_fixture()
         };
@@ -7192,6 +7220,7 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_partial_vault_apply_backs_off_against_its_delivered_inputs() {
     use super::super::sign_in_ladder::Vault;
     use std::sync::atomic::{AtomicUsize, Ordering};

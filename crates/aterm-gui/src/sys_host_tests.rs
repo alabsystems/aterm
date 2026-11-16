@@ -87,9 +87,11 @@ fn gathered() -> Gathered {
         }],
         roots: Vec::new(),
         disk: None,
+        stores: Vec::new(),
         volume: None,
         caller_panes: None,
         home: None,
+        held: None,
     }
 }
 
@@ -159,7 +161,9 @@ fn every_view_of_a_live_snapshot_answers_and_its_json_keeps_the_contract() {
             events: &[],
             gap: None,
             disk: None,
+            stores: &[],
             head_seq: 0,
+            held: None,
         };
         let v = contract_violations(&render_json(&q, &ctx));
         assert!(v.is_empty(), "{view:?}: {v:?}");
@@ -2076,6 +2080,596 @@ fn scope_request_reads_the_request_owning_the_tab() {
         "an unread tree is unread, never 0"
     );
     crate::requests_host::set_dir_for_test(None);
+}
+
+/// The row of `held` at the fixture path `path`.
+#[cfg(unix)]
+fn row_at(
+    held: &aterm_vitals::sys::held::Holdings,
+    path: &str,
+) -> aterm_vitals::sys::held::Holding {
+    let path = abs(path);
+    let Some(h) = held.rows.iter().find(|h| h.path == path) else {
+        panic!("no {path} row: {:#?}", held.rows);
+    };
+    h.clone()
+}
+
+/// SYS DISK HELD GATHERS ITS ROWS FROM THE WALKER'S BOARD AND THE BUILD-START LINES (DC-09a):
+/// read as aterm's scope, each root on home's volume is a row, its pinned children's bytes out
+/// of it. Out of the root that holds each, a row of its own for a project's `target` its walk
+/// listed, aterm's build cache, the root that cache moved from and its tooling cache, and each
+/// build mirror in the build cache that a build-start line names, a nested one apart from the
+/// one around it; a listed folder that holds a root row counts in none of them, and aterm's
+/// caches folder keeps the rest (its reserve, its virtual machines), kept. Each row carries the
+/// mark of the sessions that claim it (a mirror's, those its own lines name), the tab and
+/// program of the nearest at work, and the next pass the passes that are on give it: a verify
+/// run's end only where a run kept its record. The reply prints the rows gathered.
+/// NEGATIVE CONTROLS: with no line the build cache keeps the mirrors' bytes; with no session in
+/// aterm's table every claimed row is gone; a line of a session at work marks its mirror at
+/// work, and run-end only once a run kept its record there; with cleanup off every pass but a
+/// verify run's end is none; a linked worktree splits its `target` and a folder none; a root
+/// on another volume is no row; with every walk complete the walk is complete, with no walk
+/// demanded an unwalked root is not sampled and the walk idle, and with no walker it is
+/// stopped; a reply with no rows gathered says so.
+#[cfg(unix)]
+#[test]
+fn sys_disk_held_gathers_its_rows_from_build_start_lines_and_the_walkers_board() {
+    use crate::diskwalk_host::{
+        Claim, Complete, DirRow, DiskScope, Pool, RootKind, RootRecord, RootState, WalkerState,
+        build_report,
+    };
+    use aterm_vitals::sys::held::{Bytes, Class, Holding, Holdings, Mark, Next, Walk, Worktree};
+    use std::collections::BTreeSet;
+    const REPO: &str = "/Users//a/w/repo";
+    const TARGET: &str = "/Users//a/w/repo/target";
+    const CACHES: &str = "/Users//a/Library/Caches/aterm";
+    const BUILD: &str = "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex";
+    const MOVED: &str = "/Users//a/Library/Caches/aterm/cargo-build.noindex";
+    const TOOLING: &str = "/Users//a/Library/Caches/aterm/tooling.noindex";
+    const MIRROR: &str = "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/w/repo";
+    const OLD: &str = "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/w/old";
+    const DEV: &str = "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/dev";
+    const WT: &str = "/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/dev/.ubd/wt";
+    const STATE: &str = "/Users//a/Library/Application Support/aterm";
+    const OPT_IN: &str = "/Users//a/Documents/x";
+    let now = Instant::now();
+    let mut board = sys_board(now);
+    let caches = PathBuf::from(abs(CACHES));
+    board.own_claims.push(Claim {
+        path: caches.clone(),
+        kinds: BTreeSet::from([RootKind::Own]),
+        linked_worktree: false,
+    });
+    board.pools.insert(caches.clone(), Pool::Same);
+    let repo = PathBuf::from(abs(REPO));
+    let Some(walk) = board.records[&repo].complete.clone() else {
+        panic!("the fixture's project is walked");
+    };
+    let dir = |rel: &str, alloc: u64| DirRow {
+        rel: rel.into(),
+        alloc,
+        logical: alloc,
+        entries: 9,
+        direct_entries: 1,
+    };
+    // The build cache's own folder holds the repository's mirror, a root row: it counts in no
+    // part. Below it: two mirrors of gone sessions' workspaces (one nested in the other's
+    // folder with a line of a session at work), and one no line names.
+    let cache_walk = Complete {
+        sums: aterm_diskwalk::Sums {
+            alloc_fair: 50_000,
+            ..walk.sums
+        },
+        biggest: vec![
+            dir(".ubd/cargo-build.noindex", 32_000),
+            dir(".ubd/cargo-build.noindex/Users//a/w/old", 20_000),
+            dir(".ubd/cargo-build.noindex/Users//a/w/old/debug", 15_000),
+            dir(".ubd/cargo-build.noindex/Users//a/w/stray", 3_000),
+            dir(".ubd/cargo-build.noindex/Users//a/dev", 8_000),
+            dir(".ubd/cargo-build.noindex/Users//a/dev/.ubd/wt", 6_000),
+            dir("cargo-build.noindex", 4_000),
+            dir("tooling.noindex", 2_500),
+            dir("lima.noindex", 7_000),
+        ],
+        ..walk
+    };
+    let mut record = (*board.records[&repo]).clone();
+    record.path = caches.clone();
+    record.complete = Some(cache_walk);
+    board.records.insert(caches, Arc::new(record));
+    board.panes.get_mut(&1).expect("pane 1").exe = Some("claude".into());
+    let start = |session: &str, workspace: &str| atpkg::build_start::Start {
+        session: session.into(),
+        workspace: PathBuf::from(abs(workspace)),
+        build: None,
+        pid: 4242,
+        at_ms: 1_731_450_000_000,
+    };
+    let lines = [
+        start("s-live", REPO),
+        start("s-gone", "/Users//a/w/old"),
+        start("s-gone", "/Users//a/dev"),
+        start("s-live", "/Users//a/dev/.ubd/wt"),
+    ];
+    let live: [(u64, String); 2] = [(1, "s-live".into()), (2, "s-live2".into())];
+    let home = PathBuf::from(abs("/Users//a"));
+    let on = Passes {
+        low_disk: true,
+        daily_days: Some(3),
+        run_end: true,
+    };
+    let mirror_path = PathBuf::from(abs(MIRROR));
+    let kept_in_mirror = |m: &Path| m == mirror_path.as_path();
+    let facts = HeldFacts {
+        starts: &lines,
+        live: &live,
+        home: Some(home.as_path()),
+        passes: on,
+        kept: &kept_in_mirror,
+        now,
+    };
+    let report = build_report(DiskScope::Aterm, &board, WalkerState::Running);
+    let held = held_rows(&board, &report, true, &facts);
+    let none = |project: &str, worktree, path: &str, bytes, class, next| Holding {
+        project: project.into(),
+        worktree,
+        path: abs(path),
+        keys: Vec::new(),
+        mark: Mark::NoSession,
+        tab: None,
+        exe: None,
+        bytes,
+        class,
+        next,
+    };
+    let at_work = |keys: Vec<u64>, h: Holding| Holding {
+        keys,
+        mark: Mark::AtWork,
+        tab: Some(1),
+        exe: Some("claude".into()),
+        ..h
+    };
+    let gone = |h: Holding| Holding {
+        mark: Mark::Gone,
+        ..h
+    };
+    let daily = Next::DailyCache { stale_days: 3 };
+    let run_end = Next::RunEnd {
+        stale_days: Some(3),
+    };
+    let unused = |after: Duration| Next::DailyUnused {
+        after_s: after.as_secs(),
+    };
+    let (rebuilt, kept) = (Class::Rebuildable, Class::Kept);
+    let mut want = vec![
+        none(
+            "x",
+            Worktree::OptIn,
+            OPT_IN,
+            Bytes::Unmeasured("protected"),
+            kept,
+            Next::NotAterms,
+        ),
+        none(
+            "aterm",
+            Worktree::Aterm,
+            STATE,
+            Bytes::Measured(2_000),
+            kept,
+            Next::Nothing,
+        ),
+        none(
+            "aterm",
+            Worktree::Aterm,
+            CACHES,
+            Bytes::Measured(11_500),
+            kept,
+            Next::Nothing,
+        ),
+        none(
+            "aterm",
+            Worktree::Cache,
+            BUILD,
+            Bytes::AtLeast(3_000),
+            rebuilt,
+            daily,
+        ),
+        none(
+            "aterm",
+            Worktree::Cache,
+            MOVED,
+            Bytes::AtLeast(4_000),
+            rebuilt,
+            unused(atpkg::build_cache::MOVED_AFTER),
+        ),
+        none(
+            "aterm",
+            Worktree::Tooling,
+            TOOLING,
+            Bytes::AtLeast(2_500),
+            Class::Costly,
+            unused(atpkg::build_cache::RECLAIM_IDLE),
+        ),
+        gone(none(
+            "old",
+            Worktree::Build,
+            OLD,
+            Bytes::AtLeast(20_000),
+            rebuilt,
+            daily,
+        )),
+        gone(none(
+            "dev",
+            Worktree::Build,
+            DEV,
+            Bytes::AtLeast(2_000),
+            rebuilt,
+            daily,
+        )),
+        at_work(
+            vec![1],
+            none(
+                "wt",
+                Worktree::Build,
+                WT,
+                Bytes::AtLeast(6_000),
+                rebuilt,
+                daily,
+            ),
+        ),
+        at_work(
+            vec![1, 2],
+            none(
+                "repo",
+                Worktree::Build,
+                MIRROR,
+                Bytes::Measured(1_000),
+                rebuilt,
+                run_end,
+            ),
+        ),
+        at_work(
+            vec![1, 2],
+            none(
+                "repo",
+                Worktree::Checkout,
+                REPO,
+                Bytes::Measured(4_000),
+                kept,
+                Next::Nothing,
+            ),
+        ),
+        at_work(
+            vec![1, 2],
+            none(
+                "repo",
+                Worktree::Build,
+                TARGET,
+                Bytes::AtLeast(5_000),
+                rebuilt,
+                Next::TierPass,
+            ),
+        ),
+    ];
+    want.sort_by(|a, b| a.path.cmp(&b.path));
+    let sorted = |h: &Holdings| {
+        let mut rows = h.rows.clone();
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows
+    };
+    assert_eq!(sorted(&held), want);
+    assert_eq!(
+        held.walk,
+        Walk::Walking,
+        "the repository's build mirror is walking"
+    );
+    assert_eq!(held.oldest_walk_s, Some(4));
+    // The reply prints the rows gathered.
+    let shared = Shared::new();
+    shared.publish_for_test(synthetic(1, 0.1), Vec::new());
+    let (snap, state) = shared.fresh(Duration::from_secs(3600), false);
+    let q = SysQuery::parse("disk held").expect("disk held");
+    let wired = Gathered {
+        held: Some(held.clone()),
+        ..gathered()
+    };
+    let reply = answer(
+        &shared,
+        &q,
+        snap.as_ref(),
+        state,
+        &Machine::default(),
+        &wired,
+        true,
+    );
+    assert!(reply.contains(" view=disk form=held "), "{reply}");
+    assert!(reply.contains("\nholding n=1 "), "{reply}");
+    let unwired = answer(
+        &shared,
+        &q,
+        snap.as_ref(),
+        state,
+        &Machine::default(),
+        &gathered(),
+        true,
+    );
+    assert!(
+        unwired.contains("held unavailable(not_sampled)"),
+        "CONTROL: {unwired}"
+    );
+    // No line: the build cache keeps its mirrors' bytes.
+    let bare = held_rows(
+        &board,
+        &report,
+        true,
+        &HeldFacts {
+            starts: &[],
+            ..facts
+        },
+    );
+    for path in [OLD, DEV, WT] {
+        assert!(
+            bare.rows.iter().all(|h| h.path != abs(path)),
+            "CONTROL: {:#?}",
+            bare.rows
+        );
+    }
+    let build = row_at(&bare, BUILD);
+    assert_eq!(build.bytes, Bytes::AtLeast(31_000), "CONTROL: {build:?}");
+    // No session in aterm's table: every claimed row is gone, a mirror the daily pass's.
+    let nobody = held_rows(&board, &report, true, &HeldFacts { live: &[], ..facts });
+    for path in [REPO, TARGET, MIRROR, WT] {
+        let h = row_at(&nobody, path);
+        assert_eq!(
+            (h.mark, h.tab, h.exe.as_deref()),
+            (Mark::Gone, None, None),
+            "CONTROL: {h:?}"
+        );
+        assert!(h.keys.is_empty(), "CONTROL: {h:?}");
+    }
+    assert_eq!(row_at(&nobody, MIRROR).next, daily, "CONTROL");
+    // A line of a session at work marks its mirror at work, and run-end only once a verify
+    // run kept its record in it.
+    let mine = [start("s-live", "/Users//a/w/old")];
+    let held_live = held_rows(
+        &board,
+        &report,
+        true,
+        &HeldFacts {
+            starts: &mine,
+            ..facts
+        },
+    );
+    let old = row_at(&held_live, OLD);
+    assert_eq!(
+        (old.mark, old.tab),
+        (Mark::AtWork, Some(1)),
+        "CONTROL: {old:?}"
+    );
+    assert_eq!(old.keys, [1], "CONTROL: {old:?}");
+    assert_eq!(old.next, daily, "CONTROL: no run kept its record there");
+    let old_path = PathBuf::from(abs(OLD));
+    let kept_in_old = |m: &Path| m == old_path.as_path();
+    let ran = HeldFacts {
+        starts: &mine,
+        kept: &kept_in_old,
+        ..facts
+    };
+    let old = row_at(&held_rows(&board, &report, true, &ran), OLD);
+    assert_eq!(old.next, run_end, "CONTROL: {old:?}");
+    // Cleanup off: every pass but a verify run's end is none.
+    let off = Passes {
+        low_disk: false,
+        daily_days: None,
+        run_end: true,
+    };
+    let held_off = held_rows(
+        &board,
+        &report,
+        true,
+        &HeldFacts {
+            passes: off,
+            ..facts
+        },
+    );
+    for path in [TARGET, OLD, DEV, WT, BUILD, MOVED, TOOLING] {
+        let h = row_at(&held_off, path);
+        assert_eq!(h.next, Next::CleanupOff, "CONTROL: {h:?}");
+    }
+    let mirror = row_at(&held_off, MIRROR);
+    assert_eq!(mirror.next, Next::RunEnd { stale_days: None }, "CONTROL");
+    // A linked worktree splits its `target` too; a folder no repository holds splits none.
+    let mut linked = sys_board(now);
+    for pane in linked.panes.values_mut() {
+        for m in &mut pane.members {
+            m.linked_worktree |= m.path == repo;
+        }
+    }
+    let linked_report = build_report(DiskScope::Aterm, &linked, WalkerState::Running);
+    let held_linked = held_rows(&linked, &linked_report, true, &facts);
+    assert_eq!(
+        row_at(&held_linked, REPO).worktree,
+        Worktree::Linked,
+        "CONTROL"
+    );
+    assert_eq!(
+        row_at(&held_linked, TARGET).bytes,
+        Bytes::AtLeast(5_000),
+        "CONTROL"
+    );
+    let mut folder = sys_board(now);
+    for pane in folder.panes.values_mut() {
+        for m in pane.members.iter_mut().filter(|m| m.path == repo) {
+            m.kinds = BTreeSet::from([RootKind::Folder]);
+        }
+    }
+    let folder_report = build_report(DiskScope::Aterm, &folder, WalkerState::Running);
+    let held_folder = held_rows(&folder, &folder_report, true, &facts);
+    let plain = row_at(&held_folder, REPO);
+    assert_eq!(plain.worktree, Worktree::Folder, "CONTROL: {plain:?}");
+    assert_eq!(plain.bytes, Bytes::Measured(9_000), "CONTROL: {plain:?}");
+    assert!(
+        held_folder.rows.iter().all(|h| h.path != abs(TARGET)),
+        "CONTROL"
+    );
+    // A root on another volume is no row.
+    let mut far = sys_board(now);
+    far.pools.insert(PathBuf::from(abs(OPT_IN)), Pool::Other);
+    let far_report = build_report(DiskScope::Aterm, &far, WalkerState::Running);
+    let held_far = held_rows(&far, &far_report, true, &facts);
+    assert!(
+        held_far.rows.iter().all(|h| h.path != abs(OPT_IN)),
+        "CONTROL: {:#?}",
+        held_far.rows
+    );
+    // The walk: complete once every walk is; with no walk demanded an unwalked root is not
+    // sampled and the walk idle, else walking; with no walker, stopped.
+    let mut unwalked = (*board.records[&mirror_path]).clone();
+    unwalked.complete = None;
+    let mut owed = sys_board(now);
+    owed.records.insert(mirror_path.clone(), Arc::new(unwalked));
+    let owed_report = build_report(DiskScope::Aterm, &owed, WalkerState::Running);
+    let asked = held_rows(&owed, &owed_report, true, &facts);
+    assert_eq!(
+        row_at(&asked, MIRROR).bytes,
+        Bytes::Unmeasured("walking"),
+        "CONTROL"
+    );
+    assert_eq!(asked.walk, Walk::Walking, "CONTROL");
+    let unasked = held_rows(&owed, &owed_report, false, &facts);
+    assert_eq!(
+        row_at(&unasked, MIRROR).bytes,
+        Bytes::Unmeasured("not_sampled")
+    );
+    assert_eq!(unasked.walk, Walk::Idle);
+    let walked = RootRecord {
+        state: RootState::Complete,
+        partial: None,
+        ..(*board.records[&mirror_path]).clone()
+    };
+    board.records.insert(mirror_path.clone(), Arc::new(walked));
+    let report = build_report(DiskScope::Aterm, &board, WalkerState::Running);
+    let done = held_rows(&board, &report, false, &facts);
+    assert_eq!(done.walk, Walk::Complete, "CONTROL: every walk is complete");
+    let report = build_report(DiskScope::Aterm, &board, WalkerState::NotStarted);
+    let idle = held_rows(&board, &report, true, &facts);
+    assert_eq!(idle.walk, Walk::Stopped, "CONTROL: no walker measures");
+}
+
+/// A HOLDING NAMES THE TAB AND PROGRAM OF THE SESSION THAT CLAIMS IT MOST NEARLY: of the panes
+/// at work whose folders hold it, the one whose folder lies deepest, not the least key; every
+/// one of them may read its path. NEGATIVE CONTROL: a folder only the pane above claims names
+/// that pane.
+#[cfg(unix)]
+#[test]
+fn a_holding_names_the_tab_and_program_of_its_nearest_claimer() {
+    use crate::diskwalk_host::{Claim, RootKind};
+    use aterm_vitals::sys::held::Mark;
+    use std::collections::BTreeSet;
+    let mut board = sys_board(Instant::now());
+    board.panes.get_mut(&1).expect("pane 1").exe = Some("claude".into());
+    let mut above = board.panes[&1].clone();
+    above.key = 0;
+    above.exe = Some("zsh".into());
+    above.members = vec![Claim {
+        path: PathBuf::from(abs("/Users//a/w")),
+        kinds: BTreeSet::from([RootKind::Folder]),
+        linked_worktree: false,
+    }];
+    board.panes.insert(0, above);
+    board.tabs[1].panes.push(0);
+    let live: [(u64, String); 3] = [(0, "s-0".into()), (1, "s-1".into()), (2, "s-2".into())];
+    let repo = HeldBy::of_path(&board, &live, Path::new(&abs("/Users//a/w/repo")));
+    assert_eq!(repo.mark, Mark::AtWork);
+    assert_eq!(repo.keys, [0, 1, 2]);
+    assert_eq!((repo.tab, repo.exe.as_deref()), (Some(1), Some("claude")));
+    let other = HeldBy::of_path(&board, &live, Path::new(&abs("/Users//a/w/other")));
+    assert_eq!(other.keys, [0], "CONTROL");
+    assert_eq!(
+        (other.tab, other.exe.as_deref()),
+        (Some(2), Some("zsh")),
+        "CONTROL"
+    );
+}
+
+/// THE PASSES `sys disk held` NAMES FOLLOW aterm.toml: the tier pass while
+/// `disk.auto_free_gib` is above 0; the daily pass only on macOS, with the tier pass on and
+/// `disk.dead_build_dirs`, at the cache's stale days; a verify run's trim on macOS whatever the
+/// file says. NEGATIVE CONTROLS: each condition off turns its pass off.
+#[test]
+fn the_passes_sys_disk_names_follow_aterm_toml() {
+    use aterm_agent::harness::disk::Config;
+    let on = Config {
+        auto_free_gib: 20,
+        dead_build_dirs: true,
+        ..Config::default()
+    };
+    let days = atpkg::build_cache::RECLAIM_STALE.as_secs() / (24 * 60 * 60);
+    let all = Passes {
+        low_disk: true,
+        daily_days: Some(days),
+        run_end: true,
+    };
+    assert_eq!(Passes::of(&on, true), all);
+    let elsewhere = Passes {
+        daily_days: None,
+        run_end: false,
+        ..all
+    };
+    assert_eq!(Passes::of(&on, false), elsewhere, "CONTROL: not macOS");
+    let off = Config {
+        auto_free_gib: 0,
+        ..on
+    };
+    let none = Passes {
+        low_disk: false,
+        daily_days: None,
+        ..all
+    };
+    assert_eq!(Passes::of(&off, true), none, "CONTROL: cleanup off");
+    let kept = Config {
+        dead_build_dirs: false,
+        ..on
+    };
+    let no_daily = Passes {
+        daily_days: None,
+        ..all
+    };
+    assert_eq!(
+        Passes::of(&kept, true),
+        no_daily,
+        "CONTROL: no dead build dirs"
+    );
+}
+
+/// A HELD READ DEMANDS NO WALK: it reads the walker's last board and asks the walker for
+/// nothing, and a walker that has not started reads as stopped. NEGATIVE CONTROL: a demand of
+/// the same walker is seen.
+#[test]
+fn a_held_read_demands_no_walk() {
+    use crate::diskwalk_host::{Detail, DiskScope, Pace};
+    use aterm_vitals::sys::held::Walk;
+    let walk = crate::diskwalk_host::Shared::new();
+    let now = Instant::now();
+    let facts = HeldFacts {
+        starts: &[],
+        live: &[],
+        home: None,
+        passes: Passes {
+            low_disk: true,
+            daily_days: Some(3),
+            run_end: true,
+        },
+        kept: &|_: &Path| false,
+        now,
+    };
+    let held = held_read(&walk, &facts);
+    assert!(!walk.demanded(now), "a held read demands no walk");
+    assert_eq!(held.walk, Walk::Stopped);
+    assert!(held.rows.is_empty(), "{:#?}", held.rows);
+    walk.demand(DiskScope::Aterm, Detail::Sizes, Pace::Look, now);
+    assert!(walk.demanded(now), "CONTROL: a demand is seen");
 }
 
 /// A reading whose process sweep stalled is whole for a pull: it carries every machine figure and

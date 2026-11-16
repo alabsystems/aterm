@@ -116,10 +116,10 @@ pub mod spectrum;
 #[doc(hidden)]
 pub mod state_words;
 pub mod supernova;
-/// The tests' replay pool ([`test_pool::par_map`]), for the unit tests and the integration suite.
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-pub mod test_pool;
+/// The unit tests' replay pool ([`test_pool::par_map`]); the integration suite mounts the same
+/// file by path (`tests/common/mod.rs`), so the library holds it only in its unit-test build.
+#[cfg(test)]
+mod test_pool;
 /// Hashed char-n-gram classifier mapping typed text to a mood hint.
 pub mod tone;
 /// The tone-of-typing tracker.

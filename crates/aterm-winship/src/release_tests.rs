@@ -13,6 +13,7 @@ fn opts() -> Options {
         commit: COMMIT.to_string(),
         out: PathBuf::from("carry"),
         repo: None,
+        sign: None,
     }
 }
 

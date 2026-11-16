@@ -179,13 +179,14 @@ impl crate::App {
         ((ws.cols as usize * cw + 2 * pad) as f32, ws.scale as f32)
     }
 
-    /// Whether a visible window draws the Network State band (the deck) or its lens: what the
-    /// lab's account rows are for.
+    /// Whether a visible window draws the Network State band (in the System Resources band, so
+    /// only where the window's own form is the Deck: [`Self::window_bars`]) or its lens: what
+    /// the lab's account rows are for.
     pub(crate) fn network_band_drawn(&self) -> bool {
-        let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
-        self.windows.values().any(|window| {
+        self.windows.iter().any(|(wid, window)| {
             !window.occluded
-                && ((deck_shown && crate::stats_deck::stats_drawn_on(window))
+                && ((self.window_bars(*wid) == crate::stats_deck::StatsBars::Deck
+                    && crate::stats_deck::stats_drawn_on(window))
                     || window.stats_lens.open.is_some_and(|lens| {
                         lens.focus == crate::stats_paint::Instrument::NetworkState
                     }))
@@ -320,12 +321,12 @@ impl crate::App {
         if changed && self.lab_page_shown() {
             self.publish_native_lab_state();
         }
-        let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
         let windows: Vec<_> = self
             .windows
             .iter()
             .filter_map(|(id, window)| {
-                ((deck_shown && crate::stats_deck::stats_drawn_on(window))
+                ((self.window_bars(*id) == crate::stats_deck::StatsBars::Deck
+                    && crate::stats_deck::stats_drawn_on(window))
                     || window.stats_lens.open.is_some_and(|lens| {
                         lens.focus == crate::stats_paint::Instrument::NetworkState
                     }))

@@ -13,7 +13,7 @@ fn fill_scratch(app: &mut App, wid: WindowId) -> (usize, usize) {
         .expect("front terminal")
         .term
         .clone();
-    let ws = app.windows.get_mut(&wid).unwrap();
+    let mut ws = app.windows.get_mut(&wid).unwrap();
     let mut term = term_lock(&terminal);
     term.cell_frame_into(&mut ws.input_scratch, rows, cols);
     (rows, cols)
@@ -56,8 +56,8 @@ fn seed_query(app: &mut App, wid: WindowId, query: &str) {
     app.windows
         .get_mut(&wid)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .set_query(query.to_string());
 }
@@ -175,7 +175,8 @@ fn find_bar_100k_history_work_is_logarithmic_plus_visible() {
         let history = i32::try_from(n - rows).expect("bounded history fixture");
         let end_row = i32::try_from(rows).expect("bounded viewport rows");
         {
-            let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
+            let mut payload_guard_search = app.windows.get_mut(&wid).unwrap();
+            let search = payload_guard_search.routing.search_mut().unwrap();
             search.query = "x".into();
             search.matches = (-history..end_row).map(|row| (row, 0, 0)).collect();
             search.current = n - 1;
@@ -229,7 +230,8 @@ fn find_bar_owns_its_entire_effect_band_without_sparkle_or_sprite_bleed() {
     app.search_recompute();
     fill_scratch(&mut app, wid);
     let (_, ch) = app.win_cell_size(wid);
-    let input = &mut app.windows.get_mut(&wid).unwrap().input_scratch;
+    let mut input_guard = app.windows.get_mut(&wid).unwrap();
+    let input = &mut input_guard.input_scratch;
     input.ink.push(aterm_render::InkCell {
         row: 0,
         col: 0,
@@ -265,6 +267,7 @@ fn find_bar_owns_its_entire_effect_band_without_sparkle_or_sprite_bleed() {
         &mut input.fx_layers,
     );
 
+    drop(input_guard);
     app.splice_find_bar(wid);
     let input = &app.windows[&wid].input_scratch;
     assert!(input.ink.is_empty());
@@ -308,7 +311,8 @@ fn bottom_floated_find_bar_scrubs_upward_neighbour_decoration_spill() {
     let band_rows = crate::find_bar::FIND_BAR_ROWS;
     assert!(rows >= band_rows + 2);
     {
-        let search = app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap();
+        let mut payload_guard_search = app.windows.get_mut(&wid).unwrap();
+        let search = payload_guard_search.routing.search_mut().unwrap();
         search.query = "x".into();
         search.matches = vec![(0, 0, 0)];
         search.current = 0;
@@ -365,7 +369,13 @@ fn recompute_honors_case_and_regex_toggles() {
             .len()
     };
     let set = |app: &mut App, f: &mut dyn FnMut(&mut crate::app_search::SearchState)| {
-        f(app.windows.get_mut(&wid).unwrap().search.as_mut().unwrap());
+        f(app
+            .windows
+            .get_mut(&wid)
+            .unwrap()
+            .routing
+            .search_mut()
+            .unwrap());
     };
 
     set(&mut app, &mut |s| s.query = "foo".to_string());
@@ -674,7 +684,7 @@ fn find_bar_suppresses_stale_absolute_row_geometry() {
 
     fill_scratch(&mut app, wid);
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let search_revision = ws.search.as_ref().unwrap().match_absolute_row_revision;
         assert_eq!(
             ws.input_scratch.absolute_row_revision, search_revision,
@@ -1306,8 +1316,8 @@ fn find_again_never_reuses_an_absolute_anchor_from_another_session() {
     app.windows
         .get_mut(&first)
         .unwrap()
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .unwrap()
         .query = "hit".into();
     app.search_recompute();
@@ -2546,6 +2556,7 @@ fn a_regrid_leaves_the_find_bars_last_band_answering_nothing() {
     let set_laid = |app: &mut App, laid| {
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.find_bar_hit.as_mut())
             .expect("bar")
             .laid = laid;

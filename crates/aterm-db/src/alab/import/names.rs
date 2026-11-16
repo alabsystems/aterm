@@ -376,17 +376,10 @@ impl Planner<'_> {
                     .and_then(|values| values.get(column))
                     .is_some_and(|want| want.x == json!(node))
         };
-        let hosts: Vec<&str> = row
-            .get("hosts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .chain(
-                want.and_then(|values| values.get("hosts"))
-                    .and_then(|want| want.x.as_array()),
-            )
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
+        let mut hosts = cell::texts(row.fields.get("hosts"));
+        if wanted {
+            hosts.extend(self.wanted_texts(MACHINE.name, pk, "hosts"));
+        }
         let on_host = |host: &str| hosts.iter().any(|mine| same_host(mine, host));
         NameLinks::beside(&names, &self.links.nodes)
             .iter()
@@ -532,21 +525,23 @@ impl Planner<'_> {
 
     /// The live rows and this plan's rows holding one of `hosts`, with or without `.local`.
     fn rows_on_host(&self, hosts: &[&str]) -> BTreeSet<String> {
-        let holds = |list: Option<&Value>| {
-            list.and_then(Value::as_array).is_some_and(|list| {
-                list.iter()
-                    .filter_map(Value::as_str)
-                    .any(|held| hosts.iter().any(|host| same_host(held, host)))
-            })
+        let holds = |list: Vec<String>| {
+            list.iter()
+                .any(|held| hosts.iter().any(|host| same_host(held, host)))
         };
         let mut hits: BTreeSet<String> = self.current[MACHINE.name]
             .rows
             .iter()
-            .filter(|(_, row)| row.live() && holds(row.get("hosts")))
+            .filter(|(_, row)| row.live() && holds(cell::texts(row.fields.get("hosts"))))
             .map(|(pk, _)| pk.clone())
             .collect();
-        for (pk, row) in self.rows.get(MACHINE.name).into_iter().flatten() {
-            if holds(row.values.get("hosts").map(|want| &want.x)) {
+        for pk in self
+            .rows
+            .get(MACHINE.name)
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+        {
+            if holds(self.wanted_texts(MACHINE.name, pk, "hosts")) {
                 hits.insert(pk.clone());
             }
         }
@@ -929,25 +924,30 @@ impl Planner<'_> {
         Some(pk)
     }
 
-    /// The `hosts` cell to want of `pk` for a source stating `host`: what the row holds when it
-    /// answers that host in any spelling, so a register's fuller list is not rewritten; `None` when
-    /// another row answers it, a finding, since a Mac with that host could then adopt neither row.
-    pub(super) fn hosts_cell(&mut self, pk: &str, host: &str, at: &Coord) -> Option<Value> {
-        let held = self
-            .row_get(MACHINE.name, pk)
-            .and_then(|row| row.values.get("hosts"))
-            .map(|want| &want.x)
-            .or_else(|| self.current[MACHINE.name].rows.get(pk)?.get("hosts"))
-            .filter(|list| {
-                list.as_array().is_some_and(|list| {
-                    list.iter()
-                        .filter_map(Value::as_str)
-                        .any(|held| same_host(held, host))
-                })
-            })
-            .cloned();
-        if held.is_some() {
-            return held;
+    /// Want `host` among `pk`'s hosts for a source stating it. Where the row (or this plan)
+    /// answers that host in any spelling already, the source restates what is held, in its
+    /// spelling: the whole held list, so a register's fuller list is not rewritten, or the one
+    /// member, so a source that still states a host is never read as dropping it. Where another
+    /// row answers it, a finding instead, since a Mac with that host could then adopt neither
+    /// row. Else a generation holding a list wants the list `[host]`, and one holding a text set
+    /// the member, beside the others.
+    pub(super) fn want_host(&mut self, pk: &str, host: &str, at: &Coord) {
+        let mut held = self.wanted_texts(MACHINE.name, pk, "hosts");
+        if held.is_empty() {
+            held = self.current[MACHINE.name]
+                .rows
+                .get(pk)
+                .map(|row| cell::texts(row.fields.get("hosts")))
+                .unwrap_or_default();
+        }
+        if let Some(spelling) = held.iter().find(|held| same_host(held, host)) {
+            let restated = if self.text_set(&MACHINE, "hosts") {
+                vec![spelling.clone()]
+            } else {
+                held.clone()
+            };
+            self.texts(&MACHINE, pk, "hosts", restated, at);
+            return;
         }
         if self.rows_on_host(&[host]).iter().any(|hit| hit != pk) {
             self.findings.insert(Finding {
@@ -957,9 +957,9 @@ impl Planner<'_> {
                 column: Some("hosts".to_owned()),
                 at: vec![at.clone()],
             });
-            return None;
+            return;
         }
-        Some(json!([host]))
+        self.texts(&MACHINE, pk, "hosts", vec![host.to_owned()], at);
     }
 
     /// The row of a known Mac: by node, then host, then its label or an alias; else, where this run
@@ -1052,7 +1052,13 @@ impl Planner<'_> {
         }
         let hosts = valid_hosts(mac);
         if !hosts.is_empty() {
-            self.want(&MACHINE, &pk, "hosts", json!(hosts), &at);
+            self.texts(
+                &MACHINE,
+                &pk,
+                "hosts",
+                hosts.into_iter().map(str::to_owned).collect(),
+                &at,
+            );
         }
         for alias in &mac.aliases {
             self.alias_element(&pk, &alias.canonical(), &at);

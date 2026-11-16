@@ -235,3 +235,59 @@ fn a_session_on_no_rows_own_login_writes_nothing() {
         Ok(true)
     );
 }
+
+/// A CLAUDE CODE SESSION ON A ROW WHOSE LOGIN WAS NEVER MADE HERE WRITES NOTHING (FL-135): a
+/// session in the row's empty login directory (a launch on its fleet token, or one that found no
+/// login there) meets Claude Code's sign-in screen, which ends no login of the row's: no wall is
+/// written, so the row is not marked signed out and nothing asks for its sign-in here.
+/// NEGATIVE CONTROL: once a login is made in that directory, the same wall by the same call is
+/// written; without the enrolment filter `session_seen` took, the first call wrote it too (`left:
+/// Ok(true)`).
+#[test]
+fn a_claude_session_on_a_row_whose_login_was_never_made_here_writes_nothing() {
+    let world = World::new("login-seen-not-made");
+    let work = world.two(Cli::Claude);
+    let file = work.join(".credentials.json");
+    std::fs::remove_file(&file).expect("the stand-in login goes");
+    world.on_main(Cli::Claude, &[]);
+    let row = row_of(&world, Cli::Claude, "work");
+    let roster = world.seat().bound_roster(Cli::Claude).expect("roster");
+    assert!(!accounts::enrolled(&roster).contains("work"));
+    let before = std::fs::read(world.seat().store(Cli::Claude).ledger_path()).ok();
+    assert_eq!(
+        seen_on(
+            &world,
+            Cli::Claude,
+            &row,
+            Point::LoginEnded,
+            LoginSeen::Lost
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        std::fs::read(world.seat().store(Cli::Claude).ledger_path()).ok(),
+        before,
+        "nothing is written"
+    );
+    assert_ne!(
+        word_of(&world, Cli::Claude, &row),
+        accounts::Auth::SignedOut
+    );
+
+    std::fs::write(&file, "{}").expect("a login made here");
+    assert_eq!(
+        seen_on(
+            &world,
+            Cli::Claude,
+            &row,
+            Point::LoginEnded,
+            LoginSeen::Lost
+        ),
+        Ok(true),
+        "CONTROL: a login made here is signed out by its wall"
+    );
+    assert_eq!(
+        word_of(&world, Cli::Claude, &row),
+        accounts::Auth::SignedOut
+    );
+}

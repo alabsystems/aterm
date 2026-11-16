@@ -49,6 +49,12 @@ pub struct Screen {
     /// neither says anything about the program. It is the last title set in the tab, which outlives
     /// the program that set it, so it speaks only beside rows that program draws.
     pub title: Option<String>,
+    /// The OSC 7501 program-status report standing in the terminal (`"program_report"`), read in
+    /// the hold that read `rows`, as the body that says it (`state=<word>:app=<app>[:kind=<kind>]`):
+    /// `None` while none stands, and from a host (or a recorded tape) whose reply has no such
+    /// string. A reader whose program writes one takes its run sign from it before the title
+    /// ([`aterm_phase::ScreenReader::runs`]).
+    pub program_report: Option<String>,
 }
 
 /// Person-initiated launch witness metadata from `text --json`.
@@ -218,6 +224,10 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         inputs_before: inputs.and_then(|i| i[0].as_u64()),
         inputs_after: inputs.and_then(|i| i[1].as_u64()),
         title: v.get("title").and_then(Json::as_str).map(str::to_string),
+        program_report: v
+            .get("program_report")
+            .and_then(Json::as_str)
+            .map(str::to_string),
     })
 }
 

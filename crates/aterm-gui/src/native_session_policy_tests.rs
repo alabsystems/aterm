@@ -29,6 +29,7 @@ fn shipping_constructors() -> Vec<Constructor> {
 #[test]
 fn retained_service_requires_explicit_debug_factory_authorization() {
     assert!(!SessionPolicy::default().retained_constructor_enabled());
+    assert_eq!(SessionPolicy::default().retained_startup_mode(), "embedded");
     let fixture = fixture();
     let constructors = fixture.constructors();
     let policy = SessionPolicy {
@@ -36,12 +37,15 @@ fn retained_service_requires_explicit_debug_factory_authorization() {
         ..Default::default()
     };
     assert!(!policy.retained_constructor_enabled());
+    assert_eq!(policy.retained_startup_mode(), "embedded");
     constructors.set_enabled(&[Constructor::ColdRestart]);
     assert!(!policy.retained_constructor_enabled());
     constructors.set_enabled(&[Constructor::PrivateRestart]);
     assert!(policy.retained_constructor_enabled());
+    assert_eq!(policy.retained_startup_mode(), "retained");
     constructors.set_enabled(&[]);
     assert!(!policy.retained_constructor_enabled());
+    assert_eq!(policy.retained_startup_mode(), "embedded");
 }
 
 // Policy DTOs only: no test feeds these identities to a kernel/process proof.
@@ -113,9 +117,19 @@ fn fixture_catalog_uses_the_shipping_claim_grammar() {
         policy.read(holder, &["contract=3", "scope=walls,bogus"]),
         Words::Refused(_)
     ));
-    // The catalog is the fixture's alone: a holder the roster names and it does not is foreign.
+    // The catalog is the fixture's alone: a seed id the roster names and it does not has no row,
+    // so its claim is refused unregistered (never stored as a foreign claim taking every duty),
+    // with or without `contract=`; a holder no seed names is foreign.
     assert!(matches!(
         policy.read("grok-alab@42", &["contract=3", "scope=upgrade"]),
+        Words::Unregistered
+    ));
+    assert!(matches!(
+        policy.read("grok-alab@42", &[]),
+        Words::Unregistered
+    ));
+    assert!(matches!(
+        policy.read("other-alab@42", &["contract=3", "scope=upgrade"]),
         Words::Foreign
     ));
     assert!(matches!(
@@ -147,7 +161,10 @@ fn a_matching_path_without_the_captured_device_and_inode_is_not_allowed() {
     let mut other_path = image(11);
     other_path.path = b"/private/fixture/other-image".to_vec();
     assert!(!policy.target_image(&claude()[0], &other_path));
-    assert!(!policy.target_image(&contract::ROSTER[0], &image(11)));
+    assert!(!policy.target_image(
+        contract::row_named("grok-alab").expect("rostered"),
+        &image(11)
+    ));
 }
 
 fn native_reply(ctx: &Arc<crate::SessionCtx>, verb: &str) -> Reply {
@@ -184,7 +201,7 @@ fn a_session_policy_does_not_enable_its_sibling_and_disable_keeps_reconciliation
     // The sibling answers from the whole roster, which the one-row fixture did not narrow.
     assert!(
         matches!(native_reply(&sibling.ctx, "info"), Reply::Info { own_image, .. }
-        if own_image.len() == contract::ROSTER.len()
+        if own_image.len() == atpkg::harness_record::SEEDS.len()
             && own_image.iter().any(|row| row == "grok-alab"))
     );
     switch.set_enabled(&[]);
@@ -279,7 +296,7 @@ fn registration_prevents_later_install_even_after_exclusive_ownership_returns() 
     assert!(handle.ctx.native_policy.fixture.is_none());
     assert_eq!(
         handle.ctx.native_policy.rows().len(),
-        contract::ROSTER.len(),
+        atpkg::harness_record::SEEDS.len(),
         "the refused fixture's one-row catalog is not the session's"
     );
 }
@@ -305,10 +322,7 @@ fn native_act_info_names_claude_code_alab_for_upgrade_and_enables_no_constructor
     );
     assert_eq!(
         rows.split(',').count(),
-        contract::ROSTER
-            .iter()
-            .filter(|row| row.allows.contains(&Scope::Upgrade))
-            .count(),
+        atpkg::harness_record::SEEDS.len(),
         "one entry for each row that may claim upgrade: {line}"
     );
     assert!(
@@ -371,4 +385,45 @@ fn fixture_policy_refuses_ambiguous_or_unbounded_catalogs() {
         )
         .is_err()
     );
+}
+
+/// A TEST BINARY'S REGISTRY IS THE SEEDS': the window's tests read no store and no aterm.toml,
+/// so what they assert of `registry::current()` (the counts above, a seed's row by name, a
+/// seed's claim proven) holds whatever the machine running them holds, and the strip list they
+/// install is the default. NEGATIVE CONTROL (2026-11-14): while only aterm-agent's own unit
+/// tests read no store, the aterm.toml below made this binary's list `ZZONLY_` alone.
+#[test]
+fn a_test_binarys_registry_is_the_seeds_whatever_the_machine_holds() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
+        let path = atpkg::config::config_path().expect("a config path");
+        std::fs::create_dir_all(path.parent().expect("its folder")).expect("the folder");
+        std::fs::write(
+            &path,
+            "shell_env_strip = [\"ZZONLY_\"]\n\n[harness]\ndev = [\"agy-alab\"]\n",
+        )
+        .expect("aterm.toml");
+        assert_eq!(
+            atpkg::config::load_harness().env_strip,
+            Some(vec!["ZZONLY_".to_string()]),
+            "CONTROL: the file reads"
+        );
+        let registry = aterm_agent::harness::registry::current();
+        let ids: Vec<&str> = registry.rows().iter().map(|row| row.id).collect();
+        let mut seeds: Vec<&str> = atpkg::harness_record::SEEDS.iter().map(|s| s.id).collect();
+        seeds.sort_unstable();
+        assert_eq!(ids, seeds);
+        assert_eq!(
+            *registry.env_strip(),
+            aterm_types::domain::EnvStrip::default()
+        );
+        assert_eq!(
+            *aterm_types::domain::effective_env_strip(),
+            aterm_types::domain::EnvStrip::default(),
+            "the list it installs"
+        );
+    });
 }

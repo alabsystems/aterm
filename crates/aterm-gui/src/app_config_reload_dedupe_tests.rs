@@ -358,7 +358,7 @@ fn byte_equal_reload_still_rereads_touched_path_feed_files() {
     };
     let wid = crate::WindowId(0);
     let seed_scan = |app: &mut crate::App| {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.fx.decos_mut().rescan_from_cells(
             &[],
             &[],

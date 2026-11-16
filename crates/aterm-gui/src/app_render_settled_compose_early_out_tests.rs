@@ -87,7 +87,7 @@ fn split_settles_and_every_real_change_still_repaints() {
     settle(&mut app, wid, &mut now);
 
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.blink_phase = !ws.blink_phase;
     }
     now += Duration::from_millis(16);

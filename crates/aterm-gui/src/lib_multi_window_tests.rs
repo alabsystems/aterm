@@ -5,12 +5,12 @@ use super::{App, CloseOutcome, GestureOrigin, SelectionType, WindowId, stub_sess
 use std::time::{Duration, Instant};
 
 fn materialize_resident_pet(app: &mut App, wid: WindowId, now: Instant) {
-    let ws = app.windows.get_mut(&wid).expect("test window");
+    let mut ws = app.windows.get_mut(&wid).expect("test window");
     ws.fx
         .companion_mut()
         .set_species(aterm_effects::kitty_pet::PetSpecies::Dog);
     let frame = crate::app_render::pet_tick_for_test(
-        ws,
+        &mut ws,
         aterm_effects::host::CaptureMode::StaticCapture,
         aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
@@ -34,7 +34,7 @@ fn materialize_resident_pet(app: &mut App, wid: WindowId, now: Instant) {
 }
 
 fn earn_flying_cursor_cat(app: &mut App, wid: WindowId, now: Instant) {
-    let ws = app.windows.get_mut(&wid).expect("test window");
+    let mut ws = app.windows.get_mut(&wid).expect("test window");
     for i in 0..120 {
         ws.fx
             .companions_mut()
@@ -234,6 +234,7 @@ fn native_tab_install_and_close_are_atomic_without_a_pty_mirror() {
     let removed = app
         .windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|ws| ws.tab_set.remove(tab_id))
         .expect("installed stable tab");
     assert_eq!(removed.root.leaves(), vec![view_id]);
@@ -1195,7 +1196,7 @@ fn queued_tab_menu_preflight_settles_only_the_named_source_rename() {
             assert!(!other_draft.as_ref().unwrap().text.is_empty());
             let before_meta = (tab_menu_metadata(&app, 0), tab_menu_metadata(&app, sid_b));
             let at = Instant::now();
-            for ws in app.windows.values_mut() {
+            for mut ws in app.windows.values_mut() {
                 ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
                 ws.fx.cursor_mut().trail.note_typed(at);
                 assert!(ws.fx.cursor().glow.move_licensed(at));
@@ -1245,7 +1246,7 @@ fn queued_tab_menu_preflight_settles_only_the_named_source_rename() {
             if app.windows[&source].rename_edit.is_some() {
                 violations.push(format!("{action:?}/{field:?}: source draft stayed open"));
             }
-            if app.windows[&other].rename_edit != other_draft
+            if app.windows[&other].rename_edit.as_ref() != other_draft.as_ref()
                 || tab_menu_metadata(&app, sid_b) != before_meta.1
             {
                 violations.push(format!(
@@ -1326,7 +1327,7 @@ fn stale_tab_menu_preflight_preserves_replacement_drafts_and_licenses() {
             }
             assert_eq!(app.front_rename_edit(), Some(other));
             let at = Instant::now();
-            for ws in app.windows.values_mut() {
+            for mut ws in app.windows.values_mut() {
                 ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
                 ws.fx.cursor_mut().trail.note_typed(at);
                 assert!(ws.fx.cursor().glow.move_licensed(at));
@@ -1438,7 +1439,7 @@ fn queued_tab_menu_rename_preflight_is_idempotent_in_its_source_window() {
         );
         let metadata = (tab_menu_metadata(&app, 0), tab_menu_metadata(&app, sid_b));
         let at = Instant::now();
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
             ws.fx.cursor_mut().trail.note_typed(at);
             assert!(ws.fx.cursor().glow.move_licensed(at));
@@ -1702,7 +1703,7 @@ fn stale_native_tab_commands_preserve_replacement_drafts_and_licenses() {
                 }
             }
             let at = Instant::now();
-            for ws in app.windows.values_mut() {
+            for mut ws in app.windows.values_mut() {
                 ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
                 ws.fx.cursor_mut().trail.note_typed(at);
                 assert!(ws.fx.cursor().glow.move_licensed(at));
@@ -1849,7 +1850,7 @@ fn native_tab_drags_require_the_original_adjacent_pair_in_its_window() {
                 ));
             }
             let at = Instant::now();
-            for ws in app.windows.values_mut() {
+            for mut ws in app.windows.values_mut() {
                 ws.fx.cursor_mut().glow.note_typed_cells(at, 1);
                 ws.fx.cursor_mut().trail.note_typed(at);
                 assert!(ws.fx.cursor().glow.move_licensed(at));
@@ -2068,7 +2069,7 @@ fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
             sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
             sel.update_selection(0, 4, SelectionSide::Right);
         }
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
         ws.selecting = true;
         ws.sel_dragged = true;
     }
@@ -2104,7 +2105,7 @@ fn copy_on_select_fires_only_on_completed_drag_when_enabled() {
     let mut app = App::headless_for_test();
     app.copy_on_select = true;
     {
-        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+        let mut ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
         ws.selecting = true;
         ws.sel_dragged = false; // a press+release within one cell: a deselecting click
     }
@@ -2257,7 +2258,7 @@ fn pane_space_change_retires_only_departed_panes() {
             .expect("front terminal")
             .term
             .clone();
-        let Some(ws) = app.windows.get_mut(&wid) else {
+        let Some(mut ws) = app.windows.get_mut(&wid) else {
             panic!("window 0")
         };
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
@@ -2653,7 +2654,7 @@ fn divider_drag_resizes_split_headless() {
         .cols;
     assert_eq!(left_before, 40, "fresh split is 50/50");
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 10);
     }
     assert!(
@@ -2662,7 +2663,7 @@ fn divider_drag_resizes_split_headless() {
     );
     assert!(app.windows[&wid].divider_drag.is_none());
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 40);
     }
     assert!(
@@ -2671,7 +2672,7 @@ fn divider_drag_resizes_split_headless() {
     );
     assert!(app.windows[&wid].divider_drag.is_some());
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 20);
     }
     app.drag_divider(wid);
@@ -2694,7 +2695,7 @@ fn divider_drag_resizes_split_headless() {
         );
     }
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 0);
     }
     app.drag_divider(wid);
@@ -2751,7 +2752,7 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
         let glow_cfg = app.glow_config();
         let (mut glow_out, mut trail_out) = (Vec::new(), Vec::new());
         let seed = Instant::now();
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let cursor = ws.fx.cursor_mut();
         cursor
             .glow
@@ -2759,6 +2760,7 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
         cursor
             .trail
             .tick(Some(cell), seed, &trail_cfg, &mut trail_out);
+        drop(ws);
         assert!(app.apply_term_resize(wid, rows, cols), "geometry applies");
         assert!(
             !app.windows[&wid].fx.cursor().glow.reflow_hint_armed(),
@@ -2772,7 +2774,7 @@ fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
             (after.row, after.col)
         };
         let moved = seed + Duration::from_millis(4);
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         let cursor = ws.fx.cursor_mut();
         let geom = geom(usize::from(rows), usize::from(cols));
         let fp = (
@@ -2839,7 +2841,7 @@ fn an_all_tabs_width_settle_returns_every_panes_history() {
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = 24;
         ws.cols = 100;
     }
@@ -2876,7 +2878,7 @@ fn an_all_tabs_width_settle_returns_every_panes_history() {
         "every pane must own real off-screen history before the settle"
     );
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.cols = 72;
     }
     app.resize_panes_scoped(wid, false);
@@ -2912,7 +2914,7 @@ fn a_scoped_resize_still_reaches_a_shared_background_tab() {
     let other = app
         .open_active_session_in_new_window_logical()
         .expect("the front window has an active session to share");
-    if let Some(ws) = app.windows.get_mut(&other) {
+    if let Some(mut ws) = app.windows.get_mut(&other) {
         ws.rows = 20;
         ws.cols = 60;
     }
@@ -2924,7 +2926,7 @@ fn a_scoped_resize_still_reaches_a_shared_background_tab() {
         let t = super::term_lock(&app.pool.get(id).expect("pooled session").term);
         (t.rows(), t.cols())
     };
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = 30;
         ws.cols = 100;
     }
@@ -3204,34 +3206,74 @@ fn the_title_drift_gate_fires_for_a_newly_labeling_window_and_not_otherwise() {
         "an unchanged session must not go pending"
     );
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.tab_title_epochs.remove(&0);
     }
     let later = quiet + std::time::Duration::from_millis(500);
     app.observe_title_drift(0, later);
     assert_eq!(
+        app.windows[&wid].tab_title_epochs.get(&0),
+        Some(&live),
+        "owed delivery is repaired immediately at the same epoch"
+    );
+    assert_eq!(
         app.title_drift.last_flush.get(&0).copied(),
-        Some(later),
-        "past the debounce interval, a newly labeling window flushes at once"
+        flushed_at,
+        "topology delivery does not advance ordinary drift pacing"
     );
     assert!(
         !app.title_drift.pending.contains(&0),
-        "an immediate flush leaves nothing pending"
+        "successful topology delivery leaves nothing pending"
     );
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.tab_title_epochs.remove(&0);
-    }
-    let debounced = later + std::time::Duration::from_millis(10);
+    // Establish a new ordinary flush, then join again inside its debounce interval.
+    app.pool
+        .get(0)
+        .unwrap()
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\x1b]2;real epoch drift\x07");
+    let accepted = later + std::time::Duration::from_millis(1);
+    app.observe_title_drift(0, accepted);
+    let accepted_epoch = app.title_drift.seen[&0];
+    assert_ne!(accepted_epoch, live);
+    assert_eq!(app.title_drift.last_flush.get(&0).copied(), Some(accepted));
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .tab_title_epochs
+        .remove(&0);
+    let debounced = accepted + std::time::Duration::from_millis(10);
     app.observe_title_drift(0, debounced);
     assert_eq!(
-        app.title_drift.last_flush.get(&0).copied(),
-        Some(later),
-        "within the debounce interval, the gate defers the flush"
+        app.windows[&wid].tab_title_epochs.get(&0),
+        Some(&accepted_epoch),
+        "same-epoch delivery cannot wait for ordinary drift debounce"
     );
-    assert!(
-        app.title_drift.pending.contains(&0),
-        "within the debounce interval, the session is marked pending"
+    assert_eq!(app.title_drift.last_flush.get(&0).copied(), Some(accepted));
+    assert!(!app.title_drift.pending.contains(&0));
+
+    // A genuine new terminal epoch still waits on the ordinary pacing lane.
+    app.pool
+        .get(0)
+        .unwrap()
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\x1b]2;next real drift\x07");
+    app.observe_title_drift(0, debounced + std::time::Duration::from_millis(10));
+    assert_eq!(app.title_drift.last_flush.get(&0).copied(), Some(accepted));
+    assert!(app.title_drift.pending.contains(&0));
+    assert_eq!(
+        app.windows[&wid].tab_title_epochs.get(&0),
+        Some(&accepted_epoch)
+    );
+    app.observe_title_drift(0, accepted + super::DRIFT_REFRESH_MIN_INTERVAL);
+    assert!(!app.title_drift.pending.contains(&0));
+    assert_ne!(
+        app.windows[&wid].tab_title_epochs.get(&0),
+        Some(&accepted_epoch)
     );
 }
 
@@ -3254,7 +3296,7 @@ fn live_drag_resize_scopes_to_active_tab_then_flushes_on_switch() {
     );
     assert_eq!(size(&app, 1), (24, 80));
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.rows = 30;
         ws.cols = 100;
     }
@@ -3625,14 +3667,14 @@ fn on_focus_loss_clears_stuck_pointer_gesture() {
     let new_sid = app.split_active_stub_tab(WindowId(0)); // divider @ col 40
     let wid = WindowId(0);
 
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.last_mouse_window_cell = (5, 40);
     }
     assert!(
         app.begin_divider_drag(wid),
         "press on the divider arms a drag"
     );
-    if let Some(ws) = app.windows.get_mut(&wid) {
+    if let Some(mut ws) = app.windows.get_mut(&wid) {
         ws.selecting = true;
         ws.gesture = Some(GestureOrigin {
             row: 0,
@@ -3703,7 +3745,7 @@ fn on_focus_loss_embers_the_rainbow_ribbon_instead_of_cutting_it() {
     app.cursor_frame(wid, seed).expect("seed cursor engines");
     let typed = t0 + Duration::from_millis(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.last_key_at = Some(typed);
         ws.fx.cursor_mut().cadence.on_keystroke(typed);
         ws.fx.cursor_mut().glow.note_typed(typed);
@@ -3754,13 +3796,14 @@ fn on_focus_loss_pauses_collection_hello_before_any_redraw() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let t0 = Instant::now();
-    let Some(ws) = app.windows.get_mut(&wid) else {
+    let Some(mut ws) = app.windows.get_mut(&wid) else {
         panic!("headless fixture has window 0");
     };
     ws.fx
         .companions_mut()
         .cursor_cat
         .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
+    drop(ws);
     assert!(
         app.windows[&wid]
             .fx
@@ -3781,7 +3824,7 @@ fn on_focus_loss_pauses_collection_hello_before_any_redraw() {
         None,
         "an unfocused hello arms no wall-clock wake"
     );
-    let Some(ws) = app.windows.get_mut(&wid) else {
+    let Some(mut ws) = app.windows.get_mut(&wid) else {
         panic!("headless fixture retains window 0");
     };
     assert!(
@@ -3817,9 +3860,9 @@ fn pane_and_tab_owner_switches_retire_only_coordinate_bound_companions() {
         assert_cursor_companion_owner_transition(&model, "Materialize", &cold, &materialized);
         earn_flying_cursor_cat(&mut app, wid, now);
         {
-            let ws = app.windows.get_mut(&wid).expect("test window");
+            let mut ws = app.windows.get_mut(&wid).expect("test window");
             let seeded = crate::app_render::pet_prepare_for_test(
-                ws,
+                &mut ws,
                 now,
                 old_session,
                 Some((4, 12)),
@@ -3872,9 +3915,14 @@ fn pane_and_tab_owner_switches_retire_only_coordinate_bound_companions() {
             !ws.fx.companions().cursor_cat.is_active(),
             "an ordinary cursor-owned flight cannot jump to the new owner"
         );
-        let ws = app.windows.get_mut(&wid).expect("test window");
-        let probe =
-            crate::app_render::pet_prepare_for_test(ws, now, old_session, None, Some((8, 1, None)));
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
+        let probe = crate::app_render::pet_prepare_for_test(
+            &mut ws,
+            now,
+            old_session,
+            None,
+            Some((8, 1, None)),
+        );
         assert_eq!(
             probe.completion, None,
             "the old stream's completion replayed"
@@ -3887,13 +3935,8 @@ fn pane_and_tab_owner_switches_retire_only_coordinate_bound_companions() {
     promised.split_active_stub_tab(wid);
     let now = Instant::now();
     {
-        let cat = &mut promised
-            .windows
-            .get_mut(&wid)
-            .expect("test window")
-            .fx
-            .companions_mut()
-            .cursor_cat;
+        let mut window = promised.windows.get_mut(&wid).expect("test window");
+        let cat = &mut window.fx.companions_mut().cursor_cat;
         cat.on_collect(now, aterm_effects::kitty_registry::KittyLook::default());
         cat.on_motion_pulse(aterm_effects::cursor_glow::CursorCatMotionPulse {
             at: now,
@@ -3953,13 +3996,13 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
     };
     assert!(!initial_alt, "fixture begins on the main screen");
     assert!(!crate::app_render::sync_cursor_effect_coordinate_space(
-        app.windows.get_mut(&wid).expect("test window"),
+        &mut app.windows.get_mut(&wid).expect("test window"),
         terminal_id,
         initial_alt,
     ));
 
     {
-        let ws = app.windows.get_mut(&wid).expect("test window");
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
         let repeats = aterm_effects::kitty_sing::SING_ARM_REPEATS;
         for i in 0..repeats {
             ws.fx.companions_mut().kitty_sing.note_char(
@@ -3994,7 +4037,7 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         materialize_resident_pet(&mut app, wid, now);
         earn_flying_cursor_cat(&mut app, wid, now);
         {
-            let ws = app.windows.get_mut(&wid).expect("test window");
+            let mut ws = app.windows.get_mut(&wid).expect("test window");
             ws.fx.companions_mut().cursor_cat.on_motion_pulse(
                 aterm_effects::cursor_glow::CursorCatMotionPulse {
                     at: now,
@@ -4010,7 +4053,7 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
                     .is_some()
             );
             let seeded = crate::app_render::pet_prepare_for_test(
-                ws,
+                &mut ws,
                 now,
                 session,
                 Some((4, 12)),
@@ -4028,7 +4071,7 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         assert_eq!(next_terminal_id, terminal_id, "same terminal identity");
         assert_eq!(next_alt, expected_alt, "screen edge reached");
         assert!(crate::app_render::sync_cursor_effect_coordinate_space(
-            app.windows.get_mut(&wid).expect("test window"),
+            &mut app.windows.get_mut(&wid).expect("test window"),
             next_terminal_id,
             next_alt,
         ));
@@ -4078,9 +4121,14 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         );
         assert!(ws.fx.companions().music_notes.is_active());
         assert_eq!(ws.fx.companions().sing_riff_bar, Some(7));
-        let ws = app.windows.get_mut(&wid).expect("test window");
-        let probe =
-            crate::app_render::pet_prepare_for_test(ws, now, session, None, Some((8, 1, None)));
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
+        let probe = crate::app_render::pet_prepare_for_test(
+            &mut ws,
+            now,
+            session,
+            None,
+            Some((8, 1, None)),
+        );
         assert_eq!(
             probe.completion, None,
             "the old stream's completion replayed"
@@ -4287,7 +4335,7 @@ fn shared_target_geometry_uses_foreground_viewers_only() {
         .open_active_session_in_new_window_logical()
         .expect("share session 0 into window B");
     assert_eq!(app.pool.views(0), Some(2));
-    if let Some(ws) = app.windows.get_mut(&bwid) {
+    if let Some(mut ws) = app.windows.get_mut(&bwid) {
         ws.rows = 60;
         ws.cols = 200;
     }

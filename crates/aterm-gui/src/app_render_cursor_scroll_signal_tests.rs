@@ -27,7 +27,7 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
 
     let mut term = Terminal::new(10, 40);
     term.process(b"the quick brown fox");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx.set_scroll_baseline(Some(term.content_scroll_state()));
     let mut out = Vec::new();
     ws.fx
@@ -62,7 +62,7 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
             ContentScrollDelta::Unchanged,
             "{spelling:?} rewrites cells in place; it is not a coordinate change"
         );
-        let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+        let change = sync_cursor_effect_scroll(&mut ws, term.content_scroll_state());
         assert!(
             !change.invalidated,
             "{spelling:?} must not retire the cursor effects"
@@ -86,7 +86,7 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
         },
         "a region scroll is an exact row-band translate"
     );
-    let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+    let change = sync_cursor_effect_scroll(&mut ws, term.content_scroll_state());
     assert!(!change.invalidated, "an explained band never retires");
     assert_eq!(change.band_moves, 1);
     assert!(change.changed(), "the coordinates under the light did move");
@@ -174,7 +174,7 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
 
     let mut term = Terminal::new(20, 40);
     term.process(b"the quick brown fox");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx.set_scroll_baseline(Some(term.content_scroll_state()));
     let before = term.content_scroll_state();
     let mut out = Vec::new();
@@ -221,7 +221,7 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     let decision = ContentScrollState::delta_since(Some(before), seventeen);
     assert_eq!(decision, ContentScrollDelta::Invalidate);
 
-    let change = sync_cursor_effect_scroll(ws, seventeen);
+    let change = sync_cursor_effect_scroll(&mut ws, seventeen);
     assert!(change.invalidated);
     assert_eq!(change.band_moves, 0);
     assert!(
@@ -380,7 +380,7 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
         .ring_buffer_size(1000)
         .build();
     term.process(b"\x1b[27;10H");
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx.set_scroll_baseline(Some(term.content_scroll_state()));
     let mut out = Vec::new();
     let mut unmoved = crate::cursor_glow::CursorGlow::default();
@@ -420,7 +420,7 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
     for (k, (dt_ms, bytes)) in CODEX_STREAM.iter().enumerate() {
         let at = t_stream + Duration::from_millis(*dt_ms);
         term.process(bytes);
-        let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+        let change = sync_cursor_effect_scroll(&mut ws, term.content_scroll_state());
         assert!(
             !change.invalidated,
             "record {k}: a real Codex write retired the cursor effects"
@@ -516,12 +516,12 @@ fn invalidation_runs_before_current_alt_context_and_drops_old_blink() {
         head: 0,
     };
     let now = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx
         .set_scroll_baseline(Some(ContentScrollState::default()));
     ws.fx.cursor_mut().glow.note_repaint_blink(now);
     let change = sync_cursor_effect_scroll(
-        ws,
+        &mut ws,
         ContentScrollState {
             uniform_up_rows: 0,
             invalidation_epoch: 1,

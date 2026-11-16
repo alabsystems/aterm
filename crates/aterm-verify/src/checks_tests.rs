@@ -64,7 +64,7 @@ fn the_release_is_its_tree_half_and_its_timed_bundle_half() {
     assert_eq!(RELEASE[RELEASE_TREE.len()..], RELEASE_BUNDLE);
     assert!(RELEASE_TREE.iter().all(|c| !RELEASE_BUNDLE.contains(c)));
     for c in RELEASE {
-        let timed = stages_of(&[c]).into_iter().any(StageId::timed);
+        let timed = stages_of(&[c], false).into_iter().any(StageId::timed);
         assert_eq!(RELEASE_BUNDLE.contains(&c), timed, "{c:?}");
     }
 }

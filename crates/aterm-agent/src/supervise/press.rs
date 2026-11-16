@@ -779,6 +779,35 @@ impl<C: Ctl> Session<'_, C> {
         Err(Fail::Hard(why))
     }
 
+    /// THE READ A FOCUS ARROW IS FOLLOWED BY: the first read, after the arrow accepted at screen
+    /// `at`, whose focused option is no longer `from`, the one the arrow left. Each wait is for
+    /// the screen to move, never for it to hold still: a dialog over a ticking screen never
+    /// holds still, and a dialog that does costs its answer the whole quiet (500 ms an arrow,
+    /// measured on Claude Code's folder-trust dialog, which a person answers in about a second).
+    /// The key that follows is fenced on this read's generation, so a screen that moves again
+    /// before it skips the key and the box is decided again. After [`SETTLE_CAP`] with the focus
+    /// where it was, the last read is returned as it is, and the caller reads it as an arrow
+    /// that went nowhere.
+    fn read_past_arrow(
+        &mut self,
+        at: u64,
+        from: Option<&str>,
+        focused_on: &dyn Fn(&[String]) -> Option<String>,
+    ) -> Result<Screen, Fail> {
+        let until = self.fx.mono() + SETTLE_CAP;
+        let mut at = at;
+        loop {
+            let left = until.saturating_duration_since(self.fx.mono());
+            let moved = !left.is_zero()
+                && matches!(self.wait(&["seq", &at.to_string()], left)?, Wait::Latched);
+            let now = self.screen()?;
+            if !moved || now.seq <= at || focused_on(&now.rows).as_deref() != from {
+                return Ok(now);
+            }
+            at = now.seq;
+        }
+    }
+
     /// Answer a focus-driven dialog.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn press_focused(
@@ -822,6 +851,7 @@ impl<C: Ctl> Session<'_, C> {
         let before = focused_on(&seen.rows);
         let mut now = seen.clone();
         for _ in 0..steps.unsigned_abs() {
+            let from = focused_on(&now.rows);
             let Some(generation) = now.generation.clone() else {
                 return unconfirmed("the read carried no screen generation to fence on");
             };
@@ -846,9 +876,7 @@ impl<C: Ctl> Session<'_, C> {
             if r.skipped() {
                 return Ok(Pressing::Done(Press::Skipped { seq: at }));
             }
-            self.wait(&["seq", &at.to_string()], STRAY_SETTLE)?;
-            self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-            now = self.screen()?;
+            now = self.read_past_arrow(at, from.as_deref(), &focused_on)?;
         }
         let reading = aterm_phase::read(self.program.as_deref(), &now.rows, None);
         let focused = reading.prompt.as_ref().and_then(|q| {
@@ -878,13 +906,20 @@ impl<C: Ctl> Session<'_, C> {
             return unconfirmed("the read carried no screen generation to fence on");
         };
         let enter_guard = alab_policy::guard::row_guard(&now.rows[focused.row]);
+        // The Enter is fenced on the person count the read that saw the focus land carried: a
+        // gesture counted between an arrow and that read left the focus where the arrow put it,
+        // so it moved nothing on the box; one after that read stops the Enter.
+        let landed = match (person, now.human_seq) {
+            (Some(_), Some(n)) => Some(n),
+            (judged, _) => judged,
+        };
+        let enter_args = alab_policy::guard::key_args(&enter_guard, key, Some(&generation));
         let args = self.acting(
             act,
-            fenced(alab_policy::guard::key_args(
-                &enter_guard,
-                key,
-                Some(&generation),
-            )),
+            match landed {
+                Some(n) => format!("if-human={n} {enter_args}"),
+                None => enter_args,
+            },
         );
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));

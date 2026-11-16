@@ -128,6 +128,7 @@ fn an_adapter_row_reads_as_its_link() {
         link,
         LinkReading {
             name: "Wi-Fi".to_owned(),
+            byte_counter: crate::LinkByteCounter::Cumulative64,
             index: 14,
             kind: LinkKind::Wifi,
             up: true,

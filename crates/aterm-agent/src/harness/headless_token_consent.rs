@@ -116,20 +116,9 @@ impl<'a> TokenRequest<'a> {
     }
 }
 
-/// The widgets of the human checks a page holds an action behind, as aterm's sign-in window
-/// reads them (`signin_window`'s `humanCheck`): hCaptcha's, reCAPTCHA's and Cloudflare
-/// Turnstile's response field or frame, as one CSS selector list.
-macro_rules! human_check_widgets {
-    () => {
-        "textarea[name='h-captcha-response'], iframe[src*='hcaptcha.com'], \
-         textarea[name='g-recaptcha-response'], iframe[src*='recaptcha'], \
-         input[name='cf-turnstile-response'], iframe[src*='challenges.cloudflare.com']"
-    };
-}
-
 /// Reads a token's consent page: [`super::VENDOR_PAGE_JS`]'s [`Page`], with whether a human
-/// check's widget is in it (`humanCheck`, [`human_check_widgets`]). It reads only that the
-/// widget is there, and sets and presses nothing.
+/// check's widget is in it (`humanCheck`, [`super::HUMAN_CHECK_WIDGETS`]). It reads only that
+/// the widget is there, and sets and presses nothing.
 pub(in crate::harness) const TOKEN_PAGE_JS: &str = concat!(
     "(() => { const page = ",
     vendor_page_js!(),

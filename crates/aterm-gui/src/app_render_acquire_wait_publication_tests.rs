@@ -50,7 +50,8 @@ fn surface_results_route_and_publish_only_completed_waits() {
             })
             .expect_err("a temporarily unavailable surface");
         app.handle_failed_present(id, reason, before);
-        let retry = &mut app.windows.get_mut(&id).expect("the window").present_retry;
+        let mut retry_guard = app.windows.get_mut(&id).expect("the window");
+        let retry = &mut retry_guard.present_retry;
         let due = retry.deadline.expect("another attempt without input");
         assert!(due > before, "the retry is strictly future");
         assert!(!retry.present_attempt_allowed());
@@ -58,10 +59,12 @@ fn surface_results_route_and_publish_only_completed_waits() {
         assert!(retry.present_attempt_allowed());
     }
     app.handle_failed_present(id, Reason::GpuUnavailable, crate::Instant::now());
-    let retry = &mut app.windows.get_mut(&id).expect("the window").present_retry;
+    let mut retry_guard = app.windows.get_mut(&id).expect("the window");
+    let retry = &mut retry_guard.present_retry;
     assert!(retry.parked, "exhaustion cannot spin");
     assert!(retry.deadline.is_none());
     assert!(retry.on_external_stimulus());
+    drop(retry_guard);
     app.handle_failed_present(id, Reason::GpuValidation, crate::Instant::now());
     let retry = &app.windows[&id].present_retry;
     assert!(retry.parked, "validation still waits for external input");

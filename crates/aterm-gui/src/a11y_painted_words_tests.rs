@@ -92,10 +92,12 @@ fn a_session_field_holds_the_focus_and_reads_what_is_typed() {
     app.redraw_window(WID);
     let rename = item_named(sent(&app), "Rename Session\u{2026}");
     press(&mut app, rename);
-    let window = app.windows.get_mut(&WID).unwrap();
-    let edit = window.rename_edit.as_mut().unwrap();
-    edit.text = "build".to_owned();
-    edit.cursor = 2;
+    {
+        let mut window = app.windows.get_mut(&WID).unwrap();
+        let mut edit = window.routing.rename_mut().unwrap();
+        edit.text = "build".to_owned();
+        edit.cursor = 2;
+    }
     app.redraw_window(WID);
 
     let tree = sent(&app);
@@ -113,8 +115,9 @@ fn a_press_on_a_row_of_a_menu_that_changed_does_nothing() {
     assert!(app.open_tab_context_menu(WID, 0, 3, true));
     app.redraw_window(WID);
     let rename = item_named(sent(&app), "Rename Session\u{2026}");
-    let window = app.windows.get_mut(&WID).unwrap();
-    window.tab_menu.as_mut().unwrap().entries.reverse();
+    let mut window = app.windows.get_mut(&WID).unwrap();
+    window.routing.menu_mut().unwrap().entries.reverse();
+    drop(window);
 
     press(&mut app, rename);
 
@@ -345,7 +348,11 @@ fn a_composition_in_the_find_field_reads_in_the_field() {
     let mut search = crate::app_search::SearchState::default();
     search.query = "ab".to_owned();
     search.cursor = 1;
-    app.windows.get_mut(&WID).unwrap().search = Some(search);
+    app.windows
+        .get_mut(&WID)
+        .unwrap()
+        .routing
+        .set_search(Some(search));
 
     app.on_ime_preedit(WID, "\u{65e5}\u{672c}".to_owned(), None);
 

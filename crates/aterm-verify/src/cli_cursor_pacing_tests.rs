@@ -56,3 +56,30 @@ fn focused_measurement_cannot_replace_release_qualification() {
         assert!(super::parse(bad).is_err());
     }
 }
+
+#[test]
+fn debug_artifact_validation_is_explicit_and_never_qualifies_a_release() {
+    let args = super::parse(["measure", "--app", "/debug.app", "--app-profile", "debug"]).unwrap();
+    assert_eq!(args.app_profile, crate::artifact::Profile::Debug);
+    assert_eq!(
+        super::parse(["measure", "--app", "/release.app"])
+            .unwrap()
+            .app_profile,
+        crate::artifact::Profile::Release
+    );
+    for bad in [
+        vec!["release", "--app", "/debug.app", "--app-profile", "debug"],
+        vec![
+            "measure",
+            "test",
+            "--app",
+            "/debug.app",
+            "--app-profile",
+            "debug",
+        ],
+        vec!["measure", "--app-profile", "debug"],
+        vec!["measure", "--app", "/debug.app", "--app-profile", "unknown"],
+    ] {
+        assert!(super::parse(bad).is_err());
+    }
+}

@@ -10,6 +10,18 @@
 //! cargo config reaches it. A machine whose pin lacks a cell's std or clippy has that cell
 //! COULD NOT RUN, naming `verify provision`: no other toolchain stands in, so one tree's verdict
 //! is the same on every Mac whatever rustup's floating `stable` is there.
+//!
+//! Each cell builds in a directory of its own in the cells lane (`cell_dir`), and the run keeps a
+//! record of what it used there as it does of its main lane's ([`crate::disk`]): each cargo call
+//! notes the units its messages name and the workspace's members it built (`cargo_call`), a cell
+//! whose row passed closes its note (`close_passed`), and at the run's end the record is kept at
+//! the directory's top and the directory is trimmed by the main lane's rule, a stock toolchain's
+//! units as Trust's (`atpkg::build_cache::stale::decide`, `atpkg::build_cache::trim_run_end`): a
+//! unit of a member that an earlier run of the same checks used there and no kept run uses goes
+//! where a kept run uses another unit of its package and kind. A dependency's unit stays, as it
+//! does in the main lane's, though a lock change or a move of the stock pin replaced it. A cell
+//! that failed, could not run, or was cut short keeps no record and trims nothing, and no row
+//! reads the record or the trim.
 use aterm_uds::output::CommandOutput as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -578,6 +590,7 @@ pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedR
                 ctx.events.as_ref(),
                 &cell_event(cell, started.elapsed(), &calls),
             );
+            close_passed(ctx, cell, &outcome);
             outcome
         };
         let prepared = cached
@@ -1155,13 +1168,20 @@ pub fn resolve_roots(
     Ok((graph, paths))
 }
 
+/// The build directory the cell named `cell` builds in: its own in the cells lane
+/// ([`crate::plan::cells_dir`]), which [`crate::disk`] keeps the run's record of
+/// ([`crate::disk::Dir::Side`]).
+pub(crate) fn cell_dir(ctx: &Ctx, cell: &str) -> PathBuf {
+    crate::plan::cells_dir(ctx).join(cell)
+}
+
 /// One cell, end to end: its graph, its shims, its toolchain (the stock pin, `stock`), the lint of
 /// its roots, and (off wasm32) the all-targets pass over its workspace members; of [`narrows`] a
 /// selection, the lint and that pass of the selected members, in a cone run with the dependents in
 /// this cell's graph of what the change touched ([`wanted_in_cell`]). A pin that cannot serve the
 /// cell ([`serving`]) is a COULD NOT RUN (`NO-TOOLCHAIN`) naming what provides the missing piece
 /// (provision's rustup row adds every cell's std and clippy to the pin,
-/// [`crate::provision::CELL_TARGETS`]).
+/// [`crate::rustup::CELL_TARGETS`]).
 fn check_cell(
     ctx: &Ctx,
     stock: &Result<rustup::Stock, rustup::Unready>,
@@ -1285,7 +1305,7 @@ fn check_cell(
         Err(unready) => return could_not("NO-TOOLCHAIN", vec![unready.to_string()]),
     };
 
-    let target_dir = crate::plan::cells_dir(ctx).join(&cell.name);
+    let target_dir = cell_dir(ctx, &cell.name);
     let cwd = ctx.scratch.join(format!("cells-{}", cell.name));
     if let Err(e) = std::fs::create_dir_all(&cwd) {
         return could_not(
@@ -1314,13 +1334,14 @@ fn check_cell(
     // The cell compiles into its own target directory: a stale artifact there is removed from
     // it alone ([`crate::stale_artifact::retried`]).
     let built = [aterm_uds::runs::canonical(&target_dir)];
-    let lint = noted(calls, LINT_CALL, || {
-        crate::stale_artifact::retried(
-            &built,
-            || exec::run(&cargo.lint(&packages), ctx.exec_env()),
-            |run| run,
-        )
-    });
+    let lint = cargo_call(
+        ctx,
+        calls,
+        LINT_CALL,
+        &cargo.lint(&packages),
+        &members.names,
+        &built,
+    );
     let mut red = Red::default();
     let read = match read_cargo_run_with_discovery(
         &lint,
@@ -1407,9 +1428,7 @@ fn check_cell(
         } else {
             test_cargo.all_targets(&tests.excluded)
         };
-        let run = noted(calls, ALL_TARGETS_CALL, || {
-            crate::stale_artifact::retried(&built, || exec::run(&check, ctx.exec_env()), |run| run)
-        });
+        let run = cargo_call(ctx, calls, ALL_TARGETS_CALL, &check, &members.names, &built);
         let read = match read_cargo_run_with_discovery(
             &run,
             &cell.triple,
@@ -1511,6 +1530,41 @@ fn noted(
         usage: run.usage,
     });
     run
+}
+
+/// Run `cmd`, one of a cell's compiling cargo calls, noted in `calls` as `call` ([`noted`]) and
+/// for the run's record of the cell's directory ([`crate::disk::note_call_owning`]): the units
+/// its messages name, the packages of the workspace's `members` it built counted as the
+/// workspace's own. It passed only where cargo exited 0 and said its build finished
+/// ([`cargo_finished_successfully`]): a call cut short (the ceiling, a halt, an interrupt) named
+/// only part of what it used, and its note fails. The run returned is the one that ran: the
+/// cell's row reads it, and nothing the note holds. A call that stopped on a stale artifact
+/// under `built`, the cell's own target directory, is made once more with that artifact removed
+/// ([`crate::stale_artifact::retried`]), and the run noted is the one that then ran.
+fn cargo_call(
+    ctx: &Ctx,
+    calls: &mut Vec<CargoCall>,
+    call: &'static str,
+    cmd: &Cmd,
+    members: &BTreeSet<String>,
+    built: &[PathBuf],
+) -> exec::Run {
+    let run = noted(calls, call, || {
+        crate::stale_artifact::retried(built, || exec::run(cmd, ctx.exec_env()), |run| run)
+    });
+    let complete = run.ok && cargo_finished_successfully(&run.output);
+    crate::disk::note_call_owning(ctx, cmd, Some(&run.output), complete, members);
+    run
+}
+
+/// Close the run's note of `cell`'s directory ([`crate::disk::close`]) where its row passed
+/// (`outcome` is [`CellOutcome::Checked`]): every call the cell owed was made and passed (a call
+/// that did not is a red, `CARGO-EXIT` among them), so what they noted is all it used there. A
+/// cell that failed, could not run, or was not selected keeps nothing of it.
+fn close_passed(ctx: &Ctx, cell: &Cell, outcome: &CellOutcome) {
+    if matches!(outcome, CellOutcome::Checked(_)) {
+        crate::disk::close(ctx, &crate::disk::Dir::Side(cell_dir(ctx, &cell.name)));
+    }
 }
 
 /// The `cell-finished` event of a cell this run checked: its name and triple, its whole wall

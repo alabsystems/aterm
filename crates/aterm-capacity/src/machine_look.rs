@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use aterm_sysprobe::linux::Psi;
 use aterm_sysprobe::{CoreTicks, LinkReading, MemoryLevel};
 use aterm_vitals::Pressure;
+use aterm_vitals::net_counter::{ByteCounter, ByteSample, byte_delta};
 use aterm_vitals::strain::{self, Now};
 
 use crate::floor::Lines;
@@ -310,8 +311,8 @@ impl MachineLook {
             mem_used_mb: memory.map(|m| mib(m.used())),
             mem_avail_mb: memory.map(|m| mib(m.available)),
             mem_pressure: memory.and_then(|m| m.pressure),
-            swap_used_mb: memory.map(|m| mib(m.swap_used)),
-            swap_total_mb: memory.map(|m| mib(m.swap_total)),
+            swap_used_mb: memory.and_then(|m| m.swap_used).map(mib),
+            swap_total_mb: memory.and_then(|m| m.swap_total).map(mib),
             disk_total_mb: volume.map(|v| mib(v.total)),
             disk_free_mb: volume.map(|v| mib(v.free)),
             gpu_cores: gpu.and_then(|g| g.cores).filter(|n| *n > 0).map(u32::from),
@@ -412,8 +413,23 @@ impl Probe for Live {
 #[derive(Clone, Debug)]
 struct LinkBytes {
     name: String,
-    rx: u64,
-    tx: u64,
+    sample: ByteSample,
+}
+
+fn link_byte_sample(link: &LinkReading) -> ByteSample {
+    ByteSample {
+        index: link.index,
+        counter: match link.byte_counter {
+            aterm_sysprobe::LinkByteCounter::Unknown => ByteCounter::Unknown,
+            aterm_sysprobe::LinkByteCounter::Cumulative64 => ByteCounter::Cumulative64,
+            aterm_sysprobe::LinkByteCounter::DarwinModulo32 => ByteCounter::DarwinModulo32,
+        },
+        rx: link.rx.bytes,
+        tx: link.tx.bytes,
+        rx_packets: link.rx.packets,
+        tx_packets: link.tx.packets,
+        rate_bps: link.rate_bps,
+    }
 }
 
 /// The counters one look read, kept for a later look's rates.
@@ -566,8 +582,7 @@ impl Keeper {
                         .iter()
                         .map(|link| LinkBytes {
                             name: link.name.clone(),
-                            rx: link.rx.bytes,
-                            tx: link.tx.bytes,
+                            sample: link_byte_sample(link),
                         })
                         .collect()
                 }),
@@ -606,7 +621,9 @@ impl Net {
     /// capacity by adding another link's traffic; the other counted links' bytes are the
     /// "other" figure. Where no counted link reports a rate there is no capacity, received and
     /// sent are sums over the counted links and nothing is left for "other". A link has a rate
-    /// only where it counted at both looks and neither of its counters went back; a sum is
+    /// only where it counted at both looks and the counter source establishes an unambiguous
+    /// delta. Darwin modulo bytes can be ambiguous over a long look even when they increase;
+    /// no lifetime total is reconstructed. A sum is
     /// `None` where any link in it has none, and every rate is `None` with no counted link.
     fn of(counted: Option<&[&LinkReading]>, back: Option<(&[LinkBytes], Duration)>) -> Net {
         let mut net = Net {
@@ -634,10 +651,9 @@ impl Net {
         let kbps = |bytes: u64| u64::try_from(u128::from(bytes) * 8_000_000 / interval_ns).ok();
         let moved = |link: &LinkReading| {
             let was = then.iter().find(|was| was.name == link.name)?;
-            Some((
-                link.rx.bytes.checked_sub(was.rx)?,
-                link.tx.bytes.checked_sub(was.tx)?,
-            ))
+            let window_ns = u64::try_from(interval_ns).ok()?;
+            let bytes = byte_delta(was.sample, link_byte_sample(link), window_ns).ok()?;
+            Some((bytes.rx, bytes.tx))
         };
         let sum = |main: Option<&LinkReading>| {
             counted

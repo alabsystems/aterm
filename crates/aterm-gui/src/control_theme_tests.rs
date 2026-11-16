@@ -495,8 +495,8 @@ fn control_theme_form_grammar() {
 
 fn set_settings_trial(app: &mut App, trial: crate::native_settings::showcase_page::ShowcaseTrial) {
     let (_, _, view, _) = app.native_settings_view_target().expect("a Settings view");
-    let Some(crate::native_app::AppViewState::Settings(state)) =
-        app.native_runtime.view_state_mut(view)
+    let mut route_native_guard = app.native_runtime.view_state_mut(view);
+    let Some(crate::native_app::AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
     else {
         unreachable!()
     };
@@ -538,8 +538,9 @@ fn settings_trial_draws_without_writing_and_every_ending_reverts() {
             ),
             "leave" => {
                 let (_, _, view, _) = app.native_settings_view_target().unwrap();
+                let mut route_native_guard = app.native_runtime.view_state_mut(view);
                 let Some(crate::native_app::AppViewState::Settings(state)) =
-                    app.native_runtime.view_state_mut(view)
+                    route_native_guard.as_deref_mut()
                 else {
                     unreachable!()
                 };

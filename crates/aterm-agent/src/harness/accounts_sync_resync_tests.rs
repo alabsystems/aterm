@@ -503,6 +503,7 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
     let desk = Desk::new("m16");
     let config = desk.config.join("aterm.toml");
@@ -637,6 +638,7 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
 }
 
 #[test]
+#[cfg(unix)]
 fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
     let desk = Desk::new("m16");
     let config = desk.config.join("aterm.toml");

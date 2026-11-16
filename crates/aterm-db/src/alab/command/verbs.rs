@@ -148,6 +148,17 @@ fn text(row: &cell::Row, column: &str) -> Value {
     row.get(column).cloned().unwrap_or(Value::Null)
 }
 
+/// The free-text column `column` of `row` as one list, in either form a generation holds it
+/// ([`cell::texts`]): null where it holds none.
+fn texts(row: &cell::Row, column: &str) -> Value {
+    let texts = cell::texts(row.fields.get(column));
+    if texts.is_empty() {
+        Value::Null
+    } else {
+        Value::from(texts)
+    }
+}
+
 /// The facts columns `machines <machine>` shows of each facts row bound to the machine: its
 /// hardware and OS, never its host names.
 const FACTS_SHOWN: [&str; 10] = [
@@ -286,7 +297,7 @@ pub(super) fn runs_on(
         "ram_gb": row.map_or(Value::Null, |r| text(r, "ram_gb")),
         "disk_gb": row.map_or(Value::Null, |r| text(r, "disk_gb")),
         "nickname": row.map_or(Value::Null, |r| text(r, "nickname")),
-        "nickname_aliases": row.map_or(Value::Null, |r| text(r, "nickname_aliases")),
+        "nickname_aliases": row.map_or(Value::Null, |r| texts(r, "nickname_aliases")),
         "location": row.map_or(Value::Null, |r| text(r, "location")),
         "row": row.and_then(cell::Row::lifecycle),
         "facts": bound_facts,
@@ -365,7 +376,7 @@ pub(super) fn machines(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> 
             "ram_gb": row.map_or(Value::Null, |r| text(r, "ram_gb")),
             "disk_gb": row.map_or(Value::Null, |r| text(r, "disk_gb")),
             "nickname": row.map_or(Value::Null, |r| text(r, "nickname")),
-            "nickname_aliases": row.map_or(Value::Null, |r| text(r, "nickname_aliases")),
+            "nickname_aliases": row.map_or(Value::Null, |r| texts(r, "nickname_aliases")),
             "location": row.map_or(Value::Null, |r| text(r, "location")),
             "row": row.and_then(cell::Row::lifecycle),
             "prefers": prefers,

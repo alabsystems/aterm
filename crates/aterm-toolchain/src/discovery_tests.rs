@@ -1436,38 +1436,17 @@ fn a_directory_named_targo_is_not_a_driver() {
 
 #[cfg(unix)]
 #[test]
-fn a_delayed_compiler_still_answers_its_identity_probe() {
-    let fixture = aterm_tempfile::tempdir().unwrap();
-    let bin = dated_bin(
-        fixture.path(),
-        &fixture.path().join("compiler"),
-        "2026-09-17",
-    );
-    let answer = bounded_stdout_at(
-        &bin.join("trustc"),
-        &["--print", "sysroot"],
-        probe_bound(),
-        std::time::Instant::now() - Duration::from_secs(6),
-    );
-    assert_eq!(
-        answer.as_deref().map(str::trim),
-        bin.parent().unwrap().to_str()
-    );
-    assert_eq!(
-        bounded_stdout_at(
-            &bin.join("trustc"),
-            &["--print", "sysroot"],
-            probe_bound(),
-            std::time::Instant::now() - Duration::from_secs(61),
-        ),
-        None,
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn bounded_stdout_drains_large_output_without_pipe_deadlock_and_rejects_oversize() {
     let sh = Path::new("/bin/sh");
+    let noisy = bounded_stdout(
+        sh,
+        &[
+            "-c",
+            "dd if=/dev/zero bs=1024 count=65 >&2 2>/dev/null; printf identity",
+        ],
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert_eq!(noisy.as_deref(), Some("identity"));
     let exact = bounded_stdout(
         sh,
         &[

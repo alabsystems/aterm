@@ -3,7 +3,7 @@
 
 //! Failed builds use actual Cargo diagnostics and never infer success from stdout.
 
-use atpkg_publish::artifact::tools::{HostTools, Ran, Run, Tools};
+use atpkg_publish::artifact::tools::{HostTools, Queue, Ran, Run, Tools};
 
 use super::*;
 
@@ -65,7 +65,11 @@ fn actual_cargo_compiler_errors_are_persisted_and_shown_by_the_failed_pack() {
         ],
     );
     run.cwd = Some(work.path().to_path_buf());
+    // The bound is the build's own time: the build claims this Mac's capacity and waits its
+    // turn first (behind a landing's test binaries, most of a minute), which says how busy the
+    // Mac is and nothing of the build, so the wait of a claim in its checkout is not counted.
     run.deadline = Some(Duration::from_secs(60));
+    run.queue = Some(Queue::of(work.path()));
     run.env.push((
         "CARGO_TARGET_DIR".into(),
         work.path().join("target.noindex").into_os_string(),
@@ -74,7 +78,9 @@ fn actual_cargo_compiler_errors_are_persisted_and_shown_by_the_failed_pack() {
     assert!(!output.success());
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("compiler-message"),
-        "the real driver must have emitted Cargo JSON"
+        "the real driver must have emitted Cargo JSON; it exited {:?} saying:\n{}",
+        output.code,
+        String::from_utf8_lossy(&output.stderr)
     );
     let world = world("plain-real-compiler-failure");
     let error = failure(&world, output);

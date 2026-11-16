@@ -59,6 +59,7 @@ fn blocked_envelopes_share_one_read_only_observation() {
     let at = Instant::now();
     let probe = ResourceProbe::capture_at(&ledger, &machine, at)
         .unwrap()
+        .observed()
         .unwrap();
     for gib in 1..=32 {
         assert_eq!(
@@ -94,7 +95,10 @@ fn possible_observation_cannot_override_a_fresh_process_or_ledger_refusal() {
         ..Proc::default()
     }])));
     let need = Need::new("candidate").mem_gib(4);
-    let probe = ResourceProbe::capture(&ledger, &machine).unwrap().unwrap();
+    let probe = ResourceProbe::capture(&ledger, &machine)
+        .unwrap()
+        .observed()
+        .unwrap();
     assert_eq!(probe.check(&need), ProbeDecision::Possible);
     machine.fixed.set_procs(Some(Procs::of(vec![Proc {
         pid: std::process::id(),
@@ -122,6 +126,7 @@ fn expired_missing_and_unsupported_observations_defer_to_fresh_admission() {
     let at = Instant::now();
     let probe = ResourceProbe::capture_at(&ledger, &machine, at)
         .unwrap()
+        .observed()
         .unwrap();
     assert_eq!(probe.check_at(&need, at), ProbeDecision::Blocked);
     assert_eq!(
@@ -137,13 +142,19 @@ fn expired_missing_and_unsupported_observations_defer_to_fresh_admission() {
         ProbeDecision::Possible
     );
     machine.fixed.set_procs(None);
-    assert!(ResourceProbe::capture(&ledger, &machine).unwrap().is_none());
+    assert!(matches!(
+        ResourceProbe::capture(&ledger, &machine).unwrap(),
+        Capture::Unsupported
+    ));
     machine.fixed.set_procs(Some(Procs::of(vec![Proc {
         pid: std::process::id(),
         ..Proc::default()
     }])));
     assert!(
-        ResourceProbe::capture(&ledger, &machine).unwrap().is_none(),
+        matches!(
+            ResourceProbe::capture(&ledger, &machine).unwrap(),
+            Capture::Unsupported
+        ),
         "unread footprint is not rejection evidence"
     );
     let row = Proc {
@@ -154,13 +165,19 @@ fn expired_missing_and_unsupported_observations_defer_to_fresh_admission() {
     };
     machine.fixed.set_procs(Some(Procs::of(vec![row, row])));
     assert!(
-        ResourceProbe::capture(&ledger, &machine).unwrap().is_none(),
+        matches!(
+            ResourceProbe::capture(&ledger, &machine).unwrap(),
+            Capture::Unsupported
+        ),
         "duplicate identity rows are ambiguous"
     );
     let mut unread = Reading::of_gib(48, 8, 14);
     unread.available = None;
     machine.fixed.set(unread);
-    assert!(ResourceProbe::capture(&ledger, &machine).unwrap().is_none());
+    assert!(matches!(
+        ResourceProbe::capture(&ledger, &machine).unwrap(),
+        Capture::Unsupported
+    ));
 }
 
 /// THE PROBE ASKS AS A WAITING CLAIM OF ITS PROCESS ([`ResourceProbe::capture_at`]'s stand-in),
@@ -223,10 +240,42 @@ fn the_probe_asks_as_its_process_waiting_claim() {
     let at = Instant::now();
     let probe = ResourceProbe::capture_at(&ledger, &machine, at)
         .unwrap()
+        .observed()
         .unwrap();
     assert_eq!(
         probe.check_at(&Need::new("candidate").mem_gib(10), at),
         ProbeDecision::Possible
     );
     drop(boot);
+}
+
+/// THE LEDGER'S LOCK IS AN ANSWER: while another admission holds it, a capture says so and names
+/// that holder, after one try of the lock and nothing else: no machine read, no process sweep,
+/// no claim. Once the lock is let go the same capture observes.
+#[test]
+fn a_held_lock_is_the_captures_answer_after_one_try() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let machine = Counted::new();
+    let claim = held(&ledger, &machine);
+    machine.reads.set(0);
+    machine.sweeps.set(0);
+    let turn = ledger.hold_turn().unwrap().unwrap();
+    let tries = ledger.turn_tries();
+    match ResourceProbe::capture(&ledger, &machine).unwrap() {
+        Capture::Turn(holder) => assert_eq!(holder, Some(std::process::id())),
+        Capture::Observed(_) => panic!("a held lock was read through"),
+        Capture::Unsupported => panic!("a held lock was taken for an unsupported observation"),
+    }
+    assert_eq!(ledger.turn_tries() - tries, 1);
+    assert_eq!((machine.reads.get(), machine.sweeps.get()), (0, 0));
+    assert_eq!(ledger.list().unwrap().len(), 1, "no claim was laid");
+    drop(turn);
+    assert!(
+        ResourceProbe::capture(&ledger, &machine)
+            .unwrap()
+            .observed()
+            .is_some()
+    );
+    drop(claim);
 }

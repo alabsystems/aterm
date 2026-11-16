@@ -26,6 +26,7 @@ pub(crate) fn asking(pid: u32) -> Record {
         accounting: crate::Accounting::Holder,
         pid,
         start_ms: u64::MAX,
+        laid_at: None,
         seq: u64::MAX,
         checkout: String::new(),
         need: Need::new("asker"),
@@ -1627,6 +1628,7 @@ fn record(pid: u32, start_ms: u64, need: Need, held: Option<u32>) -> Record {
         accounting: crate::Accounting::Holder,
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/ck".to_owned(),
         need,
@@ -2784,6 +2786,7 @@ fn a_holders_child_is_admitted_beside_its_ancestors_claim() {
             above_floor: 90 * GIB,
             floor: 10 * GIB,
             reserved: 60 * GIB,
+            writing: 60 * GIB,
             held: Vec::new(),
         }]
     );
@@ -2878,6 +2881,7 @@ fn disk_is_held_above_the_floor() {
             above_floor: 68 * GIB,
             floor: 32 * GIB,
             reserved: 50 * GIB,
+            writing: 50 * GIB,
             held: Vec::new(),
         }]
     );
@@ -2981,6 +2985,7 @@ fn a_waiter_no_claims_end_can_admit_reserves_no_disk() {
                 above_floor: tenths(436),
                 floor: 32 * GIB,
                 reserved: 3 * GIB,
+                writing: 3 * GIB,
                 held: Vec::new(),
             }],
             "{}: the durable claim blocks now but its end cannot return space: {short}",
@@ -3035,6 +3040,7 @@ fn a_waiter_the_room_can_hold_and_a_held_claim_still_reserve_their_disk() {
                         above_floor: tenths(436),
                         floor: 32 * GIB,
                         reserved,
+                        writing: 3 * GIB,
                         held: Vec::new(),
                     }],
                     "{short}"
@@ -3062,6 +3068,7 @@ fn a_waiter_the_room_can_hold_and_a_held_claim_still_reserve_their_disk() {
             above_floor: tenths(436),
             floor: 32 * GIB,
             reserved: 50 * GIB,
+            writing: 50 * GIB,
             held: Vec::new(),
         }]
     );
@@ -3276,6 +3283,7 @@ fn an_unservable_waiter_is_admitted_once_room_comes_and_holds_its_place_once_it_
             above_floor: tenths(637),
             floor: 32 * GIB,
             reserved: 5 * GIB,
+            writing: 5 * GIB,
             held: Vec::new(),
         }]
     );
@@ -3290,6 +3298,7 @@ fn an_unservable_waiter_is_admitted_once_room_comes_and_holds_its_place_once_it_
             above_floor: tenths(650),
             floor: 32 * GIB,
             reserved: 5 * GIB,
+            writing: 5 * GIB,
             held: Vec::new(),
         }]
     );
@@ -3303,6 +3312,7 @@ fn an_unservable_waiter_is_admitted_once_room_comes_and_holds_its_place_once_it_
             above_floor: tenths(650),
             floor: 32 * GIB,
             reserved: 5 * GIB + tenths(637),
+            writing: 5 * GIB,
             held: Vec::new(),
         }]
     );
@@ -3319,17 +3329,18 @@ fn an_unservable_waiter_is_admitted_once_room_comes_and_holds_its_place_once_it_
     drop((first, big, second));
 }
 
-/// UNMET: a disk need more than its volume holds above the floor once its relief ran, with no
-/// other claim held there, is refused at once, with no wait line, its error naming the need, the
-/// volume, what is free above the floor, the floor, how much to free and that no relief ran, and
-/// the claim leaves the queue: no claim's end frees disk, so a wait could never end. With no
-/// relief ([`admit_with`]) that is the look after the first; the remedy of starting at once is
-/// its caller's to add, so the error names none.
-/// NEGATIVE CONTROL, a meetable need on the same room: 40 GiB, short only of what a held 10 GiB
-/// claim reserves, waits, its line naming that claim, and is admitted once the claim ends.
-/// Each runs on a thread of its own, joined within the hang detector, so a wait fails the test.
+/// UNMET: a disk need more than its volume holds above the floor once its relief ran is refused
+/// at once, with no wait line, its error naming the need, the volume, what is free above the
+/// floor, the floor, that no relief ran and that it ends now rather than wait for disk, and no
+/// space to free; the claim leaves the queue. With no relief ([`admit_with`]) that is the look
+/// after the first; the remedy of starting at once is its caller's to add, so the error names
+/// none.
+/// NEGATIVE CONTROL, a need within the same room: 40 GiB, short only of the 10 GiB a waiter ahead
+/// reserves while it waits for memory, is judged by the room the running claims leave once its
+/// (empty) relief ran and admitted beside that waiter, with no wait line. Each runs on a thread
+/// of its own, joined within the hang detector, so a wait fails the test.
 #[test]
-fn a_disk_need_beyond_the_room_is_refused_at_once_and_one_short_of_claims_waits() {
+fn a_disk_need_beyond_the_room_is_refused_at_once_and_one_short_of_claims_starts() {
     let s = scratch("unmet");
     let m = Arc::new(Fixed::new(data(436)));
     let pace = Pace {
@@ -3369,10 +3380,11 @@ fn a_disk_need_beyond_the_room_is_refused_at_once_and_one_short_of_claims_waits(
             DATA,
             "43.6 GiB",
             "32 GiB",
-            "Free at least 20.1 GiB on /System/Volumes/Data",
             "with no relief to free it",
+            "ends now rather than wait for disk",
         ],
     );
+    assert!(!refused.to_string().contains("Free at least"), "{refused}");
     assert!(!refused.to_string().contains("--admit"), "{refused}");
     assert!(said.is_empty(), "no wait line: {said:?}");
     assert!(
@@ -3380,40 +3392,29 @@ fn a_disk_need_beyond_the_room_is_refused_at_once_and_one_short_of_claims_waits(
         "it left the queue"
     );
 
-    let held = admitted(enter(&s, &m, Need::new("held").disk(10 * GIB, DATA)), &m);
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let held = admitted(enter(&s, &m, Need::new("held").mem_gib(30)), &m);
+    let reserving = Need::new("ahead").mem_gib(20).disk(10 * GIB, DATA);
+    let (ahead, _) = waits(enter(&s, &m, reserving), &m);
     let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
-    let waiting = std::thread::spawn(move || {
-        admit_with(
+    let starting = std::thread::spawn(move || {
+        let mut said = Vec::new();
+        let got = admit_with(
             &ledger,
             &*theirs,
             Need::new("verify").disk(40 * GIB, DATA),
             Admit::Wait,
             pace,
-            &mut |l| {
-                let _ = tx.send(l.to_owned());
-            },
-        )
-        .map(|c| c.record().need.what.clone())
+            &mut |l| said.push(l.to_owned()),
+        );
+        (got.map(|c| c.record().need.what.clone()), said)
     });
-    let line = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(
-        &line,
-        &[
-            "verify",
-            "40 GiB",
-            "43.6 GiB",
-            "10 GiB reserved",
-            "\"held\"",
-        ],
-    );
-    assert!(!waiting.is_finished(), "it waits for the held claim");
-    drop(held);
-    let got = joined(waiting, "its admission once the held claim ended");
+    let (got, said) = joined(starting, "its admission beside the waiter ahead");
     assert_eq!(got.expect("admitted").as_str(), "verify");
+    assert!(said.is_empty(), "no wait line: {said:?}");
+    drop((ahead, held));
 }
 
-/// `--admit now` starts a need no wait could admit, saying what it would wait for, and the claim
+/// `--admit now` starts a need no wait could admit, saying what it is short of, and the claim
 /// holds its whole 63.7 GiB against every later one: a later 5 GiB run waits, that much reserved.
 #[test]
 fn admit_now_starts_a_need_beyond_the_room_holding_its_whole_need() {
@@ -3442,275 +3443,17 @@ fn admit_now_starts_a_need_beyond_the_room_holding_its_whole_need() {
     drop((later, forced));
 }
 
-/// An unservable waiter overtaken while it could not fit is relieved again at the look at which
-/// space freed brings its need within the room but the claims admitted around it hold the rest.
-/// On a volume 16 GiB above its 4 GiB floor a 27 GiB run is relieved (nothing freed), and a 5 GiB
-/// run is admitted around it; freed to 27 GiB above the floor, it fits the room but is short by
-/// that run's 5 GiB, so the relief is asked again, with those 5 GiB reserved, and once that
-/// frees 32 GiB above the floor the run is admitted. Negative control: relieved at its first
-/// look alone, it waits for space no relief is asked for (the hang detector ends the test).
-#[test]
-fn an_overtaken_unservable_waiter_is_relieved_again_once_it_fits_the_room() {
-    /// Records the reserved figure each call is sized by; the first waits for the test's word,
-    /// the second frees 32 GiB above the floor.
-    struct Again {
-        machine: Arc<Fixed>,
-        asked: std::sync::mpsc::Sender<u64>,
-        go: std::sync::mpsc::Receiver<()>,
-        calls: usize,
-    }
-    impl crate::Relief for Again {
-        fn relieve(
-            &mut self,
-            short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
-            _stopped: &dyn Fn() -> bool,
-        ) {
-            let [Short::Disk { reserved, .. }] = short.shorts[..] else {
-                panic!("a disk shortfall alone: {short}");
-            };
-            self.calls += 1;
-            let _ = self.asked.send(reserved);
-            if self.calls == 1 {
-                self.go.recv_timeout(MUST_HAPPEN).expect("the test's word");
-            } else {
-                self.machine.set(with_vol(vol(100, 36, 4)));
-            }
-        }
-        fn holders(
-            &mut self,
-            _short: &crate::Shortfall,
-            _stopped: &dyn Fn() -> bool,
-        ) -> Option<String> {
-            None
-        }
-    }
-    let s = scratch("relief-again");
-    let m = Arc::new(on(vol(100, 20, 4)));
-    let (asked, asks) = std::sync::mpsc::channel::<u64>();
-    let (go, word) = std::sync::mpsc::channel::<()>();
-    let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
-    let waiting = std::thread::spawn(move || {
-        let mut relief = Again {
-            machine: Arc::clone(&theirs),
-            asked,
-            go: word,
-            calls: 0,
-        };
-        crate::admit_relieved(
-            &ledger,
-            &*theirs,
-            Need::new("verify").disk(27 * GIB, "/vol"),
-            Admit::Wait,
-            Pace {
-                poll: Duration::from_millis(5),
-                line_every: Duration::from_secs(60),
-            },
-            &mut relief,
-            &mut |_| {},
-        )
-        .map(|c| c.record().need.what.clone())
-    });
-    assert_eq!(asks.recv_timeout(MUST_HAPPEN).expect("the first ask"), 0);
-    let around = admitted(enter(&s, &m, Need::new("around").disk(5 * GIB, "/vol")), &m);
-    m.set(with_vol(vol(100, 31, 4)));
-    go.send(()).expect("the waiter's relief listens");
-    assert_eq!(
-        asks.recv_timeout(MUST_HAPPEN)
-            .expect("asked again once it fits the room"),
-        5 * GIB
-    );
-    let got = joined(waiting, "its admission once the second relief freed room");
-    assert_eq!(got.expect("admitted").as_str(), "verify");
-    drop(around);
-}
-
-/// A waiter is relieved again once its relief says what it may take grew ([`crate::Relief::renewed`]):
-/// a workspace removed while it waits leaves a build directory nobody builds into again (m20,
-/// 2026-11-05: a verify waited five hours beside 52.8 GiB of removed worktrees' caches, its one
-/// relief having run before they were removed). A 15 GiB run on a volume 20 GiB above its floor,
-/// beside a held 10 GiB claim, is relieved once (nothing freed) and waits for that claim.
-/// NEGATIVE CONTROL, in the same wait: while `renewed` says no, the looks ask it again and again
-/// and the relief is not called a second time; once it says yes, the relief runs at that look,
-/// frees room, and the run is admitted beside the claim.
-#[test]
-fn a_waiter_is_relieved_again_once_its_relief_is_renewed() {
-    struct Renewing {
-        machine: Arc<Fixed>,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-        asked: std::sync::mpsc::Sender<()>,
-        grown: Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl crate::Relief for Renewing {
-        fn relieve(
-            &mut self,
-            _short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
-            _stopped: &dyn Fn() -> bool,
-        ) {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                self.machine.set(with_vol(vol(100, 36, 4)));
-            }
-        }
-        fn holders(
-            &mut self,
-            _short: &crate::Shortfall,
-            _stopped: &dyn Fn() -> bool,
-        ) -> Option<String> {
-            None
-        }
-        fn renewed(&mut self, _stopped: &dyn Fn() -> bool) -> bool {
-            let _ = self.asked.send(());
-            self.grown.swap(false, Ordering::SeqCst)
-        }
-    }
-    let s = scratch("relief-renewed");
-    let m = Arc::new(on(vol(100, 24, 4)));
-    let held = admitted(enter(&s, &m, Need::new("held").disk(10 * GIB, "/vol")), &m);
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let grown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (asked, asks) = std::sync::mpsc::channel::<()>();
-    let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
-    let (their_calls, their_grown) = (Arc::clone(&calls), Arc::clone(&grown));
-    let waiting = std::thread::spawn(move || {
-        let mut relief = Renewing {
-            machine: Arc::clone(&theirs),
-            calls: their_calls,
-            asked,
-            grown: their_grown,
-        };
-        crate::admit_relieved(
-            &ledger,
-            &*theirs,
-            Need::new("verify").disk(15 * GIB, "/vol"),
-            Admit::Wait,
-            Pace {
-                poll: Duration::from_millis(5),
-                line_every: Duration::from_secs(60),
-            },
-            &mut relief,
-            &mut |_| {},
-        )
-        .map(|c| c.record().need.what.clone())
-    });
-    for _ in 0..3 {
-        asks.recv_timeout(MUST_HAPPEN)
-            .expect("each waiting look asks");
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "nothing grew: relieved once, at its first look"
-    );
-    grown.store(true, Ordering::SeqCst);
-    let got = joined(waiting, "its admission once the renewed relief freed room");
-    assert_eq!(got.expect("admitted").as_str(), "verify");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        2,
-        "relieved again once renewed"
-    );
-    drop(held);
-}
-
-/// An unservable waiter whose first relief itself brings its need within the room, while the
-/// claim held before it asked keeps it short, is not relieved again: that relief was sized for
-/// that claim. A 10 GiB claim is held before a 30 GiB run asks, on a volume 20 GiB above its
-/// 4 GiB floor; the relief, sized with those 10 GiB reserved, frees to 35 GiB above the floor,
-/// so the run fits the room but is short by 5 GiB of what that claim holds, and it waits, its
-/// line naming that claim, with no second call. Once 45 GiB are free above the floor it is
-/// admitted, the relief asked once. Negative control: relieving at every look that turns
-/// servable asks again at once, with the same 10 GiB reserved, before the wait line.
-#[test]
-fn a_waiter_its_own_relief_brought_within_the_room_is_not_relieved_again_for_the_same_claims() {
-    /// Records each call's reserved figure and whether its look was unservable; frees to 35 GiB
-    /// above the floor.
-    struct Once {
-        machine: Arc<Fixed>,
-        calls: Arc<std::sync::Mutex<Vec<(u64, bool)>>>,
-    }
-    impl crate::Relief for Once {
-        fn relieve(
-            &mut self,
-            short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
-            _stopped: &dyn Fn() -> bool,
-        ) {
-            let [disk] = &short.shorts[..] else {
-                panic!("one shortfall: {short}");
-            };
-            let Short::Disk { reserved, .. } = *disk else {
-                panic!("a disk shortfall alone: {short}");
-            };
-            self.calls
-                .lock()
-                .expect("calls")
-                .push((reserved, disk.unservable()));
-            self.machine.set(with_vol(vol(100, 39, 4)));
-        }
-        fn holders(
-            &mut self,
-            _short: &crate::Shortfall,
-            _stopped: &dyn Fn() -> bool,
-        ) -> Option<String> {
-            None
-        }
-    }
-    let s = scratch("relief-once");
-    let m = Arc::new(on(vol(100, 24, 4)));
-    let held = admitted(enter(&s, &m, Need::new("held").disk(10 * GIB, "/vol")), &m);
-    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let (ledger, theirs, their_calls) = (s.ledger.clone(), Arc::clone(&m), Arc::clone(&calls));
-    let waiting = std::thread::spawn(move || {
-        let mut relief = Once {
-            machine: Arc::clone(&theirs),
-            calls: their_calls,
-        };
-        crate::admit_relieved(
-            &ledger,
-            &*theirs,
-            Need::new("verify").disk(30 * GIB, "/vol"),
-            Admit::Wait,
-            Pace {
-                poll: Duration::from_millis(5),
-                line_every: Duration::from_secs(60),
-            },
-            &mut relief,
-            &mut |l| {
-                let _ = tx.send(l.to_owned());
-            },
-        )
-        .map(|c| c.record().need.what.clone())
-    });
-    let line = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(
-        &line,
-        &[
-            "verify",
-            "short by 5 GiB",
-            "35 GiB",
-            "10 GiB reserved",
-            "\"held\"",
-        ],
-    );
-    assert_eq!(*calls.lock().expect("calls"), [(10 * GIB, true)]);
-    m.set(with_vol(vol(100, 49, 4)));
-    let got = joined(waiting, "its admission once room came");
-    assert_eq!(got.expect("admitted").as_str(), "verify");
-    assert_eq!(*calls.lock().expect("calls"), [(10 * GIB, true)]);
-    drop(held);
-}
-
 /// A NEED SIZED AGAIN AFTER ITS RELIEF RE-ENTERS THE WAIT WITH IT ([`crate::Relief::resized`]).
 /// A 2 GiB run on a volume 1 GiB above its 4 GiB floor is relieved, which takes 100 ms and frees
-/// to 10 GiB above the floor but removes what the need was sized on, so it is sized again at 12
-/// GiB: it waits with that need, relieved afresh, sized for 12 GiB, and once that relief frees
-/// to 16 GiB above the floor it is admitted holding 12 GiB, its wait counted from when it first
-/// entered (at least the first relief's 100 ms). Sized again to more than the volume holds above
-/// its floor, it is refused at once, naming that figure, and leaves nothing in the ledger.
-/// Negative control: sized again at or below its need, nothing changes: one relief, and it is
-/// admitted holding 2 GiB. Each runs on a thread of its own, joined within the hang detector.
+/// to 12 GiB above the floor but removes what the need was sized on, so it is sized again at 12
+/// GiB: it re-enters with that need, judged by the room as before, and is admitted holding 12
+/// GiB after that one relief, its wait counted from when it first entered (at least the
+/// relief's 100 ms). Where that relief frees only to 10 GiB above the floor, the re-entered
+/// need is beyond the room and ends at once ([`Error::Unmet`]), relieved no second time, and
+/// leaves nothing in the ledger. Sized again to more than the volume holds above its floor, it
+/// is refused at once, naming that figure, and leaves nothing in the ledger. Negative control:
+/// sized again at or below its need, nothing changes: one relief, and it is admitted holding 2
+/// GiB. Each runs on a thread of its own, joined within the hang detector.
 #[test]
 fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
     /// How long the first call takes, as a relief's pass does.
@@ -3789,8 +3532,8 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
         joined(waiting, "its admission or refusal")
     };
 
-    let (got, needs, said) = run(&[14, 20], &[Some(12 * GIB), None]);
-    let claim = got.expect("admitted once the second relief freed room");
+    let (got, needs, said) = run(&[16], &[Some(12 * GIB)]);
+    let claim = got.expect("admitted once its one relief freed room");
     assert_eq!(claim.record().need.disk, 12 * GIB);
     assert!(
         claim.waited() >= FIRST,
@@ -3803,10 +3546,10 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
     );
     assert_eq!(
         needs,
-        [2 * GIB, 12 * GIB],
-        "relieved afresh, sized for 12 GiB"
+        [2 * GIB],
+        "relieved once, not afresh once sized again"
     );
-    assert_eq!(said, ["sized again: 12 GiB"]);
+    assert_eq!(said, ["sized again: 12 GiB", "sized again: 12 GiB"]);
     let listed = s.ledger.list().expect("listed");
     assert_eq!(
         listed.len(),
@@ -3839,6 +3582,14 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
         "its row's wait from when it first entered: {waited_ms} ms"
     );
 
+    let (got, needs, _) = run(&[14], &[Some(12 * GIB)]);
+    match got {
+        Err(Error::Unmet { relieved: true, .. }) => {}
+        other => panic!("expected it to end once re-entered beyond the room, got {other:?}"),
+    }
+    assert_eq!(needs, [2 * GIB], "relieved no second time");
+    assert!(s.ledger.list().expect("listed").is_empty());
+
     let (got, needs, _) = run(&[14], &[Some(200 * GIB)]);
     match got {
         Err(Error::Never(why)) => names(&why, &["verify", "200 GiB", "/vol", "96 GiB"]),
@@ -3854,13 +3605,13 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
     assert_eq!(said, ["sized again: 1 GiB", "sized again: 1 GiB"]);
 }
 
-/// A NEED THAT GREW WHILE IT WAITED IS SIZED AGAIN AS IT IS ADMITTED: a 2 GiB run waits on a
-/// volume 4 GiB above its floor beside a held 3 GiB claim, its relief freeing nothing and sizing
-/// nothing again; then room comes, but what it was sized on went meanwhile (another run's pass,
-/// the watch's own), so at the look that admits it the need is sized again at 12 GiB: the 2 GiB
-/// claim is let go and the need re-enters, admitted holding 12 GiB, one entry of its own in the
-/// ledger. Negative control: a run admitted at its first look, having waited for nothing, is
-/// not sized again.
+/// A NEED THAT GREW WHILE IT WAITED IS SIZED AGAIN AS IT IS ADMITTED: a run of 20 GiB of memory
+/// and 2 GiB of disk waits for memory beside a held 30 GiB claim, short of no disk, so with no
+/// relief; then the claim ends, but what the run's disk was sized on went
+/// meanwhile (another run's pass, the watch's own), so at the look that admits it the need is
+/// sized again at 12 GiB: the 2 GiB claim is let go and the need re-enters, admitted holding 12
+/// GiB, one entry of its own in the ledger. Negative control: a run admitted at its first look,
+/// having waited for nothing, is not sized again.
 #[test]
 fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
     /// Frees nothing; sizes the need again to `grown` once the test has said so.
@@ -3898,7 +3649,7 @@ fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
     };
     let s = scratch("grown-waiting");
     let m = Arc::new(on(vol(100, 8, 4)));
-    let held = admitted(enter(&s, &m, Need::new("held").disk(3 * GIB, "/vol")), &m);
+    let held = admitted(enter(&s, &m, Need::new("held").mem_gib(30)), &m);
     let grown = Arc::new(std::sync::Mutex::new(None));
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -3911,7 +3662,7 @@ fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
         crate::admit_relieved(
             &ledger,
             &*theirs,
-            Need::new("verify").disk(2 * GIB, "/vol"),
+            Need::new("verify").mem_gib(20).disk(2 * GIB, "/vol"),
             Admit::Wait,
             pace,
             &mut relief,
@@ -3921,10 +3672,11 @@ fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
         )
     });
     let line = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(&line, &["verify", "short by 1 GiB", "\"held\""]);
+    names(&line, &["verify", "memory short by 10 GiB", "\"held\""]);
     *grown.lock().expect("grown") = Some(12 * GIB);
     m.set(with_vol(vol(100, 20, 4)));
-    let claim = joined(waiting, "its admission once room came").expect("admitted");
+    drop(held);
+    let claim = joined(waiting, "its admission once the held claim ended").expect("admitted");
     assert_eq!(claim.record().need.disk, 12 * GIB);
     let listed = s.ledger.list().expect("listed");
     assert_eq!(
@@ -3932,7 +3684,7 @@ fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
         1,
         "the 2 GiB claim was let go: {listed:?}"
     );
-    drop((claim, held));
+    drop(claim);
 
     let before = asked.load(Ordering::SeqCst);
     let mut relief = Grown {
@@ -3951,100 +3703,6 @@ fn a_need_that_grew_while_it_waited_is_sized_again_as_it_is_admitted() {
     .expect("admitted at once");
     assert_eq!(at_once.record().need.disk, GIB);
     assert_eq!(asked.load(Ordering::SeqCst), before, "not sized again");
-}
-
-/// AN UNSERVABLE WAITER IS RELIEVED AGAIN FOR A CLAIM ITS LAST RELIEF DID NOT COUNT, whatever the
-/// figure: a 10 GiB claim held before a 30 GiB run asks, on a volume 20 GiB above its 4 GiB
-/// floor, is what the first relief was sized for; that claim ends (its writes stay: 10 GiB above
-/// the floor), a 5 GiB claim is admitted around the run, and space freed to 33 GiB above the
-/// floor brings the run within the room, short by those 5 GiB: less reserved than the first
-/// relief was sized for, but by a claim it did not count, so the relief is asked again, sized for
-/// it, and once that frees room the run is admitted. Negative control: compared by the reserved
-/// figure alone (5 GiB is not above 10), it is never asked again, and the run waits for a person
-/// (the hang detector ends the test).
-#[test]
-fn an_unservable_waiter_is_relieved_again_for_a_claim_its_last_relief_did_not_count() {
-    /// Records the reserved figure and unservability each call is sized by; the first waits for
-    /// the test's word, the second frees to 45 GiB above the floor.
-    struct Counted {
-        machine: Arc<Fixed>,
-        asked: std::sync::mpsc::Sender<(u64, bool)>,
-        go: std::sync::mpsc::Receiver<()>,
-        calls: usize,
-    }
-    impl crate::Relief for Counted {
-        fn relieve(
-            &mut self,
-            short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
-            _stopped: &dyn Fn() -> bool,
-        ) {
-            let [disk] = &short.shorts[..] else {
-                panic!("one shortfall: {short}");
-            };
-            let Short::Disk { reserved, .. } = *disk else {
-                panic!("a disk shortfall alone: {short}");
-            };
-            self.calls += 1;
-            let _ = self.asked.send((reserved, disk.unservable()));
-            if self.calls == 1 {
-                self.go.recv_timeout(MUST_HAPPEN).expect("the test's word");
-            } else {
-                self.machine.set(with_vol(vol(100, 49, 4)));
-            }
-        }
-        fn holders(
-            &mut self,
-            _short: &crate::Shortfall,
-            _stopped: &dyn Fn() -> bool,
-        ) -> Option<String> {
-            None
-        }
-    }
-    let s = scratch("relief-counted");
-    let m = Arc::new(on(vol(100, 24, 4)));
-    let first = admitted(enter(&s, &m, Need::new("first").disk(10 * GIB, "/vol")), &m);
-    let (asked, asks) = std::sync::mpsc::channel::<(u64, bool)>();
-    let (go, word) = std::sync::mpsc::channel::<()>();
-    let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
-    let waiting = std::thread::spawn(move || {
-        let mut relief = Counted {
-            machine: Arc::clone(&theirs),
-            asked,
-            go: word,
-            calls: 0,
-        };
-        crate::admit_relieved(
-            &ledger,
-            &*theirs,
-            Need::new("verify").disk(30 * GIB, "/vol"),
-            Admit::Wait,
-            Pace {
-                poll: Duration::from_millis(5),
-                line_every: Duration::from_secs(60),
-            },
-            &mut relief,
-            &mut |_| {},
-        )
-        .map(|c| c.record().need.what.clone())
-    });
-    assert_eq!(
-        asks.recv_timeout(MUST_HAPPEN).expect("the first ask"),
-        (10 * GIB, true)
-    );
-    drop(first);
-    m.set(with_vol(vol(100, 14, 4)));
-    let around = admitted(enter(&s, &m, Need::new("around").disk(5 * GIB, "/vol")), &m);
-    m.set(with_vol(vol(100, 37, 4)));
-    go.send(()).expect("the waiter's relief listens");
-    assert_eq!(
-        asks.recv_timeout(MUST_HAPPEN)
-            .expect("asked again for the claim it did not count"),
-        (5 * GIB, false)
-    );
-    let got = joined(waiting, "its admission once the second relief freed room");
-    assert_eq!(got.expect("admitted").as_str(), "verify");
-    drop(around);
 }
 
 /// A quiet claim waits for the load to fall to its bound and for any other quiet claim to end.
@@ -5745,6 +5403,7 @@ fn a_holders_measured_writes_are_credited() {
             above_floor: 49 * GIB,
             floor: 10 * GIB,
             reserved: 50 * GIB,
+            writing: 50 * GIB,
             held: Vec::new(),
         }]
     );
@@ -5757,13 +5416,13 @@ fn a_holders_measured_writes_are_credited() {
     drop((w, h));
 }
 
-/// Free space a [`crate::Relief`] can give back is given back before the first wait line, and
-/// a need it meets is admitted with no line at all. One it brings within the room but short of
-/// what a held claim reserves waits, its lines naming the need, the free space and what the
-/// relief says holds the rest. Negative control: with room, the relief is never asked and
-/// nothing is said.
+/// Free space a [`crate::Relief`] can give back is given back before the need is judged by its
+/// volume's room, and a need it meets is admitted with no wait line. One it brings within the
+/// room the running claims leave (what the volume holds above the floor less the 10 GiB a held
+/// claim has still to write) is admitted at once beside that claim, relieved once and with no
+/// wait line. Negative control: with room, the relief is never asked and nothing is said.
 #[test]
-fn a_disk_need_is_relieved_before_it_waits() {
+fn a_disk_need_is_relieved_before_it_is_judged() {
     struct Freeing<'a> {
         machine: &'a Fixed,
         to: u64,
@@ -5848,15 +5507,15 @@ fn a_disk_need_is_relieved_before_it_waits() {
     let s2 = scratch("relief-short");
     let m = std::sync::Arc::new(on(vol(40, 20, 4)));
     let held = admitted(enter(&s2, &m, Need::new("held").disk(10 * GIB, "/vol")), &m);
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
     let ledger = s2.ledger.clone();
     let theirs = std::sync::Arc::clone(&m);
-    let waiting = std::thread::spawn(move || {
+    let starting = std::thread::spawn(move || {
         let mut relief = Freeing {
             machine: &theirs,
-            to: 22,
+            to: 26,
             asked: 0,
         };
+        let mut said = Vec::new();
         let claim = crate::admit_relieved(
             &ledger,
             &*theirs,
@@ -5864,35 +5523,18 @@ fn a_disk_need_is_relieved_before_it_waits() {
             Admit::Wait,
             pace,
             &mut relief,
-            &mut |l| {
-                let _ = tx.send(l.to_owned());
-            },
+            &mut |l| said.push(l.to_owned()),
         );
-        (claim.map(|c| c.record().need.what.clone()), relief.asked)
+        (
+            claim.map(|c| c.record().need.what.clone()),
+            relief.asked,
+            said,
+        )
     });
-    let first = rx.recv_timeout(MUST_HAPPEN).expect("the relief's line");
-    assert_eq!(first, "reclaimed");
-    let line = rx.recv_timeout(MUST_HAPPEN).expect("the wait line");
-    names(
-        &line,
-        &[
-            "verify",
-            "12 GiB",
-            "18 GiB",
-            "10 GiB reserved",
-            "/vol",
-            "largest: /vol/big 9 GiB",
-        ],
-    );
-    assert!(!waiting.is_finished(), "it waits, short of room");
-    m.set({
-        let mut r = Reading::of_gib(48, 40, 14);
-        r.volume = Some(vol(40, 36, 4));
-        r
-    });
-    let (claim, asked) = joined(waiting, "the waiter's admission once room came");
-    assert_eq!(claim.expect("admitted once room came").as_str(), "verify");
+    let (claim, asked, said) = joined(starting, "its admission beside the held claim");
+    assert_eq!(claim.expect("admitted at once").as_str(), "verify");
     assert_eq!(asked, 1, "relieved once");
+    assert_eq!(said, ["reclaimed"], "admitted with no wait line");
     drop(held);
 }
 
@@ -5900,16 +5542,15 @@ fn a_disk_need_is_relieved_before_it_waits() {
 /// before any wait line, and the relief frees to 18 GiB above the floor, still less than the
 /// need: it is refused at the next look, no wait line said, its error naming the need, the
 /// volume, what is free above the floor and the floor after that relief, what the relief says
-/// holds the rest and `--admit now`, and the claim leaves the queue. NEGATIVE CONTROL: where the
-/// relief says at that look that what it may take grew ([`crate::Relief::renewed`]), it is
-/// relieved again rather than refused, and admitted once that frees room.
+/// holds the rest and that it ends now rather than wait for disk, and no space to free; the
+/// claim leaves the queue. NEGATIVE CONTROL: where the relief frees to 32 GiB above the floor,
+/// the need is admitted at that next look, relieved once, with no wait line.
 #[test]
-fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_unless_the_relief_renewed() {
-    /// Frees to `frees[i]` GiB at its `i`th call; says its reach grew `grows` times.
+fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_at_once() {
+    /// Frees to `frees[i]` GiB at its `i`th call.
     struct Leaves {
         machine: Arc<Fixed>,
         frees: Vec<u64>,
-        grows: usize,
         asked: usize,
     }
     impl crate::Relief for Leaves {
@@ -5931,23 +5572,17 @@ fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_unless_the_relief_re
         ) -> Option<String> {
             Some("largest: /vol/big 9 GiB".to_owned())
         }
-        fn renewed(&mut self, _stopped: &dyn Fn() -> bool) -> bool {
-            let grew = self.grows > 0;
-            self.grows = self.grows.saturating_sub(1);
-            grew
-        }
     }
     let pace = Pace {
         poll: Duration::from_millis(5),
         line_every: Duration::from_secs(60),
     };
     let s = scratch("unmet-relieved");
-    let run = |frees: &[u64], grows: usize| {
+    let run = |frees: &[u64]| {
         let ledger = s.ledger.clone();
         let mut relief = Leaves {
             machine: Arc::new(on(vol(40, 20, 4))),
             frees: frees.to_vec(),
-            grows,
             asked: 0,
         };
         let deciding = std::thread::spawn(move || {
@@ -5968,7 +5603,7 @@ fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_unless_the_relief_re
         joined(deciding, "its admission or refusal")
     };
 
-    let (got, asked, said) = run(&[22], 0);
+    let (got, asked, said) = run(&[22]);
     let Err(
         refused @ Error::Unmet {
             holders: Some(holders),
@@ -5987,10 +5622,11 @@ fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_unless_the_relief_re
             "18 GiB",
             "4 GiB floor",
             "largest: /vol/big 9 GiB",
-            "Free at least 9 GiB on /vol",
             "once its relief freed what it could",
+            "ends now rather than wait for disk",
         ],
     );
+    assert!(!refused.to_string().contains("Free at least"), "{refused}");
     assert_eq!(asked, 1);
     assert_eq!(said, ["reclaimed"], "no wait line");
     assert!(
@@ -5998,42 +5634,278 @@ fn a_disk_need_its_relief_leaves_beyond_the_room_is_refused_unless_the_relief_re
         "it left the queue"
     );
 
-    let (got, asked, said) = run(&[22, 36], 1);
-    assert_eq!(
-        got.expect("admitted once the renewed relief freed room"),
-        "verify"
-    );
-    assert_eq!(asked, 2, "relieved again, not refused");
-    assert_eq!(said, ["reclaimed", "reclaimed"], "no wait line");
+    let (got, asked, said) = run(&[36]);
+    assert_eq!(got.expect("admitted once its relief freed room"), "verify");
+    assert_eq!(asked, 1, "relieved once");
+    assert_eq!(said, ["reclaimed"], "no wait line");
 }
 
-/// UNMET after a wait: a 27 GiB need on a volume 20 GiB above its 4 GiB floor, beside a held
-/// 10 GiB claim of its own process (which it never waits for once beyond the room: its process
-/// lets that claim go only after its wait), is relieved to 31 GiB above the floor, within the
-/// room but short of what the held claim reserves, so it waits, saying so. Others' writes then take the volume back to
-/// 20 GiB above the floor: that look finds it beyond the room again, after one that found it
-/// within, so it is relieved again before anything is decided, and a relief that frees nothing
-/// then has it refused at the next look, the claim leaving the queue. NEGATIVE CONTROL: where
-/// that second relief frees to 41 GiB above the floor, it is admitted beside the held claim.
-/// Either way it waits for no person: the hang detector ends a wait that is never relieved again.
-#[test]
-fn a_waiter_pushed_back_beyond_the_room_is_relieved_again_then_refused_or_admitted() {
-    /// Sets the volume free to `frees[i]` GiB (4 GiB floor) at its `i`th call.
-    struct Twice {
-        machine: Arc<Fixed>,
-        frees: [u64; 2],
-        asked: usize,
+/// An admission's decision, with how many times its relief ran and the admission rows it wrote.
+type Decision = (
+    Result<crate::Claim, Error>,
+    usize,
+    Vec<aterm_telemetry::Row>,
+);
+
+/// What [`decided_without_a_wait`] hears from the admission it runs.
+enum Heard {
+    /// A line it said.
+    Line(String),
+    /// Its decision.
+    Decided(Box<Decision>),
+}
+
+/// A relief that counts its calls and sets the volume free to `frees` GiB (4 GiB floor) where
+/// given, else frees nothing.
+struct OneRelief {
+    machine: Arc<Fixed>,
+    frees: Option<u64>,
+    calls: usize,
+}
+
+impl crate::Relief for OneRelief {
+    fn relieve(
+        &mut self,
+        _short: &crate::Shortfall,
+        _say: &mut dyn FnMut(&str),
+        _stopped: &dyn Fn() -> bool,
+    ) {
+        self.calls += 1;
+        if let Some(free) = self.frees {
+            self.machine.set(with_vol(vol(100, free, 4)));
+        }
     }
-    impl crate::Relief for Twice {
+    fn holders(
+        &mut self,
+        _short: &crate::Shortfall,
+        _stopped: &dyn Fn() -> bool,
+    ) -> Option<String> {
+        None
+    }
+}
+
+/// `need`'s admission on `machine`, relieved by a [`OneRelief`] freeing to `frees`, on a thread
+/// of its own in `s`'s ledger, which stands for this user's so its admission rows are captured
+/// ([`crate::telemetry::capture`]): its decision, its relief's calls and its rows. Each line it
+/// says is heard as it is said, and a wait line fails the test at once; its looks are two hang
+/// detectors apart, so a wait never ends on its own before that line, and a decision that does
+/// not come within the hang detector fails it too.
+fn decided_without_a_wait(
+    s: &Scratch,
+    machine: &Arc<Fixed>,
+    need: Need,
+    frees: Option<u64>,
+) -> Decision {
+    let (tx, heard) = std::sync::mpsc::channel::<Heard>();
+    let (ledger, theirs) = (s.ledger.clone(), Arc::clone(machine));
+    let deciding = std::thread::spawn(move || {
+        let mut relief = OneRelief {
+            machine: Arc::clone(&theirs),
+            frees,
+            calls: 0,
+        };
+        let lines = tx.clone();
+        let (got, rows) = crate::telemetry::capture(ledger.clone(), || {
+            crate::admit_relieved(
+                &ledger,
+                &*theirs,
+                need,
+                Admit::Wait,
+                Pace {
+                    poll: MUST_HAPPEN * 2,
+                    line_every: Duration::from_secs(60),
+                },
+                &mut relief,
+                &mut |l| {
+                    let _ = lines.send(Heard::Line(l.to_owned()));
+                },
+            )
+        });
+        let _ = tx.send(Heard::Decided(Box::new((got, relief.calls, rows))));
+    });
+    loop {
+        match heard.recv_timeout(MUST_HAPPEN) {
+            Ok(Heard::Line(line)) => assert!(!line.contains(" waits ("), "it waited: {line}"),
+            Ok(Heard::Decided(decided)) => {
+                deciding.join().expect("the admission's thread");
+                return *decided;
+            }
+            Err(e) => panic!("no decision within the hang detector: {e}"),
+        }
+    }
+}
+
+/// ONE RELIEF, THEN THE ROOM: a 35 GiB need on a volume 40 GiB above its 4 GiB floor, behind a
+/// waiter that reserves 10 GiB there while it waits for memory, is short of what that waiter
+/// reserves; its one relief frees nothing, and it starts at the next look, with no wait line,
+/// its need judged by the room the running claims leave (none held there writes), not by what a
+/// waiter reserves. NEGATIVE CONTROL: the same need's look that counts reservations
+/// ([`Waiter::poll`]) is short of disk, those 10 GiB reserved.
+#[test]
+fn a_disk_need_that_fits_after_its_one_relief_starts_without_waiting_on_reserved_disk() {
+    let s = scratch("one-relief-starts");
+    let m = Arc::new(on(vol(100, 44, 4)));
+    let held = admitted(enter(&s, &m, Need::new("held").mem_gib(30)), &m);
+    let reserving = Need::new("ahead").mem_gib(20).disk(10 * GIB, "/vol");
+    let (ahead, _) = waits(enter(&s, &m, reserving), &m);
+    let need = || Need::new("verify").disk(35 * GIB, "/vol");
+    let (w, short) = waits(enter(&s, &m, need()), &m);
+    assert!(
+        matches!(short.shorts[..], [Short::Disk { reserved, .. }] if reserved == 10 * GIB),
+        "{short}"
+    );
+    drop(w);
+    let (got, calls, _) = decided_without_a_wait(&s, &m, need(), None);
+    let claim = got.expect("admitted after its one relief");
+    assert_eq!(claim.record().need.disk, 35 * GIB);
+    assert_eq!(calls, 1, "relieved once");
+    drop((claim, ahead, held));
+}
+
+/// ROOM IS WHAT THE RUNNING CLAIMS LEAVE: a 35 GiB need on a volume 40 GiB above its 4 GiB floor,
+/// beside a held claim that has 10 GiB of its need still to write there, ends at once after its
+/// one relief freed nothing ([`Error::Unmet`]), short by 5 GiB with those 10 GiB named: that
+/// claim runs and writes into the same room, so two runs are not admitted into room only one of
+/// them fits. NEGATIVE CONTROL: once that claim says it wrote its 10 GiB it has nothing still to
+/// write, and the same need, kept short at its first look by a waiter ahead that reserves 10 GiB
+/// there while it waits for memory, is admitted after its one relief.
+#[test]
+fn a_disk_need_beyond_the_room_running_claims_leave_ends_at_once() {
+    let s = scratch("room-left");
+    let m = Arc::new(on(vol(100, 44, 4)));
+    let writes = Need::new("writer").mem_gib(30).disk(10 * GIB, "/vol");
+    let mut writer = admitted(enter(&s, &m, writes), &m);
+    let need = || Need::new("verify").disk(35 * GIB, "/vol");
+    let (got, calls, _) = decided_without_a_wait(&s, &m, need(), None);
+    let Err(refused @ Error::Unmet { relieved: true, .. }) = &got else {
+        panic!("refused as unmet once its relief ran, got {got:?}");
+    };
+    names(
+        &refused.to_string(),
+        &[
+            "verify: disk short by 5 GiB",
+            "35 GiB",
+            "40 GiB",
+            "less 10 GiB reserved",
+            "ends now rather than wait for disk",
+        ],
+    );
+    assert_eq!(calls, 1, "relieved once");
+
+    writer.wrote(10 * GIB).expect("said");
+    let reserving = Need::new("ahead").mem_gib(20).disk(10 * GIB, "/vol");
+    let (ahead, _) = waits(enter(&s, &m, reserving), &m);
+    let (got, calls, _) = decided_without_a_wait(&s, &m, need(), None);
+    let claim = got.expect("admitted once the claim beside it had nothing still to write");
+    assert_eq!(calls, 1, "relieved once");
+    drop((claim, ahead, writer));
+}
+
+/// ONE RELIEF, THEN THE END: a 45 GiB need on a volume 40 GiB above its 4 GiB floor, beside a
+/// 10 GiB scratch claim another process holds there (what it wrote may come back by its end,
+/// which a need beyond the room once waited for), is still beyond the room the running claims
+/// leave (40 GiB less the 10 GiB that claim has still to write) once its one relief freed
+/// nothing: it ends at once ([`Error::Unmet`], its relief named as run), with exactly one
+/// `kind=admission` row, refused, and leaves nothing of its own in the ledger; the scratch claim
+/// stays held. NEGATIVE CONTROL: a relief that frees 15 GiB brings it within that room, and it is
+/// admitted, with one admitted row.
+#[cfg(unix)]
+#[test]
+fn a_disk_need_that_cannot_fit_after_its_one_relief_ends_at_once_with_one_admission_row() {
+    let s = scratch("one-relief-ends");
+    let (mut child, holder) = standin_with(
+        &s,
+        &[
+            (STANDIN_DISK, "10".to_owned()),
+            (STANDIN_SCRATCH, "1".to_owned()),
+        ],
+    );
+    let m = Arc::new(on(vol(100, 44, 4)));
+    let need = || Need::new("verify").disk(45 * GIB, "/vol");
+    let (got, calls, rows) = decided_without_a_wait(&s, &m, need(), None);
+    let Err(refused @ Error::Unmet { relieved: true, .. }) = &got else {
+        panic!("refused as unmet once its relief ran, got {got:?}");
+    };
+    names(
+        &refused.to_string(),
+        &[
+            "verify: disk short by 15 GiB",
+            "45 GiB",
+            "40 GiB",
+            "less 10 GiB reserved",
+            "ends now rather than wait for disk",
+        ],
+    );
+    assert_eq!(calls, 1, "relieved once");
+    let [row] = &rows[..] else {
+        panic!("one admission row: {rows:?}");
+    };
+    assert_eq!(
+        (&row.kind, row.outcome),
+        (
+            &aterm_telemetry::Kind::Admission,
+            aterm_telemetry::Outcome::Refused
+        )
+    );
+    let left: Vec<(u32, bool)> = s
+        .ledger
+        .list()
+        .expect("listed")
+        .iter()
+        .map(|r| (r.pid, r.held.is_some()))
+        .collect();
+    assert_eq!(
+        left,
+        [(holder, true)],
+        "it left the queue; the scratch claim stays held"
+    );
+
+    let (got, calls, rows) = decided_without_a_wait(&s, &m, need(), Some(59));
+    let claim = got.expect("admitted once its relief freed 15 GiB");
+    assert_eq!(calls, 1, "relieved once");
+    let [row] = &rows[..] else {
+        panic!("one admission row: {rows:?}");
+    };
+    assert_eq!(row.outcome, aterm_telemetry::Outcome::Ok);
+    drop(claim);
+    std::fs::write(s.dir.path().join("die"), "").expect("told the stand-in to die");
+    let _ = child.wait();
+}
+
+/// ONE RELIEF, ONE JUDGMENT, THEN NO MORE ABOUT DISK: a run of 20 GiB of memory and 27 GiB of
+/// disk on a volume 31 GiB above its 4 GiB floor waits for memory beside a held 30 GiB claim,
+/// unrelieved, since it is short of no disk. Others' writes then take the volume to 20 GiB above
+/// the floor: that first look short of disk runs its one relief, which frees to 41 GiB above the
+/// floor, and the look after it finds the room and goes on waiting for memory. From then on its
+/// disk is not judged: the volume falling to 20 GiB above the floor again ends nothing, and it
+/// is admitted once the held claim ends, relieved once. NEGATIVE CONTROL: where that relief
+/// frees nothing, the look after it ends the wait at once ([`Error::Unmet`]), still short of
+/// memory, with no space to free named, the claim leaving the queue and the held claim listed
+/// alone. Either way it waits for no person: the hang detector ends a wait that never ends.
+#[test]
+fn a_waiter_whose_disk_was_met_after_its_relief_waits_on_for_memory_alone() {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    /// Sets the volume free to `frees` GiB (4 GiB floor) and says `relieved` at each call, and
+    /// sends whether its look was short of disk.
+    struct Toward {
+        machine: Arc<Fixed>,
+        frees: u64,
+        calls: Sender<bool>,
+    }
+    impl crate::Relief for Toward {
         fn relieve(
             &mut self,
-            _short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
+            short: &crate::Shortfall,
+            say: &mut dyn FnMut(&str),
             _stopped: &dyn Fn() -> bool,
         ) {
-            self.machine
-                .set(with_vol(vol(100, self.frees[self.asked], 4)));
-            self.asked += 1;
+            self.machine.set(with_vol(vol(100, self.frees, 4)));
+            say("relieved");
+            let disk = short
+                .shorts
+                .iter()
+                .any(|item| matches!(item, Short::Disk { .. }));
+            let _ = self.calls.send(disk);
         }
         fn holders(
             &mut self,
@@ -6043,217 +5915,123 @@ fn a_waiter_pushed_back_beyond_the_room_is_relieved_again_then_refused_or_admitt
             None
         }
     }
-    let run = |label: &str, second: u64| {
+    /// A run under way once its one relief came: every look says its line (a line every look).
+    struct Running {
+        s: Scratch,
+        m: Arc<Fixed>,
+        held: crate::Claim,
+        lines: Receiver<String>,
+        calls: Receiver<bool>,
+        deciding: std::thread::JoinHandle<Result<String, Error>>,
+    }
+    fn run(label: &str, frees: u64) -> Running {
         let s = scratch(label);
-        let m = Arc::new(on(vol(100, 24, 4)));
-        let held = admitted(enter(&s, &m, Need::new("held").disk(10 * GIB, "/vol")), &m);
-        let (tx, lines) = std::sync::mpsc::channel::<String>();
+        let m = Arc::new(on(vol(100, 35, 4)));
+        let held = admitted(enter(&s, &m, Need::new("held").mem_gib(30)), &m);
+        let (tx, lines) = channel::<String>();
+        let (called, calls) = channel::<bool>();
         let (ledger, theirs) = (s.ledger.clone(), Arc::clone(&m));
         let deciding = std::thread::spawn(move || {
-            let mut relief = Twice {
+            let mut relief = Toward {
                 machine: Arc::clone(&theirs),
-                frees: [35, second],
-                asked: 0,
+                frees,
+                calls: called,
             };
-            let got = crate::admit_relieved(
+            crate::admit_relieved(
                 &ledger,
                 &*theirs,
-                Need::new("verify").disk(27 * GIB, "/vol"),
+                Need::new("verify").mem_gib(20).disk(27 * GIB, "/vol"),
                 Admit::Wait,
                 Pace {
                     poll: Duration::from_millis(5),
-                    line_every: Duration::from_secs(60),
+                    line_every: Duration::ZERO,
                 },
                 &mut relief,
                 &mut |l| {
                     let _ = tx.send(l.to_owned());
                 },
             )
-            .map(|c| c.record().need.what.clone());
-            (got, relief.asked)
+            .map(|c| c.record().need.what.clone())
         });
         let line = lines.recv_timeout(MUST_HAPPEN).expect("the wait line");
-        names(
-            &line,
-            &["verify", "27 GiB", "31 GiB", "10 GiB reserved", "\"held\""],
-        );
+        names(&line, &["verify", "memory short by 10 GiB", "\"held\""]);
         m.set(with_vol(vol(100, 24, 4)));
-        let (got, asked) = joined(deciding, "its refusal or admission");
-        let left = s.ledger.list().expect("listed").len();
-        drop(held);
-        (got, asked, left)
-    };
+        assert!(
+            calls.recv_timeout(MUST_HAPPEN).expect("its one relief"),
+            "its one relief came at its first look short of disk"
+        );
+        Running {
+            s,
+            m,
+            held,
+            lines,
+            calls,
+            deciding,
+        }
+    }
+    /// The first line said after the relief's own: `None` where the wait ended instead.
+    fn after_relief(lines: &Receiver<String>) -> Option<String> {
+        loop {
+            if lines.recv_timeout(MUST_HAPPEN).ok()? == "relieved" {
+                return lines.recv_timeout(MUST_HAPPEN).ok();
+            }
+        }
+    }
 
-    let (got, asked, left) = run("unmet-after-wait", 24);
+    let met = run("met-after-relief", 45);
+    let line = after_relief(&met.lines).expect("the look after its relief waits on for memory");
+    names(&line, &["verify", "memory short by 10 GiB"]);
+    assert!(!line.contains("disk"), "its disk was met: {line}");
+    met.m.set(with_vol(vol(100, 24, 4)));
+    // A look that read the fallen volume: the second line said once the channel was drained.
+    while met.lines.try_recv().is_ok() {}
+    met.lines
+        .recv_timeout(MUST_HAPPEN)
+        .expect("a look after the fall");
+    let line = met
+        .lines
+        .recv_timeout(MUST_HAPPEN)
+        .expect("its wait goes on");
+    assert!(
+        !line.contains("disk"),
+        "its disk is not judged again: {line}"
+    );
+    drop(met.held);
+    let got = joined(met.deciding, "its admission once the held claim ended");
+    assert_eq!(got.expect("admitted once the held claim ended"), "verify");
+    assert_eq!(met.calls.try_iter().count(), 0, "relieved once");
+    drop(met.s);
+
+    let unmet = run("unmet-after-relief", 24);
+    assert_eq!(
+        after_relief(&unmet.lines),
+        None,
+        "the look after its relief ended it"
+    );
+    let got = joined(unmet.deciding, "its refusal");
     let Err(refused @ Error::Unmet { short, .. }) = &got else {
         panic!("refused as unmet, got {got:?}");
     };
     assert!(short.shorts.iter().any(Short::unservable), "{refused}");
+    assert!(
+        short
+            .shorts
+            .iter()
+            .any(|item| matches!(item, Short::Memory { .. })),
+        "still short of memory: {refused}"
+    );
     names(
         &refused.to_string(),
-        &["27 GiB", "20 GiB", "Free at least 7 GiB on /vol"],
+        &["27 GiB", "20 GiB", "ends now rather than wait for disk"],
     );
-    assert_eq!(asked, 2, "relieved again before it was refused");
-    assert_eq!(left, 1, "it left the queue: the held claim alone is listed");
-
-    let (got, asked, _) = run("admitted-after-wait", 45);
+    assert!(!refused.to_string().contains("Free at least"), "{refused}");
     assert_eq!(
-        got.expect("admitted once the second relief freed room"),
-        "verify"
+        unmet.s.ledger.list().expect("listed").len(),
+        1,
+        "it left the queue: the held claim alone is listed"
     );
-    assert_eq!(asked, 2, "relieved again");
-}
-
-/// UNMET-HELD: a 27 GiB need on a volume 20 GiB above its 4 GiB floor, beside a 30 GiB scratch
-/// claim another process holds there, is relieved once and then waits for that claim, its line
-/// naming it, instead of being refused: the claim may give back by its end what it wrote and does
-/// not keep. Where the stand-in gives back 16 GiB and then ends, the need fits with no second
-/// relief. Where a scratch stand-in returns no space, its end is followed by a second relief and
-/// UNMET rather than another wait. NEGATIVE CONTROLS: the need is refused after its first relief
-/// without waiting where the otherwise identical 30 GiB claim is durable, or where a scratch
-/// claim can return only 5 GiB of its 7 GiB deficit. No wait line comes and the holder remains
-/// listed. If the scratch marker were ignored, both sufficient-scratch cases take that path; if
-/// any scratch claim sufficed, the insufficient one waits instead of being refused.
-#[cfg(unix)]
-#[test]
-fn a_need_beyond_the_room_waits_for_a_claim_held_on_its_volume_then_is_relieved_again() {
-    /// Frees nothing; counts its calls.
-    struct Counts(Arc<std::sync::atomic::AtomicUsize>);
-    impl crate::Relief for Counts {
-        fn relieve(
-            &mut self,
-            _short: &crate::Shortfall,
-            _say: &mut dyn FnMut(&str),
-            _stopped: &dyn Fn() -> bool,
-        ) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        fn holders(
-            &mut self,
-            _short: &crate::Shortfall,
-            _stopped: &dyn Fn() -> bool,
-        ) -> Option<String> {
-            None
-        }
-    }
-    let run = |label: &str,
-               disk_gib: u64,
-               scratch_claim: bool,
-               gives_back: bool,
-               waits_for_holder: bool| {
-        let s = scratch(label);
-        let mut envs = vec![(STANDIN_DISK, disk_gib.to_string())];
-        if scratch_claim {
-            envs.push((STANDIN_SCRATCH, "1".to_owned()));
-        }
-        let (mut child, holder) = standin_with(&s, &envs);
-        let m = Arc::new(on(vol(100, 24, 4)));
-        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (tx, lines) = std::sync::mpsc::channel::<String>();
-        let (ledger, theirs, counted) = (s.ledger.clone(), Arc::clone(&m), Arc::clone(&asked));
-        let deciding = std::thread::spawn(move || {
-            crate::admit_relieved(
-                &ledger,
-                &*theirs,
-                Need::new("verify").disk(27 * GIB, "/vol"),
-                Admit::Wait,
-                Pace {
-                    poll: Duration::from_millis(5),
-                    line_every: Duration::from_secs(60),
-                },
-                &mut Counts(counted),
-                &mut |l| {
-                    let _ = tx.send(l.to_owned());
-                },
-            )
-            .map(|c| c.record().need.what.clone())
-        });
-        if waits_for_holder {
-            assert!(scratch_claim, "only a scratch claim can return its writes");
-            let line = lines.recv_timeout(MUST_HAPPEN).expect("the wait line");
-            names(
-                &line,
-                &[
-                    "verify",
-                    "27 GiB",
-                    "20 GiB",
-                    &format!("pid {holder}"),
-                    "stand-in A",
-                ],
-            );
-            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
-            if gives_back {
-                m.set(with_vol(vol(100, 40, 4)));
-            }
-            std::fs::write(s.dir.path().join("die"), "").expect("told the stand-in to die");
-            let _ = child.wait();
-            let got = joined(deciding, "its admission");
-            let left = s.ledger.list().expect("listed").len();
-            (got, asked.load(std::sync::atomic::Ordering::SeqCst), left)
-        } else {
-            let got = joined(deciding, "its immediate refusal");
-            assert!(
-                matches!(
-                    lines.try_recv(),
-                    Err(std::sync::mpsc::TryRecvError::Disconnected)
-                ),
-                "a holder that cannot return enough produced no wait line"
-            );
-            let left = s.ledger.list().expect("listed").len();
-            std::fs::write(s.dir.path().join("die"), "").expect("told the stand-in to die");
-            let _ = child.wait();
-            (got, asked.load(std::sync::atomic::Ordering::SeqCst), left)
-        }
-    };
-
-    let (got, asked, _) = run("held-gives-back", 30, true, true, true);
-    assert_eq!(got.expect("admitted once the holder gave back"), "verify");
-    assert_eq!(
-        asked, 1,
-        "what the holder gave back admits it, no second relief"
-    );
-
-    let (got, asked, left) = run("scratch-keeps", 30, true, false, true);
-    let Err(refused @ Error::Unmet { short, .. }) = &got else {
-        panic!("refused as unmet once the scratch holder ended, got {got:?}");
-    };
-    assert!(short.shorts.iter().any(Short::unservable), "{refused}");
-    names(&refused.to_string(), &["Free at least 7 GiB on /vol"]);
-    assert_eq!(asked, 2, "relieved again once the scratch claim ended");
-    assert_eq!(
-        left, 0,
-        "the scratch holder ended; the waiter left the queue"
-    );
-
-    let (got, asked, left) = run("scratch-insufficient", 5, true, false, false);
-    let Err(refused @ Error::Unmet { short, .. }) = &got else {
-        panic!("refused as unmet without waiting for insufficient scratch, got {got:?}");
-    };
-    assert!(short.shorts.iter().any(Short::unservable), "{refused}");
-    names(
-        &refused.to_string(),
-        &[
-            "no held scratch claim can return enough",
-            "Free at least 7 GiB on /vol",
-        ],
-    );
-    assert_eq!(asked, 1, "one relief preceded the immediate refusal");
-    assert_eq!(
-        left, 1,
-        "the insufficient scratch holder remains; the waiter left the queue"
-    );
-
-    let (got, asked, left) = run("durable-keeps", 30, false, false, false);
-    let Err(refused @ Error::Unmet { short, .. }) = &got else {
-        panic!("refused as unmet without waiting for a durable holder, got {got:?}");
-    };
-    assert!(short.shorts.iter().any(Short::unservable), "{refused}");
-    names(&refused.to_string(), &["Free at least 7 GiB on /vol"]);
-    assert_eq!(asked, 1, "one relief preceded the immediate refusal");
-    assert_eq!(
-        left, 1,
-        "the durable holder remains; the waiter left the queue"
-    );
+    assert_eq!(unmet.calls.try_iter().count(), 0, "relieved once");
+    drop(unmet.held);
 }
 
 /// The tag of the directories the footprint tests' runs claim on ([`crate::Footprint::dirs`]).
@@ -7277,6 +7055,7 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
                 above_floor: 90 * GIB,
                 floor: 10 * GIB,
                 reserved: u64::MAX,
+                writing: u64::MAX,
                 held: Vec::new(),
             },
         ]
@@ -7602,7 +7381,8 @@ impl crate::Machine for Working {
 }
 
 /// A WAIT THAT ASKS TO END BEHIND A HOLDER THAT MAKES NO PROGRESS ENDS THERE
-/// (CW-WAIT-UNBOUNDED): behind a stand-in's held claim whose tree reads idle, a need that ends
+/// (CW-WAIT-UNBOUNDED): behind a stand-in's held 30 GiB memory claim whose tree reads idle, a
+/// 20 GiB memory need (a need short only of disk never waits) that ends
 /// when stuck after a short bound gives up within the hang detector, naming the stand-in and how
 /// long it made no progress, and leaves the queue; the stand-in's claim stays held and the
 /// stand-in lives on, unsignalled. Its work is read with the processes its claim is credited
@@ -7618,13 +7398,7 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
     let s = scratch("ends-stuck");
     // A process launchd parents, outside the stand-in's tree, credited to its claim: its VM.
     let vm = 99_991;
-    let (mut child, holder) = standin_with(
-        &s,
-        &[
-            (STANDIN_DISK, "60".to_owned()),
-            (STANDIN_CREDIT, vm.to_string()),
-        ],
-    );
+    let (mut child, holder) = standin_with(&s, &[(STANDIN_CREDIT, vm.to_string())]);
     let bound = Duration::from_millis(200);
     let m = Arc::new(Working::new(holder, vm, bound));
     let pace = Pace {
@@ -7637,9 +7411,7 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
             admit_until(
                 &ledger,
                 &*machine,
-                Need::new("verify lint")
-                    .disk(40 * GIB, "/vol")
-                    .ends_when_stuck(bound),
+                Need::new("verify lint").mem_gib(20).ends_when_stuck(bound),
                 Admit::Wait,
                 pace,
                 &mut |_| {},
@@ -7658,7 +7430,7 @@ fn a_wait_that_asks_to_end_behind_a_stuck_holder_ends_there() {
                 &e.to_string(),
                 &[
                     "gave up its wait",
-                    &format!("pid {holder} holds 60 GiB of disk"),
+                    &format!("pid {holder} holds 30 GiB of memory"),
                     "which has made no progress for",
                 ],
             );
@@ -10260,4 +10032,41 @@ fn observed_nonblocking_attempts_preserve_admission_and_leave_no_denied_reservat
     assert_eq!(ledger.list().unwrap().len(), 1);
     drop(claim);
     assert!(ledger.list().unwrap().is_empty());
+}
+
+/// A VOLUME'S LINES ARE READ ONLY NEAR AN EMERGENCY LINE ([`crate::reading::lined`], the judge
+/// [`crate::reading::read_lined`] applies to what it read): at exactly 8 GiB free (the largest
+/// emergency line any volume has) and 50,000 inodes free, with inodes untracked, or well clear
+/// of both, the lines are not read (the reader panics here) and none are kept. NEGATIVE CONTROL:
+/// a byte below 8 GiB, or an inode below 50,000, reads them and keeps them.
+#[test]
+fn a_volumes_lines_are_read_only_near_its_emergency_line() {
+    assert_eq!(
+        floor::EMERGENCY_FREE_SHARE_MAX_GIB.max(floor::EMERGENCY_FREE_GIB),
+        8,
+        "the largest emergency line any volume has, in GiB"
+    );
+    let most = 8 * GIB;
+    let lines = floor::lines(floor::Knobs::default(), Some(500 * GIB), None);
+    let mount = || PathBuf::from("/Volumes/scratch");
+    for (free, files, why) in [
+        (most, Some(floor::EMERGENCY_FILES_FREE), "at both lines"),
+        (most, None, "at the bytes' line, inodes untracked"),
+        (400 * GIB, Some(1_000_000), "well clear of both"),
+    ] {
+        let got = crate::reading::lined(mount(), free, files, || panic!("{why}: lines read"));
+        assert_eq!(got.lines, None, "{why}");
+        assert_eq!((got.free, got.files_free), (free, files), "{why}");
+    }
+    for (free, files, why) in [
+        (most - 1, Some(1_000_000), "a byte below the bytes' line"),
+        (
+            400 * GIB,
+            Some(floor::EMERGENCY_FILES_FREE - 1),
+            "an inode below the inodes' line",
+        ),
+    ] {
+        let got = crate::reading::lined(mount(), free, files, || lines);
+        assert_eq!(got.lines, Some(lines), "{why}");
+    }
 }

@@ -1866,8 +1866,10 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
 }
 
 /// A renewal whose page met Cloudflare's bot check, which did not clear, ends as a failure on
-/// record naming Cloudflare, with a durable human login task and no NEEDS YOU prompt.
-/// An unrelated failure must not replace that task or create a new human action.
+/// record naming Cloudflare, with the account's check, a durable human login task and no NEEDS
+/// YOU prompt. A later renewal with nobody at the terminal runs nothing and names the person's
+/// step; a person's renewal that fails for another reason replaces neither the task nor the
+/// check.
 ///
 /// Unix only, as the overlay staging home it signs in to is; off Unix,
 /// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
@@ -1904,21 +1906,53 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     assert!(out.contains("human browser challenge recorded"), "{out}");
     assert!(out.contains("accounts login kimi-one --cli kimi"), "{out}");
     let before = records.logins.get("kimi-one").cloned();
+    assert!(
+        before
+            .as_ref()
+            .is_some_and(|binding| binding.check_stop.is_some()),
+        "the account's check is on record"
+    );
+    // With nobody at this terminal, the row the check stopped is not signed in again, on any
+    // clock: the run names the person's step and changes nothing.
     let failed = SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home);
-    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
-    assert!(!out.contains("human browser challenge"), "{out}");
-    assert!(!out.contains("NEEDS YOU"), "{out}");
+    let (code, out, err) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(
+        err.contains("not run: its last sign-in stopped where only a person at this Mac can go on")
+            && err.contains("a person runs `aterm harness accounts login kimi-one --cli kimi`"),
+        "{err}"
+    );
     assert_eq!(
         store.load_logins(env.now).unwrap().0.get("kimi-one"),
         before.as_ref()
     );
-
-    let signed_out = SignInHost::new(
-        Script::Ends(login_drive::Outcome::NeedsSignIn(
-            "the sign-in waits on `www.kimi.ai/code/authorize_device` for a person".to_owned(),
-        )),
-        &home,
+    // A person at this terminal runs it, and an unrelated failure replaces neither the task nor
+    // the check.
+    let failed = SignInHost {
+        terminal: true,
+        ..SignInHost::new(Script::Ends(login_drive::Outcome::Failed), &home)
+    };
+    let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &failed);
+    assert!(!out.contains("human browser challenge"), "{out}");
+    assert!(!out.contains("NEEDS YOU"), "{out}");
+    let after = store.load_logins(env.now).unwrap().0;
+    let after = after.get("kimi-one");
+    assert_eq!(
+        after.map(|binding| (binding.sign_in_task, binding.check_stop.clone())),
+        before
+            .as_ref()
+            .map(|binding| (binding.sign_in_task, binding.check_stop.clone()))
     );
+
+    let signed_out = SignInHost {
+        terminal: true,
+        ..SignInHost::new(
+            Script::Ends(login_drive::Outcome::NeedsSignIn(
+                "the sign-in waits on `www.kimi.ai/code/authorize_device` for a person".to_owned(),
+            )),
+            &home,
+        )
+    };
     let (_, out, _) = renew("accounts renew kimi-one --cli kimi", &env, &signed_out);
     assert!(out.contains("NEEDS YOU"), "CONTROL: {out}");
     assert!(
@@ -1932,7 +1966,9 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
 /// the 15-minute cooldown holds: with no line on record a restart has nothing to hold the row by,
 /// so its end is all there is. Its record fails where the binding moved during the sign-in, or
 /// where the ledger cannot be written. CONTROLS: a plain failure so unrecorded ends `Failed`, and
-/// a bot check on record ends `BotCheck` with its line there.
+/// a bot check on record ends `BotCheck` with its line there. Each renewal is a person's at this
+/// Mac's terminal, the one door the check an earlier one left on record does not hold
+/// (`cli::person_at_terminal`).
 #[cfg(unix)]
 #[test]
 fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
@@ -1951,6 +1987,7 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
     let renewal = |outcome: login_drive::Outcome, during: Option<During>| {
         let host = SignInHost {
             during,
+            terminal: true,
             ..SignInHost::new(Script::Ends(outcome), &home)
         };
         let logins = store.load_logins(env.now).expect("logins").0;
@@ -2653,7 +2690,11 @@ fn codex_default_completion_preserves_metadata_and_is_idempotent() {
 
 #[test]
 fn codex_default_completion_rechecks_identity_roster_and_source() {
-    for race in ["identity", "roster", "source", "policy"] {
+    #[cfg(unix)]
+    let races = ["identity", "roster", "source", "policy"];
+    #[cfg(not(unix))]
+    let races = ["identity", "roster", "policy"];
+    for race in races {
         let tmp = tmp_dir("codex-complete-race");
         let env = env_at(&tmp);
         std::fs::create_dir_all(env.home.as_ref().unwrap().join(".codex")).unwrap();
@@ -2667,6 +2708,7 @@ fn codex_default_completion_rechecks_identity_roster_and_source() {
                 if race == "roster" {
                     std::fs::write(&path, format!("{original}held_by = 'm2'\n")).unwrap();
                 }
+                #[cfg(unix)]
                 if race == "source" {
                     crate::vault_entry::put(
                         env.home.as_ref().unwrap(),
@@ -2855,6 +2897,7 @@ fn codex_default_completion_respects_signed_out_state() {
     assert_eq!(read(&path), original);
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_default_completion_preserves_pool_holds_and_local_authority() {
     for warm in ["[]", "['m2']", "['m1']"] {
@@ -2904,6 +2947,7 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
 }
 
 /// The text of the vault entry `name` under `home`, read in place.
+#[cfg(unix)]
 fn delivered(home: &Path, name: &str) -> String {
     crate::vault_entry::read_text(home, name, 4 << 20)
         .text()
@@ -2913,6 +2957,7 @@ fn delivered(home: &Path, name: &str) -> String {
 
 /// The sheet at `tmp`'s home whose one line gives `address`'s account to `computer`, in the column
 /// `cells` fills, with this Mac named m16.
+#[cfg(unix)]
 fn sheet_of_other_macs(tmp: &Tmp, env: &Env, cells: &str, address: &str, computer: &str) {
     let config = env.config.clone().expect("a config path");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();

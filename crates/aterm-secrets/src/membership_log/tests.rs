@@ -2139,6 +2139,7 @@ mod readers;
 mod record_budgets;
 mod seat_removed;
 pub(super) mod signed;
+mod vault_fill;
 pub(super) mod weigh;
 
 /// A `[everyone]` entry.

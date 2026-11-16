@@ -590,14 +590,6 @@ fn a_removed_table_is_one_line_while_the_file_writes_it() {
             Some(&aterm_messages::Intent::OpenConfigEditor { line: Some(4) }),
             "{text:?}"
         );
-        assert!(
-            line.why.contains("a manager session")
-                && line
-                    .detail
-                    .iter()
-                    .any(|said| said.contains("spawn agent=claude")),
-            "{text:?}: {line:?}"
-        );
         app.note_removed_settings("font_px = [\n");
         assert_eq!(
             app.messages.digest().len(),

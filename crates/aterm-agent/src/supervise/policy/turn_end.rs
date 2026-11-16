@@ -9285,9 +9285,11 @@ impl TurnEndState {
                     || self.opened_fresh
                     || (!drawn_before && self.launched_in_turn(d, now));
                 self.exchange_opens = opens || undecided;
-                self.exchange_unread = undecided && !opens;
                 self.exchange =
                     theirs && d < EXCHANGE_WORK && self.mode_leaves_exchange(reading.autopilot);
+                // Only an exchange left to the person is left for want of a read: its `LEFT` row
+                // says so, and the read that answers corrects that row, in hand or not.
+                self.exchange_unread = undecided && !opens && self.exchange;
                 if self.exchange {
                     // This loop's own `LEFT` row for it, read again at the same turn (the answer
                     // to a wall's retry, a relaunch's start-up), is judged as a loop that follows
@@ -11216,7 +11218,11 @@ impl TurnEndState {
             return;
         }
         let undecided = std::mem::take(&mut self.taskless_unread);
-        let left_unread = std::mem::take(&mut self.exchange_unread) && self.exchange;
+        // Whether or not the exchange is still in hand: one that ended before the read answered
+        // (a host's turn, a switch to Cruise) was still not the session's opening message, and its
+        // `LEFT` row, which said it was, is corrected all the same. Left uncorrected, a loop that
+        // seeds from the ledger would park the session on it while this one has moved on.
+        let left_unread = std::mem::take(&mut self.exchange_unread);
         let current = current.read();
         if let Some(cur) = current {
             if undecided && !cur.resumed {
@@ -11224,7 +11230,8 @@ impl TurnEndState {
             }
             if left_unread && cur.resumed {
                 // The exchange was the resumed session's: not its opening message. Land takes it
-                // back at the next fold ([`Self::mode_takes_exchange`]) and carries the work on.
+                // back at the next fold ([`Self::mode_takes_exchange`]) and carries the work on;
+                // one no longer in hand has nothing left to take, and only its row is corrected.
                 self.exchange_opens = false;
                 self.left_after_work = true;
                 self.exchange_taken_back = true;

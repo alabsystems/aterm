@@ -14,6 +14,7 @@ fn terminal(title: &str) -> restore::RestoredSplitTree {
         restore::TerminalLeafRestore {
             sid: None,
             lineage: None,
+            opened_ms: None,
             log_ep: None,
             cwd: Some("/tmp".into()),
             title: title.into(),

@@ -14,7 +14,11 @@ aterm-json = { workspace = true }
 aterm-toml = { workspace = true }
 aterm-tempfile = { workspace = true }
 aterm-uds = { workspace = true }
+# The census's lexer (`rust_source_views`), which blanks comments and literals in the sources
+# the oracle tokenizes.
 aterm-census = { workspace = true }
+# The seal each emitted Rust file carries (`aterm_seal`).
+aterm-seal = { workspace = true }
 # The build directory's named lock (`named_lock`): a second record/oracle/oracle-052 run on one
 # target directory waits for the first, named, instead of racing its `cargo clean -p` and
 # builds. Workspace crate.

@@ -442,6 +442,7 @@ fn terminal(id: Option<u64>, title: &str) -> RestoredSplitTree {
         pinned: false,
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: Some("/tmp/work".to_string()),
         title: title.to_string(),
@@ -2042,6 +2043,7 @@ fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
                 pinned: false,
                 sid,
                 lineage,
+                opened_ms: None,
                 log_ep: None,
                 cwd: None,
                 title: "zsh".into(),
@@ -2081,12 +2083,15 @@ fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
         _ => panic!("a terminal leaf"),
     };
     let named = RestoreManifest::new(vec![window(
-        Some("s-0123abcd".into()),
-        Some("s-00ff".into()),
+        Some("s-0000000000000123abcd".into()),
+        Some("s-000000000000000000ff".into()),
     )]);
     let wire = named.to_toml().expect("serialize");
-    assert!(wire.contains("sid = \"s-0123abcd\""), "{wire}");
-    assert!(wire.contains("lineage = \"s-00ff\""), "{wire}");
+    assert!(wire.contains("sid = \"s-0000000000000123abcd\""), "{wire}");
+    assert!(
+        wire.contains("lineage = \"s-000000000000000000ff\""),
+        "{wire}"
+    );
     let parsed = RestoreManifest::from_toml(&wire).expect("parse");
     assert_eq!(parsed, named, "the round trip holds");
     let plain = RestoreManifest::new(vec![window(None, None)])
@@ -2097,8 +2102,8 @@ fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
         "a leaf without them is written as before: {plain}"
     );
     let newer = wire.replace(
-        "sid = \"s-0123abcd\"",
-        "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"\nidentity = \"worker\"\ntold = \"1f\"",
+        "sid = \"s-0000000000000123abcd\"",
+        "sid = \"s-0000000000000123abcd\"\nfuture_field = \"from a newer peer\"\nidentity = \"worker\"\ntold = \"1f\"",
     );
     assert_ne!(newer, wire, "PRECONDITION: the unknown field is in");
     assert_eq!(
@@ -2119,6 +2124,12 @@ fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
         ("s-ab\0cd".to_string(), format!("s-{}", "a".repeat(1 << 20))),
         (format!("s-{}", "0".repeat(48)), "s-xyz".to_string()),
         (String::new(), "-".to_string()),
+        // NEGATIVE CONTROL: the loose `s-` forms earlier builds wrote name no tab.
+        ("s-0123abcd".to_string(), "s-00ff".to_string()),
+        (
+            "S-1A2B3C4D5E6F70819203".to_string(),
+            "tqn5r6e014u".to_string(),
+        ),
     ] {
         let raw = RestoreManifest {
             schema: SCHEMA,
@@ -3953,6 +3964,7 @@ fn a_leaf_carries_a_tab_id_in_either_form() {
     for malformed in [
         "",
         "s-",
+        "s-a0",
         "s-../x",
         "S-1a2b",
         "t",

@@ -515,6 +515,8 @@ impl Flow {
 pub(crate) struct LiveFacts {
     /// When the held snapshot landed; `None` before the first.
     pub(crate) landed: Option<Instant>,
+    /// When the held reading began; adoption does not renew its freshness.
+    pub(crate) sampled: Option<Instant>,
     /// How long it speaks for ([`stale_after`]).
     pub(crate) stale_after: Duration,
     /// The strips may move and the dot may beat ([`MotionEffect::DeckLive`]).
@@ -538,7 +540,7 @@ pub(crate) struct LiveFacts {
 
 impl LiveFacts {
     fn fresh(&self, now: Instant) -> bool {
-        self.landed
+        self.sampled
             .is_some_and(|at| now.saturating_duration_since(at) < self.stale_after)
     }
 
@@ -664,7 +666,7 @@ impl LiveFacts {
     /// window's deck clock's (`App::deck_clock_deadline`, the `deck_clock` owner).
     pub(crate) fn next_change(&self, now: Instant, now_ms: i64) -> Option<Instant> {
         let landed = self.landed?;
-        let stale = landed + self.stale_after;
+        let stale = self.sampled? + self.stale_after;
         if stale <= now {
             return None;
         }
@@ -696,7 +698,8 @@ impl LiveFacts {
     /// or for the rest of a sweep this window drew at rest ([`Self::needle_at`]).
     #[cfg(test)]
     pub(crate) fn next_needle(&self, now: Instant) -> Option<Instant> {
-        let stale = self.landed? + self.stale_after;
+        self.landed?;
+        let stale = self.sampled? + self.stale_after;
         if stale <= now || !self.motion {
             return None;
         }
@@ -713,7 +716,8 @@ impl LiveFacts {
     /// stands a whole step elsewhere ([`Needle::next_after`], the needle's law); `None` as for
     /// [`Self::next_needle`].
     pub(crate) fn needle_due(&self, at: Instant, now: Instant) -> Option<Instant> {
-        let stale = self.landed? + self.stale_after;
+        self.landed?;
+        let stale = self.sampled? + self.stale_after;
         if stale <= now || !self.motion {
             return None;
         }
@@ -764,13 +768,10 @@ fn now_unix_ms() -> i64 {
 }
 
 impl crate::App {
-    /// What decides window `wid`'s live edge now, while it draws the v2 deck on screen.
+    /// What decides window `wid`'s freshness and live edge while its resource band is shown.
     pub(crate) fn live_facts(&self, wid: crate::WindowId) -> Option<LiveFacts> {
         let ws = self.windows.get(&wid)?;
-        if self.stats_bars_form() != crate::stats_deck::StatsBars::Deck
-            || !crate::stats_deck::stats_drawn_on(ws)
-            || ws.occluded
-        {
+        if !self.window_bars(wid).shown() || !crate::stats_deck::stats_drawn_on(ws) || ws.occluded {
             return None;
         }
         let lens = self.any_stats_lens_open();
@@ -781,12 +782,13 @@ impl crate::App {
         let effect = MotionEffect::DeckLive;
         // A resting window's deck draws as an unfocused one's, and a woken one's until a reading
         // lands after the wake ([`crate::window_rest::Rest::deck_moves`]).
-        let motion = self
-            .effect_policy(
-                effect,
-                self.motion_focus(wid, ws.focused && ws.rest.deck_moves(self.vitals.landed_at)),
-            )
-            .animate(effect);
+        let motion = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck
+            && self
+                .effect_policy(
+                    effect,
+                    self.motion_focus(wid, ws.focused && ws.rest.deck_moves(self.vitals.landed_at)),
+                )
+                .animate(effect);
         let alone = ws.lens_card.is_none()
             && ws.route_card.is_none()
             && ws.settings_card.is_none()
@@ -820,6 +822,7 @@ impl crate::App {
             });
         Some(LiveFacts {
             landed: snap.and(self.vitals.landed_at),
+            sampled: snap.and(self.vitals.sampled_at),
             stale_after: stale_after(period, self.vitals.landed_period),
             motion,
             beat,
@@ -837,8 +840,8 @@ impl crate::App {
         self.deck_live_now(wid).0
     }
 
-    /// What window `wid`'s deck draws of its live edge now ([`DeckLive::STILL`] for a window
-    /// that draws no v2 deck on screen: its card is not presented, or another painter draws it),
+    /// What window `wid`'s resource band draws of its live edge now ([`DeckLive::STILL`] for a
+    /// window whose card is not presented; the sill retains freshness without animation),
     /// and what it draws of the needle ([`LiveFacts::needle_at`]), which the splice keeps as what
     /// the window drew: at rest on the reading where the deck draws no live edge (an occluded
     /// window's draws the reading), `None` with no needle or no dial.

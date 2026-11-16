@@ -140,7 +140,8 @@ fn every_page(
     let mut page = 0;
     loop {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.scroll_page_to(page);
@@ -326,7 +327,8 @@ fn the_ai_routes_presses_are_typed_host_requests() {
             )),
             "{action}: {effects:?}"
         );
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.pending.clear();

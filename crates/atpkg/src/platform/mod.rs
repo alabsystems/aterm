@@ -639,7 +639,8 @@ pub(crate) fn twin_prelude_with_launcher(
     s
 }
 
-/// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`]): once a
+/// THE HARNESS HAND-OFF of an agent program's twin ([`crate::harness::twin_harness`], the
+/// registry row that leads the word): once a
 /// LIVE build of the harness is installed, the twin execs `<prefix>/bin/<tool> run --` with the
 /// argv the yolo block left, so the session runs under the harness
 /// (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D32); `--no-alab-harness`,
@@ -657,12 +658,13 @@ pub(crate) fn twin_prelude_with_launcher(
 /// harness.
 #[cfg(any(unix, test))]
 pub(crate) fn sh_harness_prelude(program: &str, prefix: &Path) -> String {
-    let Some((harness, tool)) = crate::harness::twin_harness(program) else {
-        return String::new();
-    };
     let layout = crate::store::Layout {
         prefix: prefix.to_path_buf(),
     };
+    let Some((harness, tool)) = crate::harness::twin_harness(&layout, program) else {
+        return String::new();
+    };
+    let (harness, tool) = (harness.as_str(), tool.as_str());
     let exe = sh_shim_quote(&prefix.join("bin").join(tool));
     let store = sh_shim_quote(layout.program_current(harness).parent().unwrap_or(prefix));
     let marker = sh_shim_quote(&layout.link_marker(harness));

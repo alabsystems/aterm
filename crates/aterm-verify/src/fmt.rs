@@ -69,9 +69,21 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
         r.skip(ctx.tools.missing_trustfmt_label());
         return;
     };
-    let files = match rs_files(ctx) {
+    let narrowed = match narrowed_to(ctx) {
+        Ok(narrowed) => narrowed,
+        Err(why) => {
+            r.cannot_run(format!("trustfmt — {why}"));
+            return;
+        }
+    };
+    let files = match rs_files_in(&ctx.root, &ctx.path_env).map(|mut files| {
+        if let Some(paths) = &narrowed {
+            files.retain(|p| paths.contains(p));
+        }
+        files
+    }) {
         Ok(f) if !f.is_empty() => f,
-        Ok(_) if ctx.input_paths.is_some() => {
+        Ok(_) if narrowed.is_some() => {
             r.pass("trustfmt: no unchecked Rust files");
             return;
         }
@@ -301,14 +313,54 @@ fn record_editions(r: &mut Report, gaps: &[EditionGap]) {
     );
 }
 
-fn rs_files(ctx: &Ctx) -> Result<Vec<String>, String> {
-    let mut files = rs_files_in(&ctx.root, &ctx.path_env)?;
-    if let Some(paths) = &ctx.input_paths
-        && !paths.iter().any(|p| p.ends_with("rustfmt.toml"))
-    {
-        files.retain(|p| paths.contains(p));
+/// The paths whose Rust files `fmt` judges, `None` for every file: a release hop's input paths,
+/// or a change's own (a run over [`crate::scope::Scope::Changed`], as `verify` and `verify land`
+/// are: what differs from its base, committed or not, and what is untracked). So a file main
+/// holds unformatted is not every landing's red: the landing formats what it changed, and the
+/// follower's and `verify fmt`'s whole-tree runs judge main. A changed `rustfmt.toml` widens to
+/// every file, since it can reformat any.
+fn narrowed_to(ctx: &Ctx) -> Result<Option<BTreeSet<String>>, String> {
+    let paths: BTreeSet<String> = match (&ctx.input_paths, &ctx.scope) {
+        (Some(paths), _) => paths.iter().cloned().collect(),
+        (None, crate::scope::Scope::Changed(changed)) => {
+            changed_since(&ctx.root, &ctx.path_env, &changed.base)?
+        }
+        (None, _) => return Ok(None),
+    };
+    Ok((!paths.iter().any(|p| p.ends_with("rustfmt.toml"))).then_some(paths))
+}
+
+/// The paths of `root` that differ from `base` (committed, staged or neither) and the untracked
+/// ones, relative to `root`.
+fn changed_since(
+    root: &Path,
+    path_env: &std::ffi::OsStr,
+    base: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut paths = BTreeSet::new();
+    for args in [
+        &["diff", "-z", "--name-only", "--no-renames", base, "--"][..],
+        &["ls-files", "-z", "--others", "--exclude-standard"][..],
+    ] {
+        let out = crate::changed::git(root, path_env)
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run `git {}`: {e}", args[0]))?;
+        if !out.status.success() {
+            return Err(format!(
+                "`git {}` against {base} failed: {}",
+                args[0],
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            ));
+        }
+        paths.extend(
+            out.stdout
+                .split(|b| *b == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| String::from_utf8_lossy(path).into_owned()),
+        );
     }
-    Ok(files)
+    Ok(paths)
 }
 
 fn rs_files_in(root: &Path, path_env: &std::ffi::OsStr) -> Result<Vec<String>, String> {

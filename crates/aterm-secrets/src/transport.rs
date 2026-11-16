@@ -530,6 +530,16 @@ pub const RECORDS_NEED_HEADER: &str = "X-Aterm-Records-Need";
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 8).
 pub const RECORDS_BOOT_HEADER: &str = "X-Aterm-Records-Boot";
 
+/// Header on a vault server's records GET reply: the digest of the records it holds of the
+/// vault as it answered ([`crate::membership_log::Store::records_digest`], 64 lowercase hex
+/// digits; the empty log's while it holds no genesis), taken under the lock its records were
+/// read under. A server pulling it keeps the digest with the endpoint that answered once it
+/// judged the answer whole, and pulls that endpoint no more while its TXT names that digest
+/// (`crate::server::PullGate`): a log with that digest holds nothing it has not taken or
+/// refused. Like a TXT it is a claim anyone answering at an address can make, so it binds only
+/// the endpoint that made it.
+pub const RECORDS_HEADS_HEADER: &str = "X-Aterm-Records-Heads";
+
 /// Header on every records GET and POST a build since the crossed fence sends, on each of a vault
 /// server's pulls of its peers, and on every records reply such a server sends: what the sender
 /// states of its records ([`crate::crossing::RecordsBound`]: its held bound, and whether its log
@@ -1248,6 +1258,9 @@ pub(crate) struct ReceivedRecordsAnswer {
     pub(crate) boot: Option<String>,
     /// What the server stated of its records ([`RECORDS_BOUND_HEADER`]).
     pub(crate) bound: ReplyBound,
+    /// The heads digest the server stated its records had as it answered
+    /// ([`RECORDS_HEADS_HEADER`]): `None` from a server before it, or one holding no genesis.
+    pub(crate) heads: Option<[u8; 32]>,
 }
 
 #[cfg(unix)]
@@ -1259,6 +1272,7 @@ impl ReceivedRecordsAnswer {
             needs: false,
             boot: None,
             bound: ReplyBound::Unheard,
+            heads: None,
         }
     }
 }
@@ -1337,6 +1351,7 @@ impl RecordReception {
             exchange.header(RECORDS_NEED_HEADER),
             exchange.header(RECORDS_BOOT_HEADER),
         );
+        let heads = records_heads(exchange.header(RECORDS_HEADS_HEADER));
         let received = exchange.consume_body(|reader| {
             crate::membership_log::untaken::ReceivedFrames::read_from_with_known(reader, known)
         })?;
@@ -1345,6 +1360,7 @@ impl RecordReception {
             needs,
             boot,
             bound,
+            heads,
         }))
     }
 
@@ -1357,11 +1373,13 @@ impl RecordReception {
             Self::Received(answer) => Ok(answer),
             Self::Refused(error) => Err(error),
             Self::Other(response) => {
+                let heads = records_heads(response.header(RECORDS_HEADS_HEADER));
                 records_answer(response, url, local).map(|answer| ReceivedRecordsAnswer {
                     received: crate::membership_log::untaken::ReceivedFrames::empty(),
                     needs: answer.needs,
                     boot: answer.boot,
                     bound: answer.bound,
+                    heads,
                 })
             }
         }
@@ -1547,6 +1565,14 @@ fn records_answer(
             response.body(),
         )),
     }
+}
+
+/// The digest a records reply's [`RECORDS_HEADS_HEADER`] states: none unless it is exactly 64
+/// lowercase hex digits.
+fn records_heads(value: Option<&str>) -> Option<[u8; 32]> {
+    let value = value.filter(|text| aterm_codec::hex::is_lower(text, 64))?;
+    let mut digest = [0u8; 32];
+    aterm_codec::hex::decode_into(value.as_bytes(), &mut digest).then_some(digest)
 }
 
 fn records_headers(needs: Option<&str>, boot: Option<&str>) -> (bool, Option<String>) {

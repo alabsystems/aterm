@@ -2207,28 +2207,64 @@ fn a_heartbeat_renewal_that_meets_another_holder_ends_the_run() {
     assert_eq!(holder.held().holder, m73);
 }
 
-/// A heartbeat alone does not hold a line for ever: processes that work without the run ever
-/// completing a row or a step are renewed for [`PULSE_ALONE_S`] and no longer, and the run's
-/// next row starts that count again. Nothing renews twice within [`PULSE_RENEW_S`].
+/// A heartbeat alone does not hold a line for ever, and holds it no longer than
+/// [`PULSE_ALONE_S`], the lease it renews included: processes that work without the run ever
+/// completing a row or a step leave the line to any cutter one second past that bound after the
+/// look that first saw the run's last progress, whatever the step's lease (the half-hour floor,
+/// qualification's default three hours, or the four-hour cap, which no heartbeat renews), and
+/// it is held until then. The run's next row starts that count again. Nothing renews twice
+/// within [`PULSE_RENEW_S`], nor on a look with no evidence.
+/// The heartbeat first renewed until the bound itself and the lease ran on after it, which held
+/// the floor's line half an hour past the bound and the cap's four hours.
 #[test]
 fn a_tree_that_works_without_finishing_anything_is_not_renewed_for_ever() {
-    let mut pulse = Pulse::new(1);
-    let mut held = orphan();
-    let start = held.at;
     let evidence = || Some("its processes work".to_string());
-    assert!(!pulse.beat(&mut held, evidence(), start + PULSE_RENEW_S - 1));
-    assert!(!pulse.beat(&mut held, None, start + PULSE_RENEW_S));
-    assert!(pulse.beat(&mut held, evidence(), start + PULSE_RENEW_S));
-    assert_eq!(
-        (held.at, held.evidence.as_str()),
-        (start + 300, "its processes work")
-    );
-    let last = start + PULSE_RENEW_S - 1 + PULSE_ALONE_S;
-    assert!(pulse.beat(&mut held, evidence(), last));
-    assert!(!pulse.beat(&mut held, evidence(), last + PULSE_RENEW_S));
-    assert_eq!(held.at, last);
-    held.rows.push("a row".into());
-    assert!(pulse.beat(&mut held, evidence(), last + PULSE_RENEW_S));
+    for (p95_s, lease, renewals) in [(0, 1_800, 42), (5_400, 10_800, 12), (7_200, 14_400, 0)] {
+        let mut pulse = Pulse::new(1);
+        let mut held = orphan();
+        held.p95_s = p95_s;
+        assert_eq!(lease_s(&held), lease);
+        let start = held.at;
+        let mut renewed = Vec::new();
+        let look = usize::try_from(PULSE_LOOK.as_secs()).unwrap();
+        for t in (start..=start + 2 * PULSE_ALONE_S).step_by(look) {
+            assert!(
+                !pulse.beat(&mut held, None, t),
+                "a look with no evidence renews nothing"
+            );
+            if pulse.beat(&mut held, evidence(), t) {
+                renewed.push(t - start);
+            }
+        }
+        let every_five_minutes: Vec<u64> = (1..=renewals).map(|n| n * PULSE_RENEW_S).collect();
+        assert_eq!(renewed, every_five_minutes, "lease {lease}");
+        assert!(
+            !expired(&held, start + PULSE_ALONE_S),
+            "lease {lease}: held to the bound"
+        );
+        assert!(
+            expired(&held, start + PULSE_ALONE_S + 1),
+            "lease {lease}: renewed at {} and held past the bound",
+            held.at - start
+        );
+        assert_eq!(
+            admit(&held, &held.line, start + PULSE_ALONE_S + 1, unreachable),
+            Ok(()),
+            "lease {lease}: any cutter takes the line past the bound"
+        );
+        // The run's next row, which renews the lease itself, starts the count again: the look
+        // half a minute after it sees it, and the heartbeat renews once the lease it renews
+        // still ends inside the bound.
+        held.rows.push("a row".into());
+        let row = start + 2 * PULSE_ALONE_S;
+        held.at = row;
+        assert!(!pulse.beat(&mut held, evidence(), row + 30));
+        assert_eq!(
+            pulse.beat(&mut held, evidence(), row + PULSE_RENEW_S),
+            lease < PULSE_ALONE_S,
+            "lease {lease}"
+        );
+    }
 }
 
 /// A holder whose write waits behind another writer's open intent runs nothing and writes

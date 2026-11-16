@@ -696,7 +696,9 @@ fn the_every_rows_open_timer_shows_its_last_choice_to_a_press_and_to_the_keyboar
             let cx = view_cx_at(504.0, height);
             let (mut runtime, instance, view) = harness_route(state.clone());
             let set_seat = |runtime: &mut NativeRuntime, page: usize| {
-                let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut()
+                else {
                     unreachable!()
                 };
                 settings.scroll_page_to(page);
@@ -809,13 +811,15 @@ fn a_timer_closed_gives_back_the_place_its_opening_scrolled() {
                 let timer = format!("harness/session/{row}/timer");
                 let mut page = 0;
                 let closed = loop {
-                    let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view)
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut()
                     else {
                         unreachable!()
                     };
                     settings.scroll_page_to(page);
                     settings.page_reveal = None;
                     settings.drop_list_nudge();
+                    drop(route_native_guard);
                     let shown = compile_settings_view(&runtime, instance, view, &cx);
                     if let Some((rect, clip)) = block_of(&shown, row)
                         && rect == clip
@@ -954,12 +958,15 @@ fn an_open_timers_choices_show_together_and_with_its_button() {
             let (mut runtime, instance, view) = harness_route(state.clone());
             let mut page = 0;
             loop {
-                let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(settings)) = route_native_guard.as_deref_mut()
+                else {
                     unreachable!()
                 };
                 settings.scroll_page_to(page);
                 settings.page_reveal = None;
                 settings.drop_list_nudge();
+                drop(route_native_guard);
                 let shown = compile_settings_view(&runtime, instance, view, &cx);
                 if drawn_whole(&shown, TIMER) {
                     break;

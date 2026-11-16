@@ -67,7 +67,8 @@
 //! - **Cloudflare's check is never operated.** A page that is its check is waited on with
 //!   nothing read from its controls, pressed or filled: it may clear by itself, and a person
 //!   at the desk may complete it. One that stands until the deadline ends the sign-in naming
-//!   Cloudflare ([`Stop::BotCheck`]).
+//!   Cloudflare ([`Stop::BotCheck`]); in a sign-in nobody started ([`SignIn::unattended`]),
+//!   nobody completes it, so one that stands for [`UNATTENDED_BOT_CHECK`] ends it.
 //! - **The consent page's human check is never operated.** Claude's consent page may carry an
 //!   hCaptcha and keep `Authorize` disabled until it is answered. It comes and goes (measured
 //!   2026-11-12: in this window it stood for the whole four minutes in three sign-ins of one
@@ -76,7 +77,8 @@
 //!   `Authorize` is disabled, waits, and presses `Authorize` once the page enables it: after
 //!   the check passed by itself, or a person at the desk completed it in the window. One
 //!   that stands until the deadline ends the sign-in naming it ([`Stop::HumanCheck`]), and
-//!   the row is left to a person at this Mac.
+//!   the row is left to a person at this Mac. A sign-in nobody started ends at the read that
+//!   first finds one: nobody would complete it, and none measured cleared by itself.
 //! - **The callback.** A loopback flow's callback is a navigation the window follows: the
 //!   page requests `http://localhost:<port>/callback` itself, the waiting `claude auth login`
 //!   answers it and sends the page on to its success page, and seeing that page ends the flow
@@ -105,6 +107,13 @@ const TICK: Duration = Duration::from_millis(500);
 
 /// How long one sign-in in the window may take, the opening of the window included.
 pub(super) const WITHIN: Duration = Duration::from_secs(240);
+
+/// How long a sign-in nobody started ([`SignIn::unattended`]) waits on Cloudflare's check
+/// before it ends naming it ([`Stop::BotCheck`]): long enough for a check that clears by itself,
+/// the bound aterm's headless drive, which nobody watches either, waits on one
+/// ([`super::headless_oauth::VENDOR_STALL`]), and never the whole [`WITHIN`], whose rest serves
+/// only a person at the desk.
+const UNATTENDED_BOT_CHECK: Duration = super::headless_oauth::VENDOR_STALL;
 
 /// How long a loopback callback may stand in the page's address before the waiting sign-in's
 /// listener has plainly not answered it ([`Stop::ListenerSilent`]).
@@ -427,6 +436,10 @@ pub(super) enum Stop {
     ListenerSilent,
     /// The deadline came: where the sign-in stood.
     TimedOut(Phase),
+    /// Nobody started this sign-in ([`SignIn::unattended`]), and it reached the code page, or
+    /// the sign-in page's `Continue with email`, with no mailbox of the account the window
+    /// reads: nobody would type the code, so it ends at once.
+    NobodyForCode,
     /// The deadline came on the code page after the account's mailbox was dropped
     /// ([`Progress::drop_mailbox`]) and nobody typed the code: why it was dropped, in the
     /// mailbox's own words, so the row's record says what to repair.
@@ -474,6 +487,11 @@ impl std::fmt::Display for Stop {
                 WITHIN.as_secs(),
                 phase.words()
             ),
+            Self::NobodyForCode => f.write_str(
+                "the sign-in in aterm's window asks for a login code, the window reads no \
+                 mailbox of the account on this Mac, and nobody started this sign-in to type \
+                 the code",
+            ),
             Self::MailboxDropped(why) => write!(
                 f,
                 "the sign-in in aterm's window was not completed in {} s: nobody typed the \
@@ -491,7 +509,8 @@ pub(super) const NO_MAILBOX_READ: &str = "the window reads no mailbox of the acc
 
 /// What the opener records of a stop. The code page's deadline where the window read no
 /// mailbox of the account from the start is [`VisibleStop::CodeNoMailbox`], which holds a token
-/// step; one where it dropped the mailbox it had ([`Stop::MailboxDropped`]: reads that failed,
+/// step, and so is the code page a sign-in nobody started reached with no mailbox
+/// ([`Stop::NobodyForCode`]); one where it dropped the mailbox it had ([`Stop::MailboxDropped`]: reads that failed,
 /// or an answer it could not use) is an ordinary failure that another try may pass, since a
 /// connection that failed may not fail twice.
 impl From<Stop> for VisibleStop {
@@ -503,7 +522,9 @@ impl From<Stop> for VisibleStop {
             Stop::HumanCheck(host) => Self::HumanCheck(host),
             Stop::WrongAccount => Self::WrongAccount,
             Stop::Closed => Self::Closed,
-            Stop::TimedOut(Phase::CodeNoMailbox) => Self::CodeNoMailbox(NO_MAILBOX_READ.to_owned()),
+            Stop::TimedOut(Phase::CodeNoMailbox) | Stop::NobodyForCode => {
+                Self::CodeNoMailbox(NO_MAILBOX_READ.to_owned())
+            }
             Stop::TimedOut(phase) => Self::Deadline(phase.words().to_owned()),
             other => Self::Failed(other.to_string()),
         }
@@ -554,6 +575,14 @@ pub(super) struct SignIn<'a> {
     pub email: &'a str,
     /// How long it may take, the opening of its window included.
     pub within: Duration,
+    /// Nobody started it: this Mac's upkeep did (plan package FL-138,
+    /// [`super::open_url::UNATTENDED_ENV`]). Where the window reads no mailbox of the account,
+    /// it never presses `Continue with email`, which mails a code nobody would type, and a code
+    /// page ends it at once ([`Stop::NobodyForCode`]); a mailbox it dropped ends it as the
+    /// deadline would ([`Stop::MailboxDropped`]). The consent page's human check ends it at the
+    /// read that finds it ([`Stop::HumanCheck`]), and Cloudflare's check once it has stood for
+    /// [`UNATTENDED_BOT_CHECK`] ([`Stop::BotCheck`]): nobody waits for a person.
+    pub unattended: bool,
 }
 
 /// What the flow has done so far.
@@ -584,6 +613,9 @@ struct Progress {
     phase: Option<Phase>,
     bot_host: Option<String>,
     bot_stands: bool,
+    /// When this run first read Cloudflare's check: a sign-in nobody started waits on it from
+    /// then for [`UNATTENDED_BOT_CHECK`] in all, a check that comes back included.
+    bot_since: Option<Instant>,
     /// Whether the consent page's human check holds `Authorize` at the last read.
     human_stands: bool,
     callback_at: Option<Instant>,
@@ -839,6 +871,12 @@ fn step(
         return Err(Stop::BlockPage(host).into());
     }
     if is_bot_check(&page) {
+        // Nobody started this sign-in, so nobody completes the check: it is waited on only as
+        // long as one that clears by itself takes.
+        let since = *did.bot_since.get_or_insert(now);
+        if run.unattended && now.saturating_duration_since(since) >= UNATTENDED_BOT_CHECK {
+            return Err(Stop::BotCheck(host).into());
+        }
         did.bot_stands = true;
         did.bot_host = host;
         did.enter(Phase::BotCheck, desk);
@@ -863,6 +901,12 @@ fn step(
             Account::Other => return Err(Stop::WrongAccount.into()),
             Account::Unnamed if did.vouches_unnamed(desk) => {}
             Account::Unnamed => return Err(Stop::UnknownSession.into()),
+        }
+        // Nobody started this sign-in, so nobody completes the check, and it has not been seen
+        // to clear by itself while it stood (it stood the whole four minutes in each of five
+        // loads measured): it ends at the read that finds it.
+        if run.unattended {
+            return Err(Stop::HumanCheck(host).into());
         }
         did.bot_host = host;
         did.enter(Phase::HumanCheck, desk);
@@ -892,6 +936,10 @@ fn step(
     }
 
     if shows(Button::ContinueWithEmail) && !did.continued {
+        // A sign-in nobody started mails no code nobody would type.
+        if run.unattended && !desk.has_mailbox() {
+            return Err(Stop::NobodyForCode.into());
+        }
         // The address the code is mailed to is the account's, set here and read back at the
         // press: a field that holds another address is never continued with.
         match desk.fill(Field::Email, run.email, url)? {
@@ -966,6 +1014,13 @@ fn code_step(
     }
     if did.held.is_none() {
         if !desk.has_mailbox() || did.mailbox_dropped.is_some() {
+            // Nobody started this sign-in, so nobody types the code: it ends here.
+            if run.unattended {
+                return Err(did
+                    .mailbox_dropped
+                    .map_or(Stop::NobodyForCode, Stop::MailboxDropped)
+                    .into());
+            }
             did.enter(Phase::CodeNoMailbox, desk);
             return Ok(());
         }
@@ -1004,9 +1059,9 @@ fn code_step(
             // sign-in: one connection that failed may not fail twice. Then it is dropped, not
             // the sign-in: a person at this Mac may still type the code in the window, whose
             // own deadline bounds the wait. Every window opens at this Mac's own desk
-            // (`cli::opens_sign_in_window_by`), an upkeep's included, and the drive runs in
-            // the opener, which is told nothing of who started it, so it waits for a person
-            // in every run.
+            // (`cli::opens_sign_in_window_by`), an upkeep's included, so it waits for a person
+            // in every run but a token capture the upkeep started with nobody there
+            // (`SignIn::unattended`), which the next read of the code page ends.
             Err(why) => {
                 did.mail_errors += 1;
                 if did.mail_errors >= MAX_MAILBOX_ERRORS {
@@ -1835,6 +1890,14 @@ pub(super) fn store_marker(records: &Path, email: &str) -> PathBuf {
     marker_of(records, &claude_store(email))
 }
 
+/// Whether a sign-in in the window recorded that its data store for the Claude account `email`,
+/// under the accounts store `records`, holds that account's session ([`store_marker`]): its
+/// token's consent page there is authorized with nobody there (plan package FL-138).
+pub(super) fn store_holds_session(records: &Path, email: &str) -> bool {
+    std::fs::read_to_string(store_marker(records, email))
+        .is_ok_and(|held| super::accounts::email_matches(held.trim(), email))
+}
+
 /// Takes back the record that the window's store for `email` holds that account's session,
 /// where a sign-in made in it turned out to be another account's: the next consent page
 /// there is authorized only where it names the account, and one that names nobody ends with
@@ -2252,6 +2315,7 @@ impl Desk for Window<'_> {
 /// Signs in at `authorize_url` as `email` in a window of aterm's own and answers how its
 /// callback reached, or reaches, the waiting sign-in. `scope` is the caller's account-work
 /// scope, whose cancellation ends the wait; the opener process has none and passes `None`.
+/// `unattended`: nobody started it ([`SignIn::unattended`]).
 /// Whether a sign-in may open the window at all is its caller's to have established
 /// ([`super::headless_oauth::visible_sign_in`]).
 ///
@@ -2269,6 +2333,7 @@ pub(super) fn authorize(
     authorize_url: &str,
     email: Option<&str>,
     scope: Option<&super::account_work::Scope>,
+    unattended: bool,
 ) -> Result<VisibleDone, VisibleStop> {
     let Some(email) = email.map(str::trim).filter(|email| !email.is_empty()) else {
         return Err(VisibleStop::Failed(
@@ -2335,6 +2400,7 @@ pub(super) fn authorize(
             flow: &flow,
             email,
             within: WITHIN,
+            unattended,
         },
         &mut desk,
     );

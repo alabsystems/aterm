@@ -260,7 +260,7 @@ fn what_would_read_differently_stays_inline() {
 
     let sealed = format!(
         "{}{HEAD}#[cfg(test)]\nmod tests {{}}\n",
-        crate::seal::line("//", "gen")
+        aterm_seal::line("//", "gen")
     );
     let generated = planned("crates/x/src/g.rs", false, &sealed, &[]);
     assert_eq!(refused(&generated), [("tests", Refusal::Generated)]);

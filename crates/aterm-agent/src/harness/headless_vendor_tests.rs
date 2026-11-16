@@ -258,6 +258,16 @@ fn a_vendors_webmail_rows_are_chosen_by_its_senders() {
     assert!(!kimi.contains(r#"["claude","anthropic"]"#));
 }
 
+/// Actual mailbox sources this target can read. Unix also exercises the verified vault;
+/// every target keeps the ordinary local-file path.
+pub(super) fn mailbox_paths() -> &'static [&'static str] {
+    if cfg!(unix) {
+        &[".config/aterm/mailbox.toml", ".secrets/ai-mailbox.toml"]
+    } else {
+        &[".config/aterm/mailbox.toml"]
+    }
+}
+
 /// A home holding `files`, each `(path, text)` under it; a `.secrets/NAME` path is the vault
 /// entry NAME, published to the store this home administers and read in place, never a file.
 fn home_with(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
@@ -279,39 +289,39 @@ fn plant(home: &Path, files: &[(&str, &str)]) {
         std::fs::write(at, text).expect("write");
     }
     if !entries.is_empty() {
+        #[cfg(unix)]
         crate::vault_entry::seed(home, &entries);
+        #[cfg(not(unix))]
+        panic!("this fixture source requires the Unix vault");
     }
 }
 
 #[test]
 fn a_clis_roster_aliases_its_labels_to_their_emails() {
-    let home = home_with(&[
-        (
-            ".secrets/ai-mailbox.toml",
-            "[passwords]\nkimi-one = \"fixture-pw\"\n",
-        ),
-        (
-            ".config/aterm/accounts-kimi.toml",
-            "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
+    for &mailbox_path in mailbox_paths() {
+        let home = home_with(&[
+            (mailbox_path, "[passwords]\nkimi-one = \"fixture-pw\"\n"),
+            (
+                ".config/aterm/accounts-kimi.toml",
+                "[[account]]\nlabel = \"kimi-one\"\nclass = \"dedicated\"\n\
              email = \"kimi-one@example.com\"\nregion = \"global\"\n",
-        ),
-    ]);
-    let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
-    assert_eq!(
-        cfg.password_for(Some("kimi-one@example.com")).as_deref(),
-        Some("fixture-pw")
-    );
-    let bare = home_with(&[(
-        ".secrets/ai-mailbox.toml",
-        "[passwords]\nkimi-one = \"fixture-pw\"\n",
-    )]);
-    let cfg = discover_mailbox_config_files_raw(Some(bare.path()), None, None);
-    assert!(
-        !cfg.passwords.contains_key("kimi-one@example.com"),
-        "no roster, no alias"
-    );
+            ),
+        ]);
+        let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
+        assert_eq!(
+            cfg.password_for(Some("kimi-one@example.com")).as_deref(),
+            Some("fixture-pw")
+        );
+        let bare = home_with(&[(mailbox_path, "[passwords]\nkimi-one = \"fixture-pw\"\n")]);
+        let cfg = discover_mailbox_config_files_raw(Some(bare.path()), None, None);
+        assert!(
+            !cfg.passwords.contains_key("kimi-one@example.com"),
+            "no roster, no alias"
+        );
+    }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_clis_fleet_roster_in_secrets_is_no_mailbox_fragment_and_a_machines_file_still_is() {
     let roster = home_with(&[(
@@ -336,6 +346,7 @@ fn a_clis_fleet_roster_in_secrets_is_no_mailbox_fragment_and_a_machines_file_sti
 /// aliases its labels to their emails as its roster does, so a password filed under the label
 /// reaches the sign-in of that email. CONTROL: the same password with no fleet naming the
 /// label is no alias.
+#[cfg(unix)]
 #[test]
 fn a_clis_fleet_in_secrets_aliases_its_labels_to_their_emails() {
     let mailbox = (
@@ -663,65 +674,68 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
 /// different emails hands its secret to Claude Code's own row alone.
 #[test]
 fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_pool() {
-    let home = aterm_tempfile::tempdir().expect("tmp");
-    let kimi_toml = format!(
-        "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
+    for &mailbox_path in mailbox_paths() {
+        let home = aterm_tempfile::tempdir().expect("tmp");
+        let kimi_toml = format!(
+            "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
          email = \"personal@example.org\"\nregion = \"global\"\n\n[[account]]\n\
          label = \"kimi-1\"\nclass = \"dedicated\"\nemail = \"kimi-box@example.net\"\n\
          region = \"global\"\ndir = \"{}\"\n",
-        crate::harness::host_path::abs("/nonexistent/aterm-fixture/logins/kimi/kimi-1")
-    );
-    for (path, text) in [
-        (
-            ".secrets/ai-mailbox.toml",
-            "[passwords]\nm16-1 = \"claude-mailbox-fixture-pw\"\nkimi-1 = \"kimi-fixture-pw\"\n",
-        ),
-        (
-            ".config/aterm/accounts.toml",
-            "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
+            crate::harness::host_path::abs("/nonexistent/aterm-fixture/logins/kimi/kimi-1")
+        );
+        for (path, text) in [
+            (
+                mailbox_path,
+                "[passwords]\nm16-1 = \"claude-mailbox-fixture-pw\"\nkimi-1 = \"kimi-fixture-pw\"\n",
+            ),
+            (
+                ".config/aterm/accounts.toml",
+                "[[account]]\nlabel = \"m16-1\"\nclass = \"dedicated\"\n\
              email = \"claude-box@example.com\"\n",
-        ),
-        (".config/aterm/accounts-kimi.toml", kimi_toml.as_str()),
-    ] {
-        plant(home.path(), &[(path, text)]);
+            ),
+            (".config/aterm/accounts-kimi.toml", kimi_toml.as_str()),
+        ] {
+            plant(home.path(), &[(path, text)]);
+        }
+        let kimi = home.path().join(".config/aterm/accounts-kimi.toml");
+        assert_eq!(
+            super::super::accounts::Roster::load_for(super::super::accounts::Cli::Kimi, &kimi)
+                .map(|r| r.rows.len()),
+            Ok(2)
+        );
+        let mut cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
+        assert_ne!(
+            cfg.password_for(Some("personal@example.org")).as_deref(),
+            Some("claude-mailbox-fixture-pw"),
+            "the Kimi row's mailbox never carries Claude Code's row's password"
+        );
+        cfg.alias_label_to_email(Some("m16-1"), Some("personal@example.org"));
+        assert_ne!(
+            cfg.password_for(Some("personal@example.org")).as_deref(),
+            Some("claude-mailbox-fixture-pw"),
+            "nor does the vendor approver's own alias of its row"
+        );
+        // Negative: Claude Code's row keeps its label's password, and an uncontested label of
+        // another pool still names its own.
+        assert_eq!(
+            cfg.password_for(Some("claude-box@example.com")).as_deref(),
+            Some("claude-mailbox-fixture-pw")
+        );
+        assert_eq!(
+            cfg.password_for(Some("kimi-box@example.net")).as_deref(),
+            Some("kimi-fixture-pw")
+        );
     }
-    let kimi = home.path().join(".config/aterm/accounts-kimi.toml");
-    assert_eq!(
-        super::super::accounts::Roster::load_for(super::super::accounts::Cli::Kimi, &kimi)
-            .map(|r| r.rows.len()),
-        Ok(2)
-    );
-    let mut cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
-    assert_ne!(
-        cfg.password_for(Some("personal@example.org")).as_deref(),
-        Some("claude-mailbox-fixture-pw"),
-        "the Kimi row's mailbox never carries Claude Code's row's password"
-    );
-    cfg.alias_label_to_email(Some("m16-1"), Some("personal@example.org"));
-    assert_ne!(
-        cfg.password_for(Some("personal@example.org")).as_deref(),
-        Some("claude-mailbox-fixture-pw"),
-        "nor does the vendor approver's own alias of its row"
-    );
-    // Negative: Claude Code's row keeps its label's password, and an uncontested label of
-    // another pool still names its own.
-    assert_eq!(
-        cfg.password_for(Some("claude-box@example.com")).as_deref(),
-        Some("claude-mailbox-fixture-pw")
-    );
-    assert_eq!(
-        cfg.password_for(Some("kimi-box@example.net")).as_deref(),
-        Some("kimi-fixture-pw")
-    );
 }
 
 #[test]
 fn contested_mailbox_labels_cannot_be_recovered_from_an_email_spelling() {
-    let home = aterm_tempfile::tempdir().expect("tmp");
-    for (path, text) in [
-        (
-            ".secrets/ai-mailbox.toml",
-            r#"
+    for &mailbox_path in mailbox_paths() {
+        let home = aterm_tempfile::tempdir().expect("tmp");
+        for (path, text) in [
+            (
+                mailbox_path,
+                r#"
 [passwords]
 m27_2 = "claude-password-fixture"
 [mailbox_passwords]
@@ -729,53 +743,54 @@ m27_2 = "claude-mailbox-password-fixture"
 [totp_secrets]
 m27_2 = "claude-totp-fixture"
 "#,
-        ),
-        (
-            ".config/aterm/accounts.toml",
-            r#"
+            ),
+            (
+                ".config/aterm/accounts.toml",
+                r#"
 [[account]]
 label = "m27-2"
 class = "dedicated"
 email = "claude-box@example.com"
 "#,
-        ),
-        (
-            ".config/aterm/accounts-kimi.toml",
-            r#"
+            ),
+            (
+                ".config/aterm/accounts-kimi.toml",
+                r#"
 [[account]]
 label = "m27-2"
 class = "dedicated"
 email = "sun.m27.2@example.org"
 region = "global"
 "#,
-        ),
-    ] {
-        plant(home.path(), &[(path, text)]);
-    }
-    let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
-    assert!(cfg.contested_labels.contains("m27-2"));
-    for (blocked, own) in [
-        (
-            cfg.password_for(Some("sun.m27.2@example.org")),
-            cfg.password_for(Some("claude-box@example.com")),
-        ),
-        (
-            cfg.mailbox_password_for(Some("sun.m27.2@example.org")),
-            cfg.mailbox_password_for(Some("claude-box@example.com")),
-        ),
-        (
-            cfg.totp_secret_for(Some("sun.m27.2@example.org")),
-            cfg.totp_secret_for(Some("claude-box@example.com")),
-        ),
-    ] {
-        assert!(
-            own.is_some(),
-            "the owning roster keeps its explicit email alias"
-        );
-        assert!(
-            blocked.is_none(),
-            "email-derived labels cannot bypass a contest"
-        );
+            ),
+        ] {
+            plant(home.path(), &[(path, text)]);
+        }
+        let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
+        assert!(cfg.contested_labels.contains("m27-2"));
+        for (blocked, own) in [
+            (
+                cfg.password_for(Some("sun.m27.2@example.org")),
+                cfg.password_for(Some("claude-box@example.com")),
+            ),
+            (
+                cfg.mailbox_password_for(Some("sun.m27.2@example.org")),
+                cfg.mailbox_password_for(Some("claude-box@example.com")),
+            ),
+            (
+                cfg.totp_secret_for(Some("sun.m27.2@example.org")),
+                cfg.totp_secret_for(Some("claude-box@example.com")),
+            ),
+        ] {
+            assert!(
+                own.is_some(),
+                "the owning roster keeps its explicit email alias"
+            );
+            assert!(
+                blocked.is_none(),
+                "email-derived labels cannot bypass a contest"
+            );
+        }
     }
 }
 
@@ -887,97 +902,103 @@ fn mailbox_credential_selection_conforms_with_negative_controls() {
 
 #[test]
 fn mailbox_conflicts_include_csv_and_configured_fleets_before_totp_aliasing() {
-    for source in ["config-fleet", "sibling-fleet", "claude-csv", "vendor-csv"] {
-        let home = aterm_tempfile::tempdir().unwrap();
-        let label = if source == "vendor-csv" {
-            "kimi-m27-2"
-        } else {
-            "m27-2"
-        };
-        let own = format!(
-            "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='claude-box@example.com'\n"
-        );
-        let fleet = format!("{own}machines=['m27']\n");
-        let other = format!(
-            "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='vendor-box@example.org'\nregion='global'\n"
-        );
-        let (own_path, own_text, other_path, other_text) = match source {
-            "config-fleet" => (
-                ".config/aterm/fleet-accounts.toml",
-                fleet,
-                ".config/aterm/accounts-kimi.toml",
-                other,
-            ),
-            "sibling-fleet" => (
-                "custom/aterm/fleet-accounts.toml",
-                fleet,
-                "custom/aterm/accounts-kimi.toml",
-                other,
-            ),
-            "claude-csv" => (
-                ".secrets/ai-accounts.csv",
-                "email,computer,claude\nclaude-box@example.com,m27.2,1\n".to_owned(),
-                ".config/aterm/accounts-kimi.toml",
-                other,
-            ),
-            "vendor-csv" => (
-                ".config/aterm/accounts.toml",
-                own,
-                ".secrets/ai-accounts.csv",
-                "email,computer,kimi\nvendor-box@example.org,m27.2,global\n".to_owned(),
-            ),
-            _ => unreachable!(),
-        };
-        let secret = format!(
-            "[passwords]\n'{label}'='password-fixture'\n\
+    for &mailbox_path in mailbox_paths() {
+        for source in ["config-fleet", "sibling-fleet", "claude-csv", "vendor-csv"] {
+            #[cfg(not(unix))]
+            if matches!(source, "claude-csv" | "vendor-csv") {
+                continue;
+            }
+            let home = aterm_tempfile::tempdir().unwrap();
+            let label = if source == "vendor-csv" {
+                "kimi-m27-2"
+            } else {
+                "m27-2"
+            };
+            let own = format!(
+                "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='claude-box@example.com'\n"
+            );
+            let fleet = format!("{own}machines=['m27']\n");
+            let other = format!(
+                "[[account]]\nlabel='{label}'\nclass='dedicated'\nemail='vendor-box@example.org'\nregion='global'\n"
+            );
+            let (own_path, own_text, other_path, other_text) = match source {
+                "config-fleet" => (
+                    ".config/aterm/fleet-accounts.toml",
+                    fleet,
+                    ".config/aterm/accounts-kimi.toml",
+                    other,
+                ),
+                "sibling-fleet" => (
+                    "custom/aterm/fleet-accounts.toml",
+                    fleet,
+                    "custom/aterm/accounts-kimi.toml",
+                    other,
+                ),
+                "claude-csv" => (
+                    ".secrets/ai-accounts.csv",
+                    "email,computer,claude\nclaude-box@example.com,m27.2,1\n".to_owned(),
+                    ".config/aterm/accounts-kimi.toml",
+                    other,
+                ),
+                "vendor-csv" => (
+                    ".config/aterm/accounts.toml",
+                    own,
+                    ".secrets/ai-accounts.csv",
+                    "email,computer,kimi\nvendor-box@example.org,m27.2,global\n".to_owned(),
+                ),
+                _ => unreachable!(),
+            };
+            let secret = format!(
+                "[passwords]\n'{label}'='password-fixture'\n\
              [mailbox_passwords]\n'{label}'='mailbox-fixture'\n\
              [totp_secrets]\n'{label}'='otpauth://totp/Test:uri-recipient%40example.org?secret=JBSWY3DPEHPK3PXP&issuer=Test'\n"
-        );
-        for (path, text) in [
-            (own_path, own_text.as_str()),
-            (other_path, other_text.as_str()),
-            (".secrets/ai-mailbox.toml", secret.as_str()),
-        ] {
-            plant(home.path(), &[(path, text)]);
-        }
-        let custom_config = home.path().join("custom/aterm/aterm.toml");
-        let cfg = discover_mailbox_config_files_raw(
-            Some(home.path()),
-            None,
-            (source == "sibling-fleet").then_some(custom_config.as_path()),
-        );
-        let override_path = home.path().join("explicit-mailbox.toml");
-        std::fs::write(
-            &override_path,
-            secret.replace("password-fixture", "override-fixture"),
-        )
-        .unwrap();
-        let overridden =
-            discover_mailbox_config_with_env(Some(home.path()), None, |name| match name {
-                MAILBOX_ENV => Some(override_path.as_os_str().to_owned()),
-                "XDG_CONFIG_HOME" if source == "sibling-fleet" => {
-                    Some(home.path().join("custom").into_os_string())
-                }
-                _ => None,
-            })
+            );
+            for (path, text) in [
+                (own_path, own_text.as_str()),
+                (other_path, other_text.as_str()),
+                (mailbox_path, secret.as_str()),
+            ] {
+                plant(home.path(), &[(path, text)]);
+            }
+            let custom_config = home.path().join("custom/aterm/aterm.toml");
+            let cfg = discover_mailbox_config_files_raw(
+                Some(home.path()),
+                None,
+                (source == "sibling-fleet").then_some(custom_config.as_path()),
+            );
+            let override_path = home.path().join("explicit-mailbox.toml");
+            std::fs::write(
+                &override_path,
+                secret.replace("password-fixture", "override-fixture"),
+            )
             .unwrap();
-        for (cfg, expected) in [(cfg, "password-fixture"), (overridden, "override-fixture")] {
-            assert!(cfg.contested_labels.contains(label), "{source}");
-            for email in ["vendor-box@example.org", "uri-recipient@example.org"] {
-                assert!(cfg.password_for(Some(email)).is_none(), "{source} {email}");
+            let overridden =
+                discover_mailbox_config_with_env(Some(home.path()), None, |name| match name {
+                    MAILBOX_ENV => Some(override_path.as_os_str().to_owned()),
+                    "XDG_CONFIG_HOME" if source == "sibling-fleet" => {
+                        Some(home.path().join("custom").into_os_string())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for (cfg, expected) in [(cfg, "password-fixture"), (overridden, "override-fixture")] {
+                assert!(cfg.contested_labels.contains(label), "{source}");
+                for email in ["vendor-box@example.org", "uri-recipient@example.org"] {
+                    assert!(cfg.password_for(Some(email)).is_none(), "{source} {email}");
+                    assert!(
+                        cfg.mailbox_password_for(Some(email)).is_none(),
+                        "{source} {email}"
+                    );
+                }
                 assert!(
-                    cfg.mailbox_password_for(Some(email)).is_none(),
-                    "{source} {email}"
+                    cfg.totp_secret_for(Some("uri-recipient@example.org"))
+                        .is_some()
+                );
+                assert_eq!(
+                    cfg.password_for(Some("claude-box@example.com")).as_deref(),
+                    Some(expected)
                 );
             }
-            assert!(
-                cfg.totp_secret_for(Some("uri-recipient@example.org"))
-                    .is_some()
-            );
-            assert_eq!(
-                cfg.password_for(Some("claude-box@example.com")).as_deref(),
-                Some(expected)
-            );
         }
     }
 }
@@ -1003,50 +1024,58 @@ m27 = "new-second-fixture"
 m27 = "KRSXG5A"
 "#;
         let raw = "old-password-fixture\nold-second-fixture\notpauth://totp/Test:mailbox%40example.org?secret=JBSWY3DPEHPK3PXP&issuer=Test\n";
-        let (old_path, old) = if source.starts_with("raw-") {
-            (".secrets/m27", raw)
-        } else {
-            (".secrets/ai-mailbox.toml", old)
-        };
-        for (name, text) in [
-            (old_path, old),
-            (
-                ".config/aterm/accounts.toml",
-                "[[account]]\nlabel='m27'\nclass='dedicated'\nemail='mailbox@example.org'\n",
-            ),
-            ("store/mailbox.toml", new),
-        ] {
-            plant(home.path(), &[(name, text)]);
+        let is_raw = source.starts_with("raw-");
+        #[cfg(not(unix))]
+        if is_raw {
+            continue;
         }
-        let store = home.path().join("store");
-        let cfg = if source.ends_with("store") {
-            discover_mailbox_config_files_raw(Some(home.path()), Some(&store), None)
+        let paths = if is_raw {
+            &[".secrets/m27"][..]
         } else {
-            discover_mailbox_config_with_env(Some(home.path()), None, |name| {
-                (name == MAILBOX_ENV).then(|| store.join("mailbox.toml").into_os_string())
-            })
-            .unwrap()
+            mailbox_paths()
         };
-        assert_eq!(
-            cfg.password_for(Some("m27")).as_deref(),
-            Some("new-password-fixture")
-        );
-        assert_eq!(
-            cfg.password_for(Some("mailbox@example.org")).as_deref(),
-            Some("new-password-fixture"),
-            "{source}: a derived email alias must use the winning label credential"
-        );
-        assert_eq!(
-            cfg.mailbox_password_for(Some("mailbox@example.org"))
-                .as_deref(),
-            Some("new-second-fixture"),
-            "{source}: second-stage credentials obey the same source precedence"
-        );
-        assert_eq!(
-            cfg.totp_secret_for(Some("mailbox@example.org")).as_deref(),
-            Some("KRSXG5A"),
-            "{source}: a superseded TOTP URI must not keep its old email value"
-        );
+        for &old_path in paths {
+            let old = if is_raw { raw } else { old };
+            for (name, text) in [
+                (old_path, old),
+                (
+                    ".config/aterm/accounts.toml",
+                    "[[account]]\nlabel='m27'\nclass='dedicated'\nemail='mailbox@example.org'\n",
+                ),
+                ("store/mailbox.toml", new),
+            ] {
+                plant(home.path(), &[(name, text)]);
+            }
+            let store = home.path().join("store");
+            let cfg = if source.ends_with("store") {
+                discover_mailbox_config_files_raw(Some(home.path()), Some(&store), None)
+            } else {
+                discover_mailbox_config_with_env(Some(home.path()), None, |name| {
+                    (name == MAILBOX_ENV).then(|| store.join("mailbox.toml").into_os_string())
+                })
+                .unwrap()
+            };
+            assert_eq!(
+                cfg.password_for(Some("m27")).as_deref(),
+                Some("new-password-fixture")
+            );
+            assert_eq!(
+                cfg.password_for(Some("mailbox@example.org")).as_deref(),
+                Some("new-password-fixture"),
+                "{source}: a derived email alias must use the winning label credential"
+            );
+            assert_eq!(
+                cfg.mailbox_password_for(Some("mailbox@example.org"))
+                    .as_deref(),
+                Some("new-second-fixture"),
+                "{source}: second-stage credentials obey the same source precedence"
+            );
+            assert_eq!(
+                cfg.totp_secret_for(Some("mailbox@example.org")).as_deref(),
+                Some("KRSXG5A"),
+                "{source}: a superseded TOTP URI must not keep its old email value"
+            );
+        }
     }
 }
 
@@ -1769,7 +1798,7 @@ fn a_bot_protection_block_page_stops_at_once_and_keeps_its_text_out_of_the_reaso
         &[],
     );
     match vendor_step(&blocked, &gate) {
-        Step::Stop(why) => {
+        Step::Blocked(why) => {
             assert!(why.contains("bot-protection block page"), "{why}");
             assert!(
                 !why.contains("192.0.2.1") && !why.to_ascii_lowercase().contains("ray id"),
@@ -3284,7 +3313,7 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
 
     // 2. `oauth_step_js`, `webmail_step_js`, `VENDOR_PAGE_JS`, and `vendor_act_js` guard
     // against `readOnly` inputs, plus-sibling collisions, and step-1 username traps on 2FA.
-    let oauth_js = oauth_step_js(Some("owner+2@example.com"), None, false, false);
+    let oauth_js = oauth_step_js(Some("owner+2@example.com"), None, (false, false), None);
     assert!(
         oauth_js
             .contains("!e.includes(\"+\") || !targetEmail.includes(\"+\") || e === targetEmail")
@@ -4020,7 +4049,7 @@ fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
             &[],
         )
     };
-    assert!(matches!(vendor_step(&blocked, &gate), Step::Stop(_)));
+    assert!(matches!(vendor_step(&blocked, &gate), Step::Blocked(_)));
 }
 
 /// A reason the drive ends with on Cloudflare's bot check names Cloudflare and the page's host
@@ -4325,6 +4354,29 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
         ),
         Approval::Approved { page: false }
     );
+
+    // A bot protection's block page ends the drive `BotCheck` at once, as the account's check
+    // to record, its text (this machine's address, the ray id) kept out of the reason.
+    let blocked = json!({
+        "url": "https://auth.openai.com/log-in",
+        "heading": "sorry, you have been blocked",
+        "title": "",
+        "text": "Sorry, you have been blocked\nYou are unable to access openai.com\nCloudflare \
+                 Ray ID: 8f00aa11bb22cc33 \u{2022} Your IP: 192.0.2.1 \u{2022} Performance & \
+                 security by Cloudflare",
+        "buttons": [],
+        "inputs": [],
+        "markers": []
+    });
+    match run(fake_cdp_pages(vec![blocked]), aterm_spec::wait::MUST_HAPPEN) {
+        Approval::BotCheck(why) => assert!(
+            why.contains("bot-protection block page")
+                && !why.contains("192.0.2.1")
+                && !why.to_ascii_lowercase().contains("ray id"),
+            "{why}"
+        ),
+        other => panic!("the block page: {other:?}"),
+    }
 }
 
 /// GOLDEN: the headless browser is launched as itself, with nothing that changes what a bot
@@ -4396,7 +4448,12 @@ fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
     assert_eq!(read.markers, vec![Marker::Turnstile]);
     assert!(bot_check(&read));
 
-    let step = oauth_step_js(Some("one@example.com"), Some("123456"), false, false);
+    let step = oauth_step_js(
+        Some("one@example.com"),
+        Some("123456"),
+        (false, false),
+        None,
+    );
     assert!(step.contains(BOT_CHECK_JS));
     let blocked = step
         .find("state: \"block_page\"")
@@ -4404,10 +4461,10 @@ fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
     let checked = step.find("state: \"bot_check\"").expect("bot check state");
     for act in [
         "switchBtn.click()",
-        "btn.click()",
+        "control.click()",
         "fillCodeInputs(otpInputs",
         "setNativeValue(emailInput",
-        "approveForm.requestSubmit()",
+        "pressConsent(approve",
     ] {
         let at = step.find(act).expect(act);
         assert!(blocked < at && checked < at, "{act} before the bot check");

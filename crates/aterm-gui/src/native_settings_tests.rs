@@ -1674,7 +1674,8 @@ fn replace_settings_source(
     let snapshot = VersionedConfigService::new(source)
         .expect("valid Settings fixture")
         .snapshot();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&snapshot).expect("project Settings fixture");
@@ -2092,7 +2093,8 @@ fn a_decline_quiets_every_view_and_doubles_in_a_row() {
     let open_view = || {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -2116,7 +2118,8 @@ fn a_decline_quiets_every_view_and_doubles_in_a_row() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.feedback.clone().unwrap_or_default()
@@ -2189,7 +2192,8 @@ fn the_reset_report_expires_and_the_trash_status_shows_in_every_layout() {
     access.warmup_rows = denied_rows();
     let report = MacosAccessReset::from_attempts(&[]);
     let (mut runtime, _instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.navigate(SettingsRoute::Security);
@@ -2312,7 +2316,8 @@ fn switching_privacy_off_takes_the_ask_again_offer_and_its_advice() {
 
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -2329,7 +2334,8 @@ fn switching_privacy_off_takes_the_ask_again_offer_and_its_advice() {
             }),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert!(state.feedback.is_some());
@@ -2439,7 +2445,8 @@ fn the_trash_alert_escapes_planted_names_and_counts_its_copies() {
     });
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -2494,7 +2501,8 @@ fn an_unconfirmed_owner_gesture_changes_nothing() {
     ] {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -2510,7 +2518,8 @@ fn an_unconfirmed_owner_gesture_changes_nothing() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert!(!state.take_consent_warmup_request(), "{action}");
@@ -2523,6 +2532,7 @@ fn an_unconfirmed_owner_gesture_changes_nothing() {
         );
         let said = state.feedback.clone();
         assert!(said.is_some(), "{action}: says so");
+        drop(route_native_guard);
         runtime
             .dispatch(
                 instance,
@@ -2533,7 +2543,8 @@ fn an_unconfirmed_owner_gesture_changes_nothing() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(
@@ -2563,7 +2574,8 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
         let shared = SharedOwnerQuiet::default();
         let open_view = || {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -2573,6 +2585,7 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
                 ..ConsentGestures::inert()
             });
             state.arm_owner_quiet(std::sync::Arc::clone(&shared));
+            drop(route_native_guard);
             (runtime, instance, view)
         };
         let press = |runtime: &mut NativeRuntime, instance, view| {
@@ -2586,7 +2599,8 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
                     }),
                 )
                 .unwrap();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback.clone().unwrap_or_default()
@@ -2608,7 +2622,8 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
         );
 
         {
-            let Some(AppViewState::Settings(state)) = first.view_state_mut(first_view) else {
+            let mut route_native_guard = first.view_state_mut(first_view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             let taken = if action == MACOS_ACCESS_WARM_UP {
@@ -2656,7 +2671,8 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
             .unwrap_or_else(|p| p.into_inner())
             .settle_confirmed();
         {
-            let Some(AppViewState::Settings(state)) = first.view_state_mut(first_view) else {
+            let mut route_native_guard = first.view_state_mut(first_view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.replace_macos_access(MacosAccess {
@@ -2669,7 +2685,8 @@ fn a_press_behind_a_confirmed_alert_asks_nothing() {
         assert!(live.contains(under_way), "{action}: a live worker: {live}");
         assert_eq!(ASKED.load(Ordering::Acquire), 1, "{action}: no second ask");
         {
-            let Some(AppViewState::Settings(state)) = first.view_state_mut(first_view) else {
+            let mut route_native_guard = first.view_state_mut(first_view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             assert!(
@@ -2927,7 +2944,8 @@ fn press_debugger(
             }),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.feedback.clone()
@@ -2969,7 +2987,8 @@ fn a_confirmed_debugger_press_records_one_change_for_the_park() {
         let open_view = || {
             let (mut runtime, instance, view) = setup();
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::Security);
@@ -2999,7 +3018,8 @@ fn a_confirmed_debugger_press_records_one_change_for_the_park() {
             "{context}: another view behind the same yes is refused"
         );
         assert_eq!(ASKED.load(Ordering::Acquire), 1, "{context}: one alert");
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(
@@ -3012,7 +3032,8 @@ fn a_confirmed_debugger_press_records_one_change_for_the_park() {
             None,
             "{context}: drained"
         );
-        let Some(AppViewState::Settings(other_state)) = other.view_state_mut(other_view) else {
+        let mut route_native_guard = other.view_state_mut(other_view);
+        let Some(AppViewState::Settings(other_state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(
@@ -3101,7 +3122,8 @@ fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
     for (context, facts, action) in cases {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -3117,7 +3139,8 @@ fn a_debugger_press_the_row_does_not_offer_asks_nothing() {
             press_debugger(&mut runtime, instance, view, action).is_some(),
             "{context}: the refusal is said on the page"
         );
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(state.take_debugger_change_request(), None, "{context}");
@@ -3288,7 +3311,8 @@ fn owner_confirms_with_mints_a_yes_only_from_the_alert() {
     assert_eq!(ask(yes), OwnerAnswer::Quiet, "quieted: not asked");
     assert_eq!(ASKED.load(Ordering::Acquire), 3, "no alert while quiet");
     let (mut runtime, _instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.arm_owner_quiet(std::sync::Arc::clone(&quiet));
@@ -3311,7 +3335,8 @@ fn a_declined_debugger_alert_quiets_the_block_and_records_nothing() {
     let shared = SharedOwnerQuiet::default();
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -3323,7 +3348,8 @@ fn a_declined_debugger_alert_quiets_the_block_and_records_nothing() {
     assert!(press_debugger(&mut runtime, instance, view, MACOS_ACCESS_DEBUGGER_ON).is_some());
     assert!(!shared.lock().unwrap().is_quiet_now_for_test());
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.arm_consent_gestures(ConsentGestures {
@@ -3339,7 +3365,8 @@ fn a_declined_debugger_alert_quiets_the_block_and_records_nothing() {
         Some(quieted),
         "a debugger Cancel quiets the warm-up too"
     );
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(state.take_debugger_change_request(), None);
@@ -3414,7 +3441,8 @@ fn the_macos_access_block_draws_the_rows_it_measures() {
 fn a_warm_up_refusal_is_drawn_and_outlasts_the_switch_that_caused_it() {
     use aterm_containment::FdaScope;
     let (mut runtime, _instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.navigate(SettingsRoute::Security);
@@ -3451,7 +3479,8 @@ fn the_trash_press_records_its_plan_once() {
     let press = |access: MacosAccess| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -3468,7 +3497,8 @@ fn the_trash_press_records_its_plan_once() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         (state.take_claimant_retire_request(), state.feedback.clone())
@@ -3609,7 +3639,8 @@ fn the_devtools_card_explains_itself_on_an_ordinary_window() {
             let access = devtools_access(facts, SpikeEvidence::UNMEASURED);
             let (mut runtime, instance, view) = setup();
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::Security);
@@ -3729,7 +3760,9 @@ fn open_privacy_and_security_is_on_the_first_screen_at_every_size() {
                 let context = format!("{name} {width}x{height} at {scale}x");
                 let (mut runtime, instance, view) = setup();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.navigate(SettingsRoute::Security);
@@ -3823,7 +3856,8 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
     let access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -3832,7 +3866,8 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
     let cx = view_cx_at(624.0, 348.0);
     let at = |runtime: &mut NativeRuntime, page: usize| {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.scroll_page_to(page);
@@ -3883,7 +3918,8 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
     });
     assert!(rows, "the list reaches a permission toggle");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(0);
@@ -3910,7 +3946,8 @@ fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
         assert!(carried.contains(key), "{key}");
     }
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(0);
@@ -4100,7 +4137,8 @@ fn a_partial_reset_is_reported_as_partial_with_one_line_per_failure() {
 fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -4555,7 +4593,8 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
     let words = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::DeveloperTools);
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -4587,7 +4626,8 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
             )
             .unwrap();
     }
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(
@@ -4649,10 +4689,12 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
     assert!(!state.note_devtools_hand_over(HandOver::Opened, None));
     assert_eq!(state.feedback, before);
 
+    drop(route_native_guard);
     for (published, armed) in [(false, true), (true, false)] {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
@@ -4680,7 +4722,8 @@ fn the_developer_tools_button_asks_the_host_for_the_one_hand_over() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         let context = format!("published={published} armed={armed}");
@@ -5607,7 +5650,8 @@ fn list_bound_sweep(scale: f32) {
                     cell += 1;
                     let cx = view_cx_at(width, height);
                     {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        let mut route_native_guard = runtime.view_state_mut(view);
+                        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
                         else {
                             unreachable!()
                         };
@@ -5618,7 +5662,9 @@ fn list_bound_sweep(scale: f32) {
                     let mut page = 0;
                     loop {
                         {
-                            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                            let mut route_native_guard = runtime.view_state_mut(view);
+                            let Some(AppViewState::Settings(state)) =
+                                route_native_guard.as_deref_mut()
                             else {
                                 unreachable!()
                             };
@@ -5816,11 +5862,13 @@ fn unrelated_two_view_publication_preserves_a_blurred_draft() {
         VersionedConfigService::new("font_family = \"Committed Mono\"\n".to_string()).unwrap();
     let snapshot = service.snapshot();
     let (mut runtime, instance, first) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(first) else {
+    let mut route_native_guard = runtime.view_state_mut(first);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
     state.navigate(SettingsRoute::TextFonts);
+    drop(route_native_guard);
     let second = attach_second_settings_view(&mut runtime, instance, &snapshot);
 
     enter_font_family_draft(&mut runtime, instance, first, "Draft Mono");
@@ -5886,10 +5934,12 @@ fn same_key_two_view_publication_preserves_draft_and_requires_explicit_return() 
         VersionedConfigService::new("font_family = \"Committed Mono\"\n".to_string()).unwrap();
     let snapshot = service.snapshot();
     let (mut runtime, instance, first) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(first) else {
+    let mut route_native_guard = runtime.view_state_mut(first);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+    drop(route_native_guard);
     let second = attach_second_settings_view(&mut runtime, instance, &snapshot);
     enter_font_family_draft(&mut runtime, instance, first, "My Unsaved Mono");
 
@@ -6242,10 +6292,12 @@ fn route_activation_keeps_focus_on_a_surviving_visible_control() {
             AppEvent::FocusChanged(Some(desktop_key.clone())),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view")
     };
     state.common.focus_visible = true;
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -6373,13 +6425,15 @@ fn route_activation_keeps_focus_on_a_surviving_visible_control() {
 #[test]
 fn cmd_z_falls_back_to_last_config_patch_when_no_text_field_owns_undo() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.feedback = Some("Color theme set to Nord".to_string());
     state.last_undo = Some(UndoOffer::showing(41, "Color theme set to Nord"));
     state.common.last_focus = Some(UiKey::new("settings/page/appearance"));
 
+    drop(route_native_guard);
     let outcome = runtime
         .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Undo))
         .unwrap();
@@ -6506,7 +6560,8 @@ fn escape_with_nothing_to_cancel_keeps_the_page_its_undo_and_place() {
             None,
         );
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = Some("Tone-adaptive melody turned off".to_string());
@@ -6641,13 +6696,15 @@ fn focusing_search_closes_invisible_picker_and_confirmation_before_one_escape() 
             }),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     assert!(state.choice_picker.is_some());
     state.reset_all_confirmation = true;
     state.feedback = Some("Reset all settings?".to_string());
 
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -6880,7 +6937,8 @@ fn a_theme_picked_over_an_unset_theme_is_its_plain_name() {
     let pick = |source: &str| {
         let service = VersionedConfigService::new(source.to_string()).unwrap();
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view");
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
@@ -6891,6 +6949,7 @@ fn a_theme_picked_over_an_unset_theme_is_its_plain_name() {
                 value: None,
             })
         };
+        drop(route_native_guard);
         runtime
             .dispatch(
                 instance,
@@ -6942,7 +7001,8 @@ fn a_theme_picked_over_an_unset_theme_is_its_plain_name() {
 #[test]
 fn explicit_choice_offers_the_true_default_and_opens_on_current_value() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     let theme = state
@@ -6957,6 +7017,7 @@ fn explicit_choice_offers_the_true_default_and_opens_on_current_value() {
         .raw_values
         .insert(prefs::EDIT_THEME.to_string(), "Nord".to_string());
 
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -7067,7 +7128,8 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
         ("Zeta".to_string(), scheme.clone()),
     ]);
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     let mut assets = (*state.assets).clone();
@@ -7097,6 +7159,7 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
         "semantic cycling recognizes the complete authored suffix",
     );
 
+    drop(route_native_guard);
     let opened = runtime
         .dispatch(
             instance,
@@ -7144,7 +7207,8 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
         "choosing the theme the file already holds writes nothing",
     );
 
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state
@@ -7158,6 +7222,7 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
         .expect("theme field");
     theme.seed = Some("Zeta".to_string());
     theme.placeholder = "Zeta".to_string();
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -7208,7 +7273,8 @@ fn cursor_styles_runtime(
     let service = VersionedConfigService::new(toml.to_string()).unwrap();
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
@@ -7295,7 +7361,8 @@ fn cursor_style_rows_preview_unsaved_and_save_in_one_patch() {
     );
     assert_eq!(preview_style(&runtime), PreviewTrailStyle::Comet);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
@@ -7345,7 +7412,8 @@ fn cursor_style_rows_preview_unsaved_and_save_in_one_patch() {
         assert_eq!(saved_cursor_style(state), prefs::DEFAULT_CURSOR_TRAIL_STYLE);
     }
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = None;
@@ -7574,7 +7642,9 @@ fn a_drawn_cursor_preview_shows_its_style_at_a_large_text_size() {
                 let (mut runtime, instance, view) =
                     cursor_styles_runtime(&trail_drawn("line_height = 2\n"));
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.common.hovered =
@@ -8820,7 +8890,8 @@ fn the_keyboard_takes_the_cursor_style_preview_from_a_resting_pointer() {
         )
         .unwrap();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
@@ -8840,7 +8911,8 @@ fn the_keyboard_takes_the_cursor_style_preview_from_a_resting_pointer() {
     assert_ne!(landed, "comet");
     assert_eq!(candidate(&runtime), Some(landed), "the keyboard's row");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = Some(UiKey::new(cursor_style_row_key("fire")));
@@ -8982,7 +9054,8 @@ fn the_sound_page_s_music_effects_row_paints_its_notes_and_offers_reset() {
         let service = VersionedConfigService::new("trail_sounds = false\n".to_string()).unwrap();
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
@@ -9735,7 +9808,8 @@ fn short_choices_are_segments_that_save_in_one_click() {
         view,
         "ambiguous_width = \"wide\"\n".to_string(),
     );
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.navigate(SettingsRoute::Terminal);
@@ -9745,6 +9819,7 @@ fn short_choices_are_segments_that_save_in_one_click() {
         state.common.last_focus.as_ref().map(UiKey::as_str),
         Some(format!("settings/control/{}", prefs::EDIT_AMBIGUOUS_WIDTH).as_str())
     );
+    drop(route_native_guard);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
     let narrow = compiled
         .semantic(&UiKey::new(format!(
@@ -9828,7 +9903,8 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
             .iter()
             .all(|effect| !matches!(effect, AppEffect::ConfigPatch { .. }))
     );
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     let picker = state.choice_picker.as_mut().unwrap();
@@ -9867,6 +9943,7 @@ fn top_choice_picker_pointer_hover_previews_without_persisting() {
     assert!(!state.is_explicit(prefs::EDIT_THEME));
 
     let cx = view_cx_at(390.0, 568.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -10167,7 +10244,8 @@ fn packages_sharing_switch_shows_the_persons_off_and_a_flip_runs_atpkgs_own_verb
     let open = |state: PackagesState| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(view_state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(view_state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             view_state.navigate(SettingsRoute::Packages);
@@ -10370,7 +10448,8 @@ fn the_packages_rail_entry_wears_the_badge_while_a_failure_is_named() {
         compact_categories_showing(&mut runtime, instance, view, SettingsRoute::Packages);
     assert!(painted_badge_dots(&compiled).is_empty(), "cleared");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.compact_navigation = false;
@@ -10410,11 +10489,13 @@ fn compact_categories_showing(
     let cx = view_cx_at(568.0, 900.0);
     let key = UiKey::new(format!("settings/categories{}", route.path()));
     for page in 0..SettingsRoute::ALL.len() {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.compact_navigation = true;
         state.scroll_page_to(page);
+        drop(route_native_guard);
         let compiled = compile_settings_view(runtime, instance, view, &cx);
         if compiled.semantic(&key).is_some() {
             return compiled;
@@ -10540,7 +10621,8 @@ fn packages_page_semantics(
     cx: &ViewCx<'_>,
 ) -> Vec<(String, String)> {
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Packages);
@@ -10676,7 +10758,8 @@ fn a_program_rows_accessible_value_is_atpkgs_own_state() {
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_packages(packages_state_with_activity(0), 2));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Packages);
@@ -10729,7 +10812,8 @@ fn a_completion_line_is_transient_and_a_line_with_an_answer_stands() {
     );
     assert_eq!(clock, None, "an operation in flight stands");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.show_transient_status_for_test("Copied");
@@ -10762,7 +10846,8 @@ fn a_completion_line_is_transient_and_a_line_with_an_answer_stands() {
     assert_eq!(said.as_deref(), Some("Build information copied"));
     assert_eq!(clock, Some(false), "the copy's outcome runs the clock");
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.feedback = Some("Font size set to 14 px \u{b7} Undo".to_string());
@@ -10827,7 +10912,8 @@ fn the_activity_card_lists_the_log_as_stops_of_the_page() {
         assert!(seen.iter().any(|(k, _)| k == "packages/activity/open-log"));
         let top = |runtime: &mut NativeRuntime| {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.scroll_page_to(0);
@@ -10969,7 +11055,8 @@ fn software_update_links_to_its_messages() {
         let mut found = false;
         for page in 0..200 {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::SoftwareUpdate);
@@ -11018,7 +11105,8 @@ fn a_display_face_row_speaks_its_name_not_its_face_id() {
     let key = UiKey::new("settings/display-face/label/chunky");
     for page in 0..24 {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::TextFonts);
@@ -11057,7 +11145,8 @@ fn display_face_switches_line_up_with_the_pages_controls() {
         let mut face = None;
         for page in 0..24 {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::TextFonts);
@@ -11135,7 +11224,8 @@ fn one_line_compact_rows_share_one_fit_rule() {
         let (mut thicken, mut face) = (None, None);
         for page in 0..40 {
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::TextFonts);
@@ -11173,7 +11263,8 @@ fn compact_top_settings_keeps_the_playful_effects_note() {
     let mut shown = false;
     for page in 0..12 {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Home);
@@ -11225,7 +11316,8 @@ fn software_update_keeps_its_buttons_in_the_status_card_at_the_default_window() 
     assert!(runtime.replace_settings_packages(packages_state_with_activity(9), 2));
     let cx = view_cx_at(738.0, 420.0);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::SoftwareUpdate);
@@ -11320,7 +11412,8 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             )
         );
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.scroll_page_to(0);
@@ -11691,10 +11784,12 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
     let checks = UiKey::new(format!("settings/control/{}", prefs::EDIT_UPDATE_ENABLED));
     let install = UiKey::new("settings/control/update.auto_apply");
     let page = |runtime: &mut NativeRuntime, cx: &ViewCx<'static>, index: usize| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(index);
+        drop(route_native_guard);
         let compiled = compile_settings_view(runtime, instance, view, cx);
         let overflowing = compiled
             .paint_audit_lines()
@@ -11780,10 +11875,12 @@ fn packages_page_shows_one_live_switch_and_the_dormant_install_consent() {
     )
     .unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    drop(route_native_guard);
     assert!(runtime.replace_settings_packages(
         live_packages_state_with_policy(None, false, true, true),
         2,
@@ -11831,12 +11928,14 @@ fn automatic_updates_reads_and_restores_auto_update() {
     )
     .unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
     let config: Config =
         aterm_toml::from_str("[packages]\nenabled = true\nauto_update = false\n").unwrap();
+    drop(route_native_guard);
     assert!(
         runtime.replace_settings_packages(
             live_packages_state_with_policy(None, config.packages_enabled(), true, true)
@@ -11858,10 +11957,12 @@ fn automatic_updates_reads_and_restores_auto_update() {
     let control = UiKey::new(format!("settings/control/{}", prefs::EDIT_PACKAGES_ENABLED));
     let compiled = (0..4)
         .map(|page| {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.scroll_page_to(page);
+            drop(route_native_guard);
             runtime
                 .render(instance, view, &cx)
                 .unwrap()
@@ -11953,7 +12054,8 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     let source = "[packages]\nauto_update = false\nseed_install = false\n";
     let mut service = VersionedConfigService::new(source.to_string()).unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
@@ -11999,6 +12101,7 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
             .unwrap(),
     );
     let cx = view_cx_at(1_080.0, 720.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -12040,10 +12143,12 @@ fn a_retired_packages_spelling_is_named_resettable_and_reset_by_reset_all() {
     let source = "font_px = 14.0\n[packages]\nauto_update = false\n";
     let mut service = VersionedConfigService::new(source.to_string()).unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    drop(route_native_guard);
     for id in ["settings/reset-all", "settings/reset-all-confirm"] {
         let outcome = runtime
             .dispatch(
@@ -12144,11 +12249,13 @@ fn the_retired_switch_note_and_the_service_line_paint_whole_at_every_width() {
             let mut audits = Vec::new();
             let mut note_semantic = None;
             for page in 0..40 {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::Packages);
                 state.scroll_page_to(page);
+                drop(route_native_guard);
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 if let Some(detail) = compiled.semantic(&UiKey::new("packages/detail")) {
                     assert!(!detail.label.contains(&note), "{context}: {}", detail.label);
@@ -12276,7 +12383,8 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
         2,
     ));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Packages);
@@ -12287,7 +12395,8 @@ fn the_security_route_offers_the_machine_apply_command_in_the_palette() {
     );
 
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -12317,7 +12426,8 @@ fn the_short_security_list_reaches_its_last_row_under_the_access_card() {
     use atpkg::machine::{HomePosture, UcPosture};
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -12404,7 +12514,8 @@ fn package_admission_is_drawn_from_the_tool_before_the_status_read() {
             "[packages]\nenabled = false\n".to_string(),
         );
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Packages);
@@ -12488,7 +12599,8 @@ fn package_admission_is_drawn_from_the_tool_before_the_status_read() {
 fn packages_says_a_missing_tool_once_and_keeps_its_verbs_in_its_card() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Packages);
@@ -12616,7 +12728,8 @@ fn one_cause_paints_one_note() {
         (SettingsRoute::Security, "automatically"),
     ] {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -12720,7 +12833,8 @@ fn search_result_groups_keep_their_identity_whatever_page_search_started_on() {
     let groups = |route: SettingsRoute, search: &str| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -12756,7 +12870,8 @@ fn the_security_page_shows_machine_settings_under_its_row() {
     use atpkg::machine::{HomePosture, UcPosture};
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -12978,7 +13093,8 @@ fn the_security_page_shows_machine_settings_under_its_row() {
         "the control's name still says why"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.search = "universal".to_string();
@@ -12990,7 +13106,8 @@ fn the_security_page_shows_machine_settings_under_its_row() {
         painted_row(&searched)
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.search.clear();
@@ -13012,7 +13129,8 @@ fn the_security_page_shows_machine_settings_under_its_row() {
         (SettingsRoute::Security, "universal"),
     ] {
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -13026,7 +13144,8 @@ fn the_security_page_shows_machine_settings_under_its_row() {
     }
 
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.search.clear();
@@ -13501,11 +13620,13 @@ fn packages_long_reason_rows_put_the_fix_first_and_keep_short_states_stable() {
         let cx = view_cx_at(viewport_width, viewport_height);
         let mut reason_audit = Vec::new();
         for page in 0..16 {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Packages);
             state.scroll_page_to(page);
+            drop(route_native_guard);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let painted: Vec<String> = compiled
                 .paint_audit_lines()
@@ -13743,10 +13864,12 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
     for (width, height) in viewports {
         for route in routes {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.navigate(route);
+            drop(route_native_guard);
             let compiled = compile(&runtime, instance, view, width, height);
             let context = format!("{} {width}×{height} at {scale}×", route.label());
             assert_whole(&compiled, width, height, &context);
@@ -13906,11 +14029,13 @@ fn visual_preview_matrix_covers_four_viewports_at_three_text_scales_at_scale(sca
         }
 
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.set_search("font".to_string());
         state.common.last_focus = Some(UiKey::new("settings/search"));
+        drop(route_native_guard);
         let searched = compile(&runtime, instance, view, width, height);
         let context = format!("font search {width}×{height} at {scale}×");
         assert_whole(&searched, width, height, &context);
@@ -15546,7 +15671,8 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
     // step below lands on neither.
     let seed = crate::FONT_PX + 2.0;
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.route = SettingsRoute::TextFonts;
@@ -15564,6 +15690,7 @@ fn bounded_numeric_setting_is_a_real_slider_and_keyboard_steps_exactly() {
     )));
 
     let cx = view_cx_at(900.0, 820.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -15655,7 +15782,8 @@ fn a_step_onto_the_automatic_font_size_removes_the_key() {
         view,
         format!("font_px = {}\n", crate::FONT_PX + 1.0),
     );
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.route = SettingsRoute::TextFonts;
@@ -15664,6 +15792,7 @@ fn a_step_onto_the_automatic_font_size_removes_the_key() {
         prefs::EDIT_FONT_PX
     )));
     let cx = view_cx_at(900.0, 820.0);
+    drop(route_native_guard);
     runtime.render(instance, view, &cx).unwrap();
     let outcome = runtime
         .dispatch(
@@ -15701,7 +15830,8 @@ fn slider_writes_land_on_the_step_grid_without_float_noise() {
     }
 
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.route = SettingsRoute::Appearance;
@@ -15716,6 +15846,7 @@ fn slider_writes_land_on_the_step_grid_without_float_noise() {
         "settings/control/{}",
         prefs::EDIT_FAINT_OPACITY
     )));
+    drop(route_native_guard);
     let outcome = runtime
         .dispatch(
             instance,
@@ -15954,7 +16085,8 @@ fn rejected_bounded_numeric_return_retains_exact_draft_and_focus() {
     let (mut runtime, instance, view) = setup();
     let key = prefs::EDIT_FONT_PX;
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.route = SettingsRoute::TextFonts;
@@ -16013,7 +16145,8 @@ fn an_out_of_range_font_size_keeps_the_row_and_the_specimen() {
     let (mut runtime, instance, view) = setup();
     replace_settings_source(&mut runtime, view, "font_px = 14\n".to_string());
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -16150,7 +16283,8 @@ fn motion_auto_discloses_platform_behavior_when_explicit_or_implicit() {
 #[test]
 fn color_override_has_a_truthful_swatch_and_source_context() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     let field = state
@@ -16168,6 +16302,7 @@ fn color_override_has_a_truthful_swatch_and_source_context() {
     state.set_search("foreground".to_string());
 
     let cx = view_cx_at(900.0, 820.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -16195,12 +16330,14 @@ fn color_override_has_a_truthful_swatch_and_source_context() {
 fn pointer_text_positions_reduce_to_grapheme_safe_caret_and_selection() {
     let (mut runtime, instance, view) = setup();
     let text = "Aé👩‍💻末";
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.search_input = crate::native_text_input::TextInputState::new(text.to_string());
     state.set_search(text.to_string());
 
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -16261,13 +16398,15 @@ fn pointer_text_positions_reduce_to_grapheme_safe_caret_and_selection() {
 #[test]
 fn readline_events_edit_the_search_field_at_the_caret() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.search_input = crate::native_text_input::TextInputState::new("cursor trail".into());
     state.set_search("cursor trail".to_string());
     state.common.last_focus = Some(UiKey::new("settings/search"));
 
+    drop(route_native_guard);
     let text_input = |runtime: &mut NativeRuntime, event| {
         runtime
             .dispatch(instance, view, AppEvent::TextInput(event))
@@ -16325,7 +16464,8 @@ fn pointer_text_position_enters_real_field_edit_and_invalid_kinds_fail_closed() 
     let (mut runtime, instance, view) = setup();
     let text_key = prefs::EDIT_FONT_FAMILY;
     let slider_key = prefs::EDIT_FONT_PX;
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state.route = SettingsRoute::TextFonts;
@@ -16344,6 +16484,7 @@ fn pointer_text_position_enters_real_field_edit_and_invalid_kinds_fail_closed() 
         .unwrap()
         .seed = Some("14".to_string());
 
+    drop(route_native_guard);
     let outcome = runtime
         .dispatch(
             instance,
@@ -16546,10 +16687,12 @@ fn every_rail_row_reaches_a_screen_reader_and_scrolls_whole_into_the_rail_when_a
     for height in (560..=900).step_by(4) {
         let cx = view_cx_at(1_284.0, height as f32);
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
+        drop(route_native_guard);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let list = compiled
             .semantic(&UiKey::new("settings/navigation/list"))
@@ -16573,10 +16716,12 @@ fn every_rail_row_reaches_a_screen_reader_and_scrolls_whole_into_the_rail_when_a
         }
         for row in asked {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Security);
+            drop(route_native_guard);
             compile_settings_view(&runtime, instance, view, &cx);
             let focus = |runtime: &NativeRuntime| {
                 let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
@@ -16696,10 +16841,12 @@ fn a_short_wide_window_keeps_the_sidebar_on_every_page_without_a_cut() {
         let cx = view_cx_at(1_193.0, height);
         for route in SettingsRoute::ALL {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.navigate(route);
+            drop(route_native_guard);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let at = format!("{route:?} at 1193x{height}");
             assert!(
@@ -16751,7 +16898,8 @@ fn the_rail_scrolls_to_keep_the_selected_route_whole() {
         "premise: the rail outgrows this window"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.common.last_focus = Some(UiKey::new("settings/nav/about"));
@@ -16912,10 +17060,13 @@ fn no_rail_screen_cuts_a_row_at_its_top_and_every_row_is_whole_on_one() {
                 };
                 for route in SettingsRoute::ALL {
                     let (mut runtime, instance, view) = setup();
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.navigate(route);
+                    drop(route_native_guard);
                     let compiled = compile_settings_view(&runtime, instance, view, &cx);
                     look(
                         &compiled,
@@ -17176,10 +17327,13 @@ fn a_click_on_a_rail_row_opens_its_page_wherever_the_rail_stands() {
                         }
                         let mut lab = modified::Lab::new("");
                         assert!(wheeled(&mut lab), "PRECONDITION: the same screen again");
-                        let common = &mut lab.state_mut().common;
-                        common.pressed = Some(key.clone());
-                        common.last_focus = Some(key.clone());
-                        common.focus_visible = false;
+                        {
+                            let mut state = lab.state_mut();
+                            let common = &mut state.common;
+                            common.pressed = Some(key.clone());
+                            common.last_focus = Some(key.clone());
+                            common.focus_visible = false;
+                        }
                         let pressed = lab.compile(width, height);
                         lab.state_mut().common.pressed = None;
                         clicks += 1;
@@ -17314,10 +17468,12 @@ fn a_rail_too_short_for_a_row_gives_its_title_to_the_list() {
     at_each_text_scale(&[2.0], "the rail's title", |_| {
         for (height, titled) in [(180.0, false), (240.0, true)] {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.navigate(SettingsRoute::Themes);
+            drop(route_native_guard);
             let compiled =
                 compile_settings_view(&runtime, instance, view, &view_cx_at(1_564.0, height));
             assert_eq!(
@@ -17379,10 +17535,13 @@ fn every_rail_row_is_whole_selected_or_not() {
                         break;
                     };
                     let (mut runtime, instance, view) = setup();
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.navigate(route);
+                    drop(route_native_guard);
                     let compiled = compile_settings_view(&runtime, instance, view, &cx);
                     let at = format!("{route:?} selected, {width}x{height} at {scale} in {face:?}");
                     let navigation = compiled
@@ -17413,7 +17572,8 @@ fn the_category_sheet_selects_themes_under_appearance() {
     let sheet = |route: SettingsRoute| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.navigate(route);
@@ -17725,7 +17885,8 @@ fn each_screen_of(
 }
 
 fn set_walk_top(runtime: &mut NativeRuntime, view: crate::native_app::ViewId, top: usize) {
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.scroll_page_to(top);
@@ -17775,11 +17936,13 @@ fn screen_showing(
         }
     });
     if let Some(top) = wanted {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(top);
         state.page_reveal = None;
+        drop(route_native_guard);
         found = Some(compile_settings_view(runtime, instance, view, cx));
     }
     found
@@ -17807,7 +17970,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.compact_navigation = true;
@@ -17845,7 +18009,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             };
             let (mut runtime, instance, view) = setup();
             let (total, expected_controls) = {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(route);
@@ -17891,7 +18056,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Manual);
@@ -17909,7 +18075,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Home);
@@ -17951,7 +18118,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
         let snapshot = VersionedConfigService::new(source).unwrap().snapshot();
         let (mut runtime, instance, view) = setup();
         let overrides = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -17993,7 +18161,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::About);
@@ -18027,7 +18196,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
             let update_state = UpdateState::from_status(1, "0.1.0", Some(&status), false);
             let (mut runtime, instance, view) = setup_with_update(update_state);
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::SoftwareUpdate);
@@ -18060,7 +18230,8 @@ fn short_landscape_audit_reaches_every_control_with_feedback_at_scale(scale: f32
         let (mut runtime, instance, view) = setup();
         assert!(runtime.replace_settings_packages(packages_state, 2));
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::Packages);
@@ -18107,7 +18278,8 @@ fn the_packages_verbs_stay_inside_their_card_at_every_width() {
     let (mut runtime, instance, view) = setup();
     assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Packages);
@@ -18330,7 +18502,8 @@ fn settings_action(
 fn a_font_picker_paints_its_automatic_and_other_rows_by_their_names() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18425,7 +18598,8 @@ fn unset_style_rows_name_the_faces_the_terminal_draws() {
     };
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18437,7 +18611,8 @@ fn unset_style_rows_name_the_faces_the_terminal_draws() {
         "no report yet"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         assert!(state.replace_drawn_faces(Some(drawn.clone())));
@@ -18516,7 +18691,8 @@ fn unset_style_rows_name_the_faces_the_terminal_draws() {
 fn the_font_family_picker_lists_installed_families_and_previews_each() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18593,7 +18769,8 @@ fn the_font_family_picker_lists_installed_families_and_previews_each() {
 fn the_font_picker_takes_typing_and_other_takes_a_name() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18697,7 +18874,8 @@ fn the_font_picker_takes_typing_and_other_takes_a_name() {
 fn other_starts_from_the_name_typed_into_the_search() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18751,7 +18929,8 @@ fn typing_on_a_font_row_opens_its_list_narrowed() {
         "font_family = \"Courier\"\n".to_string(),
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -18833,7 +19012,8 @@ fn backspace_on_a_closed_font_row_edits_nothing() {
         "emoji_font = \"Apple Color Emoji\"\n".to_string(),
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -19024,7 +19204,8 @@ fn the_full_display_face_line_goes_when_the_mix_changes_elsewhere() {
             .unwrap();
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
@@ -19315,7 +19496,8 @@ fn a_display_family_shows_as_the_display_layer() {
         let snapshot = service.replace_theme_catalog(Arc::clone(&catalog));
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -19417,7 +19599,8 @@ fn a_fourth_display_face_is_refused_out_loud() {
         "display_font = \"chunky+pixel+engraved\"\n".to_string(),
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -19582,7 +19765,8 @@ fn typography_list_pins_its_specimen_and_reaches_every_field_at_scale(_scale: f3
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, "font_px = 36\n".to_string());
         let expected: BTreeSet<String> = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.navigate(SettingsRoute::TextFonts);
@@ -19803,10 +19987,12 @@ fn default_on_boolean_apply_and_reset_round_trip_through_real_config_service() {
     let mut service = VersionedConfigService::new(String::new()).unwrap();
 
     let modified = {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view");
         };
         state.navigate(SettingsRoute::Modified);
+        drop(route_native_guard);
         runtime
             .render(instance, view, &view_cx())
             .unwrap()
@@ -19931,7 +20117,8 @@ fn default_on_boolean_apply_and_reset_round_trip_through_real_config_service() {
 fn indeterminate_config_publication_stays_unverified_until_snapshot_reconciliation() {
     let (mut runtime, instance, view) = setup();
     let (before_raw, before_display) = {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view");
         };
         state.last_undo = Some(UndoOffer::showing(41, "Cursor blink turned off"));
@@ -20609,7 +20796,8 @@ fn escape_discards_field_draft_while_ordinary_blur_preserves_it() {
     let (mut runtime, instance, view) = setup();
     let text_key = prefs::EDIT_FONT_FEATURES;
     let text_focus = UiKey::new(format!("settings/control/{text_key}"));
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     state
@@ -20620,6 +20808,7 @@ fn escape_discards_field_draft_while_ordinary_blur_preserves_it() {
         .unwrap()
         .seed = Some("Committed Mono".to_string());
 
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -20770,10 +20959,12 @@ fn tall_special_pages_publish_zero_bound_and_never_scroll() {
         SettingsRoute::About,
     ] {
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(route);
+        drop(route_native_guard);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!();
@@ -20956,13 +21147,15 @@ fn clear_search_is_visible_touchable_and_resets_the_complete_query_state() {
                 }),
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         state.search_input.select_all();
         state.scroll_page_to(4);
 
         let cx = view_cx_at(width, height);
+        drop(route_native_guard);
         let compiled = runtime
             .render(instance, view, &cx)
             .unwrap()
@@ -21904,11 +22097,13 @@ fn global_search_finds_authored_unknown_keys_through_manual() {
     )
     .unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
 
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -22491,7 +22686,8 @@ fn about_copy_and_update_install_actions_emit_exact_typed_effects_and_complete()
 #[test]
 fn a_write_on_its_way_offers_its_own_undo() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view")
     };
     state.route = SettingsRoute::Modified;
@@ -22506,6 +22702,7 @@ fn a_write_on_its_way_offers_its_own_undo() {
         .find(|field| field.key == prefs::EDIT_CURSOR_BLINK)
         .unwrap()
         .seed = Some("false".to_string());
+    drop(route_native_guard);
     let set = runtime
         .dispatch(
             instance,
@@ -22640,7 +22837,8 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
 
     let ordinary = compile_settings_view(&runtime, instance, view, &cx);
     assert_zero_top_paint(&ordinary, "open picker at 1×");
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
@@ -22648,9 +22846,11 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
     assert!(picker.is_visible(picker.selected));
 
     install_scale(2.0);
+    drop(route_native_guard);
     let maximum = compile_settings_view(&runtime, instance, view, &cx);
     assert_zero_top_paint(&maximum, "same open picker at 2×");
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
@@ -22661,9 +22861,11 @@ fn open_choice_picker_reflows_across_live_dynamic_type_changes_at_scale(_scale: 
     assert!(picker.is_visible(picker.selected));
 
     install_scale(1.0);
+    drop(route_native_guard);
     let expanded = compile_settings_view(&runtime, instance, view, &cx);
     assert_zero_top_paint(&expanded, "same open picker expanded back to 1×");
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     let picker = state.choice_picker.as_ref().unwrap();
@@ -22799,7 +23001,8 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
             let (mut runtime, instance, view) = setup();
             replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
             let question_page = {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 configure(state, variant);
@@ -22895,7 +23098,9 @@ fn compact_top_status_cross_product_keeps_controls_and_recovery_actions_reachabl
                     )
                     .unwrap();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     configure(state, variant);
@@ -22992,7 +23197,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
@@ -23013,11 +23219,13 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                     format!("{key} = {}\n", quote(value))
                 };
                 replace_settings_source(&mut runtime, view, source);
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.page_reveal = Some(UiKey::new(format!("settings/control/{key}")));
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
+                drop(route_native_guard);
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 let context = format!(
                     "committed {key}={value:?} at {viewport_width}×{viewport_height} {scale}×"
@@ -23063,7 +23271,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 )
                 .unwrap();
             let expected_labels = {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
@@ -23112,7 +23321,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         let (mut runtime, instance, view) = setup();
         replace_settings_source(&mut runtime, view, "serious_mode = true\n".to_string());
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
@@ -23143,7 +23353,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 )
                 .unwrap();
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.feedback = (viewport_height <= 320.0).then(|| "Saved".to_string());
@@ -23160,11 +23371,13 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
 
     if scale >= 2.0 {
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.feedback = Some(top_effect_apply_feedback(true));
         let cx = view_cx_at(286.5, 558.0);
+        drop(route_native_guard);
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         assert_zero_top_paint(
             &compiled,
@@ -23173,7 +23386,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
 
         for confirmation in [false, true] {
             let (mut runtime, instance, view) = setup();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.field_inputs.insert(
@@ -23183,6 +23397,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 ),
             );
             state.draft_discard_confirmation = confirmation;
+            drop(route_native_guard);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let context = if confirmation {
                 "draft discard confirmation at 286.5×558 2×"
@@ -23212,20 +23427,24 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         }
 
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.feedback = Some("Reset all settings?".to_string());
         state.reset_all_confirmation = true;
+        drop(route_native_guard);
         let reset = compile_settings_view(&runtime, instance, view, &cx);
         assert_zero_top_paint(&reset, "Reset All disclosure at 286.5×558 2×");
 
         let (mut runtime, instance, view) = setup();
         let warning = "aterm.toml reload rejected at /Users//example/配置/very-long-profile-name/aterm.toml: an authored value is invalid and must be repaired.";
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.config_watch_status = Some(warning.to_string());
+        drop(route_native_guard);
         let watched = compile_settings_view(&runtime, instance, view, &cx);
         assert_zero_top_paint(&watched, "config watcher warning at 286.5×558 2×");
         assert!(
@@ -23256,7 +23475,8 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
         scheme.name = name.to_string();
         let themes = crate::app_config::ThemeCatalog::from_schemes([(name.to_string(), scheme)]);
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         **state = SettingsViewState::new(&Config {
@@ -23272,6 +23492,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
             prefs::EDIT_THEME
         )));
         let cx = view_cx_at(286.5, 558.0);
+        drop(route_native_guard);
         let committed = compile_settings_view(&runtime, instance, view, &cx);
         assert_zero_top_paint(&committed, "long Unicode committed theme");
         let control = committed
@@ -23311,7 +23532,7 @@ fn top_settings_builtin_and_hidden_state_matrix_has_zero_renderer_overflow_at_sc
                 }),
             )
             .unwrap();
-        let index = match runtime.view_state_mut(view) {
+        let index = match runtime.view_state_mut(view).as_deref_mut() {
             Some(AppViewState::Settings(state)) => {
                 let picker = state.choice_picker.as_mut().unwrap();
                 let index = picker
@@ -23628,10 +23849,12 @@ fn top_effect_controls_truthfully_escape_the_serious_mode_override() {
         );
 
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         **state = before;
+        drop(route_native_guard);
         let outcome = runtime
             .dispatch(
                 instance,
@@ -23835,10 +24058,12 @@ fn leaving_serious_mode_by_another_effect_keeps_the_saved_cursor_style() {
     let before_off = prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF;
     let patch_of = |state: SettingsViewState, id: String, value: Option<SemanticInput>| {
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(slot)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(slot)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         **slot = state;
+        drop(route_native_guard);
         let outcome = runtime
             .dispatch(
                 instance,
@@ -24027,10 +24252,12 @@ fn leaving_serious_mode_keeps_an_old_classic_mono_in_the_cursor_color() {
     const SOURCE: &str = "serious_mode = true\ncursor_trail_style = \"classic mono\"\n";
     let dispatch = |state: SettingsViewState, id: String, value: Option<SemanticInput>| {
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(slot)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(slot)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         **slot = state;
+        drop(route_native_guard);
         let outcome = runtime
             .dispatch(
                 instance,
@@ -24270,10 +24497,12 @@ fn resetting_a_toy_removes_only_its_own_key() {
     let source = "serious_mode = true\n[sparkle_words]\nenabled = false\n[sparkle_words.profanity]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n";
     let service = VersionedConfigService::new(source.to_string()).unwrap();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    drop(route_native_guard);
     let outcome = runtime
         .dispatch(
             instance,
@@ -24359,10 +24588,12 @@ fn modified_music_switch_toggles_its_authored_value_while_serious_mode_suppresse
     assert!(!top_projected_music_value(&before));
 
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view")
     };
     **state = before;
+    drop(route_native_guard);
     let outcome = runtime
         .dispatch(
             instance,
@@ -24413,7 +24644,8 @@ enabled = true
     let service = VersionedConfigService::new(source.to_string()).unwrap();
     let snapshot = service.snapshot();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -24448,6 +24680,7 @@ enabled = true
     state.page_reveal = Some(UiKey::new("settings/modified/manual/reset/keybindings"));
 
     let cx = view_cx_at(1_080.0, 720.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -24536,7 +24769,8 @@ exclude = ["nested"]
     let mut service = VersionedConfigService::new(source.to_string()).unwrap();
     let snapshot = service.snapshot();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -24562,6 +24796,7 @@ exclude = ["nested"]
             .unwrap(),
     );
     let cx = view_cx_at(1_080.0, 720.0);
+    drop(route_native_guard);
     let compiled = runtime
         .render(instance, view, &cx)
         .unwrap()
@@ -24960,7 +25195,8 @@ fn modified_pages_every_manual_override_at_normal_and_large_text_at_scale(_scale
         .collect::<String>();
     let snapshot = VersionedConfigService::new(source).unwrap().snapshot();
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         panic!("Settings view");
     };
     **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -24969,11 +25205,14 @@ fn modified_pages_every_manual_override_at_normal_and_large_text_at_scale(_scale
     assert_eq!(overrides.len(), 7);
     assert_eq!(settings_field_result_count(state), overrides.len());
     let cx = view_cx_at(320.0, 568.0);
+    drop(route_native_guard);
     for (offset, authored) in overrides.iter().enumerate() {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.scroll_page_to(offset);
+        drop(route_native_guard);
         let compiled = runtime
             .render(instance, view, &cx)
             .unwrap()
@@ -25043,7 +25282,8 @@ enabled = true
 fn the_rail_arrows_onto_manual_like_any_row() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         state.navigate(SettingsRoute::Modified);
@@ -26141,7 +26381,8 @@ fn active_environment_override_drives_row_preview_and_save_feedback() {
     runtime
         .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
         .unwrap();
-    let Some(AppViewState::Settings(runtime_state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(runtime_state)) = route_native_guard.as_deref_mut() else {
         unreachable!()
     };
     runtime_state.environment_overrides.insert(
@@ -26151,6 +26392,7 @@ fn active_environment_override_drives_row_preview_and_save_feedback() {
             effective: "22".to_string(),
         },
     );
+    drop(route_native_guard);
     let requested = runtime
         .dispatch(
             instance,
@@ -28469,7 +28711,8 @@ fn constrained_window_top_padding_is_honest_in_settings_manual_and_feedback() {
             .snapshot();
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             panic!("Settings view")
         };
         **state = SettingsViewState::from_snapshot(&snapshot).unwrap();
@@ -29230,7 +29473,8 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
         };
         let scroll_to = |top: usize| {
             let mut runtime = runtime.borrow_mut();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.scroll_page_to(top);
@@ -29458,12 +29702,14 @@ fn about_byline_sweep(scale: f32, coarse: f32, resolution: f32) {
 #[test]
 fn watcher_warning_is_global_separate_from_action_feedback_and_recovery_clears_it() {
     let (mut runtime, instance, view) = setup();
-    let AppViewState::Settings(state) = runtime.view_state_mut(view).unwrap() else {
+    let mut guard = runtime.view_state_mut(view).unwrap();
+    let AppViewState::Settings(state) = &mut *guard else {
         panic!("Settings view state");
     };
     state.feedback = Some("Undo available".to_string());
     state.config_watch_status =
         Some("aterm.toml reload rejected: the file is not valid UTF-8.".to_string());
+    drop(guard);
 
     let cx = view_cx_at(568.0, 420.0);
     let compiled = compile_settings_view(&runtime, instance, view, &cx);
@@ -29481,10 +29727,12 @@ fn watcher_warning_is_global_separate_from_action_feedback_and_recovery_clears_i
         "persistent watcher status must not overwrite ordinary feedback"
     );
 
-    let AppViewState::Settings(state) = runtime.view_state_mut(view).unwrap() else {
+    let mut guard = runtime.view_state_mut(view).unwrap();
+    let AppViewState::Settings(state) = &mut *guard else {
         panic!("Settings view state");
     };
     state.config_watch_status = None;
+    drop(guard);
     let recovered = compile_settings_view(&runtime, instance, view, &cx);
     assert!(
         recovered
@@ -30072,7 +30320,8 @@ fn the_log_is_sectioned_by_the_readers_local_day() {
     assert!(runtime.replace_settings_messages(multi_day_messages(), 8));
     let _ = compile_settings_view(&runtime, instance, view, &cx);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.common.last_focus = Some(UiKey::new("settings/messages/row/38/title"));
@@ -30379,7 +30628,8 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
         "the list scrolls until its oldest entry is its last row"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.scroll_page_to(limit);
@@ -30396,7 +30646,8 @@ fn messages_page_lists_newest_first_and_filters_by_tag() {
         "never scrolled past its end"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.scroll_page_to(0);
@@ -30602,7 +30853,8 @@ fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
         "{described}"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.common.last_focus = Some(UiKey::new(format!(
@@ -30622,7 +30874,8 @@ fn the_log_rows_share_one_lead_column_and_speak_plain_words() {
         Some(format!("settings/messages/row/{}/title", rows[1]).as_str())
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.common.last_focus = Some(UiKey::new(format!(
@@ -31478,7 +31731,7 @@ fn a_tag_pop_up_opened_on_a_scrolled_wide_page_is_drawn() {
         "settings/messages/row/40/title",
     );
     let tag_menu = |runtime: &mut NativeRuntime, open: bool| {
-        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) {
+        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view).as_deref_mut() {
             state.messages_tag_menu = open;
         }
     };
@@ -31718,7 +31971,7 @@ fn a_scroll_to_the_end_clamped_by_a_leaner_chrome_shows_the_last_entry() {
         ..PageChrome::FULL
     };
     let set_chrome = |runtime: &mut NativeRuntime, chrome: PageChrome| {
-        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) {
+        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view).as_deref_mut() {
             state.page_chrome.set(chrome);
         }
     };
@@ -31788,7 +32041,7 @@ fn an_entry_opened_from_a_scrolled_list_keeps_the_readers_top_entry() {
     let (mut runtime, instance, view) = setup_with_messages();
     assert!(runtime.replace_settings_messages(log.clone(), 8));
     let open = |runtime: &mut NativeRuntime, id: Option<u64>| {
-        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) {
+        if let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view).as_deref_mut() {
             state.messages_selected = id;
         }
     };
@@ -32147,7 +32400,8 @@ fn the_software_update_link_opens_messages_on_the_update_chip() {
 fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     let (mut runtime, instance, view) = setup();
     let cx = view_cx_at(474.0, 572.0);
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.compact_navigation = true;
@@ -32165,6 +32419,7 @@ fn page_keys_move_the_compact_category_list_by_the_page_it_shows() {
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut pages = Vec::new();
+    drop(route_native_guard);
     for _ in 0..SettingsRoute::rail_len() {
         let compiled = compile_settings_view(&runtime, instance, view, &cx);
         let rows = shown(&compiled);
@@ -32227,7 +32482,8 @@ fn page_keys_turn_a_whole_screen_and_the_wheel_a_row() {
         let (mut runtime, instance, view) = setup();
         assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -32318,7 +32574,8 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
     select_message(&mut runtime, instance, view, first[4]);
     let before = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.show_transient_status_for_test("Copied");
@@ -32343,7 +32600,8 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
     for (w, h) in [(774.0, 612.0), (474.0, 572.0)] {
         let cx = view_cx_at(w, h);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = None;
@@ -32351,7 +32609,8 @@ fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
         }
         let quiet = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.show_transient_status_for_test(long);
@@ -32408,7 +32667,8 @@ fn a_scrolled_compact_messages_page_says_an_entrys_copy_where_it_is_seen() {
         let rows = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
         let newest = rows[0];
         let lead = {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.scroll_page_to(1);
@@ -34006,7 +34266,8 @@ fn every_route_reaches_every_control_by_scrolling_at_every_window_size() {
             let (mut runtime, instance, view) = setup();
             assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(route);
@@ -34054,7 +34315,8 @@ fn every_route_reaches_every_control_by_scrolling_at_every_window_size() {
 
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.compact_navigation = true;
@@ -34087,7 +34349,8 @@ fn the_pinned_preview_keeps_a_specimen_row_and_yields_for_a_second_stop() {
     ] {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -34139,7 +34402,8 @@ fn a_short_host_scrolls_the_preview_never_drops_it() {
         let source = "theme = \"dark:Nord,light:Default Light\"\n";
         let (mut runtime, instance, view) = theme_pair_runtime(source, true);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(route);
@@ -34209,7 +34473,8 @@ fn a_short_host_scrolls_the_preview_never_drops_it() {
 fn up_and_down_walk_the_page_controls_and_the_list_follows() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Appearance);
@@ -34291,7 +34556,8 @@ fn the_status_bar_never_scrolls_the_edited_row_away() {
     ] {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.navigate(SettingsRoute::CursorMotion);
@@ -34332,7 +34598,8 @@ fn the_status_bar_never_scrolls_the_edited_row_away() {
         runtime.dispatch(instance, view, event).unwrap();
         let _ = compile_settings_view(&runtime, instance, view, &cx);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.feedback = Some("Applied".to_string());
@@ -34361,7 +34628,8 @@ fn the_status_bar_never_scrolls_the_edited_row_away() {
 fn a_grown_window_reclamps_the_scroll_to_a_full_last_screen() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -34833,7 +35101,8 @@ fn tab_color_takes_hex_text_brightness_and_resets_only_a_set_color() {
 fn an_invalid_color_keeps_its_draft_and_says_why() {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::Appearance);
@@ -34911,7 +35180,8 @@ fn both_padding_rows_stay_sliders_set_or_unset() {
 fn the_appearance_page_leads_with_theme_and_ends_with_effects() {
     let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Nord\"\n", true);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::Appearance);
@@ -35620,7 +35890,8 @@ fn about_names_its_site_once_and_the_byline_is_not_a_link() {
 }
 
 fn top_of_page(runtime: &mut NativeRuntime, view: crate::native_app::ViewId) {
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.scroll_page_to(0);
@@ -36052,7 +36323,8 @@ fn theme_picker_runtime(
 ) {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         let mut assets = (*state.assets).clone();
@@ -36118,7 +36390,8 @@ fn theme_picker_filter_nord_leaves_only_nord_rows() {
     assert_eq!(drawn, ["Nord"], "the page draws only what the filter left");
 
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.last_focus = Some(UiKey::new(THEME_FILTER_ACTION));
@@ -36536,7 +36809,8 @@ fn a_theme_name_finds_the_theme_control_and_seeds_the_picker_filter() {
 
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         let mut assets = (*state.assets).clone();
@@ -36573,7 +36847,8 @@ fn a_search_that_names_no_theme_opens_the_theme_picker_unfiltered() {
     let open = |source: &str, search: &str, action: &str| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             let service = VersionedConfigService::new(source.to_string()).expect("fixture");
@@ -36644,7 +36919,8 @@ fn a_theme_name_seeds_the_slot_picker_on_its_own_side() {
     let open = |source: &str, search: &str, action: &str| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             let service = VersionedConfigService::new(source.to_string()).expect("fixture");
@@ -36710,7 +36986,8 @@ fn a_seeded_theme_filter_lists_what_its_text_lists() {
     let check = |source: &str, search: &str, action: &str| {
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             let service = VersionedConfigService::new(source.to_string()).expect("fixture");
@@ -36834,7 +37111,8 @@ fn a_search_finds_the_theme_rows_wherever_their_picker_seeds() {
         .expect("fixture");
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
@@ -36929,7 +37207,8 @@ fn the_theme_picker_footer_opens_the_folder_and_imports_through_the_host() {
         theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
     let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(320.0, 568.0));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         let picker = state.choice_picker.as_ref().unwrap();
@@ -36975,11 +37254,13 @@ fn every_theme_picker_page_paints_whole_at_scale(scale: f32) {
         let (mut runtime, instance, view) = theme_picker_runtime(Arc::clone(&themes));
         let cx = view_cx_at(width, height);
         let _ = compile_settings_view(&runtime, instance, view, &cx);
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.last_focus = None;
         let mut first = 0;
+        drop(route_native_guard);
         for page in 0..64 {
             open_theme_picker(&runtime, view).offset.set(first);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
@@ -37008,7 +37289,8 @@ fn theme_pair_runtime(
 ) {
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         **state = settings_state_with_themes(source, crate::app_config::ThemeCatalog::empty());
@@ -37215,13 +37497,15 @@ fn follow_system_off_then_on_gives_the_pair_back() {
         let mut service = VersionedConfigService::new(format!("theme = \"{pair}\"\n")).unwrap();
         let (mut runtime, instance, view) = setup();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             **state = SettingsViewState::from_snapshot(&service.snapshot()).expect("snapshot");
         }
         let motion = |runtime: &mut NativeRuntime| {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.presented_motion.set(crate::native_app::ViewMotionCx {
@@ -37575,7 +37859,9 @@ fn appearance_theme_pickers_share_one_choice_column() {
                 let cx = view_cx_at(width, height);
                 let (mut runtime, instance, view) = theme_pair_runtime(source, true);
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.navigate(SettingsRoute::Appearance);
@@ -37787,7 +38073,8 @@ fn controls_records_find_the_theme_in_every_mode() {
             let context = format!("{source:?} {route:?}");
             let (mut runtime, instance, view) = theme_pair_runtime(source, true);
             {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(route);
@@ -37830,7 +38117,8 @@ fn controls_records_find_the_theme_in_every_mode() {
     let (mut runtime, instance, view) =
         theme_pair_runtime("theme = \"dark:Nord,light:Solarized Light\"\n", true);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Sound);
@@ -38408,7 +38696,8 @@ fn theme_route_nodes(
 ) -> std::collections::BTreeMap<String, crate::native_ui::SemanticNode> {
     let (mut runtime, instance, view) = theme_pair_runtime(source, true);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(route);
@@ -38847,7 +39136,8 @@ fn pickers_at(
     pickers.push(("yours", runtime, instance, view));
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(SettingsRoute::TextFonts);
@@ -38861,7 +39151,8 @@ fn pickers_at(
     );
     pickers.push(("fonts", runtime, instance, view));
     for (_, runtime, _, view) in &mut pickers {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(*view) else {
+        let mut route_native_guard = runtime.view_state_mut(*view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.last_focus = None;
@@ -39011,7 +39302,8 @@ fn a_short_picker_host_shows_a_whole_row_under_its_caption() {
         for host in ["home", "appearance"] {
             let (mut runtime, instance, view) = theme_pair_runtime("theme = \"Nord\"\n", true);
             if host == "appearance" {
-                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                let mut route_native_guard = runtime.view_state_mut(view);
+                let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                     unreachable!();
                 };
                 state.navigate(SettingsRoute::Appearance);
@@ -39108,7 +39400,8 @@ fn the_theme_picker_heads_its_sections_in_the_list() {
     let (mut runtime, instance, view) = full_theme_picker_at(&cx);
     let mut headings = Vec::new();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.last_focus = None;
@@ -39259,7 +39552,9 @@ fn every_picker_host_leaves_the_theme_picker_a_heading_over_two_rows() {
                 let context = format!("{size} {host} {action}");
                 let (mut runtime, instance, view) = theme_pair_runtime(source, true);
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     match host {
@@ -39334,7 +39629,8 @@ fn a_theme_picker_list_never_ends_on_a_bare_heading() {
         let cx = view_cx_at(width, height);
         let (mut runtime, instance, view) = full_theme_picker_at(&cx);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.common.last_focus = None;
@@ -39382,7 +39678,8 @@ fn a_theme_picker_scrolled_into_a_section_names_it() {
         let cx = view_cx_at(width, height);
         let (mut runtime, instance, view) = full_theme_picker_at(&cx);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.common.last_focus = None;
@@ -39956,7 +40253,8 @@ fn an_askpass_off_switch_press_records_its_direction_for_the_park() {
     };
     let (mut runtime, instance, view) = setup();
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Security);
@@ -39964,7 +40262,8 @@ fn an_askpass_off_switch_press_records_its_direction_for_the_park() {
     }
     press(&mut runtime, instance, view, MACOS_ACCESS_ASKPASS_OFF);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(
@@ -39976,7 +40275,8 @@ fn an_askpass_off_switch_press_records_its_direction_for_the_park() {
     }
     press(&mut runtime, instance, view, MACOS_ACCESS_ASKPASS_ON);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         assert_eq!(
@@ -39989,11 +40289,13 @@ fn an_askpass_off_switch_press_records_its_direction_for_the_park() {
 #[test]
 fn askpass_settings_waits_for_marker_publication_before_reporting_success() {
     let (mut runtime, instance, view) = setup();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     state.navigate(SettingsRoute::Security);
     state.arm_consent_gestures(ConsentGestures::confirming());
+    drop(route_native_guard);
     runtime
         .dispatch(
             instance,
@@ -40004,7 +40306,8 @@ fn askpass_settings_waits_for_marker_publication_before_reporting_success() {
             }),
         )
         .unwrap();
-    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(
@@ -40059,14 +40362,17 @@ fn askpass_settings_one_owner_answer_is_not_replaced_by_a_queued_direction() {
             )
             .unwrap();
     }
-    let Some(AppViewState::Settings(first)) = runtime.view_state_mut(ids[0]) else {
+    let mut route_native_guard = runtime.view_state_mut(ids[0]);
+    let Some(AppViewState::Settings(first)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(
         first.take_askpass_off_request().map(|(off, _)| off),
         Some(true)
     );
-    let Some(AppViewState::Settings(second)) = runtime.view_state_mut(ids[1]) else {
+    drop(route_native_guard);
+    let mut route_native_guard = runtime.view_state_mut(ids[1]);
+    let Some(AppViewState::Settings(second)) = route_native_guard.as_deref_mut() else {
         unreachable!();
     };
     assert_eq!(
@@ -40203,7 +40509,8 @@ fn an_outside_change_takes_the_preview_from_the_chosen_style() {
         compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
         let off = UiKey::new(cursor_style_row_key("off"));
         if pointer {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!();
             };
             state.common.hovered = Some(off.clone());
@@ -40337,7 +40644,8 @@ fn a_tried_style_says_it_is_not_saved() {
     assert!(spec.style_trial.is_none(), "the saved row is no trial");
     assert!(!spec.semantic_value().contains("not saved"));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = Some(dog);
@@ -40380,7 +40688,8 @@ fn a_tried_styles_hint_says_what_its_gesture_does() {
             .join(" | ")
     };
     let set = |runtime: &mut NativeRuntime, hovered: Option<&UiKey>, focus: Option<UiKey>| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = hovered.cloned();
@@ -40479,7 +40788,8 @@ fn a_kept_style_says_it_is_tried_after_the_adjust_card_had_the_keyboard() {
             .join(" | ")
     };
     let set = |runtime: &mut NativeRuntime, hovered: Option<&UiKey>, focus: &UiKey| {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = hovered.cloned();
@@ -40560,7 +40870,8 @@ fn a_hover_goes_with_its_page() {
     compile_settings_view(&runtime, instance, view, &view_cx_at(1_024.0, 768.0));
     let underline = UiKey::new(cursor_style_row_key("comet"));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.common.hovered = Some(underline);
@@ -40571,7 +40882,8 @@ fn a_hover_goes_with_its_page() {
         "CONTROL: the hovered row is tried"
     );
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.navigate(SettingsRoute::Home);
@@ -40683,7 +40995,8 @@ fn the_cursor_motion_style_row_says_changed_and_resets() {
     {
         let service =
             VersionedConfigService::new("cursor_trail_style = \"comet\"\n".to_string()).unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         **state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
@@ -41443,7 +41756,8 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
             .dispatch(instance, view, AppEvent::ConfigChanged(service.snapshot()))
             .unwrap();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             assert_eq!(
@@ -41523,12 +41837,14 @@ fn session_controls_save_reset_and_disclose_observed_runtime() {
             runtime
                 .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
                 .unwrap();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.search.clear();
             state.navigate(SettingsRoute::Modified);
             assert_eq!(state.raw_value(key).is_some(), authored.is_some());
+            drop(route_native_guard);
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             assert_eq!(
                 compiled
@@ -41843,7 +42159,8 @@ fn the_compact_toolbar_names_the_page_where_it_holds_the_title() {
     let (mut runtime, instance, view) = setup();
     go_to_route(&mut runtime, instance, view, SettingsRoute::Appearance);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.compact_navigation = true;
@@ -41860,7 +42177,8 @@ fn the_compact_toolbar_names_the_page_where_it_holds_the_title() {
     );
     assert!(headings[0].2.bottom() <= toolbar_of(&sheet).bottom() + 0.5);
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!();
         };
         state.compact_navigation = false;
@@ -42658,7 +42976,9 @@ fn the_last_screen_draws_no_band_over_its_rows() {
                 let (mut runtime, instance, view) = setup();
                 assert!(runtime.replace_settings_packages(packages_state_with_activity(20), 2));
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.navigate(route);
@@ -42672,7 +42992,9 @@ fn the_last_screen_draws_no_band_over_its_rows() {
                     continue;
                 }
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.scroll_page_to(limit);
@@ -42832,10 +43154,12 @@ fn the_last_screen_draws_no_band_over_its_rows() {
 fn no_page_moves_the_rails_rows() {
     let compile = |route: SettingsRoute, cx: &ViewCx<'_>| {
         let (mut runtime, instance, view) = setup();
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.navigate(route);
+        drop(route_native_guard);
         compile_settings_view(&runtime, instance, view, cx)
     };
     let mut faults = Vec::new();

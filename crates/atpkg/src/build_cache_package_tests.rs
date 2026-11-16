@@ -407,6 +407,40 @@ fn a_creation_rechecks_the_coordinator_and_a_late_preservation_marker_before_adm
     }
 }
 
+/// A PACKAGE TARGET'S OWNER IS THE ROOT TARGO FINDS FOR ITS MANIFEST, OR IT IS NOT ADMITTED.
+/// A member's owner is the workspace above it; a package in a `target/package` folder is its
+/// own root, as Targo's root walk stops there, whatever the manifest above it holds; a manifest
+/// on that walk that cannot be read (no UTF-8) tells no owner, and the package is refused with
+/// nothing recorded. NEGATIVE CONTROL: before, the owner walk read past `target/package`, so a
+/// package there under an unreadable manifest was refused; read leniently, the unreadable root
+/// would make the member its own owner.
+#[test]
+fn a_package_targets_owner_is_the_root_targo_finds_or_it_is_refused() {
+    let layout = |manifest: &str, above: &[u8]| {
+        let mut world = World::new();
+        let root = world.home.join("ws");
+        std::fs::create_dir_all(root.join(manifest)).unwrap();
+        std::fs::write(root.join("Cargo.toml"), above).unwrap();
+        world.manifest = root.join(manifest).join("Cargo.toml");
+        std::fs::write(&world.manifest, "[package]\nname = \"m\"\n").unwrap();
+        (world, root)
+    };
+    let members = b"[workspace]\nmembers = [\"m\"]\n";
+    let (world, root) = layout("m", members);
+    world.admit(FIRST, 1).unwrap();
+    assert_eq!(world.receipt().owners, [root]);
+    let unreadable = [&members[..], b"# \xff\n"].concat();
+    let (world, root) = layout("target/package/q", &unreadable);
+    world.admit(FIRST, 1).unwrap();
+    assert_eq!(world.receipt().owners, [root.join("target/package/q")]);
+    let (world, _) = layout("m", &unreadable);
+    assert_eq!(
+        world.admit(FIRST, 1).unwrap_err(),
+        "package workspace cannot be established"
+    );
+    assert!(super::super::read(&world.path()).is_none());
+}
+
 #[test]
 fn ordinary_clearance_keeps_the_whole_package_coordinator_for_v2_and_legacy_custody() {
     let world = World::new();
@@ -2257,4 +2291,23 @@ fn a_package_declaration_from_an_earlier_boot_binds_by_volume_uuid_and_another_v
         );
         assert!(world.target.join("debug/deps/unit").is_file(), "{which}");
     }
+}
+
+/// A package producer refused its cache's registration gate is told why, as a build's producer
+/// is: here the gate's holder on record, this process.
+#[test]
+fn a_package_producer_refused_its_gate_is_told_its_holder() {
+    let world = World::new();
+    super::super::index(&world.home).unwrap();
+    let gate = super::super::gate_path(&world.path()).unwrap();
+    let held = super::super::gate::try_exclusive(super::super::open_gate(&gate).unwrap()).unwrap();
+    let refused = world.admit(FIRST, 1).unwrap_err();
+    assert!(
+        refused.contains(&format!(
+            "held by this process (pid {})",
+            std::process::id()
+        )),
+        "{refused}"
+    );
+    drop(held);
 }

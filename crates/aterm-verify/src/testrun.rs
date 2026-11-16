@@ -23,8 +23,15 @@ use aterm_capacity::Machine as _;
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
 /// How long a binary the live-rate backstop holds back waits before it looks again, unless a
-/// binary ends first: the stage meter's read cadence, which moves the rate.
+/// binary ends first: the stage meter's read cadence, which moves the rate. A dispatch looks
+/// once per this interval however many workers it has ([`Dispatcher::look_due`]).
 const LOOK_AGAIN: Duration = exec::READ_USAGE_EVERY;
+
+/// How long after a look that met another admission's hold of the ledger's lock the dispatch
+/// looks again ([`AdmissionPass::again`]): short, so a binary that fits is not held back for a
+/// whole [`LOOK_AGAIN`] behind a peer whose looks keep taking the lock, and bounded, so a lock
+/// held for long costs one look of a few touches of the ledger per pause and no more.
+const LOCK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Environment variable naming the shared subprocess slot directory created by [`run_tests`].
 pub const SUBPROCESS_SLOTS_ENV: &str = "ATERM_TEST_SUBPROCESS_SLOTS";
@@ -888,7 +895,7 @@ where
 }
 
 /// [`dispatch_pooled`] inside a run (`ctx`), whose binaries each claim their memory and cores
-/// as they start ([`binary_permit_noting`]), and, where the run has one, on its live share
+/// as they start ([`binary_permit_in`]), and, where the run has one, on its live share
 /// (`share`, [`crate::test_share`]): a binary the plan's share admits beside others starts only
 /// while the share as it is at that look covers it too, and waits as one the dispatcher's own
 /// rule held back does. One with none beside it asks its claim alone.
@@ -935,6 +942,9 @@ where
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
+                // A worker that panics halts the dispatch through its `Charged`, which clears
+                // nothing: its retained request leaves the queue here, after that halt.
+                let _clear_on_panic = ClearOnPanic(&waiters);
                 let _metering = crate::memory::metering(meter.clone());
                 let _covering = crate::memory::covering(cover.clone());
                 let _reservation = crate::holding_resource_claim(reservation.clone());
@@ -949,8 +959,10 @@ where
                                 waiters.clear();
                             }
                         },
-                        &mut |generation, b, held| {
+                        &mut |look, b, held| {
                             if let Some(share) = share {
+                                // One stamp places the dispatch for cores and for memory.
+                                share.placed(waiters.place_ms());
                                 let rate = live();
                                 let (refused, moved) =
                                     share.refuses(b.charge, held, rate, Instant::now());
@@ -958,26 +970,41 @@ where
                                     emit(ctx, &share_event(share.asked(), &moved));
                                 }
                                 if let Some(refused) = refused {
-                                    waits.change(
+                                    waits.waits(
                                         b.index,
-                                        Some(test_waits::Reason::share(b, held, rate, refused)),
+                                        test_waits::Wait::For(test_waits::Reason::share(
+                                            b, held, rate, refused,
+                                        )),
                                     );
                                     return None;
                                 }
                             }
-                            let (permit, reason) = binary_permit_observed(
+                            let (permit, wait) = binary_permit_observed(
                                 ctx,
                                 pool,
                                 b,
                                 &waiters,
                                 &|| held == 0 && idle(),
-                                Some((&probes, generation)),
+                                Some((&probes, look)),
                             );
-                            waits.change(b.index, reason);
+                            if permit.is_some() {
+                                waits.started(b.index);
+                            } else if let Some(wait) = wait {
+                                waits.waits(b.index, wait);
+                            }
                             permit
                         },
                         &mut |b, resources| {
-                            waits.change(b.index, Some(test_waits::Reason::local(b, resources)))
+                            waits.waits(
+                                b.index,
+                                test_waits::Wait::For(test_waits::Reason::local(b, resources)),
+                            );
+                        },
+                        &|look| {
+                            probes
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .again(look)
                         },
                     );
                     let Some((planned, permit)) = next else {
@@ -1044,6 +1071,27 @@ where
                         let answered = refused.or_else(|| run_one(binary, &b, &halt));
                         drop(_binary_cover);
                         drop(_binary_reservation);
+                        // THE PLACE IS HANDED ON BEFORE THE LAST CLAIM GOES ([`BinaryWaiters`]):
+                        // where no other binary of the dispatch holds one, the next queued
+                        // binary's request is entered at the dispatch's place while this
+                        // binary's claim still stands at it, under the dispatcher's mutex, so no
+                        // look of another process finds the dispatch gone from the queue.
+                        if let Some(ctx) =
+                            ctx.filter(|ctx| ctx.memory.is_some() && !overriding(ctx))
+                            && permit.as_ref().is_some_and(|p| p.claim.is_some())
+                        {
+                            let stopping = stop() || exec::ending();
+                            let d = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            waiters.hand_over(
+                                &d,
+                                b.index,
+                                stopping,
+                                &|next| binary_need(ctx, pool.is_some(), next),
+                                &aterm_capacity::Live,
+                                enter_on_the_ledger,
+                            );
+                            drop(d);
+                        }
                         drop(permit);
                         // For the record of the pool's next count that is not whole.
                         if let (Some(pool), Some(run)) = (pool, answered.as_ref()) {
@@ -1075,7 +1123,14 @@ where
                     if let Some(pool) = pool {
                         let none_runs =
                             state.lock().unwrap_or_else(PoisonError::into_inner).held() == 0;
-                        count_at_reap(pool, &|| none_runs && idle());
+                        if count_at_reap(pool, &|| none_runs && idle()) {
+                            // Tokens put back change no generation: the next look is due now.
+                            state
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .look_now();
+                            turn.notify_all();
+                        }
                     }
                 }
             });
@@ -1091,12 +1146,17 @@ where
 /// `quiet` says nothing of the run is left running (asked again under the count's locks,
 /// [`aterm_capacity::Jobserver::count_alone`]): a loss is written back and recorded with the
 /// clients noted since the last whole count, and each whole count closes that window, so a
-/// later record names only the clients reaped after it.
-pub(crate) fn count_at_reap(pool: &aterm_capacity::Jobserver, quiet: &dyn Fn() -> bool) {
-    if quiet()
-        && let Err(why) = pool.count_alone(quiet)
-    {
-        eprintln!("verify: the release's pool was not counted: {why}");
+/// later record names only the clients reaped after it. Whether it put tokens back.
+pub(crate) fn count_at_reap(pool: &aterm_capacity::Jobserver, quiet: &dyn Fn() -> bool) -> bool {
+    if !quiet() {
+        return false;
+    }
+    match pool.count_alone(quiet) {
+        Ok(count) => count.reminted() > 0,
+        Err(why) => {
+            eprintln!("verify: the release's pool was not counted: {why}");
+            false
+        }
     }
 }
 
@@ -1148,22 +1208,221 @@ impl BinaryPermit<'_> {
     }
 }
 
-/// Keep one stable admission request while trying the dispatch's other safe envelopes.
-/// One-shot attempts alone lose every queue position on a shortfall. Retaining the whole
-/// plan would reserve every unstarted binary against later work instead of one next turn.
+/// THE DISPATCH'S PLACE IN THE MEMORY QUEUE, FROM ITS FIRST BINARY TO ITS LAST.
+///
+/// A dispatch asks the ledger for one claim per binary, and the ledger serves memory first in,
+/// first out by when each record was laid. Laid at now, each binary's request went behind
+/// every claim any process had laid meanwhile, and a claim that does not fit beside what is
+/// ahead spares nothing while it waits and is admitted alone once clear: a dispatch paid one
+/// whole trip through the queue per binary, and while other sessions kept laying large claims
+/// it did not finish (measured 2026-11-14: five of 298 binaries started in 2 h 40 m).
+///
+/// So the dispatch keeps ONE PLACE ([`aterm_capacity::admit::Place`]): the order stamp of the
+/// first request it entered. Every request it enters after that is laid at that place
+/// ([`aterm_capacity::admit::Waiter::enter_at`]): the retained one, which is polled fresh at
+/// every look and keeps its record, its claim file and its wait mark until it is admitted or
+/// cleared; and the one-shot attempts for the other binaries its share allows, which leave the
+/// queue on a shortfall and so reserve nothing lasting, but are judged ahead of the large
+/// waiters laid since the place rather than last behind them. And the place is HANDED ON
+/// WITHOUT A GAP: while a binary of the dispatch holds its claim the place stands on that
+/// claim, and before the last such claim is released the request of the next queued binary is
+/// entered at the place and retained ([`Self::hand_over`]), its index chosen under the
+/// dispatcher's mutex among the binaries still queued whose need can ever fit
+/// ([`aterm_capacity::admit::never`]). A place is good only while a record at it stands, so the
+/// dispatch cannot take one it has left: a gap sends its next request to the back, as before.
+///
+/// Only the LAST claim hands on, so that the request it enters is one the next pass polls: with
+/// no binary of the dispatch running, neither the dispatcher's rule nor the live share refuses
+/// the head of the plan. Entered while other binaries still ran, a request could stand
+/// unpolled for as long as they did (a binary that runs alone, put off until the rest have
+/// ended, would hold every later claim back meanwhile, one that fits among them; and its wait
+/// mark, never rewritten, would read to other waiters as work that waits, hiding a stalled
+/// binary from them).
+///
+/// This reverses what this type's first comment refused. It still retains one request, never
+/// the plan, so one binary's memory is all it reserves; but that one record now holds the head
+/// of the queue against later claims for the plan's length. THE COST: a claim laid after the
+/// dispatch's first request that cannot fit beside it waits for the dispatch's whole remaining
+/// run, not for one binary (and so does what queues behind that claim). It is bounded by the
+/// dispatches ahead: a claim laid before the dispatch's first request stays ahead of every
+/// binary, and a dispatch that enters after a large waiter stays behind it.
+///
+/// NO ORPHAN AT THE HEAD. A retained request is always one a pass can poll: its binary is
+/// queued (a binary started another way gives it up, [`Self::forget`], and a hand-over drops
+/// one whose binary is no longer queued), a halt or a stop clears it ([`Self::clear`], and a
+/// worker's panic does, [`ClearOnPanic`]) and a hand-over enters nothing once either holds,
+/// and with none of the dispatch's binaries running neither the dispatcher's rule nor the
+/// live share refuses the head.
 #[derive(Default)]
 struct BinaryWaiters {
-    pending: Mutex<Option<(usize, aterm_capacity::admit::Waiter)>>,
+    state: Mutex<Standing>,
+}
+
+/// Clears a dispatch's retained request when its worker unwinds ([`BinaryWaiters::clear`]).
+struct ClearOnPanic<'a>(&'a BinaryWaiters);
+
+impl Drop for ClearOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.clear();
+        }
+    }
+}
+
+/// What a dispatch has standing in the ledger's queue.
+#[derive(Default)]
+struct Standing {
+    /// The one retained request: a queued binary's index and its waiter.
+    pending: Option<(usize, aterm_capacity::admit::Waiter)>,
+    /// The dispatch's place: its first request's, kept by every later one while a record of
+    /// the dispatch stands at it.
+    place: Option<aterm_capacity::admit::Place>,
+    /// The binaries whose claim has reached its hand-over ([`BinaryWaiters::hand_over`]): each
+    /// is about to release it, so it no longer keeps the place for the others, though the
+    /// dispatcher counts it running until its charge is returned.
+    released: std::collections::BTreeSet<usize>,
+}
+
+impl Standing {
+    /// `waiter` was just entered or is the retained one: its place is the dispatch's from now
+    /// on where the dispatch has none that stands (its first request, or the first after it
+    /// left the queue). A place that still stands is kept: every entry was made at it.
+    fn adopt(&mut self, waiter: &aterm_capacity::admit::Waiter) {
+        if self
+            .place
+            .as_ref()
+            .and_then(aterm_capacity::admit::Place::standing_ms)
+            .is_none()
+        {
+            self.place = Some(waiter.place());
+        }
+    }
 }
 
 impl BinaryWaiters {
     fn clear(&self) {
         let pending = self
-            .pending
+            .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .pending
             .take();
         drop(pending);
+    }
+
+    /// The dispatch's place while it stands, unix ms: the stamp the run's live share places the
+    /// dispatch by too ([`crate::test_share::Live::placed`]). `None` before its first request
+    /// and once no record of it stands.
+    fn place_ms(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .place
+            .as_ref()
+            .and_then(aterm_capacity::admit::Place::standing_ms)
+    }
+
+    /// Binary `index` started without its retained request (an overriding admission): the
+    /// request leaves the queue, so none stands for a binary that will never poll it.
+    fn forget(&self, index: usize) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|(queued, _)| *queued == index)
+        {
+            state.pending = None;
+        }
+    }
+
+    /// BEFORE BINARY `finishing`'S CLAIM IS RELEASED, with the dispatcher's mutex held (`d` is
+    /// read under it): where it is the last claim the dispatch holds and no request stands,
+    /// enter the next queued binary's at the dispatch's place and retain it, so the queue holds
+    /// a record of the dispatch at its place at every instant from its first entry to its last
+    /// binary's admission. While another running binary has still to reach its own hand-over,
+    /// its claim keeps the place and nothing is entered. The next binary is the first of the
+    /// plan's order still queued whose need (`need_of`) can ever fit on `machine`; the next
+    /// pass polls it as it polls any retained request. Once the dispatch has halted or is
+    /// `stopping` nothing is entered and a retained request is dropped, as [`Self::clear`]
+    /// does. Nothing is entered where the dispatch has no place yet. A failed entry leaves
+    /// none: the next pass enters as it did before, at now.
+    fn hand_over(
+        &self,
+        d: &Dispatcher,
+        finishing: usize,
+        stopping: bool,
+        need_of: &dyn Fn(&Planned) -> aterm_capacity::Need,
+        machine: &dyn aterm_capacity::Machine,
+        enter: impl FnOnce(
+            aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
+        ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.released.insert(finishing);
+        if stopping || d.halted() {
+            state.pending = None;
+            return;
+        }
+        // A request retained for a binary that is no longer queued would never be polled.
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|(queued, _)| d.phase(*queued) != Some(test_plan::Phase::Queued))
+        {
+            state.pending = None;
+        }
+        // Another binary's claim still stands at the place: it hands on, or one after it.
+        if d.running().any(|index| !state.released.contains(&index)) {
+            return;
+        }
+        let reading = machine.read(None);
+        let next = d
+            .queued()
+            .map(|b| (b.index, need_of(b)))
+            .find(|(_, need)| aterm_capacity::admit::never(need, &reading).is_none());
+        if let Some((index, need)) = next {
+            Self::stand(&mut state, index, need, enter);
+        }
+    }
+
+    /// [`Self::hand_over`] for a claim given back inside a pass, before its binary started (the
+    /// release's pool had no tokens for it): `index` is that binary, still queued, and the
+    /// dispatcher's mutex is the pass's own.
+    fn hand_back(
+        &self,
+        index: usize,
+        need: aterm_capacity::Need,
+        enter: impl FnOnce(
+            aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
+        ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::stand(&mut state, index, need, enter);
+    }
+
+    /// Enter `need` for binary `index` at the dispatch's place and retain it, where no request
+    /// is retained and the dispatch has a place.
+    fn stand(
+        state: &mut Standing,
+        index: usize,
+        need: aterm_capacity::Need,
+        enter: impl FnOnce(
+            aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
+        ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+    ) {
+        if state.pending.is_some() {
+            return;
+        }
+        let Some(place) = state.place.clone() else {
+            return;
+        };
+        if let Ok(waiter) = enter(need, Some(&place)) {
+            state.adopt(&waiter);
+            state.pending = Some((index, waiter));
+        }
     }
 
     #[cfg(test)]
@@ -1174,11 +1433,19 @@ impl BinaryWaiters {
         machine: &dyn aterm_capacity::Machine,
         enter: impl FnOnce(
             aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
         ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
-        self.poll_noting(index, need, machine, enter, &mut |_| None, &mut None)
+        self.poll_noting(index, need, machine, enter, &mut |_, _| None, &mut None)
     }
 
+    /// One look for binary `index`'s `need`. The retained request is polled as it stands; any
+    /// other binary's is entered at the dispatch's place (`enter` is handed it; `None` for the
+    /// dispatch's first request, which is laid at now and mints the place), polled once, and
+    /// retained where it waits and none is, else dropped. While another binary's request is
+    /// retained, `rejection` may answer for this one from a shared observation, judged at the
+    /// same place, without entering it: a rejection, or the ledger's lock met by that look
+    /// ([`aterm_capacity::admit::ProbeRejection::Turn`]), which decides nothing.
     fn poll_noting(
         &self,
         index: usize,
@@ -1186,45 +1453,58 @@ impl BinaryWaiters {
         machine: &dyn aterm_capacity::Machine,
         enter: impl FnOnce(
             aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
         ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
         rejection: &mut impl FnMut(
             &aterm_capacity::Need,
+            Option<&aterm_capacity::admit::Place>,
         ) -> Option<aterm_capacity::admit::ProbeRejection>,
-        waiting: &mut Option<test_waits::Reason>,
+        waiting: &mut Option<test_waits::Wait>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
-        use aterm_capacity::admit::Polled;
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        use aterm_capacity::admit::{Polled, ProbeRejection};
+        use test_waits::{Reason, Wait};
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let place = state.place.clone();
         // A retained waiter keeps its queue position and always polls fresh. Only temporary
         // alternative envelopes may be rejected by the bounded shared observation.
-        if pending.as_ref().is_some_and(|(queued, _)| *queued != index)
-            && let Some(rejection) = rejection(&need)
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|(queued, _)| *queued != index)
+            && let Some(rejection) = rejection(&need, place.as_ref())
         {
             *waiting = Some(match rejection {
-                aterm_capacity::admit::ProbeRejection::Waiting(short) => {
-                    test_waits::Reason::ledger(&short)
-                }
-                aterm_capacity::admit::ProbeRejection::Unreachable(why) => {
-                    test_waits::Reason::unreachable(why)
-                }
+                ProbeRejection::Waiting(short) => Wait::ledger(&short),
+                ProbeRejection::Unreachable(why) => Wait::For(Reason::unreachable(why)),
+                ProbeRejection::Turn(holder) => Wait::Unread(holder),
             });
             return Ok(None);
         }
         if let Some(why) = aterm_capacity::admit::never(&need, &machine.read(need.path.as_deref()))
         {
-            *waiting = Some(test_waits::Reason::unreachable(why));
+            *waiting = Some(Wait::For(Reason::unreachable(why)));
             return Ok(None);
         }
-        let waiter = if pending.as_ref().is_some_and(|(queued, _)| *queued == index) {
-            pending.take().expect("the queued request was present").1
+        let waiter = if state
+            .pending
+            .as_ref()
+            .is_some_and(|(queued, _)| *queued == index)
+        {
+            state
+                .pending
+                .take()
+                .expect("the queued request was present")
+                .1
         } else {
-            enter(need)?
+            enter(need, place.as_ref())?
         };
+        state.adopt(&waiter);
         match waiter.poll(machine) {
             Polled::Admitted(claim) => Ok(Some(claim)),
             Polled::Waiting(waiter, short) => {
-                *waiting = Some(test_waits::Reason::ledger(&short));
-                if pending.is_none() {
-                    *pending = Some((index, waiter));
+                *waiting = Some(Wait::ledger(&short));
+                if state.pending.is_none() {
+                    state.pending = Some((index, waiter));
                 }
                 Ok(None)
             }
@@ -1234,55 +1514,140 @@ impl BinaryWaiters {
     }
 }
 
-/// Background cancellation must cover the intervals with no admitted binary too. This guard
-/// reserves neither memory nor CPU; per-binary custody alone owns those resources.
-fn dispatch_lifetime(
-    ctx: &crate::Ctx,
-    admit: crate::Admitter,
-) -> Result<Option<aterm_capacity::Claim>, String> {
-    if !ctx.background || ctx.memory.is_none() {
-        return Ok(None);
-    }
-    admit(
-        aterm_capacity::Need::new("verify test dispatch lifetime"),
-        aterm_capacity::Admit::Preemptible,
+/// Enter `need` in the user's ledger on this machine, at `place` where the dispatch has one.
+fn enter_on_the_ledger(
+    need: aterm_capacity::Need,
+    place: Option<&aterm_capacity::admit::Place>,
+) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error> {
+    enter_in(
+        aterm_capacity::Ledger::user().as_ref(),
+        &aterm_capacity::Live,
+        need,
+        place,
     )
-    .map(Some)
-    .map_err(|why| format!("test dispatch lifetime admission refused: {why}"))
 }
 
+/// Enter `need` in `ledger` (`None`: there is no home to keep one under) read on `machine`, at
+/// `place` where the dispatch has one.
+fn enter_in(
+    ledger: Option<&aterm_capacity::Ledger>,
+    machine: &dyn aterm_capacity::Machine,
+    need: aterm_capacity::Need,
+    place: Option<&aterm_capacity::admit::Place>,
+) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error> {
+    let ledger = ledger.ok_or_else(|| {
+        aterm_capacity::Error::Ledger(std::io::Error::other(
+            "no home directory for binary memory admission",
+        ))
+    })?;
+    match place {
+        Some(place) => aterm_capacity::admit::Waiter::enter_at(ledger, machine, need, place),
+        None => aterm_capacity::admit::Waiter::enter(ledger, machine, need),
+    }
+    .map_err(aterm_capacity::Error::Ledger)
+}
+
+/// WHAT A DISPATCH'S LOOKS SHARE OF THE LEDGER, one look at a time (looks are paced per
+/// dispatch, [`Dispatcher::look_due`], and each holds the dispatcher's mutex for its pass).
+///
+/// The shared observation ([`aterm_capacity::admit::ResourceProbe`]), which rejects the
+/// envelopes of binaries other than the retained one without entering them, kept within one
+/// generation for at most its age. THE LEDGER'S LOCK, where a try of it met another admission's
+/// hold during a look (the observation's own try, the retained request's poll, or a fresh
+/// entry's): that is the look's answer for every envelope the observation does not reject, so
+/// a look over N binaries touches the ledger a constant number of times, and the next look is
+/// due after [`LOCK_AGAIN`]. And the user's ledger, resolved once per look.
 #[derive(Default)]
 struct AdmissionPass {
     generation: Option<u64>,
     sampled: Option<Instant>,
     probe: Option<aterm_capacity::admit::ResourceProbe>,
+    /// The look that met another admission's hold of the ledger's lock, and that holder.
+    turn: Option<(u64, Option<u32>)>,
+    /// The ledger the look of that number resolved ([`Self::ledger`]).
+    ledger: Option<(u64, Option<aterm_capacity::Ledger>)>,
 }
 
 impl AdmissionPass {
+    /// What the shared observation says of `need`, entered at `place`, during `look`: a
+    /// rejection; the ledger's lock, where the look met it; or `None`, where the need takes a
+    /// fresh admission. An observation of another generation answers nothing, a look that met
+    /// the lock included; one is taken where the look has none of its generation younger than
+    /// its age, and not again in a look that met the lock.
     fn rejection(
         &mut self,
-        generation: u64,
+        look: test_plan::Look,
         ledger: &aterm_capacity::Ledger,
         machine: &dyn aterm_capacity::Machine,
         need: &aterm_capacity::Need,
+        place: Option<&aterm_capacity::admit::Place>,
         clock: &dyn Fn() -> Instant,
     ) -> Option<aterm_capacity::admit::ProbeRejection> {
+        use aterm_capacity::admit::{Capture, ProbeRejection, ResourceProbe};
         let at = clock();
-        if self.generation != Some(generation)
-            || self.sampled.is_none_or(|sampled| {
+        if self.generation != Some(look.generation) {
+            self.generation = Some(look.generation);
+            self.sampled = None;
+            self.probe = None;
+        }
+        if self.met(look).is_none()
+            && self.sampled.is_none_or(|sampled| {
                 at.saturating_duration_since(sampled)
                     >= aterm_capacity::admit::RESOURCE_PROBE_MAX_AGE
             })
         {
-            self.generation = Some(generation);
             self.sampled = Some(at);
-            self.probe = aterm_capacity::admit::ResourceProbe::capture_at(ledger, machine, at)
-                .ok()
-                .flatten();
+            self.probe = match ResourceProbe::capture_at(ledger, machine, at) {
+                Ok(Capture::Observed(probe)) => Some(probe),
+                Ok(Capture::Turn(holder)) => {
+                    // Nothing was read: the next look tries again, whatever its age.
+                    self.sampled = None;
+                    self.met_turn(look, holder);
+                    None
+                }
+                Ok(Capture::Unsupported) | Err(_) => None,
+            };
         }
-        self.probe
+        if let Some(rejection) = self
+            .probe
             .as_ref()
-            .and_then(|probe| probe.rejection_at(need, clock()))
+            .and_then(|probe| probe.rejection_placed(need, clock(), place))
+        {
+            return Some(rejection);
+        }
+        self.met(look).map(ProbeRejection::Turn)
+    }
+
+    /// The holder of the ledger's lock `look` met, where it met one.
+    fn met(&self, look: test_plan::Look) -> Option<Option<u32>> {
+        self.turn
+            .filter(|(seq, _)| *seq == look.seq)
+            .map(|(_, holder)| holder)
+    }
+
+    /// `look` met another admission's hold of the ledger's lock, by `holder`.
+    fn met_turn(&mut self, look: test_plan::Look, holder: Option<u32>) {
+        if self.met(look).is_none() {
+            self.turn = Some((look.seq, holder));
+        }
+    }
+
+    /// How long after `look`'s pass the next look at the same generation is due: [`LOCK_AGAIN`]
+    /// where it met the ledger's lock, else [`LOOK_AGAIN`].
+    fn again(&self, look: test_plan::Look) -> Duration {
+        if self.met(look).is_some() {
+            LOCK_AGAIN
+        } else {
+            LOOK_AGAIN
+        }
+    }
+
+    /// The user's ledger, resolved once in `look`.
+    fn ledger(&mut self, look: test_plan::Look) -> Option<aterm_capacity::Ledger> {
+        if self.ledger.as_ref().is_none_or(|(seq, _)| *seq != look.seq) {
+            self.ledger = Some((look.seq, aterm_capacity::Ledger::user()));
+        }
+        self.ledger.as_ref().and_then(|(_, ledger)| ledger.clone())
     }
 
     #[cfg(test)]
@@ -1294,7 +1659,8 @@ impl AdmissionPass {
         need: &aterm_capacity::Need,
         clock: &dyn Fn() -> Instant,
     ) -> bool {
-        self.rejection(generation, ledger, machine, need, clock)
+        let look = test_plan::Look { generation, seq: 0 };
+        self.rejection(look, ledger, machine, need, None, clock)
             .is_none()
     }
 
@@ -1305,74 +1671,134 @@ impl AdmissionPass {
     }
 }
 
+/// Where a dispatch's binaries ask for their claims: the ledger (the user's, resolved once per
+/// look; `None` with no home), the machine its looks read, and how a request is entered there.
+struct Asking<'l> {
+    ledger: Option<&'l aterm_capacity::Ledger>,
+    machine: &'l dyn aterm_capacity::Machine,
+    enter: &'l dyn Fn(
+        aterm_capacity::Need,
+        Option<&aterm_capacity::admit::Place>,
+    ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+}
+
+/// [`binary_permit_in`] in the user's ledger on this machine: during a dispatch's `look`, the
+/// ledger that look resolved.
 fn binary_permit_observed<'a>(
     ctx: Option<&crate::Ctx>,
     pool: Option<&'a aterm_capacity::Jobserver>,
     b: &Planned,
     waiters: &BinaryWaiters,
     alone: &dyn Fn() -> bool,
-    pass: Option<(&Mutex<AdmissionPass>, u64)>,
+    pass: Option<(&Mutex<AdmissionPass>, test_plan::Look)>,
 ) -> (
     Option<Result<BinaryPermit<'a>, std::io::Error>>,
-    Option<test_waits::Reason>,
+    Option<test_waits::Wait>,
+) {
+    let ledger = match pass {
+        Some((pass, look)) => pass
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ledger(look),
+        None => aterm_capacity::Ledger::user(),
+    };
+    let ledger = ledger.as_ref();
+    let enter = |need, place: Option<&aterm_capacity::admit::Place>| {
+        enter_in(ledger, &aterm_capacity::Live, need, place)
+    };
+    binary_permit_in(
+        ctx,
+        pool,
+        b,
+        waiters,
+        alone,
+        pass,
+        &Asking {
+            ledger,
+            machine: &aterm_capacity::Live,
+            enter: &enter,
+        },
+    )
+}
+
+/// One look's attempt to start binary `b`: its claim asked as [`binary_permit_returning`] asks
+/// it, through `waiters` (its retained request polled, any other entered at the dispatch's
+/// place) in `asking`'s ledger, with what the look's shared state answers for it
+/// ([`AdmissionPass`]). The permit where its resources were acquired, or refused; else what the
+/// look found. A look that met the ledger's lock tells `pass`, so it is the look's answer for
+/// the other binaries' envelopes.
+fn binary_permit_in<'a>(
+    ctx: Option<&crate::Ctx>,
+    pool: Option<&'a aterm_capacity::Jobserver>,
+    b: &Planned,
+    waiters: &BinaryWaiters,
+    alone: &dyn Fn() -> bool,
+    pass: Option<(&Mutex<AdmissionPass>, test_plan::Look)>,
+    asking: &Asking<'_>,
+) -> (
+    Option<Result<BinaryPermit<'a>, std::io::Error>>,
+    Option<test_waits::Wait>,
 ) {
     let mut global_wait = None;
     let mut core_wait = None;
-    let result = binary_permit_noting(
+    let result = binary_permit_returning(
         ctx,
         pool,
         b,
         &mut |need, mode| {
             if let Some(mode) = mode {
                 let result = crate::admit_live(need, mode).map(Some);
-                if matches!(&result, Ok(Some(_)))
-                    && let Some((pass, _)) = pass
-                {
-                    pass.lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .acquired();
+                if matches!(&result, Ok(Some(_))) {
+                    // It starts without a queued request: none stays behind for it.
+                    waiters.forget(b.index);
+                    if let Some((pass, _)) = pass {
+                        pass.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .acquired();
+                    }
                 }
                 return result;
             }
             let result = waiters.poll_noting(
                 b.index,
                 need,
-                &aterm_capacity::Live,
-                |need| {
-                    let ledger = aterm_capacity::Ledger::user().ok_or_else(|| {
-                        aterm_capacity::Error::Ledger(std::io::Error::other(
-                            "no home directory for binary memory admission",
-                        ))
-                    })?;
-                    aterm_capacity::admit::Waiter::enter(&ledger, &aterm_capacity::Live, need)
-                        .map_err(aterm_capacity::Error::Ledger)
-                },
-                &mut |need| {
-                    let (pass, generation) = pass?;
-                    let ledger = aterm_capacity::Ledger::user()?;
+                asking.machine,
+                asking.enter,
+                &mut |need, place| {
+                    let (pass, look) = pass?;
                     pass.lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .rejection(
-                            generation,
-                            &ledger,
-                            &aterm_capacity::Live,
+                            look,
+                            asking.ledger?,
+                            asking.machine,
                             need,
+                            place,
                             &Instant::now,
                         )
                 },
                 &mut global_wait,
             );
-            if matches!(&result, Ok(Some(_)))
-                && let Some((pass, _)) = pass
-            {
-                pass.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .acquired();
+            if let Some((pass, look)) = pass {
+                let mut pass = pass.lock().unwrap_or_else(PoisonError::into_inner);
+                match (&result, &global_wait) {
+                    (Ok(Some(_)), _) => pass.acquired(),
+                    (Ok(None), Some(test_waits::Wait::Unread(holder))) => {
+                        pass.met_turn(look, *holder);
+                    }
+                    _ => {}
+                }
             }
             result
         },
         alone,
         &mut core_wait,
+        // The claim goes back with its binary still queued: its request stands again first.
+        &mut || {
+            if let Some(ctx) = ctx.filter(|ctx| ctx.memory.is_some() && !overriding(ctx)) {
+                waiters.hand_back(b.index, binary_need(ctx, pool.is_some(), b), asking.enter);
+            }
+        },
     );
     (result, core_wait.or(global_wait))
 }
@@ -1390,6 +1816,7 @@ fn binary_permit_with<'a>(
     binary_permit_noting(ctx, pool, b, attempt, &|| false, &mut None)
 }
 
+#[cfg(test)]
 fn binary_permit_noting<'a>(
     ctx: Option<&crate::Ctx>,
     pool: Option<&'a aterm_capacity::Jobserver>,
@@ -1399,30 +1826,62 @@ fn binary_permit_noting<'a>(
         Option<aterm_capacity::Admit>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
     alone: &dyn Fn() -> bool,
-    waiting: &mut Option<test_waits::Reason>,
+    waiting: &mut Option<test_waits::Wait>,
+) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
+    binary_permit_returning(ctx, pool, b, attempt, alone, waiting, &mut || {})
+}
+
+/// The claim a binary of the plan asks as it starts: its peak, its charge in cores (none under
+/// a release's pool, whose tokens are its cores), at the run's rank, covering its children, and
+/// alone where its peak reaches the run's budget.
+fn binary_need(ctx: &crate::Ctx, pooled: bool, b: &Planned) -> aterm_capacity::Need {
+    let need = aterm_capacity::Need::new(crate::test_share::BINARY_CLAIM)
+        .mem(b.peak)
+        .cores(if pooled { 0 } else { b.charge })
+        .rank(aterm_capacity::Rank::Ordinary)
+        .covers();
+    if ctx
+        .memory
+        .as_ref()
+        .is_some_and(|book| b.peak >= book.budget())
+    {
+        need.alone()
+    } else {
+        need
+    }
+}
+
+/// Whether the run's binaries are admitted at once whatever the room (`--admit now`): an
+/// explicit resource override retains its CLI meaning, and such a start enters no queue.
+fn overriding(ctx: &crate::Ctx) -> bool {
+    ctx.quiet == Some(aterm_capacity::Admit::Now)
+}
+
+/// The claim and tokens binary `b` asks as it starts (`attempt` asks its claim), `waiting` told
+/// what a look found where it does not start, calling `giving_back` before a claim it was
+/// granted goes back with its binary unstarted (no core in the grant, or no tokens in the
+/// release's pool), while that claim is still held.
+fn binary_permit_returning<'a>(
+    ctx: Option<&crate::Ctx>,
+    pool: Option<&'a aterm_capacity::Jobserver>,
+    b: &Planned,
+    attempt: &mut impl FnMut(
+        aterm_capacity::Need,
+        Option<aterm_capacity::Admit>,
+    ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
+    alone: &dyn Fn() -> bool,
+    waiting: &mut Option<test_waits::Wait>,
+    giving_back: &mut dyn FnMut(),
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
     let claim = if let Some(ctx) = ctx.filter(|ctx| ctx.memory.is_some()) {
-        let need = aterm_capacity::Need::new(crate::test_share::BINARY_CLAIM)
-            .mem(b.peak)
-            .cores(if pool.is_some() { 0 } else { b.charge })
-            .rank(binary_rank(ctx))
-            .covers();
-        let need = if ctx
-            .memory
-            .as_ref()
-            .is_some_and(|book| b.peak >= book.budget())
-        {
-            need.alone()
-        } else {
-            need
-        };
-        // Explicit resource overrides retain their CLI meaning. Background work always keeps
-        // its cancellable, non-overriding admission; FIFO tokens remain mandatory either way.
-        let mode = (!ctx.background && ctx.quiet == Some(aterm_capacity::Admit::Now))
-            .then_some(aterm_capacity::Admit::Now);
+        let need = binary_need(ctx, pool.is_some(), b);
+        // FIFO tokens remain mandatory whatever the admission mode.
+        let mode = overriding(ctx).then_some(aterm_capacity::Admit::Now);
         match attempt(need, mode) {
             Ok(Some(claim)) if pool.is_none() && claim.cores() == 0 => {
-                *waiting = Some(test_waits::Reason::zero_core_grant());
+                *waiting = Some(test_waits::Wait::For(test_waits::Reason::zero_core_grant()));
+                giving_back();
+                drop(claim);
                 return None;
             }
             Ok(Some(claim)) => Some(Arc::new(claim)),
@@ -1465,7 +1924,10 @@ fn binary_permit_noting<'a>(
                         if lone && !tokens.is_empty() {
                             break;
                         }
-                        *waiting = Some(test_waits::Reason::fifo());
+                        *waiting = Some(test_waits::Wait::For(test_waits::Reason::fifo()));
+                        if claim.is_some() {
+                            giving_back();
+                        }
                         return None;
                     }
                     Err(why) => return Some(Err(why)),
@@ -1475,15 +1937,6 @@ fn binary_permit_noting<'a>(
         }
     };
     Some(Ok(BinaryPermit { claim, tokens }))
-}
-
-/// The rank a run's test binaries claim at: behind ordinary work for a background run.
-const fn binary_rank(ctx: &crate::Ctx) -> aterm_capacity::Rank {
-    if ctx.background {
-        aterm_capacity::Rank::Background
-    } else {
-        aterm_capacity::Rank::Ordinary
-    }
 }
 
 /// A binary whose wait for the release's pool's tokens an interrupt or the FIFO ended: verify
@@ -1579,6 +2032,7 @@ fn admitted_holding<T>(
         after_stop,
         &mut |_, b, _| acquire(b),
         &mut |_, _| {},
+        &|_| LOOK_AGAIN,
     )
 }
 
@@ -1589,7 +2043,7 @@ fn admitted_holding_pass<T>(
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     after_stop: &(impl Fn() + Sync),
-    acquire: &mut impl FnMut(u64, &Planned) -> Option<T>,
+    acquire: &mut impl FnMut(test_plan::Look, &Planned) -> Option<T>,
 ) -> Option<(Planned, T)> {
     admitted_holding_observed(
         state,
@@ -1597,19 +2051,28 @@ fn admitted_holding_pass<T>(
         live,
         stop,
         after_stop,
-        &mut |generation, b, _| acquire(generation, b),
+        &mut |look, b, _| acquire(look, b),
         &mut |_, _| {},
+        &|_| LOOK_AGAIN,
     )
 }
 
+/// The next binary a look of the dispatch admits, `None` once none is left to start or the run
+/// halted. Each worker checks the stop and the halt first; then, where a look is due
+/// ([`Dispatcher::look_due`]), passes over the queue under the dispatcher's mutex, `acquire`
+/// asked of each binary the dispatcher's rule lets start (`rejected` told of each it holds
+/// back) with the look's identity and the cores the running binaries hold; a pass that starts
+/// nothing is stamped when it ends, the next look at that generation due `again(look)` after
+/// it. A worker whose look is not due waits until it is, or until a binary starts or ends.
 fn admitted_holding_observed<T>(
     state: &Mutex<Dispatcher>,
     turn: &Condvar,
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     after_stop: &(impl Fn() + Sync),
-    acquire: &mut impl FnMut(u64, &Planned, u32) -> Option<T>,
+    acquire: &mut impl FnMut(test_plan::Look, &Planned, u32) -> Option<T>,
     rejected: &mut impl FnMut(&Planned, test_plan::DispatchResources),
+    again: &dyn Fn(test_plan::Look) -> Duration,
 ) -> Option<(Planned, T)> {
     loop {
         let stopping = stop() || exec::ending();
@@ -1621,22 +2084,31 @@ fn admitted_holding_observed<T>(
         if !d.waiting() {
             return None;
         }
-        let mut permit = None;
-        let generation = d.generation();
-        // The cores this dispatch's running binaries hold, none where none runs: `acquire`
-        // reads it under this lock.
-        let held = d.held();
-        if let Some(b) = d.next_with_observed(
-            live(),
-            &mut |b| {
-                permit = acquire(generation, b, held);
-                permit.is_some()
-            },
-            rejected,
-        ) {
-            return Some((b, permit.expect("admission acquired its resources")));
-        }
-        drop(match turn.wait_timeout(d, LOOK_AGAIN) {
+        // ONE LOOK PER DISPATCH PER INTERVAL: a worker whose look another worker has just made
+        // waits out what is left of its interval, and looks at once after a generation change.
+        let wait = if let Some(left) = d.look_due(Instant::now()) {
+            left
+        } else {
+            let look = d.begin_look();
+            let mut permit = None;
+            // The cores this dispatch's running binaries hold, none where none runs: `acquire`
+            // reads it under this lock.
+            let held = d.held();
+            if let Some(b) = d.next_with_observed(
+                live(),
+                &mut |b| {
+                    permit = acquire(look, b, held);
+                    permit.is_some()
+                },
+                rejected,
+            ) {
+                return Some((b, permit.expect("admission acquired its resources")));
+            }
+            let again = again(look);
+            d.looked(look, Instant::now(), again);
+            again
+        };
+        drop(match turn.wait_timeout(d, wait) {
             Ok((d, _)) => d,
             Err(poisoned) => poisoned.into_inner().0,
         });
@@ -2588,7 +3060,7 @@ pub fn run_tests(
         crate::test_share::Live::on_the_ledger(
             cores.asked,
             cores.granted,
-            binary_rank(ctx),
+            aterm_capacity::Rank::Ordinary,
             Some(crate::test_share::Slots::of(
                 slots.path(),
                 cores.subprocess_slots(),
@@ -3011,7 +3483,7 @@ fn probe_json(
             }
             // No dispatch runs yet: the probe alone asks, and a listing needs no more than the
             // tokens a pool that lost some still holds.
-            let (permit, reason) = binary_permit_observed(
+            let (permit, wait) = binary_permit_observed(
                 Some(ctx),
                 ctx.pool.as_deref(),
                 planned,
@@ -3019,14 +3491,23 @@ fn probe_json(
                 &exec::no_child_runs,
                 None,
             );
-            waits.change(index, reason);
             if let Some(permit) = permit {
+                waits.started(index);
                 match permit {
                     Ok(permit) => break permit,
                     Err(why) => return Ok(Some(Probe::Unanswered(why.to_string()))),
                 }
             }
-            std::thread::park_timeout(LOOK_AGAIN);
+            // A look that met only the ledger's lock is made again soon ([`LOCK_AGAIN`]).
+            let again = if matches!(wait, Some(test_waits::Wait::Unread(_))) {
+                LOCK_AGAIN
+            } else {
+                LOOK_AGAIN
+            };
+            if let Some(wait) = wait {
+                waits.waits(index, wait);
+            }
+            std::thread::park_timeout(again);
         };
         let _reservation = crate::holding_resource_claim(permit.claim.clone());
         let _cover = crate::memory::covering(
@@ -3212,13 +3693,6 @@ fn run_planned_observed(
     // Drop recording memory and CPU before any per-binary admission.
     progress.enter(Phase::ExecutionAdmission);
     drop(claims);
-    let _background = match dispatch_lifetime(ctx, crate::admit_live) {
-        Ok(guard) => guard,
-        Err(why) => {
-            r.cannot_run(why);
-            return;
-        }
-    };
     progress.enter(Phase::Planning);
     // A failed test reruns at the width its binary runs at, which the full plan sets. A probe hang
     // only projects this plan; it does not replan the peers after their widths are fixed.

@@ -724,16 +724,25 @@ fn machines_of(home: Option<&std::path::Path>, memo: &Mutex<CardMemo>, now: i64)
 /// table, and the card then says it does not read other Macs.
 fn claims_of(home: &std::path::Path) -> Result<Option<(claims::View, claims::Book)>, String> {
     let read = claims::read_book(home);
-    #[cfg(unix)]
-    if read.is_err()
-        && matches!(
-            aterm_secrets::client::config(&aterm_secrets::client::Paths::for_home(home)),
-            Ok(None)
-        )
-    {
+    if read.is_err() && !has_vault(home) {
         return Ok(None);
     }
     read
+}
+
+/// Whether `home` names a vault: a config that cannot be read is counted as one.
+#[cfg(unix)]
+fn has_vault(home: &std::path::Path) -> bool {
+    !matches!(
+        aterm_secrets::client::config(&aterm_secrets::client::Paths::for_home(home)),
+        Ok(None)
+    )
+}
+
+/// No vault client builds off unix (`aterm_secrets::client`), so no host there has a vault.
+#[cfg(not(unix))]
+const fn has_vault(_: &std::path::Path) -> bool {
+    false
 }
 
 pub(crate) fn queue_status(

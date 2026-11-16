@@ -243,7 +243,7 @@ pub struct Terminal {
     /// Taskbar progress state (ConEmu OSC 9;4), for the host's taskbar/dock.
     pub(super) taskbar_progress: Option<TaskbarProgress>,
     /// The program's own state report (OSC 7501, [`super::program_state`]).
-    pub(super) program_state: super::program_state::ProgramStateReport,
+    pub(super) program_state: super::program_state::ProgramStateRecord,
     /// Kitty keyboard protocol state.
     pub(super) kitty_keyboard: KittyKeyboardState,
     /// xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).

@@ -495,6 +495,44 @@ pub(crate) const NOT_WRITTEN: SystemAccent = SystemAccent {
 /// How far toward [`NativeRoles::unwritten`] a staged cell's ground is washed.
 pub(crate) const UNWRITTEN_WASH: f32 = 0.24;
 
+/// The most a sheet's header ground (its header line, its row numbers) is lifted off the
+/// elevated ground toward the primary ink. A theme whose inks would read under
+/// [`SHEET_WORD_FLOOR`] there gets less of it ([`sheet_ground`]).
+pub(crate) const SHEET_HEAD_LIFT: f32 = 0.06;
+
+/// The most the cells of a sheet's range are washed, off the elevated ground toward the primary
+/// ink; less where a cell's words would read under [`SHEET_WORD_FLOOR`] ([`sheet_ground`]).
+pub(crate) const SHEET_RANGE_WASH: f32 = 0.14;
+
+/// What words on a ground a sheet mixes for itself read at, at the least (STYLE-aterm 2.3):
+/// held on every shipped theme by `a_sheets_words_read_on_its_header_ground_and_its_range_wash`.
+pub(crate) const SHEET_WORD_FLOOR: f32 = 4.5;
+
+/// A sheet's ground: the elevated ground lifted `most` of the way toward `primary`, or as far
+/// that way as each of `inks` still reads at [`SHEET_WORD_FLOOR`] on it. The elevated ground
+/// itself where no lift leaves them that: the role inks are solved for it, and it stands off
+/// the page a sheet's cells lie on.
+pub(crate) fn sheet_ground(
+    elevated: [u8; 3],
+    primary: [u8; 3],
+    inks: &[[u8; 3]],
+    most: f32,
+) -> [u8; 3] {
+    const STEP: f32 = 0.01;
+    let mut lift = most;
+    while lift > 0.0 {
+        let ground = mix_srgb(elevated, primary, lift);
+        if inks
+            .iter()
+            .all(|ink| contrast_ratio(*ink, ground) >= SHEET_WORD_FLOOR)
+        {
+            return ground;
+        }
+        lift -= STEP;
+    }
+    elevated
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Oklch {
     l: f32,
@@ -515,7 +553,7 @@ pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
 const ACCENT_INK_FLOOR: f32 = 3.0;
 // Keep headroom above the 4.5 floor for small painted accent labels.
 const ACCENT_TEXT_TARGET: f32 = 5.0;
-const CARD_CONTRAST_MIN: f32 = 1.2;
+pub(crate) const CARD_CONTRAST_MIN: f32 = 1.2;
 // Leave room for the gallery's f64 calculation of the quantized u8 colours.
 const CONTRAST_ROUNDING_MARGIN: f32 = 0.000_1;
 const LIGHT_ELEVATION_STEP: f32 = 0.035;

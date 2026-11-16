@@ -446,14 +446,21 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["repo", "create"],
         class: Class::Write,
-        usage: "agh repo create OWNER/NAME --public [--dry-run]",
-        summary: "create a public repository for the authenticated User owner",
+        usage: "agh repo create OWNER/NAME (--public|--private) [--dry-run]",
+        summary: "create a repository for the authenticated User owner",
         example: "agh repo create alabsystems/new-project --public --dry-run",
         noun: Noun::Write,
         gh: "gh repo create",
         milestone: 2,
         flags: &[
-            on("--public", "required: create public, with no initial files"),
+            on(
+                "--public",
+                "create public, with no initial files; choose one visibility",
+            ),
+            on(
+                "--private",
+                "create private, with no initial files; choose one visibility",
+            ),
             DRY_RUN,
         ],
         positionals: &["REPO"],

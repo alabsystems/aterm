@@ -158,10 +158,22 @@ impl Broker {
             entry.if_absent,
             entry.anchor.as_deref(),
         )
-        .map_err(|_| Error::new("broker policy cannot be encoded"))?;
-        client::admin_publish_conditional_until(&paths, admin, &doc, deadline)
-            .map(Box::new)
-            .map(Publication::Published)
-            .map_err(crate::table::failure)
+        // The text's own refusal: a name, an anchor, or a policy over the 64 KiB a fleet
+        // configuration value may be set to. Its words hold the name and sizes, never a value.
+        .map_err(|error| Error::new(&format!("broker policy cannot be encoded: {error}")))?;
+        // The broker's publish is an automatic writer of the vault log: it signs no `Put` over
+        // 64 KiB, stops at seven eighths of the log's bound and is held to what this Mac's seat
+        // signed in a day. A refusal is the command's answer, in the log's own words (the size
+        // and the limit, or the class, the fill and what still fits); nothing was signed.
+        client::admin_publish_conditional_until(
+            &paths,
+            admin,
+            &doc,
+            deadline,
+            client::Author::Automatic("the account broker"),
+        )
+        .map(Box::new)
+        .map(Publication::Published)
+        .map_err(crate::table::failure)
     }
 }

@@ -237,7 +237,7 @@ pub fn admit_in(
             "{why}; the VM can never boot here"
         ))),
         Err(e @ Error::Unmet { .. }) => Err(crate::linux::not_run(format!(
-            "its claim for {} was refused: {e}, {}; this run {}",
+            "its claim for {} was refused: {e}; {}; this run {}",
             guest.vm,
             crate::linux::AT_ONCE,
             if booting {

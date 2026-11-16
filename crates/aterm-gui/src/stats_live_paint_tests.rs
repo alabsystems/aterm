@@ -1112,6 +1112,7 @@ fn every_glide_frame_moves_the_cards_pixels() {
             assert_ne!(flow, Flow::None, "CONTROL {form:?} {w} pt {s}x: it moves");
             let facts = LiveFacts {
                 landed: Some(landed),
+                sampled: Some(landed),
                 stale_after: Duration::from_secs(3),
                 motion: true,
                 beat: false,
@@ -1952,6 +1953,7 @@ fn deck_live_gallery() {
             .collect();
     }
     show.facts.link = Some(aterm_vitals::LinkSample {
+        byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: aterm_vitals::LinkKind::Wifi,
         up: true,
@@ -1984,6 +1986,7 @@ fn deck_live_gallery() {
         ..aterm_vitals::NetView::default()
     });
     show.facts.link = Some(aterm_vitals::LinkSample {
+        byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: aterm_vitals::LinkKind::Wifi,
         up: true,

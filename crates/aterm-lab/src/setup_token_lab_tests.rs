@@ -309,12 +309,10 @@ fn lane_a_passes_only_a_stop_at_the_prompt() {
 /// The lanes: none named is all; a tag; `--keep`; an unknown flag refused.
 #[test]
 fn the_verb_parses_its_lanes() {
-    let all = Lanes {
-        a: true,
-        b: true,
-        c: true,
-    };
-    assert_eq!(parse(&[]).unwrap(), (all, "setup-token".to_string(), false));
+    assert_eq!(
+        parse(&[]).unwrap(),
+        (Lanes::ALL, "setup-token".to_string(), false)
+    );
     let words = |w: &[&str]| w.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     assert_eq!(
         parse(&words(&["c", "mine", "--keep"])).unwrap(),
@@ -322,12 +320,23 @@ fn the_verb_parses_its_lanes() {
             Lanes {
                 a: false,
                 b: false,
-                c: true
+                c: true,
+                d: false,
             },
             "mine".to_string(),
             true
         )
     );
+    assert_eq!(
+        parse(&words(&["d"])).unwrap().0,
+        Lanes {
+            a: false,
+            b: false,
+            c: false,
+            d: true,
+        }
+    );
+    assert_eq!(parse(&words(&["all"])).unwrap().0, Lanes::ALL);
     assert!(parse(&words(&["--bogus"])).is_err());
 }
 
@@ -412,4 +421,49 @@ fn a_hit_is_placed_by_its_path() {
         "the scratch config folder"
     );
     assert_eq!(place_of(Path::new("/r/scratch/x.bin")), "another file");
+}
+
+/// Lane D's readers: Claude Code's first-run screens are told from its composer; the control's
+/// profile drops exactly the first-run state `up` lays and keeps the rest; a directory's listing
+/// names paths and sizes, and says when it is not there.
+#[test]
+fn lane_d_reads_first_run_screens_and_strips_only_the_first_run_state() {
+    assert!(first_run_screen(
+        "Welcome to Claude Code\n Let\u{2019}s get started.\n Choose the text style"
+    ));
+    assert!(first_run_screen(" Select login method:"));
+    assert!(
+        !first_run_screen("\u{276f} \n ? for shortcuts"),
+        "a composer"
+    );
+    let profile = J::parse(
+        r#"{"hasCompletedOnboarding":true,"theme":"dark","lastOnboardingVersion":"99.0.0",
+            "hasSeenAutoDefaultNotice":true,"hasSeenAutoDefaultNudge":true,
+            "projects":{"/p":{"hasTrustDialogAccepted":true}},"mcpServers":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        first_run_state(&profile),
+        [
+            "hasCompletedOnboarding",
+            "theme",
+            "lastOnboardingVersion",
+            "hasSeenAutoDefaultNotice",
+            "hasSeenAutoDefaultNudge",
+            "projects"
+        ]
+    );
+    let bare = without_first_run(&profile);
+    assert!(first_run_state(&bare).is_empty());
+    assert!(bare.get("mcpServers").is_some(), "the rest is kept");
+
+    let dir = scratch();
+    let row = dir.path().join("logins/lab-b");
+    assert_eq!(dir_listing(&row), None);
+    std::fs::create_dir_all(row.join("sub")).unwrap();
+    std::fs::write(row.join("sub/f"), b"abc").unwrap();
+    assert_eq!(
+        dir_listing(&row),
+        Some(vec!["sub/".to_string(), "sub/f (3 B)".to_string()])
+    );
 }

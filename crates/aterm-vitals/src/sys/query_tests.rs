@@ -282,3 +282,48 @@ fn request_scope_reads_jobs_disk_and_procs_beyond_the_target_and_is_no_scope_of_
     assert_eq!(SysQuery::parse("overview scope=request"), Err(USAGE));
     assert_eq!(ScopeArg::Request.word(), "request");
 }
+
+/// `held` is a form of the disk view: one word after `disk`, which reads every holding on
+/// home's volume, so it has no scope, is not the target's own rows, and takes no scope, depth,
+/// row count or instances; anywhere else it is no word. NEGATIVE CONTROL: plain `disk` keeps
+/// its tab scope, its target-rows read and its depth.
+#[test]
+fn sys_disk_held_parses_after_disk_and_nowhere_else() {
+    for text in [
+        "disk held",
+        "disk held --json",
+        "disk held fresh=500",
+        "disk held since=1.2",
+        "disk held caller=s1",
+    ] {
+        let q = SysQuery::parse(text).expect(text);
+        assert_eq!(q.view, View::Disk, "{text}");
+        assert_eq!(q.form, Some(DiskForm::Held), "{text}");
+        assert_eq!(q.effective_scope(), None, "{text}");
+        assert!(!q.target_rows_only(), "{text}");
+    }
+    assert_eq!(DiskForm::Held.word(), "held");
+    for bad in [
+        "held",
+        "held disk",
+        "disk held held",
+        "jobs held",
+        "tab held",
+        "disk held scope=tab",
+        "disk scope=aterm held",
+        "disk held depth=2",
+        "disk held top=3",
+        "disk held instances=all",
+    ] {
+        assert_eq!(SysQuery::parse(bad), Err(USAGE), "{bad}");
+    }
+    assert_eq!(SysQuery::parse("why held"), Err(WHY_USAGE));
+    let plain = SysQuery::parse("disk").unwrap();
+    assert_eq!(plain.form, None);
+    assert_eq!(plain.effective_scope(), Some(ScopeArg::Tab));
+    assert!(plain.target_rows_only());
+    assert_eq!(
+        SysQuery::parse("disk depth=2").map(|q| q.depth),
+        Ok(Some(2))
+    );
+}

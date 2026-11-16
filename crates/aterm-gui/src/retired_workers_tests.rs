@@ -4,6 +4,10 @@
 use super::*;
 use crate::task_record::{TaskMark, TaskState};
 
+fn sid(local: u64) -> SessionId {
+    SessionId::new(aterm_types::tab_id::TabId::from_bits(local).as_str())
+}
+
 fn row(local: u64, window: u64, closed_unix_ms: u64) -> Retired {
     let (record, _) = TaskMark::new(TaskState::Done).apply(
         None,
@@ -12,7 +16,7 @@ fn row(local: u64, window: u64, closed_unix_ms: u64) -> Retired {
         closed_unix_ms,
     );
     Retired {
-        sid: SessionId::new(format!("s-{local:04x}")),
+        sid: sid(local),
         local: Some(local),
         window: Some(WindowId(window)),
         title: format!("worker {local}"),
@@ -42,10 +46,7 @@ fn the_rows_are_bounded_by_count_and_age_and_a_page_only_unlists() {
     assert_eq!(pushed.len(), 1);
     assert_eq!(pushed[0].local, Some(0), "the oldest goes first");
     assert!(kept.by_local(0).is_none());
-    assert_eq!(
-        kept.by_sid(&SessionId::new("s-03e7")).map(|row| row.local),
-        Some(Some(999))
-    );
+    assert_eq!(kept.by_sid(&sid(999)).map(|row| row.local), Some(Some(999)));
 
     let aged = kept.drop_aged(1_001 + RETIRED_FOR_MS);
     assert_eq!(
@@ -81,6 +82,7 @@ fn a_seamless_update_carries_every_row_unlisted() {
     let now = std::time::Instant::now();
     let mut outgoing = RetiredWorkers::default();
     let mut first = row(0xa1, 3, 7_000);
+    first.sid = SessionId::new("s-000000000000000000a1");
     first.title = "Claim API credit".to_string();
     first.last_words = Some("Nothing left: CLAIMED: $5".to_string());
     outgoing.keep(first.clone());
@@ -92,11 +94,16 @@ fn a_seamless_update_carries_every_row_unlisted() {
     let mut carried = rows.clone();
     carried.push("sid=not-a-sid closed=1 title=x rev=1 state=done".to_string());
     carried.push(rows[1].clone());
-    carried.push("sid=s-c3 closed=9 title=x state=done".to_string());
+    carried.push(format!(
+        "sid={} closed=9 title=x state=done",
+        sid(0xc3).as_str()
+    ));
+    // A short legacy word is not a session ID, even in an otherwise valid carried row.
+    let malformed = rows[0].replace(&format!("sid={}", first.sid), "sid=s-00a1");
+    assert_ne!(malformed, rows[0], "PRECONDITION: the carried SID changed");
+    carried.push(malformed);
     assert_eq!(successor.adopt(&carried, None, now, 9_000), 2);
-    let back = successor
-        .by_sid(&SessionId::new("s-00a1"))
-        .expect("carried");
+    let back = successor.by_sid(&first.sid).expect("carried");
     assert_eq!(
         (
             back.local,
@@ -122,5 +129,6 @@ fn a_seamless_update_carries_every_row_unlisted() {
         successor.listed_on(WindowId(3)).next().is_none(),
         "unlisted"
     );
-    assert!(successor.by_sid(&SessionId::new("s-c3")).is_none());
+    assert!(successor.by_sid(&sid(0xc3)).is_none());
+    assert!(successor.by_sid(&SessionId::new("s-00a1")).is_none());
 }

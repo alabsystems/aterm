@@ -644,6 +644,10 @@ pub(crate) struct SessionFactory {
     /// running command ([`shell_children`]).
     #[cfg(unix)]
     pub(crate) shell_children: fn(i32) -> Vec<i32>,
+    /// How each PTY reader's watch on what a keeper META reads rings the META pump
+    /// ([`crate::keeper_link::MetaRing::KEEPER`]; a test's own pair hears one reader's rings).
+    #[cfg(unix)]
+    pub(crate) meta_ring: crate::keeper_link::MetaRing,
     /// How a Windows PTY reader lists its session's job for the programs its commands ran
     /// ([`crate::command_ran::RanJob`]; `None`: it lists nothing, the test App's inert arm).
     #[cfg(windows)]
@@ -669,8 +673,15 @@ impl SessionFactory {
     }
 
     /// What a spare spawned by this factory shares with a cold tab spawned by it now
-    /// (`crate::spare`'s gate G4).
+    /// (`crate::spare`'s gate G4), under the strip list installed now.
     pub(crate) fn spawn_fingerprint(&self) -> u64 {
+        self.spawn_fingerprint_under(&aterm_types::domain::effective_env_strip())
+    }
+
+    /// [`Self::spawn_fingerprint`] under the strip list `strip`: a shell keeps the environment
+    /// it was forked with, so a spare forked under another list kept, or lost, what a cold tab
+    /// now would not (`docs/HARNESS-CONTRACT.md` §2).
+    pub(crate) fn spawn_fingerprint_under(&self, strip: &aterm_types::domain::EnvStrip) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
         let Self {
             spawn_cap: _,
@@ -710,6 +721,8 @@ impl SessionFactory {
                 leader_execd: _,
             #[cfg(unix)]
                 shell_children: _,
+            #[cfg(unix)]
+                meta_ring: _,
             #[cfg(windows)]
                 job_seam: _,
             card_probe: _,
@@ -740,6 +753,7 @@ impl SessionFactory {
         // A spare spawned before the git-and-friends shim was wanted (or after) has the PATH of
         // that moment, not the one a cold tab gets now.
         crate::clt_shim::wanted_dir().hash(&mut h);
+        strip.prefixes().hash(&mut h);
         static LAUNCH_ENV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         LAUNCH_ENV
             .get_or_init(|| {
@@ -1512,6 +1526,9 @@ pub(crate) fn spawn_session(
     });
     if adopt.is_none() {
         crate::tab_label::note_this_machine_name();
+        // The strip list as the store and aterm.toml stand now (`docs/HARNESS-CONTRACT.md` §2):
+        // a glance at what it is read from, and a read only when that moved.
+        aterm_agent::harness::registry::install_shell_strip_list();
     }
     let mut keeper_claim = adopt.as_mut().and_then(|adopted| adopted.keeper.take());
     let restore_report = keeper_claim
@@ -2710,6 +2727,8 @@ fn attach_reader_inner(
             session.ctx.update_parked.clone(),
             session.ctx.update_parked.mark(),
         ),
+        #[cfg(unix)]
+        meta_ring: factory.meta_ring,
     });
     #[cfg(windows)]
     let _ = (
@@ -2951,6 +2970,14 @@ mod foreground_handback_conformance;
 #[cfg(all(test, unix))]
 #[path = "cwd_report_reader_tests.rs"]
 mod cwd_report_reader_tests;
+
+#[cfg(all(test, unix))]
+#[path = "program_front_reader_tests.rs"]
+mod program_front_reader_tests;
+
+#[cfg(all(test, unix))]
+#[path = "keeper_meta_reader_tests.rs"]
+mod keeper_meta_reader_tests;
 
 #[cfg(all(test, target_os = "macos"))]
 #[path = "act_barrier_reader_tests.rs"]
@@ -4829,6 +4856,9 @@ struct PtyReaderWiring {
     journal: Option<Arc<crate::crash_restore::SessionJournal>>,
     #[cfg(unix)]
     park: (Arc<UpdatePark>, u64),
+    /// How the reader's watch on a keeper META's fingerprint rings the META pump.
+    #[cfg(unix)]
+    meta_ring: crate::keeper_link::MetaRing,
 }
 
 /// The dev `card-seen` probe over one parsed slice's visible rows and the fence they left
@@ -4940,6 +4970,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
         journal,
         #[cfg(unix)]
         park,
+        #[cfg(unix)]
+        meta_ring,
     } = w;
     #[cfg(not(unix))]
     let _ = (&reset_lane, &witness);
@@ -5054,6 +5086,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                 std::cell::Cell::new(None);
             let mut fg_owners = crate::foreground_handback::FgOwners::default();
             let mut prefetch = crate::host_io_prefetch::Prefetch::default();
+            // What a keeper META's fingerprint read when this reader last looked.
+            #[cfg(unix)]
+            let mut meta_watch = crate::keeper_link::MetaWatch::new(meta_ring);
             let mut cadence = PostCadence::default();
             let output_wake = |cadence: &mut PostCadence| {
                 let now = (lat_epoch.elapsed().as_nanos() as u64).max(1);
@@ -5368,6 +5403,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 term_lock(&term)
                             };
                             crate::metrics::note_parse_hold(parse_hold_wait(waited));
+                            #[cfg(unix)]
+                            meta_watch.hold(&t);
                             crate::temporal::pick_up(
                                 &temporal_arm,
                                 &mut temporal_lane.0,
@@ -5456,6 +5493,10 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 note_cut(&mut t, cut, group, &mut group_notes);
                             }
                             t.set_foreground_job(slice_holder > 0 && slice_holder != fg_shell);
+                            // The OSC 7501 reports this slice carries are its holder's, so one
+                            // standing from before the front moved is its writer's, gone, and no
+                            // run sign (`ProgramStateReport::run_sign`).
+                            t.program_front_is(slice_holder);
                             #[cfg(test)]
                             crate::holder_image::hold_hook::at_hold(
                                 id,
@@ -5503,6 +5544,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 probe_sink.upgrade().map(|sink| sink.driven_input())
                             });
                             prefetch.held(&t);
+                            #[cfg(unix)]
+                            meta_watch.saw(&t);
                             emitted += end - off;
                             fg_owners.observe(
                                 slice_holder,
@@ -5570,6 +5613,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                                 ));
                             }
                         }
+                        // The slice's hold is dropped: a META pass it rings finds the engine free.
+                        #[cfg(unix)]
+                        meta_watch.ring();
                         #[cfg(unix)]
                         if let (Some(j), Some(captured)) = (&journal, journal_keyframe.take()) {
                             j.write(captured);

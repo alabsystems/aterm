@@ -682,7 +682,7 @@ impl App {
             .get(&ticket)
             .map(|entry| entry.caller_tab);
         if let Some(caller_tab) = caller_tab
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             if let Some(caller) = ws.tab_set.tabs().iter().position(|t| t.id == caller_tab) {
                 ws.tab_set.reorder(tab, caller + 1);
@@ -1011,7 +1011,7 @@ impl App {
         // Only the window the edit tab closed in goes to the caller's tab, and only
         // while it holds that tab: a tab moved to another window takes nothing back.
         if !behind
-            && let Some(ws) = self
+            && let Some(mut ws) = self
                 .native_documents
                 .edits
                 .retiring_in
@@ -1019,7 +1019,7 @@ impl App {
             && ws.tab_set.get(tab).is_none()
             && ws.tab_set.switch_to(entry.caller_tab)
         {
-            crate::app_tabs::align_terminal_projection_to_active(ws, &self.view_store);
+            crate::app_tabs::align_terminal_projection_to_active(&mut ws, &self.view_store);
             ws.last_present = None;
         }
     }
@@ -1190,8 +1190,9 @@ impl App {
         else {
             return;
         };
+        let mut route_native_guard = self.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Editor(state)) =
-            self.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             return;
         };
@@ -1200,6 +1201,7 @@ impl App {
         }
         state.edit_header = Some(header);
         state.common.presentation_revision = state.common.presentation_revision.saturating_add(1);
+        drop(route_native_guard);
         self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
         self.request_native_redraw(window);
     }
@@ -1319,7 +1321,8 @@ impl App {
         let closed = if whole {
             // Selected for its close preflight only; the tab in front is put
             // back in the same topology edit, before any sync.
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.tab_set.switch_to(tab);
             }
             self.close_active_native_tab_keeping(wid, Some(front))
@@ -1327,7 +1330,8 @@ impl App {
             self.close_editor_view(view)
         };
         self.native_documents.edits.closing_behind = None;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        let moved = self.windows.get_mut(&wid).is_some_and(|mut guard| {
+            let ws = &mut **guard;
             let mut moved = ws.tab_set.active_id() != Some(front) && ws.tab_set.switch_to(front);
             if let Some(active) = ws.tab_set.active_mut()
                 && active.id == front
@@ -1339,9 +1343,12 @@ impl App {
             if moved {
                 crate::app_tabs::align_terminal_projection_to_active(ws, &self.view_store);
                 ws.last_present = None;
-                self.resync_active_or_window(wid);
-                self.request_native_redraw(wid);
             }
+            moved
+        });
+        if moved {
+            self.resync_active_or_window(wid);
+            self.request_native_redraw(wid);
         }
         closed
     }

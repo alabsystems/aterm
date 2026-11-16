@@ -877,7 +877,15 @@ struct Custody {
     caps: std::sync::atomic::AtomicU8,
     /// The masters whose REGISTER that connection carried, with no refusal of them read since.
     masters: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// Each turn's wait ([`wait_for`]) and whether the worker was connected as it chose it.
+    #[cfg(test)]
+    waits: (std::sync::Mutex<Vec<TurnWait>>, std::sync::Condvar),
 }
+
+/// One turn's wait as the link's worker chose it ([`wait_for`]): whether it was connected, and
+/// the wait (`None`: no deadline).
+#[cfg(test)]
+type TurnWait = (bool, Option<Duration>);
 
 /// The queue's doorbell, rung by [`KeeperLink`] once it has queued an op.
 #[derive(Debug)]
@@ -969,14 +977,15 @@ impl Door {
 
     /// What wakes the worker next: the op queued at once when there is one, else as soon as one
     /// is; [`Woke::Keeper`] once `keeper` (the link's connection) has something to read with no
-    /// op queued; [`Woke::Idle`] once `idle` has passed with neither; [`Woke::Closed`] once the
-    /// queue is closed and empty. A ring whose op was already taken, or a signal, wakes nobody:
-    /// the wait goes on for what is left of `idle`.
+    /// op queued; [`Woke::Idle`] once `wait` has passed with neither (never, when `wait` is
+    /// `None`: the wait has no deadline); [`Woke::Closed`] once the queue is closed and empty. A
+    /// ring whose op was already taken, or a signal, wakes nobody: the wait goes on for what is
+    /// left of `wait`.
     fn next(
         &mut self,
         rx: &Receiver<Queued>,
         keeper: Option<&KeeperClient>,
-        idle: Duration,
+        wait: Option<Duration>,
     ) -> Woke {
         use std::os::fd::AsRawFd as _;
         let started = std::time::Instant::now();
@@ -987,11 +996,14 @@ impl Door {
                 Err(mpsc::TryRecvError::Disconnected) => return Woke::Closed,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
-            let left = idle.saturating_sub(started.elapsed());
+            let left = wait.map(|wait| wait.saturating_sub(started.elapsed()));
             if self.hung_up {
                 // Nothing will ring again, and a hung-up door reads ready for good: wait on the
                 // queue alone (the link is gone, so it is closed, or soon will be).
-                return Woke::of(rx.recv_timeout(left));
+                return match left {
+                    Some(left) => Woke::of(rx.recv_timeout(left)),
+                    None => rx.recv().map_or(Woke::Closed, Woke::Op),
+                };
             }
             let mut fds = [crate::sys::PollFd {
                 fd: self.far.as_raw_fd(),
@@ -1005,16 +1017,19 @@ impl Door {
                 }
                 None => 1,
             };
-            // Rounded up, so a wait shorter than a millisecond is not a poll that returns at once.
-            let millis = i32::try_from(left.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX);
+            let millis = poll_millis(left);
+            #[cfg(test)]
+            POLLED_MS.with(|polled| polled.set(Some(millis)));
             let (heard, over) = match crate::sys::poll(&mut fds[..watched], millis) {
                 Ok(0) => (false, true),
                 Ok(_) => (watched == 2 && fds[1].revents != 0, false),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => (false, false),
-                // A poll that fails would fail again at once: wait on the queue alone.
-                Err(_) => return Woke::of(rx.recv_timeout(left)),
+                // A poll that fails would fail again at once: wait on the queue alone, and with
+                // no deadline for [`LINK_POLL`] at most, so the worker's next turn still looks at
+                // the keeper's connection (its drain finds a broken one gone).
+                Err(_) => return Woke::of(rx.recv_timeout(left.unwrap_or(LINK_POLL))),
             };
-            if !heard && !over && left > Duration::ZERO {
+            if !heard && !over && left.is_none_or(|left| left > Duration::ZERO) {
                 continue;
             }
             self.answer();
@@ -1028,13 +1043,28 @@ impl Door {
     }
 }
 
+/// The poll(2) timeout for a wait with `left` to run: rounded up to whole milliseconds, so a wait
+/// shorter than one is not a poll that returns at once; with no deadline, -1, so the poll returns
+/// only for the door or the keeper.
+fn poll_millis(left: Option<Duration>) -> i32 {
+    left.map_or(-1, |left| {
+        i32::try_from(left.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The timeout of this thread's last [`Door::next`] poll, in milliseconds (-1: none).
+    static POLLED_MS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
 /// What woke the link's worker ([`Door::next`]).
 enum Woke {
     /// An op was queued.
     Op(Queued),
     /// The keeper wrote a frame or closed the connection, and no op is queued.
     Keeper,
-    /// The idle wait passed with no op queued and nothing from the keeper.
+    /// The wait's deadline passed with no op queued and nothing from the keeper.
     Idle,
     /// The queue is closed and empty: the link is shut down.
     Closed,
@@ -1062,10 +1092,9 @@ struct LinkPeer {
     /// This window journals its sessions: every link HELLO states [`CAP_JOURNAL`], and its
     /// companions are told to a keeper that states it.
     journal: bool,
-    /// How long the worker waits with no op queued and nothing from the keeper before it looks
-    /// again ([`LINK_POLL`] but for [`KeeperLink::start_idling`]): what paces its tries at a
-    /// keeper it lost.
-    idle: Duration,
+    /// The shortest pause between the worker's tries at a keeper it lost ([`LINK_POLL`] but for
+    /// [`KeeperLink::start_retrying`]); see [`wait_for`].
+    retry: Duration,
 }
 
 impl KeeperLink {
@@ -1087,21 +1116,22 @@ impl KeeperLink {
         booted: Option<KeeperClient>,
         journal: bool,
     ) -> io::Result<Self> {
-        Self::start_idling(path, identity, build, marker, booted, journal, LINK_POLL)
+        Self::start_retrying(path, identity, build, marker, booted, journal, LINK_POLL)
     }
 
-    /// [`Self::start_marked`] with the worker waiting `idle`, not [`LINK_POLL`], when no op is
-    /// queued and the keeper wrote nothing: what paces its tries at a keeper it lost.
+    /// [`Self::start_marked`] with the worker's own tries at a keeper it lost (those no op asked
+    /// for) paced by `retry`, not [`LINK_POLL`] ([`wait_for`]). A connected worker waits with no
+    /// deadline either way.
     /// # Errors
     /// The worker's doorbell (a socket pair) not being made, or the thread failing to spawn.
-    pub fn start_idling(
+    pub fn start_retrying(
         path: PathBuf,
         identity: Identity,
         build: String,
         marker: Option<MarkerRef>,
         booted: Option<KeeperClient>,
         journal: bool,
-        idle: Duration,
+        retry: Duration,
     ) -> io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel(LINK_QUEUE + WAITED_ROOM);
         let room = std::sync::Arc::new(Room::default());
@@ -1113,7 +1143,7 @@ impl KeeperLink {
             build,
             marker,
             journal,
-            idle,
+            retry,
         };
         let custody = std::sync::Arc::new(Custody {
             caps: std::sync::atomic::AtomicU8::new(
@@ -1147,6 +1177,26 @@ impl KeeperLink {
         booted: Option<KeeperClient>,
     ) -> io::Result<Self> {
         Self::start_marked(path, identity, build, None, booted, false)
+    }
+
+    /// The waits the worker's turns chose so far ([`wait_for`]), each with whether it was
+    /// connected, once `done` holds of them, under the one-minute hang detector.
+    /// # Panics
+    /// `done` not holding within the hang detector.
+    #[cfg(all(test, target_vendor = "apple"))]
+    fn waits_until(&self, what: &str, done: impl Fn(&[TurnWait]) -> bool) -> Vec<TurnWait> {
+        let (waits, noted) = &self.custody.waits;
+        let (waits, timed_out) = noted
+            .wait_timeout_while(
+                waits
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                aterm_spec::wait::MUST_HAPPEN,
+                |waits| !done(waits),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!timed_out.timed_out(), "never: {what}");
+        waits.clone()
     }
 
     /// Queue `op`, returning `false` when the queue is full or the worker is gone.
@@ -1389,12 +1439,32 @@ enum Send {
     Frame(Frame),
 }
 
-/// How long an idle link's worker waits, with no op queued and nothing from the keeper to read,
-/// before it looks again: what paces its tries at a keeper it lost. A queued op rings its door and
-/// a keeper's frame (a SYNC's answer, a refusal, the keeper's close) makes its socket readable,
-/// and either wakes it at once ([`Door::next`]). Only an op's wake or this one dials a keeper,
-/// never the wake a keeper's close made.
+/// The shortest pause between a link worker's tries at a keeper it lost, while it holds a master
+/// or owes a RELEASE ([`wait_for`]). A queued op rings its door and a keeper's frame (a SYNC's
+/// answer, a refusal, the keeper's close) makes its socket readable, and either wakes it at once
+/// ([`Door::next`]); a connected worker, and a lost one with nothing to tell a keeper, waits for
+/// nothing else. Only an op's wake or a retry's dials a keeper, never the wake a keeper's close
+/// made.
 pub const LINK_POLL: Duration = Duration::from_millis(500);
+
+/// How long the link's worker waits for an op or a keeper frame before it looks again, at `now`:
+/// with no deadline while `connected` (everything a connected turn does, a keeper frame's wake
+/// does: its drain, the RELEASEs a SYNC answer settles, the companion reads it confirms, a close
+/// it finds), and with none while the keeper is lost but the worker has nothing to `dial_for`
+/// (no master held, no RELEASE owed: such a turn dials nobody). Otherwise until the next try at
+/// the lost keeper: `next_try` (the backoff after a failed dial), and never sooner than `retry`
+/// after the wait begins, so the tries its own wakes make stay at least `retry` apart and the
+/// first comes `retry` after the wake a keeper's close made (an op's wake dials once `next_try`
+/// is past, as before).
+fn wait_for(
+    connected: bool,
+    dial_for: bool,
+    retry: Duration,
+    next_try: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<Duration> {
+    (!connected && dial_for).then(|| retry.max(next_try.saturating_duration_since(now)))
+}
 
 fn link_worker(
     peer: &LinkPeer,
@@ -1412,6 +1482,11 @@ fn link_worker(
         keep(&mut owed, rdev, owe);
     }
     let mut client: Option<KeeperClient> = booted;
+    // An answer the boot connection already read settles its retirement now: a connected worker
+    // waits for an op or a keeper frame alone ([`wait_for`]), and that answer is neither.
+    if let Some(c) = &client {
+        settle_owed(&mut owed, c.synced());
+    }
     // The held masters whose REGISTER the keeper refused on this connection.
     let mut refused: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut backoff = Duration::from_millis(50);
@@ -1419,10 +1494,19 @@ fn link_worker(
     loop {
         stated.now(client.as_ref(), &held, &refused);
         // A wake only the keeper caused (its answer, its refusal, its close) dials nobody: a
-        // keeper that closed the link is tried again on the next op or idle wake, as one the
+        // keeper that closed the link is tried again on the next op or retry wake, as one the
         // worker found gone there would be, so one that drops every link it welcomes is not
         // dialled again the moment it does.
-        let (op, ack, heard) = match door.next(&rx, client.as_ref(), peer.idle) {
+        let wait = wait_for(
+            client.is_some(),
+            !held.is_empty() || !owed.is_empty(),
+            peer.retry,
+            next_try,
+            std::time::Instant::now(),
+        );
+        #[cfg(test)]
+        stated.waited(client.is_some(), wait);
+        let (op, ack, heard) = match door.next(&rx, client.as_ref(), wait) {
             Woke::Op(queued) => {
                 if queued.1.is_none() {
                     room.give_back(1);
@@ -1659,6 +1743,17 @@ impl Stated {
             masters.extend(held.keys().filter(|rdev| !refused.contains(rdev)));
         }
     }
+
+    /// Note the wait a turn chose, `connected` or not ([`KeeperLink::waits_until`]).
+    #[cfg(test)]
+    fn waited(&self, connected: bool, wait: Option<Duration>) {
+        let (waits, noted) = &self.0.waits;
+        waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((connected, wait));
+        noted.notify_all();
+    }
 }
 
 impl Drop for Stated {
@@ -1877,3 +1972,8 @@ mod tests;
 #[cfg(test)]
 #[path = "client_offer_tests.rs"]
 mod offer_tests;
+
+/// How long the link's worker waits, on any unix (no keeper is reached).
+#[cfg(test)]
+#[path = "client_wait_tests.rs"]
+mod wait_tests;

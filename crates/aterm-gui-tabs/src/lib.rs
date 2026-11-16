@@ -11,3 +11,5 @@
 pub mod front_content;
 /// Stable view, tab and app-instance ids, the view store and the pane tree.
 pub mod tab_model;
+
+mod title_authority;

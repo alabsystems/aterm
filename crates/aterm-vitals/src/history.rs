@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The disk's 24 h free history and its rates (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.2),
-//! kept across relaunches ([`FreeHistory::saved`], [`FreeHistory::restored`]).
+//! The disk's free history and its rates (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §7.2): 24
+//! hours in 10-minute buckets ([`FreeHistory`]) and 3 weeks in hour buckets ([`FreeWeeks`],
+//! `docs/DESIGN-disk-custody-2026-11-12.md` §4), each kept across relaunches
+//! ([`FreeSeries::saved`], [`FreeSeries::restored`]).
 
 use std::collections::VecDeque;
 
@@ -12,6 +14,10 @@ use crate::ring::{Agg, BUCKET_S, BucketRing, Lands, Taken, lands};
 pub const FREE_BUCKET_S: i64 = 600;
 /// Buckets the free history keeps: 24 hours.
 pub const FREE_BUCKETS: usize = 144;
+/// Seconds one bucket of the three-week free history covers: an hour.
+pub const WEEK_BUCKET_S: i64 = 3_600;
+/// Buckets the three-week free history keeps: 21 days.
+pub const WEEK_BUCKETS: usize = 504;
 /// How long `rate60` must have been positive before time to full shows, ms.
 pub const FILLING_FOR_MS: i64 = 600_000;
 /// Time to full is shown only under this, seconds: 7 days.
@@ -36,7 +42,7 @@ pub struct VolumeId {
 /// weighed by its time ([`Agg`]: the mean, the least and the most free).
 pub type FreeRow = (i64, Agg);
 
-/// A free history as the host writes it ([`FreeHistory::saved`]).
+/// A free history as the host writes it ([`FreeSeries::saved`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SavedFree {
     /// The volume it read.
@@ -45,10 +51,12 @@ pub struct SavedFree {
     pub rows: Vec<FreeRow>,
 }
 
-/// The last 24 hours of free space, in 10-minute buckets of time-weighted readings.
+/// The last `BUCKETS` buckets of free space, each `BUCKET_MS` long, of time-weighted readings:
+/// the series' span. [`FreeHistory`] and [`FreeWeeks`] are its two spans; both land, step back
+/// and restore by the one rule this type holds.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FreeHistory {
-    /// The key (unix minute ÷ 10) of `b[0]`.
+pub struct FreeSeries<const BUCKET_MS: i64, const BUCKETS: usize> {
+    /// The key (unix ms ÷ `BUCKET_MS`) of `b[0]`.
     first_k: i64,
     b: VecDeque<Agg>,
     /// When the newest reading was taken, unix ms; `None` for a restored history not read on.
@@ -62,8 +70,15 @@ pub struct FreeHistory {
 }
 
 const FREE_BUCKET_MS: i64 = FREE_BUCKET_S * 1000;
+const WEEK_BUCKET_MS: i64 = WEEK_BUCKET_S * 1000;
 
-impl Default for FreeHistory {
+/// The last 24 hours of free space, in 10-minute buckets of time-weighted readings.
+pub type FreeHistory = FreeSeries<FREE_BUCKET_MS, FREE_BUCKETS>;
+
+/// The last 3 weeks of free space, in hour buckets of time-weighted readings.
+pub type FreeWeeks = FreeSeries<WEEK_BUCKET_MS, WEEK_BUCKETS>;
+
+impl<const BUCKET_MS: i64, const BUCKETS: usize> Default for FreeSeries<BUCKET_MS, BUCKETS> {
     fn default() -> Self {
         Self {
             first_k: 0,
@@ -76,7 +91,7 @@ impl Default for FreeHistory {
     }
 }
 
-impl FreeHistory {
+impl<const BUCKET_MS: i64, const BUCKETS: usize> FreeSeries<BUCKET_MS, BUCKETS> {
     /// An empty history.
     #[must_use]
     pub fn new() -> Self {
@@ -115,34 +130,34 @@ impl FreeHistory {
     /// reading stands for.
     pub fn note(&mut self, t: Taken, free: u64) {
         let at = t.at_ms;
-        match lands(self.last_k(), self.newest_ms, at, FREE_BUCKET_MS) {
+        match lands(self.last_k(), self.newest_ms, at, BUCKET_MS) {
             Lands::First(k) => {
                 self.first_k = k;
                 self.b.push_back(Agg::default());
             }
             Lands::Newest => {}
             Lands::Ahead(by) => {
-                if by >= FREE_BUCKETS as i64 {
+                if by >= BUCKETS as i64 {
                     self.b.clear();
-                    self.first_k = at.div_euclid(FREE_BUCKET_MS);
+                    self.first_k = at.div_euclid(BUCKET_MS);
                 } else {
                     for _ in 1..by {
                         self.b.push_back(Agg::default());
                     }
                 }
                 self.b.push_back(Agg::default());
-                while self.b.len() > FREE_BUCKETS {
+                while self.b.len() > BUCKETS {
                     self.b.pop_front();
                     self.first_k += 1;
                 }
             }
             Lands::Back(by) => {
-                let shift = by.saturating_mul(FREE_BUCKET_MS);
+                let shift = by.saturating_mul(BUCKET_MS);
                 self.first_k -= by;
                 self.covered_to = self.covered_to.saturating_sub(shift);
                 self.newest_ms = self.newest_ms.map(|n| n.saturating_sub(shift));
                 self.b.push_back(Agg::default());
-                while self.b.len() > FREE_BUCKETS {
+                while self.b.len() > BUCKETS {
                     self.b.pop_front();
                     self.first_k += 1;
                 }
@@ -153,10 +168,10 @@ impl FreeHistory {
         }
         let k = self.last_k().unwrap_or(0);
         let (lo, hi) = t.slot();
-        let b_lo = k.saturating_mul(FREE_BUCKET_MS);
+        let b_lo = k.saturating_mul(BUCKET_MS);
         let from = lo.max(self.covered_to).max(b_lo);
-        let to = hi.min(b_lo.saturating_add(FREE_BUCKET_MS));
-        let w = u32::try_from(to.saturating_sub(from).clamp(0, FREE_BUCKET_MS)).unwrap_or(0);
+        let to = hi.min(b_lo.saturating_add(BUCKET_MS));
+        let w = u32::try_from(to.saturating_sub(from).clamp(0, BUCKET_MS)).unwrap_or(0);
         if w > 0 {
             self.covered_to = to;
         }
@@ -203,21 +218,21 @@ impl FreeHistory {
         (self.first_k..)
             .zip(&self.b)
             .filter(|(_, b)| b.is_sound())
-            .map(|(k, b)| (k.saturating_mul(FREE_BUCKET_MS), *b))
+            .map(|(k, b)| (k.saturating_mul(BUCKET_MS), *b))
             .collect()
     }
 
-    /// A history from what [`Self::saved`] gave, holding only the rows in the 24 hours ending at
-    /// `now_unix_ms`; its first reading keeps it only on the same volume ([`Self::note_on`]).
+    /// A history from what [`Self::saved`] gave, holding only the rows in the series' span ending
+    /// at `now_unix_ms`; its first reading keeps it only on the same volume ([`Self::note_on`]).
     #[must_use]
     pub fn restored(saved: &SavedFree, now_unix_ms: i64) -> Self {
-        let now_k = now_unix_ms.div_euclid(FREE_BUCKET_MS);
-        let oldest = now_k.saturating_sub(FREE_BUCKETS as i64 - 1);
+        let now_k = now_unix_ms.div_euclid(BUCKET_MS);
+        let oldest = now_k.saturating_sub(BUCKETS as i64 - 1);
         let mut rows: Vec<(i64, Agg)> = saved
             .rows
             .iter()
             .filter(|(_, b)| b.is_sound())
-            .map(|&(at, b)| (at.div_euclid(FREE_BUCKET_MS), b))
+            .map(|&(at, b)| (at.div_euclid(BUCKET_MS), b))
             .filter(|(k, _)| (oldest..=now_k).contains(k))
             .collect();
         rows.sort_by_key(|&(k, _)| k);
@@ -238,7 +253,7 @@ impl FreeHistory {
         }
     }
 
-    /// The 24 hours ending at `now_unix_ms`, each bucket's least free space.
+    /// The series' span ending at `now_unix_ms`, each bucket's least free space.
     #[must_use]
     pub fn window(&self, now_unix_ms: i64) -> Vec<Option<u64>> {
         self.buckets(now_unix_ms)
@@ -247,12 +262,12 @@ impl FreeHistory {
             .collect()
     }
 
-    /// The 24 hours ending at `now_unix_ms`, each bucket's readings: its time-weighted mean, its
-    /// least and its most free space.
+    /// The series' span ending at `now_unix_ms`, each bucket's readings: its time-weighted mean,
+    /// its least and its most free space.
     #[must_use]
     pub fn buckets(&self, now_unix_ms: i64) -> Vec<Option<Agg>> {
-        let now_k = now_unix_ms.div_euclid(FREE_BUCKET_MS);
-        let start_k = now_k.saturating_sub(FREE_BUCKETS as i64 - 1);
+        let now_k = now_unix_ms.div_euclid(BUCKET_MS);
+        let start_k = now_k.saturating_sub(BUCKETS as i64 - 1);
         (start_k..=now_k)
             .map(|k| {
                 k.checked_sub(self.first_k)

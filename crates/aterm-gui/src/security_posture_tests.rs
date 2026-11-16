@@ -38,7 +38,7 @@ fn a_staged_posture_draws_the_security_block_on_a_headless_instance() {
     use aterm_types::app_inspection::InspectionProjection;
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 160;
         window.rows = 60;
     }

@@ -105,8 +105,8 @@ impl Kernel for Kernel2 {
         matches!(pid, NEW | TUI).then_some(SHELL)
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        Some((1, "launchd".to_string()))
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(Some((1, "launchd".to_string())))
     }
 
     fn process_start(&self, pid: u32) -> Option<String> {

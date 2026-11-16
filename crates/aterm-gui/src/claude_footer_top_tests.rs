@@ -819,7 +819,7 @@ const GHOST: KeyFace = KeyFace {
 #[test]
 fn the_ghost_sits_left_of_the_switch() {
     let ghost_text = format!(" {} off ", aterm_primer::CLAUDE_TOP_EFFORT_KEY);
-    let lockup = CliMark::Claude.lockup_cells(Build::Vendor);
+    let lockup = CliMark::CLAUDE.lockup_cells(Build::Vendor);
     let mut seen = [false; 3];
     for len in (19..=140).rev() {
         let run = plain_run(len);
@@ -1140,7 +1140,7 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
         ),
     ];
     let mut walked = 0;
-    for mark in CliMark::ALL {
+    for mark in CliMark::SEEDS {
         for build in Build::ALL {
             for switch in [
                 Some(LIT),
@@ -1170,12 +1170,12 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
             }
         }
     }
-    assert_eq!(walked, CliMark::ALL.len() * Build::ALL.len() * 10 * 4);
+    assert_eq!(walked, CliMark::SEEDS.len() * Build::ALL.len() * 10 * 4);
     let span_of = |w: usize| tailed_run(w.saturating_sub(12), &tail).span(KeyFace::default());
     let (rungs, n) = ladder(
         span_of(200),
         Some(known(LIT)),
-        Some(CliMark::Claude.lockup_cells(Build::Vendor)),
+        Some(CliMark::CLAUDE.lockup_cells(Build::Vendor)),
     );
     let mut skipped: Vec<Rung> = rungs[..n].to_vec();
     let icon = skipped
@@ -1201,7 +1201,7 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     let (rungs, n) = ladder(
         span_of(200),
         Some(unknown),
-        Some(CliMark::Claude.lockup_cells(Build::Vendor)),
+        Some(CliMark::CLAUDE.lockup_cells(Build::Vendor)),
     );
     let mut early: Vec<Rung> = rungs[..n].to_vec();
     early[0].lockup = Some(Lockup::Icon);
@@ -1220,7 +1220,7 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         cli_ver: Inline::new("2.1.305"),
         ..LIT
     };
-    let lockup = Some(CliMark::Claude.lockup_cells(Build::Vendor));
+    let lockup = Some(CliMark::CLAUDE.lockup_cells(Build::Vendor));
     let rung_at = |span: TopSpan| rung_name(lay_top(span, Some(paint), lockup).map(|l| l.rung));
     let tailed = |w: usize| tailed_run(w - 12, &tail).span(KeyFace::default());
     let ghost = |w: usize| plain_run(w).span(GHOST);
@@ -1273,7 +1273,7 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
     );
     assert_eq!(up_at(icon_build), "T0 icon", "the icon keeps the build");
     let (rungs, n) = ladder(tailed(icon_build), Some(up), lockup);
-    let full = CliMark::Claude.lockup_cells(Build::Vendor);
+    let full = CliMark::CLAUDE.lockup_cells(Build::Vendor);
     let named: Vec<Rung> = rungs[..n]
         .iter()
         .map(|r| match (r.label, r.lockup) {
@@ -1369,7 +1369,7 @@ fn a_switch_stands_wherever_it_stood() {
         let (rungs, n) = ladder(
             span,
             Some(paint),
-            Some(CliMark::Claude.lockup_cells(Build::Vendor)),
+            Some(CliMark::CLAUDE.lockup_cells(Build::Vendor)),
         );
         let without: Vec<Rung> = rungs[..n]
             .iter()
@@ -1947,13 +1947,15 @@ fn the_mark_stands_only_where_its_write_took() {
             .contains(&laid[0]),
         "CONTROL: in the card's record"
     );
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut field_guard_ws = app.windows.get_mut(&wid).expect("window");
+    let ws = &mut **field_guard_ws;
     assert!(
         crate::claude_footer::undo(&mut ws.claude_footer_undo, &mut ws.input_scratch),
         "the footer's write comes off"
     );
     ws.input_scratch.combining[row].push((40, Box::new(['\u{301}'])));
     let _ = crate::work_counts::take_footer_tops_composed();
+    drop(field_guard_ws);
     let _ = pass(&mut app, wid);
     assert_eq!(
         crate::work_counts::take_footer_tops_composed(),
@@ -2997,7 +2999,7 @@ fn arrow_paint(state: UpState) -> SwitchPaint {
 #[test]
 fn the_arrow_ends_the_rule_a_blank_from_its_close() {
     let tail = claude_tail();
-    let lockup = Some(CliMark::Claude.lockup_cells(Build::Vendor));
+    let lockup = Some(CliMark::CLAUDE.lockup_cells(Build::Vendor));
     let run = tailed_run(158 - 12, &tail);
     let field = run.col + run.span(KeyFace::default()).whole;
     for state in [UpState::Ready, UpState::Asked] {
@@ -3130,7 +3132,7 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
 #[test]
 fn an_asked_move_keeps_the_labels_width() {
     let tail = claude_tail();
-    let lockup = Some(CliMark::Claude.lockup_cells(Build::Vendor));
+    let lockup = Some(CliMark::CLAUDE.lockup_cells(Build::Vendor));
     let laid_at = |paint: SwitchPaint, w: usize| {
         let span = tailed_run(w - 12, &tail).span(KeyFace::default());
         lay_top(span, Some(paint), lockup).expect("a rung")
@@ -4249,13 +4251,17 @@ fn the_press_names_what_it_ends() {
         rule,
     ];
     assert_eq!(
-        press_wait(&idle, None, false),
+        press_wait(&idle, None, None, false),
         "",
         "an idle screen: at once"
     );
-    assert_eq!(press_wait(&turn, None, false), "busy", "a turn: at its end");
     assert_eq!(
-        press_wait(&turn, None, true),
+        press_wait(&turn, None, None, false),
+        "busy",
+        "a turn: at its end"
+    );
+    assert_eq!(
+        press_wait(&turn, None, None, true),
         "draft",
         "a draft before a turn"
     );
@@ -4263,14 +4269,32 @@ fn the_press_names_what_it_ends() {
         aterm_phase::prompt::fixtures::STATUSLINE_MIDREPLY_2_1_311,
     );
     assert_eq!(
-        press_wait(&mid_reply, Some("\u{25D0} Claude Code"), false),
+        press_wait(&mid_reply, Some("\u{25D0} Claude Code"), None, false),
         "busy",
         "a reply the title runs under a status line: at its end, as the lane reads it"
     );
     assert_eq!(
-        press_wait(&mid_reply, Some("\u{2733} Claude Code"), false),
+        press_wait(&mid_reply, Some("\u{2733} Claude Code"), None, false),
         "",
         "CONTROL: the rest glyph leaves the screen alone"
+    );
+    let answered = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::STATUSLINE_MIDREPLY_ANSWERED_2_1_323,
+    );
+    assert_eq!(
+        press_wait(
+            &answered,
+            Some("Claude Code"),
+            Some("state=working:app=claude-code"),
+            false
+        ),
+        "busy",
+        "a reply its report runs under a glyphless title (2.1.323, its query answered): at its end"
+    );
+    assert_eq!(
+        press_wait(&answered, Some("Claude Code"), None, false),
+        "",
+        "CONTROL: with no report the glyphless title leaves the screen alone"
     );
     assert_eq!(
         press_wait_of("background"),

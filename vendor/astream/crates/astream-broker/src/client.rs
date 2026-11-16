@@ -18,10 +18,11 @@
 
 use crate::logid::{Lineage, LogIdentity};
 use crate::proto::{
-    append_commit_frame, append_frame, append_publish_frame, append_relay_frame,
-    append_retire_frame, decode_delivery_origin, decode_response_with_bt, encode_request,
-    foreign_protocol, read_frame, Request, Response, WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER,
-    ERR_BAD_SUBJECT, ERR_ORIGIN_REFUSED, ERR_ORIGIN_UNKNOWN, ERR_PROTOCOL, ERR_RATE_LIMITED,
+    append_commit_frame, append_frame, append_fresh_publish_frame, append_publish_frame,
+    append_relay_frame, append_retire_frame, decode_delivery_origin, decode_response_with_bt,
+    encode_request, foreign_protocol, fresh_publish_frame_len, read_frame, Request, Response,
+    WireStats, CAP_EXPIRED_PREFIX, ERR_BAD_FILTER, ERR_BAD_SUBJECT, ERR_FRESH_FENCED,
+    ERR_FRESH_HELD, ERR_ORIGIN_REFUSED, ERR_ORIGIN_UNKNOWN, ERR_PROTOCOL, ERR_RATE_LIMITED,
     ERR_RECORD_REFUSED, ERR_REFUSED, ERR_RETIRE_REFUSED, ERR_SUBJECT_BOUND, ERR_UNAUTHORIZED,
     LOG_POISONED_PREFIX, PROTO_VERSION, RATE_LIMITED_PREFIX, RETAINED_FROM_PREFIX,
     RETIRE_CHARGED_PREFIX, RETIRE_CUT_PREFIX, RETIRE_LOG_PREFIX, RETIRE_WILL_PREFIX,
@@ -257,6 +258,9 @@ impl CreditWindow {
 
 const ATTACH_WINDOW: usize = 16;
 const MAX_PIPELINE_WINDOW: usize = 512;
+
+/// Maximum total framed bytes accepted by one [`Client::send_fresh_pipelined`] call.
+pub const MAX_FRESH_PIPELINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A connection to a broker over a byte stream. Three transports:
 ///
@@ -989,6 +993,12 @@ impl<S: Read + Write> Client<S> {
         self.ext.supports_settle()
     }
 
+    /// Whether the latest `Hello` offered [`Request::FreshPublish`] and its mandatory fence.
+    /// False before `Hello` and against a broker that predates the request.
+    pub const fn supports_fresh_publish(&self) -> bool {
+        self.ext.supports_fresh_publish()
+    }
+
     /// The device the broker's log file is on and whether its full flush drains it, as the
     /// latest `Hello` answer told it ([`LogDevice`](crate::LogDevice)). `None` before any
     /// `Hello`, from a broker that predates the entry, or from one that could not read its
@@ -1402,6 +1412,77 @@ impl<S: Read + Write> Client<S> {
         }
         if burst.is_empty() {
             return Ok(());
+        }
+        self.write_owed_n(&out, burst.len())
+    }
+
+    /// Send fresh publishes in order, without waiting for their FIFO acknowledgements.
+    /// Read each answer with [`recv_publish_ack`](Self::recv_publish_ack). A held key is an
+    /// [`ERR_FRESH_HELD`] refusal even when its subject and body match. A staging refusal makes
+    /// later fresh publishes [`ERR_FRESH_FENCED`] before they stage. A late commit, flush or quorum
+    /// error fences subsequent staging; other requests already staged in that batch retain their
+    /// own outcomes. Reconnect before sending fresh publishes after a broker refusal. Ordinary
+    /// publishes retain their existing behavior.
+    ///
+    /// The latest `Hello` must offer [`supports_fresh_publish`](Self::supports_fresh_publish),
+    /// including for an empty call. At most [`MAX_PIPELINE_WINDOW`](Self::MAX_PIPELINE_WINDOW)
+    /// acknowledgements may be outstanding after the send, and this call may contain at most
+    /// [`MAX_FRESH_PIPELINE_BYTES`] framed bytes. All bounds and framing are checked before any
+    /// bytes are written; a refusal leaves the client in step and its owed count unchanged.
+    ///
+    /// A transport error may follow complete frames already received by the broker. It leaves
+    /// their outcomes unknown and latches the client out of step. It does not imply success or
+    /// failure of those publishes; a caller chooses recovery according to its own replay contract.
+    pub fn send_fresh_pipelined(&mut self, burst: &[FreshPublish<'_>]) -> io::Result<()> {
+        self.in_step()?;
+        if !self.supports_fresh_publish() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "broker did not offer fresh publishes",
+            ));
+        }
+        if burst.len() > Self::MAX_PIPELINE_WINDOW
+            || self
+                .owed
+                .checked_add(burst.len() as u64)
+                .is_none_or(|owed| owed > Self::MAX_PIPELINE_WINDOW as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fresh publish batch exceeds the outstanding acknowledgement window",
+            ));
+        }
+        let mut bytes = 0usize;
+        for op in burst {
+            let len = fresh_publish_frame_len(op.subject.len(), op.body.len())?;
+            bytes = bytes
+                .checked_add(len)
+                .filter(|&n| n <= MAX_FRESH_PIPELINE_BYTES)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "fresh publish batch exceeds byte cap",
+                    )
+                })?;
+        }
+        if burst.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "fresh publish buffer allocation failed",
+            )
+        })?;
+        for op in burst {
+            append_fresh_publish_frame(
+                &mut out,
+                op.producer_id,
+                op.producer_seq,
+                op.subject,
+                op.body,
+            )?;
         }
         self.write_owed_n(&out, burst.len())
     }
@@ -3146,6 +3227,20 @@ pub enum Pipelined<'a> {
     },
 }
 
+/// One borrowed record for [`Client::send_fresh_pipelined`]. A fresh publish requires its
+/// producer key to be absent; it is not an idempotent retry of an ordinary publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshPublish<'a> {
+    /// The producer the key belongs to.
+    pub producer_id: u64,
+    /// Its sequence within that producer.
+    pub producer_seq: u64,
+    /// Where the record is published.
+    pub subject: &'a str,
+    /// What it carries.
+    pub body: &'a [u8],
+}
+
 impl std::fmt::Display for AcksOwed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -3208,6 +3303,18 @@ pub struct BrokerRefusal {
 }
 
 impl BrokerRefusal {
+    /// Whether a fresh publish found its key already held ([`ERR_FRESH_HELD`]). This request
+    /// appended nothing, even if the held body is equal; later fresh requests need a reconnect.
+    pub const fn is_fresh_held(&self) -> bool {
+        self.code == ERR_FRESH_HELD
+    }
+
+    /// Whether an earlier fresh failure fenced this request ([`ERR_FRESH_FENCED`]). This request
+    /// appended nothing and did not establish another key collision. Reconnect before retrying.
+    pub const fn is_fresh_fenced(&self) -> bool {
+        self.code == ERR_FRESH_FENCED
+    }
+
     /// Whether the SAME request, resent unchanged on the same connection, is refused
     /// again — a record that can never land, a read the grants never cover — so a
     /// caller retrying it would loop: [`ERR_BAD_SUBJECT`], [`ERR_BAD_FILTER`],
@@ -3218,8 +3325,9 @@ impl BrokerRefusal {
     /// `false` is NOT "will succeed": it is every other code, [`ERR_REFUSED`] above
     /// all — a write that failed to append or commit, a quorum not reached — then
     /// [`ERR_SUBJECT_BOUND`] (see [`is_subject_bound`](Self::is_subject_bound)),
-    /// [`ERR_ORIGIN_UNKNOWN`] (see [`is_origin_unknown`](Self::is_origin_unknown)), and
-    /// every code this client does not know. A broker older than the permanent codes
+    /// [`ERR_ORIGIN_UNKNOWN`] (see [`is_origin_unknown`](Self::is_origin_unknown)), fresh-key
+    /// collisions or fences, which require the caller's reconnect/recovery decision, and every
+    /// code this client does not know. A broker older than the permanent codes
     /// answered every refusal but 2, 3 and 6 with `ERR_REFUSED`, so against it this is
     /// `false` for a permanent refusal too: the fail-safe reading, under which a
     /// caller retries rather than drops.
@@ -5121,6 +5229,227 @@ mod owed_acks {
         c.send_publish(1, 2, "/o/a", b"two").unwrap();
         assert_eq!(c.owed_acks(), 2);
         (c, written)
+    }
+
+    fn fresh_client(replies: Vec<u8>) -> (Client<Recorder>, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut client = Client::from_stream(Recorder {
+            replies,
+            written: Arc::clone(&written),
+            fail_writes: false,
+        });
+        client.ext.requests = Some(crate::proto::REQUEST_FRESH_PUBLISH);
+        (client, written)
+    }
+
+    fn fresh<'a>(seq: u64, body: &'a [u8]) -> super::FreshPublish<'a> {
+        super::FreshPublish {
+            producer_id: 7,
+            producer_seq: seq,
+            subject: "/fresh",
+            body,
+        }
+    }
+
+    #[test]
+    fn fresh_send_requires_an_offer_and_preserves_fifo_refusals() {
+        use crate::proto::{ERR_FRESH_FENCED, ERR_FRESH_HELD};
+        let replies = [
+            ack(10),
+            frame(&Response::Error {
+                code: ERR_FRESH_HELD,
+                msg: "held".into(),
+            }),
+            frame(&Response::Error {
+                code: ERR_FRESH_FENCED,
+                msg: "fenced".into(),
+            }),
+            ack(11),
+        ]
+        .concat();
+        let (mut client, written) = fresh_client(replies);
+        client.ext.requests = None;
+        assert!(!client.supports_fresh_publish());
+        for burst in [&[][..], &[fresh(1, b"one")][..]] {
+            assert_eq!(
+                client.send_fresh_pipelined(burst).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(client.owed_acks(), 0);
+        client.ext.requests = Some(crate::proto::REQUEST_FRESH_PUBLISH);
+        assert!(client.supports_fresh_publish());
+        client.send_fresh_pipelined(&[]).unwrap();
+        assert!(written.lock().unwrap().is_empty());
+        client
+            .send_fresh_pipelined(&[fresh(1, b"one"), fresh(2, b"two"), fresh(3, b"three")])
+            .unwrap();
+        assert_eq!(client.owed_acks(), 3);
+        assert_eq!(client.recv_publish_ack().unwrap(), (10, false));
+        let held = client.recv_publish_ack().unwrap_err();
+        let held = broker_refusal(&held).unwrap();
+        assert!(held.is_fresh_held() && !held.is_fresh_fenced() && !held.is_permanent());
+        let fenced = client.recv_publish_ack().unwrap_err();
+        let fenced = broker_refusal(&fenced).unwrap();
+        assert!(fenced.is_fresh_fenced() && !fenced.is_fresh_held() && !fenced.is_permanent());
+        assert_eq!(client.owed_acks(), 0);
+        assert_eq!(
+            client.publish(7, 4, "/ordinary", b"unchanged").unwrap(),
+            (11, false)
+        );
+        let sent = requests(&written);
+        assert_eq!(sent.len(), 4);
+        for (index, body) in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                sent[index],
+                Request::FreshPublish {
+                    producer_id: 7,
+                    producer_seq: index as u64 + 1,
+                    subject: "/fresh".into(),
+                    body: body.to_vec(),
+                }
+            );
+        }
+        assert!(matches!(sent[3], Request::Publish { .. }));
+    }
+
+    #[test]
+    fn fresh_send_checks_the_whole_window_and_all_frames_before_writing() {
+        let (mut client, written) = fresh_client(Vec::new());
+        let tiny = fresh(1, b"");
+        assert!(client.send_fresh_pipelined(&vec![tiny; 513]).is_err());
+        assert!(written.lock().unwrap().is_empty());
+        client.owed = u64::MAX;
+        assert!(client.send_fresh_pipelined(&[tiny]).is_err());
+        assert_eq!(client.owed_acks(), u64::MAX);
+        client.owed = 511;
+        assert!(client.send_fresh_pipelined(&[tiny, tiny]).is_err());
+        assert!(written.lock().unwrap().is_empty());
+        client.owed = 0;
+        let huge = vec![0; MAX_PAYLOAD_LEN];
+        assert_eq!(
+            client
+                .send_fresh_pipelined(&[tiny, fresh(2, &huge)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "a bad later frame sends no prefix"
+        );
+        assert_eq!(client.owed_acks(), 0);
+        drop(huge);
+        client.send_fresh_pipelined(&vec![tiny; 512]).unwrap();
+        assert_eq!(client.owed_acks(), 512);
+        assert_eq!(requests(&written).len(), 512);
+        let before = written.lock().unwrap().len();
+        assert!(client.send_fresh_pipelined(&[tiny]).is_err());
+        assert_eq!(written.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn fresh_send_counts_frame_headers_at_the_byte_cap() {
+        struct Count(usize);
+        impl Read for Count {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut client = Client::from_stream(Count(0));
+        client.ext.requests = Some(crate::proto::REQUEST_FRESH_PUBLISH);
+        let overhead = crate::proto::fresh_publish_frame_len("/fresh".len(), 0).unwrap();
+        let exact = super::MAX_FRESH_PIPELINE_BYTES - overhead;
+        let body = vec![0; exact + 1];
+        assert_eq!(
+            client
+                .send_fresh_pipelined(&[fresh(1, &body)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(client.stream.0, 0);
+        assert_eq!(client.owed_acks(), 0);
+        client
+            .send_fresh_pipelined(&[fresh(1, &body[..exact])])
+            .unwrap();
+        assert_eq!(client.stream.0, super::MAX_FRESH_PIPELINE_BYTES);
+        assert_eq!(client.owed_acks(), 1);
+        drop(body);
+        let body = vec![0; 1024 * 1024];
+        let before = client.stream.0;
+        assert_eq!(
+            client
+                .send_fresh_pipelined(&vec![fresh(2, &body); 16])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            client.stream.0, before,
+            "individually valid frames exceed the aggregate cap"
+        );
+        assert_eq!(client.owed_acks(), 1);
+    }
+
+    #[test]
+    fn a_partial_fresh_write_latches_unknown_outcomes() {
+        struct Partial {
+            left: usize,
+            wrote: usize,
+        }
+        impl Read for Partial {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for Partial {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.left == 0 {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                let n = self.left.min(bytes.len());
+                self.left -= n;
+                self.wrote += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut client = Client::from_stream(Partial { left: 20, wrote: 0 });
+        client.ext.requests = Some(crate::proto::REQUEST_FRESH_PUBLISH);
+        assert_eq!(
+            client
+                .send_fresh_pipelined(&[fresh(1, b"one"), fresh(2, b"two")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(client.stream.wrote, 20);
+        assert_eq!(client.owed_acks(), 0);
+        assert_eq!(
+            client.recv_publish_ack().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            client.send_fresh_pipelined(&[]).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(client.stream.wrote, 20);
     }
 
     /// EVERY request that reads its own reply is refused with the count while two acks

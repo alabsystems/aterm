@@ -70,21 +70,34 @@ words!(
         TokenFallback = "token-fallback",
         TokenOffered = "token-offered",
         TokenRemoved = "token-removed",
+        TokenDiffer = "token-differ",
         TokenStopped = "token-stopped",
         // What a tab's CLI really runs on, read from its login file
         // (`docs/DESIGN-account-discovery-2026-11-09.md`): the observed account, the tab and the
         // harness that runs it.
         Seen = "seen",
+        // The shared files' words (docs/DESIGN-shared-files-2026-11-11.md §10 file 5): a
+        // sign-in a bot protection stopped, one no route could start, and an owner's write this
+        // Mac published (`op`, `via`, `program`).
+        SignInBlocked = "sign-in-blocked",
+        NoRoute = "no-route",
+        Decided = "decided",
     }
 );
 
 impl Kind {
     /// A sharp event goes out within the flusher's next pass while this Mac is under its pace
-    /// (design §3.9): a sign-in, a sign-out, a wrong account, an ended login or a wall.
+    /// (design §3.9): a sign-in, a sign-out, a wrong account, an ended login, a wall or a
+    /// blocked sign-in (docs/DESIGN-shared-files-2026-11-11.md §10, "Publication pace").
     pub const fn sharp(self) -> bool {
         matches!(
             self,
-            Self::SignedIn | Self::SignedOut | Self::WrongAccount | Self::LoginEnded | Self::Wall
+            Self::SignedIn
+                | Self::SignedOut
+                | Self::WrongAccount
+                | Self::LoginEnded
+                | Self::Wall
+                | Self::SignInBlocked
         )
     }
 
@@ -146,6 +159,8 @@ words!(
         AuthFile = "auth-file",
         CliLog = "cli-log",
         VaultToken = "vault-token",
+        // A `decided` event's: an owner's write to a shared file, through `aterm file`.
+        File = "file",
     }
 );
 
@@ -244,8 +259,9 @@ impl std::fmt::Debug for Pk {
 pub type SubKey = Word<12>;
 
 /// One event (design §4.17 `ev`): `{t, k, a, c, s?, w?, p?, r?, rr?, u?, plan?, src, why?, to?,
-/// x?, h?}`, `a` absent only on a `probe` of an unpooled CLI's unseen login, `x` and `h` only on
-/// a kind that [names a tab](Kind::names_tab).
+/// x?, h?, op?, via?, pg?}`, `a` absent only on a `probe` of an unpooled CLI's unseen login and on
+/// a `decided`, `x` and `h` only on a kind that [names a tab](Kind::names_tab), and `op`, `via`
+/// and `pg` on a `decided` and on nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Event {
     /// When, Unix seconds.
@@ -255,7 +271,8 @@ pub struct Event {
     /// Muse) whose login the reader did not see is attributed by its realm alone, which the CLI
     /// word fixes (design §11 step 9).
     pub account: Option<Pk>,
-    /// The CLI word (`claude`, `codex`, `grok`, `kimi`, `agy`, `muse`, `codex-alab`).
+    /// The CLI word (`claude`, `codex`, `grok`, `kimi`, `agy`, `muse`, `codex-alab`); `aterm`
+    /// on a `decided`, whose write went through `aterm file`.
     pub cli: Word<10>,
     /// The sub-account's `AccountKey`, where the account has workspaces.
     pub sub: Option<SubKey>,
@@ -279,6 +296,13 @@ pub struct Event {
     pub tab: Option<Word<8>>,
     /// The harness word of the tab's session.
     pub harness: Option<Word<16>>,
+    /// A `decided`'s operation: the first 8 bytes of its digest, 16 lower-case hex.
+    pub op: Option<Word<16>>,
+    /// A `decided`'s verb (`set`, `add`, `rm`, `revert`, `resolve`, `commit`).
+    pub via: Option<Word<16>>,
+    /// A `decided`'s author, as the intent says it (`person`, `program`, `harness`, an agent's
+    /// word): a claim, never an admission condition (docs/DESIGN-shared-files-2026-11-11.md §5).
+    pub program: Option<Word<16>>,
 }
 
 impl Event {
@@ -297,7 +321,7 @@ impl Event {
             Kind::SignedOut | Kind::Displaced => Some(SIGNIN_OUT),
             Kind::LoginEnded => Some(SIGNIN_ENDED),
             Kind::WrongAccount if self.tab.is_none() => Some(SIGNIN_WRONG),
-            Kind::SignInFailed => Some(SIGNIN_FAILED),
+            Kind::SignInFailed | Kind::SignInBlocked | Kind::NoRoute => Some(SIGNIN_FAILED),
             Kind::Auth => match self.why.as_ref().map(Word::as_str) {
                 Some(AUTH_OK) => Some(SIGNIN_IN),
                 Some(AUTH_UNSEEN) => Some(SIGNIN_UNKNOWN),
@@ -387,8 +411,14 @@ impl Event {
             line.text(f, "h", h.as_str())?;
         }
         line.text(f, "k", self.kind.word())?;
+        if let Some(op) = &self.op {
+            line.text(f, "op", op.as_str())?;
+        }
         if let Some(p) = self.pct_x10 {
             line.uint(f, "p", u64::from(p))?;
+        }
+        if let Some(pg) = &self.program {
+            line.text(f, "pg", pg.as_str())?;
         }
         if let Some(plan) = &self.plan {
             line.text(f, "plan", plan.as_str())?;
@@ -409,6 +439,9 @@ impl Event {
         }
         if let Some(u) = self.until {
             line.uint(f, "u", u)?;
+        }
+        if let Some(via) = &self.via {
+            line.text(f, "via", via.as_str())?;
         }
         if let Some(w) = self.window {
             line.text(f, "w", w.word())?;
@@ -459,6 +492,15 @@ impl Event {
         if let Some(h) = &self.harness {
             text("h", h.as_str());
         }
+        if let Some(op) = &self.op {
+            text("op", op.as_str());
+        }
+        if let Some(via) = &self.via {
+            text("via", via.as_str());
+        }
+        if let Some(pg) = &self.program {
+            text("pg", pg.as_str());
+        }
         o.insert("t".to_owned(), Value::from(self.t));
         for (k, v) in [
             ("p", self.pct_x10.map(u64::from)),
@@ -476,8 +518,9 @@ impl Event {
     /// peer's modified build cannot slip text past the vocabulary.
     pub fn from_value(value: &Value) -> Option<Self> {
         let o = value.as_object()?;
-        const KEYS: [&str; 16] = [
-            "a", "c", "h", "k", "p", "plan", "r", "rr", "s", "src", "t", "to", "u", "w", "why", "x",
+        const KEYS: [&str; 19] = [
+            "a", "c", "h", "k", "op", "p", "pg", "plan", "r", "rr", "s", "src", "t", "to", "u",
+            "via", "w", "why", "x",
         ];
         if o.keys().any(|k| !KEYS.contains(&k.as_str())) {
             return None;
@@ -543,13 +586,36 @@ impl Event {
                 None => None,
                 Some(w) => Some(Word::new(w)?),
             },
+            op: match word("op")? {
+                None => None,
+                Some(w) => Some(Word::new(w).filter(|op: &Word<16>| {
+                    op.as_str().len() == 16 && op.as_str().bytes().all(|b| b.is_ascii_hexdigit())
+                })?),
+            },
+            via: match word("via")? {
+                None => None,
+                Some(w) => Some(Word::new(w)?),
+            },
+            program: match word("pg")? {
+                None => None,
+                Some(w) => Some(Word::new(w)?),
+            },
         };
         // Only a kind about one tab's run names the tab and its harness.
         if (event.tab.is_some() || event.harness.is_some()) && !event.kind.names_tab() {
             return None;
         }
-        // An event names its account; a probe may name only its realm, and then no workspace.
-        if event.account.is_none() && (event.kind != Kind::Probe || event.sub.is_some()) {
+        // A `decided` names its operation, verb and author, and nothing else does.
+        let decided = event.op.is_some() && event.via.is_some() && event.program.is_some();
+        let any = event.op.is_some() || event.via.is_some() || event.program.is_some();
+        if (event.kind == Kind::Decided) != decided || (event.kind != Kind::Decided && any) {
+            return None;
+        }
+        // An event names its account; a probe may name only its realm, and then no workspace;
+        // a `decided` is about a write to a shared file, not an account.
+        if event.account.is_none()
+            && !(event.kind == Kind::Decided || (event.kind == Kind::Probe && event.sub.is_none()))
+        {
             return None;
         }
         let mut buf = [0; MAX_EVENT];

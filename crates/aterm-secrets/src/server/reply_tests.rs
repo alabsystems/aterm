@@ -199,7 +199,7 @@ fn tiny_and_large_record_parts_coalesce_without_changing_the_wire() {
 #[test]
 fn an_oversized_record_reply_is_rejected_before_any_header() {
     let large = large_record(crate::text::MAX_VALUE);
-    let reply = records_reply(vec![large; 65], false);
+    let reply = records_reply(vec![large; 65], false, None);
     let mut sink = Sink::new();
     let error = write_reply_to(&mut sink, &reply, None, HANG, HANG).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -209,7 +209,7 @@ fn an_oversized_record_reply_is_rejected_before_any_header() {
 
 #[test]
 fn the_header_and_every_record_chunk_share_one_absolute_deadline() {
-    let reply = records_reply(vec![large_record(WRITE_CHUNK); 3], false);
+    let reply = records_reply(vec![large_record(WRITE_CHUNK); 3], false, None);
     let mut sink = Sink::new();
     sink.step = Duration::from_millis(4);
     let error =

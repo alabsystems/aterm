@@ -424,6 +424,9 @@ pub(crate) enum MenuAction {
     DeckSizeFull,
     /// View ▸ Deck Size: Folded.
     DeckSizeFolded,
+    /// View ▸ Show System Resources Here: the front window takes the System Resources band, or
+    /// gives it up for the Sill (`App::toggle_window_band`).
+    ShowSystemResourcesHere,
     /// View ▸ Stats Lens (⌘I).
     ToggleStatsLens,
     /// Open the peer and shared-state close-up, including while resource bars are hidden.
@@ -446,6 +449,9 @@ pub(crate) enum MenuAction {
     Messages,
     /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
+    /// Aterm ▸ Tables…: focus or create the Tables tab, the registry's tables, in the front
+    /// window.
+    Tables,
     /// Open the read-only Allocation pane beside the focused view, or in a tab when space is tight.
     Allocation,
     /// Open the native email client.
@@ -586,6 +592,7 @@ impl MenuAction {
             MenuAction::StatsBarsDeck => 84,
             MenuAction::StatsBarsSill => 85,
             MenuAction::StatsBarsOff => 86,
+            MenuAction::ShowSystemResourcesHere => 106,
             MenuAction::ToggleStatsLens => 87,
             MenuAction::NetworkState => 95,
             MenuAction::RewindPane => 93,
@@ -598,6 +605,7 @@ impl MenuAction {
             MenuAction::DeckSizeFolded => 90,
             MenuAction::Save => 91,
             MenuAction::SystemState => 92,
+            MenuAction::Tables => 105,
             MenuAction::Mail => 98,
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -678,6 +686,7 @@ impl MenuAction {
             84 => MenuAction::StatsBarsDeck,
             85 => MenuAction::StatsBarsSill,
             86 => MenuAction::StatsBarsOff,
+            106 => MenuAction::ShowSystemResourcesHere,
             87 => MenuAction::ToggleStatsLens,
             95 => MenuAction::NetworkState,
             88 => MenuAction::DeckSizeAuto,
@@ -685,6 +694,7 @@ impl MenuAction {
             90 => MenuAction::DeckSizeFolded,
             91 => MenuAction::Save,
             92 => MenuAction::SystemState,
+            105 => MenuAction::Tables,
             98 => MenuAction::Mail,
             93 => MenuAction::RewindPane,
             94 => MenuAction::ExportPaneHistory,
@@ -721,7 +731,10 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
         | "NewControlledTab"
         | "NewControllerWindow"
         | "NewControllerTab" => Some(
-            "every in-session client already holds Owner; start workers with spawn agent=claude",
+            "every in-session client already holds Owner; read existing sessions with `aterm ctl \
+             survey`; use your harness's native subagents for delegation and its own shell tools \
+             for commands; new sessions need an explicit request or a concrete need native tools \
+             cannot meet (`aterm help workers`)",
         ),
 
         "TogglePresenceBand" | "TogglePresenceRim" | "ToggleNeedsInWindows" => {
@@ -1056,6 +1069,9 @@ pub(crate) struct MenuLive {
     pub aos_attached: bool,
     /// The front window's recording carries the person's grant (its checkmark).
     pub aos_unseen: bool,
+    /// The front window carries the System Resources band (Show System Resources Here's
+    /// checkmark): the window's bit, kept while the Stats Bars setting is not Deck.
+    pub band_here: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1076,6 +1092,7 @@ impl MenuLive {
         can_rewind: false,
         aos_attached: false,
         aos_unseen: false,
+        band_here: false,
     };
 
     const fn bits(self) -> u16 {
@@ -1093,6 +1110,7 @@ impl MenuLive {
             | (self.can_rewind as u16) << 11
             | (self.aos_attached as u16) << 12
             | (self.aos_unseen as u16) << 13
+            | (self.band_here as u16) << 14
     }
 
     const fn from_bits(b: u16) -> MenuLive {
@@ -1111,6 +1129,7 @@ impl MenuLive {
             can_rewind: b & (1 << 11) != 0,
             aos_attached: b & (1 << 12) != 0,
             aos_unseen: b & (1 << 13) != 0,
+            band_here: b & (1 << 14) != 0,
         }
     }
 }
@@ -1147,6 +1166,7 @@ pub(crate) fn native_menu_checked(action: MenuAction) -> Option<bool> {
         MenuAction::ToggleMatrixRain => Some(menu_live().rain_on),
         MenuAction::FavouriteKitty => Some(menu_live().kitty_favourited),
         MenuAction::RecordUnseenKeys => Some(menu_live().aos_unseen),
+        MenuAction::ShowSystemResourcesHere => Some(menu_live().band_here),
         _ => None,
     }
 }
@@ -1211,6 +1231,10 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
             live.can_rewind
         }
         MenuAction::RecordUnseenKeys => live.aos_attached,
+        // Only the Deck setting gives a window the band; under Sill and Off the bit is inert.
+        MenuAction::ShowSystemResourcesHere => {
+            stats_bars_form() == crate::stats_deck::StatsBars::Deck
+        }
         _ => true,
     };
     precondition
@@ -1262,7 +1286,7 @@ impl MenuAction {
             | MenuAction::BrowseThemes
             | MenuAction::Messages
             | MenuAction::ToggleSeriousMode => ConfigWrite,
-            MenuAction::SystemState | MenuAction::Mail => ConfigWrite,
+            MenuAction::SystemState | MenuAction::Tables | MenuAction::Mail => ConfigWrite,
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
@@ -1285,7 +1309,8 @@ impl MenuAction {
             MenuAction::DeckSizeAuto | MenuAction::DeckSizeFull | MenuAction::DeckSizeFolded => {
                 ConfigWrite
             }
-            MenuAction::ToggleStatsLens
+            MenuAction::ShowSystemResourcesHere
+            | MenuAction::ToggleStatsLens
             | MenuAction::ExportPaneHistory
             | MenuAction::RecordUnseenKeys
             | MenuAction::RenameMachine => PersonOnly,
@@ -1343,6 +1368,7 @@ impl MenuAction {
             | MenuAction::DeckSizeAuto
             | MenuAction::DeckSizeFull
             | MenuAction::DeckSizeFolded
+            | MenuAction::ShowSystemResourcesHere
             | MenuAction::ToggleStatsLens
             | MenuAction::NetworkState
             | MenuAction::RewindPane
@@ -1387,6 +1413,7 @@ impl MenuAction {
             | MenuAction::HarnessSettings
             | MenuAction::Messages
             | MenuAction::SystemState
+            | MenuAction::Tables
             | MenuAction::Allocation
             | MenuAction::Mail
             | MenuAction::OpenPalette
@@ -1475,6 +1502,7 @@ impl MenuAction {
             MenuAction::SystemState => {
                 "Open System State: this Mac's setup and secrets vault, and what each step needs."
             }
+            MenuAction::Tables => "Open Tables: the registry's stored tables, to read and edit.",
             MenuAction::Allocation => "Show this computer's CPU lease and resource observations.",
             MenuAction::Mail => "Open Mail: accounts, folders, messages and drafts.",
             MenuAction::HarnessSettings => {
@@ -1550,24 +1578,35 @@ impl MenuAction {
             MenuAction::NextTab => "Show the next tab.",
             MenuAction::PrevTab => "Show the previous tab.",
             MenuAction::StatsBarsDeck => {
-                "Show the Global, aterm and Tab bars at full size under the titlebar; saved in \
-                 aterm.toml."
+                "Show the Global, aterm and Tab bars at full size under the titlebar in each \
+                 window that shows System Resources, and as the Sill's light lanes in the others; \
+                 saved in aterm.toml."
             }
             MenuAction::StatsBarsSill => {
-                "Show the Global, aterm and Tab bars as light lanes in the window's bottom \
+                "Show the Global, aterm and Tab bars as light lanes in every window's bottom \
                  padding, which takes no terminal row; saved in aterm.toml."
             }
             MenuAction::StatsBarsOff => "Hide the stats bars; saved in aterm.toml.",
             MenuAction::DeckSizeAuto => {
-                "Show each window's stats deck Folded, however tall the window is; saved in \
-                 aterm.toml."
+                "Show the stats deck Folded, however tall the window is, in each window that \
+                 shows System Resources; saved in aterm.toml."
             }
             MenuAction::DeckSizeFull => {
-                "Show the stats deck Full, a row per resource, in every window; saved in \
-                 aterm.toml."
+                "Show the stats deck Full, a row per resource, in each window that shows System \
+                 Resources; saved in aterm.toml."
             }
             MenuAction::DeckSizeFolded => {
-                "Show the stats deck Folded into two blocks in every window; saved in aterm.toml."
+                "Show the stats deck Folded into two blocks in each window that shows System \
+                 Resources; saved in aterm.toml."
+            }
+            MenuAction::ShowSystemResourcesHere => {
+                "Show the System Resources band (the stats deck over the Network State band) in \
+                 this window, or take it away: the window keeps its size and its terminals \
+                 re-grid once, except that a window holding Settings grows to its least size \
+                 where the band would leave it under that. A window without it shows the Sill, light lanes in the bottom \
+                 padding: nothing where that padding is under 8 pt, no Tab lane where a large \
+                 window at 1× leaves the padding too thin for it, and no Tab lane or tab meter \
+                 in a one-tab window. Available while Stats Bars is Deck."
             }
             MenuAction::ToggleStatsLens => {
                 "Open the stats bars' close-up, or close it: arrows move between instruments \
@@ -1612,6 +1651,8 @@ impl MenuAction {
             MenuAction::SystemState | MenuAction::RecordUnseenKeys | MenuAction::RenameMachine => {
                 cfg!(target_os = "macos")
             }
+            // The registry is kept on macOS and Linux (`crate::tables_store`).
+            MenuAction::Tables => cfg!(unix),
             _ => true,
         }
     }
@@ -1657,6 +1698,7 @@ impl MenuAction {
             "Packages" => Some(MenuAction::Packages),
             "Messages" => Some(MenuAction::Messages),
             "SystemState" => Some(MenuAction::SystemState),
+            "Tables" => Some(MenuAction::Tables),
             "Allocation" => Some(MenuAction::Allocation),
             "Mail" => Some(MenuAction::Mail),
             "HarnessSettings" => Some(MenuAction::HarnessSettings),
@@ -1692,6 +1734,7 @@ impl MenuAction {
             "DeckSizeAuto" => Some(MenuAction::DeckSizeAuto),
             "DeckSizeFull" => Some(MenuAction::DeckSizeFull),
             "DeckSizeFolded" => Some(MenuAction::DeckSizeFolded),
+            "ShowSystemResourcesHere" => Some(MenuAction::ShowSystemResourcesHere),
             "ToggleStatsLens" => Some(MenuAction::ToggleStatsLens),
             "NetworkState" => Some(MenuAction::NetworkState),
             "RewindPane" => Some(MenuAction::RewindPane),
@@ -1806,6 +1849,12 @@ const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "System State…",
         action: MenuAction::SystemState,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Tables…",
+        action: MenuAction::Tables,
         key: "",
         mods: MenuMods::None,
     },
@@ -2104,6 +2153,12 @@ const VIEW_MENU: &[MenuEntry] = &[
     Item {
         label: "Deck Size: Folded",
         action: MenuAction::DeckSizeFolded,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Show System Resources Here",
+        action: MenuAction::ShowSystemResourcesHere,
         key: "",
         mods: MenuMods::None,
     },

@@ -119,10 +119,31 @@ pub struct SwarmSurveyFacts {
     /// reads ([`Self::take_latest_look`]). Not on the wire, and read from a path [`Self::home`]
     /// cannot spell (one that is not UTF-8) as from any other.
     pub home_dir: Option<PathBuf>,
-    /// Free space on the home's volume, in MiB (`home_free_mb=`): read with the facts, and with
-    /// a look ([`Self::machine`]) the look's own figure ([`MachineLook::disk_free_mb`]), so the
-    /// volume's size and its limit verdict travel beside the free space they were read with.
+    /// Free space on the home's volume, in MiB (`home_free_mb=`): read with the facts beside the
+    /// volume's size ([`Self::home_total_mb`]), and with a look ([`Self::machine`]) both are the
+    /// look's own figures ([`MachineLook::disk_free_mb`], [`MachineLook::disk_total_mb`]), so the
+    /// look's limit verdict travels beside the free space it was judged against.
     pub home_free_mb: Option<u64>,
+    /// The size of the home's volume, in MiB (`home_total_mb=`, right after `home_free_mb=`): read
+    /// in the one volume read that says its free space, and with a look the look's own. `None`
+    /// where no volume was read or it read a size of 0, and from an aterm older than the key
+    /// (one whose look said it among the look's keys still reads): unknown, never 0. A size, no
+    /// path.
+    pub home_total_mb: Option<u64>,
+    /// The build output aterm sizes as rebuildable on the home's volume (`home_build_mb=`,
+    /// `home_build_at_ms=`, `home_build_partial=`, after `home_total_mb=`): the figure the disk
+    /// watch's last sizing of that volume kept in its record
+    /// ([`crate::harness::disk::budget::Record`]), read and never walked, with when that sizing
+    /// ended, so a reader sees how old it is. `None` where no sizing of this volume is recorded
+    /// (none ran yet, or the record is another volume's), and from an aterm older than the keys:
+    /// unknown, never 0. Sizes and a time, no path.
+    pub home_build: Option<HomeBuild>,
+    /// The fullest of the stores aterm itself keeps that refuse writes at a bound
+    /// (`store_worst=`, `store_worst_pct=`, the header's last keys): which store by its fixed
+    /// word, and the share of its bound it holds. The window or node job that answers sets it
+    /// ([`StoreWorst`]); collected facts carry none. `None` where no such store was sized, and
+    /// from an aterm older than the keys: unknown, never 0. A word and a share, no path.
+    pub store_worst: Option<StoreWorst>,
     /// This machine's look at its own resources, with its OS, its target and since when it has
     /// been up (the header's `os=` to `gpu_lim=`, [`MachineFacts::header_tokens`]). An answer
     /// takes it ([`Self::take_latest_look`]); collected facts carry none, so the 3-minute facts
@@ -179,10 +200,11 @@ impl MachineFacts {
 
     /// Space-prefixed `key=value` tokens for the `instance` header, `os=` to `load=`: each
     /// figure a whole number in the unit its key names, `-` where it is unread. The home
-    /// volume's free space is not among them: it is the header's `home_free_mb=`, which older
-    /// readers know. `load=<level>:<over>` is the deck dial's system-load score in hundredths
-    /// ([`LoadScore`]), `load=-` where its level is unread and `load=<level>:-` where its
-    /// over is.
+    /// volume's free space and size are not among them: they are the header's `home_free_mb=`
+    /// and `home_total_mb=` ([`SwarmSurveyFacts::header_tokens`]), which a header says with no
+    /// look too, and which readers find by key. `load=<level>:<over>` is the deck dial's
+    /// system-load score in hundredths ([`LoadScore`]), `load=-` where its level is unread and
+    /// `load=<level>:-` where its over is.
     #[must_use]
     pub fn header_tokens(&self) -> String {
         let look = &self.look;
@@ -191,10 +213,9 @@ impl MachineFacts {
         format!(
             " os={} target={} m_at_ms={} cores={} load1_x100={} load5_x100={} load15_x100={} \
              cpu_busy_x100={} rate_win_ms={} mem_total_mb={} mem_used_mb={} mem_avail_mb={} \
-             mem_pressure={} mem_psi60_x100={} swap_used_mb={} swap_total_mb={} \
-             home_total_mb={} gpu_cores={} gpu_busy_pct={} net_link_kbps={} net_rx_kbps={} \
-             net_tx_kbps={} net_other_kbps={} up_since_ms={} cpu_lim={} mem_lim={} disk_lim={} \
-             gpu_lim={} load={}",
+             mem_pressure={} mem_psi60_x100={} swap_used_mb={} swap_total_mb={} gpu_cores={} \
+             gpu_busy_pct={} net_link_kbps={} net_rx_kbps={} net_tx_kbps={} net_other_kbps={} \
+             up_since_ms={} cpu_lim={} mem_lim={} disk_lim={} gpu_lim={} load={}",
             self.os.unwrap_or("-"),
             word_token(self.target.as_deref()),
             opt_u64_token(look.at_unix_ms),
@@ -211,7 +232,6 @@ impl MachineFacts {
             opt_u32_token(look.mem_psi60_x100),
             opt_u64_token(look.swap_used_mb),
             opt_u64_token(look.swap_total_mb),
-            opt_u64_token(look.disk_total_mb),
             opt_u32_token(look.gpu_cores),
             opt_u32_token(look.gpu_busy_pct.map(u32::from)),
             opt_u64_token(look.net_link_kbps),
@@ -227,13 +247,18 @@ impl MachineFacts {
         )
     }
 
-    /// What an `instance` header says of its machine, with the free space its `home_free_mb=`
-    /// said: `None` where it has no `m_at_ms=` (an aterm whose facts predate the look). Each key
-    /// is read by itself and leniently: one that is absent, `-`, not a whole number in its
-    /// range or not a word of its closed set is `None`, and the rest still read. A size or a
-    /// core count of 0 is no capacity and reads `None`; the three loads read together or not at
-    /// all, and so do the load score's two parts ([`load_of`]).
-    fn of_header(header: &[(String, String)], home_free_mb: Option<u64>) -> Option<Self> {
+    /// What an `instance` header says of its machine, with the free space and the size its
+    /// `home_free_mb=` and `home_total_mb=` said: `None` where it has no `m_at_ms=` (an aterm
+    /// whose facts predate the look). Each key is read by itself and leniently: one that is
+    /// absent, `-`, not a whole number in its range or not a word of its closed set is `None`,
+    /// and the rest still read. A size or a core count of 0 is no capacity and reads `None`; the
+    /// three loads read together or not at all, and so do the load score's two parts
+    /// ([`load_of`]).
+    fn of_header(
+        header: &[(String, String)],
+        home_free_mb: Option<u64>,
+        home_total_mb: Option<u64>,
+    ) -> Option<Self> {
         field_raw(header, "m_at_ms")?;
         let n = |key: &str| lenient_u64(header, key);
         let n32 = |key: &str| n(key).and_then(|n| u32::try_from(n).ok());
@@ -259,7 +284,7 @@ impl MachineFacts {
                 mem_psi60_x100: n32("mem_psi60_x100"),
                 swap_used_mb: n("swap_used_mb"),
                 swap_total_mb: n("swap_total_mb"),
-                disk_total_mb: n("home_total_mb").filter(|total| *total > 0),
+                disk_total_mb: home_total_mb,
                 disk_free_mb: home_free_mb,
                 gpu_cores: n32("gpu_cores").filter(|cores| *cores > 0),
                 gpu_busy_pct: n("gpu_busy_pct")
@@ -359,6 +384,108 @@ impl MoveFacts {
     }
 }
 
+/// The build output on the home's volume as the disk watch last sized it: the bytes its build
+/// caches and build folders held, aterm's rebuildable figure (`aterm ctl sys disk`'s `budget`
+/// record), and when that sizing ended. A survey reads it from the record every process of the
+/// account shares and walks nothing: the watch sizes at most hourly, on a thread of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomeBuild {
+    /// The bytes counted, in whole MiB (`home_build_mb=`). A measured 0 is 0.
+    pub mb: u64,
+    /// When the sizing ended, Unix ms on the sizing Mac's clock (`home_build_at_ms=`).
+    pub at_ms: u64,
+    /// The sizing was cut short (a walk met its bound): `mb` is a floor (`home_build_partial=1`).
+    pub partial: bool,
+}
+
+impl HomeBuild {
+    /// The last sizing the record in the harness state directory `state` keeps
+    /// ([`crate::harness::disk::budget::Record::load`], one bounded read and no lock), where it
+    /// sized the volume spelled `volume` (`aterm_sysprobe::volumes::VolumeKey::spelled`): another
+    /// volume's figure says nothing of this one. `None` where there is no record, it is of
+    /// another volume, or its time does not read as a time after the epoch.
+    fn recorded(state: &Path, volume: &str) -> Option<Self> {
+        let last = crate::harness::disk::budget::Record::load(state)
+            .last
+            .filter(|last| last.volume == volume)?;
+        Some(Self {
+            mb: last.sized.bytes >> 20,
+            at_ms: u64::try_from(last.sized_unix)
+                .ok()
+                .filter(|at| *at > 0)?
+                .checked_mul(1000)?,
+            partial: last.sized.partial,
+        })
+    }
+
+    /// What an `instance` header says of its build output: the three keys read together, each
+    /// leniently, or not at all. A key absent, `-`, not a whole number in its range (a time of
+    /// 0 among them) or a partial word other than `0` or `1` reads `None` alone, and the rest of
+    /// the reply still reads: a figure nothing here acts on must not cost a machine its reply.
+    fn of_header(header: &[(String, String)]) -> Option<Self> {
+        Some(Self {
+            mb: lenient_u64(header, "home_build_mb")?,
+            at_ms: lenient_u64(header, "home_build_at_ms").filter(|at| *at > 0)?,
+            partial: match field_raw(header, "home_build_partial")? {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            },
+        })
+    }
+}
+
+/// The fullest of the durable stores aterm keeps on a machine that refuse writes once they
+/// meet a bound (the vault's records log, the lab journal's outbox): the one nearest to
+/// refusing, as `aterm ctl sys disk`'s `store` lines name and judge them. A store that discards
+/// its oldest at its bound is never it, however full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreWorst {
+    /// The store's fixed word (`store_worst=`): lowercase letters and hyphens, never an
+    /// entry's name, an account or an address.
+    pub name: String,
+    /// The share of its bound it holds, in whole percent, rounded down (`store_worst_pct=`);
+    /// past 100 where it stands past its bound. A measured 0 is 0.
+    pub pct: u64,
+}
+
+impl StoreWorst {
+    /// The most characters a store's word has.
+    const NAME_MAX: usize = 32;
+
+    /// The store `name` at `pct` of its bound; `None` where `name` is not a fixed word's shape
+    /// (1 to 32 lowercase letters and hyphens), so nothing else is ever said or shown as one.
+    #[must_use]
+    pub fn new(name: &str, pct: u64) -> Option<Self> {
+        let word = !name.is_empty()
+            && name.len() <= Self::NAME_MAX
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            && name.bytes().any(|b| b.is_ascii_lowercase());
+        word.then(|| Self {
+            name: name.to_owned(),
+            pct,
+        })
+    }
+
+    /// What an `instance` header says of its fullest store: the two keys read together,
+    /// leniently, or not at all, as [`HomeBuild::of_header`] reads its three.
+    fn of_header(header: &[(String, String)]) -> Option<Self> {
+        Self::new(
+            field_raw(header, "store_worst")?,
+            lenient_u64(header, "store_worst_pct")?,
+        )
+    }
+
+    /// The header's two tokens, each `-` where `worst` is unknown.
+    fn tokens(worst: Option<&Self>) -> String {
+        format!(
+            " store_worst={} store_worst_pct={}",
+            worst.map_or("-", |worst| worst.name.as_str()),
+            opt_u64_token(worst.map(|worst| worst.pct)),
+        )
+    }
+}
+
 fn word_token(text: Option<&str>) -> String {
     text.filter(|t| !t.is_empty())
         .map_or_else(|| "-".to_owned(), aterm_codec::pct::encode)
@@ -403,6 +530,9 @@ impl SwarmSurveyFacts {
                 home: None,
                 home_dir: None,
                 home_free_mb: None,
+                home_total_mb: None,
+                home_build: None,
+                store_worst: None,
                 machine: None,
                 repos: None,
                 update: None,
@@ -444,6 +574,11 @@ impl SwarmSurveyFacts {
         let (accounts, accounts_unread, session_accounts, moved) = collect_account_facts(env);
         let server_heard = collect_server_heard(env);
         let home = env.home.as_deref().filter(|home| home.is_absolute());
+        // The one volume read collected facts make, by the reader that places a path as the
+        // disk watch does, so its key is the key the watch's record names.
+        let volume = home.and_then(|home| {
+            crate::harness::disk::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
+        });
         Self {
             operation_lines: crate::release_progress::survey(&env.state)
                 .into_iter()
@@ -467,7 +602,15 @@ impl SwarmSurveyFacts {
             server_heard,
             home: home.and_then(Path::to_str).map(str::to_owned),
             home_dir: home.map(Path::to_path_buf),
-            home_free_mb: home.and_then(free_mb),
+            home_free_mb: volume.as_ref().map(|volume| volume.free >> 20),
+            home_total_mb: volume
+                .as_ref()
+                .map(|volume| volume.total >> 20)
+                .filter(|total| *total > 0),
+            home_build: volume
+                .as_ref()
+                .and_then(|volume| HomeBuild::recorded(&env.state, &volume.key.spelled())),
+            store_worst: None,
             machine: None,
             repos: home.and_then(repo_home::latest),
             update: None,
@@ -477,11 +620,16 @@ impl SwarmSurveyFacts {
     /// Space-prefixed `key=value` tokens appended onto `survey`'s `instance …` header line: with
     /// `accounts=` counting the `account` lines that follow, and `accounts_unread=` naming the
     /// pools none of whose rows they list because their records could not be read (`-` for none).
-    /// Volume free space (`home_free_mb=`) is a resource fact, and so are the machine's look
-    /// after it ([`Self::machine_tokens`]) and where the updater stands (the `update*=` words
-    /// after `roster_unread=`, where [`Self::update`] says it). A reply at `content` also adds the
-    /// home location and its checkouts' count and read (`home=`, `repos=`, `repos_at=`,
-    /// `repos_cut=`): work locations remain content, as a session's folder is.
+    /// The home volume's free space, its size and its build output with that sizing's time and
+    /// whether it was cut short (`home_free_mb=`, `home_total_mb=`, `home_build_mb=`,
+    /// `home_build_at_ms=`, `home_build_partial=`, each `-` where unknown) are resource facts,
+    /// sizes and a time with no path, and so are the machine's look after them
+    /// ([`Self::machine_tokens`]) and where the updater stands (the `update*=` words after
+    /// `roster_unread=`, where [`Self::update`] says it). The header ends with the fullest of
+    /// aterm's own stores that refuse writes at a bound (`store_worst=`, `store_worst_pct=`,
+    /// each `-` where unknown): a fixed word and a share, a resource fact too. A reply at `content` also adds the home
+    /// location and its checkouts' count and read (`home=`, `repos=`, `repos_at=`, `repos_cut=`):
+    /// work locations remain content, as a session's folder is.
     #[must_use]
     pub fn header_tokens(&self, content: bool) -> String {
         let home = if content {
@@ -496,15 +644,20 @@ impl SwarmSurveyFacts {
         } else {
             String::new()
         };
+        let build = self.home_build;
         format!(
-            " label={} window={} window_last={} ssh_host_key={} home_free_mb={}{}{home} \
-             accounts={} accounts_unread={} moves_7d={} move_tries_7d={} last_move={} \
-             roster_unread={}{}",
+            " label={} window={} window_last={} ssh_host_key={} home_free_mb={} home_total_mb={} \
+             home_build_mb={} home_build_at_ms={} home_build_partial={}{}{home} accounts={} \
+             accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}{}{}",
             word_token(self.label.as_deref()),
             u8::from(self.window),
             opt_u64_token(self.window_last),
             word_token(self.ssh_host_key.as_deref()),
             opt_u64_token(self.home_free_mb),
+            opt_u64_token(self.home_total_mb),
+            opt_u64_token(build.map(|build| build.mb)),
+            opt_u64_token(build.map(|build| build.at_ms)),
+            build.map_or("-", |build| if build.partial { "1" } else { "0" }),
             self.machine_tokens(),
             self.accounts.len(),
             word_token(Some(&self.accounts_unread.join(","))),
@@ -515,6 +668,7 @@ impl SwarmSurveyFacts {
             self.update
                 .as_ref()
                 .map_or_else(String::new, UpdateFact::tokens),
+            StoreWorst::tokens(self.store_worst.as_ref()),
         )
     }
 
@@ -537,12 +691,14 @@ impl SwarmSurveyFacts {
 
     /// Take this machine's look as it is now ([`MachineFacts::now`], kept
     /// [`aterm_capacity::machine_look::LOOK_KEEP`]), its volume the one holding
-    /// [`Self::home_dir`], with the free space it read: what an answer does, so facts a listener
-    /// keeps a minute say a look of the reply they go out in, never one a minute behind its
-    /// `at_ms`. Only an answer calls it: a look is taken only inside one.
+    /// [`Self::home_dir`], with the free space and the size it read: what an answer does, so
+    /// facts a listener keeps a minute say a look of the reply they go out in, never one a minute
+    /// behind its `at_ms`. Only an answer calls it: a look is taken only inside one. The build
+    /// output stays as collected: the record it was read from moves at most hourly.
     pub fn take_latest_look(&mut self) {
         let machine = MachineFacts::now(self.home_dir.as_deref());
         self.home_free_mb = machine.look.disk_free_mb;
+        self.home_total_mb = machine.look.disk_total_mb.filter(|total| *total > 0);
         self.machine = Some(machine);
     }
 
@@ -742,6 +898,9 @@ impl SwarmSurveyFacts {
 
         let home_free_mb = field_raw(&header, "home_free_mb")
             .map_or(Ok(None), |raw| parse_opt_u64(raw, "home_free_mb"))?;
+        // Optional and lenient: an aterm older than the key sends none, and one whose look said
+        // it among the look's keys is read wherever it stands on the line.
+        let home_total_mb = lenient_u64(&header, "home_total_mb").filter(|total| *total > 0);
         Ok(Self {
             operation_lines,
             node,
@@ -761,7 +920,10 @@ impl SwarmSurveyFacts {
             home: field_raw(&header, "home").and_then(optional_word),
             home_dir: None,
             home_free_mb,
-            machine: MachineFacts::of_header(&header, home_free_mb),
+            home_total_mb,
+            home_build: HomeBuild::of_header(&header),
+            store_worst: StoreWorst::of_header(&header),
+            machine: MachineFacts::of_header(&header, home_free_mb, home_total_mb),
             repos,
             // Lenient: a word outside its grammar reads as unknown and never fails the facts.
             update: UpdateFact::of_fields(&header),
@@ -817,13 +979,6 @@ fn parse_repo_line(fields: &[(String, String)]) -> Result<HomeRepo, String> {
             raw => Some(parse_bool01(raw, "dirty")?),
         },
     })
-}
-
-/// The free space on `home`'s volume, in MiB: the one volume read collected facts make.
-fn free_mb(home: &Path) -> Option<u64> {
-    aterm_sysprobe::volumes::read_path(home, &aterm_sysprobe::volumes::table())
-        .ok()
-        .map(|reading| reading.free >> 20)
 }
 
 fn parse_fields(line: &str) -> Vec<(String, String)> {

@@ -141,7 +141,7 @@ fn command_scope_close_keys_keep_their_originating_window() {
                     ModifiersState::SUPER,
                 )
             };
-            if let Some(window) = app.windows.get_mut(&source) {
+            if let Some(mut window) = app.windows.get_mut(&source) {
                 window.mods = mods;
             }
             for state in [ElementState::Pressed, ElementState::Released] {
@@ -301,7 +301,7 @@ fn check_tab_navigation_keyboard_window_scope(configured: bool) {
             };
             (code, WinitKey::Character(SmolStr::new(text)), mods)
         };
-        if let Some(window) = app.windows.get_mut(&source) {
+        if let Some(mut window) = app.windows.get_mut(&source) {
             window.mods = mods;
         }
         for state in [ElementState::Pressed, ElementState::Released] {

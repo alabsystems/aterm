@@ -285,7 +285,7 @@ fn release_input_scans_the_unchecked_paths_only() {
 /// Attaching the genuine checked-tree shape to that same merge removes it from the input.
 #[test]
 fn a_hand_merge_reaches_the_content_guard_but_a_checked_merge_does_not() {
-    use aterm_types::land_trailer::{Checked, Row, Stated};
+    use aterm_land_trailer::{Checked, Row, Stated};
     let (_dir, mut ctx) = checkout("// quokkaword\n");
     let base = crate::head_commit(&ctx.root, &ctx.path_env).unwrap();
     git(&ctx.root, &["checkout", "-qb", "topic"]);

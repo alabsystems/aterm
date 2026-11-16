@@ -1108,6 +1108,12 @@ fn each_rule_switched_off_is_caught() {
             42,
         ),
         (
+            "an own record is fetched only once its in-flight entry is gone",
+            Box::new(|s| fetching(s).testing(Mutant::FetchPastAStandingEntry)),
+            "decision on",
+            5434,
+        ),
+        (
             "a mirror takes only once its open made the pin's fence durable (D06)",
             Box::new(|s| Opts::seed(s).testing(Mutant::TakeAheadOfTheFence)),
             "mirror fence:",
@@ -1139,12 +1145,13 @@ fn each_rule_switched_off_is_caught() {
         ),
         // Explicit discovery on the composed budget scope and per-node hand-over found 1465
         // first within the original 20,000-seed bound; since the self-lane window names its log
-        // (the seed 3483 review) discovery finds 2170 first.
+        // (the seed 3483 review) discovery finds 2170 first, and since a re-base's witness is on
+        // the media (critic review F1) composed with the t-form session names (LT-19) 682.
         (
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).testing(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            2170,
+            682,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
@@ -1245,11 +1252,13 @@ fn each_rule_switched_off_is_caught() {
             "mirror",
             1,
         ),
+        // Critic review F1 composed with the t-form session names (LT-19) moved 602 to 3494, the
+        // first within 20,000.
         (
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).testing(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            602,
+            3494,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -1362,13 +1371,13 @@ fn each_rule_switched_off_is_caught() {
         // the node read. Each is met where another log follows a replay or a keyed re-post, a
         // seed in the hundreds or the thousands.
         (
-            "an entry journaled before another log is read back from its start (KI-1111-4)",
+            "an entry journaled before another log is read back on it (KI-1111-4)",
             Box::new(|s| Opts::lossy_logs(s).testing(Mutant::NoReadBackOnAnotherLog)),
             "dup post",
-            975,
+            746,
         ),
         (
-            "another log brings a pin's head to its start (KI-1111-4)",
+            "another log brings a pin's head to the attach's head (KI-1111-4)",
             Box::new(|s| Opts::lossy_logs(s).testing(Mutant::PinHeadGoneOnAnotherLog)),
             "dup post",
             5779,
@@ -1392,13 +1401,13 @@ fn each_rule_switched_off_is_caught() {
             "a key's own post rebuilt from its key's pin keeps a head",
             Box::new(|s| lossy_keyed(s).testing(Mutant::OwnersPinFromItsKeyHeadless)),
             "key:",
-            603,
+            2638,
         ),
         (
             "another log keeps no offset of the old one (KI-1111-4)",
             Box::new(|s| Opts::lossy_logs(s).testing(Mutant::KeepFloorOnAnotherLog)),
             "lost:|dup|key:|order:",
-            73516,
+            47166,
         ),
         (
             "another log is not read as a move (KI-1111-4)",
@@ -1439,6 +1448,9 @@ fn each_rule_switched_off_is_caught() {
         // files written and two unlinked: fewer writes for a write error to land on.
         "the recovery a write error stopped is done before the run record",
         "an own record is delivered only once its in-flight entry is gone",
+        // ATERM-KI-1113-957's: the receipt law reads what an asker fetched since 2026-11-15; of
+        // the fetching world none within 64 meets it, and 5434 is the first of 10,000.
+        "an own record is fetched only once its in-flight entry is gone",
         "a read back that meets its subject's floor reads again told",
         // Met where a blocking call inside a drain reads an answer that holds the sender of a
         // post the drain reaches next. Since a drain reads the subject budget once, not at each
@@ -1461,36 +1473,35 @@ fn each_rule_switched_off_is_caught() {
         // unverifiable answer, or a replay past one, sends a sender's later post ahead of it.
         "an unverifiable answer leaves the link up (F21)",
         "the attach's replay holds an unverifiable entry's lane (F21)",
-        // KI-1111-4's: none within 64 of its world; the first seeds are 975, 5779, 588, 216 and
+        // KI-1111-4's: none within 64 of its world; the first seeds were 975, 5779, 588, 216 and
         // 1846 (of the keyed lossy world none within 20,000 meets the kept floor), found again by
         // explicit discovery within 20,000 on the tree that composes the receipt heads
         // (ATERM-KI-1111-7) with the seed 590 and 355 fixes (an outcome unknown no answer,
         // another log's pin drop on the media). Seed 590, which before those fixes broke `key:`
         // with every pin's offset kept, holds every law with every rule on (FOUND_LOSSY), so
         // 3113, the receipt heads' pick past it, no longer matters: 588 is first and holds the
-        // law with the rule on.
-        "an entry journaled before another log is read back from its start (KI-1111-4)",
+        // law with the rule on. Critic review F1 (a read back on another log from the head the node
+        // met it at, the re-base's witness on the media) moved 975 to 746, the first within 20,000.
+        "an entry journaled before another log is read back on it (KI-1111-4)",
         "another log takes every pin's offset out (KI-1111-4)",
-        "another log brings a pin's head to its start (KI-1111-4)",
+        "another log brings a pin's head to the attach's head (KI-1111-4)",
         "a replay that lands a key's winner tells the key where (KI-1111-4)",
         "another log is not read as a move (KI-1111-4)",
         // Met where a key's own post's pin write is refused after its key's took, its attempt
-        // then landing unanswered and carried past a cut: none within 64; 603 is the first within
+        // then landing unanswered and carried past a cut: none within 64; 603 was the first within
         // 20,000 on the tree that composes it with ATERM-KI-1111-4's outcome-unknown rule (590
-        // before: either rule alone now holds seed 590's law).
+        // before: either rule alone now holds seed 590's law), and 2638 is since critic review F1.
         "a key's own post rebuilt from its key's pin keeps a head",
     ];
     const RAREST: &[&str] = &[
         "the incarnation lease is trusted only in the boot that wrote it",
-        // 73516 is the first seed to 100,000 that reaches it, and holds the law with the rule on
-        // (searched with every seed 1..=73516, 2026-11-13). Seed 3483 seemed to reach it first:
-        // it broke `dup delivery` with every rule on, a self-lane window kept from a log no
-        // witness named (FOUND_LOSSY's seed 3483, `Mutant::UnboundWindow`). With that window
-        // bound to its log it holds every law with this rule off as well (run 2026-11-13): its
-        // witness, torn, names no high, so the move its attach judges from the log `acked` names
-        // keeps no offset (82994 was the pick before the seed 590 and 355 fixes). This pin is
-        // checked to reach the rule, not to be the first: the search from 1 last ran before the
-        // seed 3483 review.
+        // 47166 is the first seed to 100,000 that reaches it, and holds the law with the rule on,
+        // since critic review F1 (searched from 1, 2026-11-14; 73516 before). Seed 3483 seemed to
+        // reach it first: it broke `dup delivery` with every rule on, a self-lane window kept from
+        // a log no witness named (FOUND_LOSSY's seed 3483, `Mutant::UnboundWindow`). With that
+        // window bound to its log it holds every law with this rule off as well (run 2026-11-13):
+        // its witness, torn, names no high, so the move its attach judges from the log `acked`
+        // names keeps no offset (82994 was the pick before the seed 590 and 355 fixes).
         "another log keeps no offset of the old one (KI-1111-4)",
     ];
     for rare in RARE.iter().chain(RAREST) {
@@ -1631,9 +1642,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         "a sweep a write error stopped, closed by the run record",
     ),
     // Composing the receipt heads (ATERM-KI-1111-7) with ATERM-KI-1111-4's seed 590 and 355
-    // fixes moved 15 off this bug; explicit discovery found 27 first within 60,000.
+    // fixes moved 15 off this bug; explicit discovery found 27 first within 60,000, and 31 since
+    // a re-base's witness is on the media (critic review F1).
     (
-        27,
+        31,
         400,
         "a pin judged before the reconcile a write error stopped",
     ),
@@ -1681,9 +1693,11 @@ const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     // Grouped landing moved 3273 off it, the E07 review's fix 558, critic item F17's self-lane
     // log 7324, F20's floor written at the attach 2127, and G04's one subject-budget read a
     // drain 4431. With C3b's per-node hand-over, discovery found 1465 first within 60,000, and
-    // since the self-lane window names its log (the seed 3483 review) 2170.
+    // since the self-lane window names its log (the seed 3483 review) 2170, and since a re-base's
+    // witness is on the media (critic review F1) composed with the t-form session names (LT-19)
+    // 682.
     (
-        2170,
+        682,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1715,10 +1729,11 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // G04).
     // Main replaced the obsolete carried-cut seed 31508 with 1179. Grouped landing moved that
     // row too, the E07 review's fix 462, critic item F17's self-lane log 931, and G04's one
-    // subject-budget read a drain 1634. Composed with C3b, the first replacement is 409, found
-    // within the original 60,000-seed bound.
+    // subject-budget read a drain 1634. Composed with C3b, the first replacement was 409, found
+    // within the original 60,000-seed bound, and since a re-base's witness is on the media (critic
+    // review F1) 512.
     (
-        409,
+        512,
         400,
         "a read back that went on at the floor missed the record a hold rule carried below it",
     ),
@@ -1781,7 +1796,8 @@ const FOUND_QUITTING: &[FoundIn] = &[
     // (ATERM-KI-1111-7) moved the first's 3397 to 2403; ATERM-KI-1111-4's seed 355 and 590
     // fixes moved the second's 2375 to 10354, and composing the two, to 15, each the first
     // within 60,000. The t-form session names of the tab-ID grammar (LT-19) moved the first's
-    // 2403 to 4847, the first within 60,000.
+    // 2403 to 4847, the first within 60,000, and a re-base's witness on the media (critic review
+    // F1) the second's 15 to 2375.
     (
         both_ways_erring_quitting,
         4847,
@@ -1790,15 +1806,17 @@ const FOUND_QUITTING: &[FoundIn] = &[
     ),
     (
         both_ways_erring_quitting,
-        15,
+        2375,
         400,
         "an entry sent ahead of a post of its sender's with none",
     ),
     (
         // Critic item F20's floor written at the attach moved 13679 to 3400, G04's one
         // subject-budget read a drain 3400 to 55609, and the t-form session names of the tab-ID
-        // grammar (LT-19) 55609 to 697, the first within 60,000.
-        both_ways_erring_quitting,
+        // grammar (LT-19) 55609 to 697, the first within 60,000. Composed with critic review F1, no
+        // seed of this world to 60,000 reaches it with its rule off; it is pinned where the
+        // re-base's witness is written as any other witness is ([`quitting_light_rebase`]).
+        quitting_light_rebase,
         697,
         400,
         "a retired record's copy ended the memory of its torn file's",
@@ -1827,14 +1845,27 @@ const FOUND_ASKING: &[FoundIn] = &[
         400,
         "the deadline sweep expired an ask whose answer the mailbox held unhandled",
     ),
+    // ATERM-KI-1114-3752: `expired` at @26 ahead of the answer at @44, cuts to 45 and 59, and
+    // the relaunch's replay, reading @26 back nowhere, published it again at @100 behind the
+    // answer. 7102 and 8298 reach it too.
+    (
+        asking,
+        3752,
+        400,
+        "the replay published again an expiry whose ask was answered on the bus since",
+    ),
 ];
 
 /// Found seeds of the lossy-log worlds ([`Opts::lossy_logs`], and [`lossy_keyed`] over it), each
-/// past the committed seeds and found by a witness search (ATERM-KI-1111-4).
+/// past the committed seeds, found by a witness search (ATERM-KI-1111-4) or a known issue's
+/// sweep (ATERM-KI-1114-1487).
 const FOUND_LOSSY: &[FoundIn] = &[
+    // Critic review F1 (a read back on another log from the head the node met it at, the
+    // re-base's witness on the media) moved 1498 off it; 36618 is the first to 60,000 that
+    // reaches it with its rule off and holds every law with it on.
     (
         lossy_keyed,
-        1498,
+        36618,
         400,
         "a keyed re-post replayed before an earlier post on another log",
     ),
@@ -1843,21 +1874,24 @@ const FOUND_LOSSY: &[FoundIn] = &[
     // log was reopened its record, shown and carried below a cut that dropped its dedup key, was
     // published again by a later attach. Seed 590 was the first; composed with the head a key's
     // own post keeps when its pin is rebuilt from its key's (`Mutant::OwnersPinFromItsKeyHeadless`),
-    // either rule alone holds seed 590, and 1514 is the first to 60,000 that reaches this one with
-    // its rule off and holds every law with it on.
+    // either rule alone holds seed 590, and 1514 was the first to 60,000 that reached this one
+    // with its rule off and held every law with it on; since critic review F1, 4936 is.
     // Since a keyed re-post reads its own attempt back (`Bridge::keyed_repost_own_attempt`),
     // that read alone also holds it, so it is pinned where the read is off ([`lossy_keyed_unread`]).
     (
         lossy_keyed_unread,
-        1514,
+        4936,
         400,
         "an outcome unknown taken as an answer dropped its publish's entry",
     ),
     // Another log's drop of the mirror's pin was written under the pin's fence alone; a power
     // cut brought the old log's window ledger back under the new log's witness, and the window
-    // budget held the mirror on an offset (@153) the new log's oldest stayed below.
+    // budget held the mirror on an offset (@153) the new log's oldest stayed below. Since critic
+    // review F1 the re-base's witness on the media carries the drop with it, and no seed of the
+    // lossy-log world to 60,000 reaches it with its rule off; it is pinned where the re-base is
+    // written as any other witness is ([`lossy_logs_light_rebase`]).
     (
-        Opts::lossy_logs,
+        lossy_logs_light_rebase,
         355,
         400,
         "another log's pin drop a power cut undid held the mirror on the old log's window",
@@ -1883,6 +1917,18 @@ const FOUND_LOSSY: &[FoundIn] = &[
         3794,
         400,
         "a keyed re-post's attempt no entry or claim names was published again past a cut",
+    ),
+    // NOT A BRIDGE BUG: the receipt law's own misreading (ATERM-KI-1114-1487). An answer landed
+    // at @21, two cuts gave it up before its asker's inbox read it, and the replay after a broker
+    // crash, its read back refused below the floor (28), landed it again at @41, the one copy the
+    // asker was handed. Sessions long gone held notes at @21 of logs since retired, and the law
+    // took them for the answer's first copy (`Mutant::AnswerHandedByOffset` reads it so again).
+    // 921 is the first of 6,000 at 1200 steps; 2206, 2366, 5240 and 5596 meet it too.
+    (
+        lossy_keyed,
+        921,
+        1200,
+        "a receipt's copy given up unread was judged handed by another record at its offset",
     ),
 ];
 
@@ -1936,9 +1982,9 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
 }
 
 /// THE RULES whose bugs the found seeds pin, where a [`Mutant`] switches the
-/// rule off: `(what the found rows name the bug, the rule off, the law it breaks)`. One is a
-/// law's own reading, not a bridge rule ([`FOUND_ASKING`]): its mutant puts the misreading
-/// back, and the seed's false violation returns.
+/// rule off: `(what the found rows name the bug, the rule off, the law it breaks)`. Two are a
+/// law's own reading, not a bridge rule ([`FOUND_ASKING`]'s follow, [`FOUND_LOSSY`]'s receipt):
+/// each one's mutant puts the misreading back, and the seed's false violation returns.
 const FOUND_RULES: &[(&str, Mutant, &str)] = &[
     (
         "a keyed re-post replayed before an earlier post on another log",
@@ -1964,6 +2010,11 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "a stop between the drops behind a refused post let the replay overtake the drain",
         Mutant::DropBehindLowestFirst,
         "order",
+    ),
+    (
+        "the replay published again an expiry whose ask was answered on the bus since",
+        Mutant::ReplayRepostsAMootExpiry,
+        "deadline",
     ),
     (
         "a pin judged before the reconcile a write error stopped",
@@ -2044,6 +2095,11 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         "a follow judged on a log its session had yet to be told",
         Mutant::FollowOnTheBrokersLog,
         "it follows it from",
+    ),
+    (
+        "a receipt's copy given up unread was judged handed by another record at its offset",
+        Mutant::AnswerHandedByOffset,
+        "decision on",
     ),
     (
         "an outcome unknown taken as an answer dropped its publish's entry",
@@ -2598,10 +2654,11 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
 /// ANOTHER LOG (critic item F10, ATERM-KI-1111-4): what astream settles at every open that finds
 /// no record (a fresh id at generation 0 with no lineage, continuing nothing) is a restart the law
 /// admits at any stop: a power loss that kept none, a clean stop or a crash of an empty log, and a
-/// retired log whatever it held. So is the move a lossy run's reopen makes at a clean stop, and a
+/// retired log whatever it held, and a log whose identity no longer reads, which keeps every
+/// record under its fresh id. So is the move a lossy run's reopen makes at a clean stop, and a
 /// power loss of one whose images cut the record its poison held. Refused: another log of a log
-/// that kept records, one that names a generation, a lossy run that kept its identity, and a power
-/// loss that cut an escalated record below the held one.
+/// that kept records for any other reason, one that names a generation, a lossy run that kept its
+/// identity, and a power loss that cut an escalated record below the held one.
 #[test]
 fn the_law_admits_another_log_only_where_an_open_finds_no_record() {
     let oracle = Escalation::aterm();
@@ -2657,6 +2714,17 @@ fn the_law_admits_another_log_only_where_an_open_finds_no_record() {
     );
     retired.generation_after = 1;
     refused(&retired, "names generation", "another log at generation 1");
+    let b = broker(3);
+    b.stop_keeping_all(Stop::Clean);
+    let mut reminted = b.lose_identity().expect("a stopped log's identity rots");
+    assert_eq!(reminted.kept, 3, "a re-minted log forgot its records");
+    admitted(&reminted, "a log whose identity no longer reads");
+    reminted.reminted = false;
+    refused(
+        &reminted,
+        "P7: another log, 3 records kept",
+        "another log of 3 kept for no rotted sidecar",
+    );
     // A lossy run: an escalated publish's full flush failed and held its record.
     let lossy = || {
         let b = broker(2);
@@ -4432,11 +4500,20 @@ fn lossy_keyed(seed: u64) -> Opts {
 /// The keyed lossy-log world with a keyed re-post's own-attempt read off
 /// (`Mutant::KeyedRepostReadsNoOwnAttempt`): a rule that keeps such an attempt named (its entry
 /// standing for the replay, its pin's offsets on another log) is then the only one between it
-/// and a second copy, as before that read. Seed 1514 with an outcome unknown taken as an answer,
-/// and seed 588 with every pin's offset kept on another log, each hold every law with either
-/// rule on and break with both off.
+/// and a second copy, as before that read. Seed 4936 with an outcome unknown taken as an answer,
+/// and seed 588 with every pin's offset kept on another log, each break its law here with its
+/// rule off and hold every law with it on.
 fn lossy_keyed_unread(seed: u64) -> Opts {
     lossy_keyed(seed).with(Mutant::KeyedRepostReadsNoOwnAttempt)
+}
+
+/// The lossy-log world with a re-base's witness written as any other witness is
+/// (`Mutant::RebaseWitnessUnflushed`): the re-base on the media, written after the attach drops
+/// the mirror's pin, carries that drop to the media too, so here the drop's own write on the
+/// media is the only rule between a power cut and the old log's window ledger under the new
+/// log's witness, as before critic review F1.
+fn lossy_logs_light_rebase(seed: u64) -> Opts {
+    Opts::lossy_logs(seed).with(Mutant::RebaseWitnessUnflushed)
 }
 
 /// [`keyed`] with power cuts and bus losses both on (ATERM-KI-1114-479).
@@ -4548,6 +4625,12 @@ fn both_ways_erring_quitting(seed: u64) -> Opts {
         quits: true,
         ..both_ways_erring(seed)
     }
+}
+
+/// [`both_ways_erring_quitting`] with a re-base's witness written as any other witness is
+/// (`Mutant::RebaseWitnessUnflushed`), as before critic review F1.
+fn quitting_light_rebase(seed: u64) -> Opts {
+    both_ways_erring_quitting(seed).with(Mutant::RebaseWitnessUnflushed)
 }
 
 /// The committed world, retained, its sessions fetching records of their lanes by offset
@@ -4719,6 +4802,16 @@ fn asking_erring(seed: u64) -> Opts {
     }
 }
 
+/// [`asking`], its broker setting its log aside now and then ([`Opts::retire_logs`]): under the
+/// asks, answers and deadlines every offset starts again on another log, and a session that
+/// left keeps the rows it was handed on the log before.
+fn asking_retired(seed: u64) -> Opts {
+    Opts {
+        retire_logs: true,
+        ..asking(seed)
+    }
+}
+
 /// **A DEADLINE FIRES ONCE FOR EVERY ASK NOBODY ANSWERED, AND A FOLLOWER SEES EVERY BROADCAST
 /// IT IS OWED OR AN HONEST GAP** (item F4): over a retaining broker cutting under the traffic,
 /// across bridge kills, handoffs, power cuts and broker restarts, every ask with a deadline
@@ -4790,6 +4883,33 @@ fn every_seed_of_the_asking_world_holds_every_law() {
     for &(what, n) in &counts {
         assert!(n > 0, "the seeds exercised no {what}: {counts:?}");
     }
+}
+
+/// THE ASKING WORLD WITH ITS LOGS SET ASIDE (ATERM-KI-1114-1487): [`asking_retired`]'s seeds
+/// break no law. Its seed 1487 first broke the receipt law's reading of a handed copy, which took
+/// a row a retired log handed at an answer's offset for that answer ([`FOUND_LOSSY`]'s receipt
+/// row pins the correction). Swept on main 16fabacc72d (2026-11-15): none of 1..=6000 breaks a
+/// law, about six minutes on ten workers.
+#[test]
+fn every_seed_of_the_asking_world_with_logs_set_aside_holds_every_law() {
+    let outs = run_all(&asking_retired, 1..=SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {SEEDS} seeds of the asking world with its logs set aside broke a law:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    let retired: u64 = outs.iter().map(|out| out.stats.retired_logs).sum();
+    let expired: u64 = outs.iter().map(|out| out.stats.expired).sum();
+    assert!(
+        retired > 0 && expired > 0,
+        "the seeds set aside {retired} logs and expired {expired} asks"
+    );
 }
 
 #[test]

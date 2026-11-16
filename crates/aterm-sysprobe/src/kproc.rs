@@ -108,13 +108,31 @@ pub fn image_file(pid: u32) -> Option<ImageFile> {
 /// `ps -o comm=` for `r` in `locale` ([`vis`], [`unread`]).
 #[must_use]
 pub fn ps_comm(r: &Record, locale: Locale) -> String {
+    comm_read(r, locale).unwrap_or_else(|| unread(r, locale))
+}
+
+/// [`ps_comm`] where `r`'s name was read: `None` where the kernel reads `r`'s arguments and did
+/// not answer them (its `KERN_PROCARGS2` read failed, as on a loaded host or mid-exec), where
+/// `ps` prints the placeholder `(comm)`, which names no program and is never a read name.
+#[must_use]
+pub fn comm_read(r: &Record, locale: Locale) -> Option<String> {
+    comm_read_by(r, locale, argv)
+}
+
+fn comm_read_by(
+    r: &Record,
+    locale: Locale,
+    argv: impl FnOnce(u32) -> Option<Vec<Vec<u8>>>,
+) -> Option<String> {
     if r.zombie {
-        return DEFUNCT.to_string();
+        return Some(DEFUNCT.to_string());
     }
-    readable_argv(r)
+    if !imp::reads_args_of(r.uid) {
+        return Some(unread(r, locale));
+    }
+    argv(r.pid)
         .and_then(|words| words.into_iter().next())
         .and_then(|word| vis(&word, locale))
-        .unwrap_or_else(|| unread(r, locale))
 }
 
 /// `ps -ww -o args=` (`command=`) for `r` in `locale` ([`vis`], [`unread`]).
@@ -126,6 +144,15 @@ pub fn ps_args(r: &Record, locale: Locale) -> String {
     readable_argv(r)
         .and_then(|words| vis(&words.join(&b' '), locale))
         .unwrap_or_else(|| unread(r, locale))
+}
+
+/// Whether the kernel withholds `r`'s arguments and environment from this process for as long
+/// as both run: `KERN_PROCARGS2` answers only for a process of this one's effective user, or to
+/// root. A lasting state, never a failed read: every later read of `r` finds it again. Off macOS
+/// no such rule is known here and this is `false`.
+#[must_use]
+pub fn withholds_args(r: &Record) -> bool {
+    cfg!(target_os = "macos") && !imp::reads_args_of(r.uid)
 }
 
 /// [`argv`] of `r` where the kernel answers it.

@@ -112,7 +112,7 @@ pub(crate) fn mark_ephemeral(app: &mut crate::App, session: u64) {
         .iter()
         .position(|tab| app.tab_holds_session(tab, session))
         .expect("its tab");
-    let ws = app.windows.get_mut(&WID).expect("its window");
+    let mut ws = app.windows.get_mut(&WID).expect("its window");
     ws.tab_set.tab_at_mut(at).expect("its tab").ephemeral = true;
 }
 
@@ -636,10 +636,11 @@ fn the_looks_exit_mark_takes_down_a_held_ask_and_spares_a_concluded_end() {
 fn a_claim_worker_in_a_visible_split_is_left_alone() {
     let claim = claim_folder();
     let mut app = crate::App::headless_for_test();
-    let ws = app.windows.get_mut(&WID).expect("its window");
+    let mut ws = app.windows.get_mut(&WID).expect("its window");
     ws.focused = true;
     ws.os_window_for_test = true;
     let worker = 0;
+    drop(ws);
     mark_ephemeral(&mut app, worker);
     let began = set_task(&app, worker, &claim);
     let beside = app.split_active_stub_tab(WID);

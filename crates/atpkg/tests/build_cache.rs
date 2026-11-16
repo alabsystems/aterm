@@ -782,8 +782,10 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         assert!(refused.stdout.is_empty());
         assert!(!ws.join(target).exists());
     }
-    // Directory-changing calls retain the original argv and register the effective package,
-    // while a query owns nothing. The public boundary only prints argv; custody is real.
+    // A directory-changing call is placed as the same call typed from its directory: its
+    // intermediates go under the target that directory's package names, and that target is
+    // registered for the package, never the launcher's; a query owns nothing. The public
+    // boundary only prints argv; custody is real.
     let moved = ws.join("moved");
     write(&moved.join("Cargo.toml"), "[workspace]\nmembers = []\n");
     let directory_args = [
@@ -797,8 +799,13 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
     ];
     assert_eq!(
         run("trust", &directory_args, &[]),
-        format!("{}\n", directory_args.join("\n"))
+        format!(
+            "+trust\n--config\nbuild.build-dir='{}/.ubd/build.noindex'\n{}\n",
+            moved.join("fresh.noindex").display(),
+            directory_args[1..].join("\n")
+        )
     );
+    assert!(moved.join("fresh.noindex/.ubd/build.noindex").is_dir());
     assert!(
         atpkg::build_cache::registered::roots(&home)
             .iter()
@@ -1278,9 +1285,15 @@ fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
     }
 }
 
+/// A routed build's owner is the root Targo finds, its walk stopping after the effective package
+/// home: deep members, a home that stops the walk, and a `-C` call whose home is absolute.
+/// NEGATIVE CONTROL: a relative `CARGO_HOME` under a `-C` by the `cargo` name names one home
+/// against the launcher's folder (a rustup proxy's) and another against that directory
+/// (Targo's), whose walks find different roots here: the call is refused before any build,
+/// nothing recorded.
 #[test]
 fn routed_workspace_owners_follow_deep_and_effective_package_home_boundaries() {
-    for case in ["deep", "stopped", "moved-relative"] {
+    for case in ["deep", "stopped", "moved-absolute", "moved-relative"] {
         let temporary = aterm_tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temporary.path()).unwrap();
         let home = root.join("home");
@@ -1308,7 +1321,8 @@ fn routed_workspace_owners_follow_deep_and_effective_package_home_boundaries() {
         let target = home.join("selected.noindex");
         let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
         command.arg("__reroute").arg("cargo");
-        if case == "moved-relative" {
+        let moved = case.starts_with("moved");
+        if moved {
             command.args(["-Zunstable-options", "-C"]).arg(&member);
         }
         command
@@ -1320,18 +1334,27 @@ fn routed_workspace_owners_follow_deep_and_effective_package_home_boundaries() {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env(atpkg::build_admit::LEDGER_ENV, root.join("ledger"))
-            .current_dir(if case == "moved-relative" {
-                &launcher
-            } else {
-                &member
-            });
+            .current_dir(if moved { &launcher } else { &member });
         let package_home = match case {
             "deep" => root.join("cargo-home"),
-            "stopped" => member.parent().unwrap().to_path_buf(),
+            "stopped" | "moved-absolute" => member.parent().unwrap().to_path_buf(),
             "moved-relative" => PathBuf::from(".."),
             _ => unreachable!(),
         };
         let output = command.env("CARGO_HOME", package_home).output().unwrap();
+        if case == "moved-relative" {
+            assert_eq!(output.status.code(), Some(75), "{case}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("a relative CARGO_HOME with -C"),
+                "{case}: {output:?}"
+            );
+            assert!(!target.exists(), "{case}");
+            assert!(
+                atpkg::build_cache::registered::roots(&home).is_empty(),
+                "{case}"
+            );
+            continue;
+        }
         assert!(output.status.success(), "{case}: {output:?}");
         let recorded = atpkg::build_cache::registered::roots(&home);
         let selected = recorded.iter().find(|entry| entry.root == target).unwrap();

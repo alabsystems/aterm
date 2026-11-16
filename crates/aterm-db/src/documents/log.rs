@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use crate::documents::materialized::{Materialized, Read, materialize};
 use crate::{
     Error, Result,
     database::{Cell, Change, Command},
@@ -10,8 +11,9 @@ use crate::{
         store::{Receipt, Store},
     },
 };
-use astream_wire::sync::{Actor, Digest, Header, Index};
+use astream_wire::sync::{Actor, Digest, Header, Index, Projection};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 /// Eligible causal-only merges as (writer, sequence) ([`Log::eligible_and_merges`]).
 pub(crate) type Merges = Vec<(Actor, u64)>;
@@ -96,6 +98,9 @@ pub(crate) struct Log {
     append_bound: usize,
     local_use: crate::catalog::ring::Used,
     index: Index,
+    /// The projection of `index` without the catalog-withheld records, whose version vectors
+    /// answer [`Self::observes`] without walking the graph.
+    projection: Projection,
     records: BTreeMap<Digest, (Operation, Option<Command>)>,
     conflicts: BTreeSet<Digest>,
     opaque_authors: BTreeSet<Actor>,
@@ -103,6 +108,15 @@ pub(crate) struct Log {
     eligible: BTreeSet<Digest>,
     revert_refusals: BTreeSet<Digest>,
 }
+
+/// The last cells each recently read table made in this process, most recent first, so the next
+/// read of a table applies only what arrived since ([`crate::documents::materialized`]). An
+/// entry is taken out while a read extends it, so two reads of one table never share one.
+static MATERIALIZED: Mutex<Vec<(Scope, Materialized)>> = Mutex::new(Vec::new());
+
+/// Tables whose cells [`MATERIALIZED`] keeps. A memory bound on a cache, not on any table: a
+/// table that falls out of it is read in full once, then kept again.
+const MATERIALIZED_TABLES: usize = 32;
 
 const REVERT_REFUSAL: &str =
     "revert does not name a structurally valid observed edit with the same keys";
@@ -142,6 +156,7 @@ impl Log {
             append_bound,
             local_use: store.retained_use(session, session.actor())?,
             index: Index::new(crate::database::MAX_RECORDS * 2),
+            projection: Projection::default(),
             records: BTreeMap::new(),
             conflicts: BTreeSet::new(),
             opaque_authors: BTreeSet::new(),
@@ -150,6 +165,7 @@ impl Log {
             revert_refusals: BTreeSet::new(),
         };
         for evidence in metadata {
+            let control = evidence.is_table_control();
             let header = evidence.header;
             let id = header.id;
             log.index
@@ -157,9 +173,10 @@ impl Log {
                 .map_err(|_| Error::new("invalid proposal causal history"))?;
             let available = evidence.record.is_some();
             let (command, refusal) = match &evidence.record {
-                // A removal cutoff is table membership, not a document command: a causal
-                // parent here that projects nothing and refuses nothing.
-                Some(_) if evidence.cutoff => (None, None),
+                // A removal cutoff is table membership and a checkpoint is table compaction,
+                // neither a document command: a causal parent here that projects nothing and
+                // refuses nothing.
+                Some(_) if control => (None, None),
                 Some(record) => match decode_with_merge(record.payload(), decode) {
                     Ok(command) => (Some(command), None),
                     Err(error) => (None, Some(error.0)),
@@ -226,7 +243,8 @@ impl Log {
         // Request conflicts are inert application data, not a signed-chain fork.
         // Keep their headers as dependencies so one author cannot suppress the
         // well-formed later edits of every peer that observed the bad request.
-        for id in log.index.project_excluding(&withheld).ordered {
+        log.projection = log.index.project_excluding(&withheld);
+        for id in log.projection.ordered.clone() {
             let (operation, Some(command)) = &log.records[&id] else {
                 continue;
             };
@@ -235,7 +253,7 @@ impl Log {
                 changes,
                 ..
             } = command
-                && (!log.index.observes(&id, target)
+                && (!log.observes(&id, target)
                     || !structural.contains(target)
                     || !log
                         .records
@@ -295,19 +313,26 @@ impl Log {
                     .filter(|parent| !cut.contains(*parent)),
             );
         }
-        Ok(Self {
+        Ok(self.as_of_cut(&cut))
+    }
+    /// The log restricted to `cut`, a causally closed set of its operations ([`Self::as_of`]
+    /// for one operation's cut; a table checkpoint's frontier for several writers',
+    /// [`crate::checkpoint`]), judged as [`Self::as_of`] judges.
+    pub(crate) fn as_of_cut(&self, cut: &BTreeSet<Digest>) -> Self {
+        Self {
             scope: self.scope,
             retained: self.retained,
             append_bound: self.append_bound,
             local_use: self.local_use,
             index: self.index.clone(),
+            projection: self.projection.clone(),
             records: self
                 .records
                 .iter()
                 .filter(|(id, _)| cut.contains(*id))
                 .map(|(id, record)| (*id, record.clone()))
                 .collect(),
-            conflicts: self.conflicts.intersection(&cut).copied().collect(),
+            conflicts: self.conflicts.intersection(cut).copied().collect(),
             opaque_authors: self.opaque_authors.clone(),
             ordered: self
                 .ordered
@@ -315,9 +340,26 @@ impl Log {
                 .filter(|id| cut.contains(*id))
                 .copied()
                 .collect(),
-            eligible: self.eligible.intersection(&cut).copied().collect(),
-            revert_refusals: self.revert_refusals.intersection(&cut).copied().collect(),
-        })
+            eligible: self.eligible.intersection(cut).copied().collect(),
+            revert_refusals: self.revert_refusals.intersection(cut).copied().collect(),
+        }
+    }
+    /// [`Index::observes`] of this log's index, answered from the projection's version vectors
+    /// where `later` has a row and by a bounded walk otherwise (astream's
+    /// `Projection::observes`), so a read applying `n` operations costs no walk per candidate.
+    pub(crate) fn observes(&self, later: &Digest, earlier: &Digest) -> bool {
+        self.projection.observes(&self.index, later, earlier)
+    }
+    /// The projection [`Self::observes`] answers from: this log's order, quarantines and version
+    /// vectors.
+    pub(crate) const fn projection(&self) -> &Projection {
+        &self.projection
+    }
+    /// The signed authoring time of the retained operation `id`.
+    pub(crate) fn authored_ms(&self, id: &Digest) -> Option<u64> {
+        self.records
+            .get(id)
+            .map(|(operation, _)| operation.authored_ms)
     }
     /// Whether this log (a cut of one, [`Self::as_of`]) holds the retained operation `id`.
     pub(crate) fn holds(&self, id: &Digest) -> bool {
@@ -330,7 +372,7 @@ impl Log {
     fn project_cells(&self, before: Option<Digest>, skip: &BTreeSet<Digest>) -> Cells {
         let mut cells = Cells::new();
         for &id in &self.ordered {
-            if before.is_some_and(|target| target == id || !self.index.observes(&target, &id))
+            if before.is_some_and(|target| target == id || !self.observes(&target, &id))
                 || skip.contains(&id)
             {
                 continue;
@@ -339,7 +381,7 @@ impl Log {
                 && !matches!(command, Command::Merge { .. })
             {
                 crate::documents::apply(
-                    &self.index,
+                    &|later, earlier| self.observes(later, earlier),
                     &mut cells,
                     id,
                     command.changes().unwrap(),
@@ -371,7 +413,7 @@ impl Log {
                 for change in command.changes().unwrap() {
                     if change.collection == collection && change.key == key {
                         crate::documents::apply(
-                            &self.index,
+                            &|later, earlier| self.observes(later, earlier),
                             &mut cells,
                             id,
                             std::slice::from_ref(change),
@@ -400,7 +442,7 @@ impl Log {
         skip: &BTreeSet<Digest>,
         awaited: &BTreeSet<Digest>,
     ) -> (Cells, Vec<Digest>) {
-        let cells = self.project_cells(None, skip);
+        let cells = self.materialized_cells(skip);
         let refused = self
             .records
             .iter()
@@ -415,6 +457,37 @@ impl Log {
             .map(|(id, _)| *id)
             .collect();
         (cells, refused)
+    }
+    /// The cells without `skip`, extended from this table's last read in this process where
+    /// [`materialize`] may reuse it, and kept for the next.
+    fn materialized_cells(&self, skip: &BTreeSet<Digest>) -> Cells {
+        let previous = MATERIALIZED.lock().ok().and_then(|mut held| {
+            let at = held.iter().position(|(scope, _)| *scope == self.scope)?;
+            Some(held.remove(at).1)
+        });
+        let made = materialize(
+            previous,
+            Read {
+                retained: self.records.keys().copied().collect(),
+                ordered: &self.ordered,
+                skip,
+                quarantined: &self.projection.quarantined,
+            },
+            |id| {
+                self.records
+                    .get(id)
+                    .and_then(|(_, command)| command.as_ref())
+                    .filter(|command| !matches!(command, Command::Merge { .. }))
+                    .and_then(Command::changes)
+            },
+            &|later, earlier| self.observes(later, earlier),
+        );
+        let cells = made.cells.clone();
+        if let Ok(mut held) = MATERIALIZED.lock() {
+            held.insert(0, (self.scope, made));
+            held.truncate(MATERIALIZED_TABLES);
+        }
+        cells
     }
     pub(crate) const fn retained(&self) -> usize {
         self.retained
@@ -614,6 +687,26 @@ impl Log {
             }
         }
         awaited
+    }
+    /// The rows (collection, primary key) the `awaited` records write, from their decoded
+    /// commands; `None` where one has no readable command, so its rows are unknown. A merge
+    /// writes none; a revert writes the keys of its compensation.
+    pub(crate) fn awaited_rows(
+        &self,
+        awaited: &BTreeSet<Digest>,
+    ) -> Option<BTreeSet<(String, String)>> {
+        let mut rows = BTreeSet::new();
+        for id in awaited {
+            let (_, command) = self.records.get(id)?;
+            for change in command.as_ref()?.changes()? {
+                let pk = change
+                    .key
+                    .split_once('.')
+                    .map_or(change.key.as_str(), |(pk, _)| pk);
+                rows.insert((change.collection.clone(), pk.to_owned()));
+            }
+        }
+        Some(rows)
     }
     pub(crate) fn writable(&self, actor: Actor) -> Result<()> {
         if self.opaque_authors.contains(&actor)

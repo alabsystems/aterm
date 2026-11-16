@@ -25,11 +25,12 @@ fn framed(frame: Option<ClientFrame>) -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.tab_strip_rows = u16::from(frame.is_some_and(ClientFrame::has_header));
-    let ws = app.windows.get_mut(&wid).expect("the headless window");
+    let mut ws = app.windows.get_mut(&wid).expect("the headless window");
     ws.client_frame = frame;
     ws.scale = 1.0;
     ws.metrics.pad = crate::logical_to_device_px(crate::PAD_LOGICAL_PX, 1.0);
     ws.metrics.pad_top = crate::logical_to_device_px(crate::PAD_TOP_LOGICAL_PX, 1.0);
+    drop(ws);
     let (cw, ch) = app.win_cell_size(wid);
     let (pad, pad_top, head) = (app.win_pad(wid), app.win_pad_top(wid), app.win_head(wid));
     let (rows, cols) = (
@@ -123,7 +124,7 @@ fn a_press_on_a_handle_goes_no_further() {
 fn at_no_padding_the_edge_cells_stay_the_grids() {
     let (mut app, wid) = framed(Some(FRAME));
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.metrics.pad = 0;
         ws.metrics.pad_top = 0;
     }
@@ -157,7 +158,7 @@ fn at_no_padding_the_edge_cells_stay_the_grids() {
     );
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.metrics.pad = 12;
         ws.win_px = Some(PhysicalSize::new(
             u32::try_from(cols * cw + 24).expect("width"),

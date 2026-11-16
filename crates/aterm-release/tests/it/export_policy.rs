@@ -80,6 +80,7 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
     for withheld in [
         "publish/manifest.txt",
         "crates/aterm-release/tests/changelog.rs",
+        "crates/aterm-bootstrap-verify/tests/win_scripts/main.rs",
     ] {
         assert!(!exported.contains(withheld), "{withheld} is exported");
     }
@@ -87,6 +88,13 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
         exported.contains("man/aterm.1"),
         "man/aterm.1 is not exported"
     );
+    // `ship site` serves /install.sh and /get-aterm.ps1 from the public commit.
+    for installer in [
+        crate::site::INSTALLER_SOURCE,
+        crate::site::WINDOWS_INSTALLER_SOURCE,
+    ] {
+        assert!(exported.contains(installer), "{installer} is not exported");
+    }
 
     let art = "crates/aterm-effects/art";
     let tracked: BTreeSet<String> = git(&["ls-files", "--", art])
@@ -190,7 +198,10 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
             .env("CARGO_TARGET_DIR", &target)
             .env("ATERM_TEST_VERSION", line)
             .env("ATERM_TEST_EXIT", exit.to_string());
-        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).unwrap()
+        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|why| {
+                panic!("public version clause for {line:?}, child exit {exit}: {why:?}")
+            })
     };
     let toml = std::fs::read_to_string(repo().join("Cargo.toml")).unwrap();
     let workspace = toml

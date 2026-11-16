@@ -1002,10 +1002,8 @@ impl TapeSink {
         };
         let fault = |what: &str, e: &dyn std::fmt::Display| {
             StoreFault::Write(
-                Error::local(format!("{what} {}: {e}", dir.display())).with_next(format!(
-                    "make room in {}, or record to another path",
-                    path_word(&dir)
-                )),
+                Error::local(format!("{what} {}: {e}", dir.display()))
+                    .with_next("record to another path"),
             )
         };
         aterm_uds::private_file::create_private_dir(&dir)

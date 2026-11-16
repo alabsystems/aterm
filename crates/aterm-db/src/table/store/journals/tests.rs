@@ -664,7 +664,7 @@ fn overlapping_physical_reads_retain_facts_and_independently_hash_wires() {
     // Synthetic journal records exercise fact ownership, not payload authentication.
     // Store-level regressions separately require fresh keys and historical eligibility.
     for link in original.links.iter() {
-        link.wire.remember_non_cut(identity);
+        link.wire.remember_non_control(identity);
     }
     assert!(
         journals.list.lock().unwrap().slots[0]
@@ -692,7 +692,7 @@ fn overlapping_physical_reads_retain_facts_and_independently_hash_wires() {
         let all_facts = current
             .links
             .iter()
-            .all(|link| link.wire.verified_non_cut(&identity));
+            .all(|link| link.wire.verified_non_control(&identity));
         let hashed = test_hashed() - hashed;
         (all_facts, hashed, answer(current.witnessed(claim)))
     };

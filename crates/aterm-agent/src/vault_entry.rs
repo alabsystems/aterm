@@ -23,6 +23,13 @@ pub const SOURCE_PREFIX: &str = "vault:";
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Read {
     /// The verified value, as bounded UTF-8 text.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "the vault client builds on unix only: every other host's reader answers absent"
+        )
+    )]
     Present(String),
     /// No such entry for this Mac: no vault is configured here, this Mac is not (or no longer)
     /// in it, or its verified view holds no entry of that name.

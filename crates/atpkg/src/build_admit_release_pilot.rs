@@ -150,7 +150,7 @@ fn release_and_dev_abba() {
             }
             if let Some(dev) = &dev {
                 for record in ledger.list().unwrap().iter().filter(|r| r.pid == dev.id()) {
-                    asked_ms = Some(record.start_ms);
+                    asked_ms = Some(record.laid_ms());
                     if let Some(held) = record.held {
                         admitted_ms = Some(held.admitted_ms);
                     }
@@ -170,7 +170,7 @@ fn release_and_dev_abba() {
         let dev_row = dev.map(|mut dev| {
             while dev.try_wait_with_rusage().unwrap().is_none() {
                 for record in ledger.list().unwrap().iter().filter(|r| r.pid == dev.id()) {
-                    asked_ms = Some(record.start_ms);
+                    asked_ms = Some(record.laid_ms());
                     if let Some(held) = record.held {
                         admitted_ms = Some(held.admitted_ms);
                     }

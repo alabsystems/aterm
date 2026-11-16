@@ -982,7 +982,7 @@ fn the_offered_move_reads_the_vault_and_the_roster() {
         panic!("the vault holds the token");
     };
     assert!(
-        crate::harness::accounts_tokens::note_rejected(&lab.paths, &store, &standing, NOW)
+        crate::harness::accounts_tokens::note_rejected(&lab.paths, &store, &standing, 401, NOW)
             .expect("recorded"),
         "this Mac saw the vault's token refused"
     );

@@ -19,7 +19,7 @@
 //!
 //! `vendor/VENDORED` lists every other file under `vendor/` as `<fnv1a64> <path>` (the FNV-1a 64
 //! digest of its bytes in 16 lowercase hex digits, then its path from `vendor/`), in path order,
-//! and carries an [`aterm_census::seal`] of itself: the receiving repository's check finds a hand
+//! and carries an [`aterm_seal`] line of itself: the receiving repository's check finds a hand
 //! edit of a copy, or of the list, without aterm.
 //!
 //! Writing replaces whatever is at a path it writes, and removes a file under `vendor/` only where
@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use aterm_census::seal;
+use aterm_seal as seal;
 use aterm_toml::{Table, Value};
 
 use crate::exit;

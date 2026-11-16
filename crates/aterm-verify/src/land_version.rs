@@ -225,7 +225,7 @@ fn tree(git: &Git<'_>, id: &str, until: Instant) -> Result<Tree, String> {
             .map_err(|_| unread())?
             .split_whitespace()
             .collect();
-        if words.len() != 3 || !aterm_types::land_trailer::object_id(words[2]) {
+        if words.len() != 3 || !aterm_land_trailer::object_id(words[2]) {
             return Err(unread());
         }
         if !selected(path) && matches!((words[0], words[1]), ("100644" | "100755", "blob")) {

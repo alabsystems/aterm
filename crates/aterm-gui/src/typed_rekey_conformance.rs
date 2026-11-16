@@ -13,6 +13,7 @@ use aterm_session::SessionId;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
+use aterm_types::tab_id::TabId;
 
 use crate::shell_rekey::typed;
 
@@ -157,7 +158,9 @@ fn replay(model: &Model, schedule: &[&str], tag: &str) -> Vec<(String, bool)> {
         .prefix("rk-conf")
         .tempdir()
         .expect("scratch");
-    let sid = SessionId::new(format!("s-c0{:04x}", tag.len() * 16 + schedule.len()));
+    let sid = SessionId::new(
+        TabId::from_bits(0xc0_0000 + (tag.len() * 16 + schedule.len()) as u64).as_str(),
+    );
     let mut verdicts = Vec::new();
     for k in 0..schedule.len() {
         let before = Replay::run(dir.path(), &sid, &schedule[..k]).project(k > 0);
@@ -190,7 +193,7 @@ fn the_real_typed_rekey_conforms_to_the_model() {
     for (n, schedule) in SCHEDULES.iter().enumerate() {
         let end = Replay::run(
             dir.path(),
-            &SessionId::new(format!("s-c1{n:04x}")),
+            &SessionId::new(TabId::from_bits(0xc1_0000 + n as u64).as_str()),
             schedule,
         )
         .project(true);

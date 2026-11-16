@@ -179,6 +179,8 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
         .into_owned();
     // The stand-in: atpkg's launcher of a codex-alab package whose binary holds the auth-path
     // mark. Its interpreter is named `codex`, as the kernel names a codex-alab's process.
+    // It traps TERM before it writes anything, so a Signal at any point after its run's log line
+    // ends it through its own exit, as a codex-alab ends, never by the signal's default action.
     let interp = dir.join("sh/codex");
     std::fs::create_dir_all(interp.parent().expect("its folder")).expect("sh");
     std::os::unix::fs::symlink("/bin/sh", &interp).expect("the interpreter");
@@ -187,9 +189,10 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     std::fs::write(
         &exe,
         format!(
-            "#!{interp}\n# {mark}\nprintf '%s|%s|%s|%s\\n' \"$$\" \"${{CODEX_AUTH_PATH-unset}}\" \
-             \"${{CODEX_HOME-unset}}\" \"$*\" >> '{log}'\nprintf '{UP} %s\\n' \"$$\"\n\
-             trap 'kill $! 2>/dev/null; exit 143' TERM\n/bin/sleep \"${{STAND_IN_FOR:-2}}\" & wait $!\n",
+            "#!{interp}\n# {mark}\ntrap 'kill $! 2>/dev/null; exit 143' TERM\n\
+             printf '%s|%s|%s|%s\\n' \"$$\" \"${{CODEX_AUTH_PATH-unset}}\" \"${{CODEX_HOME-unset}}\" \
+             \"$*\" >> '{log}'\nprintf '{UP} %s\\n' \"$$\"\n\
+             /bin/sleep \"${{STAND_IN_FOR:-2}}\" & wait $!\n",
             interp = interp.display(),
             mark = crate::harness::codex_alab::AUTH_PATH_MARK,
             log = log.display(),
@@ -365,6 +368,11 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     assert_eq!(step(), "ended:handled");
     assert_eq!(typed(), typed_once, "the line is never typed twice");
     assert_eq!(runs(&log).len(), 2, "nothing ran again");
+    // The pty's reader drains on its own thread: the relaunch's up line can still be on its way
+    // once the relaunch ended. Count them once both are there; a third still fails the count.
+    zsh.until("the pty saw the relaunch start", || {
+        (zsh.said().matches(UP).count() >= 2).then_some(())
+    });
     assert_eq!(
         zsh.said().matches(UP).count(),
         2,

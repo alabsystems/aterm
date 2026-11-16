@@ -18,10 +18,12 @@ const WARM: &str = "r24.warm";
 /// Each session log's bound in this world (`ATERM_SLOG_RING`): one [`churn`] of 64 overflows it.
 const SLOG_RING: &str = "96,65536";
 
-/// `2n` timeline records on `sid` — `meta set title` alternating two values.
+/// `2n` timeline records on `sid` — `meta set icon` alternating two values. Not `title`: a
+/// title write is a description claim, which spends its author's mark tokens (`ERR busy` past
+/// a burst of 20), and this churn writes 128 at once.
 fn churn(c: &mut Ctl, sid: &str, n: usize) {
     for _ in 0..n {
-        for verb in ["meta set title r24a", "meta set title r24b"] {
+        for verb in ["meta set icon r24a", "meta set icon r24b"] {
             let reply = c.request(&format!("@{sid} {verb}")).expect("churn");
             assert!(reply.ok(), "{verb}: {}", reply.header());
         }

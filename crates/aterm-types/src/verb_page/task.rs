@@ -65,8 +65,8 @@ pub(crate) const PAGE: Page = Page {
                     "`task` answers `rev= state= from= since_ms= result_bytes= [conclusion=] \
                      [why=] [checked=] [left=] [exit=] [result_path=] [fact= fact_rev=] agent= \
                      program_state= attention=` (or `OK task -` when the session has no task; \
-                     `program_state=` is `status program_state=`, a codex's or Grok Build's own \
-                     report, `-` otherwise).",
+                     `program_state=` is `status program_state=`, a codex's, Grok Build's or \
+                     Claude Code's own report, `-` otherwise).",
                 ),
                 para(
                     "`state=`: `working`, `done` (under Land, a clean `Nothing left:` defense and \
@@ -146,7 +146,7 @@ pub(crate) const PAGE: Page = Page {
             name: "mark",
             about: "task mark: its words and what a hand mark may not set",
             rows: &[para(concat!(
-                "`task mark <working|done|exited|stalled|failed> [from=<s-…|ctl>] [why=<word>] \
+                "`task mark <working|done|exited|stalled|failed> [from=<sid|ctl>] [why=<word>] \
                  [checked=<word>] [left=<word>] [exit=<n>] [result_bytes=<n>] \
                  [result_path=<pct>]` (Owner-only; `checked=` and `left=` on `done` alone and \
                  from aterm's own loop alone: a hand mark naming either is refused, `ERR task \

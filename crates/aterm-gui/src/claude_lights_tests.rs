@@ -77,7 +77,7 @@ fn a_reader_panic_folds_nothing_in_and_types_nothing() {
         .is_none()
     );
     assert!(
-        fenced_screen_now(7, &plan, || lights::read_screen(&plan, None)).is_some(),
+        fenced_screen_now(7, &plan, || lights::read_screen(&plan, None, None)).is_some(),
         "the real reader sees the composer"
     );
     observe(&mut w, &plan);

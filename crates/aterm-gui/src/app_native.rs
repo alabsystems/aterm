@@ -2953,7 +2953,8 @@ impl App {
     }
 
     pub(crate) fn invalidate_native_ui_cache(&mut self, wid: WindowId) {
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.native_ui_compiled = None;
             #[cfg(a11y_tree)]
             {
@@ -2977,9 +2978,10 @@ impl App {
         view: crate::tab_model::ViewId,
         damage: DamageRegion,
     ) {
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         if window
             .native_ui_compiled
             .as_ref()
@@ -3016,11 +3018,13 @@ impl App {
                         })
             });
         self.invalidate_native_view_cache(wid, view, DamageRegion::All);
-        if let Some(cache) = self
+        if let Some(route_guard_cache) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.leaf_render_cache.get_mut(&view))
         {
+            let cache = &mut *route_guard_cache;
             cache.native_pointer_style_only = style_only;
         }
     }
@@ -3037,7 +3041,8 @@ impl App {
     /// Raise `view`'s paint serial past every raster painted so far: what the view draws changed
     /// now, and only pixels painted from here on show it.
     fn note_native_paint(&mut self, wid: WindowId, view: crate::tab_model::ViewId) -> u64 {
-        self.windows.get_mut(&wid).map_or(0, |window| {
+        self.windows.get_mut(&wid).map_or(0, |mut window| {
+            let window = &mut **window;
             let cache = window.leaf_render_cache.entry(view).or_default();
             cache.native_paint_serial = cache.native_paint_serial.wrapping_add(1);
             cache.native_pointer_style_only = false;
@@ -3052,7 +3057,8 @@ impl App {
         damage: DamageRegion,
     ) {
         self.invalidate_native_view_cache(wid, view, damage);
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.settings_card = None;
             if let Some(window) = window.os_window.as_ref() {
                 window.request_redraw();
@@ -3594,7 +3600,7 @@ impl App {
             let geometry = crate::native_ui::text_viewport_geometry(editor_rect, footer_rows);
             ((editor_rect.right() - geometry.text_x).max(1.0) / geometry.cell_w).floor() as usize
         };
-        let grid_width_changed = match self.native_runtime.view_state_mut(view) {
+        let grid_width_changed = match self.native_runtime.view_state_mut(view).as_deref_mut() {
             Some(crate::native_app::AppViewState::Editor(state)) => state
                 .buffer
                 .as_mut()
@@ -3663,6 +3669,28 @@ impl App {
         self.dispatch_native_target_event(wid, native.instance, view, event)
     }
 
+    /// Scroll a visible native leaf across (a sideways wheel or swipe over it), without changing
+    /// which leaf owns the keyboard.
+    pub(crate) fn scroll_native_view_across(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        lines: i32,
+    ) -> Result<EventResult, String> {
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| crate::active_tab_shows(ws, |candidate| candidate == view))
+        {
+            return Err("native scroll target is no longer visible".to_string());
+        }
+        let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view).copied()
+        else {
+            return Err("scroll target is not a native app".to_string());
+        };
+        self.dispatch_native_target_event(wid, native.instance, view, AppEvent::ScrollAcross(lines))
+    }
+
     /// Every input reaches a native app's reducer here. A person-only press no person is known to
     /// stand behind is refused before anything of it is taken, whichever way it came: a control,
     /// a palette command or an accessibility request ([`App::person_only_press_refusal`]).
@@ -3684,8 +3712,11 @@ impl App {
         // afterwards is theirs to press (`app_mouse::NativePointerRest`).
         if matches!(
             event,
-            AppEvent::ScrollLines(_) | AppEvent::ScrollPage(_) | AppEvent::ScrollAt { .. }
-        ) && let Some(ws) = self.windows.get_mut(&wid)
+            AppEvent::ScrollLines(_)
+                | AppEvent::ScrollAcross(_)
+                | AppEvent::ScrollPage(_)
+                | AppEvent::ScrollAt { .. }
+        ) && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.native_rest = None;
         }
@@ -4093,7 +4124,8 @@ impl App {
     }
 
     fn note_native_handled_dispatch(&mut self, wid: WindowId) {
-        if let Some(window) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
             window.native_dispatch_serial = window.native_dispatch_serial.saturating_add(1);
         }
     }
@@ -4132,7 +4164,8 @@ impl App {
                 || painted != Some(self.native_paint_serial(wid, after.view)))
         {
             let serial = self.note_native_paint(wid, after.view);
-            if let Some(window) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
                 crate::metrics::note_native_window_input(
                     &mut window.present_metrics.pending_native_input,
                     after.view,
@@ -4279,6 +4312,10 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings);
         let markdown_active = workspace_reader_active;
+        let tables_active = self
+            .native_runtime
+            .app(instance)
+            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Tables);
         // A list whose rows the arrows move between, as Settings' controls.
         let steps_focus = settings_active
             || self.native_runtime.app(instance).is_some_and(|app| {
@@ -4359,7 +4396,27 @@ impl App {
                 return true;
             }
             if !editor_active && *event_type == KeyEventType::Press {
-                let _ = self.move_native_focus(wid, mods.contains(Modifiers::SHIFT));
+                // On a sheet's cell Tab moves to the cell beside it, as in a spreadsheet; past
+                // the sheet's first or last cell it leaves the grid as Tab leaves any control.
+                let backwards = mods.contains(Modifiers::SHIFT);
+                let in_sheet = match (
+                    self.native_runtime.app(instance),
+                    self.native_runtime.view_state(active_view),
+                ) {
+                    (
+                        Some(crate::native_app::NativeApp::Tables(app)),
+                        Some(crate::native_app::AppViewState::Tables(state)),
+                    ) => app.tab_stays(state, backwards),
+                    _ => false,
+                };
+                if in_sheet {
+                    let _ = self.dispatch_native_event(
+                        wid,
+                        AppEvent::StepAcross(if backwards { -1 } else { 1 }),
+                    );
+                    return true;
+                }
+                let _ = self.move_native_focus(wid, backwards);
                 return true;
             }
         }
@@ -4508,6 +4565,14 @@ impl App {
             InputEvent::Paste(text, _) if editor_active => Some(AppEvent::EditorInput(
                 amacs::input::EditorInput::Paste(text.clone()),
             )),
+            // A paste on the Tables page is a block of cells where a cell is selected, which
+            // typed text is not: the page tells them apart by this action.
+            InputEvent::Paste(text, _) if tables_active => {
+                Some(AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new(crate::native_tables::PASTE),
+                    value: Some(crate::native_app::SemanticInput::Text(text.clone())),
+                }))
+            }
             InputEvent::Text(text) | InputEvent::Paste(text, _) => {
                 Some(AppEvent::TextInput(TextInputEvent::Commit(text.clone())))
             }
@@ -4573,6 +4638,15 @@ impl App {
                         id: crate::native_ui::ActionId::new("settings/search"),
                         value: None,
                     }))
+                } else if tables_active
+                    && (mods.contains(Modifiers::SUPER)
+                        || cfg!(not(target_os = "macos")) && mods.contains(Modifiers::CTRL))
+                    && !mods.intersects(Modifiers::ALT | Modifiers::SHIFT)
+                    && matches!(key, Key::Character('s' | 'S'))
+                {
+                    // Save's key writes the staged cells, as File ▸ Save does.
+                    self.write_front_tables(wid);
+                    return true;
                 } else if markdown_active && command && matches!(key, Key::Character('[')) {
                     Some(AppEvent::Action(crate::native_app::ActionInvocation {
                         id: crate::native_ui::ActionId::new("markdown/back"),
@@ -4672,6 +4746,12 @@ impl App {
                         }
                         Key::Named(NamedKey::Escape) => {
                             Some(AppEvent::TextInput(TextInputEvent::Cancel))
+                        }
+                        Key::Named(NamedKey::ArrowUp) if extend && tables_active => {
+                            Some(AppEvent::ExtendFocus(-1))
+                        }
+                        Key::Named(NamedKey::ArrowDown) if extend && tables_active => {
+                            Some(AppEvent::ExtendFocus(1))
                         }
                         Key::Named(NamedKey::ArrowUp) if steps_focus => {
                             Some(AppEvent::StepFocus(-1))
@@ -4819,7 +4899,7 @@ impl App {
         for effect in outcome.effects {
             self.execute_native_effect(wid, instance, view, effect)?;
         }
-        if let Some(state) = self.native_runtime.view_state_mut(view) {
+        if let Some(mut state) = self.native_runtime.view_state_mut(view) {
             state.common_mut().focus_visible = focus_visible;
         }
         self.note_native_handled_dispatch(wid);
@@ -5642,7 +5722,8 @@ impl App {
         cause: &str,
         indeterminate: bool,
     ) {
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             if ws.claude_lights.let_switches_go() {
                 crate::claude_lights::redraw(ws);
             }
@@ -6945,12 +7026,14 @@ impl App {
             match effect {
                 AppEffect::RepaintSelf(damage) => {
                     self.invalidate_native_view_cache(wid, view, damage);
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.last_present = None;
                     }
                 }
                 AppEffect::InvalidateOwnPresentation => {
-                    if let Some(ws) = self.windows.get_mut(&wid) {
+                    if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                        let ws = &mut **route_guard_ws;
                         ws.last_present = None;
                     }
                 }
@@ -7486,7 +7569,8 @@ impl App {
     /// Deliver `event` to every Settings view and repaint every window that shows one.
     pub(crate) fn dispatch_to_settings_views(&mut self, event: &AppEvent) {
         let setting_views = self.dispatch_settings_event(event);
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             let shows_settings = ws
                 .tab_set
                 .tabs()
@@ -10486,7 +10570,8 @@ impl App {
             .replace_settings_update(update, revision);
 
         let setting_views = self.dispatch_settings_event(&AppEvent::UpdateChanged { revision });
-        for ws in self.windows.values_mut() {
+        for mut route_guard_ws in self.windows.values_mut() {
+            let ws = &mut **route_guard_ws;
             let count = ws.tab_set.len();
             for index in 0..count {
                 let Some(tab) = ws.tab_set.tab_at(index) else {
@@ -12632,15 +12717,17 @@ impl App {
         }) else {
             return;
         };
-        if let Some(window) = self.windows.get_mut(&wid)
-            && let Some(index) = window
+        if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+            let window = &mut **route_guard_window;
+            if let Some(index) = window
                 .tab_set
                 .tabs()
                 .iter()
                 .position(|tab| tab.id == tab_id)
-            && let Some(slot) = window.tab_set.presentation_at_mut(index)
-        {
-            *slot = presentation;
+                && let Some(slot) = window.tab_set.presentation_at_mut(index)
+            {
+                *slot = presentation;
+            }
         }
     }
 }

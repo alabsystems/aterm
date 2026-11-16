@@ -216,7 +216,8 @@ pub(crate) struct PaletteRow {
 }
 
 impl PaletteRow {
-    fn menu(&self) -> Option<MenuAction> {
+    /// The menu action this row stands for, if any.
+    pub(crate) fn menu(&self) -> Option<MenuAction> {
         self.menu_alias.or_else(|| self.action.menu())
     }
 }
@@ -287,6 +288,9 @@ pub(crate) struct PaletteLive {
     pub stats_bars: Option<crate::stats_deck::StatsBars>,
     /// Active View ▸ Deck Size setting (`[sys] stats_deck_size`).
     pub deck_size: Option<crate::stats_plan::DeckSizePref>,
+    /// Whether the front window carries the System Resources band (Show System Resources
+    /// Here's checkmark).
+    pub band_here: bool,
     /// Live state for Agents menu rows.
     pub agents: crate::menu::AgentsLive,
     /// Newer `(build, version)` staged for one-click install, if any.
@@ -675,6 +679,15 @@ impl PaletteState {
                         .stats_bars
                         .unwrap_or(crate::stats_deck::StatsBars::Deck)
                         .shown();
+                }
+                MenuAction::ShowSystemResourcesHere => {
+                    // Only the Deck setting gives a window the band; the bit is kept under
+                    // Sill and Off, where it is inert.
+                    row.enabled = live
+                        .stats_bars
+                        .unwrap_or(crate::stats_deck::StatsBars::Deck)
+                        == crate::stats_deck::StatsBars::Deck;
+                    row.checked = Some(live.band_here);
                 }
                 _ => {}
             }

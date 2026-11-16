@@ -137,6 +137,14 @@ pub struct OpenedAudienceEntries {
     /// `(Audience, name)` registers holding two or more concurrent sibling writes that write
     /// different things (a reseal, which carries a value unchanged, is none).
     pub conflicts: BTreeSet<(Audience, String)>,
+    /// The ops of each `(Audience, name)` register holding two or more concurrent siblings, by
+    /// record id, conflicted or not ([`Self::conflicts`]): siblings that write the same value are
+    /// no conflict, yet their writers wrote concurrently all the same (`claude_token::settle`
+    /// reads who, [`Self::everyone_ops`]).
+    pub concurrent: BTreeMap<(Audience, String), Vec<RecordId>>,
+    /// Each carry among the ops a register holds now (its siblings, or its one op), by record id:
+    /// the op whose value it carries ([`Self::stands_for`]).
+    pub carried: BTreeMap<RecordId, RecordId>,
     /// Unwrapped symmetric keys of epochs that count, keyed by `epoch` [`RecordId`]. Every path
     /// that decides what to wrap or reuse reads this, so it never holds a keyed epoch.
     pub unwrapped_keys: BTreeMap<RecordId, Zeroizing<[u8; 32]>>,
@@ -195,6 +203,30 @@ impl OpenedAudienceEntries {
     #[must_use]
     pub fn reputs_whole(&self, audience: &EpochAudience) -> bool {
         self.fully_unwrapped_audiences.contains(audience) && !self.keyless_keyed.contains(audience)
+    }
+
+    /// The ops the `[everyone]` register `name` holds now, by record id: its concurrent siblings
+    /// ([`Self::concurrent`]), else its winning `Put` alone; none where neither stands (no write,
+    /// or a `Delete` that won alone).
+    #[must_use]
+    pub fn everyone_ops(&self, name: &str) -> Vec<RecordId> {
+        let at = (Audience::Everyone, name.to_owned());
+        self.concurrent.get(&at).cloned().unwrap_or_else(|| {
+            self.winning_puts
+                .get(&at)
+                .map(|put| vec![*put])
+                .unwrap_or_default()
+        })
+    }
+
+    /// The op `op`, one a register holds now ([`Self::everyone_ops`]), stands for: for a carry (a
+    /// reseal's re-`Put` of the value the register held), the op whose value it carries; for any
+    /// other op, itself. Which draft wrote a carried value, and so what that draft wrote beside it
+    /// (`claude_token::settle`'s pair), is that op's: a reseal re-puts each register's winner in
+    /// one draft of its own, and two registers' winners may come from two drafts.
+    #[must_use]
+    pub fn stands_for(&self, op: &RecordId) -> RecordId {
+        self.carried.get(op).copied().unwrap_or(*op)
     }
 }
 
@@ -302,6 +334,21 @@ pub(crate) mod most_bytes {
     ) -> usize {
         let plaintext = PUT_MAGIC.len() + 1 + 2 + name + anchor.map_or(0, |a| 2 + a) + 4 + value;
         super::super::MOST_FRAME + audience(of) + 32 + 32 + 4 + plaintext + TAG
+    }
+
+    /// The least a `Put` that [`put`] sizes takes once signed: one parent in place of the most
+    /// (every record after the genesis names one). What a write that waits for a key is weighed
+    /// as where its command queues it, so the class it is asked there is never less critical
+    /// than the one its signed record has.
+    #[must_use]
+    #[cfg(unix)]
+    pub(crate) fn put_least(
+        of: &EpochAudience,
+        name: usize,
+        anchor: Option<usize>,
+        value: usize,
+    ) -> usize {
+        put(of, name, anchor, value) - 32 * (super::super::MAX_PARENTS - 1)
     }
 
     /// A `Delete` under an epoch of `of` of an entry whose name is `name` bytes long.
@@ -2395,6 +2442,8 @@ impl Log {
         }
 
         let mut conflicts = BTreeSet::new();
+        let mut concurrent: BTreeMap<(Audience, String), Vec<RecordId>> = BTreeMap::new();
+        let mut carried: BTreeMap<RecordId, RecordId> = BTreeMap::new();
         let mut by_audience: BTreeMap<Audience, BTreeMap<String, EntryMeta>> = BTreeMap::new();
         let mut winning_epochs: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
         let mut keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
@@ -2418,6 +2467,20 @@ impl Log {
             let siblings = register.siblings(effective.reach());
             #[cfg(test)]
             register::oracle::check(candidates, effective, register, &siblings);
+            for &i in &siblings {
+                if register.reps[i] != i {
+                    carried.insert(
+                        candidates[i].record_id,
+                        candidates[register.reps[i]].record_id,
+                    );
+                }
+            }
+            if siblings.len() > 1 {
+                concurrent.insert(
+                    (audience.clone(), name.clone()),
+                    siblings.iter().map(|&i| candidates[i].record_id).collect(),
+                );
+            }
             let Some(w) = register.winner(&siblings) else {
                 continue;
             };
@@ -2519,6 +2582,8 @@ impl Log {
                 max_generation,
                 wrapped_recipients,
                 conflicts,
+                concurrent,
+                carried,
                 unwrapped_keys: unwrapped,
                 keyed_keys,
                 uncovered_keyed,
@@ -2727,6 +2792,119 @@ impl Log {
         Ok(Some(lineage))
     }
 
+    /// The `[everyone]` value of `name` each op of `ops` writes, as `opened` (this log as one
+    /// identity opens it, [`Self::open_audience_entries`]) opens it, in the order of `ops` (a
+    /// register's ops, [`OpenedAudienceEntries::everyone_ops`]): a `Put`'s value opened from its
+    /// inner seal ([`inner::load`]; a seal this Mac does not open stays sealed, [`inner::of`]
+    /// reads it so), `None` for a `Delete`, an op of another name, or one this Mac does not open
+    /// or the log does not hold. It opens with the epoch keys `opened` unwrapped, never
+    /// unwrapping again. What `claude_token::settle` reads the siblings of a split pair by.
+    ///
+    /// # Errors
+    /// A `Put` sealed under an epoch key `opened` holds fails to open.
+    #[cfg(unix)]
+    pub(crate) fn everyone_values(
+        &self,
+        opened: &OpenedAudienceEntries,
+        name: &str,
+        ops: &[RecordId],
+    ) -> Result<Vec<Option<SecretBytes>>> {
+        let mut values = vec![None; ops.len()];
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            let Some(at) = ops.iter().position(|op| op == record.id()) else {
+                continue;
+            };
+            if let Opened::Wrote(value) = self.everyone_put_opened(opened, i, record, name)? {
+                values[at] = Some(value);
+            }
+        }
+        Ok(values)
+    }
+
+    /// What each of `drafts` (a `Put`'s signer, the `authored_ms` it signed at and the epoch it
+    /// sealed under: one draft's writes) put under the `[everyone]` name `name`, as `opened`
+    /// opens this log, in the order of `drafts`, in one pass over the log: the value of its
+    /// first such `Put` that opens here; else [`DraftPut::Unopened`] where one of its
+    /// `[everyone]` `Put`s does not open here (it may be that name's), else
+    /// [`DraftPut::Nothing`]. What `claude_token::settle` reads to find the token a meta's draft
+    /// wrote beside it.
+    ///
+    /// # Errors
+    /// A `Put` sealed under an epoch key `opened` holds fails to open.
+    #[cfg(unix)]
+    pub(crate) fn everyone_puts_of_drafts(
+        &self,
+        opened: &OpenedAudienceEntries,
+        name: &str,
+        drafts: &[(MemberId, u64, RecordId)],
+    ) -> Result<Vec<DraftPut>> {
+        let mut found: Vec<DraftPut> = drafts.iter().map(|_| DraftPut::Nothing).collect();
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            let Body::Put {
+                audience: EpochAudience::Everyone,
+                epoch,
+                ..
+            } = record.body()
+            else {
+                continue;
+            };
+            let of_draft = |(actor, authored_ms, of): &(MemberId, u64, RecordId)| {
+                record.actor() == actor && record.authored_ms() == *authored_ms && of == epoch
+            };
+            if !drafts.iter().any(of_draft) {
+                continue;
+            }
+            let put = self.everyone_put_opened(opened, i, record, name)?;
+            for (at, _) in drafts
+                .iter()
+                .enumerate()
+                .filter(|(_, draft)| of_draft(draft))
+            {
+                found[at] = match (&found[at], &put) {
+                    (DraftPut::Wrote(_), _) | (DraftPut::Unopened, Opened::Other) => continue,
+                    (_, Opened::Wrote(value)) => DraftPut::Wrote(value.clone()),
+                    (_, Opened::Unopened) => DraftPut::Unopened,
+                    (DraftPut::Nothing, Opened::Other) => DraftPut::Nothing,
+                };
+            }
+        }
+        Ok(found)
+    }
+
+    /// The `[everyone]` `Put` `record`, at `index` of the log, as `opened` opens it: the value it
+    /// writes under `name` (opened from its inner seal), [`Opened::Other`] for another name or
+    /// another body, [`Opened::Unopened`] where no epoch key `opened` holds opens it.
+    #[cfg(unix)]
+    fn everyone_put_opened(
+        &self,
+        opened: &OpenedAudienceEntries,
+        index: usize,
+        record: &Record,
+        name: &str,
+    ) -> Result<Opened> {
+        let Body::Put {
+            audience: audience @ EpochAudience::Everyone,
+            epoch,
+            salt,
+            ciphertext,
+        } = record.body()
+        else {
+            return Ok(Opened::Other);
+        };
+        let (unwrapped, keyed) = (&opened.unwrapped_keys, &opened.keyed_keys);
+        let Some(epoch_key) = self.op_key(index, epoch, unwrapped, keyed, self.effective()) else {
+            return Ok(Opened::Unopened);
+        };
+        let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
+        let stored = decode_put_plaintext(&Audience::Everyone, &plain)?;
+        if stored.name != name {
+            return Ok(Opened::Other);
+        }
+        Ok(Opened::Wrote(
+            open_inner(self.network(), unwrapped, keyed, stored).value,
+        ))
+    }
+
     /// Every recipient a `Wrap` of `epoch` in this log hands its key to, whether or not the log
     /// still counts that `Wrap`: who could open what `epoch` seals, once they held these records.
     #[cfg(unix)]
@@ -2744,6 +2922,29 @@ impl Log {
             })
             .collect()
     }
+}
+
+/// What one draft put under an `[everyone]` name, as a Mac opens it
+/// ([`Log::everyone_puts_of_drafts`]).
+#[cfg(unix)]
+pub(crate) enum DraftPut {
+    /// The value its first `Put` of the name that opens here writes.
+    Wrote(SecretBytes),
+    /// It holds a `Put` this Mac does not open, which may be of the name.
+    Unopened,
+    /// Every `Put` it holds opens here, and none is of the name.
+    Nothing,
+}
+
+/// One `[everyone]` `Put` as a Mac opens it ([`Log::everyone_put_opened`]).
+#[cfg(unix)]
+enum Opened {
+    /// The value it writes under the name asked for.
+    Wrote(SecretBytes),
+    /// It writes another name, or is no `[everyone]` `Put`.
+    Other,
+    /// No epoch key this Mac holds opens it.
+    Unopened,
 }
 
 /// The `Put`s of one `[everyone]` value as a Mac opens them ([`Log::put_lineage`]).

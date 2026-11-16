@@ -668,7 +668,7 @@ fn a_press_the_layout_moved_under_a_still_pointer_chooses_nothing() {
     let host = idle_host();
     app.harness = Some(host.clone());
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.cols = 160;
         ws.rows = 90;
     }
@@ -793,7 +793,7 @@ fn a_row_the_layout_moved_under_a_pointer_on_the_bulk_row_waits_for_a_look() {
     let host = idle_host();
     app.harness = Some(host.clone());
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.cols = 160;
         ws.rows = 90;
     }
@@ -898,7 +898,7 @@ fn a_rows_button_a_state_line_moved_under_a_still_pointer_waits_for_a_look() {
     let host = idle_host();
     app.harness = Some(host.clone());
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.cols = 160;
         ws.rows = 90;
     }

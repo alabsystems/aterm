@@ -52,10 +52,12 @@ pub(super) struct WallMemory {
 /// ([`Session::stuck_climb`]), that the agent does not work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Witness {
-    /// Claude Code's own terminal title rests on `✳` (one `title` read, the
+    /// Claude Code's own run sign says it rests: its program-status report read
+    /// with the rows where one stands (`working` is work, every other state
+    /// rest), else its terminal title resting on `✳` (one `title` read, the
     /// program's OSC title: `status`'s `subject=` answers a person's rename
-    /// first and nothing while the terminal is held): it animates while the
-    /// agent works, and a screen no reader names says nothing either way.
+    /// first and nothing while the terminal is held), which animates while the
+    /// agent works; a screen no reader names says nothing either way.
     Title,
     /// The agent's own words stood still since the episode began
     /// ([`still_words`]): its reader read the turn's end as evidence and names
@@ -757,13 +759,33 @@ impl<C: Ctl> Session<'_, C> {
             Witness::Words(_) => String::new(),
             Witness::Title => {
                 self.stuck_asked = Some(self.fx.mono());
-                let Some(title) = self.stuck_look("title") else {
-                    return;
-                };
-                let title = title.strip_prefix("OK").unwrap_or(&title);
-                if !title.trim_start().starts_with(IDLE_TITLE_GLYPH) {
-                    self.stuck_over(screen.seq, "the agent's title moves: it works", review);
-                    return;
+                // With its query answered Claude Code's title carries no glyph: its report says.
+                // The witness is Claude Code's own, as the glyph is, whatever reader the screen
+                // names (an unread dialog names none).
+                let reported = screen
+                    .program_report
+                    .as_deref()
+                    .and_then(aterm_phase::phase::report_runs);
+                match reported {
+                    Some(true) => {
+                        self.stuck_over(screen.seq, "the agent's report says it works", review);
+                        return;
+                    }
+                    Some(false) => {}
+                    None => {
+                        let Some(title) = self.stuck_look("title") else {
+                            return;
+                        };
+                        let title = title.strip_prefix("OK").unwrap_or(&title);
+                        if !title.trim_start().starts_with(IDLE_TITLE_GLYPH) {
+                            self.stuck_over(
+                                screen.seq,
+                                "the agent's title moves: it works",
+                                review,
+                            );
+                            return;
+                        }
+                    }
                 }
                 if dialog {
                     let Some(status) = self.stuck_look("status") else {
@@ -796,7 +818,7 @@ impl<C: Ctl> Session<'_, C> {
                     }
                 };
                 review.note(&format!(
-                    "STUCK seq={} the agent's own title says idle, and {} has stood open, \
+                    "STUCK seq={} the agent's own run sign says idle, and {} has stood open, \
                      unchanged, for {minutes} min (agent={}): {closes}. rows: {}",
                     screen.seq,
                     named.unwrap_or(SETTINGS_PANEL),
@@ -807,7 +829,7 @@ impl<C: Ctl> Session<'_, C> {
             StuckRung::Said if dialog => {
                 let agent = crate::supervise::screen::status_field(&status, "agent");
                 review.note(&format!(
-                    "STUCK seq={} the agent's own title says idle, and the screen has stood \
+                    "STUCK seq={} the agent's own run sign says idle, and the screen has stood \
                      unchanged for {minutes} min with no composer, box, wall or busy row \
                      (agent={}): no reader here names it. If the tab is stalled, this is \
                      {UNREAD_DIALOG}, and only a person can answer it. rows: {}",
@@ -818,7 +840,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             StuckRung::Said => match witness {
                 Witness::Title => review.note(&format!(
-                    "STUCK seq={} the agent's own title says idle, and the screen has read busy \
+                    "STUCK seq={} the agent's own run sign says idle, and the screen has read busy \
                      on background work alone (a shell, a monitor, a workflow) for {minutes} \
                      min: no wall, question or box is recognised there. If the tab is stalled, \
                      this screen is one this build does not read.",

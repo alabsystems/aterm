@@ -37,6 +37,8 @@ const TEST_STAMP: Stamp = Stamp {
     trust_verify: "off",
     index_hint: "",
     release_build: false,
+    // This synthetic identity does not establish executable compile facts.
+    ..Stamp::UNSTAMPED
 };
 
 /// The running binary's build facts: the stamp `crates/aterm` installs first thing in `main`

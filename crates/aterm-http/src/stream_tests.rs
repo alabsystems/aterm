@@ -35,14 +35,18 @@ fn cancellation_wakes_a_silent_socket_and_prevents_writes() {
     ready_rx.recv_timeout(HANG_DETECTOR).unwrap();
     interrupt.interrupt();
     let (read, write) = done_rx.recv_timeout(HANG_DETECTOR).unwrap();
+    // Windows ends a `recv` the interrupt cancelled with WSAEINTR (10004), and one that began
+    // after its shutdown with WSAESHUTDOWN (10058); std names neither kind.
     assert!(
         matches!(read, Ok(0))
-            || read.is_err_and(|error| matches!(
+            || read.as_ref().is_err_and(|error| matches!(
                 error.kind(),
                 io::ErrorKind::ConnectionReset
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::NotConnected
-            ))
+            ) || cfg!(windows)
+                && matches!(error.raw_os_error(), Some(10004 | 10058))),
+        "the interrupt ends the waiting read, before its deadline: {read:?}"
     );
     assert!(write.is_err());
     worker.join().unwrap();

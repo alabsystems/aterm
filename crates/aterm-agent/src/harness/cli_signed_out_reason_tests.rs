@@ -9,6 +9,9 @@
 //! beside a row not signed out here makes it neither signed out nor annotated.
 
 use super::*;
+use crate::harness::alab_roster::{
+    Lab, LabAccount, SourceSnapshot, TestSourceOverride, test_machine,
+};
 use crate::harness::codex_app_login::{self, RefusalReason};
 
 struct NoProvider;
@@ -36,9 +39,9 @@ impl AccountsHost for NoProvider {
 /// refusal just made and not yet settled) and `live` (a settled refusal on record, and never
 /// signed out here), each on a login directory of its own, and `base`, the row on the default
 /// login (`base@example.test`; signed out here, the refusal of the token at the default home on
-/// record and settled), whose default home holds a login of `default_names`. A source table
-/// names none of them, so `accounts table` lists all of them as this Mac's own.
-fn pool(tag: &str, default_names: &str) -> (Tmp, Env) {
+/// record and settled), whose default home holds a login of `default_names`. A native source
+/// table names none of them, so `accounts table` lists all of them as this Mac's own.
+fn pool(tag: &str, default_names: &str) -> (Tmp, Env, TestSourceOverride) {
     let tmp = tmp_dir(tag);
     let env = env_at(&tmp);
     let home = env.home.clone().expect("a home");
@@ -48,11 +51,23 @@ fn pool(tag: &str, default_names: &str) -> (Tmp, Env) {
         0o600,
     )
     .expect("config");
-    crate::vault_entry::put(
-        &home,
-        "ai-accounts.csv",
-        "email,computer,codex\nelsewhere@example.test,m22,1\n",
-    );
+    let source = TestSourceOverride::new(SourceSnapshot::Present(std::sync::Arc::new(Lab {
+        me: Some(test_machine("m16")),
+        settled: true,
+        accounts: vec![LabAccount {
+            pk: "ac-0000000000000001".into(),
+            cli: Cli::Codex,
+            vendor: accounts::Vendor::default(),
+            label: "elsewhere".into(),
+            legacy_label: None,
+            email: "elsewhere@example.test".into(),
+            identity: None,
+            browser: None,
+            joinable: true,
+            preferred: vec![(test_machine("m22"), Some(1))],
+        }],
+        ..Lab::default()
+    })));
     let login = |dir: &Path, names: &str, refresh: &str| {
         let access = codex_app_login::tests::make_chatgpt_jwt(Some(names), "pro", env.now + 3600);
         std::fs::create_dir_all(dir).expect("mkdir");
@@ -113,7 +128,7 @@ fn pool(tag: &str, default_names: &str) -> (Tmp, Env) {
         codex_app_login::record_refusal_for_test(dir, RefusalReason::Expired, at)
             .expect("the refusal");
     }
-    (tmp, env)
+    (tmp, env, source)
 }
 
 fn run(form: AccountsCmd, env: &Env) -> String {
@@ -158,7 +173,7 @@ const PLAIN: [&str; 2] = ["gone", "fresh"];
 /// settled on record stays plain `signed-out`, and the row not signed out keeps its own condition.
 #[test]
 fn the_codex_list_says_why_a_row_is_signed_out() {
-    let (_tmp, env) = pool("signed-out-reason-list", "base@example.test");
+    let (_tmp, env, _source) = pool("signed-out-reason-list", "base@example.test");
     let ((text, json), reads) = crate::harness::provider_read::captured(|| {
         (
             run(AccountsCmd::Report { json: false }, &env),
@@ -199,7 +214,7 @@ fn the_codex_list_says_why_a_row_is_signed_out() {
 /// the readiness word itself unchanged in its JSON beside `signed_out_reason`.
 #[test]
 fn the_codex_table_says_why_a_row_is_signed_out() {
-    let (_tmp, env) = pool("signed-out-reason-table", "base@example.test");
+    let (_tmp, env, _source) = pool("signed-out-reason-table", "base@example.test");
     let text = run(AccountsCmd::Table { json: false }, &env);
     for label in SAYS {
         assert!(
@@ -233,7 +248,7 @@ fn the_codex_table_says_why_a_row_is_signed_out() {
 /// reason where a settled one is on record; a row not signed out here says nothing in AUTH.
 #[test]
 fn the_observed_codex_places_say_why_a_row_is_signed_out() {
-    let (_tmp, env) = pool("signed-out-reason-observed", "base@example.test");
+    let (_tmp, env, _source) = pool("signed-out-reason-observed", "base@example.test");
     let (mut text, mut json) = (Vec::new(), Vec::new());
     assert_eq!(
         run_accounts_observed(&env, false, &mut text),
@@ -283,7 +298,7 @@ fn a_row_says_no_reason_for_another_accounts_login_in_its_place() {
         ("other@example.test", None),
         ("base@example.test", Some("refresh_token_expired")),
     ] {
-        let (_tmp, env) = pool("signed-out-reason-displaced", default_names);
+        let (_tmp, env, _source) = pool("signed-out-reason-displaced", default_names);
         let says = |text: &str| {
             let line = line_of(text, "base");
             assert!(line.contains(" signed-out"), "{default_names}: {text}");
@@ -336,7 +351,7 @@ fn a_row_says_no_reason_for_another_accounts_login_in_its_place() {
 /// do.
 #[test]
 fn the_observed_columns_stay_aligned_beside_a_reason() {
-    let (_tmp, env) = pool("signed-out-reason-columns", "base@example.test");
+    let (_tmp, env, _source) = pool("signed-out-reason-columns", "base@example.test");
     let mut text = Vec::new();
     assert_eq!(
         run_accounts_observed(&env, false, &mut text),

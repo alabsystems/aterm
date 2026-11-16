@@ -233,6 +233,10 @@ struct Mock {
     /// screen; a screen not named sends none, as an older host does. The host's own reader word
     /// and its log read the title as the screen's ([`Self::host_phase`]).
     screen_titles: BTreeMap<usize, String>,
+    /// The program-status report the host sends standing with each screen's rows (`text --json`'s
+    /// `"program_report"`), by screen; a screen not named sends none, as a host does while none
+    /// stands. The host's own reader word reads it before the title ([`Self::host_phase`]).
+    screen_reports: BTreeMap<usize, String>,
     cursor_on_caret: bool,
     /// The first this many `text` reads find the cursor off the caret (row 10), later ones on
     /// it; the move bumps no content seq.
@@ -1153,6 +1157,7 @@ impl Mock {
             attention_kind: None,
             screen_cols: BTreeMap::new(),
             screen_titles: BTreeMap::new(),
+            screen_reports: BTreeMap::new(),
             cursor_on_caret: false,
             caret_after_reads: None,
             cursor_home_after: None,
@@ -1745,11 +1750,10 @@ impl Mock {
     /// with them ([`Self::screen_titles`]), as a host whose agent verdict reads the title does.
     fn host_phase(&self, i: usize) -> Phase {
         let i = i.min(self.screens.len() - 1);
-        let runs = self
-            .screen_titles
-            .get(&i)
-            .filter(|t| !t.is_empty())
-            .map(|t| aterm_phase::phase::title_runs(t));
+        let runs = aterm_phase::ClaudeReader.runs(
+            self.screen_titles.get(&i).map(String::as_str),
+            self.screen_reports.get(&i).map(String::as_str),
+        );
         aterm_phase::phase::worker_phase_seen(&self.screens[i], runs)
     }
 
@@ -2042,6 +2046,9 @@ impl Mock {
         if let Some(title) = self.screen_titles.get(&i) {
             let title = title.replace('\\', "\\\\").replace('"', "\\\"");
             human.push_str(&format!(",\"title\":\"{title}\""));
+        }
+        if let Some(report) = self.screen_reports.get(&i) {
+            human.push_str(&format!(",\"program_report\":\"{report}\""));
         }
         format!(
             "{{\"rows\":[{}],\"cursor\":{{\"row\":{cursor_row},\"col\":{composer_col},\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":{},\"cols\":{}}},\"seq\":{}{generation}{human}{first}}}\n",
@@ -4891,7 +4898,7 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
     assert!(r.took >= TITLE_HOLD, "{:?}", r.took);
     assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
     assert!(
-        r.noted[0].contains("title still said its run goes on, its reply unchanged 60 s"),
+        r.noted[0].contains("run sign still said its run goes on, its reply unchanged 60 s"),
         "{:#?}",
         r.noted
     );
@@ -5003,6 +5010,79 @@ fn a_title_sent_with_the_rows_holds_a_status_line_reply_with_no_title_call() {
     assert_eq!(title_reads(&r.requests), 0, "CONTROL: {:#?}", r.requests);
 }
 
+/// A host that answers Claude Code's program-status query sends its title with no run glyph and
+/// its report standing with the rows (`text --json`'s `"program_report"`): a status-line reply
+/// under `working` reads Busy with no `title` call, and the turn ends on the frame drawn after
+/// `done`, all four NEEDS YOU lines in it. A 2.1.323 reply half drawn under a `working` that never
+/// moves is held TITLE_HOLD of its reply unchanged and then read as its screen shows it, with the
+/// hold's NOTE. NEGATIVE CONTROL: the same frames sent with no report end on the first mid-reply
+/// read, as the screen alone reads it.
+#[test]
+fn a_report_sent_with_the_rows_holds_a_status_line_reply_under_a_glyphless_title() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_MIDREPLY_ANSWERED_2_1_323, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let frames = vec![mid.clone(), mid.clone(), held.clone(), done.clone()];
+    let reports = [
+        "state=working:app=claude-code",
+        "state=working:app=claude-code",
+        "state=done:app=claude-code",
+        "state=done:app=claude-code",
+    ];
+    let reported = |frames: Vec<Vec<String>>, reports: &[&str]| {
+        let mut m = snapshot_mock(frames, &["Claude Code"]);
+        m.screen_reports = reports
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, (*r).to_string()))
+            .collect();
+        title_run_on(m, None)
+    };
+    let r = reported(frames.clone(), &reports);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(needs_said(&r.turn.screen.rows), 4);
+    assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    let answered = screen(STATUSLINE_MIDREPLY_ANSWERED_2_1_323);
+    let r = reported(vec![answered.clone()], &["state=working:app=claude-code"]);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &answered, false),
+        "{:#?}",
+        r.requests
+    );
+    assert!(r.took >= TITLE_HOLD, "held the hold: {:?}", r.took);
+    assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
+    assert!(
+        r.noted[0].contains("run sign still said its run goes on, its reply unchanged 60 s"),
+        "{:#?}",
+        r.noted
+    );
+    let r = snapshot_run(frames, &["Claude Code"], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &mid),
+        "CONTROL: {:#?}",
+        r.requests
+    );
+    let r = snapshot_run(vec![answered.clone()], &["Claude Code"], false);
+    assert_eq!(
+        (r.turn.phase, &r.turn.screen.rows),
+        (Phase::Idle, &answered),
+        "CONTROL"
+    );
+    assert!(r.took < TITLE_HOLD, "CONTROL: no hold: {:?}", r.took);
+}
+
 /// Claude Code's critical-memory banner beside a status-line reply is no end of it: the loop holds
 /// the reply while its title runs, waits out the frame still holding its last line back under the
 /// title already at rest, and ends the turn on its done frame, all four NEEDS YOU lines in it and
@@ -5053,6 +5133,90 @@ fn the_memory_banner_beside_a_status_line_reply_holds_it_to_its_end() {
         assert_eq!(needs_said(&r.turn.screen.rows), 4);
     }
     let r = snapshot_run(frames, &[""], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &mid),
+        "CONTROL: {:#?}",
+        r.requests
+    );
+}
+
+/// Claude Code's run sign also runs while work it handed off runs (a background agent in the
+/// panel under its composer), so beside such work the rows' rest stands whatever the sign says
+/// ([`ScreenReader::title_live`] is false) and a status-line reply drawn beside it is held by the
+/// run sign the loop reads at that rest alone (`title_reading`), as a running title holds it.
+/// Under the glyphless title a terminal that answers Claude Code's program-status query gets,
+/// that sign is the report sent with the rows: `working` holds the reply and the turn ends on its
+/// done frame, all four NEEDS YOU lines in it, no `title` asked. NEGATIVE CONTROL: the same
+/// frames sent with no report end on a mid-reply read, the glyphless title at rest.
+#[test]
+fn a_reply_beside_handed_off_work_is_held_by_its_report_under_a_glyphless_title() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let beside_an_agent = |text: &str| {
+        let mut rows = screen(text);
+        rows.extend(
+            [
+                "",
+                "  ⏺ main",
+                "  ◯ general-purpose  bling probe                                    21s · ↓ 6.2k tokens",
+            ]
+            .map(str::to_string),
+        );
+        rows
+    };
+    let mid = beside_an_agent(STATUSLINE_MIDREPLY_2_1_311);
+    let done = beside_an_agent(STATUSLINE_REPLY_DONE_2_1_311);
+    let reader = aterm_phase::Program::Claude.reader();
+    assert!(
+        reader.delegated_shown(&mid),
+        "fixture guard: the panel's agent is handed-off work"
+    );
+    let working = Screen {
+        rows: mid.clone(),
+        title: Some("Claude Code".to_string()),
+        program_report: Some("state=working:app=claude-code".to_string()),
+        ..Screen::default()
+    };
+    assert_eq!(
+        super::phase_of(reader, &working),
+        Phase::Idle,
+        "fixture guard: beside it the rows' rest stands"
+    );
+    assert!(reader.end_drawn(&done), "fixture guard: the done row");
+    let frames = vec![mid.clone(), mid.clone(), done.clone()];
+    let mut m = snapshot_mock(frames.clone(), &["Claude Code"]);
+    m.screen_reports = [
+        "state=working:app=claude-code",
+        "state=working:app=claude-code",
+        "state=done:app=claude-code",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, r)| (i, (*r).to_string()))
+    .collect();
+    let r = title_run_on(m, None);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(needs_said(&r.turn.screen.rows), 4);
+    assert_eq!(title_reads(&r.requests), 0, "{:#?}", r.requests);
+    let r = snapshot_run(
+        frames.clone(),
+        &["◐ Claude Code", "◑ Claude Code", "✳ Claude Code"],
+        false,
+    );
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "the running title holds it alike: {:#?}",
+        r.requests
+    );
+    let r = snapshot_run(frames, &["Claude Code"], false);
     assert_eq!(
         (r.turn.phase.clone(), &r.turn.screen.rows),
         (Phase::Idle, &mid),
@@ -5189,7 +5353,7 @@ fn a_title_only_run_holds_while_its_reply_changes_and_ends_when_it_stands_past_t
     assert!(
         r.noted
             .iter()
-            .any(|n| n.contains("the agent's title still said its run goes on")),
+            .any(|n| n.contains("the agent's run sign still said its run goes on")),
         "{:#?}",
         r.noted
     );
@@ -5218,7 +5382,7 @@ fn a_title_only_run_holds_while_its_reply_changes_and_ends_when_it_stands_past_t
     );
     assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
     assert!(
-        r.noted[0].contains("the agent's title still said its run goes on, its reply unchanged"),
+        r.noted[0].contains("the agent's run sign still said its run goes on, its reply unchanged"),
         "{:#?}",
         r.noted
     );
@@ -5333,7 +5497,7 @@ fn an_interrupt_under_a_rested_title_decides_as_read() {
 }
 
 /// `aterm drive phase` of a status-line reply under a running title says it is busy, and why
-/// (`reason title: running`, R9). NEGATIVE CONTROLS: the rest glyph and no title read it idle.
+/// (`reason run sign: running`, R9). NEGATIVE CONTROLS: the rest glyph and no title read it idle.
 #[test]
 fn drive_phase_names_a_turn_only_the_title_runs() {
     use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen};
@@ -5349,9 +5513,40 @@ fn drive_phase_names_a_turn_only_the_title_runs() {
         render_phase(&turn, by_screen(&turn), &[])
     };
     for run in ["◐ Claude Code", "◑ Claude Code"] {
-        assert_eq!(read(Some(run)), "busy\nreason title: running\n", "{run}");
+        assert_eq!(read(Some(run)), "busy\nreason run sign: running\n", "{run}");
     }
     for quiet in [Some("✳ Claude Code"), Some(""), None] {
+        assert_eq!(read(quiet), "idle\n", "{quiet:?}");
+    }
+}
+
+/// `aterm drive phase` of a status-line reply whose program-status report says `working`, under
+/// the glyphless title Claude Code writes with its query answered, says it is busy, and why
+/// (`reason run sign: running`). NEGATIVE CONTROLS: a report at rest, and none, read it idle.
+#[test]
+fn drive_phase_names_a_turn_only_the_report_runs() {
+    use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_ANSWERED_2_1_323, screen};
+    let mid = screen(STATUSLINE_MIDREPLY_ANSWERED_2_1_323);
+    let mut m = Mock::new(vec![mid.clone()]);
+    let s = session(&mut m, None);
+    let read = |report: Option<&str>| {
+        let turn = s.turn_of(Screen {
+            rows: mid.clone(),
+            title: Some("Claude Code".to_string()),
+            program_report: report.map(str::to_string),
+            ..Screen::default()
+        });
+        render_phase(&turn, by_screen(&turn), &[])
+    };
+    assert_eq!(
+        read(Some("state=working:app=claude-code")),
+        "busy\nreason run sign: running\n"
+    );
+    for quiet in [
+        Some("state=done:app=claude-code"),
+        Some("state=working:app=codex"),
+        None,
+    ] {
         assert_eq!(read(quiet), "idle\n", "{quiet:?}");
     }
 }
@@ -5808,7 +6003,7 @@ fn a_title_hold_counts_from_the_replys_last_change_not_its_first_hold() {
         );
         assert_eq!(r.noted.len(), 1, "CONTROL {name}: {:#?}", r.noted);
         assert!(
-            r.noted[0].contains("title still said its run goes on, its reply unchanged 60 s"),
+            r.noted[0].contains("run sign still said its run goes on, its reply unchanged 60 s"),
             "CONTROL {name}: {:#?}",
             r.noted
         );

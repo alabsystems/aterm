@@ -1411,7 +1411,12 @@ type Handle = super::LaneChild;
 impl Command {
     /// Replace this process with the program (`POSIX_SPAWN_SETEXEC`): it holds this process's
     /// stdio and explicitly named guards. This process's own table is untouched if exec fails.
+    /// An unsettled process-table read returns `WouldBlock` before changing this command.
     pub fn exec(&mut self) -> io::Error {
+        let _closed = match super::close_exec_gate() {
+            Ok(closed) => closed,
+            Err(error) => return error,
+        };
         match self.launch(Fallback::Inherit, true, true, false) {
             Ok(_) => io::Error::other("the exec returned a child"),
             Err(error) => error,
@@ -1424,7 +1429,12 @@ impl Command {
     /// This creates no child or resource grant. Ordinary [`Self::exec`] keeps
     /// refusing suspended exec; mapped guards, disclaim and tether also retain
     /// their existing refusals. A failed exec preserves this process's table.
+    /// An unsettled process-table read returns `WouldBlock` before arming suspension.
     pub fn exec_suspended(&mut self) -> io::Error {
+        let _closed = match super::close_exec_gate() {
+            Ok(closed) => closed,
+            Err(error) => return error,
+        };
         self.suspended = true;
         match self.launch(Fallback::Inherit, true, true, true) {
             Ok(_) => io::Error::other("the suspended exec returned a child"),

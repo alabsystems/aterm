@@ -34,7 +34,7 @@ mod frontend_control;
 pub use frontend_control::{ControllerWithdrawal, FrontendController, FrontendMember};
 #[cfg(unix)]
 pub use owned_launch::{
-    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend,
+    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend, ServiceIdentity,
 };
 #[cfg(unix)]
 #[path = "codex_source_owned_environment.rs"]
@@ -1321,6 +1321,38 @@ impl Registry {
         environment: OwnedLaunchEnvironment,
     ) -> Result<OwnedLaunchReservation, Error> {
         let environment = environment.admit(admitted.starter())?;
+        self.reserve_owned_admission(env, sid, admitted, scope, environment)
+    }
+
+    /// Seal explicit native arguments before reserving an owned child. These
+    /// arguments never pass through a shell or replace the program/environment
+    /// admission. Only the resulting sealed command can install them at spawn.
+    ///
+    /// # Errors
+    /// As [`Self::reserve_owned_worker`], or an argument contains NUL.
+    #[cfg(unix)]
+    pub fn reserve_owned_worker_with_arguments(
+        &self,
+        env: &Env,
+        sid: &str,
+        admitted: &worker::Admitted,
+        scope: &super::account_work::Scope,
+        settings: (OwnedLaunchEnvironment, Vec<std::ffi::OsString>),
+    ) -> Result<OwnedLaunchReservation, Error> {
+        let (environment, arguments) = settings;
+        let environment = environment.admit_arguments(admitted.starter(), arguments)?;
+        self.reserve_owned_admission(env, sid, admitted, scope, environment)
+    }
+
+    #[cfg(unix)]
+    fn reserve_owned_admission(
+        &self,
+        env: &Env,
+        sid: &str,
+        admitted: &worker::Admitted,
+        scope: &super::account_work::Scope,
+        environment: owned_environment::AdmittedEnvironment,
+    ) -> Result<OwnedLaunchReservation, Error> {
         let binding = Arc::new(owned_launch::Binding::default());
         self.reserve_launch(
             env,
@@ -1343,7 +1375,7 @@ impl Registry {
         if scope.cancelled() {
             return Err(Error::Denied);
         }
-        if !aterm_types::control_verbs::is_minted_sid(sid) {
+        if aterm_types::control_request::Sid::parse(sid).is_none() {
             return Err(Error::Denied);
         }
         // Resolve only the existing managed-twin grammar. The kernel observes

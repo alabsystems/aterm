@@ -84,7 +84,7 @@ impl App {
         // a terminal route shows none, so its composition drops the one a native frame left, on
         // every path that composes (a window's redraw, a headless capture, a glassless lay).
         if matches!(route, VisibleContentRoute::Terminal { .. })
-            && let Some(window) = self.windows.get_mut(&wid)
+            && let Some(mut window) = self.windows.get_mut(&wid)
         {
             window.route_card = None;
         }
@@ -121,7 +121,7 @@ impl App {
         }
         if crate::icon_scene::active()
             && let Some(cell) = self.spawn_cell_px(wid)
-            && let Some(window) = self.windows.get_mut(&wid)
+            && let Some(mut window) = self.windows.get_mut(&wid)
         {
             crate::icon_scene::apply(&mut window.input_scratch, cell);
         }

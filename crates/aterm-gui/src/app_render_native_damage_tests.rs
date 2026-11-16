@@ -48,9 +48,10 @@ fn about_page_with_a_client() -> (App, WindowId, crate::tab_model::ViewId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.first_present_done = true;
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.cols = 140;
     window.rows = 50;
+    drop(window);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
     let (_, view) = app.active_native_view(wid).unwrap();
     app.windows.get_mut(&wid).unwrap().a11y_active = true;
@@ -291,9 +292,10 @@ impl ReloadedPage {
         .unwrap();
         let (instance, view) = app.active_native_view(wid).unwrap();
         let document = app.native_runtime.document_id(instance).unwrap().get();
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.a11y_active = true;
         window.bootstrap_present_retry_available = false;
+        drop(window);
         present_page(&mut app, wid, view);
         Self {
             app,
@@ -484,9 +486,10 @@ fn a_parked_redraw_with_nothing_to_tell_sends_nothing() {
     let (mut app, wid, view) = about_page_with_a_client();
     app.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
     assert!(app.prepare_native_input_scratch(wid));
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.bootstrap_present_retry_available = false;
     window.a11y_sent.clear();
+    drop(window);
     app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
     assert_eq!(app.windows[&wid].a11y_sent.len(), 1);
     app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
@@ -611,9 +614,10 @@ fn a_reveal_asked_on_a_shrunken_window_shows_the_row_whole() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.first_present_done = true;
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.cols = 140;
     window.rows = 40;
+    drop(window);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
     let (_, view) = app.active_native_view(wid).unwrap();
     app.windows.get_mut(&wid).unwrap().a11y_active = true;
@@ -798,19 +802,15 @@ fn native_leaf_cache_lifetime_conforms_across_split_zoom_tab_and_capture() {
         } else {
             app.switch_tab_in(wid, usize::from(action != "BindTerminal"));
             if action != "BindTerminal" {
-                let tab = app
-                    .windows
-                    .get_mut(&wid)
-                    .unwrap()
-                    .tab_set
-                    .active_mut()
-                    .unwrap();
+                let mut window_guard = app.windows.get_mut(&wid).unwrap();
+                let tab = window_guard.tab_set.active_mut().unwrap();
                 tab.focus = if action == "BindSecond" {
                     second
                 } else {
                     first
                 };
                 tab.zoomed = action != "BindSplit";
+                drop(window_guard);
                 app.resync_active_or_window(wid);
             }
             let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
@@ -875,7 +875,7 @@ fn native_route_card_composes_global_priority_and_modal_suppression() {
         delta: None,
     };
     {
-        let window = app.windows.get_mut(&wid).expect("window");
+        let mut window = app.windows.get_mut(&wid).expect("window");
         window.settings_card = Some(crate::SettingsCard {
             scrim: None,
             rgba: vec![0, 0, 0, 255, 0, 0, 0, 255],
@@ -1271,7 +1271,7 @@ fn native_chrome_redraw_reuses_compiled_tree_but_real_damage_rebuilds() {
         app.windows[&wid].settings_card.as_ref().unwrap().rgba,
         pixels
     );
-    app.windows.get_mut(&wid).unwrap().overlay = None;
+    app.windows.get_mut(&wid).unwrap().routing.set_overlay(None);
     assert!(app.prepare_native_input_scratch(wid));
     assert_eq!(
         app.windows[&wid].settings_card.as_ref().unwrap().rgba,
@@ -1359,7 +1359,7 @@ fn a_top_settings_tick_repaints_only_the_moving_specimen() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 60;
         window.cols = 220;
     }
@@ -1458,7 +1458,7 @@ fn every_top_settings_screen_paints_ready_previews_and_moves_the_cursor_it_draws
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         {
-            let window = app.windows.get_mut(&wid).unwrap();
+            let mut window = app.windows.get_mut(&wid).unwrap();
             window.rows = rows;
             window.cols = cols;
         }
@@ -1552,7 +1552,7 @@ fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
         crate::tray_raster::semantic_font_snapshot_for_test(&candidate),
         before
     );
-    app.windows.get_mut(&wid).unwrap().overlay = None;
+    app.windows.get_mut(&wid).unwrap().routing.set_overlay(None);
 
     assert_eq!(
         app.native_settings_preview_for_tick(wid, 165, true),
@@ -2312,7 +2312,7 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 160;
         window.rows = 50;
         window.focused = true;
@@ -2324,8 +2324,9 @@ fn a_resting_theme_demo_draws_its_settled_frame_once() {
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
     let (_, view) = app.active_native_view(wid).expect("native Settings view");
     let set_last_input = |app: &mut App, at: u64| {
+        let mut route_native_guard = app.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::Settings(state)) =
-            app.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("a Settings view")
         };
@@ -2383,7 +2384,7 @@ fn a_theme_demo_tick_repaints_only_its_grid() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 160;
         window.rows = 50;
         window.focused = true;

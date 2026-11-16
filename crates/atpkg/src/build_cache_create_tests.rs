@@ -585,9 +585,11 @@ const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
                          # For information about cache directory tags see https://bford.info/cachedir/\n";
 
 /// `root` as a build left it before any registration: the folder cargo made, its tag, the
-/// rustc facts it keeps, and one profile with its lock and an artifact, each with the mode
-/// cargo gives it under umask 022, whatever this process's: adoption proves custody only of a
-/// folder and a tag no group or other user can write.
+/// rustc facts it keeps, and one profile as its build prepared it (`deps`, `.fingerprint`,
+/// `examples`, `build` and `incremental`, Targo's `BuildDirLayout::prepare`) with the locks
+/// Targo 16387's `Layout::new` lays there off NFS (`.cargo-lock`, `.cargo-build-lock`) and
+/// an artifact, each with the mode cargo gives it under umask 022, whatever this process's:
+/// adoption proves custody only of a folder and a tag no group or other user can write.
 fn cargo_laid(root: &Path) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -603,13 +605,14 @@ fn cargo_laid(root: &Path) {
     std::fs::DirBuilder::new().mode(0o755).create(root).unwrap();
     put(&root.join("CACHEDIR.TAG"), CARGO_TAG.as_bytes());
     put(&root.join(".rustc_info.json"), b"{}");
+    for prepared in ["deps", ".fingerprint", "examples", "build", "incremental"] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(root.join("debug").join(prepared))
+            .unwrap();
+    }
     std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(root.join("debug/deps"))
-        .unwrap();
-    std::fs::DirBuilder::new()
-        .recursive(true)
         .mode(0o755)
         .create(root.join("debug/.fingerprint/probe-0123456789abcdef"))
         .unwrap();
@@ -618,6 +621,7 @@ fn cargo_laid(root: &Path) {
         b"invoked",
     );
     put(&root.join("debug/.cargo-lock"), b"");
+    put(&root.join("debug/.cargo-build-lock"), b"");
     put(&root.join("debug/deps/libprobe.rlib"), b"reusable output");
 }
 
@@ -969,20 +973,24 @@ fn a_target_cargo_made_before_registration_is_adopted_where_it_stands() {
                 .create(&leaf)
                 .unwrap();
             std::fs::write(leaf.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
-            std::fs::DirBuilder::new()
-                .mode(0o755)
-                .create(leaf.join("debug"))
-                .unwrap();
-            std::fs::rename(
-                world.target.join("debug/.fingerprint"),
-                leaf.join("debug/.fingerprint"),
-            )
-            .unwrap();
             std::fs::rename(
                 world.target.join(".rustc_info.json"),
                 leaf.join(".rustc_info.json"),
             )
             .unwrap();
+            // The build directory is the leaf, so its build prepared its profile there, laid its
+            // build lock there and recorded its units' invocations there.
+            std::fs::DirBuilder::new()
+                .mode(0o755)
+                .create(leaf.join("debug"))
+                .unwrap();
+            for prepared in ["build", "incremental", ".cargo-build-lock", ".fingerprint"] {
+                std::fs::rename(
+                    world.target.join("debug").join(prepared),
+                    leaf.join("debug").join(prepared),
+                )
+                .unwrap();
+            }
         }
         let before = identity(&world.target).unwrap();
         let machine = producer_machine(&world);
@@ -1028,8 +1036,10 @@ fn cargo_laid_by_umask(root: &Path) {
     std::fs::create_dir(root).unwrap();
     std::fs::write(root.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
     std::fs::write(root.join(".rustc_info.json"), b"{}").unwrap();
-    std::fs::create_dir_all(root.join("debug/deps")).unwrap();
-    std::fs::create_dir_all(root.join("debug/.fingerprint/probe-0123456789abcdef")).unwrap();
+    for prepared in ["deps", ".fingerprint", "examples", "build", "incremental"] {
+        std::fs::create_dir_all(root.join("debug").join(prepared)).unwrap();
+    }
+    std::fs::create_dir(root.join("debug/.fingerprint/probe-0123456789abcdef")).unwrap();
     std::fs::write(
         root.join("debug/.fingerprint/probe-0123456789abcdef/invoked.timestamp"),
         b"invoked",
@@ -1147,13 +1157,8 @@ fn a_folder_cargo_did_not_make_as_its_build_directory_is_never_adopted() {
                 std::fs::set_permissions(&tag, std::fs::Permissions::from_mode(0o664)).unwrap();
             }
             "tag-hardlinked" => std::fs::hard_link(&tag, world.home.join("CACHEDIR.TAG")).unwrap(),
-            // Cargo tags its home's git and registry caches where they stand, and never builds
-            // in them: `~/.cargo/git` holds the tag, `db` and `checkouts`, and no rustc facts.
-            "never-built" => {
-                std::fs::remove_file(world.target.join(".rustc_info.json")).unwrap();
-                std::fs::create_dir(world.target.join("db")).unwrap();
-                std::fs::create_dir(world.target.join("checkouts")).unwrap();
-            }
+            // A profile a build prepared, with no rustc facts beside it.
+            "never-built" => std::fs::remove_file(world.target.join(".rustc_info.json")).unwrap(),
             "linked-rustc-info" => {
                 let facts = world.target.join(".rustc_info.json");
                 let elsewhere = world.home.join("rustc_info.json");
@@ -1226,6 +1231,933 @@ fn a_folder_cargo_did_not_make_as_its_build_directory_is_never_adopted() {
             held,
             "{case}: its contents stand"
         );
+    }
+}
+
+/// A new file at `at` holding `bytes`, with the mode cargo gives a file under umask 022.
+fn laid_file(at: &Path, bytes: &[u8]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(at)
+        .and_then(|mut file| file.write_all(bytes))
+        .unwrap();
+}
+
+/// The folder `at` and its missing parents, with the mode cargo gives a folder under umask 022.
+fn laid_dir(at: &Path) {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(at)
+        .unwrap();
+}
+
+/// The folder `at` with cargo's tag, as Targo makes a target or build directory itself.
+fn laid_tagged(at: &Path) {
+    laid_dir(at);
+    laid_file(&at.join("CACHEDIR.TAG"), CARGO_TAG.as_bytes());
+}
+
+/// What a compilation lays in its build directory `dir`: the rustc facts, and a profile its
+/// build prepared (Targo's `BuildDirLayout::prepare`) with its build lock, a unit's invocation
+/// fingerprint and an artifact.
+fn compiled_in(dir: &Path) {
+    laid_file(&dir.join(".rustc_info.json"), b"{}");
+    for prepared in ["deps", ".fingerprint", "examples", "build", "incremental"] {
+        laid_dir(&dir.join("debug").join(prepared));
+    }
+    laid_dir(&dir.join("debug/.fingerprint/probe-0123456789abcdef"));
+    laid_file(
+        &dir.join("debug/.fingerprint/probe-0123456789abcdef/invoked.timestamp"),
+        b"invoked",
+    );
+    laid_file(&dir.join("debug/.cargo-build-lock"), b"");
+    laid_file(&dir.join("debug/deps/libprobe.rlib"), b"reusable output");
+}
+
+/// What a compilation lays in its artifact directory `dir`: the profile's locks and examples.
+fn artifacts_in(dir: &Path) {
+    laid_dir(&dir.join("debug/examples"));
+    laid_file(&dir.join("debug/.cargo-lock"), b"");
+    laid_file(&dir.join("debug/.cargo-artifact-lock"), b"");
+}
+
+/// KI-1111-15: THE RUSTC FACTS COUNT ONLY BESIDE A PROFILE A BUILD LAID, IN THE SAME FOLDER.
+/// A resolving verb (`metadata`, `tree`, `fetch`, `generate-lockfile`, `build --unit-graph`)
+/// writes `.rustc_info.json` into a build directory that already stands and makes no folder; a
+/// profile's folders are laid only by `Layout::new`, which `clean -p` reaches (its locks) and a
+/// compilation's `BuildRunner::prepare` (its `build` and `incremental`), in a build directory
+/// Targo made with its tag. A tagged folder whose facts stand with no such profile beside them
+/// (at its top, or in its build leaf), whose facts and profile stand apart (one at the top, the
+/// other in the leaf), whose profile is reached through a link, or whose profile holds a
+/// prepared folder (`build`, `incremental`) Targo never lays, a link or a file, its build lock
+/// beside it or not, is not adopted, nor is a profile whose build lock is a link or a folder with
+/// no prepared folders beside it, nor one with no facts beside its lock, nor its leaf, and a
+/// producer naming it is refused, with nothing recorded and no marker written. Each starts from
+/// the layout Targo 16387 lays off NFS, its build lock included ([`cargo_laid`]). A profile that
+/// holds `clean -p`'s build lock with no unit invoked counts only as Targo leaves it: in a folder
+/// of this user's no group or other user can write, the lock a regular file of this user's with
+/// no other name, and beside it either nothing a build prepares (a `clean -p` before any build) or
+/// the folders a build prepared, `build` and `incremental` among them, each a folder (a `clean -p`
+/// after one: `clean_specs` takes each cleaned package's entries out of them and leaves the
+/// folders), with no unit's folder left in any profile, at the top or in a target's folder: any
+/// folder there but Targo's `doc`, `tmp`, `package` or `cargo-timings` holding no cargo lock and
+/// no `.fingerprint`. A lone `deps` beside the lock is neither, and a unit's folder with no
+/// invocation is a build cut short before its first job, in a target's profile or the predefined
+/// `doc` profile too, or a dry run in the new layout, whose `prepare` makes every unit's folder
+/// (`adoption_requires_unlinked_private_compilation_evidence_in_known_layouts` holds the
+/// cut-short build in each layout); a `.fingerprint` that is no folder is no layout Targo lays.
+/// NEGATIVE CONTROL: the folder a build laid is adopted, and so are the ones a `clean -p` laid
+/// before any build (the front frees `clean`, so it never makes that folder), which every later
+/// build was refused before it could prepare a profile, and the ones a `clean -p` of every
+/// package a build compiled leaves, in either layout, where every later build was refused too,
+/// also beside what a `doc`, a test and a `package` leave that names no unit (a crate's
+/// `doc/<crate>/build` page, a test's `tmp/build` and `tmp/<case>/build`, an extracted
+/// package's `package/<name>-<version>/build`).
+#[test]
+fn a_folder_no_build_prepared_is_never_adopted_whatever_rustc_facts_it_holds() {
+    for case in [
+        "built",
+        "top-metadata",
+        "leaf-metadata",
+        "clean-p",
+        "facts-top-profile-leaf",
+        "facts-leaf-profile-top",
+        "profile-linked",
+        "build-missing",
+        "build-linked",
+        "build-file",
+        "profile-folder-linked",
+        "build-lock-linked",
+        "build-lock-folder",
+        "lock-without-facts",
+        "clean-p-shared-profile",
+        "clean-p-shared-lock",
+        "clean-p-lock-hardlinked",
+        "clean-p-beside-deps",
+        "clean-p-after-build",
+        "clean-p-after-build-new-layout",
+        "clean-p-after-build-beside-doc-tmp-package",
+        "build-cut-short",
+        "build-cut-short-cross",
+        "build-cut-short-doc-profile",
+        "dry-run-new-layout",
+        "clean-p-after-build-fingerprint-file",
+    ] {
+        let world = World::new();
+        let target = &world.target;
+        let leaf = super::super::super::target_build_path(target);
+        let elsewhere = world.home.join("elsewhere");
+        match case {
+            "built" => cargo_laid(target),
+            // `targo metadata` into a target an earlier call made.
+            "top-metadata" => {
+                laid_tagged(target);
+                laid_file(&target.join(".rustc_info.json"), b"{}");
+            }
+            // The same, with the shim naming the build leaf as the build directory.
+            "leaf-metadata" => {
+                laid_tagged(target);
+                laid_tagged(&leaf);
+                laid_file(&leaf.join(".rustc_info.json"), b"{}");
+            }
+            // `targo clean -p x --target-dir T` with no `T`: `Layout::new`'s folders and locks,
+            // and the facts its workspace resolution wrote, but no profile prepared.
+            "clean-p"
+            | "clean-p-shared-profile"
+            | "clean-p-shared-lock"
+            | "clean-p-lock-hardlinked"
+            | "clean-p-beside-deps" => {
+                use std::os::unix::fs::PermissionsExt as _;
+                laid_tagged(target);
+                laid_dir(&target.join("debug"));
+                laid_file(&target.join("debug/.cargo-lock"), b"");
+                laid_file(&target.join("debug/.cargo-artifact-lock"), b"");
+                laid_tagged(&leaf);
+                laid_dir(&leaf.join("debug"));
+                let lock = leaf.join("debug/.cargo-build-lock");
+                laid_file(&lock, b"");
+                laid_file(&leaf.join(".rustc_info.json"), b"{}");
+                match case {
+                    // A profile another user can write proves nothing of Targo's.
+                    "clean-p-shared-profile" => std::fs::set_permissions(
+                        leaf.join("debug"),
+                        std::fs::Permissions::from_mode(0o777),
+                    )
+                    .unwrap(),
+                    "clean-p-shared-lock" => {
+                        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o666))
+                            .unwrap();
+                    }
+                    "clean-p-lock-hardlinked" => {
+                        laid_dir(&elsewhere);
+                        std::fs::hard_link(&lock, elsewhere.join("lock")).unwrap();
+                    }
+                    // One folder a build prepares, without the others a build lays with it.
+                    "clean-p-beside-deps" => laid_dir(&leaf.join("debug/deps")),
+                    _ => {}
+                }
+            }
+            // `targo clean -p probe` after a build of `probe` alone, in the old layout: its
+            // fingerprint folder and its artifact go, every folder the build prepared stays.
+            "clean-p-after-build" | "clean-p-after-build-fingerprint-file" => {
+                cargo_laid(target);
+                std::fs::remove_dir_all(target.join("debug/.fingerprint/probe-0123456789abcdef"))
+                    .unwrap();
+                std::fs::remove_file(target.join("debug/deps/libprobe.rlib")).unwrap();
+                if case == "clean-p-after-build-fingerprint-file" {
+                    std::fs::remove_dir(target.join("debug/.fingerprint")).unwrap();
+                    laid_file(&target.join("debug/.fingerprint"), b"");
+                }
+            }
+            // The same in the new layout (`-Zbuild-dir-new-layout`), whose `prepare` lays only
+            // `build` and `incremental`, and whose `clean -p` takes `build/probe`.
+            "clean-p-after-build-new-layout" => {
+                laid_tagged(target);
+                laid_file(&target.join(".rustc_info.json"), b"{}");
+                for prepared in ["build", "incremental", "examples"] {
+                    laid_dir(&target.join("debug").join(prepared));
+                }
+                laid_file(&target.join("debug/.cargo-lock"), b"");
+                laid_file(&target.join("debug/.cargo-build-lock"), b"");
+            }
+            // `targo build`, `targo doc` and `targo test`, then `targo clean -p probe` of a
+            // package with a `pub mod build`, a test that wrote under `CARGO_TARGET_TMPDIR`, and a
+            // `targo package`: `clean -p` touches none of `doc`, `tmp` or `package`.
+            "clean-p-after-build-beside-doc-tmp-package" => {
+                cargo_laid(target);
+                std::fs::remove_dir_all(target.join("debug/.fingerprint/probe-0123456789abcdef"))
+                    .unwrap();
+                std::fs::remove_file(target.join("debug/deps/libprobe.rlib")).unwrap();
+                for (folder, file) in [
+                    ("doc/probe/build", "index.html"),
+                    ("tmp/build", "case.txt"),
+                    ("tmp/case/build", "out.txt"),
+                    ("package/probe-0.1.0/build", "main.rs"),
+                ] {
+                    laid_dir(&target.join(folder));
+                    laid_file(&target.join(folder).join(file), b"left");
+                }
+            }
+            // A cross build cut short in its target's profile, beside a top profile `clean -p`
+            // left.
+            "build-cut-short-cross" => {
+                cargo_laid(target);
+                std::fs::remove_dir_all(target.join("debug/.fingerprint/probe-0123456789abcdef"))
+                    .unwrap();
+                std::fs::remove_file(target.join("debug/deps/libprobe.rlib")).unwrap();
+                let cross = target.join("aarch64-apple-darwin/debug");
+                for prepared in ["deps", ".fingerprint", "examples", "build", "incremental"] {
+                    laid_dir(&cross.join(prepared));
+                }
+                laid_file(&cross.join(".cargo-build-lock"), b"");
+                laid_dir(&cross.join(".fingerprint/probe-0123456789abcdef"));
+            }
+            // `targo build --profile doc` cut short, its profile in rustdoc's folder.
+            "build-cut-short-doc-profile" => {
+                cargo_laid(target);
+                std::fs::remove_dir_all(target.join("debug/.fingerprint/probe-0123456789abcdef"))
+                    .unwrap();
+                std::fs::remove_file(target.join("debug/deps/libprobe.rlib")).unwrap();
+                for prepared in ["deps", ".fingerprint", "examples", "build", "incremental"] {
+                    laid_dir(&target.join("doc").join(prepared));
+                }
+                laid_file(&target.join("doc/.cargo-build-lock"), b"");
+                laid_dir(&target.join("doc/.fingerprint/probe-0123456789abcdef"));
+            }
+            // `targo install --dry-run --target-dir T` in the new layout: `BuildRunner::prepare`
+            // makes every unit's `build/<package>/<hash>/out`, and no job runs.
+            "dry-run-new-layout" => {
+                laid_tagged(target);
+                laid_file(&target.join(".rustc_info.json"), b"{}");
+                for prepared in ["build", "incremental"] {
+                    laid_dir(&target.join("release").join(prepared));
+                }
+                laid_file(&target.join("release/.cargo-lock"), b"");
+                laid_file(&target.join("release/.cargo-build-lock"), b"");
+                laid_dir(&target.join("release/build/probe/0123456789abcdef/out"));
+            }
+            // A build cut short after `prepare_init` made its unit's folder, before its job.
+            "build-cut-short" => {
+                cargo_laid(target);
+                std::fs::remove_file(
+                    target.join("debug/.fingerprint/probe-0123456789abcdef/invoked.timestamp"),
+                )
+                .unwrap();
+            }
+            // The build directory's profile, its lock and prepared folders, in the leaf.
+            "facts-top-profile-leaf" => {
+                cargo_laid(target);
+                laid_tagged(&leaf);
+                laid_dir(&leaf.join("debug"));
+                for prepared in ["build", "incremental", ".cargo-build-lock"] {
+                    std::fs::rename(
+                        target.join("debug").join(prepared),
+                        leaf.join("debug").join(prepared),
+                    )
+                    .unwrap();
+                }
+            }
+            "facts-leaf-profile-top" => {
+                cargo_laid(target);
+                laid_tagged(&leaf);
+                std::fs::rename(
+                    target.join(".rustc_info.json"),
+                    leaf.join(".rustc_info.json"),
+                )
+                .unwrap();
+            }
+            "profile-linked" => {
+                cargo_laid(target);
+                laid_dir(&elsewhere);
+                std::fs::remove_dir(target.join("debug/incremental")).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, target.join("debug/incremental")).unwrap();
+            }
+            // `build` counts as `incremental` does: missing (with no build lock, as on NFS,
+            // where `Layout::new` lays none), linked, or a file, beside a real `incremental`.
+            "build-missing" => {
+                cargo_laid(target);
+                std::fs::remove_dir(target.join("debug/build")).unwrap();
+                std::fs::remove_file(target.join("debug/.cargo-build-lock")).unwrap();
+            }
+            "build-linked" => {
+                cargo_laid(target);
+                laid_dir(&elsewhere);
+                std::fs::remove_dir(target.join("debug/build")).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, target.join("debug/build")).unwrap();
+            }
+            "build-file" => {
+                cargo_laid(target);
+                std::fs::remove_dir(target.join("debug/build")).unwrap();
+                laid_file(&target.join("debug/build"), b"");
+            }
+            "profile-folder-linked" => {
+                cargo_laid(target);
+                laid_dir(&elsewhere);
+                std::fs::rename(target.join("debug"), elsewhere.join("debug")).unwrap();
+                std::os::unix::fs::symlink(elsewhere.join("debug"), target.join("debug")).unwrap();
+            }
+            // A build lock that is no regular file of the profile's own proves no `Layout::new`
+            // ran there: a link to one elsewhere, or a folder at its name, with no prepared
+            // folders beside it.
+            "build-lock-linked" | "build-lock-folder" => {
+                cargo_laid(target);
+                for prepared in ["build", "incremental"] {
+                    std::fs::remove_dir(target.join("debug").join(prepared)).unwrap();
+                }
+                let lock = target.join("debug/.cargo-build-lock");
+                std::fs::remove_file(&lock).unwrap();
+                if case == "build-lock-linked" {
+                    laid_dir(&elsewhere);
+                    laid_file(&elsewhere.join(".cargo-build-lock"), b"");
+                    std::os::unix::fs::symlink(elsewhere.join(".cargo-build-lock"), &lock).unwrap();
+                } else {
+                    laid_dir(&lock);
+                }
+            }
+            // The lock with no rustc facts beside it, at the top.
+            "lock-without-facts" => {
+                cargo_laid(target);
+                std::fs::remove_file(target.join(".rustc_info.json")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let admitted = world.admit().unwrap();
+        if matches!(
+            case,
+            "built"
+                | "clean-p"
+                | "clean-p-after-build"
+                | "clean-p-after-build-new-layout"
+                | "clean-p-after-build-beside-doc-tmp-package"
+        ) {
+            assert!(admitted, "{case}: the folder a build laid is adopted");
+            assert!(target.join(MARKER).is_file(), "{case}: custody declared");
+            continue;
+        }
+        assert!(!admitted, "{case}: not adopted");
+        assert!(!target.join(MARKER).exists(), "{case}: no custody declared");
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+        if leaf.is_dir() {
+            assert!(
+                !create_checked(&world.home, &leaf, &world.owner).unwrap(),
+                "{case}: nor is its leaf adopted"
+            );
+            assert!(!leaf.join(MARKER).exists(), "{case}");
+        }
+        let refused = super::super::observe_for_producer(
+            &build_into(&world, target),
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        );
+        assert!(
+            refused.is_err(),
+            "{case}: a producer naming it is refused: {refused:?}"
+        );
+        assert!(!target.join(MARKER).exists(), "{case}: no custody declared");
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+    }
+}
+
+/// Every folder and file under `root`, each file with its bytes, read without following links.
+fn contents(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut seen = Vec::new();
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(at) = folders.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                folders.push(path.clone());
+                seen.push((path, None));
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                seen.push((path, Some(bytes)));
+            }
+        }
+    }
+    seen.sort();
+    seen
+}
+
+/// What a cargo home's cache keeps under `name`, laid in `cache` as Targo lays it: a git
+/// dependency's database (`db`) and its checkout (`checkouts`), a registry's index (`index`) and
+/// the crates it downloaded (`cache`).
+fn kept_in(cache: &Path, name: &str) {
+    let (folder, file, bytes): (&str, &str, &[u8]) = match name {
+        "db" => ("db/dep-0123456789abcdef", "HEAD", b"ref: refs/heads/main\n"),
+        "checkouts" => (
+            "checkouts/dep-0123456789abcdef/abc1234",
+            "lib.rs",
+            b"pub fn dep() {}\n",
+        ),
+        "index" => (
+            "index/index.crates.io-1949cf8c6b5b557f",
+            "config.json",
+            b"{\"dl\":\"https://static.crates.io/crates\"}",
+        ),
+        "cache" => (
+            "cache/index.crates.io-1949cf8c6b5b557f",
+            "dep-1.0.0.crate",
+            b"a crate",
+        ),
+        _ => unreachable!(),
+    };
+    laid_dir(&cache.join(folder));
+    laid_file(&cache.join(folder).join(file), bytes);
+}
+
+/// Where a case of [`a_cargo_home_cache_is_never_adopted_whatever_build_ran_in_it`] lays the
+/// evidence a build or a resolving verb leaves in the cache it names as its target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Laid {
+    /// A build's, at the cache's top.
+    Top,
+    /// A build's, in the build leaf the shim names.
+    Leaf,
+    /// `targo metadata`'s: the rustc facts at the cache's top, and nothing else.
+    Facts,
+}
+
+/// KI-1111-15: A CARGO HOME'S OWN CACHE IS NEVER ADOPTED, WHATEVER BUILD RAN IN IT. Targo tags
+/// `<home>/git` and `<home>/registry` where they stand, and a build the front admits unjudged (a
+/// package outside HOME, built from outside it; a package in HOME itself) writes wherever its
+/// target names, so a full build's evidence can stand in them: at the cache's top, or in the
+/// build leaf the shim names; a resolving verb leaves only the rustc facts there. None of these
+/// is adopted: a cache at its own name in Targo's default home (`~/.cargo`) or in another cargo
+/// home its locks or cache tracker mark, fetched or not; a cache under any name that keeps any
+/// one of what Targo keeps there (`db`, `checkouts`; `index`, as `generate-lockfile` leaves a
+/// registry, `cache`); and a cache, unfetched, under another name that `~/.cargo`'s cache names
+/// through a link. A producer naming it is refused, nothing is recorded, no marker is written,
+/// and what the cache holds stands.
+#[test]
+fn a_cargo_home_cache_is_never_adopted_whatever_build_ran_in_it() {
+    // The case, the cache's folder in HOME, what it keeps, the cargo home's mark beside it, the
+    // name `~/.cargo` links to it by, and where the evidence is laid.
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        Option<&'static str>,
+        Option<&'static str>,
+        Laid,
+    );
+    let cases: [Case; 18] = [
+        (
+            "git-built-top",
+            ".cargo/git",
+            &["db", "checkouts"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "git-built-leaf",
+            ".cargo/git",
+            &["db", "checkouts"],
+            None,
+            None,
+            Laid::Leaf,
+        ),
+        (
+            "registry-built-top",
+            ".cargo/registry",
+            &["index", "cache"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "registry-built-leaf",
+            ".cargo/registry",
+            &["index", "cache"],
+            None,
+            None,
+            Laid::Leaf,
+        ),
+        (
+            "git-elsewhere",
+            "git-store.noindex",
+            &["db", "checkouts"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "registry-elsewhere",
+            "registry-store.noindex",
+            &["index", "cache"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        ("db-only", "store.noindex", &["db"], None, None, Laid::Top),
+        (
+            "checkouts-only",
+            "store.noindex",
+            &["checkouts"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "index-only",
+            "registry-store.noindex",
+            &["index"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "cache-only",
+            "store.noindex",
+            &["cache"],
+            None,
+            None,
+            Laid::Top,
+        ),
+        ("git-unfetched", ".cargo/git", &[], None, None, Laid::Top),
+        (
+            "registry-unfetched",
+            ".cargo/registry",
+            &[],
+            None,
+            None,
+            Laid::Top,
+        ),
+        (
+            "git-unfetched-locked-home",
+            "cargo-home/git",
+            &[],
+            Some(".package-cache"),
+            None,
+            Laid::Top,
+        ),
+        (
+            "registry-unfetched-mutated-home",
+            "cargo-home/registry",
+            &[],
+            Some(".package-cache-mutate"),
+            None,
+            Laid::Top,
+        ),
+        (
+            "git-unfetched-tracked-home",
+            "cargo-home/git",
+            &[],
+            Some(".global-cache"),
+            None,
+            Laid::Top,
+        ),
+        (
+            "git-unfetched-linked",
+            "cargo-git.noindex",
+            &[],
+            None,
+            Some("git"),
+            Laid::Top,
+        ),
+        (
+            "registry-unfetched-linked",
+            "cargo-registry.noindex",
+            &[],
+            None,
+            Some("registry"),
+            Laid::Top,
+        ),
+        (
+            "git-metadata",
+            ".cargo/git",
+            &["db", "checkouts"],
+            None,
+            None,
+            Laid::Facts,
+        ),
+    ];
+    for (case, at, kept, mark, linked, laid) in cases {
+        let mut world = World::new();
+        world.target = world.home.join(at);
+        let target = world.target.clone();
+        // The cache as Targo keeps it: its folder, then cargo's tag written into it, under the
+        // package cache's lock in its home.
+        laid_dir(&target);
+        laid_file(&target.join("CACHEDIR.TAG"), CARGO_TAG.as_bytes());
+        if let Some(mark) = mark {
+            laid_file(&target.parent().unwrap().join(mark), b"");
+        }
+        if let Some(name) = linked {
+            laid_dir(&world.home.join(".cargo"));
+            std::os::unix::fs::symlink(&target, world.home.join(".cargo").join(name)).unwrap();
+        }
+        for name in kept {
+            kept_in(&target, name);
+        }
+        let leafed = laid == Laid::Leaf;
+        let held: Vec<_> = kept
+            .iter()
+            .map(|name| contents(&target.join(name)))
+            .collect();
+
+        // The build that lays the evidence is admitted unjudged: a package outside HOME built
+        // from outside it, its target and build directory the cache itself; or a package in
+        // HOME itself, built from there, its build directory the leaf the shim names.
+        let (package, cwd) = if leafed {
+            (world.home.clone(), world.home.clone())
+        } else {
+            let outside = world.home.parent().unwrap().join("outside/p");
+            std::fs::create_dir_all(&outside).unwrap();
+            (outside.clone(), outside)
+        };
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let unjudged = super::super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &|_| Some(true),
+        };
+        let unjudged_build = vec![
+            "--unverified".to_owned(),
+            "build".to_owned(),
+            format!("--manifest-path={}", package.join("Cargo.toml").display()),
+            format!("--target-dir={}", target.display()),
+        ];
+        assert!(
+            !super::super::observe_for_producer(
+                &unjudged_build,
+                super::super::super::Tool::Targo,
+                &world.home,
+                &unjudged,
+                true,
+            )
+            .unwrap(),
+            "{case}: the build that writes into the cache is admitted, owing no custody"
+        );
+        assert!(!target.join(MARKER).exists(), "{case}");
+        assert!(read(&world.record()).is_none(), "{case}");
+        std::fs::remove_file(package.join("Cargo.toml")).unwrap();
+        match laid {
+            Laid::Leaf => {
+                let leaf = super::super::super::target_build_path(&target);
+                laid_tagged(&leaf);
+                compiled_in(&leaf);
+                artifacts_in(&target);
+            }
+            Laid::Top => {
+                compiled_in(&target);
+                artifacts_in(&target);
+            }
+            Laid::Facts => laid_file(&target.join(".rustc_info.json"), b"{}"),
+        }
+
+        assert!(!world.admit().unwrap(), "{case}: not adopted");
+        assert!(!target.join(MARKER).exists(), "{case}: no custody declared");
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+        let refused = super::super::observe_for_producer(
+            &build_into(&world, &target),
+            super::super::super::Tool::Targo,
+            &world.home,
+            &producer_machine(&world),
+            true,
+        );
+        assert!(
+            refused.is_err(),
+            "{case}: a producer naming the cache is refused: {refused:?}"
+        );
+        assert!(!target.join(MARKER).exists(), "{case}: no custody declared");
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+        // Nor is the build leaf the shim names there made or recorded, nor a folder for it.
+        let leaf = super::super::super::target_build_path(&target);
+        assert!(!leaf.join(MARKER).exists(), "{case}: no leaf custody");
+        assert!(super::super::roots(&world.home).is_empty(), "{case}");
+        if laid != Laid::Leaf {
+            assert!(!target.join(".ubd").exists(), "{case}: no leaf parent made");
+        }
+        assert_eq!(
+            kept.iter()
+                .map(|name| contents(&target.join(name)))
+                .collect::<Vec<_>>(),
+            held,
+            "{case}: what the cache keeps stands"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("CACHEDIR.TAG")).unwrap(),
+            CARGO_TAG,
+            "{case}"
+        );
+    }
+}
+
+/// KI-1111-15: A CACHE'S NAME COUNTS ONLY IN A CARGO HOME, AND A CACHE'S CONTENTS ONLY WHERE NO
+/// PROFILE STANDS. Targo names `git` and `registry` caches only in its home, so a build
+/// directory a build made under either name elsewhere (`~/targets/registry`) is adopted where it
+/// stands; and a custom profile may take a name a cache keeps (`[profile.cache]`, `[profile.db]`),
+/// its folder holding the profile's lock, as may a custom target (`--target cache.json`), its
+/// folder holding profiles that hold theirs, so a build directory holding one is adopted too.
+#[test]
+fn a_build_directory_named_or_profiled_like_a_cache_outside_a_cargo_home_is_adopted() {
+    for (case, at, profile) in [
+        ("named-git", "targets/git", None),
+        ("named-registry", "targets/registry", None),
+        (
+            "profile-cache",
+            "target.noindex",
+            Some(("cache", ".cargo-lock")),
+        ),
+        (
+            "profile-db",
+            "target.noindex",
+            Some(("db", ".cargo-build-lock")),
+        ),
+        // A custom target's folder is its file's stem (`--target cache.json`), its profiles
+        // one level down, each holding its locks.
+        (
+            "target-cache",
+            "target.noindex",
+            Some(("cache", "debug/.cargo-lock")),
+        ),
+        (
+            "target-checkouts",
+            "target.noindex",
+            Some(("checkouts", "release/.cargo-build-lock")),
+        ),
+    ] {
+        let mut world = World::new();
+        world.target = world.home.join(at);
+        laid_dir(world.target.parent().unwrap());
+        cargo_laid(&world.target);
+        if let Some((name, lock)) = profile {
+            let lock = world.target.join(name).join(lock);
+            laid_dir(&lock.parent().unwrap().join("deps"));
+            laid_file(&lock, b"");
+        }
+        assert!(world.admit().unwrap(), "{case}: adopted where it stands");
+        assert!(
+            world.target.join(MARKER).is_file(),
+            "{case}: custody declared"
+        );
+        assert!(
+            create_checked(&world.home, &world.target, &world.owner).unwrap(),
+            "{case}: its custody binds"
+        );
+    }
+}
+
+/// KI-1111-15: A CARGO HOME'S CACHE NEVER COMES UNDER CUSTODY BY CREATION, AND CUSTODY ALREADY
+/// ON RECORD STOPS BINDING ONCE THE FOLDER IS SUCH A CACHE. A missing cache at its own name in
+/// Targo's default home or in a cargo home its locks mark, a folder Targo keeps in one
+/// (`registry/cache`), and the build leaf inside one are not created: the producer is told it
+/// owes no custody there and nothing is made. A folder recorded before it became a cache (one
+/// created in a cargo home no Targo had marked yet, then fetched into; one adopted, then filled
+/// as a cache or linked to as `~/.cargo`'s) admits no other owner, and reclaim keeps it whole
+/// once its owners are gone, what the cache keeps included.
+#[test]
+fn a_cargo_home_cache_never_comes_under_custody_by_creation_nor_stays_there_once_filled() {
+    for (case, at, mark) in [
+        ("default-git", ".cargo/git", None),
+        ("default-registry-cache", ".cargo/registry/cache", None),
+        ("locked-home-git", "cargo-home/git", Some(".package-cache")),
+        ("leaf-in-git", ".cargo/git/.ubd/build.noindex", None),
+    ] {
+        let mut world = World::new();
+        world.target = world.home.join(at);
+        laid_dir(&world.home.join(".cargo"));
+        if at.starts_with(".cargo/git/") {
+            laid_tagged(&world.home.join(".cargo/git"));
+        }
+        if let Some(mark) = mark {
+            laid_dir(&world.home.join("cargo-home"));
+            laid_file(&world.home.join("cargo-home").join(mark), b"");
+        }
+        assert!(!world.admit().unwrap(), "{case}: owes no custody");
+        assert!(!world.target.exists(), "{case}: nothing made");
+        assert!(read(&world.record()).is_none(), "{case}: nothing recorded");
+    }
+
+    for case in [
+        "created-then-fetched",
+        "adopted-then-filled",
+        "adopted-then-linked",
+    ] {
+        let mut world = World::new();
+        match case {
+            "created-then-fetched" => {
+                world.target = world.home.join("cargo-home/git");
+                laid_dir(world.target.parent().unwrap());
+                assert!(world.admit().unwrap(), "{case}: no cargo home marked yet");
+                compiled_in(&world.target);
+                artifacts_in(&world.target);
+                laid_file(&world.home.join("cargo-home/.package-cache"), b"");
+                kept_in(&world.target, "db");
+            }
+            "adopted-then-filled" => {
+                cargo_laid(&world.target);
+                assert!(world.admit().unwrap(), "{case}: a build's folder");
+                kept_in(&world.target, "checkouts");
+            }
+            "adopted-then-linked" => {
+                cargo_laid(&world.target);
+                assert!(world.admit().unwrap(), "{case}: a build's folder");
+                laid_dir(&world.home.join(".cargo"));
+                std::os::unix::fs::symlink(&world.target, world.home.join(".cargo/registry"))
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let recorded = std::fs::read(world.record()).unwrap();
+        let other = world.home.join("other-source");
+        laid_dir(&other);
+        laid_file(&other.join("Cargo.toml"), b"[workspace]\nmembers = []\n");
+        assert!(
+            create_checked(&world.home, &world.target, &other).is_err(),
+            "{case}: no other owner is admitted"
+        );
+        assert_eq!(
+            std::fs::read(world.record()).unwrap(),
+            recorded,
+            "{case}: nothing more recorded"
+        );
+        let held = contents(&world.target);
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+        assert!(
+            super::super::reclaim(
+                &world.home,
+                later,
+                super::super::super::ReclaimAfter::CALM,
+                None,
+                &mut |_, _| true,
+            )
+            .is_empty(),
+            "{case}: reclaim plans nothing for it"
+        );
+        assert_eq!(contents(&world.target), held, "{case}: it stands whole");
+    }
+}
+
+/// A PACKAGE TARGO CHECKED OUT OR EXTRACTED IN A CARGO HOME'S CACHE BUILDS INTO ITS OWN TARGET.
+/// A git checkout (`git/checkouts/<name>/<rev>`) and a registry extraction
+/// (`registry/src/<index>/<crate>`) are package roots; a `target` a build of one makes inside it
+/// is the build's, which Targo's fetches never fill (they write the whole checkout or
+/// extraction), so it is created and owned, its quiet leaf too. NEGATIVE CONTROL: the checkout
+/// itself, and a folder in a git database (no package), are the cache's, and nothing is made.
+#[test]
+fn a_package_in_a_cargo_home_cache_builds_into_its_own_target() {
+    for (case, package) in [
+        (
+            "checkout",
+            ".cargo/git/checkouts/dep-0123456789abcdef/abc1234",
+        ),
+        (
+            "extracted",
+            ".cargo/registry/src/index.crates.io-1949cf8c6b5b557f/dep-1.0.0",
+        ),
+    ] {
+        let mut world = World::new();
+        laid_dir(&world.home.join(".cargo"));
+        let cache = world.home.join(".cargo").join(case_cache(case));
+        laid_tagged(&cache);
+        let package = world.home.join(package);
+        laid_dir(&package.join("src"));
+        laid_file(&package.join("Cargo.toml"), b"[package]\nname = \"dep\"\n");
+        laid_file(&package.join("src/lib.rs"), b"pub fn dep() {}\n");
+        world.owner = package.clone();
+        world.target = package.join("target");
+        let owned = super::super::observe_for_producer(
+            &build_into(&world, &world.target),
+            super::super::super::Tool::Targo,
+            &world.home,
+            &super::super::super::Machine {
+                cwd: Some(&package),
+                ..producer_machine(&world)
+            },
+            true,
+        );
+        assert!(owned.unwrap(), "{case}: its own target is owned");
+        assert!(world.target.join(MARKER).is_file(), "{case}");
+        assert!(
+            super::super::super::target_build_path(&world.target).is_dir(),
+            "{case}: its leaf prepared"
+        );
+        // The cache's own folders are not the package's target.
+        let held = contents(&package.join("src"));
+        world.target = package.clone();
+        assert!(
+            !world.admit().unwrap(),
+            "{case}: the package's folder owes none"
+        );
+        assert!(!package.join(MARKER).exists(), "{case}");
+        assert_eq!(contents(&package.join("src")), held, "{case}");
+    }
+    let mut world = World::new();
+    laid_dir(&world.home.join(".cargo"));
+    laid_tagged(&world.home.join(".cargo/git"));
+    world.target = world.home.join(".cargo/git/db/dep-0123456789abcdef/target");
+    laid_dir(world.target.parent().unwrap());
+    assert!(
+        !world.admit().unwrap(),
+        "a database's folder is the cache's"
+    );
+    assert!(!world.target.exists());
+}
+
+/// The cache a case of [`a_package_in_a_cargo_home_cache_builds_into_its_own_target`] lies in.
+fn case_cache(case: &str) -> &'static str {
+    if case == "checkout" {
+        "git"
+    } else {
+        "registry"
     }
 }
 

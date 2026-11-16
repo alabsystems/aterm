@@ -178,6 +178,7 @@ fn a_disk_claim_given_up_behind_a_stuck_holder_could_not_run() {
                 above_floor: 90 * GIB,
                 floor: 65 * GIB,
                 reserved: 35 * GIB,
+                writing: 35 * GIB,
                 held: Vec::new(),
             }],
             holders: vec![holder],
@@ -198,9 +199,10 @@ fn a_disk_claim_given_up_behind_a_stuck_holder_could_not_run() {
 }
 
 /// A disk claim more than the volume has free above its floor once its relief ran (UNMET) is
-/// the run's COULD NOT RUN at once, naming the need, how much to free on which volume, what
-/// holds the most there and `--admit now`. NEGATIVE CONTROL: the same shortfall as a stuck
-/// wait's says that wait gave up, not what to free.
+/// the run's COULD NOT RUN at once, naming the need, the volume, what holds the most there, that
+/// it ends now rather than wait for disk and `--admit now`, and no space to free by hand.
+/// NEGATIVE CONTROL: the same shortfall as a stuck wait's says that wait gave up, not that the
+/// claim ended rather than wait for disk.
 #[test]
 fn a_disk_claim_no_wait_can_admit_could_not_run_naming_its_remedy() {
     let short = aterm_capacity::Shortfall {
@@ -210,6 +212,7 @@ fn a_disk_claim_no_wait_can_admit_could_not_run_naming_its_remedy() {
             above_floor: 24 * GIB,
             floor: 47 * GIB,
             reserved: 0,
+            writing: 0,
             held: Vec::new(),
         }],
         holders: Vec::new(),
@@ -226,11 +229,12 @@ fn a_disk_claim_no_wait_can_admit_could_not_run_naming_its_remedy() {
         "verify lint test -p aterm-capacity",
         "needs 68 GiB on /System/Volumes/Data, 24 GiB free above its 47 GiB floor",
         "largest on /System/Volumes/Data: /Users//u/aterm-wt 30 GiB",
-        "Free at least 44 GiB on /System/Volumes/Data",
+        "ends now rather than wait for disk",
         "--admit now",
     ] {
         assert!(why.contains(said), "{said:?} in {why}");
     }
+    assert!(!why.contains("Free at least"), "{why}");
     let stuck = atpkg::admit_disk::Error::Stuck {
         stuck: aterm_toolchain::waits::Stuck {
             holders: vec![4242],
@@ -239,7 +243,7 @@ fn a_disk_claim_no_wait_can_admit_could_not_run_naming_its_remedy() {
         short,
     };
     let why = answer(Err(stuck)).expect_err("could not run");
-    assert!(!why.contains("Free at least"), "{why}");
+    assert!(!why.contains("ends now rather than wait for disk"), "{why}");
 }
 
 /// A run's footprints are kept by what it builds: its checks that build, sorted, and the
@@ -628,12 +632,15 @@ fn only_a_run_that_passed_is_kept_for_this_machines_other_checkouts() {
 }
 
 /// Set, the test binary is [`standin_a_runs_disk`], its run's directories under this one.
+#[cfg(unix)]
 const STANDIN: &str = "ATERM_VERIFY_DISK_STANDIN";
 /// Set with [`STANDIN`], the stand-in holds a release's disk claim and hands its run its name.
+#[cfg(unix)]
 const COVERED: &str = "ATERM_VERIFY_DISK_STANDIN_COVERED";
 
 /// The line [`standin_a_runs_disk`] says on stderr for the claim that covered its run: its
 /// `what`, its name, and the name of the release's claim it holds, as JSON.
+#[cfg(unix)]
 const STANDIN_COVERED: &str = "standin-covered: ";
 
 /// Run by [`a_covered_run_walks_nothing_and_keeps_nothing`] in a process of its own, whose walk
@@ -796,8 +803,10 @@ fn a_covered_run_walks_nothing_and_keeps_nothing() {
 }
 
 /// Set, the test binary is [`standin_reads_the_disk_cover`].
+#[cfg(unix)]
 const CAPTURE: &str = "ATERM_VERIFY_DISK_COVER_CAPTURE";
 /// What [`standin_reads_the_disk_cover`] says on stderr: the snapshot's cover, as JSON.
+#[cfg(unix)]
 const CAPTURED: &str = "captured-disk-cover: ";
 
 /// Run by [`verify_reads_the_disk_cover_from_its_environment`] in a process of its own: the
@@ -1216,7 +1225,7 @@ fn the_run_end_trim_takes_the_retired_bytes_and_leaves_every_unit_the_run_used()
 
     let (ctx, kept) = ran([NEW, BOTH]);
     assert_eq!(kept[0].retired, 1, "{kept:?}");
-    let held = aterm_toolchain::record_lock::RecordLock::lock(
+    let held = aterm_toolchain::record_lock::RecordLock::try_lock(
         std::fs::File::open(&lock).expect("cargo's lock"),
         0,
     )
@@ -1320,4 +1329,102 @@ fn the_run_end_trim_takes_the_retired_bytes_and_leaves_every_unit_the_run_used()
             .is_dir(),
         "the retired unit stands where its directory went"
     );
+}
+
+/// A CELL'S DIRECTORY IS A BUILD DIRECTORY OF ITS OWN ([`dir_of`], `crate::cells::cell_dir`): a
+/// call whose `CARGO_TARGET_DIR` names the directory of one of forge's cells in the cells lane
+/// builds into a side lane of that path, whether the lanes stand beside the run's target or in
+/// the shared cache; the main lane's and the lint lane's stay theirs. NEGATIVE CONTROLS: the
+/// cells lane itself, each folder in it that is no cell's (the browser smoke's, the wasm glue's,
+/// the browser frames', the windows-sys oracles'), a folder inside a cell's directory, and a
+/// cell's directory where the run's lanes are not, name none; and a call into one of those notes
+/// nothing and keeps nothing, though it reported a unit of a member and its directory was closed.
+#[test]
+fn a_cells_directory_is_a_build_directory_of_its_own() {
+    let made = |lanes: Option<PathBuf>| {
+        let mut ctx = Ctx::new(
+            PathBuf::from("/repo"),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp/x"),
+        );
+        ctx.cached_lanes_dir = lanes;
+        ctx
+    };
+    let into = |dir: &Path| crate::exec::Cmd::new("cargo").env("CARGO_TARGET_DIR", dir);
+    let beside = made(None);
+    let cached = made(Some(PathBuf::from("/cache/repo/.cargo-build/verify/.ubd")));
+    for cell in aterm_forge::resolve::default_cells() {
+        let own = crate::cells::cell_dir(&beside, &cell.name);
+        let moved = crate::cells::cell_dir(&cached, &cell.name);
+        assert_ne!(own, moved, "{}", cell.name);
+        assert_eq!(
+            dir_of(&beside, &into(&own)),
+            Some(Dir::Side(own.clone())),
+            "{}",
+            cell.name
+        );
+        assert_eq!(
+            dir_of(&cached, &into(&moved)),
+            Some(Dir::Side(moved.clone())),
+            "{}",
+            cell.name
+        );
+        assert_eq!(
+            dir_of(&cached, &into(&own)),
+            None,
+            "{}: the run's lanes are not there",
+            cell.name
+        );
+    }
+    let lane = crate::plan::cells_dir(&beside);
+    let elsewhere = [
+        lane.clone(),
+        lane.join("wasm-smoke"),
+        lane.join("wasm-glue"),
+        lane.join("browser"),
+        lane.join("win32-oracle-bin"),
+        crate::cells::cell_dir(&beside, "linux-arm").join("aarch64-unknown-linux-gnu"),
+    ];
+    for dir in &elsewhere {
+        assert_eq!(dir_of(&beside, &into(dir)), None, "{}", dir.display());
+    }
+    // CONTROLS: no variable and the run's target are the main lane's, and the lint lane's path
+    // is that lane's.
+    assert_eq!(
+        dir_of(&beside, &crate::exec::Cmd::new("cargo")),
+        Some(Dir::Main)
+    );
+    assert_eq!(dir_of(&beside, &into(&beside.target_dir)), Some(Dir::Main));
+    let lint =
+        crate::plan::lane_dir(&beside, crate::plan::Lane::TippyTarget).expect("the lint lane");
+    assert_eq!(dir_of(&beside, &into(&lint)), Some(Dir::Side(lint.clone())));
+
+    let smoke = &elsewhere[1];
+    let unit = smoke
+        .join("wasm32-unknown-unknown/debug/deps/libaterm_wasm-5555555555555555.rmeta")
+        .display()
+        .to_string();
+    let wire = aterm_json::json!({
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///repo/crates/aterm-wasm#0.155.0",
+        "target": {"kind": ["lib"], "name": "aterm_wasm"},
+        "profile": {"test": false},
+        "filenames": [unit],
+        "fresh": true,
+    })
+    .to_string();
+    let members = std::collections::BTreeSet::from(["aterm-wasm".to_owned()]);
+    note_call_owning(&beside, &into(smoke), Some(&wire), true, &members);
+    assert!(
+        beside
+            .shape_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .used
+            .is_empty(),
+        "a call into a folder that is no cell's notes nothing"
+    );
+    close(&beside, &Dir::Side(smoke.clone()));
+    assert!(keep_used(&beside).is_empty(), "and keeps nothing");
 }

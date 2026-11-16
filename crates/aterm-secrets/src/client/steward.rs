@@ -292,7 +292,9 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
             ));
         }
     };
-    match admin_publish(paths, &admin, &doc) {
+    // The removal's tail, asked no class: the removal runs to the log's bound, and so does what
+    // completes it.
+    match super::admin_publish_removal_tail(paths, &admin, &doc) {
         Ok(done) => Ok(StewardRevoke::Done(format!(
             "{summary} (version {})",
             done.seq
@@ -324,7 +326,7 @@ pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
                     "another steward finished the revoke cascade first".to_owned(),
                 )),
                 Some(summary2) => {
-                    let done = admin_publish(paths, &refreshed, &again)?;
+                    let done = super::admin_publish_removal_tail(paths, &refreshed, &again)?;
                     Ok(StewardRevoke::Done(format!(
                         "{summary2} (version {})",
                         done.seq

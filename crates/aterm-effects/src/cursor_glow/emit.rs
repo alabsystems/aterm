@@ -8018,6 +8018,9 @@ impl CursorGlow {
             }
             night.extend_from_slice(&self.under_out);
             std::mem::swap(&mut self.under_out, &mut night);
+            // The spans of the quads the guard cut name them past the grounds too: a later
+            // cut of the frame (a thin caret's hold) keeps what the guard kept.
+            self.ink_ledger.shift_under_spans(moved);
             self.under_ramps
                 .truncate_laid(&mut self.under_out, Self::MAX_QUADS);
         }

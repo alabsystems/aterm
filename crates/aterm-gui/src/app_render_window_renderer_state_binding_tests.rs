@@ -22,12 +22,12 @@ fn opposite_two_window_cursor_state_is_rebound_before_each_encode() {
     let second = app.insert_logical_window(crate::stub_session(session), 24, 80);
     app.render_knobs.selection_inactive = true;
     {
-        let first = app.windows.get_mut(&first).unwrap();
+        let mut first = app.windows.get_mut(&first).unwrap();
         first.blink_phase = false;
         first.focused = false;
     }
     {
-        let second = app.windows.get_mut(&second).unwrap();
+        let mut second = app.windows.get_mut(&second).unwrap();
         second.blink_phase = true;
         second.focused = true;
     }

@@ -126,7 +126,7 @@ fn a_seated_mac_sets_with_no_admin_and_status_says_so() {
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     crate::client::sync(m22, None).expect("m22 syncs");
     assert_eq!(
-        crate::client::stored(&m22, "gh_access_token").unwrap(),
+        crate::client::stored(m22, "gh_access_token").unwrap(),
         b"token-v9"
     );
 
@@ -165,7 +165,7 @@ fn a_seated_mac_unsets_with_no_admin() {
     crate::client::sync(m22, None).expect("m22 syncs");
     crate::client::sync(m7, None).expect("m7 syncs");
     assert!(
-        crate::client::stored(&m22, "gh_access_token").is_some(),
+        crate::client::stored(m22, "gh_access_token").is_some(),
         "CONTROL"
     );
 
@@ -173,7 +173,7 @@ fn a_seated_mac_unsets_with_no_admin() {
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     crate::client::sync(m22, None).expect("m22 syncs");
     assert!(
-        crate::client::stored(&m22, "gh_access_token").is_none(),
+        crate::client::stored(m22, "gh_access_token").is_none(),
         "m22 reads it no more"
     );
     let error = unix::unset(m7, "gh_access_token", &[]).expect_err("absent");
@@ -2803,6 +2803,35 @@ fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
     assert!(!holds(&json, VALUE));
     let plain = super::inventory::listing(&names, &rows, false, false).unwrap();
     assert!(plain.lines().any(|line| line == key.entry()));
+    assert!(!text.contains("verified 2"), "CONTROL: no verification yet");
+    // A verification names the Mac that compared, which need not be the one that minted (FL-134).
+    let mut verified = standings.clone();
+    verified[0].meta.as_mut().expect("a meta").verified = Some(crate::claude_token::Verified {
+        on: "m22".into(),
+        at: 4_102_444_800 - 86_400,
+        by: crate::claude_token::BY_WINDOWS.into(),
+        seven_day_resets_at: None,
+        five_hour_resets_at: None,
+    });
+    let rows = super::inventory::token_rows(&verified, 0);
+    let text = super::inventory::listing(&names, &rows, true, false).unwrap();
+    assert!(
+        text.contains("minted on m7, verified 2099-12-31 on m22, ends 2100-01-01"),
+        "{text}"
+    );
+    // A pair that does not read as one token (two Macs wrote it at once) shows no verification:
+    // the verified meta may be of the token a concurrent replacement replaced (FL-134 review).
+    // NEGATIVE CONTROL (by hand, then restored): with `token_rows`' check of the pair cut, this
+    // row reads "verified 2099-12-31 on m22".
+    verified[0].check =
+        crate::claude_token::Check::Mismatched(crate::claude_token::Mismatch::Draft);
+    let rows = super::inventory::token_rows(&verified, 0);
+    let text = super::inventory::listing(&names, &rows, true, false).unwrap();
+    assert!(text.contains("minted on m7, ends 2100-01-01"), "{text}");
+    assert!(
+        !text.contains("verified 2"),
+        "a split pair shows no verification: {text}"
+    );
     macs.server.stop();
 }
 

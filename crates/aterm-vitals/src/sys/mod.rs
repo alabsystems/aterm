@@ -6,11 +6,13 @@
 pub mod delta;
 pub mod disk;
 pub mod hardware;
+pub mod held;
 pub mod jobs_view;
 pub mod json;
 pub mod left;
 pub mod predicate;
 pub mod query;
+pub mod stores;
 pub mod view;
 pub mod why;
 
@@ -19,7 +21,8 @@ pub use disk::{
     DirSize, DiskTotals, HugeDirFact, PaneLine, RootSize, RootSizes, ScopeBytes, ScopeLine,
 };
 pub use predicate::{AwaitSys, Metric, Outcome, Term, evaluate};
-pub use query::{Cursor, ScopeArg, SysQuery, USAGE, View, WHY_USAGE};
+pub use query::{Cursor, DiskForm, ScopeArg, SysQuery, USAGE, View, WHY_USAGE};
+pub use stores::{StoreFact, StoreHistory, StoreSample, StoreSize, StoreWord};
 pub use view::{Reply, render_json, render_text};
 
 use crate::events::Event;
@@ -43,9 +46,15 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "asleep",
     "truncated",
     "not_sampled",
+    "not_read",
     "ambiguous_reap",
     "mixed_ownership",
     "no_counter_delta",
+    "counter_source_changed",
+    "counter_provenance_unknown",
+    "counter_interval_invalid",
+    "counter_discontinuity",
+    "counter_wrap_ambiguous",
     "hung",
     "protected",
     "remote",
@@ -56,6 +65,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "other_pool",
     "walking",
     "unread_format",
+    "unread",
     "os_error:",
 ];
 
@@ -371,6 +381,8 @@ pub struct Ctx<'a> {
     pub roots: &'a [Root],
     /// The walker's balance over them; `None` where no walker measures.
     pub disk: Option<&'a DiskTotals>,
+    /// The stores aterm itself keeps on this machine, for `disk`'s `store` lines.
+    pub stores: &'a [StoreFact],
     /// The person's home, for `under=`.
     pub home: Option<&'a str>,
     /// The events since the cursor (or none without one).
@@ -379,6 +391,8 @@ pub struct Ctx<'a> {
     pub gap: Option<Gap>,
     /// Newest snapshot seq the host published (including machine-only readings), or `0`.
     pub head_seq: u64,
+    /// `disk held`'s rows, gathered by the host; `None` for every other request.
+    pub held: Option<&'a held::Holdings>,
 }
 
 impl Ctx<'_> {

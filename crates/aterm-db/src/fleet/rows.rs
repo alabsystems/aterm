@@ -545,6 +545,105 @@ pub struct Evidence {
     pub at_ms: u64,
 }
 
+/// When a fact was read and the Mac that read it: what every observed fact of a row carries
+/// (`<fact>_at`, `<fact>_by`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    /// When, Unix milliseconds, by the clock of the Mac that read it and never after the read of
+    /// the journal that carried it.
+    pub at_ms: u64,
+    /// The Mac: its machine's label, else its machine's key, else (no live machine row binds
+    /// its Commons uuid) the first 8 digits of that uuid.
+    pub by: String,
+}
+
+/// A fact some Mac observed: what it read, and when and which Mac read it. The registry's own
+/// cells are not facts of this kind: a person or an import states them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fact<T> {
+    pub v: T,
+    pub read: Stamp,
+}
+
+/// Which of its two sources an account row's `plan` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanSource {
+    /// The registry's `plan` cell: what a person (or the sheet a person kept) says it is.
+    Set,
+    /// The newest plan a Mac's CLI reported, from the journal.
+    Observed,
+}
+
+impl PlanSource {
+    pub const WORDS: &'static [&'static str] = &["set", "observed"];
+
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Observed => "observed",
+        }
+    }
+}
+
+/// What the fleet has observed of an account: derived from evidence each fold and stored
+/// nowhere. It stands beside the registry's `status`, which a person states (`paused` is a
+/// person's hold, `pending` an import's default) and which no observation rewrites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedState {
+    /// The newest sign-in word of some Mac a live machine row binds is `in`.
+    SignedIn,
+    /// No Mac is signed in to it; Macs state that their login of it ended (a sign-in word
+    /// `out`, `ended`, `wrong` or `failed`, or a registry row that says `signed-out` with no
+    /// sighting since), a retired Mac among them, and no Mac that states nothing sighted it.
+    SignedOut,
+    /// No Mac is signed in to it, and a Mac that states no word sighted it: a login file there
+    /// names it (a tab runs on it, or the machine sweep found the login place). A sighting is
+    /// no sign-in word: a file names its account after the login ended, so a Mac that says its
+    /// login ended is not counted here for the file it still holds. The `in` of a Mac no live
+    /// machine row binds is no word, and its sighting counts.
+    Seen,
+    /// No Mac's word of its login stands and none sighted it; a place row, a claim or a
+    /// sighted agent session puts it on a Mac.
+    PlaceOnly,
+    /// The journal was read and nothing a Mac says of it stands: none of the above.
+    NeverSeen,
+}
+
+impl ObservedState {
+    pub const WORDS: &'static [&'static str] = &[
+        "signed-in",
+        "seen",
+        "signed-out",
+        "place-only",
+        "never-seen",
+    ];
+
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::SignedIn => "signed-in",
+            Self::Seen => "seen",
+            Self::SignedOut => "signed-out",
+            Self::PlaceOnly => "place-only",
+            Self::NeverSeen => "never-seen",
+        }
+    }
+}
+
+/// One Mac that sighted an account: a login file there names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeenOn {
+    /// The Mac, as a fact's `by` names one ([`Stamp::by`]).
+    pub on: String,
+    /// The tabs that run the account there now; 0 where none does (an idle login place, or a
+    /// tab not seen for two hours).
+    pub tabs: u64,
+    /// That Mac's newest sighting of it, however old.
+    pub at_ms: u64,
+}
+
+/// The most Macs an account row's `seen_on` lists: the ones that sighted it last.
+pub const SEEN_ON_MAX: usize = 64;
+
 /// One AI account: every registry row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRow {
@@ -555,7 +654,15 @@ pub struct AccountRow {
     /// Its login address, held as the registry holds it and printed as it is.
     pub login: Option<String>,
     pub status: Option<&'static str>,
+    /// Its plan's key: the registry's where the registry states one, else the newest plan a Mac
+    /// observed ([`Self::plan_observed`]); [`Self::plan_source`] says which.
     pub plan: Option<String>,
+    /// Which of the two `plan` is; `None` where neither says one.
+    pub plan_source: Option<PlanSource>,
+    /// The newest plan a Mac's CLI reported, as the key of that provider's plan, whatever the
+    /// registry states. Beside a stated plan it differs from it is a mismatch: both are shown,
+    /// and an observation is never written over what a person stated.
+    pub plan_observed: Option<Fact<String>>,
     pub w5h: WindowRow,
     pub w7d: WindowRow,
     /// Whether a wall stands; `None` where the journal says nothing of the account.
@@ -574,7 +681,34 @@ pub struct AccountRow {
     pub agents: Option<u32>,
     pub last_use_ms: Option<u64>,
     pub last_use_on: Option<String>,
+    /// What the fleet observed of it, among the Macs a live machine row binds; `None` where the
+    /// journal was not read.
+    pub observed: Option<ObservedState>,
+    /// The newest evidence [`Self::observed`] stands on: since when it holds, and the Mac it is
+    /// of. `None` for `never-seen` and where the journal was not read.
+    pub observed_read: Option<Stamp>,
+    /// When each window was read and the Mac that read it: the read its figure is of, or, for
+    /// a window whose reset passed, the read that named that reset. `None` for a window nobody
+    /// read.
+    pub w5h_read: Option<Stamp>,
+    pub w7d_read: Option<Stamp>,
+    /// When the standing wall was hit and the Mac that hit it; `None` where none stands or the
+    /// journal says nothing of the account.
+    pub wall_read: Option<Stamp>,
+    /// The newest sighting of it on any Mac (a `seen` event or an `account-obs` row): when,
+    /// and the Mac that sighted it. `None` where no Mac sighted it or no source of sightings
+    /// was read.
+    pub last_seen: Option<Stamp>,
+    /// The Macs that sighted it, at most [`SEEN_ON_MAX`] (the ones that did last), in the
+    /// machines' order; `None` where no source of sightings was read.
+    pub seen_on: Option<Vec<SeenOn>>,
 }
+
+/// The type of a cell that names a machine as a fact's `by` does ([`Stamp::by`]): its label,
+/// its row's key or 8 digits of its Commons uuid, each a word of the key grammar. It is an
+/// identifier, never free text: free text's guards refuse a run of seven digits as a phone
+/// number, which the first 8 digits of a uuid are for one Mac in 43.
+const MAC: Ty = Ty::Key;
 
 /// The accounts relation.
 pub static ACCOUNTS: Schema = Schema {
@@ -588,7 +722,11 @@ pub static ACCOUNTS: Schema = Schema {
         opt("slug", Ty::AccountLabel(32), "its label"),
         opt("login", Ty::Email, "its login address"),
         opt("status", Ty::Enum(ACCOUNT_STATUS), "registry status"),
-        opt("plan", Ty::Key, "its plan"),
+        opt(
+            "plan",
+            Ty::Key,
+            "its plan: the registry's where set, else the newest observed (plan_source)",
+        ),
         opt(
             "w5h_used_x10",
             Ty::Uint,
@@ -600,7 +738,7 @@ pub static ACCOUNTS: Schema = Schema {
             Ty::Enum(WindowState::WORDS),
             "current, reset-passed or unread",
         ),
-        opt("w5h_at", Ty::Time, "when the 5-hour figure was read"),
+        opt("w5h_at", Ty::Time, "when the 5-hour window was read"),
         opt(
             "w7d_used_x10",
             Ty::Uint,
@@ -612,14 +750,14 @@ pub static ACCOUNTS: Schema = Schema {
             Ty::Enum(WindowState::WORDS),
             "current, reset-passed or unread",
         ),
-        opt("w7d_at", Ty::Time, "when the 7-day figure was read"),
+        opt("w7d_at", Ty::Time, "when the 7-day window was read"),
         opt("walled", Ty::Bool, "a limit stands"),
         opt("wall_until", Ty::Time, "until when it stands"),
         opt("read_by", Ty::Text(32), "the machine that read the figure"),
         opt("next_reset", Ty::Time, "the next reset or wall end ahead"),
         col(
             "expected",
-            Ty::List(&Ty::Text(32), 64),
+            Ty::List(&MAC, 64),
             "machines the registry's preferences expect it on, by rank",
         ),
         opt(
@@ -628,7 +766,7 @@ pub static ACCOUNTS: Schema = Schema {
                 &Ty::Struct(&[
                     Member {
                         name: "machine",
-                        ty: Ty::Text(32),
+                        ty: MAC,
                         null: false,
                     },
                     Member {
@@ -653,15 +791,92 @@ pub static ACCOUNTS: Schema = Schema {
         ),
         opt("agents", Ty::Uint, "sighted agent sessions on it"),
         opt("last_use", Ty::Time, "its newest use in the journal"),
-        opt("last_use_on", Ty::Text(32), "the machine of that use"),
+        opt("last_use_on", MAC, "the machine of that use"),
+        opt(
+            "plan_source",
+            Ty::Enum(PlanSource::WORDS),
+            "where plan comes from: set (the registry's cell, a person's) or observed",
+        ),
+        opt(
+            "plan_observed",
+            Ty::Key,
+            "the newest plan a machine's CLI reported, whatever the registry states",
+        ),
+        opt("plan_at", Ty::Time, "when the observed plan was read"),
+        opt("plan_by", MAC, "the machine that read the observed plan"),
+        opt(
+            "plan_mismatch",
+            Ty::Bool,
+            "the set plan and the observed one differ; unread where either is missing",
+        ),
+        opt(
+            "observed",
+            Ty::Enum(ObservedState::WORDS),
+            "what machines observed: signed-in, seen, signed-out, place-only or never-seen",
+        ),
+        opt(
+            "observed_at",
+            Ty::Time,
+            "since when the newest evidence of observed holds",
+        ),
+        opt("observed_by", MAC, "the machine that evidence is of"),
+        opt(
+            "last_seen",
+            Ty::Time,
+            "the newest sighting of its login on any machine",
+        ),
+        opt(
+            "seen_on",
+            Ty::List(
+                &Ty::Struct(&[
+                    Member {
+                        name: "machine",
+                        ty: MAC,
+                        null: false,
+                    },
+                    Member {
+                        name: "tabs",
+                        ty: Ty::Uint,
+                        null: false,
+                    },
+                    Member {
+                        name: "at",
+                        ty: Ty::Time,
+                        null: false,
+                    },
+                ]),
+                SEEN_ON_MAX,
+            ),
+            "machines whose login files name it: tabs running it now, and when last sighted",
+        ),
+        opt("w5h_by", MAC, "the machine that read the 5-hour window"),
+        opt("w7d_by", MAC, "the machine that read the 7-day window"),
+        opt("wall_at", Ty::Time, "when the standing limit was hit"),
+        opt("wall_by", MAC, "the machine that hit it"),
+        opt("last_seen_by", MAC, "the machine of the newest sighting"),
     ],
 };
 
-fn window(cells: &mut Vec<Cell>, window: &WindowRow) {
+/// The two cells of a fact's provenance, when it was read and the machine that read it: each
+/// unread where nobody observed the fact.
+fn stamp(cells: &mut Vec<Cell>, read: Option<&Stamp>) {
+    cells.push(Cell::read(read.map(|read| read.at_ms)));
+    cells.push(Cell::read(read.map(|read| read.by.clone())));
+}
+
+/// The three cells of an observed fact: its value, then its provenance ([`stamp`]).
+fn fact<T: Clone + Into<Value>>(cells: &mut Vec<Cell>, fact: Option<&Fact<T>>) {
+    cells.push(Cell::read(fact.map(|fact| fact.v.clone())));
+    stamp(cells, fact.map(|fact| &fact.read));
+}
+
+/// A window's four cells: its figure, its reset, its state, and when it was read (`read`: the
+/// figure's read, or for a window whose reset passed the read that named the reset).
+fn window(cells: &mut Vec<Cell>, window: &WindowRow, read: Option<&Stamp>) {
     cells.push(Cell::read(window.used_x10.map(|at| at.v)));
     cells.push(Cell::read(window.reset_ms));
     cells.push(Cell::of(window.state.word()));
-    cells.push(Cell::read(window.used_x10.map(|at| at.at_ms)));
+    cells.push(Cell::read(read.map(|read| read.at_ms)));
 }
 
 impl Row for AccountRow {
@@ -676,8 +891,8 @@ impl Row for AccountRow {
             Cell::read(self.status),
             Cell::read(self.plan.clone()),
         ];
-        window(&mut cells, &self.w5h);
-        window(&mut cells, &self.w7d);
+        window(&mut cells, &self.w5h, self.w5h_read.as_ref());
+        window(&mut cells, &self.w7d, self.w7d_read.as_ref());
         cells.push(Cell::read(self.walled));
         cells.push(match (self.walled, self.wall_until_ms) {
             (_, Some(until)) => Cell::of(until),
@@ -710,6 +925,52 @@ impl Row for AccountRow {
         cells.push(Cell::read(self.agents));
         cells.push(Cell::read(self.last_use_ms));
         cells.push(Cell::read(self.last_use_on.clone()));
+        cells.push(Cell::read(self.plan_source.map(PlanSource::word)));
+        fact(&mut cells, self.plan_observed.as_ref());
+        // A mismatch is between two plans: with either missing there is none to say.
+        cells.push(Cell::read(match (self.plan_source, &self.plan_observed) {
+            (Some(PlanSource::Set), Some(observed)) => {
+                Some(self.plan.as_deref() != Some(observed.v.as_str()))
+            }
+            _ => None,
+        }));
+        cells.push(Cell::read(self.observed.map(ObservedState::word)));
+        match (self.observed, &self.observed_read) {
+            // Nothing was seen, and that is known: no evidence, so none to date or to credit.
+            (Some(ObservedState::NeverSeen), None) => {
+                cells.push(Cell::Empty);
+                cells.push(Cell::Empty);
+            }
+            (_, read) => stamp(&mut cells, read.as_ref()),
+        }
+        cells.push(match (&self.last_seen, &self.seen_on) {
+            // The sightings were read and none names it: known, and nothing to date.
+            (None, Some(_)) => Cell::Empty,
+            (seen, _) => Cell::read(seen.as_ref().map(|seen| seen.at_ms)),
+        });
+        cells.push(Cell::read(self.seen_on.as_ref().map(|seen_on| {
+            Value::Array(
+                seen_on
+                    .iter()
+                    .map(|seen| json!({"machine": seen.on, "tabs": seen.tabs, "at": seen.at_ms}))
+                    .collect(),
+            )
+        })));
+        for read in [&self.w5h_read, &self.w7d_read] {
+            cells.push(Cell::read(read.as_ref().map(|read| read.by.clone())));
+        }
+        match (self.walled, &self.wall_read) {
+            // No limit stands, and that is known: none to date or to credit.
+            (Some(false), None) => {
+                cells.push(Cell::Empty);
+                cells.push(Cell::Empty);
+            }
+            (_, read) => stamp(&mut cells, read.as_ref()),
+        }
+        cells.push(match (&self.last_seen, &self.seen_on) {
+            (None, Some(_)) => Cell::Empty,
+            (seen, _) => Cell::read(seen.as_ref().map(|seen| seen.by.clone())),
+        });
         cells
     }
 }

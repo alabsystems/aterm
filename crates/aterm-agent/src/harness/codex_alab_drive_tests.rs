@@ -445,8 +445,8 @@ impl Kernel for Crashed {
         (pid == NEW || pid == TUI).then_some(SHELL)
     }
 
-    fn terminal(&self, _: u32) -> Option<(u32, String)> {
-        Some((1, "launchd".to_string()))
+    fn terminal(&self, _: u32) -> crate::harness::upgrade_drive::Fact<(u32, String)> {
+        Ok(Some((1, "launchd".to_string())))
     }
 
     /// No start through the shared kernel (`None`: unread, never an end): the codex-alab lane

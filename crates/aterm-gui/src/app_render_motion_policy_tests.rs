@@ -94,7 +94,7 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
 
     let typed = t0 + Duration::from_millis(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.last_key_at = Some(typed);
         ws.fx.cursor_mut().cadence.on_keystroke(typed);
         ws.fx.cursor_mut().glow.note_synthetic_move(typed);
@@ -152,7 +152,7 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
 
     let typed = t0 + Duration::from_millis(1);
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.last_key_at = Some(typed);
         ws.fx.cursor_mut().cadence.on_keystroke(typed);
         ws.fx.cursor_mut().glow.note_synthetic_move(typed);
@@ -222,7 +222,7 @@ fn trail_status_reads_the_focus_the_frame_path_used() {
     );
 
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = false;
         ws.last_key_at = None;
     }
@@ -331,14 +331,14 @@ fn video_recording_pins_motion_focus() {
     seed.cur = Some((2, 3));
     app.cursor_frame(wid, seed).expect("seed tick");
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.fx.cursor_mut().glow.note_typed_cells(tick_at, 1);
         ws.fx.cursor_mut().trail.note_typed(tick_at);
     }
     let mut moved = CursorFxInputs::sample_for_test(tick_at + Duration::from_millis(1));
     moved.cur = Some((2, 4));
     app.cursor_frame(wid, moved).expect("licensed tick");
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     assert!(ws.fx.cursor_mut().glow.is_active() || ws.fx.cursor_mut().trail.is_active());
     assert!(
         ws.plan_terminal_effect_lane_with_recording(
@@ -367,6 +367,7 @@ fn video_recording_pins_motion_focus() {
         None,
         "without OS focus, typed wake, or recording watcher no new clock is minted"
     );
+    drop(ws);
     assert!(
         !app.motion_focus(WindowId(1), false),
         "the pin is per-window, not app-global"

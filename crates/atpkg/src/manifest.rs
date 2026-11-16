@@ -178,6 +178,17 @@ pub struct PkgManifest {
     /// `shim_env = ["NAME=VALUE", …]`: the environment every shim of this program (primary and `alab-` alias) exports before it execs the store binary ([`crate::shim_env`]), so a managed vendor tool runs with its own updater off (`DISABLE_AUTOUPDATER=1` for Claude Code) and the index re-pin is its update path.
     #[serde(default)]
     pub shim_env: Vec<String>,
+    /// `[harness]`: a harness's declaration (its repository's `alab-harness.toml`), copied by
+    /// `atpkg-publish pack`. Kept as a raw table, so a later writer's change to its shape makes
+    /// no row ([`crate::harness_record::Declaration::from_table`]) instead of refusing the whole
+    /// manifest.
+    #[serde(default)]
+    pub harness: Option<aterm_toml::Value>,
+    /// The records an install keeps beside this build: for a manifest with `[harness]`, its
+    /// signed bytes and their authorizing roster ([`crate::harness_record::kept_sidecars`]).
+    /// Filled by the flow that verified the bytes; empty for a manifest parsed apart from them.
+    #[serde(skip)]
+    pub kept: Vec<(&'static str, Vec<u8>)>,
     /// `[[artifact]]`: one row per target triple.
     #[serde(default, rename = "artifact")]
     pub artifacts: Vec<Artifact>,

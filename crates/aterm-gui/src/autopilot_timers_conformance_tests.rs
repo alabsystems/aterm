@@ -269,6 +269,7 @@ impl TimerDrive {
             pinned: false,
             sid: None,
             lineage: None,
+            opened_ms: None,
             log_ep: None,
             cwd: None,
             title: String::new(),

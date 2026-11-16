@@ -98,7 +98,7 @@ impl AppKind {
             Self::Editor => AppIcon::Editor,
             Self::Recovery => AppIcon::Recovery,
             Self::Workers => AppIcon::Workers,
-            Self::Tables => AppIcon::Editor,
+            Self::Tables => AppIcon::Tables,
         }
     }
 }
@@ -204,6 +204,12 @@ impl AppViewState {
             Self::Workers(_) => AppKind::Workers,
             Self::Tables(_) => AppKind::Tables,
         }
+    }
+
+    /// The native part of the platform Option route, independent of window chrome.
+    pub(crate) fn editor_has_typing_focus(&self) -> bool {
+        matches!(self, Self::Editor(editor)
+            if editor.markdown.as_ref().is_none_or(|workspace| workspace.editor_focused()))
     }
 
     pub(crate) fn common(&self) -> &CommonViewState {
@@ -1697,6 +1703,15 @@ pub(crate) enum AppEvent {
         visible_lines: usize,
     },
     ScrollLines(i32),
+    /// A sideways wheel or swipe over a page that scrolls across (the Tables grid): `lines`
+    /// notches to the right, to the left where negative.
+    ScrollAcross(i32),
+    /// Tab (`1`) / Shift-Tab (`-1`) on a sheet's cell (the Tables grid): the selection moves to
+    /// the cell after or before it, onto the next row past a row's end.
+    StepAcross(i32),
+    /// Shift-Up (`-1`) / Shift-Down (`1`) on a sheet's cell: the selection's range grows or
+    /// shrinks by a row.
+    ExtendFocus(i32),
     /// A press on the picture of control `key` a scrolling list draws in the strip under its room ([`crate::native_ui::CompiledUi::list_picture_at`]).
     PressListPicture(UiKey),
     /// A scroll aimed at `key`: the innermost node under the pointer for a wheel, or the node an assistive technology scrolls.
@@ -1860,6 +1875,15 @@ pub(crate) enum SemanticInput {
     ColorPick {
         hue: f32,
         saturation: f32,
+    },
+    /// The pointer's travel across, in the page's points, since it was pressed on a control that
+    /// is dragged ([`crate::native_ui::Control::drags`]): sent as the pointer moves, and once
+    /// more with `done` at the release. `presses` counts the presses of the run this one belongs
+    /// to at a still pointer (2 for a double click).
+    Drag {
+        dx: f32,
+        done: bool,
+        presses: u8,
     },
 }
 
@@ -2641,7 +2665,7 @@ pub(crate) struct NativeRuntime {
     instance_ids: crate::tab_model::IdAllocator<AppInstanceId>,
     instances: BTreeMap<AppInstanceId, NativeApp>,
     instance_generations: BTreeMap<AppInstanceId, u64>,
-    views: BTreeMap<ViewId, AppViewState>,
+    views: crate::option_routing::Views,
     view_generations: BTreeMap<ViewId, u64>,
     view_lifecycles: BTreeMap<ViewId, crate::front_content::ViewLifecycle>,
     service_generations: BTreeMap<ServiceId, u64>,
@@ -2658,7 +2682,7 @@ impl Default for NativeRuntime {
             instance_ids: crate::tab_model::IdAllocator::default(),
             instances: BTreeMap::new(),
             instance_generations: BTreeMap::new(),
-            views: BTreeMap::new(),
+            views: crate::option_routing::Views::default(),
             view_generations: BTreeMap::new(),
             view_lifecycles: BTreeMap::new(),
             service_generations: BTreeMap::new(),
@@ -2679,8 +2703,8 @@ impl NativeRuntime {
             }
         }
         if changed {
-            for state in self.views.values_mut() {
-                if let AppViewState::Tables(view) = state {
+            for mut state in self.views.values_mut() {
+                if let AppViewState::Tables(view) = &mut *state {
                     view.common.presentation_revision =
                         view.common.presentation_revision.wrapping_add(1);
                     state.touch();
@@ -2710,8 +2734,8 @@ impl NativeRuntime {
             }
         }
         if changed {
-            for state in self.views.values_mut() {
-                if let AppViewState::Mail(view) = state {
+            for mut state in self.views.values_mut() {
+                if let AppViewState::Mail(view) = &mut *state {
                     view.common.presentation_revision =
                         view.common.presentation_revision.wrapping_add(1);
                     if leave_setup {
@@ -2842,7 +2866,7 @@ impl NativeRuntime {
         let Some(NativeApp::Recovery(app)) = self.instances.get_mut(&instance) else {
             return false;
         };
-        let Some(state) = self.views.get_mut(&view) else {
+        let Some(mut state) = self.views.get_mut(&view) else {
             return false;
         };
         let AppViewState::Recovery(recovery) = &mut *state else {
@@ -2880,7 +2904,7 @@ impl NativeRuntime {
             return false;
         };
         editor.plain_for_negative_control = true;
-        for state in self.views.values_mut() {
+        for mut state in self.views.values_mut() {
             state.touch();
             let common = state.common_mut();
             common.presentation_revision = common.presentation_revision.wrapping_add(1);
@@ -2905,8 +2929,8 @@ impl NativeRuntime {
     }
 
     fn touch_system_state_views(&mut self) {
-        for state in self.views.values_mut() {
-            if matches!(state, AppViewState::SystemState(_)) {
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::SystemState(_)) {
                 state.touch();
                 let common = state.common_mut();
                 common.presentation_revision = common.presentation_revision.wrapping_add(1);
@@ -2939,8 +2963,8 @@ impl NativeRuntime {
                 // Focus on a card item that left the card moves to the card's first button (its
                 // default action), else to nothing: never a control that is gone.
                 let after = state.card_buttons();
-                for view in self.views.values_mut() {
-                    let AppViewState::SystemState(view) = view else {
+                for mut view in self.views.values_mut() {
+                    let AppViewState::SystemState(view) = &mut *view else {
                         continue;
                     };
                     let gone = view.common.last_focus.as_ref().is_some_and(|key| {
@@ -3027,7 +3051,7 @@ impl NativeRuntime {
     }
 
     pub(crate) fn retire_native_review(&mut self, view: ViewId) {
-        if let Some(state) = self.views.get_mut(&view) {
+        if let Some(mut state) = self.views.get_mut(&view) {
             let common = state.common_mut();
             common.review_revision = common.review_revision.saturating_add(1);
         }
@@ -3072,8 +3096,8 @@ impl NativeRuntime {
         app.leases = leases;
         app.machine = machine;
         app.machine_at = machine_at;
-        for state in self.views.values_mut() {
-            if matches!(state, AppViewState::Allocation(_)) {
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::Allocation(_)) {
                 let common = state.common_mut();
                 common.presentation_revision = common.presentation_revision.wrapping_add(1);
                 state.touch();
@@ -3095,7 +3119,7 @@ impl NativeRuntime {
         if !app.publish(rows) {
             return false;
         }
-        if let Some(state @ AppViewState::Workers(_)) = self.views.get_mut(&view) {
+        if let Some(state @ AppViewState::Workers(_)) = self.views.get_mut(&view).as_deref_mut() {
             if let AppViewState::Workers(workers) = state {
                 workers.common.presentation_revision =
                     workers.common.presentation_revision.wrapping_add(1);
@@ -3182,8 +3206,8 @@ impl NativeRuntime {
     /// Every Settings view renders from the projection just published: each
     /// one's content revision moves ([`AppViewState::touch`]).
     fn touch_settings_views(&mut self) {
-        for state in self.views.values_mut() {
-            if matches!(state, AppViewState::Settings(_)) {
+        for mut state in self.views.values_mut() {
+            if matches!(&*state, AppViewState::Settings(_)) {
                 state.touch();
             }
         }
@@ -3313,9 +3337,11 @@ impl NativeRuntime {
         view: ViewId,
         mode: MarkdownWorkspaceMode,
     ) -> bool {
-        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) =
-            (self.instances.get(&instance), self.views.get_mut(&view))
-        else {
+        let mut route_native_guard = self.views.get_mut(&view);
+        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) = (
+            self.instances.get(&instance),
+            route_native_guard.as_deref_mut(),
+        ) else {
             return false;
         };
         let changed = app.set_markdown_mode(view, mode);
@@ -3327,9 +3353,11 @@ impl NativeRuntime {
 
     /// Reveal the real source editor for an editing command, retaining an existing split.
     pub(crate) fn focus_markdown_editor(&mut self, instance: AppInstanceId, view: ViewId) -> bool {
-        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) =
-            (self.instances.get(&instance), self.views.get_mut(&view))
-        else {
+        let mut route_native_guard = self.views.get_mut(&view);
+        let (Some(NativeApp::Editor(app)), Some(AppViewState::Editor(view))) = (
+            self.instances.get(&instance),
+            route_native_guard.as_deref_mut(),
+        ) else {
             return false;
         };
         let changed = match app.markdown_mode(view) {
@@ -3413,8 +3441,8 @@ impl NativeRuntime {
             }
         }
         if enabled {
-            for state in self.views.values_mut() {
-                if let AppViewState::Editor(view) = state
+            for mut state in self.views.values_mut() {
+                if let AppViewState::Editor(view) = &mut *state
                     && view
                         .buffer
                         .as_ref()
@@ -3494,8 +3522,8 @@ impl NativeRuntime {
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
-        for state in self.views.values_mut() {
-            let status = match state {
+        for mut state in self.views.values_mut() {
+            let status = match &mut *state {
                 AppViewState::Settings(settings) => &mut settings.config_watch_status,
                 AppViewState::Editor(editor)
                     if editor
@@ -3521,7 +3549,7 @@ impl NativeRuntime {
             }
             status.clone_from(&message);
             state.touch();
-            match state {
+            match &mut *state {
                 AppViewState::Settings(settings) => {
                     settings.common.presentation_revision =
                         settings.common.presentation_revision.saturating_add(1);
@@ -3595,8 +3623,8 @@ impl NativeRuntime {
             editor.config_analysis = Some(analysis.clone());
         }
         if accepted {
-            for state in self.views.values_mut() {
-                let AppViewState::Editor(state) = state else {
+            for mut state in self.views.values_mut() {
+                let AppViewState::Editor(state) = &mut *state else {
                     continue;
                 };
                 if state
@@ -3894,9 +3922,10 @@ impl NativeRuntime {
         view: ViewId,
         field: Option<&UiKey>,
     ) -> bool {
-        if let (Some(NativeApp::Mail(app)), Some(AppViewState::Mail(state))) =
-            (self.instances.get_mut(&instance), self.views.get_mut(&view))
-        {
+        if let (Some(NativeApp::Mail(app)), Some(AppViewState::Mail(state))) = (
+            self.instances.get_mut(&instance),
+            self.views.get_mut(&view).as_deref_mut(),
+        ) {
             let changed = app.cancel_preedit(state, field);
             if changed {
                 state.common.presentation_revision =
@@ -3914,10 +3943,10 @@ impl NativeRuntime {
             }
             return self.update_system_state(|state| state.cancel_preedit(field));
         }
-        let Some(state) = self.views.get_mut(&view) else {
+        let Some(mut state) = self.views.get_mut(&view) else {
             return false;
         };
-        let changed = match state {
+        let changed = match &mut *state {
             AppViewState::Settings(state) => state.cancel_preedit(field),
             AppViewState::Editor(state) => {
                 let changed = !state.preedit.is_empty() || state.preedit_caret.is_some();
@@ -3982,9 +4011,35 @@ impl NativeRuntime {
             .ok_or(RuntimeError::UnknownView(view))
     }
 
+    #[cfg(test)]
+    pub(crate) fn route_classifier_work(&self) -> Vec<(ViewId, u64)> {
+        self.views.classifier_work()
+    }
+
+    /// Bind the canonical front window to this native view's mutation authority.
+    pub(crate) fn bind_option_route(
+        &mut self,
+        view: ViewId,
+        signal: crate::option_routing::Signal,
+    ) {
+        self.views.bind(view, signal);
+    }
+
+    /// Release only this window's subscription; a tab may already have moved to another.
+    pub(crate) fn unbind_option_route(
+        &mut self,
+        view: ViewId,
+        signal: &crate::option_routing::Signal,
+    ) {
+        self.views.unbind(view, signal);
+    }
+
     /// Mutate view-local controller state without exposing the runtime's app or generation maps.
-    pub(crate) fn view_state_mut(&mut self, view: ViewId) -> Option<&mut AppViewState> {
-        let state = self.views.get_mut(&view)?;
+    pub(crate) fn view_state_mut(
+        &mut self,
+        view: ViewId,
+    ) -> Option<crate::option_routing::ViewMutation<'_>> {
+        let mut state = self.views.get_mut(&view)?;
         state.touch();
         Some(state)
     }
@@ -3995,10 +4050,10 @@ impl NativeRuntime {
         view: ViewId,
         change: impl FnOnce(&mut AppViewState) -> bool,
     ) -> bool {
-        let Some(state) = self.views.get_mut(&view) else {
+        let Some(mut state) = self.views.get_mut(&view) else {
             return false;
         };
-        let changed = change(state);
+        let changed = change(&mut state);
         state.common_mut().sync_input_focus();
         if changed {
             state.touch();
@@ -4023,7 +4078,7 @@ impl NativeRuntime {
             .instances
             .get_mut(&instance)
             .ok_or(RuntimeError::UnknownInstance(instance))?;
-        let state = self
+        let mut state = self
             .views
             .get_mut(&view)
             .ok_or(RuntimeError::UnknownView(view))?;
@@ -4044,7 +4099,7 @@ impl NativeRuntime {
             }
             event => event,
         };
-        let result = app.update(state, event, &mut cx);
+        let result = app.update(&mut state, event, &mut cx);
         state.common_mut().sync_input_focus();
         let result = result?;
         Ok(DispatchOutcome {

@@ -757,13 +757,18 @@ fn a_hit_in_a_base64_copy_of_an_exported_binary_is_cleared_as_the_engine_clears_
     );
 
     // The engine reads a grep record's path up to its first `:<line>:`, so a path holding one
-    // is read as another file.
-    let mut colon = exported.clone();
-    colon[2].0 = "crates/x/src/a:1:b.rs".into();
-    let colon_stands: BTreeSet<String> = ["crates/x/src/a:1:b.rs:6", "crates/x/src/a:1:b.rs:14"]
-        .map(String::from)
-        .into();
-    assert_eq!(payload_spots("payload-colon", &colon), (colon_stands, 0));
+    // is read as another file. Windows takes no `:` in a file name, so only a Unix checkout
+    // holds such a path.
+    #[cfg(unix)]
+    {
+        let mut colon = exported.clone();
+        colon[2].0 = "crates/x/src/a:1:b.rs".into();
+        let colon_stands: BTreeSet<String> =
+            ["crates/x/src/a:1:b.rs:6", "crates/x/src/a:1:b.rs:14"]
+                .map(String::from)
+                .into();
+        assert_eq!(payload_spots("payload-colon", &colon), (colon_stands, 0));
+    }
 
     // The binary is in the checkout but not the export: nothing the export publishes.
     let unexported = payload_spots("payload-unexported", &with("tools/p.bin", decoded(&digits)));

@@ -4021,12 +4021,14 @@ impl LaneService for MetaService {
         let rest = request.line().strip_prefix("meta ").unwrap_or("");
         let master = self.master;
         let alab_image = self.alab_image;
-        let prove = |holder: &str| super::prove_self_claim_by(holder, master, &alab_image);
+        let prove =
+            |holder: &str, _: Option<u32>| super::prove_self_claim_by(holder, master, &alab_image);
         let reply = super::control_session::cmd_meta_supervisor(
             &self.ctx,
             scope,
             super::serving_connection(),
             &prove,
+            &|_, _| None,
             rest,
         )
         .map_or_else(|| "ERR usage\n".to_string(), |(reply, _)| reply);
@@ -4631,7 +4633,7 @@ fn claude_code_alab_claims_through_meta_under_contract_three_alone() {
 fn claude_code_alab_claims_the_typing_duties_under_contract_three() {
     use crate::session_timeline::SupervisorClaim;
     let store = crate::session_store::new_store();
-    let h = crate::session_store::test_handle_on(7522, -1);
+    let h = crate::session_store::test_handle_on(7524, -1);
     store.write().unwrap().register(h.clone());
     let ctx = h.ctx.as_ref();
     let host = format!("aterm-harness@{}", std::process::id());
@@ -4648,7 +4650,7 @@ fn claude_code_alab_claims_the_typing_duties_under_contract_three() {
     let me = format!("claude-code-alab@{}", stand_in());
     let serve = |rest: &str, proves: bool| {
         let prove = move |_: &str| proves.then(running);
-        super::meta_wakes_proving_for_test(&store, &h.term, 7522, &h.ctx, rest, Some(4), &prove).0
+        super::meta_wakes_proving_for_test(&store, &h.term, 7524, &h.ctx, rest, Some(4), &prove).0
     };
     // The live scoped claim's scope, whether it is proven, whether it holds the act proof, and
     // whether it speaks for the boxes and walls (the host's claim, no scoped one, takes them all).
@@ -4720,6 +4722,165 @@ fn claude_code_alab_claims_the_typing_duties_under_contract_three() {
     );
 }
 
+/// HX-06 EXIT TEST: A CONTRACT 4 CLAIM IS GRANTED ITS KNOWN WORDS AND NAMES ITS REVISION
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2), through the real `meta` dispatch. A
+/// seed row's harness (grok-alab) claiming `relaunch,turn-end,state,accounts` and a word aterm
+/// does not know is answered `OK scope=relaunch,state,accounts revision=<n>`: the unknown word
+/// dropped, `turn-end` not granted to a seed row (no verified record stands behind it), `<n>` the
+/// claim's revision as `status` prints it, with `supervisor_contract=4` (the session's
+/// `supervisor_authority().wire_fields()`, `status`'s words). The same claim again keeps
+/// its revision; a claim of words of which none is granted stands with `scope=-`.
+/// NEGATIVE CONTROLS: a claim without `version=` or `scope=`, and one naming a malformed
+/// `child=`, are `ERR usage`; an unregistered holder is `ERR unproven`, and a claim that proves
+/// nothing is `ERR unproven`, each leaving the host's claim standing.
+#[test]
+fn a_contract_4_claim_is_granted_its_known_words_and_names_its_revision() {
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7522, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let host = format!("aterm-harness@{}", std::process::id());
+    claim_supervisor_as(
+        ctx,
+        &host,
+        None,
+        None,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the host's claim");
+    let me = format!("grok-alab@{}", stand_in());
+    let serve = |rest: &str, proves: bool| {
+        let prove = move |_: &str| proves.then(running);
+        super::meta_wakes_proving_for_test(&store, &h.term, 7522, &h.ctx, rest, Some(4), &prove).0
+    };
+    let revision = || {
+        ctx.meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .supervisor_revision
+    };
+    for bad in [
+        format!("set supervisor {me} contract=4 scope=relaunch"),
+        format!("set supervisor {me} contract=4 version=0.2.0"),
+        format!("set supervisor {me} contract=4 scope=relaunch version=0.2.0 child=1:5"),
+        format!("set supervisor {me} contract=4 scope=relaunch version=0.2.0 child=x"),
+        format!("set supervisor {me} contract=4 scope=Relaunch version=0.2.0"),
+        format!("set supervisor {me} contract=4 scope=relaunch,relaunch version=0.2.0"),
+    ] {
+        let reply = serve(&bad, true);
+        assert!(reply.starts_with("ERR usage"), "{bad}: {reply}");
+        assert_eq!(shown(ctx), (Some(host.clone()), false), "{bad}");
+    }
+    let unregistered = serve(
+        "set supervisor other-alab@4242 contract=4 scope=relaunch version=1.0.0",
+        true,
+    );
+    assert!(unregistered.starts_with("ERR unproven"), "{unregistered}");
+    let claim = format!(
+        "set supervisor {me} contract=4 scope=relaunch,turn-end,state,accounts,telepathy \
+         version=0.3.0 vendor=1.0.70"
+    );
+    let unproven = serve(&claim, false);
+    assert!(unproven.starts_with("ERR unproven"), "{unproven}");
+    assert_eq!(shown(ctx), (Some(host.clone()), false));
+
+    let reply = serve(&claim, true);
+    let n = revision();
+    assert_eq!(
+        reply,
+        format!("OK scope=relaunch,state,accounts revision={n}\n")
+    );
+    assert_eq!(shown(ctx), (Some(me.clone()), false));
+    assert_eq!(
+        status_words(ctx),
+        format!(
+            "supervisor_contract=4 supervisor_scope=relaunch,state,accounts supervisor_revision={n}"
+        )
+    );
+    assert_eq!(
+        serve(&claim, true),
+        format!("OK scope=relaunch,state,accounts revision={n}\n"),
+        "the same claim again keeps its revision"
+    );
+    let nothing = serve(
+        &format!("set supervisor {me} contract=4 scope=turn-end,telepathy version=0.3.0"),
+        true,
+    );
+    let moved = revision();
+    assert_ne!(moved, n);
+    assert_eq!(nothing, format!("OK scope=- revision={moved}\n"));
+    assert_eq!(
+        status_words(ctx),
+        format!("supervisor_contract=4 supervisor_scope=- supervisor_revision={moved}")
+    );
+}
+
+/// The claim words `status` prints for `ctx`'s session: its supervisor authority's
+/// `supervisor_contract=`, `supervisor_scope=` and `supervisor_revision=`
+/// (`crate::session_status`, the same call).
+fn status_words(ctx: &crate::SessionCtx) -> String {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .supervisor_authority(crate::metrics::now_us())
+        .wire_fields()
+}
+
+/// HX-06 EXIT TEST: CONTRACTS 2 AND 3 ARE STILL SERVED, through the real `meta` dispatch:
+/// `contract 2,3,4` is what `meta` serves; codex-alab's contract 2 self-claim (no `contract=`)
+/// is proven and answered `OK`; a rostered harness's contract 3 claim is answered `OK` with no
+/// grant words, and still refuses whole what contract 4 would drop (an unknown word, a duty
+/// outside its row, `state`, `child=`).
+#[test]
+fn contracts_2_and_3_are_still_served() {
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7523, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let serve = |rest: &str| {
+        let prove = |_: &str| Some(running());
+        super::meta_wakes_proving_for_test(&store, &h.term, 7523, &h.ctx, rest, Some(4), &prove).0
+    };
+    assert_eq!(
+        aterm_agent::harness::contract::SERVED,
+        [2, 3, 4],
+        "contract 2,3,4 served"
+    );
+    let codex = format!("codex-alab@{}", stand_in());
+    assert_eq!(serve(&format!("set supervisor {codex}")), "OK\n");
+    assert_eq!(shown(ctx), (Some(codex.clone()), true));
+    assert!(release_supervisor(
+        ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+    let me = format!("grok-alab@{}", stand_in());
+    for bad in [
+        format!("set supervisor {me} contract=3 scope=relaunch,telepathy"),
+        format!("set supervisor {me} contract=3 scope=walls"),
+        format!("set supervisor {me} contract=3 scope=state"),
+        format!("set supervisor {me} contract=3 scope=relaunch child=4243:1763000000123456"),
+    ] {
+        let reply = serve(&bad);
+        assert!(reply.starts_with("ERR usage"), "{bad}: {reply}");
+        assert_eq!(shown(ctx).0, None, "{bad}");
+    }
+    assert_eq!(
+        serve(&format!(
+            "set supervisor {me} contract=3 scope=relaunch,upgrade version=0.2.0"
+        )),
+        "OK\n"
+    );
+    assert!(
+        status_words(ctx).starts_with("supervisor_contract=3 supervisor_scope=relaunch,upgrade "),
+        "{}",
+        status_words(ctx)
+    );
+}
+
 /// Put `holder`'s proven contract 3 claim of `duties` on `ctx`'s session, bound to connection
 /// `conn`, proven as the running stand-in ([`running`]). The scope is a fixture
 /// ([`Scopes::for_test`](aterm_agent::harness::contract::Scopes::for_test)), so it may name a
@@ -4730,11 +4891,23 @@ fn claim_scoped(
     duties: &[aterm_agent::harness::contract::Scope],
     conn: u64,
 ) {
+    claim_scoped_under(ctx, holder, 3, duties, conn);
+}
+
+/// [`claim_scoped`] under `contract` (3 or 4).
+fn claim_scoped_under(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    contract: u32,
+    duties: &[aterm_agent::harness::contract::Scope],
+    conn: u64,
+) {
     let aterm_agent::harness::contract::Words::Scoped(mut claim) =
         aterm_agent::harness::contract::read(holder, &["contract=3", "scope=upgrade"])
     else {
         panic!("the roster admits {holder}");
     };
+    claim.contract = contract;
     claim.scopes = aterm_agent::harness::contract::Scopes::for_test(duties);
     crate::session_timeline::claim_supervisor_scoped(
         ctx,
@@ -4743,6 +4916,7 @@ fn claim_scoped(
         crate::harness_claim::Scoped {
             proven: running(),
             claim,
+            child: None,
         },
         crate::metrics::now_us(),
         aterm_slog::Actor::Ctl,
@@ -4771,26 +4945,30 @@ fn reports(ctx: &crate::SessionCtx) -> (bool, bool, bool, usize) {
     )
 }
 
-/// HX-06'S ACT ADMISSION, FOR CONTRACT 3 (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2): an
-/// act, the stop, Land's hold, NEEDS YOU and the continuation report are admitted for any proven
-/// claim that holds `turn-end`, the duty they report on: codex-alab's contract 2 self-claim, as
-/// before, and a rostered harness's proven contract 3 claim naming `turn-end` (claude-code-alab's,
-/// whose row allows it, as a scope fixture), on its own connection or a connection its very process
-/// proves; each write is then read as that claim's while it stands. NEGATIVE CONTROLS: another
-/// connection that proves nothing is `ERR denied`; the same claim renewed without `turn-end` (a
-/// new revision) writes nothing more and its stop, hold and set go, and they do not come back when
-/// it takes `turn-end` again.
+/// HX-06 EXIT TEST: AN ACT IS ADMITTED FOR ANY PROVEN CLAIM THAT HOLDS ITS SCOPE
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2). Each act names the duty it reports on
+/// ([`aterm_agent::harness::acts::act_scope`]): `continue@v1` turn-end, `approve-all@v1`
+/// approvals, `api-retry@v1` walls, `upgrade@v1` upgrade; the lease, the stop, Land's hold and
+/// NEEDS YOU report on turn-end, the continuation report on state. codex-alab's contract 2
+/// self-claim takes every duty, an act naming none included. A proven contract 4 claim (and a
+/// contract 3 one, the same rule) is admitted for the acts whose duty it holds, on its own
+/// connection or one its very process proves, each read as that claim's while it stands.
+/// NEGATIVE CONTROLS: another connection that proves nothing is `ERR denied`; an act naming no
+/// duty is contract 2's alone; the claim renewed without `turn-end` (a new revision) still
+/// approves and reports its state but continues nothing, its stop, hold and set go, and they do
+/// not come back when it takes `turn-end` again.
 #[test]
 fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
     use super::control_session::{
         cmd_meta_harness_act, cmd_meta_harness_activity, cmd_meta_harness_held,
         cmd_meta_harness_land,
     };
-    use aterm_agent::harness::contract::Scope;
+    use aterm_agent::harness::contract::{Scope, UNIVERSAL};
     let h = crate::session_store::test_handle_on(7560, -1);
     let ctx = h.ctx.as_ref();
     let no_proof = |_: &str| -> Option<Proven> { None };
     let proof = |_: &str| -> Option<Proven> { Some(running()) };
+    let ok = Some(("OK\n".to_string(), true));
     let denied = Some(("ERR denied\n".to_string(), false));
     let act = |conn: u64, prove: &dyn Fn(&str) -> Option<Proven>, act: &str| {
         cmd_meta_harness_act(
@@ -4828,7 +5006,7 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
     };
     put_needs_entry(ctx, Some(NEEDS_ENTRY));
 
-    // codex-alab's contract 2 self-claim: its proof is the one it always was.
+    // codex-alab's contract 2 self-claim: every act, one naming no duty included.
     let codex = format!("codex-alab@{}", stand_in());
     claim_supervisor_as(
         ctx,
@@ -4840,10 +5018,7 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
         aterm_slog::Actor::Ctl,
     )
     .expect("codex-alab's proven self-claim");
-    assert_eq!(
-        act(1, &no_proof, "codex-act@v1"),
-        Some(("OK\n".to_string(), true))
-    );
+    assert_eq!(act(1, &no_proof, "codex-act@v1"), ok);
     assert!(release_supervisor(
         ctx,
         None,
@@ -4852,20 +5027,22 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
     ));
 
     let me = format!("claude-code-alab@{}", stand_in());
-    claim_scoped(ctx, &me, &Scope::ALL, 2);
+    claim_scoped_under(ctx, &me, UNIVERSAL, &Scope::ALL, 2);
+    assert_eq!(act(2, &no_proof, "continue@v1"), ok);
     assert_eq!(
-        act(2, &no_proof, "continue"),
-        Some(("OK\n".to_string(), true))
-    );
-    assert_eq!(
-        act(3, &proof, "approve"),
-        Some(("OK\n".to_string(), true)),
+        act(3, &proof, "approve-all@v1"),
+        ok,
         "a connection its very process proves"
     );
     assert_eq!(
-        act(3, &no_proof, "approve"),
+        act(3, &no_proof, "approve-all@v1"),
         denied,
         "a connection that proves nothing"
+    );
+    assert_eq!(
+        act(2, &no_proof, "codex-act@v1"),
+        denied,
+        "an act naming no duty is contract 2's alone"
     );
     let lease = cmd_meta_harness_act(
         ctx,
@@ -4887,7 +5064,7 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
         .into_iter()
         .zip(["held", "land", "needs", "activity"])
     {
-        assert_eq!(told, Some(("OK\n".to_string(), true)), "{line}");
+        assert_eq!(told, ok, "{line}");
     }
     assert_eq!(
         reports(ctx),
@@ -4900,33 +5077,40 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
         .unwrap_or_else(PoisonError::into_inner)
         .last_act()
         .map(str::to_owned);
-    assert_eq!(booked.as_deref(), Some("approve"));
+    assert_eq!(booked.as_deref(), Some("approve-all@v1"));
 
-    // The same process renews its claim without turn-end: a new revision that reports nothing.
-    claim_scoped(
+    // The same process renews its claim without turn-end: a new revision that still approves
+    // and reports its state, and continues nothing.
+    claim_scoped_under(
         ctx,
         &me,
+        UNIVERSAL,
         &[
             Scope::Relaunch,
             Scope::Upgrade,
             Scope::Approvals,
             Scope::Questions,
             Scope::Walls,
+            Scope::State,
         ],
         2,
     );
-    assert_eq!(
-        act(2, &no_proof, "continue"),
-        denied,
-        "no act without turn-end"
-    );
+    assert_eq!(act(2, &no_proof, "continue@v1"), denied, "no turn-end act");
+    assert_eq!(act(2, &no_proof, "api-retry@v1"), ok, "walls is held");
     for (told, line) in tell_all(2, &no_proof)
         .into_iter()
-        .zip(["held", "land", "needs", "activity"])
+        .zip(["held", "land", "needs"])
     {
-        assert_eq!(told, denied, "{line}: no report without turn-end");
+        assert_eq!(told, denied, "{line}: no turn-end report");
     }
-    assert_eq!(reports(ctx), (false, false, false, 3));
+    assert_eq!(
+        tell_all(2, &no_proof)[3],
+        Some(("OK\n".to_string(), false)),
+        "its state is still its own to report (the same report moves nothing)"
+    );
+    assert_eq!(reports(ctx), (false, false, false, 4));
+
+    // A contract 3 claim follows the same rule.
     claim_scoped(
         ctx,
         &me,
@@ -4935,20 +5119,24 @@ fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
     );
     assert_eq!(
         reports(ctx),
-        (false, false, false, 3),
+        (false, false, false, 4),
         "a stop, hold or set told before the narrowing never comes back"
     );
+    assert_eq!(act(2, &no_proof, "continue@v1"), ok);
+    assert_eq!(act(2, &no_proof, "upgrade@v1"), ok, "upgrade is held");
     assert_eq!(
-        act(2, &no_proof, "resume@v1"),
-        Some(("OK\n".to_string(), true))
+        act(2, &no_proof, "approve-all@v1"),
+        denied,
+        "approvals is not"
     );
 }
 
-/// A CLAIM HOLDING ONLY `relaunch,upgrade` WRITES NO ACT: claude-code-alab's and grok-alab's
-/// proven contract 3 claims of `relaunch,upgrade`, on their own connection and on a connection
-/// their process proves, are `ERR denied` for every act, its lease, the stop, Land's hold, NEEDS
-/// YOU and the continuation report, and nothing is kept: no act on the timeline, no stop, hold or
-/// set read or stored. CONTROL: the same claimant widened to `turn-end` (a scope fixture) on the
+/// A CLAIM HOLDING ONLY `relaunch,upgrade` WRITES NO TURN-END ACT: claude-code-alab's and
+/// grok-alab's proven contract 3 claims of `relaunch,upgrade`, on their own connection and on a
+/// connection their process proves, are `ERR denied` for a turn-end act, its lease, the stop,
+/// Land's hold, NEEDS YOU and the continuation report, and nothing is kept: no act on the
+/// timeline, no stop, hold or set read or stored. (Their `upgrade@v1` act is admitted: the claim
+/// holds `upgrade`.) CONTROL: the same claimant widened to `turn-end` (a scope fixture) on the
 /// same connection records its act, so the refusal is the scope's.
 #[test]
 fn a_claim_holding_only_relaunch_and_upgrade_writes_no_act() {
@@ -4971,7 +5159,7 @@ fn a_claim_holding_only_relaunch_and_upgrade_writes_no_act() {
             (2, &no_proof as &dyn Fn(&str) -> Option<Proven>),
             (3, &proof as &dyn Fn(&str) -> Option<Proven>),
         ] {
-            for line in ["set harness_act continue", "prepare harness_act"] {
+            for line in ["set harness_act continue@v1", "prepare harness_act"] {
                 assert_eq!(
                     cmd_meta_harness_act(
                         ctx,
@@ -5046,7 +5234,7 @@ fn a_claim_holding_only_relaunch_and_upgrade_writes_no_act() {
                     Some(2),
                     aterm_slog::Actor::Ctl,
                     &no_proof,
-                    "set harness_act continue"
+                    "set harness_act continue@v1"
                 ),
                 Some(("OK\n".to_string(), true)),
                 "CONTROL: the claim widened to turn-end records its act"
@@ -6270,4 +6458,75 @@ fn a_tabs_own_process_types_under_if_human_while_keys_are_injected_and_none_is_l
             hx07_tally(&fenced)
         );
     }
+}
+
+// A claimant reads the person's new sequence while the gesture is still being routed. The
+// program must receive that gesture first even when the ordered writer is currently empty.
+#[test]
+#[cfg(unix)]
+fn a_fenced_key_waits_for_a_counted_person_gesture_to_reach_the_writer() {
+    use super::control_input::{GuardedInput, InputFence, input_if_fenced_observed};
+    use crate::ReadOn;
+    use crate::input::InputEvent;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    aterm_pty::set_nonblocking(rd.as_raw_fd(), true).expect("nonblocking reader");
+    let mut program = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    aterm_pty::set_nonblocking(wr.as_raw_fd(), true).expect("nonblocking writer");
+    let mut app = crate::App::headless_for_test_with_sink(Arc::new(
+        aterm_session::sink::SinkWriter::new(wr.into_raw_fd()),
+    ));
+    let session = app.pool.get(0).expect("session");
+    let term = session.term.clone();
+    let ctx = session.ctx.clone();
+    ctx.sink.note_master_nonblocking(true);
+    let routing = ctx.human_input.begin_delivery();
+    let person = InputEvent::KeySequence(b"p".to_vec());
+    app.note_person_input(0, &person, crate::input::Source::Human);
+    let fence = InputFence {
+        human: Some(ctx.human_input.seq()),
+        ..InputFence::default()
+    };
+    let press = || {
+        input_if_fenced_observed(
+            &term,
+            &ctx,
+            InputEvent::KeySequence(b"C".to_vec()),
+            &fence,
+            ReadOn::Control,
+            None,
+        )
+    };
+    assert_eq!(ctx.sink.ordered_egress_count(), 0);
+    assert!(matches!(press(), GuardedInput::Queued));
+    // The same route queues the person's bytes before its dispatch guard leaves scope.
+    assert_eq!(
+        app.input_to_session(
+            crate::WindowId(0),
+            person,
+            crate::input::Source::Controller,
+            Some(0),
+            crate::app_input::PressPhase::Initial,
+        ),
+        crate::input::InputOutcome::Ok
+    );
+    drop(routing);
+    assert!(matches!(
+        press(),
+        GuardedInput::Pressed(crate::input::Delivery::Full)
+    ));
+    let mut bytes = [0; 2];
+    let mut read = 0;
+    aterm_spec::wait::until_while_working(std::process::id(), "both ordered writes", || {
+        match program.read(&mut bytes[read..]) {
+            Ok(n) => read += n,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("read ordered input: {error}"),
+        }
+        (read == bytes.len()).then_some(())
+    });
+    assert_eq!(&bytes, b"pC");
+    ctx.sink.sever_input();
 }

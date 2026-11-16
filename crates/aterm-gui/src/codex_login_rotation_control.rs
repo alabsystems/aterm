@@ -33,7 +33,8 @@ pub(super) trait Host: Send + Sync {
     fn copy(&self, pid: u32, start: &str) -> Option<self_claimed::Copy>;
 
     /// The reader one decision reads its logins with: the live one, or under the pinned
-    /// `fixture_roots` of a Rust fixture's isolated usage server.
+    /// `fixture_roots` of a Rust fixture's isolated provider (its usage server, and the issuer
+    /// its one presentation of a lost login's refresh token goes to).
     fn reader<'a>(
         &'a self,
         live: pool::LiveUsage<'a>,

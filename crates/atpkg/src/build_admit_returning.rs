@@ -66,6 +66,21 @@ impl Drop for Returned {
 }
 
 impl Completion {
+    /// Recover the exact successful native materialization for its semantic
+    /// postchecks. Only this returning job's private original outcome and
+    /// native cohort settlement permit the transition; public result fields,
+    /// another job's success and a foreign process cannot authorize it.
+    ///
+    /// # Errors
+    /// As [`Self::try_into_retained`]: the SAME completion retains its original
+    /// bundle when native success, ownership or its concrete type is absent.
+    pub fn try_into_materialization(
+        self,
+    ) -> Result<crate::private_input::CompletedMaterialization, Self> {
+        self.try_into_retained::<crate::private_input::MaterializationAttempt>()
+            .map(crate::private_input::CompletedMaterialization::from_native_return)
+    }
+
     /// Recover the original resource bundle from a returning submission, only
     /// after that actual job succeeded and its original native cohort drained.
     /// The caller must still perform its source/seed/content postchecks before

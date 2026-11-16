@@ -3,7 +3,7 @@
 
 use super::*;
 
-const SID: &str = "s-0123456789abcdef0123";
+const SID: &str = "t0000000001";
 
 /// The claim a tab's program holds, of `build`.
 fn claim(build: &str) -> aterm_types::clt_mark::Claim {
@@ -40,7 +40,11 @@ fn immutable_child_receipts_are_exact_bounded_and_removed_only_when_matching() {
         receipt.write_exclusive().unwrap_err().kind(),
         io::ErrorKind::AlreadyExists
     );
-    for (sid, pid, birth) in [("s-abcdef", 23, 45), (SID, 24, 45), (SID, 23, 46)] {
+    for (sid, pid, birth) in [
+        ("s-abcdef0123456789abcd", 23, 45),
+        (SID, 24, 45),
+        (SID, 23, 46),
+    ] {
         assert!(
             !Receipt::for_child(&mark, sid, pid, Some(birth), None)
                 .unwrap()
@@ -56,6 +60,7 @@ fn immutable_child_receipts_are_exact_bounded_and_removed_only_when_matching() {
     assert!(!receipt.path.exists());
     for (sid, pid, birth) in [
         ("../escaped", 23, Some(45)),
+        ("s-abcdef", 23, Some(45)),
         (SID, 1, Some(45)),
         (SID, 23, Some(0)),
         (SID, 23, None),

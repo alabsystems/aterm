@@ -166,3 +166,28 @@ fn the_ordinary_environment_and_aterm_integration_vars_survive() {
         assert!(!is_ai_env_var(v), "{v} must reach the child");
     }
 }
+
+/// AN `env_strip` ENTRY NEVER STRIPS ATERM'S OWN `__ATERM_` VARIABLES: an entry that is a prefix
+/// of `__ATERM_`, or has it as its prefix, is refused from aterm.toml and from a record alike, so
+/// the installed list keeps `__ATERM_REROUTE_PASSTHROUGH` as the default list does. NEGATIVE
+/// CONTROL (2026-11-14): with `__ATERM_` out of `PROTECTED_ENV_NAMES`, all four were admitted and
+/// the composed list stripped the passthrough marker.
+#[test]
+fn an_env_strip_entry_never_strips_aterms_own_underscore_variables() {
+    let entries = ["__A", "__ATERM", "__ATERM_", "__ATERM_REROUTE"];
+    for entry in entries {
+        assert!(
+            admit_env_strip_entry(entry).is_err(),
+            "{entry} would strip __ATERM_REROUTE_PASSTHROUGH"
+        );
+    }
+    let person: Vec<String> = entries.iter().map(|e| (*e).to_string()).collect();
+    let (strip, refused) = EnvStrip::compose(Some(&person), entries.iter().map(|e| ("x-alab", *e)));
+    assert_eq!(refused.len(), 2 * entries.len(), "{refused:?}");
+    assert!(!strip.strips("__ATERM_REROUTE_PASSTHROUGH"));
+    assert!(!strip.strips("__ATERM_REROUTE_ANNOUNCED"));
+    assert!(
+        admit_env_strip_entry("___X").is_ok(),
+        "an entry beside the family, not over it, stands"
+    );
+}

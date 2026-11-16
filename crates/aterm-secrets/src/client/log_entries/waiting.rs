@@ -111,6 +111,37 @@ impl Waiting {
         self.0.is_empty()
     }
 
+    /// The writes here that `earlier` does not hold as they are, as the class stops weigh them
+    /// from `author` where the command that queues them asks ([`waiting_put`]): each entry a
+    /// pass will sign a `Put` of. A take-back signs nothing, and a write `earlier` holds with
+    /// the same entry was asked when it was queued, so a write that waits is weighed once and
+    /// never again beside the one a later command queues.
+    pub(in super::super) fn authoring_over(&self, earlier: &Self, author: Author<'_>) -> Authoring {
+        self.0
+            .iter()
+            .filter_map(|(name, write)| {
+                let to = write.to.as_ref()?;
+                let asked = earlier
+                    .0
+                    .get(name)
+                    .and_then(|was| was.to.as_ref())
+                    .is_some_and(|was| same_entry(was, to));
+                (!asked).then(|| waiting_put(to, author))
+            })
+            .fold(Authoring::default(), |batch, (bytes, class)| {
+                batch.with_put(bytes, class)
+            })
+    }
+
+    /// The least wire bytes of the `Put`s a pass signs of these writes, by name ([`waiting_put`]);
+    /// a take-back signs none.
+    fn put_bytes(&self) -> impl Iterator<Item = (&String, usize)> {
+        self.0.iter().filter_map(|(name, write)| {
+            let to = write.to.as_ref()?;
+            Some((name, waiting_put(to, Author::Person).0))
+        })
+    }
+
     /// The names, in order.
     pub(in super::super) fn names(&self) -> Vec<String> {
         self.0.keys().cloned().collect()
@@ -289,6 +320,44 @@ pub(super) fn read_waiting(paths: &Paths, identity: &Identity) -> crate::Result<
     let plain = age::decrypt(std::slice::from_ref(identity), sealed.as_slice())
         .map_err(|error| Error::new(format!("everyone.waiting: {error}")))?;
     Waiting::decode(plain.as_slice())
+}
+
+/// The least wire bytes a vault pass will sign, asking nothing, of the `[everyone]` writes that
+/// wait on this Mac for a key: those in [`waiting_file`] and in every pending set
+/// ([`pending_dir`]), each name once at the largest of its writes, less each name `replaced`
+/// says the asking command writes itself. A class ask of a person's or an automatic writer's
+/// batch counts them ([`Authoring::beside_waiting`]): asked one by one where each was queued,
+/// writes that wait together would otherwise pass the stop together when the pass signs them.
+/// A file that does not read is none here: while it is there, no pass signs or lands what waits
+/// ([`unread_waiting`]).
+pub(in super::super) fn waiting_bytes_here(
+    paths: &Paths,
+    identity: &Identity,
+    replaced: &dyn Fn(&str) -> bool,
+) -> usize {
+    let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+    let mut count = |writes: &Waiting| {
+        for (name, bytes) in writes.put_bytes() {
+            if !replaced(name) {
+                let most = by_name.entry(name.clone()).or_default();
+                *most = (*most).max(bytes);
+            }
+        }
+    };
+    if let Ok(waiting) = read_waiting(paths, identity) {
+        count(&waiting);
+    }
+    for (_, _, _, path) in pending_files(paths).unwrap_or_default() {
+        if let Ok(Some(sealed)) =
+            fsx::read_private(&path, crate::membership_log::MAX_RECORDS_STREAM)
+            && let Some((_, writes)) = open_pending(identity, sealed.as_slice())
+        {
+            count(&writes);
+        }
+    }
+    by_name
+        .values()
+        .fold(0, |sum, bytes| sum.saturating_add(*bytes))
 }
 
 /// Write `waiting` to [`waiting_file`], sealed to `identity`'s recipient; remove the file where
@@ -1118,8 +1187,9 @@ pub(in super::super) fn overlay_waiting_onto_document(
             .filter(|(name, _)| !crate::entry_class::claude_token(name))
         {
             match &write.to {
+                // A write that waits went through the door when its command queued it.
                 Some(entry) if entry.anchor.is_some() == anchored => doc
-                    .set_entry_with(
+                    .hold_entry_with(
                         &Audience::Everyone,
                         name,
                         entry.value.as_slice(),
@@ -1713,10 +1783,21 @@ pub(super) fn everyone_fresh_to(
 /// (its actor, device key and incarnation) at `authored_ms`: a fresh epoch and its wraps first
 /// where `seal` mints one, and a `Delete` before its `Put`, so a person's save replaces every
 /// sibling. Returns what it signed, in order, already in `log`; nothing where there is nothing to
-/// write.
+/// write. Where `ask` names its author (a member's `set`, signed as the command runs), the batch
+/// is weighed by class before it is returned ([`edit_batch`]), beside the bytes `ask` gives of
+/// this Mac's writes that wait for a key ([`waiting_bytes_here`]): a `Delete` alone runs to the
+/// log's bound, and any `Put`, a credential's too, to the stop of a person's write. A vault pass
+/// asks nothing (`None`): each write it signs was asked when its command queued it
+/// ([`waiting_put`]), and a refusal here would be no command's answer, would hold every write
+/// waiting beside the refused one and would fail the pass at every step.
 ///
 /// # Errors
-/// A record fails to draft, sign or go into `log`.
+/// A record fails to draft, sign or go into `log`, or, as
+/// [`crate::ErrorKind::MembershipCapacity`], the batch `ask` weighs would pass its class's stop.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the log and its view, the signer and its clock, the seal, the writes and who asks"
+)]
 pub(super) fn sign_everyone(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
@@ -1725,9 +1806,11 @@ pub(super) fn sign_everyone(
     seal: EveryoneSeal,
     deletes: &[&String],
     puts: &[&Entry],
+    ask: Option<(Author<'_>, usize)>,
 ) -> crate::Result<Vec<Record>> {
     let (actor, device, incarnation) = signer;
     let mut minted = Vec::new();
+    let mut notes = PutNotes::default();
     if puts.is_empty() && deletes.is_empty() {
         return Ok(minted);
     }
@@ -1770,10 +1853,19 @@ pub(super) fn sign_everyone(
                 .draft_put(actor, authored_ms, epoch, &key, entry)?
                 .sign(writer_seed, incarnation)?;
             let _ = log.insert(record.clone())?;
+            notes.put(&record, &entry.name, false);
             minted.push(record);
         }
         Ok(())
     })?;
+    if let Some((author, waiting)) = ask {
+        log.authored_ask(
+            &edit_batch(&minted, &notes, author).beside_waiting(waiting),
+            author,
+            actor,
+            authored_ms,
+        )?;
+    }
     Ok(minted)
 }
 
@@ -2022,6 +2114,8 @@ pub(in super::super) fn sign_waiting_writes_by(
             seal,
             &deletes,
             &puts,
+            // Each was asked where its command queued it.
+            None,
         )?;
         Ok((minted, (settled, overtaken)))
     };

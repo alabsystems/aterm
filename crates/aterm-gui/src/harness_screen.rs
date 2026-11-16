@@ -4715,7 +4715,7 @@ fn snapshot_host_vitals(snap: &aterm_vitals::model::Snapshot) -> HostVitals {
         mem_used_bytes: mem.map(aterm_vitals::model::MemSample::used),
         mem_wired_bytes: mem.map(|m| m.wired),
         mem_compressed_bytes: mem.and_then(|m| m.compressed),
-        swap_used_bytes: mem.map(|m| m.swap_used),
+        swap_used_bytes: mem.and_then(|m| m.swap_used),
         mem_pressure: mem
             .map(|m| m.pressure)
             .filter(|p| *p != aterm_vitals::model::Pressure::Unknown)

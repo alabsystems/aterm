@@ -563,6 +563,28 @@ fn first_result_selects_for_keyboard_open_only_and_later_results_preserve_choice
 
 #[test]
 fn pointer_or_navigation_control_cancels_deferred_keyboard_selection() {
+    // A pool of one account, so the read card holds a choice above Account settings, the item
+    // a key reaches before the read, on every platform: where signing in by hand is unavailable
+    // (Windows, ATERM-KI-1105-14) the empty pool's pin item is disabled, and Account settings
+    // would also be the keyboard's first choice.
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "work".into(),
+            ..Default::default()
+        }],
+    };
+    let enrolled = roster.rows.iter().map(|row| row.label.clone()).collect();
+    let pool = crate::fact_menu::account_menu_rows_from(
+        &roster,
+        &accounts::State::default(),
+        &enrolled,
+        None,
+        false,
+        None,
+        None,
+        SessionWeek::default(),
+        NOON,
+    );
     for pointer in [false, true] {
         let (mut app, wid, session) = rig();
         let generation = open(&mut app, wid, session);
@@ -573,7 +595,7 @@ fn pointer_or_navigation_control_cancels_deferred_keyboard_selection() {
         }
         app.on_account_menu_read(Completion {
             generation,
-            rows: read(true, None),
+            rows: AccountRead::for_test(Ok(pool.clone())),
         });
         // The read does not take the selection: it stays where the person left it (nowhere
         // under a pointer, on the item their key reached).
@@ -799,7 +821,8 @@ fn the_claims_read_is_reused_within_a_minute() {
 
 /// A MAC WITH NO VAULT HAS NO CLAIMS TABLE TO READ. A table read that fails there is the
 /// table's absence (the card says this Mac does not read other Macs), never a read that failed
-/// just now. CONTROL: the same failure on a Mac whose vault is configured is a failed read.
+/// just now. CONTROL: the same failure on a Mac whose vault is configured is a failed read
+/// (on unix, where alone a vault client builds: off it no host has a vault).
 #[test]
 fn a_failed_claims_read_with_no_vault_is_no_table() {
     use aterm_agent::harness::claims::{self, Row, Table, Tabled};
@@ -824,20 +847,23 @@ fn a_failed_claims_read_with_no_vault_is_no_table() {
     };
     let bare = scratch();
     assert_eq!(claims_at(&bare), account_card::Claims::Absent);
-    let member = scratch();
-    let vault = member
-        .key
-        .home
-        .as_deref()
-        .unwrap()
-        .join(".config/aterm/secrets");
-    std::fs::create_dir_all(&vault).unwrap();
-    std::fs::write(
-        vault.join("source.toml"),
-        "url = \"http://127.0.0.1:9/v1/lab\"\nname = \"lab\"\n",
-    )
-    .unwrap();
-    assert_eq!(claims_at(&member), account_card::Claims::Unreadable);
+    #[cfg(unix)]
+    {
+        let member = scratch();
+        let vault = member
+            .key
+            .home
+            .as_deref()
+            .unwrap()
+            .join(".config/aterm/secrets");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(
+            vault.join("source.toml"),
+            "url = \"http://127.0.0.1:9/v1/lab\"\nname = \"lab\"\n",
+        )
+        .unwrap();
+        assert_eq!(claims_at(&member), account_card::Claims::Unreadable);
+    }
 }
 
 /// A FAILED POOL READ KEEPS THE CARD, and the card never claims a history it could not look

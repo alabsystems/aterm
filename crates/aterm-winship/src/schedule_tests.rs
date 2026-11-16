@@ -99,22 +99,25 @@ fn an_argument_is_read_back_as_it_was_given() {
 
 #[test]
 fn the_task_runs_update_headless_from_the_kept_copy_on_the_named_repository() {
-    let args = arguments(Path::new(TOOL), Path::new(r"D:\src\aterm")).expect("arguments");
+    let args =
+        arguments(Task::Update, Path::new(TOOL), Path::new(r"D:\src\aterm")).expect("arguments");
     assert_eq!(
         args,
         r#"--headless "C:\Users\a b\AppData\Local\aterm\build\aterm-winship.exe" update --log --repo "D:\src\aterm""#
     );
-    let trailing = arguments(Path::new(TOOL), Path::new(r"D:\src\aterm\")).expect("arguments");
+    let trailing =
+        arguments(Task::Update, Path::new(TOOL), Path::new(r"D:\src\aterm\")).expect("arguments");
     assert!(
         trailing.ends_with(r#" --repo "D:\src\aterm\\""#),
         "{trailing}"
     );
     // Negative controls: the task starts in the system directory, so a
     // relative repository is refused; so is a path that cannot be quoted.
-    assert!(arguments(Path::new(TOOL), Path::new(".")).is_err());
-    assert!(arguments(Path::new(TOOL), Path::new(r"src\aterm")).is_err());
+    assert!(arguments(Task::Update, Path::new(TOOL), Path::new(".")).is_err());
+    assert!(arguments(Task::Update, Path::new(TOOL), Path::new(r"src\aterm")).is_err());
     assert!(
         arguments(
+            Task::Update,
             Path::new("C:\\a\"b\\aterm-winship.exe"),
             Path::new(r"D:\src")
         )
@@ -142,6 +145,7 @@ fn element<'a>(xml: &'a str, name: &str) -> &'a str {
 #[test]
 fn the_task_xml_states_the_conditions_schtasks_flags_cannot() {
     let xml = task_xml(
+        Task::Update,
         Path::new(HOST),
         Path::new(TOOL),
         Path::new(r"D:\src\a&b <x>"),
@@ -180,6 +184,7 @@ fn the_task_xml_states_the_conditions_schtasks_flags_cannot() {
     // Controls: no caller named leaves the account to schtasks, and a relative
     // repository is refused before any XML is made.
     let anonymous = task_xml(
+        Task::Update,
         Path::new(HOST),
         Path::new(TOOL),
         Path::new(r"D:\src"),
@@ -190,6 +195,7 @@ fn the_task_xml_states_the_conditions_schtasks_flags_cannot() {
     assert!(!anonymous.contains("<UserId>"), "{anonymous}");
     assert!(
         task_xml(
+            Task::Update,
             Path::new(HOST),
             Path::new(TOOL),
             Path::new("."),
@@ -212,11 +218,80 @@ fn the_xml_file_is_utf_16_with_a_byte_order_mark() {
 fn schtasks_registers_from_the_file_and_removes_by_name() {
     let xml = Path::new(r"C:\Users\a b\AppData\Local\aterm\build\aterm-winship-update.xml");
     assert_eq!(
-        shown(&create_args(xml)),
+        shown(&create_args(Task::Update, xml)),
         r#"schtasks.exe /Create /F /TN aterm-winship-update /XML "C:\Users\a b\AppData\Local\aterm\build\aterm-winship-update.xml""#
     );
     assert_eq!(
-        shown(&delete_args()),
+        shown(&delete_args(Task::Update)),
         "schtasks.exe /Delete /F /TN aterm-winship-update"
     );
+    assert_eq!(
+        shown(&delete_args(Task::Serve)),
+        "schtasks.exe /Delete /F /TN aterm-winship-release-serve"
+    );
+    assert_eq!(
+        shown(&query_args(Task::Serve)),
+        "schtasks.exe /Query /TN aterm-winship-release-serve"
+    );
+}
+
+#[test]
+fn the_serve_task_polls_every_ten_minutes_one_run_at_a_time() {
+    let xml = task_xml(
+        Task::Serve,
+        Path::new(HOST),
+        Path::new(TOOL),
+        Path::new(r"D:\src\aterm"),
+        START,
+        Some(r"DESK\owner"),
+    )
+    .expect("xml");
+    for (name, want) in [
+        ("Interval", SERVE_EVERY),
+        ("StopAtDurationEnd", "false"),
+        ("StartBoundary", START),
+        ("MultipleInstancesPolicy", "IgnoreNew"),
+        ("DisallowStartIfOnBatteries", "false"),
+        ("StopIfGoingOnBatteries", "false"),
+        ("StartWhenAvailable", "true"),
+        ("WakeToRun", "false"),
+        ("LogonType", "InteractiveToken"),
+        ("RunLevel", "LeastPrivilege"),
+        ("Command", HOST),
+    ] {
+        assert_eq!(element(&xml, name), want, "<{name}>");
+    }
+    assert_eq!(SERVE_EVERY, "PT10M");
+    assert_eq!(
+        element(&xml, "Arguments"),
+        "--headless &quot;C:\\Users\\a b\\AppData\\Local\\aterm\\build\\aterm-winship.exe&quot; \
+         release-serve --once --log --repo &quot;D:\\src\\aterm&quot;"
+    );
+    // Controls: the serve task is no daily one, and the update task does not repeat.
+    assert!(!xml.contains("<CalendarTrigger>"), "{xml}");
+    let daily = task_xml(
+        Task::Update,
+        Path::new(HOST),
+        Path::new(TOOL),
+        Path::new(r"D:\src\aterm"),
+        START,
+        None,
+    )
+    .expect("xml");
+    assert!(!daily.contains("<Repetition>"), "{daily}");
+    assert!(element(&daily, "Arguments").contains(" update --log --repo "));
+    assert_eq!(
+        Task::ALL.map(Task::name),
+        ["aterm-winship-update", "aterm-winship-release-serve"]
+    );
+}
+
+#[test]
+fn the_serve_task_starts_within_two_minutes_never_in_the_past() {
+    // 2026-11-11T19:14:22 on the local clock: the start of 19:16.
+    assert_eq!(soon_boundary(1_794_424_462), "2026-11-11T19:16:00");
+    // On a minute's first second, still the second minute after it.
+    assert_eq!(soon_boundary(1_794_424_440), "2026-11-11T19:16:00");
+    // Across midnight.
+    assert_eq!(soon_boundary(1_794_441_599), "2026-11-12T00:01:00");
 }

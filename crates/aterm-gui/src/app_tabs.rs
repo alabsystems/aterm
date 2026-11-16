@@ -20,7 +20,8 @@ struct LabelIdentities {
 }
 
 impl LabelIdentities {
-    fn capture(app: &App, wid: WindowId) -> Self {
+    fn capture(app: &mut App, wid: WindowId) -> Self {
+        app.reconcile_title_delivery(std::time::Instant::now());
         let tabs = app
             .windows
             .get(&wid)
@@ -548,7 +549,8 @@ impl App {
             self.find_origins.retain(|(entry, _), _| *entry != session);
             self.session_chrome_expiry.cancel_session(session);
             self.title_drift.forget(session);
-            for window in self.windows.values_mut() {
+            for mut route_guard_window in self.windows.values_mut() {
+                let window = &mut **route_guard_window;
                 window.tab_title_epochs.remove(&session);
                 window.tab_title_cache.remove(&session);
                 window.tab_chrome_titles.remove(&session);
@@ -636,17 +638,21 @@ impl App {
         )) {
             return false;
         }
-        let removed = self.windows.get_mut(&window).and_then(|state| {
-            let canonical = state
-                .tab_set
-                .tabs()
-                .iter()
-                .position(|tab| tab.id == location.tab_id)?;
-            state
-                .tab_set
-                .tab_at_mut(canonical)
-                .map(|tab| tab.remove_view(location.view))
-        });
+        let removed = self
+            .windows
+            .get_mut(&window)
+            .as_deref_mut()
+            .and_then(|state| {
+                let canonical = state
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == location.tab_id)?;
+                state
+                    .tab_set
+                    .tab_at_mut(canonical)
+                    .map(|tab| tab.remove_view(location.view))
+            });
         if removed != Some(crate::tab_model::RemoveLeaf::Removed) {
             return false;
         }
@@ -654,7 +660,8 @@ impl App {
         else {
             return false;
         };
-        if let Some(state) = self.windows.get_mut(&window) {
+        if let Some(mut route_guard_state) = self.windows.get_mut(&window) {
+            let state = &mut **route_guard_state;
             state.leaf_render_cache.remove(&location.view);
         }
         self.teardown_session(terminal.session);
@@ -800,14 +807,20 @@ impl App {
         let Some(presentation) = self.aggregated_tab_presentation(wid, tab_id) else {
             return;
         };
-        if let Some(slot) = self.windows.get_mut(&wid).and_then(|window| {
-            let index = window
-                .tab_set
-                .tabs()
-                .iter()
-                .position(|tab| tab.id == tab_id)?;
-            window.tab_set.presentation_at_mut(index)
-        }) {
+        if let Some(route_guard_slot) =
+            self.windows
+                .get_mut(&wid)
+                .as_deref_mut()
+                .and_then(|window| {
+                    let index = window
+                        .tab_set
+                        .tabs()
+                        .iter()
+                        .position(|tab| tab.id == tab_id)?;
+                    window.tab_set.presentation_at_mut(index)
+                })
+        {
+            let slot = &mut *route_guard_slot;
             *slot = presentation;
         }
     }
@@ -896,7 +909,8 @@ impl App {
         let Some(folded) = self.tab_leaf_indicators(wid, tab_id) else {
             return false;
         };
-        let Some(presentation) = self.windows.get_mut(&wid).and_then(|window| {
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(presentation) = route_projection.as_deref_mut().and_then(|window| {
             let index = window
                 .tab_set
                 .tabs()
@@ -960,9 +974,10 @@ impl App {
         }) else {
             return;
         };
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return;
         };
+        let window = &mut **route_guard_window;
         let terminal_count = window
             .tab_set
             .tabs()
@@ -1033,13 +1048,15 @@ impl App {
         if self.stage_system_state_tab(wid).is_err() {
             return false;
         }
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if let Some(previous) = previous {
             window.tab_set.switch_to(previous);
         }
         window.last_present = None;
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.sync_active_session();
         if let Some(window) = self
@@ -1089,9 +1106,10 @@ impl App {
                 Err(_) => return false,
             },
         };
-        let Some(window) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_window) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let window = &mut **route_guard_window;
         if !window.tab_set.switch_to(tab)
             || !window
                 .tab_set
@@ -1102,6 +1120,7 @@ impl App {
         }
         cancel_pending_close(window);
         window.last_present = None;
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.sync_active_session();
         self.note_restore_focus_intent(wid);
@@ -1224,11 +1243,12 @@ impl App {
             staging.tab = Some(tab);
             return Ok((tab_id, view));
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             self.native_runtime.remove_view(view);
             self.view_store.remove(view);
             return Err(NativeTabInstallError::UnknownWindow);
         };
+        let ws = &mut **route_guard_ws;
         let keep = keep.filter(|keep| ws.tab_set.get(*keep).is_some());
         if ws.tab_set.push(tab).is_err() {
             self.native_runtime.remove_view(view);
@@ -1246,6 +1266,7 @@ impl App {
         let switched = ws.tab_set.switch_to(tab_id);
         debug_assert!(switched);
         debug_assert!(ws.tab_set.invariant_holds(&self.view_store));
+        drop(route_guard_ws);
         self.resync_active_or_window(wid);
         Ok((tab_id, view))
     }
@@ -1339,6 +1360,7 @@ impl App {
         let split = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.tab_set.active_mut())
             .is_some_and(|tab| tab.split_focused(axis, view));
         if !split {
@@ -1401,7 +1423,8 @@ impl App {
         let Some(focus) = by_session.get(&layout.focus()).copied() else {
             return false;
         };
-        let Some(tab) = self.windows.get_mut(&wid).and_then(|ws| {
+        let mut route_projection = self.windows.get_mut(&wid);
+        let Some(tab) = route_projection.as_deref_mut().and_then(|ws| {
             let canonical = ws
                 .tab_set
                 .tabs()
@@ -1442,7 +1465,8 @@ impl App {
             return None;
         }
         let removed = self.view_store.remove(view)?;
-        for window in self.windows.values_mut() {
+        for mut route_guard_window in self.windows.values_mut() {
+            let window = &mut **route_guard_window;
             window.leaf_render_cache.remove(&view);
         }
         if let crate::tab_model::View::Native(native) = removed {
@@ -1582,9 +1606,10 @@ impl App {
             })
             .collect();
         let chrome_labels = &self.chrome_labels;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return Vec::new();
         };
+        let ws = &mut **route_guard_ws;
         ws.tab_title_cache.retain(|sid, _| {
             #[cfg(test)]
             crate::work_counts::title_cache_probed();
@@ -1632,9 +1657,10 @@ impl App {
             view_store,
             ..
         } = self;
-        let Some(ws) = windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         for index in 0..ws.tab_set.len() {
             let Some(tab) = ws.tab_set.tab_at(index) else {
                 continue;
@@ -1780,7 +1806,8 @@ impl App {
                 },
             )
             .collect();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             for (i, ((origin, ..), ext)) in tabs.iter().zip(&ext).enumerate() {
                 if origin.is_some()
                     && ws
@@ -1913,7 +1940,8 @@ impl App {
             Ok(g) => g.slog().chrome_clause(now),
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().slog().chrome_clause(now),
             Err(std::sync::TryLockError::WouldBlock) => {
-                if let Some(window) = self.windows.get_mut(&retry_window) {
+                if let Some(mut route_guard_window) = self.windows.get_mut(&retry_window) {
+                    let window = &mut **route_guard_window;
                     window.tab_title_epochs.remove(&session);
                 }
                 self.session_chrome_retry.insert(session);
@@ -1989,7 +2017,8 @@ impl App {
                     .get(&session)
                     .map(|cached| cached.ext.clone())
                     .unwrap_or_default();
-                if let Some(window) = self.windows.get_mut(&retry_window) {
+                if let Some(mut route_guard_window) = self.windows.get_mut(&retry_window) {
+                    let window = &mut **route_guard_window;
                     window.tab_title_epochs.remove(&session);
                 }
                 self.session_chrome_retry.insert(session);
@@ -2146,7 +2175,8 @@ impl App {
     }
 
     /// Full hover/accessibility context paired by index with [`Self::tab_titles`].
-    pub(crate) fn tab_tooltips(&self, wid: WindowId) -> Vec<Option<String>> {
+    pub(crate) fn tab_tooltips(&mut self, wid: WindowId) -> Vec<Option<String>> {
+        self.reconcile_title_delivery(std::time::Instant::now());
         self.windows.get(&wid).map_or_else(Vec::new, |ws| {
             ws.tab_set
                 .tabs()
@@ -2359,7 +2389,8 @@ impl App {
                 None,
             ),
         };
-        if let Some(ws) = self.windows.get_mut(&wid_a) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid_a) {
+            let ws = &mut **route_guard_ws;
             if let Some(index) = terminal_index {
                 ws.layouts.remove(index);
                 remove_terminal_projection(ws, index);
@@ -2424,12 +2455,12 @@ impl App {
                 ws_b.tab_set.active()?.clone(),
             ))
         });
-        if let (Some((tree, tab)), Some(ws_a)) =
+        if let (Some((tree, tab)), Some(mut ws_a)) =
             (returned, wid_a.and_then(|a| self.windows.get_mut(&a)))
         {
             if is_terminal_tab(&tab, &self.view_store) {
                 let tree = tree.expect("detached terminal tab keeps its PaneTree projection");
-                land_terminal_tab(ws_a, &self.view_store, tree, tab)
+                land_terminal_tab(&mut ws_a, &self.view_store, tree, tab)
                     .expect("returned tab id remains unique");
             } else {
                 debug_assert!(tree.is_none());
@@ -2437,7 +2468,7 @@ impl App {
                     .push(tab)
                     .expect("returned tab id remains unique");
             }
-            align_terminal_projection_to_active(ws_a, &self.view_store);
+            align_terminal_projection_to_active(&mut ws_a, &self.view_store);
         }
         self.winit_to_window.retain(|_, &mut v| v != wid_b);
         self.focus_order.retain(|w| *w != wid_b);
@@ -2502,7 +2533,8 @@ impl App {
             .windows
             .get(&wid_a)
             .is_some_and(|ws| ws.tab_set.len() == 1);
-        if let Some(ws) = self.windows.get_mut(&wid_a) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid_a) {
+            let ws = &mut **route_guard_ws;
             if let Some(index) = terminal_index {
                 ws.layouts.remove(index);
                 remove_terminal_projection(ws, index);
@@ -2510,7 +2542,8 @@ impl App {
             ws.tab_set.remove(stable_tab.id);
             align_terminal_projection_to_active(ws, &self.view_store);
         }
-        if let Some(ws) = self.windows.get_mut(&wid_b) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid_b) {
+            let ws = &mut **route_guard_ws;
             match tree.as_ref() {
                 Some(tree) => land_terminal_tab(ws, &self.view_store, tree.clone(), stable_tab),
                 None => ws.tab_set.push(stable_tab).map(|_| ()),
@@ -2703,6 +2736,7 @@ impl App {
         let split = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.tab_set.active_mut())
             .is_some_and(|tab| tab.split_focused(axis, view));
         assert!(split, "canonical heterogeneous split succeeds");
@@ -2940,7 +2974,7 @@ impl App {
                 tl.agent().word,
                 // The survey's render-time rule: a reader that names no state (codex's) leaves
                 // the word to what the program says itself.
-                tl.program_shown()
+                tl.program_said()
                     .filter(|_| tl.agent().word == "unknown")
                     .map(|shown| crate::program_state::survey_word(shown.state)),
                 tl.task().map(|t| crate::status_item::TaskRow {
@@ -3712,6 +3746,7 @@ impl App {
         } else {
             self.windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|window| window.tab_set.active_mut())
                 .is_some_and(|tab| tab.focus != view && tab.set_focus(view))
         };
@@ -3806,7 +3841,7 @@ impl App {
         } else if split {
             self.close_split_pane_by_id(wid, location, session)?;
         } else if self.close_tab_at(wid, location.canonical_index)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.pending_close = true;
             deferred = Some(wid);
@@ -3870,7 +3905,7 @@ impl App {
             return Err("session view changed during close".to_string());
         };
         let recovery = self.closed_view_record_for(wid, location.tab_id, location.view);
-        let outcome = self.windows.get_mut(&wid).and_then(|ws| {
+        let outcome = self.windows.get_mut(&wid).as_deref_mut().and_then(|ws| {
             let tree = ws.layouts.get_mut(tab)?;
             tree.contains(session).then(|| tree.close_pane(session))
         });
@@ -4071,7 +4106,8 @@ impl App {
         tab.fleet = parked && fleet;
         self.pool_insert(session);
         self.note_tab_open(id, owner, parked, parent.as_ref(), "new-tab");
-        if let Some(ws) = self.windows.get_mut(&owner) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&owner) {
+            let ws = &mut **route_guard_ws;
             // By identity: a shown tab seated at the boundary moves a parked front along.
             let front = behind
                 .and_then(|kept| ws.tab_set.tab_at(kept))
@@ -4106,15 +4142,17 @@ impl App {
         if already_active {
             return;
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let switched = ws.tab_set.switch_to_index(i);
         debug_assert!(switched);
         debug_assert_eq!(ws.tab_set.active_id(), Some(tab_id));
         if let Some(index) = terminal_index {
             ws.tabs.switch_to(index);
         }
+        drop(route_guard_ws);
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
         } else {
@@ -4152,9 +4190,10 @@ impl App {
 
     /// [`Self::cycle_tab`] on an explicit window.
     pub(crate) fn cycle_tab_in(&mut self, wid: WindowId, forward: bool) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         if ws.tab_set.shown_len() <= 1 && !ws.tab_set.active_is_parked() {
             return;
         }
@@ -4164,6 +4203,7 @@ impl App {
         if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, next) {
             ws.tabs.switch_to(index);
         }
+        drop(route_guard_ws);
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
         } else {
@@ -4213,7 +4253,7 @@ impl App {
             NativeTabCommand::Select(_) => self.switch_tab_in(window, index),
             NativeTabCommand::Close(_) => {
                 if self.close_tab_at(window, index)
-                    && let Some(ws) = self.windows.get_mut(&window)
+                    && let Some(mut ws) = self.windows.get_mut(&window)
                 {
                     ws.pending_close = true;
                 }
@@ -4316,7 +4356,7 @@ impl App {
             return;
         }
         if self.close_tab_at(wid, i)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.pending_close = true;
         }
@@ -4325,9 +4365,10 @@ impl App {
     /// Reorder window `wid`'s canonical tab from index `from` to `to`, keeping the same stable tab selected.
     pub(crate) fn move_tab(&mut self, wid: WindowId, from: usize, to: usize) {
         let views = &self.view_store;
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let n = ws.tab_set.len();
         if from >= n || to >= n || from == to {
             return;
@@ -4336,6 +4377,7 @@ impl App {
         if !reorder_with_projection(ws, views, stable_id, |tabs| tabs.reorder(stable_id, to)) {
             return;
         }
+        drop(route_guard_ws);
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
         } else {
@@ -4404,7 +4446,8 @@ impl App {
             .get(&wid)
             .map_or(titles.len(), |ws| ws.tab_set.shown_len());
         let ids = &identities.ids;
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.strip_shadow.set((shown, active));
             ws.tab_title_epochs.retain(|sid, _| {
                 #[cfg(test)]
@@ -4461,7 +4504,8 @@ impl App {
         }
         // What the strip was given: one tip per shown tab, never a parked worker's.
         #[cfg(any(test, debug_assertions))]
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             let mut pushed = tooltips;
             pushed.truncate(shown);
             ws.tooltips_pushed = pushed;
@@ -4706,6 +4750,7 @@ impl App {
         let outcome = self
             .windows
             .get_mut(&window)
+            .as_deref_mut()
             .and_then(|state| state.layouts.get_mut(index))
             .map(|tree| tree.close_pane(session))?;
         let collapsed = matches!(outcome, pane::CloseOutcome::Collapsed { .. });
@@ -4748,10 +4793,11 @@ impl App {
         native: crate::tab_model::NativeViewRef,
         recovery: Vec<crate::native_app::Command>,
     ) -> Result<(), String> {
-        let window = self
+        let mut route_guard_window = self
             .windows
             .get_mut(&wid)
             .ok_or_else(|| "blocked native close window disappeared".to_string())?;
+        let window = &mut **route_guard_window;
         let target = window
             .tab_set
             .get(tab)
@@ -4767,6 +4813,7 @@ impl App {
         if !focused {
             return Err("blocked native close view could not be focused".to_string());
         }
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.palette_enter_native_close_recovery(wid, native.instance, view, recovery)
     }
@@ -4973,6 +5020,7 @@ impl App {
         let removed = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.tab_set.active_mut())
             .map(|tab| {
                 let removed = tab.remove_view(view);
@@ -5000,10 +5048,10 @@ impl App {
         self.resize_panes_after_collapse(wid);
         // The tab was selected for its close only: the tab in front goes back before the sync.
         if let Some(keep) = keep.filter(|keep| *keep != tab_id)
-            && let Some(state) = self.windows.get_mut(&wid)
+            && let Some(mut state) = self.windows.get_mut(&wid)
             && state.tab_set.switch_to(keep)
         {
-            align_terminal_projection_to_active(state, &self.view_store);
+            align_terminal_projection_to_active(&mut state, &self.view_store);
         }
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
@@ -5034,11 +5082,13 @@ impl App {
             .ok_or_else(|| "the view could not take focus to close".to_string())?;
         // The leaf the person had focused keeps the focus the close borrowed.
         let focus = Some(focus).filter(|focus| *focus != view);
-        if let Some(state) = self.windows.get_mut(&wid)
-            && state.tab_set.switch_to(tab)
-            && let Some(target) = state.tab_set.active_mut()
-        {
-            let _ = target.set_focus(view);
+        if let Some(mut route_guard_state) = self.windows.get_mut(&wid) {
+            let state = &mut **route_guard_state;
+            if state.tab_set.switch_to(tab)
+                && let Some(target) = state.tab_set.active_mut()
+            {
+                let _ = target.set_focus(view);
+            }
         }
         let closed = if split {
             self.close_focused_mixed_leaf_keeping(wid, front, focus)
@@ -5074,17 +5124,17 @@ impl App {
         });
         if !asks
             && let Some(focus) = focus
-            && let Some(state) = self.windows.get_mut(&wid)
+            && let Some(mut state) = self.windows.get_mut(&wid)
             && let Some(index) = state.tab_set.tabs().iter().position(|t| t.id == tab)
             && let Some(target) = state.tab_set.tab_at_mut(index)
         {
             let _ = target.set_focus(focus);
         }
         if let Some(front) = front.filter(|front| *front != tab && !asks)
-            && let Some(state) = self.windows.get_mut(&wid)
+            && let Some(mut state) = self.windows.get_mut(&wid)
             && state.tab_set.switch_to(front)
         {
-            align_terminal_projection_to_active(state, &self.view_store);
+            align_terminal_projection_to_active(&mut state, &self.view_store);
         }
         self.resync_active_or_window(wid);
     }
@@ -5167,10 +5217,11 @@ impl App {
             })
             .collect::<Vec<_>>();
         let (tab, was_last, was_workers) = {
-            let ws = self
+            let mut route_guard_ws = self
                 .windows
                 .get_mut(&wid)
                 .ok_or_else(|| "unknown window".to_string())?;
+            let ws = &mut **route_guard_ws;
             let was_last = ws.tab_set.len() == 1;
             let was_workers = ws.tab_set.home() == Some(tab_id);
             let tab = ws
@@ -5213,11 +5264,11 @@ impl App {
         // A retiring leaf can hand the window to another tab (an `edit` view gives it to
         // its caller's tab): the kept tab goes back in front before the sync all the same.
         if let Some(keep) = keep.filter(|keep| *keep != tab_id)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
             && ws.tab_set.active_id() != Some(keep)
             && ws.tab_set.switch_to(keep)
         {
-            align_terminal_projection_to_active(ws, &self.view_store);
+            align_terminal_projection_to_active(&mut ws, &self.view_store);
         }
         if self.frontmost_window == Some(wid) {
             self.sync_active_session();
@@ -5385,7 +5436,8 @@ impl App {
         wid: WindowId,
         topology: ClosedReopenTopology,
     ) -> crate::tab_model::Tab {
-        let window = self.windows.get_mut(&wid).expect("preflighted window");
+        let mut route_guard_window = self.windows.get_mut(&wid).expect("preflighted window");
+        let window = &mut **route_guard_window;
         window.tab_set = topology.tab_set;
         window.layouts = topology.layouts;
         window.tabs = topology.tabs;
@@ -5428,19 +5480,22 @@ impl App {
             return;
         };
         let Some(tree) = rebuilt else {
-            if let Some(window) = self.windows.get_mut(&wid)
-                && projection < window.layouts.len()
-            {
-                window.layouts.remove(projection);
-                remove_terminal_projection(window, projection);
+            if let Some(mut route_guard_window) = self.windows.get_mut(&wid) {
+                let window = &mut **route_guard_window;
+                if projection < window.layouts.len() {
+                    window.layouts.remove(projection);
+                    remove_terminal_projection(window, projection);
+                }
             }
             return;
         };
-        if let Some(slot) = self
+        if let Some(route_guard_slot) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.layouts.get_mut(projection))
         {
+            let slot = &mut *route_guard_slot;
             *slot = tree;
         }
     }
@@ -5477,7 +5532,7 @@ impl App {
         let outcome = self
             .windows
             .get_mut(&window)
-            .map(|ws| ws.layouts[tab].close_pane(id));
+            .map(|mut ws| ws.layouts[tab].close_pane(id));
         match outcome {
             Some(o) => self.apply_close_outcome(window, tab, o),
             None => false,
@@ -5653,7 +5708,8 @@ impl App {
             });
             self.clear_strip_press(wid);
             self.settle_rename_edit(wid);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.strip_band_press = (!band_repeat).then_some(at);
             }
             #[cfg(windows)]
@@ -5665,18 +5721,19 @@ impl App {
                 }
             }
             #[cfg(target_os = "linux")]
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && let Some(frame) = ws.client_frame.filter(|frame| frame.header)
-            {
-                if band_repeat {
-                    ws.caption_move = None;
-                    if frame.maximize
-                        && let Some(w) = &ws.os_window
-                    {
-                        w.set_maximized(!frame.maximized);
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                if let Some(frame) = ws.client_frame.filter(|frame| frame.header) {
+                    if band_repeat {
+                        ws.caption_move = None;
+                        if frame.maximize
+                            && let Some(w) = &ws.os_window
+                        {
+                            w.set_maximized(!frame.maximized);
+                        }
+                    } else if ws.pointer_position_known {
+                        ws.caption_move = Some(ws.last_cursor_px);
                     }
-                } else if ws.pointer_position_known {
-                    ws.caption_move = Some(ws.last_cursor_px);
                 }
             }
             return;
@@ -5701,7 +5758,8 @@ impl App {
                     .inline_rename_edit(wid)
                     .map(|edit| edit.tab)
                     .is_some_and(|edited| Some(edited) == tab);
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.strip_press = tab.map(|tab| (at, tab));
                     ws.strip_band_press = None;
                     ws.strip_drag = match (repeat || editing_this, tab) {
@@ -5752,9 +5810,10 @@ impl App {
     }
 
     fn press_caption_button(&mut self, wid: WindowId, button: tab_bar::CaptionButton) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         match button {
             tab_bar::CaptionButton::Close => ws.caption_close = true,
             tab_bar::CaptionButton::Minimize => {
@@ -5794,7 +5853,7 @@ impl App {
         self.clear_strip_press(wid);
         self.settle_rename_edit(wid);
         if self.close_tab_at(wid, i)
-            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(mut ws) = self.windows.get_mut(&wid)
         {
             ws.pending_close = true;
         }
@@ -5802,7 +5861,8 @@ impl App {
 
     /// Break the strip's double-click streaks — the chip one AND the bare-band one.
     pub(crate) fn clear_strip_press(&mut self, wid: WindowId) {
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.strip_press = None;
             ws.strip_band_press = None;
             ws.strip_drag = None;
@@ -5881,15 +5941,16 @@ impl App {
         let highlight = keyboard
             .then(|| crate::tab_menu::first_selectable(&entries, entries.len()))
             .flatten();
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.tab_menu = Some(crate::tab_menu::TabMenu {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            ws.routing.set_menu(Some(crate::tab_menu::TabMenu {
                 tab,
                 index,
                 entries,
                 anchor_col,
                 highlight,
                 keyboard,
-            });
+            }));
             ws.scroll_residual = 0.0;
             ws.scroll_residual_x = 0.0;
             ws.tab_menu_rect = None;
@@ -5934,10 +5995,11 @@ impl App {
 
     /// Dismiss any open tab context menu on `wid`.
     pub(crate) fn close_tab_menu(&mut self, wid: WindowId) -> bool {
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
-        if ws.tab_menu.take().is_none() {
+        let ws = &mut **route_guard_ws;
+        if ws.routing.take_menu().is_none() {
             ws.tab_menu_rect = None;
             return false;
         }
@@ -6111,7 +6173,8 @@ impl App {
     /// Stash the current close gesture's attribution on window `wid` when a last-tab close is deferred.
     pub(crate) fn stash_deferred_close_attribution(&mut self, wid: WindowId) {
         let attribution = session_store::current_close_attribution();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.pending_close_attribution = Some(attribution);
         }
     }
@@ -6177,7 +6240,8 @@ impl App {
                 }
             }
             let mut front = None;
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 front = ws.tab_set.active_id().filter(|front| *front != tab_id);
                 ws.tab_set.switch_to(tab_id);
             }
@@ -6216,13 +6280,15 @@ impl App {
             self.stash_deferred_close_attribution(wid);
             return true;
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        let ws = &mut **route_guard_ws;
         let closing = ws.layouts.remove(projection_index);
         remove_terminal_projection(ws, projection_index);
         let stable_tab = ws.tab_set.remove(tab_id).expect("stable tab mirror exists");
         align_terminal_projection_to_active(ws, &self.view_store);
+        drop(route_guard_ws);
         self.remove_tab_views(&stable_tab);
         closing.visit_sessions(&mut |sid| {
             if self.detach_session_view(sid) {
@@ -6521,7 +6587,8 @@ impl App {
                 if canonical_last {
                     return true;
                 }
-                let Some((closing, stable_tab)) = self.windows.get_mut(&wid).map(|ws| {
+                let Some((closing, stable_tab)) = self.windows.get_mut(&wid).map(|mut ws| {
+                    let ws = &mut **ws;
                     let closing = ws.layouts.remove(tab);
                     remove_terminal_projection(ws, tab);
                     let removed = ws.tab_set.remove(stable_id);

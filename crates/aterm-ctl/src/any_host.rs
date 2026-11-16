@@ -423,7 +423,7 @@ impl Member {
     }
 
     /// How it falls short of `needs`, `None` where it meets them all: a checkout it lacks first,
-    /// then too little free space, then the first need its facts cannot say.
+    /// then too little disk free, then the first need its facts cannot say.
     fn short_of(&self, needs: &[Need]) -> Option<Short> {
         let judged: Vec<(&Need, Judged)> = needs.iter().map(|n| (n, self.judge(n))).collect();
         let lacks = |repo: bool| {

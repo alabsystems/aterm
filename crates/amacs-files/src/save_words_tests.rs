@@ -173,7 +173,7 @@ fn each_kind_says_its_own_thing() {
     for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
         assert!(
             write(AtomicSaveStage::WriteTemporary, kind, SaveTouch::Folder)
-                .contains("free some space"),
+                .contains("saving again retries it"),
             "{kind:?}"
         );
     }
@@ -394,4 +394,59 @@ fn each_face_names_itself() {
         }
     }
     assert!(named > 0, "some words name the program");
+}
+
+/// A FULL DISK SAYS WHAT IT COST, BY WHAT WAS BEING DONE: a save that stopped says the file was
+/// not saved, one whose file may have been replaced that the save was not confirmed, and an open
+/// that it was not opened, naming no save; a read before a save says what a save that stopped
+/// says. Each says doing it again retries it, and none tells anyone to free space, for a full
+/// disk and a used-up quota alike. NEGATIVE CONTROL: the words an open said before
+/// (`not saved; saving again retries it`) are caught by the check that an open names no save.
+#[test]
+fn a_full_disk_says_what_it_cost_the_save_or_the_open() {
+    let names_a_save = |said: &str| said.contains("sav");
+    assert!(
+        names_a_save("the disk is full \u{b7} not saved; saving again retries it"),
+        "the words an open said before are caught"
+    );
+    let path = path();
+    for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+        let cause = Some(SaveCause {
+            kind,
+            touch: SaveTouch::Folder,
+        });
+        let refused = DocumentHostError::Io {
+            stage: AtomicSaveStage::Preflight,
+            message: "could not read /Volumes/Shared/aterm/aterm.toml".to_string(),
+            kind: Some(kind),
+        };
+        let say = |failure: &Failure<'_>| words(Speaker::Amacs, &path, failure);
+        let stopped = say(&Failure::Write {
+            stage: AtomicSaveStage::WriteTemporary,
+            cause,
+        });
+        let unconfirmed = say(&Failure::Unconfirmed {
+            stage: AtomicSaveStage::SyncDirectory,
+            cause,
+        });
+        let opened = say(&Failure::Open(&refused));
+        assert!(
+            stopped.ends_with("not saved; saving again retries it"),
+            "{stopped}"
+        );
+        assert!(
+            unconfirmed.ends_with("the save wasn\u{2019}t confirmed; saving again retries it"),
+            "{unconfirmed}"
+        );
+        assert!(
+            opened.ends_with("not opened; opening it again retries it"),
+            "{opened}"
+        );
+        assert!(!names_a_save(&opened), "{opened}");
+        assert_eq!(say(&Failure::Read(&refused)), stopped, "{kind:?}");
+        for said in [&stopped, &unconfirmed, &opened] {
+            assert!(!said.contains("free"), "{said}");
+            assert!(problems(said, Some(kind)).is_empty(), "{said}");
+        }
+    }
 }

@@ -61,9 +61,15 @@ fn the_registry_is_in_the_harness_state_folder_and_a_relative_one_is_no_registry
         registry_from(None, Some(state.clone())),
         Some(state.join("harness/claude-harness/release-lines"))
     );
+    // An absolute path as this platform spells one: Windows reads `/elsewhere` as relative.
+    let elsewhere = if cfg!(windows) {
+        r"C:\elsewhere\harness"
+    } else {
+        "/elsewhere/harness"
+    };
     assert_eq!(
-        registry_from(Some("/elsewhere/harness".into()), Some(state.clone())),
-        Some(std::path::PathBuf::from("/elsewhere/harness/release-lines"))
+        registry_from(Some(elsewhere.into()), Some(state.clone())),
+        Some(std::path::Path::new(elsewhere).join("release-lines"))
     );
     // Negative controls: a relative override names no folder and is not replaced by the
     // default, and no state root is no registry.

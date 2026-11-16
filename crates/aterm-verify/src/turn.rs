@@ -154,12 +154,9 @@ fn binary_rows<'r>(parent: &str, rows: &[&'r Row]) -> Vec<&'r Row> {
 }
 
 /// Whether a run of `ctx`'s asks for the turn when it is heavy: the dev set, every check of it,
-/// as a development run (not a release's, a background sample's or a compile-only one).
+/// as a development run (not a release's or a compile-only one).
 pub(crate) fn asks(ctx: &crate::Ctx) -> bool {
-    !ctx.release
-        && !ctx.background
-        && !ctx.compile_only
-        && crate::checks::DEV.iter().all(|c| ctx.checks.contains(c))
+    !ctx.release && !ctx.compile_only && crate::checks::DEV.iter().all(|c| ctx.checks.contains(c))
 }
 
 /// The turn a heavy run holds ([`take`]) until it ends ([`Held::end`]).

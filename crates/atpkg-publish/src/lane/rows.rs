@@ -59,8 +59,8 @@ pub fn local(path: &Path) -> Result<PkgManifest> {
 pub enum Fetched {
     /// It verified: its rows, and where its bytes and signature landed.
     Present {
-        /// The client's reading of it.
-        manifest: PkgManifest,
+        /// The client's reading of it (boxed: it carries the harness record a client keeps).
+        manifest: Box<PkgManifest>,
         /// The downloaded manifest.
         path: PathBuf,
     },
@@ -158,7 +158,10 @@ fn fetch_with(
     };
     match quad.verify_pkg(&bytes, &signature) {
         Ok(manifest) if manifest.program == program && manifest.build_number == build => {
-            Fetched::Present { manifest, path }
+            Fetched::Present {
+                manifest: Box::new(manifest),
+                path,
+            }
         }
         Ok(manifest) => Fetched::Invalid(format!(
             "{pkg} on {slug} names {} build {}, not {program} build {build}",

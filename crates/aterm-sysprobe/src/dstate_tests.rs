@@ -15,6 +15,8 @@ struct Fake {
     list_ns: u64,
     cost_ns: BTreeMap<u32, u64>,
     stuck: BTreeSet<u32>,
+    /// The pids with more threads than a read takes.
+    cut: BTreeSet<u32>,
     start: BTreeMap<u32, u64>,
     now_ns: u64,
     reads: Vec<u32>,
@@ -37,6 +39,7 @@ impl Source for Fake {
         Read::Threads {
             threads: 4,
             uninterruptible: u32::from(self.stuck.contains(&pid)),
+            cut: self.cut.contains(&pid),
         }
     }
 
@@ -300,4 +303,36 @@ fn a_mark_is_reread_first_and_held_only_for_the_same_process() {
         held.marked.iter().any(|m| m.pid == 11 && m.again),
         "held within passes, not covers: {held:?}"
     );
+}
+
+/// A process with more threads than a read takes says so: one marked carries the cut on its mark
+/// (its count is at least), and one that showed none uninterruptible is counted as
+/// `cut_unmarked`, since it may hold one past the cut. CONTROL: a pass with no cut read counts
+/// none.
+#[test]
+fn a_thread_list_cut_at_the_cap_is_told_on_the_mark_and_the_pass() {
+    let source = || Fake {
+        pids: vec![10, 11, 12, 13],
+        stuck: BTreeSet::from([11, 13]),
+        ..Fake::default()
+    };
+    let mut whole = Census::new(source());
+    let p = whole.pass();
+    assert_eq!(p.cut_unmarked, 0);
+    assert!(p.marked.iter().all(|m| !m.cut), "{:?}", p.marked);
+
+    let mut census = Census::new(Fake {
+        cut: BTreeSet::from([10, 11]),
+        ..source()
+    });
+    let p = census.pass();
+    assert!(p.cover_done);
+    assert_eq!(p.cut_unmarked, 1, "pid 10: cut, none found");
+    let cut: Vec<(u32, bool)> = p.marked.iter().map(|m| (m.pid, m.cut)).collect();
+    assert_eq!(cut, [(11, true), (13, false)]);
+    // The next pass re-reads its marks first: a cut re-read is told the same way.
+    let p = census.pass();
+    assert_eq!(p.cut_unmarked, 1);
+    let cut: Vec<(u32, bool, bool)> = p.marked.iter().map(|m| (m.pid, m.cut, m.again)).collect();
+    assert_eq!(cut, [(11, true, true), (13, false, true)]);
 }

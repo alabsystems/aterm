@@ -128,6 +128,9 @@ pub struct LabView {
     pub accounts: BTreeMap<String, Account>,
     /// Live preferences on live machines, by machine key then rank.
     pub preferences: Vec<Preference>,
+    /// Every Mac's `account-obs` rows: which accounts its login files name, and when it last
+    /// said so ([`super::sighted`]), as [`Self::read_view`] found them in the registry view.
+    pub account_obs: Vec<super::sighted::Obs>,
     addresses: Projection,
     /// `addresses` by what each row's `addr` says now: how an address names its row.
     address_index: AddressIndex,
@@ -188,14 +191,20 @@ fn sort_preferences(preferences: &mut [Preference]) {
 }
 
 impl LabView {
-    /// Read canonical identities from the authenticated registry view.
+    /// Read canonical identities from the authenticated registry view, with every Mac's
+    /// `account-obs` rows as that view holds them.
     pub fn read_view(
         view: &crate::typed::View,
         facts: &OwnedRead,
         obs: &OwnedRead,
         me_uuid: Option<&str>,
     ) -> Self {
-        Self::read_projected(&view.cells, view.project(&MACHINE), facts, obs, me_uuid)
+        let mut lab =
+            Self::read_projected(&view.cells, view.project(&MACHINE), facts, obs, me_uuid);
+        if let Some(rows) = view.owned.get(registry::ACCOUNT_OBS.name) {
+            lab.account_obs = super::sighted::obs_rows(rows);
+        }
+        lab
     }
 
     /// Project `cells`, this Mac's facts row among `facts` at `me_uuid` (32 hex), and the
@@ -306,6 +315,7 @@ impl LabView {
             machines,
             accounts,
             preferences,
+            account_obs: Vec::new(),
             addresses,
             address_index,
             observed,

@@ -334,6 +334,11 @@ pub struct OpenerRoute {
     pub opener: PathBuf,
     /// Where the opener opens the page.
     pub page: OpenerPage,
+    /// Nobody started the capture: this Mac's upkeep did (plan package FL-138). In aterm's
+    /// window the opener is told so ([`super::open_url::UNATTENDED_ENV`]), and the window's code
+    /// page, where no mailbox it reads gives the code, ends the sign-in at once instead of
+    /// waiting for a person to type it.
+    pub unattended: bool,
     /// Where the opener records a sign-in that ended without authorizing
     /// ([`super::open_url::OUTCOME_ENV`]).
     pub outcome: PathBuf,
@@ -345,8 +350,8 @@ pub struct OpenerRoute {
 /// aterm's opener: the opener as its `BROWSER`, the grant of where it opens the page (the
 /// window's, [`super::open_url::WINDOW_ENV`], or the headless profile's,
 /// [`super::open_url::TOKEN_ENV`] with the row's label), the account to sign in as, the two
-/// files the opener answers in, and, for the window, the sign-in's trace file where the verb
-/// named one.
+/// files the opener answers in, and, for the window, the mark of a capture nobody started
+/// ([`OpenerRoute::unattended`]) and the sign-in's trace file where the verb named one.
 #[must_use]
 pub fn opener_env(
     route: &OpenerRoute,
@@ -355,7 +360,12 @@ pub fn opener_env(
 ) -> Vec<(&'static str, OsString)> {
     let mut env = vec![("BROWSER", route.opener.as_os_str().to_owned())];
     match &route.page {
-        OpenerPage::Window => env.push((super::open_url::WINDOW_ENV, OsString::from("1"))),
+        OpenerPage::Window => {
+            env.push((super::open_url::WINDOW_ENV, OsString::from("1")));
+            if route.unattended {
+                env.push((super::open_url::UNATTENDED_ENV, OsString::from("1")));
+            }
+        }
         OpenerPage::Headless { label } => {
             env.push((super::open_url::TOKEN_ENV, OsString::from("1")));
             if let Some(label) = label {

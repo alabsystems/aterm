@@ -256,6 +256,38 @@ fn a_runs_progress_is_the_newest_row_of_a_live_holder_of_its_version() {
     assert_eq!(newest_row(&lines[..1], "0.6.0"), None, "a dead holder");
 }
 
+/// THE SUPERSEDE CANDIDATE IS THE NEWEST COMMIT THE FOLLOWER PASSED. Of main's commits past a
+/// line's head, newest first, the first whose follower status is `success` is named; a
+/// failure, a pending judgment, an error and an unjudged commit are passed over, and a status
+/// that cannot be read names nothing. NEGATIVE CONTROL: a reader taking the newest verdict
+/// whatever its state would name c4, a red.
+#[test]
+fn the_newest_follower_success_is_the_candidate() {
+    let commits: Vec<String> = ["c6", "c5", "c4", "c3", "c2", "c1"]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let follower = |commit: &str| -> Result<Option<String>, String> {
+        Ok(match commit {
+            "c6" => None,
+            "c5" => Some("pending".into()),
+            "c4" => Some("failure".into()),
+            "c3" => Some("error".into()),
+            "c2" | "c1" => Some("success".into()),
+            _ => unreachable!("{commit}"),
+        })
+    };
+    assert_eq!(newest_pass_of(&commits, follower), Ok(Some("c2".into())));
+    assert_eq!(newest_pass_of(&commits[..4], follower), Ok(None));
+    let mut asked = Vec::new();
+    let down = newest_pass_of(&commits, |commit| {
+        asked.push(commit.to_string());
+        Err("GitHub did not answer".into())
+    });
+    assert_eq!(down, Err("GitHub did not answer".into()));
+    assert_eq!(asked, ["c6"], "an unread status ends the search");
+}
+
 /// THE INSTALLED PUMP IS AN INTERACTIVE, KEPT-ALIVE AGENT OF THE RELEASE CLONE. Its executable
 /// is the immutable copy, its working directory the clone, and its arguments the pump with the
 /// declaration it was installed with: never `--install`, `--once` or `--dry-run`, which would

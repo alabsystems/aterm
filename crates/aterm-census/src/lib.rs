@@ -17,9 +17,10 @@ pub mod known_issues;
 mod lex;
 pub mod no_reach;
 pub mod outline;
+pub mod release_notes;
 pub mod scan_set;
-pub mod seal;
 mod tree;
+pub mod vendor_names;
 mod workers;
 pub use guards::inline_test_module::{Unread, Unreadable, unread_at};
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
@@ -166,6 +167,11 @@ pub const CENSUSES: &[Census] = &[
         about: "main-thread reach to a frame wait; unbounded work under a held `term` guard \
                 (OB-2, OB-22, OB-23)",
         run: |root, _| run_mainloop_census(root),
+    },
+    Census {
+        name: "vendor-names",
+        about: "lines of non-test source naming an agent vendor, per crate (reported, no ceiling)",
+        run: |root, _| vendor_names::run_vendor_names_census(root),
     },
     Census {
         name: "guards",

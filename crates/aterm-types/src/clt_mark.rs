@@ -228,6 +228,45 @@ pub struct Claim {
     pub n: u64,
 }
 
+impl Claim {
+    /// The exact claim line an installer's child receipt carries, without a newline; `None`
+    /// where a line of the account's record cannot name this build.
+    #[must_use]
+    pub fn receipt_line(&self) -> Option<String> {
+        nameable(&self.asker.build).then(|| {
+            format!(
+                "claimed {} {} {} {} {}",
+                self.asker.build, self.asker.pid, self.asker.birth, self.at, self.n
+            )
+        })
+    }
+
+    /// The claim named by an installer's exact receipt line ([`Self::receipt_line`]); `None`
+    /// for a malformed, partial or differently spelled line, and for `unclaimed`.
+    #[must_use]
+    pub fn from_receipt_line(line: &str) -> Option<Self> {
+        let mut words = line.strip_prefix("claimed ")?.split(' ');
+        let claim = Self {
+            asker: Asker {
+                build: words.next()?.to_owned(),
+                pid: words.next()?.parse().ok()?,
+                birth: words.next()?.parse().ok()?,
+            },
+            at: words.next()?.parse().ok()?,
+            n: words.next()?.parse().ok()?,
+        };
+        (words.next().is_none() && claim.receipt_line().as_deref() == Some(line)).then_some(claim)
+    }
+
+    /// Whether the whole account record `text` still keeps this exact attempt among its asking
+    /// claims, even under a newer one. This reads no process lifetime and grants no custody of
+    /// a child: the caller must independently establish both.
+    #[must_use]
+    pub fn is_held_in(&self, text: &str) -> bool {
+        state(text).is_some_and(|kept| kept.asking.contains(self))
+    }
+}
+
 /// A number no other claim this process makes holds, and no claim another running process makes:
 /// the process id above a count of the claims made here.
 fn fresh() -> u64 {

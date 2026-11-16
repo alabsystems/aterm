@@ -246,7 +246,7 @@ fn cache_substitution_clears_even_identical_previous_body_provenance() {
         None,
         "local substitution cannot inherit even an exact-body earlier network token"
     );
-    assert_eq!(crate::client::stored(&paths, "shared").unwrap(), b"new");
+    assert_eq!(crate::client::stored(paths, "shared").unwrap(), b"new");
     lab.server.stop();
 }
 
@@ -352,7 +352,7 @@ fn f20_log_only_update_requires_a_real_body_to_record_the_new_materialization() 
     assert_eq!(cached.seq, before.seq);
     assert_eq!(cached.digest, before.digest);
     assert_ne!(cached.records_digest, before.records_digest);
-    assert_eq!(crate::client::stored(&reader, "shared").unwrap(), b"v2");
+    assert_eq!(crate::client::stored(reader, "shared").unwrap(), b"v2");
     let retained = cached.network_materialization.as_ref().unwrap();
     assert_eq!(retained.observation.sampled_at_ms, original_sample);
     assert_eq!(
@@ -394,6 +394,6 @@ fn f20_log_only_update_requires_a_real_body_to_record_the_new_materialization() 
     let current = observed(reader).expect("new actual body records the matching materialization");
     assert_eq!(current.source(), VaultNetworkSource::ConfiguredUrl);
     assert_eq!(current.sequence(), before.seq);
-    assert_eq!(crate::client::stored(&reader, "shared").unwrap(), b"v2");
+    assert_eq!(crate::client::stored(reader, "shared").unwrap(), b"v2");
     macs.server.stop();
 }

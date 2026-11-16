@@ -728,24 +728,23 @@ fn resolve_on_path_takes_the_first_executable_and_follows_the_shim() {
     assert!(describe_on_path(&got).contains("does NOT resolve"));
 }
 
-/// The build a version line names stops at the first `)`; a line with no
+/// Reported version normalization stops at the first `)`; a line with no
 /// parenthesis is compared whole.
 #[test]
-fn build_of_stops_at_the_commit_parenthesis() {
+fn reported_version_prefix_stops_at_the_commit_parenthesis() {
     assert_eq!(
-        build_of("targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)"),
+        reported_version_prefix("targo 1.99.0-dev (43f8b339f 2026-09-12) (targo 0.1.0)"),
         "targo 1.99.0-dev (43f8b339f 2026-09-12)"
     );
     assert_eq!(
-        build_of("targo 1.99.0-dev (43f8b339f 2026-09-12)"),
+        reported_version_prefix("targo 1.99.0-dev (43f8b339f 2026-09-12)"),
         "targo 1.99.0-dev (43f8b339f 2026-09-12)"
     );
-    assert_eq!(build_of(" targo 0.1.0 "), "targo 0.1.0");
+    assert_eq!(reported_version_prefix(" targo 0.1.0 "), "targo 0.1.0");
 }
 
-/// [`compare_toolchains`] over five shapes: one directory; one build in two toolchain
-/// directories; a matching line from a non-toolchain directory; two builds; and a probe that
-/// did not answer.
+/// [`compare_toolchains`] distinguishes directories, reported version prefixes and
+/// toolchain directory shape without inferring executable identity from version text.
 #[test]
 fn compare_toolchains_classifies_the_five_shapes() {
     fn side<'a>(dir: &'a str, ver: Option<&'a str>, toolchain_bin: bool) -> Side<'a> {
@@ -775,7 +774,7 @@ fn compare_toolchains_classifies_the_five_shapes() {
             side(view, Some(new), true),
             side(store, Some("targo 1.99.0-dev (43f8b339f 2026-09-12)"), true)
         ),
-        Agreement::SameBuild
+        Agreement::MatchingPrefix
     );
     assert_eq!(
         cmp(side(tree, Some(old), true), side(script, Some(old), false)),
@@ -787,11 +786,11 @@ fn compare_toolchains_classifies_the_five_shapes() {
     );
     assert_eq!(
         cmp(side(tree, Some(old), true), side(store, Some(new), true)),
-        Agreement::OtherBuild
+        Agreement::DifferentPrefix
     );
     assert_eq!(
         cmp(side(store, Some(old), true), side(store, Some(new), true)),
-        Agreement::OtherBuild
+        Agreement::DifferentPrefix
     );
     assert_eq!(
         cmp(side(tree, None, true), side(store, Some(new), true)),
@@ -803,8 +802,8 @@ fn compare_toolchains_classifies_the_five_shapes() {
     );
 }
 
-/// `is_toolchain_bin` separates ONE BUILD from a matching line: a `trustc` with a
-/// `lib/rustlib` sysroot above it, and nothing less.
+/// `is_toolchain_bin` observes directory shape only: an executable `trustc` with a
+/// `lib/rustlib` sysroot above it. Neither contents nor compiler identity is checked.
 #[cfg(unix)]
 #[test]
 fn a_toolchain_bin_needs_trustc_and_a_sysroot() {

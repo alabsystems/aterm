@@ -455,6 +455,10 @@ pub mod caps {
     pub const PLACE_ROW: usize = 512;
     /// A Mac's `upd` update record row.
     pub const UPD_ROW: usize = 2048;
+    /// A Mac's `login` row: one account's login there (`ai/logins`).
+    pub const LOGIN_ROW: usize = 768;
+    /// A Mac's `usage` row: its latest reading of one account's windows (`ai/usage`).
+    pub const USAGE_ROW: usize = 1024;
     /// One flush record's payload.
     pub const RECORD: usize = 60 * 1024;
     /// Buckets accounts fall into for relaying.

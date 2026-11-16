@@ -56,6 +56,89 @@ fn asker(build: &str, pid: i32) -> Asker {
     }
 }
 
+#[test]
+fn a_receipts_claim_is_exact_and_must_still_be_held_in_the_whole_record() {
+    let fixture = Claim {
+        asker: Asker {
+            build: "1.0.0+gfixture".to_owned(),
+            pid: 42,
+            birth: 700,
+        },
+        at: 800,
+        n: 900,
+    };
+    let line = "claimed 1.0.0+gfixture 42 700 800 900";
+    assert_eq!(fixture.receipt_line().as_deref(), Some(line));
+    assert_eq!(Claim::from_receipt_line(line), Some(fixture.clone()));
+    for malformed in [
+        "unclaimed",
+        "claimed 1.0.0+gfixture",
+        "claimed 1.0.0+gfixture 42 700 800",
+        "claimed 1.0.0+gfixture 42 700 800 900 1",
+        "claimed 1.0.0+gfixture 042 700 800 900",
+        "claimed 1.0.0+gfixture 42 +700 800 900",
+        "claimed 1.0.0+gfixture 42 700 800 18446744073709551616",
+        "claimed 1.0.0+gfixture  42 700 800 900",
+        "claimed 1.0.0+gfixture 42 700 800 900\n",
+    ] {
+        assert_eq!(Claim::from_receipt_line(malformed), None, "{malformed:?}");
+    }
+    for build in ["", "two words", &"x".repeat(BUILD_BYTES + 1)] {
+        let mut unnameable = fixture.clone();
+        unnameable.asker.build = build.to_owned();
+        assert_eq!(unnameable.receipt_line(), None);
+    }
+
+    let root = crate::test_scratch_dir("clt-receipt-claim");
+    let path = root.path().join(FILE);
+    let world = World::new();
+    let first = explicit(&world, &path, &fixture.asker, NOW).unwrap();
+    world.start(&first.asker);
+    let second = explicit(&world, &path, &asker("newer", 43), NOW + 1).unwrap();
+    let record = Live.read(&path, BYTES).unwrap().unwrap();
+    assert!(
+        first.is_held_in(&record),
+        "an older asking attempt still has its place"
+    );
+    assert!(second.is_held_in(&record));
+    for field in ["build", "pid", "birth", "at", "n"] {
+        let mut changed = first.clone();
+        match field {
+            "build" => changed.asker.build.push('x'),
+            "pid" => changed.asker.pid += 1,
+            "birth" => changed.asker.birth += 1,
+            "at" => changed.at += 1,
+            _ => changed.n += 1,
+        }
+        assert!(
+            !changed.is_held_in(&record),
+            "the complete {field} must match"
+        );
+    }
+    for wrong in [
+        format!("opened {}\n", first.asker.build),
+        format!("{record}extra\n"),
+        format!("{record}\n"),
+        String::new(),
+    ] {
+        assert!(!first.is_held_in(&wrong), "{wrong:?}");
+    }
+    assert!(
+        end(&world, &path, &first, End::Released, NOW + 2)
+            .unwrap()
+            .held()
+    );
+    let after = Live.read(&path, BYTES).unwrap().unwrap();
+    assert!(
+        !first.is_held_in(&after),
+        "an ended claim gives no authority"
+    );
+    assert!(
+        second.is_held_in(&after),
+        "another attempt keeps its own place"
+    );
+}
+
 /// Every end an attempt can have, as the next automatic asker reads it: a cut-off attempt
 /// (its asker gone with no end written: aterm quit or crashed, a reboot) and an
 /// unfinished one are asked again by themselves, the cut-off at once and the unfinished after

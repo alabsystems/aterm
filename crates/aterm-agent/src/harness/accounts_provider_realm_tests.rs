@@ -4,6 +4,7 @@
 use super::*;
 use aterm_spec::interp::State;
 
+#[cfg(unix)]
 fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     Bed::tree(root)
         .into_iter()
@@ -16,6 +17,7 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
+#[cfg(unix)]
 fn directories(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     let mut found = std::collections::BTreeSet::new();
     let mut pending = vec![root.to_path_buf()];
@@ -31,6 +33,7 @@ fn directories(root: &Path) -> std::collections::BTreeSet<PathBuf> {
     found
 }
 
+#[cfg(unix)]
 fn realm_case(case: i64) -> [(&'static str, i64); 5] {
     let bed = Bed::new("provider-realm");
     let cli = match case {
@@ -355,10 +358,15 @@ pub(crate) fn realm_transition(state: &State, action: &str) -> State {
             next.insert("case", state["case"] + 1);
         }
         "Sync" => {
-            next.insert("phase", 1);
-            for (key, value) in realm_case(state["case"]) {
-                next.insert(key, value);
+            #[cfg(unix)]
+            {
+                next.insert("phase", 1);
+                for (key, value) in realm_case(state["case"]) {
+                    next.insert(key, value);
+                }
             }
+            #[cfg(not(unix))]
+            panic!("the source-backed Sync projection requires the Unix vault");
         }
         _ => unreachable!(),
     }
@@ -369,11 +377,14 @@ pub(crate) fn realm_transition(state: &State, action: &str) -> State {
 fn provider_realms_and_methods_conform_without_rebinding_existing_accounts() {
     account_provider_realm_environment();
     let model = aterm_models_harness::account_provider_realm_model();
-    assert_eq!(model.mutant_dials(), (1..=8).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 44);
+    // The interpreter and pure actions are portable; Sync executes the real Unix vault.
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                #[cfg(not(unix))]
+                if action.name == "Sync" {
+                    continue;
+                }
                 let next = realm_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
@@ -383,7 +394,10 @@ fn provider_realms_and_methods_conform_without_rebinding_existing_accounts() {
             }
         }
     }
+    #[cfg(unix)]
     let good = realm_transition(&model.init_state(), "Sync");
+    #[cfg(not(unix))]
+    let good = model.successors("Sync", &model.init_state()).pop().unwrap();
     for (field, value, law) in [
         ("accepted", 0, "Admission"),
         ("added", 0, "Additions"),

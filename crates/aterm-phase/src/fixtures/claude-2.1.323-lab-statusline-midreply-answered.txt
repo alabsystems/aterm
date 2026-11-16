@@ -1,0 +1,30 @@
+# claude-code 2.1.323 · MEASURED 2026-11-12, `aterm ctl text` of a private headless aterm (144x50, aterm 0.200.0) in the real-Claude lab (crates/aterm-lab) running the real Claude Code by the lab's launcher under script(1), against the lab's local stub of the API, with the terminal answering its `OSC 7501 ; ?` · a command statusLine (`lab statusline`, printing `lab status line`) drawn under the composer, so the mode row says no `esc to interrupt`; the first turn failed on the stub's empty reply (`state=error:app=claude-code`), the second is a reply half drawn: the spinner row gone, two bullets up, no done row; the window title `Claude Code` with no glyph, and the report standing `state=working:app=claude-code`
+ ▐▛███▛█   Claude Code v2.1.323
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.DdWZ/proj
+
+
+❯ write the landing report
+
+⏺ Streaming response ended before any complete data was received. Retrying without streaming. If this keeps happening, check any proxy
+  or gateway between Claude Code and your model provider.
+
+⏺ API Error: API returned an empty or malformed response (HTTP 200) — check for a proxy or gateway intercepting the request. Response:
+  content-type none, empty body, 0 bytes, request-id absent, server other. This was the non-streaming retry of streaming request (no
+  Anthropic request-id), which failed with: no_events, StreamNoEventsError; 0 stream events received.
+
+✻ Brewed for 0s · done 11:03 PM
+
+❯ write the landing report
+
+⏺ Nothing left: placeholder words of the same shape and length as the reply line placeholder words of the same shape and length as the reply
+  line
+
+  - Checkout: placeholder words of the same shape and length as the reply line placeholder words of the same shape and length as the reply line
+  - Branches: placeholder words of the same shape and length as the reply line placeholder words of the same shape and length as the reply line
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab status line
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -224,7 +224,8 @@ impl App {
         let mut any_open = false;
         let mut ask: Option<(crate::WindowId, Option<String>)> = None;
         let mut front_ask: Option<(crate::WindowId, Option<String>)> = None;
-        for (&wid, ws) in &mut self.windows {
+        for (&wid, mut route_guard_ws) in &mut self.windows {
+            let ws = &mut **route_guard_ws;
             let Some(palette) = ws.palette_mut() else {
                 continue;
             };
@@ -476,6 +477,7 @@ impl App {
             any_person_hold,
             stats_bars: Some(self.stats_bars_form()),
             deck_size: Some(self.deck_size_pref()),
+            band_here: wid.is_some_and(|wid| self.window_carries_band(wid)),
             agents: self.agents_live(),
             staged,
             staged_trouble,
@@ -539,6 +541,7 @@ impl App {
                 .front()
                 .is_some_and(|ws| ws.fx.cursor().momentum.aos_attached()),
             aos_unseen: front.is_some_and(|wid| self.aos_unseen_on(wid)),
+            band_here: front.is_some_and(|wid| self.window_carries_band(wid)),
         });
         crate::menu::set_stats_bars_form(self.stats_bars_form());
         crate::menu::set_deck_size_pref(self.deck_size_pref());
@@ -553,12 +556,13 @@ impl App {
             .collect();
         for &wid in &touched {
             let live = self.palette_live_for_window(Some(wid));
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && let Some(p) = ws.palette_mut()
-            {
-                p.resolve(&live);
-                if let Some(w) = &ws.os_window {
-                    w.request_redraw();
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
+                if let Some(p) = ws.palette_mut() {
+                    p.resolve(&live);
+                    if let Some(w) = &ws.os_window {
+                        w.request_redraw();
+                    }
                 }
             }
         }
@@ -578,6 +582,7 @@ impl App {
         if let Some(palette) = self
             .windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|window| window.palette_mut())
         {
             palette.replace_native_commands(scope);
@@ -610,16 +615,18 @@ impl App {
 
     fn palette_open_state(&mut self, wid: crate::WindowId, state: PaletteState) {
         let mut opened = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.palette().is_none()
-        {
-            ws.overlay = Some(crate::overlay::Overlay::Palette(state));
-            ws.scroll_residual = 0.0;
-            ws.scroll_residual_x = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if ws.palette().is_none() {
+                ws.routing
+                    .set_overlay(Some(crate::overlay::Overlay::Palette(state)));
+                ws.scroll_residual = 0.0;
+                ws.scroll_residual_x = 0.0;
+                if let Some(w) = &ws.os_window {
+                    w.request_redraw();
+                }
+                opened = true;
             }
-            opened = true;
         }
         if opened {
             self.retire_native_input_in(wid);
@@ -662,16 +669,20 @@ impl App {
         });
         state.resolve(&self.palette_live_for_window(Some(wid)));
 
-        let window = self
+        let mut route_guard_window = self
             .windows
             .get_mut(&wid)
             .ok_or_else(|| "blocked native close window disappeared".to_string())?;
-        window.overlay = Some(crate::overlay::Overlay::Palette(state));
+        let window = &mut **route_guard_window;
+        window
+            .routing
+            .set_overlay(Some(crate::overlay::Overlay::Palette(state)));
         window.scroll_residual = 0.0;
         window.scroll_residual_x = 0.0;
         if let Some(os_window) = &window.os_window {
             os_window.request_redraw();
         }
+        drop(route_guard_window);
         self.retire_native_input_in(wid);
         self.settle_pointer_drags(wid);
         let _ = self.palette_claims_pointer(wid);
@@ -690,16 +701,17 @@ impl App {
 
     fn palette_exit_in(&mut self, wid: crate::WindowId) {
         let mut closed = false;
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && ws.palette().is_some()
-        {
-            ws.overlay = None;
-            ws.scroll_residual = 0.0;
-            ws.scroll_residual_x = 0.0;
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if ws.palette().is_some() {
+                ws.routing.set_overlay(None);
+                ws.scroll_residual = 0.0;
+                ws.scroll_residual_x = 0.0;
+                if let Some(w) = &ws.os_window {
+                    w.request_redraw();
+                }
+                closed = true;
             }
-            closed = true;
         }
         #[cfg(a11y_tree)]
         self.push_a11y_tree(wid);
@@ -742,7 +754,12 @@ impl App {
     }
 
     fn palette_move_in(&mut self, wid: crate::WindowId, delta: isize) {
-        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut()) {
+        if let Some(p) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.palette_mut())
+        {
             p.move_selection(delta);
         }
         self.palette_repaint_in(wid);
@@ -751,8 +768,10 @@ impl App {
     /// Append filter character `c` and re-filter the open palette.
     #[cfg(test)]
     pub(crate) fn palette_filter_push(&mut self, c: char) {
-        if let Some(p) = self.front_mut().and_then(|ws| ws.palette_mut()) {
-            p.push_char(c);
+        if let Some(mut window) = self.front_mut()
+            && let Some(palette) = window.palette_mut()
+        {
+            palette.push_char(c);
         }
         if let Some(wid) = self.frontmost_window {
             self.palette_repaint_in(wid);
@@ -863,10 +882,11 @@ impl App {
 
     fn palette_repaint_in(&mut self, wid: crate::WindowId) {
         self.sync_palette_pointer_cursor(wid);
-        if let Some(ws) = self.windows.get_mut(&wid)
-            && let Some(w) = &ws.os_window
-        {
-            w.request_redraw();
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some(w) = &ws.os_window {
+                w.request_redraw();
+            }
         }
         #[cfg(a11y_tree)]
         self.push_a11y_tree(wid);
@@ -881,7 +901,12 @@ impl App {
     }
 
     fn palette_edit_in(&mut self, wid: crate::WindowId, edit: crate::app_search::SearchEdit) {
-        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut()) {
+        if let Some(p) = self
+            .windows
+            .get_mut(&wid)
+            .as_deref_mut()
+            .and_then(|ws| ws.palette_mut())
+        {
             p.edit(edit);
         }
         self.palette_repaint_in(wid);

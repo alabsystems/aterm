@@ -8,10 +8,11 @@ use crate::tab_model::{SplitAxis, ViewId, VisibleLeafPlan};
 fn fixture() -> (App, WindowId, ViewId, ViewId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.cols = 140;
     window.rows = 40;
     window.scale = 2.0;
+    drop(window);
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
     app.dispatch_native_event(
         wid,

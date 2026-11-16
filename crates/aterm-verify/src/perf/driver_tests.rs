@@ -68,8 +68,10 @@ fn a_cached_workspace_plan_prepares_its_original_target_after_config_changes() {
     }
 }
 
+#[cfg(unix)]
 struct FailedLauncherFixture(Option<aterm_tempfile::TempDir>);
 
+#[cfg(unix)]
 impl Drop for FailedLauncherFixture {
     fn drop(&mut self) {
         if (std::thread::panicking()
@@ -87,6 +89,7 @@ impl Drop for FailedLauncherFixture {
     }
 }
 
+#[cfg(unix)]
 fn record_launcher_context(
     command: &aterm_uds::spawnfd::Command,
     driver: &CargoDriver,
@@ -134,6 +137,7 @@ fn record_launcher_context(
     .unwrap();
 }
 
+#[cfg(unix)]
 fn snapshot_launcher_metadata(root: &std::path::Path, launcher: &str) {
     let destination = root.join("launcher-evidence").join(launcher);
     for directory in ["target.noindex", "build.noindex"] {
@@ -166,6 +170,7 @@ fn snapshot_launcher_metadata(root: &std::path::Path, launcher: &str) {
     }
 }
 
+#[cfg(unix)]
 fn write_launcher_fixture(root: &std::path::Path) {
     std::fs::create_dir(root.join("src")).unwrap();
     std::fs::write(
@@ -194,6 +199,9 @@ fn main() { println!("cargo:rerun-if-changed=build.rs"); }
     .unwrap();
 }
 
+/// Unix-only: the runtime fixture is qualified under the bench helpers' environment
+/// (`bench_build::Targo`), which builds on unix only.
+#[cfg(unix)]
 #[test]
 fn nested_build_reuses_artifacts_across_launcher_metadata() {
     const TEST: &str =
@@ -372,4 +380,97 @@ fn the_lane_flag_goes_on_compiling_verbs_only() {
         "/s/targo --config build.build-dir='/w/target/build.noindex' --unverified build --release"
     );
     assert_eq!(d.display_led("metadata", dir, &[]), "/s/targo metadata");
+}
+
+#[test]
+fn a_lab_app_requires_positive_debug_profile_evidence_and_no_test_harness() {
+    let artifact = |profile: &str| {
+        format!(
+            "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"aterm\",\"kind\":[\"bin\"]}},\"executable\":\"/fixture/aterm\",\"profile\":{profile}}}"
+        )
+    };
+    let valid = artifact(r#"{"debug_assertions":true,"test":false}"#);
+    assert_eq!(
+        built_debug_app(&valid, "aterm").unwrap(),
+        PathBuf::from("/fixture/aterm")
+    );
+    for profile in [
+        r#"{"debug_assertions":false,"test":false}"#,
+        r#"{"debug_assertions":true,"test":true}"#,
+        r#"{"debug_assertions":true}"#,
+        r#"{"test":false}"#,
+        r#"{"debug_assertions":"true","test":false}"#,
+        r#"{"debug_assertions":false,"debug_assertions":true,"test":false}"#,
+    ] {
+        assert!(
+            built_debug_app(&artifact(profile), "aterm").is_err(),
+            "{profile}"
+        );
+    }
+    let release = artifact(r#"{"debug_assertions":false,"test":false}"#);
+    assert!(built_executable(&release, "aterm", "bin").is_ok());
+}
+
+#[test]
+fn conflicting_artifacts_do_not_select_a_measurement_executable() {
+    let artifact = |name: &str, kind: &str, path: &str| {
+        format!(
+            r#"{{"reason":"compiler-artifact","target":{{"kind":["{kind}"],"name":"{name}"}},"executable":"{path}"}}"#
+        )
+    };
+    let first = artifact("x", "bin", "/first");
+    let second = artifact("x", "bin", "/second");
+    for positive in [
+        first.clone(),
+        format!("{first}\n{first}"),
+        format!(
+            "{}\n{first}\n{}",
+            artifact("other", "bin", "/other"),
+            artifact("x", "example", "/example")
+        ),
+    ] {
+        assert_eq!(
+            built_executable(&positive, "x", "bin").unwrap(),
+            PathBuf::from("/first")
+        );
+    }
+    for conflicting in [format!("{first}\n{second}"), format!("{second}\n{first}")] {
+        assert!(built_executable(&conflicting, "x", "bin").is_err());
+    }
+}
+
+#[test]
+fn mixed_type_target_kinds_do_not_select_measurement_executables() {
+    let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
+    for kinds in [r#"["lib"]"#, r#"["rlib","lib"]"#] {
+        let positive = valid.replace(r#"["lib"]"#, kinds);
+        assert_eq!(
+            built_executable(&positive, "x", "lib").unwrap(),
+            PathBuf::from("/built/x")
+        );
+    }
+    for kinds in [r#"["lib",7]"#, r#"[null,"lib"]"#, r#"["lib",{}]"#] {
+        let malformed = valid.replace(r#"["lib"]"#, kinds);
+        for wire in [
+            malformed.clone(),
+            format!("{valid}\n{malformed}"),
+            format!("{malformed}\n{valid}"),
+        ] {
+            assert!(built_executable(&wire, "x", "lib").is_err(), "{kinds}");
+        }
+    }
+}
+
+#[test]
+fn ambiguous_compiler_artifacts_do_not_select_measurement_executables() {
+    let valid = r#"{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"x"},"profile":{"test":true},"executable":"/built/x"}"#;
+    assert_eq!(
+        built_executable(valid, "x", "lib").unwrap(),
+        PathBuf::from("/built/x")
+    );
+    for message in include_str!("../testdata/ambiguous-compiler-artifacts.jsonl").lines() {
+        for wire in [format!("{valid}\n{message}"), format!("{message}\n{valid}")] {
+            assert!(built_executable(&wire, "x", "lib").is_err(), "{message}");
+        }
+    }
 }

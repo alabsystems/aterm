@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`), decoded from bytes: Darwin's 64-bit interface counters, which [`crate::net_links`] reads on macOS.
+//! The routing socket's interface list (`sysctl {CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0}`).
+//! Its 64-bit ABI fields do not promise 64-bit byte totals: XNU's `rtsock.c` rounds bytes down
+//! to 1024 and truncates to 32 bits for non-platform binaries. Packets remain full-width.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -38,6 +40,10 @@ pub const IFRTYPE_FUNCTIONAL_WIRED: u32 = 2;
 pub const IFRTYPE_FUNCTIONAL_WIFI_INFRA: u32 = 3;
 /// `IFRTYPE_FUNCTIONAL_CELLULAR` (`net/if.h`).
 pub const IFRTYPE_FUNCTIONAL_CELLULAR: u32 = 5;
+/// `IFM_AVALID` (`net/if_media.h`), also `kIONetworkLinkValid`.
+pub const LINK_VALID: u64 = 1;
+/// `IFM_ACTIVE` (`net/if_media.h`), also `kIONetworkLinkActive`.
+pub const LINK_ACTIVE: u64 = 2;
 
 /// `struct if_data64`: 128 bytes at 4-byte alignment (`#pragma pack(4)`).
 #[repr(C, packed(4))]
@@ -159,6 +165,8 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ("IFF_UP", IFF_UP as i64),
     ("IFF_LOOPBACK", IFF_LOOPBACK as i64),
     ("IFF_RUNNING", IFF_RUNNING as i64),
+    ("IFM_AVALID", LINK_VALID as i64),
+    ("IFM_ACTIVE", LINK_ACTIVE as i64),
     ("SIOCGIFFUNCTIONALTYPE", SIOCGIFFUNCTIONALTYPE as i64),
     ("IFRTYPE_FUNCTIONAL_WIRED", IFRTYPE_FUNCTIONAL_WIRED as i64),
     (
@@ -323,6 +331,30 @@ pub fn link_kind(name: &str, functional: impl FnOnce() -> Option<u32>) -> LinkKi
     functional().map_or(by_name, |t| kind_of_functional(t, by_name))
 }
 
+/// A routing-list baudrate of `UINT32_MAX` is saturated, not a known link speed. Only an
+/// active, non-loopback interface asks its controller for the full-width rate; other
+/// positive routing-list rates, including rates above 32 bits, retain their value.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn link_rate(
+    link: &LinkReading,
+    controller: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if link.rate_bps != Some(u64::from(u32::MAX)) {
+        return link.rate_bps;
+    }
+    if !link.up || link.loopback || link.name.is_empty() || never_the_machines(&link.name) {
+        return None;
+    }
+    controller().filter(|rate| *rate > 0 && *rate != u64::from(u32::MAX))
+}
+
+/// The controller's current link must be valid and active before its speed is known.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn controller_rate(status: u64, rate: u64) -> Option<u64> {
+    let active = LINK_VALID | LINK_ACTIVE;
+    (status & active == active && rate > 0 && rate != u64::from(u32::MAX)).then_some(rate)
+}
+
 /// What one ask of the kernel answered ([`read_growing`]).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,8 +404,8 @@ pub(crate) fn read_growing(
 
 /// One interface's reading from its message header and name: up and
 /// running from `IFF_UP | IFF_RUNNING`, loopback from `IFF_LOOPBACK`, the
-/// rate where it is not zero, the send-queue drop count (a signed 32-bit
-/// `int` in the kernel, the one 32-bit counter) read unsigned, so it wraps
+/// raw rate where it is not zero (the native reader resolves saturation),
+/// the send-queue drop count (a signed 32-bit `int` in the kernel) read unsigned, so it wraps
 /// at 2³² rather than reading zero past 2³¹; the kind is the name's
 /// ([`kind_by_name`]) and `physical` is unknown.
 fn link_of(h: &IfMsghdr2, name: String) -> LinkReading {
@@ -387,6 +419,7 @@ fn link_of(h: &IfMsghdr2, name: String) -> LinkReading {
         loopback: h.ifm_flags & IFF_LOOPBACK != 0,
         physical: None,
         rate_bps: Some(d.ifi_baudrate).filter(|b| *b > 0),
+        byte_counter: crate::LinkByteCounter::DarwinModulo32,
         rx: LinkCounters {
             bytes: d.ifi_ibytes,
             packets: d.ifi_ipackets,

@@ -1024,7 +1024,7 @@ pub(crate) fn run_test(cmd: &Cmd, env: ExecEnv<'_>, hung_red: &(dyn Fn() + Sync)
 
 /// [`run_test`] with an injected live-capture opener, for the negative control that makes the
 /// real child block forever while monitoring initialization fails.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_test_opening(
     cmd: &Cmd,
     env: ExecEnv<'_>,
@@ -1538,24 +1538,31 @@ fn create_stage_log(path: &Path) -> io::Result<File> {
 }
 
 /// Make (or validate) the owner-private directory a hung binary's raw sample is retained in.
-/// A pre-existing symlink, foreign owner or group/world-accessible directory is refused by the
-/// shared private-file boundary before `/usr/bin/sample` is launched.
+/// On unix a pre-existing symlink, foreign owner or group/world-accessible directory is refused
+/// by the shared private-file boundary before `/usr/bin/sample` is launched. Off unix the
+/// directory is only made: that boundary is unix-only, and the live sampler
+/// (`aterm_uds::wait_sample::sample`, macOS's) refuses there before it writes anything.
 fn prepare_sample_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
     let made = {
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        builder.create(path)
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
     };
+    #[cfg(not(unix))]
+    let made = std::fs::create_dir(path);
     if let Err(error) = made
         && error.kind() != io::ErrorKind::AlreadyExists
     {
         return Err(error);
     }
-    aterm_uds::private_file::check_private_dir(path)
+    #[cfg(unix)]
+    {
+        aterm_uds::private_file::check_private_dir(path)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
 }
 
 /// Sample `pid` before its hung group is ended. The sampler's own one-minute detector is

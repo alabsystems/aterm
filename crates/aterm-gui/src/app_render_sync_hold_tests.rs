@@ -374,7 +374,7 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     let model = aterm_models_effects::composed_sync_hold_model();
 
     let held = update_sync_frame_holds(
-        app.windows.get_mut(&wid).expect("test window"),
+        &mut app.windows.get_mut(&wid).expect("test window"),
         &[
             pane_observation(11, true, 0, false),
             pane_observation(22, true, 0, false),
@@ -386,7 +386,7 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     let model_held = model.successors("ArmBoth", &model.init_state())[0].clone();
 
     let held = update_sync_frame_holds(
-        app.windows.get_mut(&wid).expect("test window"),
+        &mut app.windows.get_mut(&wid).expect("test window"),
         &[
             pane_observation(11, false, 1, false),
             pane_observation(22, true, 0, false),
@@ -405,7 +405,7 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     assert_ne!(held, flawed_aggregate_holds);
 
     let held = update_sync_frame_holds(
-        app.windows.get_mut(&wid).expect("test window"),
+        &mut app.windows.get_mut(&wid).expect("test window"),
         &[
             pane_observation(11, false, 1, false),
             pane_observation(22, false, 1, false),
@@ -424,10 +424,10 @@ fn unchanged_under_lock_sample_does_not_rehold_a_close_reopen_present() {
     let wid = WindowId(0);
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
 
     assert!(update_sync_frame_holds(
-        window,
+        &mut window,
         &[observation(true, 0, false)],
         t0,
         timeout,
@@ -435,7 +435,7 @@ fn unchanged_under_lock_sample_does_not_rehold_a_close_reopen_present() {
     let preflight = observation(true, 1, false);
     assert!(
         !update_sync_frame_holds(
-            window,
+            &mut window,
             &[preflight],
             t0 + Duration::from_millis(16),
             timeout,
@@ -444,7 +444,7 @@ fn unchanged_under_lock_sample_does_not_rehold_a_close_reopen_present() {
     );
     assert!(
         !recheck_sync_frame_hold(
-            window,
+            &mut window,
             preflight,
             preflight,
             t0 + Duration::from_millis(16),
@@ -464,7 +464,7 @@ fn unchanged_under_lock_sample_does_not_rehold_a_close_reopen_present() {
         "the next episode remains armed without being consumed"
     );
     assert!(update_sync_frame_holds(
-        window,
+        &mut window,
         &[preflight],
         t0 + Duration::from_millis(32),
         timeout,
@@ -477,10 +477,10 @@ fn extraction_recheck_revokes_clean_reopen_when_new_episode_became_dirty() {
     let wid = WindowId(0);
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
 
     assert!(update_sync_frame_holds(
-        window,
+        &mut window,
         &[observation(true, 0, false)],
         t0,
         timeout,
@@ -488,7 +488,7 @@ fn extraction_recheck_revokes_clean_reopen_when_new_episode_became_dirty() {
     let preflight = observation(true, 1, false);
     assert!(
         !update_sync_frame_holds(
-            window,
+            &mut window,
             &[preflight],
             t0 + Duration::from_millis(16),
             timeout,
@@ -497,7 +497,7 @@ fn extraction_recheck_revokes_clean_reopen_when_new_episode_became_dirty() {
     );
     assert!(
         recheck_sync_frame_hold(
-            window,
+            &mut window,
             preflight,
             observation(true, 1, true),
             t0 + Duration::from_millis(16),
@@ -513,17 +513,17 @@ fn duplicate_views_transition_one_terminal_hold_only_once() {
     let wid = WindowId(0);
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
 
     assert!(update_sync_frame_holds(
-        window,
+        &mut window,
         &[observation(true, 0, false), observation(true, 0, false)],
         t0,
         timeout,
     ));
     assert!(
         !update_sync_frame_holds(
-            window,
+            &mut window,
             &[observation(true, 1, false), observation(true, 1, false)],
             t0 + Duration::from_millis(16),
             timeout,
@@ -539,17 +539,22 @@ fn one_pane_recheck_cannot_clear_a_sibling_hold_gauge() {
     let wid = WindowId(0);
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
-    let window = app.windows.get_mut(&wid).expect("test window");
+    let mut window = app.windows.get_mut(&wid).expect("test window");
     let observations = [
         pane_observation(11, true, 0, false),
         pane_observation(22, true, 0, false),
     ];
 
-    assert!(update_sync_frame_holds(window, &observations, t0, timeout,));
+    assert!(update_sync_frame_holds(
+        &mut window,
+        &observations,
+        t0,
+        timeout,
+    ));
     assert!(window.sync_holding_gauge.is_held_for_test());
     assert!(
         !recheck_sync_frame_hold(
-            window,
+            &mut window,
             observations[0],
             pane_observation(11, false, 1, false),
             t0 + Duration::from_millis(1),

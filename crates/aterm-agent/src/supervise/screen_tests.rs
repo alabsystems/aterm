@@ -255,6 +255,44 @@ fn the_title_is_read_and_its_absence_says_nothing() {
     );
 }
 
+/// `"program_report"`: a string is the program-status report standing, as the body that says it;
+/// `null` (none stands), an older host's (or a tape's) reply without the key, and a value that
+/// is no string say nothing, and none moves another field.
+#[test]
+fn the_program_report_is_read_and_its_absence_says_nothing() {
+    let with = |tail: &str| {
+        parse_text_json(&format!(
+            r#"OK 1
+{{"rows":["⏺ streaming"],"cursor":{{"row":0,"col":2}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15","title":"Claude Code"{tail},"human_ms":null,"human_seq":3,"launch":null}}"#
+        ))
+        .expect("parses")
+    };
+    let sent = with(r#","program_report":"state=working:app=claude-code""#);
+    assert_eq!(
+        sent.program_report.as_deref(),
+        Some("state=working:app=claude-code")
+    );
+    let absent = with("");
+    assert_eq!(absent.program_report, None, "an older host sends none");
+    for none in [
+        r#","program_report":null"#,
+        r#","program_report":7"#,
+        r#","program_report":["state=working"]"#,
+    ] {
+        let read = with(none);
+        assert_eq!(read.program_report, None, "{none:?}");
+        assert_eq!(read, absent, "{none:?}: nothing else moves");
+    }
+    assert_eq!(
+        Screen {
+            program_report: None,
+            ..sent
+        },
+        absent,
+        "the report is the only field it adds"
+    );
+}
+
 /// `"human_typed_ms"`: a number is the age of the person's last typing and `null` is none,
 /// apart from `"human_ms"`; absent, the window reports one stamp, which both read.
 #[test]

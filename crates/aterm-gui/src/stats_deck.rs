@@ -250,7 +250,9 @@ impl crate::App {
     }
 
     /// What deck sized window `wid`'s carried frame, `carried_h` px tall, for its carried
-    /// `rows`×`cols` grid under a `head_pts` titlebar band at `scale` ([`carried_deck`]).
+    /// `rows`×`cols` grid under a `head_pts` titlebar band at `scale` ([`carried_deck`]), in the
+    /// window's own form ([`Self::window_bars`]): a window that does not carry the band finds no
+    /// deck for a frame the band sized, and one that carries it none for a frame sized without.
     pub(crate) fn carried_deck_of(
         &self,
         wid: crate::WindowId,
@@ -259,11 +261,13 @@ impl crate::App {
         (rows, cols): (u16, u16),
         carried_h: u32,
     ) -> Option<CarriedDeck> {
-        let bars = self.stats_bars_form();
+        let bars = self.window_bars(wid);
         let (_, cell_h) = self.win_cell_size(wid);
         let band = band_px(head_pts, scale);
+        // The frame less the head it was sized under: the window's own, whichever window the
+        // renderer drew last.
         let bare = u64::from(self.window_frame_px_for(wid, rows, cols).height)
-            .saturating_sub(self.backend.head() as u64);
+            .saturating_sub(self.win_head(wid) as u64);
         carried_deck(
             carried_h,
             cell_h,
@@ -273,7 +277,8 @@ impl crate::App {
     }
 
     /// Window `wid`'s chrome head in device pixels for a `head_pts` titlebar band at `scale`,
-    /// its deck's form first decided from the size setting ([`plan::deck_form_for`]) where
+    /// in the window's own form ([`Self::window_bars`]: the band only where the window carries
+    /// it), its deck's form first decided from the size setting ([`plan::deck_form_for`]) where
     /// `frame_h_px` is a frame's height (0 keeps the form).
     pub(crate) fn deck_head_px(
         &mut self,
@@ -282,11 +287,11 @@ impl crate::App {
         scale: f64,
         frame_h_px: u32,
     ) -> usize {
-        let form = self.stats_bars_form();
+        let form = self.window_bars(wid);
         let pref = self.deck_size_pref();
         let (_, cell_px) = self.win_cell_size(wid);
         let deck = match self.windows.get_mut(&wid) {
-            Some(ws) => {
+            Some(mut ws) => {
                 if frame_h_px > 0 {
                     ws.deck_form = plan::deck_form_for(pref);
                 }
@@ -300,7 +305,7 @@ impl crate::App {
     /// The Deck's height in window `wid`'s head when it draws there, in the window's own form
     /// and at its own cell height, as the head sites count it.
     pub(crate) fn deck_drawn_px(&self, wid: crate::WindowId) -> usize {
-        let form = self.stats_bars_form();
+        let form = self.window_bars(wid);
         let Some(ws) = self.windows.get(&wid) else {
             return 0;
         };
@@ -365,6 +370,8 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) network_place: Option<&'a crate::network_deck::PlaceCaption>,
     /// Stable machine/service selected in the network close-up.
     pub(crate) network_target: crate::network_deck::Target,
+    /// The span the Disk close-up's used-space chart draws (Tab).
+    pub(crate) disk_span: crate::stats_lens::DiskSpan,
     /// The lab's account rows ([`crate::lab_deck`]), drawn on the network band's Shared State
     /// line; absent where the network band is.
     pub(crate) lab: Option<&'a crate::lab_deck::LabDeck>,
@@ -1051,7 +1058,7 @@ struct Table {
     under: Option<Col>,
     details: Option<Col>,
     /// Whether the table's Details say the glance's clauses (§6.8): Full wide and mid, as the
-    /// refined sketches drew them, and every Folded tier (the form every window draws unless
+    /// refined sketches drew them, and every Folded tier (the form the Deck takes unless
     /// Full is chosen). Full narrow and slim say the clauses before it.
     glance: bool,
     /// The well mark's size.
@@ -3356,7 +3363,7 @@ impl crate::App {
     }
 
     pub(crate) fn deck_frame(&self, wid: crate::WindowId) -> Option<DeckFrame> {
-        let form = self.stats_bars_form();
+        let form = self.window_bars(wid);
         if form == StatsBars::Off {
             return None;
         }
@@ -3451,7 +3458,7 @@ impl crate::App {
                     dwc,
                     deck: ws.deck_form,
                     contrast,
-                    live: DeckLive::STILL,
+                    live: self.deck_live_now(wid).0,
                     needle: None,
                 })
             }
@@ -3558,6 +3565,7 @@ impl crate::App {
             network: (f.form == StatsBars::Deck).then_some(self.network_snapshot.as_ref()),
             network_place: f.network_place.as_ref(),
             network_target: crate::network_deck::Target::Overview,
+            disk_span: crate::stats_lens::DiskSpan::Day,
             lab: (f.form == StatsBars::Deck).then_some(self.lab_deck.as_ref()),
             fleet: (f.form == StatsBars::Deck)
                 .then_some(self.fleet_field.as_deref())
@@ -3670,7 +3678,8 @@ impl crate::App {
     pub(crate) fn splice_stats_deck(&mut self, wid: crate::WindowId) {
         self.splice_stats_lens(wid);
         let Some(f) = self.deck_frame(wid) else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.deck_card = None;
                 ws.deck_fold = None;
                 ws.stats_hits.borrow_mut().clear();
@@ -3702,9 +3711,10 @@ impl crate::App {
             None => self.deck_layout(wid, &f, (base, key)),
         };
         let fp = self.windows.get(&wid).map_or(0, |ws| ws.deck_memo.get().1);
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let (card_base, card_live) = ws.deck_live_card.get();
         if let Some(card) = ws.deck_card.as_mut()
             && card.fp == fp
@@ -3714,6 +3724,7 @@ impl crate::App {
             return;
         }
         if let Some(card) = ws.deck_card.as_mut()
+            && f.form == StatsBars::Deck
             && card_base == base
             && card.dy == f.dy
             && let Some(rows) = patch_live_rows(
@@ -3759,9 +3770,10 @@ impl crate::App {
     /// present (the backends take one tray surface), cached by the cards' identities.
     pub(crate) fn fold_stats_deck(&mut self, wid: crate::WindowId) {
         use std::hash::{Hash, Hasher};
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let ws = &mut **route_guard_ws;
         let top = ws
             .route_card
             .as_ref()
@@ -4085,12 +4097,26 @@ impl crate::App {
                 }),
             });
         let mut group = stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc);
-        for (name, words) in crate::network_deck::meters(
-            &self.network_snapshot,
-            &self.lab_deck,
-            self.fleet_field.as_deref(),
-            (f.geom.w, f.geom.scale),
-        ) {
+        // The Network State band's meters are read where it is drawn: in the Deck (a window
+        // that carries the System Resources band) or under this window's open Network State
+        // card. A window that shows the Sill draws no such band.
+        let band_read = f.form == StatsBars::Deck
+            || self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.stats_lens.open)
+                .is_some_and(|lens| lens.focus == Instrument::NetworkState);
+        let band_meters = if band_read {
+            crate::network_deck::meters(
+                &self.network_snapshot,
+                &self.lab_deck,
+                self.fleet_field.as_deref(),
+                (f.geom.w, f.geom.scale),
+            )
+        } else {
+            Vec::new()
+        };
+        for (name, words) in band_meters {
             group.meters.push(crate::a11y_tree::StatsMeter {
                 name,
                 value: None,

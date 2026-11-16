@@ -3,6 +3,14 @@
 
 //! Content-agnostic tab, view, and split-tree identities and logical-pixel split geometry.
 
+pub use crate::title_authority::{
+    TitleAuthority, TitleIdentity, TitleLease, TitleOwner, TitleRevision,
+};
+#[cfg(any(test, debug_assertions))]
+pub use crate::title_authority::{
+    with_title_binding_replacement_fault, with_title_membership_fault,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
@@ -1438,6 +1446,7 @@ pub enum TabIconKind {
     Editor,
     Recovery,
     Workers,
+    Tables,
 }
 
 /// What kind of surface a tab's icon stands for: its session's terminal, or an application of aterm's own.
@@ -1449,7 +1458,7 @@ pub enum TabSurface {
 
 impl TabIconKind {
     /// Every kind, for the sweeps that must cover them all.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Mail,
         Self::Codex,
         Self::About,
@@ -1459,6 +1468,7 @@ impl TabIconKind {
         Self::Editor,
         Self::Recovery,
         Self::Workers,
+        Self::Tables,
     ];
 
     /// The surface this icon stands for. `Codex` names a program in a terminal, so an icon's presence never means an application: a new kind answers here.
@@ -1474,7 +1484,8 @@ impl TabIconKind {
             | Self::Markdown
             | Self::Editor
             | Self::Recovery
-            | Self::Workers => TabSurface::App,
+            | Self::Workers
+            | Self::Tables => TabSurface::App,
         }
     }
 
@@ -1492,6 +1503,7 @@ impl TabIconKind {
             Self::Editor => "editor",
             Self::Recovery => "recovery",
             Self::Workers => "workers",
+            Self::Tables => "tables",
         }
     }
 
@@ -1509,6 +1521,7 @@ impl TabIconKind {
             Self::Editor => "Editor",
             Self::Recovery => "Recovery",
             Self::Workers => "Workers",
+            Self::Tables => "Tables",
         }
     }
 }
@@ -1877,6 +1890,7 @@ pub struct TabSet {
     home: Option<TabId>,
     revision: MutationRevision,
     focused_views: OnceLock<HashSet<ViewId>>,
+    title_owner: TitleOwner,
     #[cfg(any(test, debug_assertions))]
     focused_view_visits: AtomicUsize,
 }
@@ -1900,6 +1914,7 @@ impl Clone for TabSet {
             home: self.home,
             revision: MutationRevision::default(),
             focused_views: self.focused_views.clone(),
+            title_owner: TitleOwner::default(),
             #[cfg(any(test, debug_assertions))]
             focused_view_visits: AtomicUsize::new(0),
         }
@@ -1951,6 +1966,7 @@ impl TabSet {
             home: None,
             revision: MutationRevision::default(),
             focused_views: OnceLock::new(),
+            title_owner: TitleOwner::default(),
             #[cfg(any(test, debug_assertions))]
             focused_view_visits: AtomicUsize::new(0),
         }
@@ -2035,25 +2051,45 @@ impl TabSet {
         self.revision.changed();
     }
 
+    /// Custody identity used by the window ownership boundary; no tab snapshot is taken.
+    #[must_use]
+    pub fn title_owner(&self) -> TitleIdentity {
+        self.title_owner.identity()
+    }
+
+    /// Issue custody only through mutable payload access; shared identities carry no power.
+    #[must_use]
+    pub fn bind_title_owner(&mut self, owner: u64, authority: &TitleAuthority) -> TitleLease {
+        self.title_owner.bind(owner, authority)
+    }
+
     fn membership_changed(&mut self) {
+        self.title_owner.membership_changed();
         self.changed();
         self.focused_views.take();
     }
 
     /// Whether any tab focuses `view`, regardless of which tab is active or parked.
     pub fn contains_focused_view(&self, view: ViewId) -> bool {
-        self.focused_views
-            .get_or_init(|| {
-                self.tabs
-                    .iter()
-                    .map(|tab| {
-                        #[cfg(any(test, debug_assertions))]
-                        self.focused_view_visits.fetch_add(1, Ordering::Relaxed);
-                        tab.focus
-                    })
-                    .collect()
-            })
-            .contains(&view)
+        self.focused_view_index().contains(&view)
+    }
+
+    /// The canonical focused membership, including parked and background tabs.
+    pub fn focused_views(&self) -> impl Iterator<Item = ViewId> + '_ {
+        self.focused_view_index().iter().copied()
+    }
+
+    fn focused_view_index(&self) -> &HashSet<ViewId> {
+        self.focused_views.get_or_init(|| {
+            self.tabs
+                .iter()
+                .map(|tab| {
+                    #[cfg(any(test, debug_assertions))]
+                    self.focused_view_visits.fetch_add(1, Ordering::Relaxed);
+                    tab.focus
+                })
+                .collect()
+        })
     }
 
     /// The number of tabs visited to build focused-view membership since the previous read.

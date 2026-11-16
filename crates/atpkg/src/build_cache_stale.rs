@@ -150,8 +150,7 @@ pub struct Survey {
     /// [`Used::began_ms`]), no later than its record was written; `None` where it carries no
     /// record, one unread, or one that keeps no run.
     pub began: Option<SystemTime>,
-    /// The packages the kept runs built tests of ([`Used::members`]), together: the workspace's
-    /// own.
+    /// The workspace's own packages the kept runs built ([`Used::members`]), together.
     pub members: BTreeSet<String>,
     /// When the run that last ended in the build directory began ([`Kept::retired`], its
     /// [`Used::began_ms`]), no later than its record was written: a unit it retired
@@ -268,7 +267,7 @@ pub enum Part {
 /// ([`Kept::runs`]; a scope is what a run was asked to check, so a scoped run replaces only its
 /// own scope's), at most [`KEPT_RUNS`] of them and none begun more than [`KEPT_FOR`] before the
 /// run that ended last, and the units that run retired ([`Kept::retired`]). Of each run it holds
-/// when it began, the packages it built tests of (the workspace's own), and the units of each
+/// when it began, the workspace's own packages it built ([`Used::members`]), and the units of each
 /// profile its compile calls reported as their outputs, fresh or built, the bins they copied into
 /// the target directory and the build scripts they ran among them ([`Used`]). A unit of one of
 /// those packages that no kept run names, of a kind a kept run names another unit of, is a build
@@ -313,14 +312,17 @@ pub const KEPT_FOR: Duration = RECLAIM_STALE;
 /// each kept run. A longer one is not read, and supersedes nothing.
 const USED_MAX: usize = 16 << 20;
 
-/// The units a run used, by profile, the packages it built tests of, and when it began ([`USED`]).
+/// The units a run used, by profile, the workspace's own packages it built, and when it began
+/// ([`USED`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Used {
     /// When the run began, milliseconds since the epoch: a unit written since is one some compile
     /// of it built. `0` (the default) supersedes nothing.
     pub began_ms: u64,
-    /// The packages it built tests of, as the build directory names them: the workspace's own,
-    /// which alone it supersedes units of.
+    /// The workspace's own packages it built, as the build directory names them, which alone it
+    /// supersedes units of: each it built tests of, and where its writer knew the workspace's
+    /// members by name, each of them it built anything of (`aterm-verify` names them for a
+    /// cell's calls, whose lint builds no test).
     pub members: BTreeSet<String>,
     /// Each profile, by its path below the build directory (`debug`, `aarch64-apple-darwin/debug`),
     /// and the hashes of its units the run used.
@@ -688,11 +690,11 @@ pub struct Doomed {
 /// Where that build is the current one, a profile with no unit written since keeps every unit:
 /// nothing there says which compiler is current. And where the build directory's check runs
 /// named the units they used ([`USED`], [`Survey::began`]), every unit of the profile of a
-/// package a kept run built tests of ([`Survey::members`]) that no kept run uses, of a package
-/// and kind ([`Unit::kind`]) a kept run uses another unit of ([`Part::Superseded`]): one the run
-/// that ended last retired ([`Profile::retired`]) where nothing wrote it since that run began
-/// ([`Survey::retired_before`]), whatever `after`; any other where nothing wrote it since the
-/// oldest kept run began nor for `after`.
+/// package of the workspace's own a kept run built ([`Survey::members`]) that no kept run uses,
+/// of a package and kind ([`Unit::kind`]) a kept run uses another unit of
+/// ([`Part::Superseded`]): one the run that ended last retired ([`Profile::retired`]) where
+/// nothing wrote it since that run began ([`Survey::retired_before`]), whatever `after`; any
+/// other where nothing wrote it since the oldest kept run began nor for `after`.
 #[must_use]
 pub fn decide(survey: &Survey, now: SystemTime, after: Duration) -> Vec<Doomed> {
     let stale = |at| stale_at(at, now, after);

@@ -11,7 +11,8 @@ use aterm_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// `None` is the initial, implicitly live period; other periods name a signed reactivation.
+/// `None` is the initial, implicitly live period; other periods name a signed reactivation, or
+/// a live lifecycle origin a carry held with no proof of its period ([`Activity::read`]).
 pub(super) type Epochs = BTreeSet<Option<Digest>>;
 
 pub(super) fn decode_epochs(value: &Value) -> Option<Epochs> {
@@ -283,19 +284,29 @@ impl Activity {
                 } else if !live {
                     Some(Arc::new(Epochs::new()))
                 } else if !reverted && cell::carried_refs(value).is_some() {
-                    let mut epochs = Some(Epochs::new());
-                    for item in value["k"].as_array().unwrap() {
-                        let origin = super::claim::digest(&item["o"]).unwrap();
-                        let known = match out.proofs.get(&(pk.clone(), origin)) {
-                            Some(Proof::Known(known)) if !known.is_empty() => Some(known),
-                            _ => None,
-                        };
-                        epochs = epochs.zip(known).map(|(mut all, next)| {
-                            all.extend(next.iter().copied());
-                            all
-                        });
-                    }
-                    epochs.map(Arc::new)
+                    let items = value["k"].as_array().unwrap();
+                    items
+                        .iter()
+                        .try_fold(Epochs::new(), |mut all, item| {
+                            let origin = super::claim::digest(&item["o"]).unwrap();
+                            match out.proofs.get(&(pk.clone(), origin)) {
+                                Some(Proof::Known(known)) if !known.is_empty() => {
+                                    all.extend(known.iter().copied());
+                                }
+                                // A carry with no proof (0.199.0's roll wrote no claim context)
+                                // names no period, yet the row was live in one: it is known
+                                // here by the carried origin. A claim written in it keeps its
+                                // tenure, and so does a later carry of that claim with that
+                                // period; a carried claim with no period of its own stays
+                                // unknown (`Causality::origin_epochs`).
+                                Some(Proof::Unknown) => {
+                                    all.insert(Some(origin));
+                                }
+                                _ => return None,
+                            }
+                            Some(all)
+                        })
+                        .map(Arc::new)
                 } else if prior.state.live
                     && prior
                         .state

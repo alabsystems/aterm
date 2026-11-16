@@ -43,21 +43,17 @@ fn claim_job(world: &Path, seat: &Seat<'_>) -> Held {
 }
 
 fn wait_ready(world: &Path, finished: impl Fn() -> bool) {
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "actual headless worker ready",
-        || {
-            if world.join("ready").exists() {
-                return Some(());
-            }
-            assert!(
-                !finished(),
-                "worker ended before readiness: {}",
-                std::fs::read_to_string(world.join("compiler.log")).unwrap_or_default()
-            );
-            None
-        },
-    );
+    aterm_spec::wait::until_while_descendants_work("actual headless worker ready", || {
+        if world.join("ready").exists() {
+            return Some(());
+        }
+        assert!(
+            !finished(),
+            "worker ended before readiness: {}",
+            std::fs::read_to_string(world.join("compiler.log")).unwrap_or_default()
+        );
+        None
+    });
 }
 
 #[test]
@@ -352,8 +348,12 @@ fn run_actor(mode: &str) {
     if mode == "foreground" {
         command.env(STOP, "1");
     }
-    let output =
-        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_spec::wait::MUST_HAPPEN,
+        format!("headless host actor {mode}"),
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",

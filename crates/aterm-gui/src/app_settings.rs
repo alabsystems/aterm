@@ -273,7 +273,7 @@ impl App {
             self.visit_settings_tabs_in_window(wid, |_, _, _, view| {
                 holds_changed |= changed.contains(&view);
             });
-            if holds_changed && let Some(window) = self.windows.get_mut(&wid) {
+            if holds_changed && let Some(mut window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(window) = &window.os_window {
                     window.request_redraw();
@@ -460,13 +460,13 @@ impl App {
             self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
         }
         for (wid, view) in views {
-            let changed = match self.native_runtime.view_state_mut(view) {
+            let changed = match self.native_runtime.view_state_mut(view).as_deref_mut() {
                 Some(crate::native_app::AppViewState::Settings(state)) => {
                     state.clear_macos_access()
                 }
                 _ => false,
             };
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
+            if changed && let Some(mut window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(os_window) = window.os_window.as_ref() {
                     os_window.request_redraw();
@@ -544,7 +544,7 @@ impl App {
                     | crate::native_app::AppViewState::Tables(_)
                     | crate::native_app::AppViewState::Allocation(_) => false,
                 });
-            if changed && let Some(window) = self.windows.get_mut(&wid) {
+            if changed && let Some(mut window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(os_window) = window.os_window.as_ref() {
                     os_window.request_redraw();
@@ -616,13 +616,13 @@ impl App {
             && let Some(why) = self.begin_consent_warmup().refusal()
         {
             for (wid, view) in requested_by {
-                let noted = match self.native_runtime.view_state_mut(view) {
+                let noted = match self.native_runtime.view_state_mut(view).as_deref_mut() {
                     Some(crate::native_app::AppViewState::Settings(state)) => {
                         state.note_warmup_refused(why)
                     }
                     _ => false,
                 };
-                if noted && let Some(window) = self.windows.get_mut(&wid) {
+                if noted && let Some(mut window) = self.windows.get_mut(&wid) {
                     window.last_present = None;
                     if let Some(os_window) = window.os_window.as_ref() {
                         os_window.request_redraw();
@@ -669,7 +669,7 @@ impl App {
     /// queued close may dispose of this view before the ordinary posture pass.
     /// The notification and every other Settings gesture still drain there.
     pub(crate) fn take_settings_pane_dialog(&mut self, view: crate::tab_model::ViewId) {
-        let dialog = match self.native_runtime.view_state_mut(view) {
+        let dialog = match self.native_runtime.view_state_mut(view).as_deref_mut() {
             Some(crate::native_app::AppViewState::Settings(state)) => {
                 state.take_consent_pane_dialog()
             }
@@ -688,13 +688,13 @@ impl App {
         unlisted: Option<&str>,
     ) {
         for &(wid, view) in views {
-            let noted = match self.native_runtime.view_state_mut(view) {
+            let noted = match self.native_runtime.view_state_mut(view).as_deref_mut() {
                 Some(crate::native_app::AppViewState::Settings(state)) => {
                     state.note_devtools_hand_over(outcome, unlisted)
                 }
                 _ => false,
             };
-            if noted && let Some(window) = self.windows.get_mut(&wid) {
+            if noted && let Some(mut window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(os_window) = window.os_window.as_ref() {
                     os_window.request_redraw();
@@ -730,13 +730,13 @@ impl App {
             (wid, view, Err("another confirmed preference change was already queued; this request did not run"))
         });
         for (wid, view, result) in first.chain(rest) {
-            let noted = match self.native_runtime.view_state_mut(view) {
+            let noted = match self.native_runtime.view_state_mut(view).as_deref_mut() {
                 Some(crate::native_app::AppViewState::Settings(state)) => {
                     state.note_askpass_off_outcome(result)
                 }
                 _ => false,
             };
-            if noted && let Some(window) = self.windows.get_mut(&wid) {
+            if noted && let Some(mut window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
                 if let Some(os_window) = window.os_window.as_ref() {
                     os_window.request_redraw();
@@ -1027,7 +1027,8 @@ impl App {
             (wid, index, tab_id, instance, view)
         };
 
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.tab_set.switch_to(tab_id);
             let focused = ws
                 .tab_set
@@ -1224,10 +1225,11 @@ impl App {
             .as_ref()
             .filter(|_| native_update.is_none())
             .and_then(|reads| self.grid_a11y_tree_reading(wid, reads));
-        let Some(ws) = self.windows.get_mut(&wid) else {
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let (update, published) = match &ws.overlay {
+        let ws = &mut **route_guard_ws;
+        let (update, published) = match ws.overlay.as_ref() {
             Some(o) => (crate::overlay::OverlayModel::a11y(o.model()), None),
             None => match native_update {
                 Some(Ok((update, published))) => (update, Some(published)),
@@ -1772,7 +1774,8 @@ impl App {
         match event.window_event {
             AkWindowEvent::InitialTreeRequested => {
                 crate::a11y_backend::note_at_client();
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.a11y_active = true;
                     #[cfg(target_os = "linux")]
                     if let (Some(adapter), Some(window)) =
@@ -1785,7 +1788,8 @@ impl App {
             }
             AkWindowEvent::ActionRequested(req) => self.on_accessibility_action(wid, req),
             AkWindowEvent::AccessibilityDeactivated => {
-                if let Some(ws) = self.windows.get_mut(&wid) {
+                if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                    let ws = &mut **route_guard_ws;
                     ws.a11y_active = false;
                     ws.a11y_document_frames.get_mut().clear();
                 }
@@ -1897,8 +1901,13 @@ impl App {
                 };
                 match req.action {
                     aterm_a11y::model::Action::Focus => {
-                        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut())
+                        if let Some(route_guard_p) = self
+                            .windows
+                            .get_mut(&wid)
+                            .as_deref_mut()
+                            .and_then(|ws| ws.palette_mut())
                         {
+                            let p = &mut *route_guard_p;
                             p.select(idx);
                         }
                         self.overlay_a11y_update();
@@ -1908,8 +1917,13 @@ impl App {
                         }
                     }
                     aterm_a11y::model::Action::Click => {
-                        if let Some(p) = self.windows.get_mut(&wid).and_then(|ws| ws.palette_mut())
+                        if let Some(route_guard_p) = self
+                            .windows
+                            .get_mut(&wid)
+                            .as_deref_mut()
+                            .and_then(|ws| ws.palette_mut())
                         {
+                            let p = &mut *route_guard_p;
                             p.select(idx);
                         }
                         self.palette_activate_in(wid);
@@ -1928,8 +1942,13 @@ impl App {
                 };
                 match req.action {
                     aterm_a11y::model::Action::Focus => {
-                        if let Some(m) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
+                        if let Some(route_guard_m) = self
+                            .windows
+                            .get_mut(&wid)
+                            .as_deref_mut()
+                            .and_then(|ws| ws.overview_mut())
                         {
+                            let m = &mut *route_guard_m;
                             m.select(idx);
                         }
                         self.overlay_a11y_update();
@@ -1939,8 +1958,13 @@ impl App {
                         }
                     }
                     aterm_a11y::model::Action::Click => {
-                        if let Some(m) = self.windows.get_mut(&wid).and_then(|ws| ws.overview_mut())
+                        if let Some(route_guard_m) = self
+                            .windows
+                            .get_mut(&wid)
+                            .as_deref_mut()
+                            .and_then(|ws| ws.overview_mut())
                         {
+                            let m = &mut *route_guard_m;
                             m.select(idx);
                         }
                         self.overview_activate(wid);

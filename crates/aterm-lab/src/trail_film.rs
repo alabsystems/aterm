@@ -70,8 +70,9 @@ pub const TWIN_RISE: f64 = 0.10;
 pub const TWIN_REARM: f64 = 0.03;
 /// The rows each side of the caret's the scratch probe read.
 pub const TWIN_ROWS: i64 = 2;
-/// The caret's bar: a mark, not words (WCAG 1.4.11, 3:1).
-pub const CARET_BAR: f64 = 3.0;
+/// The caret's bar: the legibility law's, as a letter's ([`LEGIBLE`], 4.5:1). The caret is what a
+/// person reads their place by, so it keeps the bar words keep, not WCAG 1.4.11's 3:1 for a mark.
+pub const CARET_BAR: f64 = LEGIBLE;
 /// The least time a pose is shown, ms.
 pub const POSE_MS: u64 = 100;
 /// A fall, then a rise, of the pet's alpha by this much or more is a blink.
@@ -119,9 +120,16 @@ pub const THEMES: [&str; 6] = [
     "dim-grey",
     "paper-grey",
 ];
-/// The caret shapes: `trail_film::CARETS` (`block-pinned`: the block with a colour the program
-/// pinned).
-pub const CARETS: [&str; 4] = ["block", "bar", "underline", "block-pinned"];
+/// The caret shapes: `trail_film::CARETS` (`block-pinned`, `bar-pinned`, `underline-pinned`: the
+/// shape with a colour the program pinned).
+pub const CARETS: [&str; 6] = [
+    "block",
+    "bar",
+    "underline",
+    "block-pinned",
+    "bar-pinned",
+    "underline-pinned",
+];
 /// The scenes and what each types: `trail_film::SCENES`. The first [`DEFAULT_SCENES`] are a run's own. The pages
 /// and lines of the resident scenes are `trail_scenes`'s, which the replay mounts too.
 pub const SCENES: [(&str, &str); 25] = [
@@ -318,7 +326,9 @@ FLASH     every pixel of every frame, by WCAG 2.3.1: a flash is a pair of opposi
           pixels of it in the pet's box and the trail's own apart.
 CONTRAST  trail-contrast's report of every frame: contrast_floor the lowest letter (local contrast), lowered the
           readings the effects took under 4.5:1 (a letter the page itself draws lower keeps 97% of its own),
-          caret_floor the caret's lowest reading.
+          caret_floor the caret's lowest reading (a bar's or an underline's line also read pixel by pixel
+          against the ground beside it, slice by slice across its length: a bar's pixel rows, an underline's
+          pixel columns).
 LINE      the cells typed along the caret's row (the caret's steps of one or two columns; a jump, a Backspace or
           a new row starts the run again) that have a vivid line under them: half a cell's pixel columns or more
           with 2 px, one over the other, that the effects drew, of chroma 140 or more (greatest channel less
@@ -345,7 +355,7 @@ GLASS     the frames' light, from their status rows: glass_frames the frames who
           a translucent window, a wallpaper); yield_frames those whose glass yielded to the frame's words; thin_ink
           the face's thin ink on the page, least..most; first_glass_ms the first frame that drew it.
 
-laws: flash_px_over3 - page_px_over3 = 0; lowered = 0 and caret_floor >= 3.0; companion_on_letters = 0, companion_on_caret = 0,
+laws: flash_px_over3 - page_px_over3 = 0; lowered = 0 and caret_floor >= 4.5; companion_on_letters = 0, companion_on_caret = 0,
 alpha_dip = 0, poses_under_100ms = 0 and no frame unread; under --glass, on a glass page (glass_page=1), glass_frames
 > 0 and admitted_frames = frames with sheer_frames = 0, and every window-lane film's dims name its glass_page.
 exit: 0; 1 a film breaks a law (--report-only: 0); 2 a usage error, or a film that could not be made or read
@@ -393,12 +403,18 @@ pub fn most_in_a_second(times: &[u32]) -> (usize, usize) {
 }
 
 /// The most of `times` (sorted, ms) in any `window` ms (half open: an event `window` after the first is out),
-/// and the index that window starts at.
+/// and the earliest index that window starts at.
 #[must_use]
 pub fn most_within(times: &[u32], window: u32) -> (usize, usize) {
     let mut best = (0, 0);
+    let mut end = 0;
     for (i, &t) in times.iter().enumerate() {
-        let n = times[i..].iter().take_while(|&&u| u < t + window).count();
+        let horizon = u64::from(t) + u64::from(window);
+        end = end.max(i);
+        while end < times.len() && u64::from(times[end]) < horizon {
+            end += 1;
+        }
+        let n = end - i;
         if n > best.0 {
             best = (n, i);
         }
@@ -637,16 +653,22 @@ fn the_page_s(times: &[u32], paged: &[u32], (per, step_ms): (usize, u32)) -> boo
 /// cut short by a frame step as [`over_bound`] cuts them.
 #[must_use]
 fn over_wherever(times: &[u32], part: &[u32], per: usize, step_ms: u32) -> bool {
-    let window = SECOND_MS.saturating_sub(step_ms).max(1);
+    let window = u64::from(SECOND_MS)
+        .saturating_sub(u64::from(step_ms))
+        .max(1);
     let most = per * FLASH_MOST;
-    let within = |v: &[u32], from: u32| {
-        v.partition_point(|&t| t < from.saturating_add(window)) - v.partition_point(|&t| t < from)
+    let within = |v: &[u32], from: u64| {
+        let horizon = from + window;
+        v.partition_point(|&t| u64::from(t) < horizon) - v.partition_point(|&t| u64::from(t) < from)
     };
     // What a second holds changes only where a turn leaves it or comes into it: read every second that starts
     // just after a turn or that ends just after one, and the one at each turn.
     times
         .iter()
-        .flat_map(|&t| [t, t + 1, (t + 1).saturating_sub(window)])
+        .flat_map(|&t| {
+            let t = u64::from(t);
+            [t, t + 1, (t + 1).saturating_sub(window)]
+        })
         .all(|from| within(times, from) <= most || within(part, from) > most)
 }
 

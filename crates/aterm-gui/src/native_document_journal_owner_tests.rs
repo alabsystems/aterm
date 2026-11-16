@@ -857,6 +857,11 @@ fn dirty_inflight_and_failed_entries_retain_their_reducer_and_write_custody() {
 
 #[test]
 fn asynchronous_release_keeps_uncertain_or_aliased_images() {
+    // Why a Windows process could not plant the symlink image: making a file symlink takes
+    // Developer Mode or elevation there. The other images still run; the test then ends
+    // COULD NOT RUN for that one.
+    #[cfg(windows)]
+    let mut no_symlink: Option<std::io::Error> = None;
     for mutation in [
         "unknown",
         "unreadable-mark",
@@ -888,7 +893,15 @@ fn asynchronous_release_keeps_uncertain_or_aliased_images() {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&alias, &path).unwrap();
                 #[cfg(windows)]
-                std::os::windows::fs::symlink_file(&alias, &path).unwrap();
+                if let Err(error) = std::os::windows::fs::symlink_file(&alias, &path) {
+                    // ERROR_PRIVILEGE_NOT_HELD: no other refusal is this host's.
+                    assert_eq!(error.raw_os_error(), Some(1314), "{error}");
+                    fs::rename(&alias, &path).unwrap();
+                    drop(prepared);
+                    fence(&host);
+                    no_symlink = Some(error);
+                    continue;
+                }
             }
             "dirty" => {
                 let (_documents, dirty) = snapshot("unsaved draft");
@@ -910,6 +923,13 @@ fn asynchronous_release_keeps_uncertain_or_aliased_images() {
         fence(&host);
         assert!(exists(&path), "{mutation}");
         assert_eq!(fs::read(&path).unwrap(), expected, "{mutation}");
+    }
+    #[cfg(windows)]
+    if let Some(error) = no_symlink {
+        aterm_spec::host::could_not_run(format!(
+            "the symlink image: this process may not make a symlink ({error}): Developer Mode \
+             is off and it is not elevated; every other image ran"
+        ));
     }
 }
 

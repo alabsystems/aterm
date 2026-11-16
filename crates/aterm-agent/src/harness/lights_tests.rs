@@ -37,7 +37,7 @@ fn a_drawn_pill_this_build_cannot_name_replaces_the_mode_shown() {
     );
     for row in ["  \u{23F5}\u{23F5} turbo mode on", "  \u{23F8} plan mo"] {
         let rows = screen(&rule, row);
-        let s = read_screen(&rows, None).unwrap();
+        let s = read_screen(&rows, None, None).unwrap();
         assert!(s.pill && s.mode.is_none(), "{row:?}");
         assert_eq!(fold_from_bypass(read_lights(&rows)), None, "{row:?}");
     }
@@ -61,7 +61,7 @@ fn a_narrow_panes_cut_hint_still_names_the_mode() {
     ];
     for (row, mode) in cases {
         let rows = screen(&rule, row);
-        let s = read_screen(&rows, None).expect("a composer");
+        let s = read_screen(&rows, None, None).expect("a composer");
         assert_eq!(s.mode, Some(mode), "{row:?}");
         assert_eq!(
             read_lights(&rows).and_then(|r| r.yolo()),
@@ -84,7 +84,7 @@ const ALL_MODES: [Mode; 6] = [
 /// A box over the composer: nothing is known, so the bit is unread.
 #[test]
 fn no_composer_no_lights_and_no_drive() {
-    assert_eq!(read_screen(&["$ ls".to_owned()], None), None);
+    assert_eq!(read_screen(&["$ ls".to_owned()], None, None), None);
     assert_eq!(read_lights(&["$ ls".to_owned()]), None);
     assert_eq!(Reading::UNKNOWN.yolo(), None);
 }
@@ -149,7 +149,7 @@ fn every_recorded_screen_reads_definitely_or_not_at_all() {
         let path = entry.unwrap().path();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let rows: Vec<String> = text.lines().map(str::to_owned).collect();
-        let Some(s) = read_screen(&rows, None) else {
+        let Some(s) = read_screen(&rows, None, None) else {
             continue;
         };
         let got = read_lights(&rows).expect("a composer, as read_screen saw");
@@ -183,7 +183,7 @@ fn the_lights_reading_is_the_screens_without_its_turn() {
         let path = entry.expect("a fixture").path();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let rows: Vec<String> = text.lines().map(str::to_owned).collect();
-        let screen = read_screen(&rows, None);
+        let screen = read_screen(&rows, None, None);
         let reading = read_lights(&rows);
         assert_eq!(
             reading,
@@ -237,7 +237,7 @@ fn every_captured_footer_screen_of_every_build_is_read() {
             .skip_while(|line| line.starts_with('#'))
             .map(str::to_owned)
             .collect();
-        let screen = read_screen(&rows, None)
+        let screen = read_screen(&rows, None, None)
             .unwrap_or_else(|| panic!("{name}: no composer this build's reader sees"));
         let row = footer::mode_row(&rows)
             .unwrap_or_else(|| panic!("{name}: no mode row the lights read"));
@@ -299,7 +299,7 @@ fn the_2_1_301_screens_read_as_measured() {
     ];
     for (name, text, mode) in cases {
         let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-        let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{name}: a composer"));
+        let s = read_screen(&rows, None, None).unwrap_or_else(|| panic!("{name}: a composer"));
         assert_eq!(s.mode, Some(mode), "{name}");
         assert!(!s.busy, "{name}: idle");
         let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -338,7 +338,7 @@ fn the_lab_footer_screens_read_as_measured() {
             let text =
                 std::fs::read_to_string(dir.join(&file)).unwrap_or_else(|e| panic!("{file}: {e}"));
             let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-            let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{file}: a composer"));
+            let s = read_screen(&rows, None, None).unwrap_or_else(|| panic!("{file}: a composer"));
             assert_eq!(s.mode, Some(mode), "{file}");
             assert_eq!(s.busy, busy, "{file}");
             let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -349,7 +349,7 @@ fn the_lab_footer_screens_read_as_measured() {
             let mut blank = rows.clone();
             blank[row].clear();
             assert_eq!(
-                read_screen(&blank, None).and_then(|s| s.mode),
+                read_screen(&blank, None, None).and_then(|s| s.mode),
                 None,
                 "{file}: CONTROL"
             );
@@ -415,7 +415,7 @@ fn the_2_1_283_screens_read_as_measured() {
     ];
     for (name, text, mode, busy) in cases {
         let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
-        let s = read_screen(&rows, None).unwrap_or_else(|| panic!("{name}: a composer"));
+        let s = read_screen(&rows, None, None).unwrap_or_else(|| panic!("{name}: a composer"));
         assert_eq!(s.mode, Some(mode), "{name}");
         assert_eq!(s.busy, busy, "{name}");
         let rule = aterm_phase::phase::composer_bottom(&rows)
@@ -442,7 +442,7 @@ fn a_reply_drawn_under_a_status_line_is_busy_while_its_title_runs() {
     let done = rows_of(STATUSLINE_REPLY_DONE_2_1_311);
     for (name, rows) in [("mid-reply", &mid), ("last line held", &held)] {
         for title in ["\u{25D0} Claude Code", "\u{25D1} Claude Code"] {
-            let s = read_screen(rows, Some(title)).unwrap_or_else(|| panic!("{name}"));
+            let s = read_screen(rows, Some(title), None).unwrap_or_else(|| panic!("{name}"));
             assert!(s.busy && s.title_live, "{name} under {title:?}: {s:?}");
             assert_eq!(s.mode, Some(Mode::Auto), "{name}");
         }
@@ -452,12 +452,12 @@ fn a_reply_drawn_under_a_status_line_is_busy_while_its_title_runs() {
             Some(""),
             None,
         ] {
-            let s = read_screen(rows, title).unwrap_or_else(|| panic!("{name}"));
+            let s = read_screen(rows, title, None).unwrap_or_else(|| panic!("{name}"));
             assert!(!s.busy && !s.title_live, "{name} under {title:?}: {s:?}");
             assert_eq!(s.mode, Some(Mode::Auto), "{name}");
         }
     }
-    let s = read_screen(&done, Some("\u{25D0} Claude Code")).expect("the done frame");
+    let s = read_screen(&done, Some("\u{25D0} Claude Code"), None).expect("the done frame");
     assert!(
         !s.busy && !s.title_live,
         "the done row ends the turn: {s:?}"

@@ -112,6 +112,12 @@ pub struct Intent {
     pub thread: String,
     pub wall: String,
     pub identity: Identity,
+    /// The limit other than the codex bucket a usage-limit handoff was asked to leave (`limit=`,
+    /// [`super::codex_app_login::is_limit_id`]): a model's own, which the handoff judges in the
+    /// session's fresh read alone. `None`, the codex bucket's, is written nowhere, so an intent
+    /// that names none is the same on disk and in its receipt as before limits were asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +125,18 @@ pub enum Request {
     Prepare(Intent),
     Commit(String),
     Status(String),
-    Consume { id: String, turn: String },
+    Consume {
+        id: String,
+        turn: String,
+    },
+    /// The bound successor's report that its resumed turn `turn`, the walled turn itself, was
+    /// served on the destination of the consumed receipt `id` ([`record_completed_rotation`]).
+    /// Only a pool move's grammar has it ([`Purpose::pool_scoped`]): only its destination
+    /// carries the pool's canary, which the report proves.
+    Complete {
+        id: String,
+        turn: String,
+    },
 }
 
 impl Request {
@@ -136,6 +153,9 @@ impl Request {
         Self::parse_for(line, Purpose::LoginRotation)
     }
 
+    /// A `prepare` takes its purpose's four keys, and a usage-limit handoff's alone a fifth, the
+    /// limit it asks about (`limit=`, [`super::codex_app_login::is_limit_id`]: never `codex`,
+    /// whose wall a prepare with four keys names).
     fn parse_for(line: &str, purpose: Purpose) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let verb = words.next()?;
@@ -146,8 +166,19 @@ impl Request {
                 return None;
             }
         }
+        let limit = match fields.get("limit") {
+            None => None,
+            Some(limit)
+                if verb == "prepare"
+                    && purpose == Purpose::WeeklyQuota
+                    && super::codex_app_login::is_limit_id(limit) =>
+            {
+                Some((*limit).to_owned())
+            }
+            Some(_) => return None,
+        };
         match verb {
-            "prepare" if fields.len() == 4 => {
+            "prepare" if fields.len() == 4 + usize::from(limit.is_some()) => {
                 let thread = *fields.get("thread")?;
                 let (wall_key, account_key, user_key) = match purpose {
                     Purpose::Login => ("wall", "account", "user"),
@@ -171,6 +202,7 @@ impl Request {
                             account: account.into(),
                             user: user.into(),
                         },
+                        limit,
                     })
                 })
             }
@@ -188,6 +220,14 @@ impl Request {
                 let id = *fields.get("id")?;
                 let turn = *fields.get("turn")?;
                 (hex(id, 32) && self_claimed::is_uuid(turn)).then(|| Self::Consume {
+                    id: id.into(),
+                    turn: turn.into(),
+                })
+            }
+            "complete" if purpose.pool_scoped() && fields.len() == 2 => {
+                let id = *fields.get("id")?;
+                let turn = *fields.get("turn")?;
+                (hex(id, 32) && self_claimed::is_uuid(turn)).then(|| Self::Complete {
                     id: id.into(),
                     turn: turn.into(),
                 })
@@ -246,8 +286,8 @@ pub fn with_successor_writer<T>(
         .ok_or("store-unavailable")?;
     let _signin = store
         .signin_within()
-        .map_err(|_| "signin-lock")?
-        .ok_or("signin-busy")?;
+        .map_err(|_| SIGNIN_LOCK)?
+        .ok_or(SIGNIN_BUSY)?;
     let _writer = store
         .acquire_bounded()
         .map_err(|_| "roster-lock")?
@@ -307,11 +347,11 @@ pub fn with_successor_writer<T>(
     let mut files = [old_auth.to_path_buf(), new_auth.clone()];
     files.sort();
     let _first = codex_app_login::AuthLock::try_take(&files[0])
-        .map_err(|_| "auth-lock")?
-        .ok_or("auth-busy")?;
+        .map_err(|_| AUTH_LOCK)?
+        .ok_or(AUTH_BUSY)?;
     let _second = codex_app_login::AuthLock::try_take(&files[1])
-        .map_err(|_| "auth-lock")?
-        .ok_or("auth-busy")?;
+        .map_err(|_| AUTH_LOCK)?
+        .ok_or(AUTH_BUSY)?;
     if codex_app_login::renewal_identity(old_home).as_ref() != Some(identity)
         || codex_app_login::renewal_identity(&new_home).as_ref() != Some(identity)
     {
@@ -418,13 +458,59 @@ pub fn cancel_unexecuted_rotation(
     })
 }
 
+/// What a writer refuses with where a lock it could not take stood in its way, not the records:
+/// the machine's sign-in turn ([`SIGNIN_LOCK`] where it could not be taken at all,
+/// [`SIGNIN_BUSY`] where another sign-in held it), an auth file's lock ([`AUTH_LOCK`],
+/// [`AUTH_BUSY`]) and the receipt writer's `accounts.lock` ([`RECEIPT_LOCK`]). Each lock's taker
+/// says it in these words, and [`Unrecorded::of`] reads them: renaming one here renames it at its
+/// taker too.
+pub(super) const SIGNIN_LOCK: &str = "signin-lock";
+pub(super) const SIGNIN_BUSY: &str = "signin-busy";
+pub(super) const AUTH_LOCK: &str = "auth-lock";
+pub(super) const AUTH_BUSY: &str = "auth-busy";
+pub(super) const RECEIPT_LOCK: &str = "receipt-lock";
+
+/// Why [`record_completed_rotation`] recorded nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unrecorded {
+    /// A lock stood in the way: another writer held the receipt writer's `accounts.lock`, or
+    /// the machine's sign-in turn or an auth file's lock was held or could not be taken. The
+    /// records were not judged, and asking again shortly may record it.
+    Busy,
+    /// The records refuse it, for the reason named: the receipt is not this consumed one, the
+    /// pool's selection, policy or pin changed, the destination no longer runs, or a login named
+    /// another identity than its receipt's or is held.
+    Refused(&'static str),
+}
+
+impl Unrecorded {
+    /// A writer's refusal `why`, read as busy where a lock stood in its way and as the records'
+    /// refusal otherwise.
+    fn of(why: &'static str) -> Self {
+        if [SIGNIN_LOCK, SIGNIN_BUSY, AUTH_LOCK, AUTH_BUSY, RECEIPT_LOCK].contains(&why) {
+            Self::Busy
+        } else {
+            Self::Refused(why)
+        }
+    }
+}
+
 /// Record native evidence that the consumed original turn served a successful
 /// response. Only the native host may supply that evidence; a receipt alone
-/// never proves process execution or completion.
-pub fn record_completed_rotation(env: &Env, receipt: &Receipt) -> Result<Option<()>, &'static str> {
-    super::codex_rotation::with_completed_writer(env, receipt, |next, writer| {
+/// never proves process execution or completion. The pool's selection is judged as a
+/// completion's writer judges it (`codex_rotation::with_completed_writer`): the destination is
+/// still the pool's `active` row and still runs, a row read low since included (no move selects a
+/// low row, but its successor was served there), and the custody lock still finds both logins
+/// naming their receipt's identities and neither source held. Recording it again for a
+/// destination already proven records nothing new and answers the same.
+pub fn record_completed_rotation(env: &Env, receipt: &Receipt) -> Result<(), Unrecorded> {
+    match super::codex_rotation::with_completed_writer(env, receipt, |next, writer| {
         writer.prove_completed_rotation(receipt, &next.row.label)
-    })
+    }) {
+        Ok(Some(())) => Ok(()),
+        Ok(None) => Err(Unrecorded::Busy),
+        Err(why) => Err(Unrecorded::of(why)),
+    }
 }
 
 pub fn with_selected_writer<T>(
@@ -461,6 +547,8 @@ impl Intent {
     }
     /// The native record is read only after its process identity and resume
     /// command were validated by the host. No bare request establishes a wall.
+    /// The limit asked about is the one the record's own move names (`limit`, absent or null
+    /// where it names none), so a request names no limit the session's record does not.
     pub fn matches_record(&self, record: &aterm_json::Value, receipt: Option<&str>) -> bool {
         let owed = &record["owed"];
         let renewal = self.marker(record);
@@ -481,6 +569,12 @@ impl Intent {
             && renewal["account"].as_str() == Some(&self.identity.account)
             && renewal["user"].as_str() == Some(&self.identity.user)
             && renewal["receipt"].as_str() == receipt
+            && match &renewal["limit"] {
+                aterm_json::Value::Null => self.limit.is_none(),
+                limit => limit
+                    .as_str()
+                    .is_some_and(|limit| self.limit.as_deref() == Some(limit)),
+            }
     }
 }
 
@@ -560,6 +654,7 @@ impl Candidate {
 
 #[path = "codex_renewal_attempts.rs"]
 mod attempts;
+pub(super) use attempts::with_receipt_writer_of;
 pub use attempts::{
     Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress, IndexKey,
     NativeCancellationProof, NativeUnattachedProof, ReceiptWriter, RootDriver, advance_root,
@@ -759,15 +854,26 @@ impl Receipt {
     }
 
     pub fn reply(&self) -> String {
-        let Some(target) = self.target_identity() else {
-            return "ERR account recovery invalid identity transition\n".into();
-        };
-        let state = match self.phase {
+        self.reply_with(match self.phase {
             Phase::Ready => "ready",
             Phase::Committing => "waiting",
             Phase::Committed => "committed",
             Phase::Consumed => "consumed",
             Phase::Retired => "retired",
+        })
+    }
+
+    /// What a recorded completion report answers ([`record_completed_rotation`]): the receipt's
+    /// own fields under `state=completed`. Completion is a fact of the pool, not a phase of the
+    /// receipt, which stays consumed.
+    pub fn completed_reply(&self) -> String {
+        self.reply_with("completed")
+    }
+
+    /// The receipt's fields under its verb's prefix, in `state`.
+    fn reply_with(&self, state: &str) -> String {
+        let Some(target) = self.target_identity() else {
+            return "ERR account recovery invalid identity transition\n".into();
         };
         let verb = match self.intent.purpose {
             Purpose::WeeklyQuota => Some("codex-rotation"),

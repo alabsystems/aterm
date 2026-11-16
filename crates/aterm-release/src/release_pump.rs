@@ -188,6 +188,56 @@ fn journal_seen(journal: Journal, cut: bool, claimed: bool) -> pump::Journal {
     }
 }
 
+/// How many of main's newest first-parent commits past a line's head are asked for a follower
+/// status: one read each, so the pump's advisory stays a bounded cost.
+const CANDIDATE_WINDOW: usize = 64;
+
+/// The first of `commits` (newest first) whose follower status, as `state` reads it, is
+/// `success`. A failure, a pending judgment and a commit the follower never judged are passed
+/// over; a read that fails ends the search with what it could not answer.
+fn newest_pass_of(
+    commits: &[String],
+    mut state: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    for commit in commits {
+        if state(commit)?.as_deref() == Some("success") {
+            return Ok(Some(commit.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The newest first-parent commit of origin/main past `head`, among its newest
+/// [`CANDIDATE_WINDOW`], that the follower judged a pass: a candidate for a session's
+/// `--commit REV --supersede`, never a base the release selects by itself. `None` where there
+/// is none or GitHub cannot be read.
+fn newest_pass(root: &Path, head: &str) -> Option<String> {
+    let listed = git_ok(
+        &GitCli::new(root),
+        &[
+            "log",
+            "--first-parent",
+            "--format=%H",
+            "-n",
+            &CANDIDATE_WINDOW.to_string(),
+            "--ancestry-path",
+            &format!("{head}..origin/main"),
+        ],
+    )
+    .ok()?
+    .stdout_utf8();
+    let commits: Vec<String> = listed.lines().map(str::to_owned).collect();
+    if commits.is_empty() {
+        return None;
+    }
+    let remote = crate::github_remote::Remote::origin(root).ok()?;
+    newest_pass_of(&commits, |commit| {
+        Ok(remote.follower(commit)?.map(|(state, _)| state))
+    })
+    .ok()
+    .flatten()
+}
+
 /// The newest completed row among `lines`, the survey's `release_line` records of this Mac
 /// ([`aterm_agent::release_progress::survey`]): the newest of the live holders of `version`'s
 /// line. A dead or unidentified holder's record is no progress of a running verb.
@@ -428,7 +478,7 @@ impl pump::World for Host {
         {
             return found.clone();
         }
-        let found = crate::main_lane::newest_pass(&self.repo, head);
+        let found = newest_pass(&self.repo, head);
         self.candidate = Some((key, found.clone()));
         found
     }

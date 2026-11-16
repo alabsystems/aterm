@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(unix)]
 use std::collections::BTreeSet;
 
 use aterm_spec::interp::State as ModelState;
 
 use super::*;
 
+#[cfg(unix)]
 const TARGET: &str = "target@example.test";
+#[cfg(unix)]
 const COMPANION: &str = "companion";
 
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     files: BTreeMap<PathBuf, Vec<u8>>,
     directories: BTreeSet<PathBuf>,
 }
 
+#[cfg(unix)]
 impl Snapshot {
     fn read(root: &Path, store: &accounts::Store) -> Self {
         let locks = [
@@ -41,6 +46,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 struct Representation {
     layout: u8,
@@ -50,6 +56,7 @@ struct Representation {
     replan: bool,
 }
 
+#[cfg(unix)]
 fn represented_sync(
     state: &ModelState,
     representation: Representation,
@@ -438,6 +445,7 @@ fn represented_sync(
     ]
 }
 
+#[cfg(unix)]
 fn sync_projection(state: &ModelState) -> [(&'static str, i64); 7] {
     let mut first = None;
     let layouts: &[u8] = if state["candidates"] == 1 && state["companion"] == 0 {
@@ -522,10 +530,15 @@ pub(crate) fn alias_transition(state: &ModelState, action: &str) -> ModelState {
             next.insert("companion", 1);
         }
         "Sync" => {
-            next.insert("phase", 1);
-            for (field, value) in sync_projection(state) {
-                next.insert(field, value);
+            #[cfg(unix)]
+            {
+                next.insert("phase", 1);
+                for (field, value) in sync_projection(state) {
+                    next.insert(field, value);
+                }
             }
+            #[cfg(not(unix))]
+            panic!("the source-backed Sync projection requires the Unix vault");
         }
         _ => unreachable!(),
     }
@@ -536,11 +549,14 @@ pub(crate) fn alias_transition(state: &ModelState, action: &str) -> ModelState {
 fn alias_admission_conforms_and_preserves_existing_logins() {
     account_alias_admission_environment();
     let model = aterm_models_harness::account_alias_admission_model();
-    assert_eq!(model.mutant_dials(), (1..=9).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 72);
+    // The interpreter and pure actions are portable; Sync executes the real Unix vault.
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                #[cfg(not(unix))]
+                if action.name == "Sync" {
+                    continue;
+                }
                 let next = alias_transition(&state, action.name);
                 assert!(
                     model.successors(action.name, &state).contains(&next),

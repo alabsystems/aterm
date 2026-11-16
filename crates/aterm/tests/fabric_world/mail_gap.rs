@@ -101,7 +101,7 @@ fn unread_mail_the_broker_gave_up_is_named_by_inbox_and_marked_in_the_log() {
         })
         .collect();
     let filler = vec![b'e'; BODY as usize];
-    let stream = format!("/f/{FLEET}/pub/n-fill/s-fill/ev");
+    let stream = format!("/f/{FLEET}/pub/n-fill/t00047tjjn7/ev");
     for seq in 1..=3 {
         god.publish(9_221, seq, &stream, &filler)
             .expect("publish an ev record");
@@ -278,7 +278,7 @@ fn status_lists_an_ask_retention_holds_below_the_in_lanes_oldest() {
     god.commit(&aterm_link::subject::inbox_group(FLEET, &w.node), read)
         .expect("the node's inbox group reads the answer and the mail");
     let filler = vec![b'e'; BODY as usize];
-    let stream = format!("/f/{FLEET}/pub/n-fill/s-fill/ev");
+    let stream = format!("/f/{FLEET}/pub/n-fill/t00047tjjn7/ev");
     for seq in 1..=3 {
         god.publish(9_231, seq, &stream, &filler)
             .expect("publish an ev record");

@@ -22,8 +22,12 @@ pub struct PathUse {
 /// What one scan found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PathScan {
+    /// Each probe's first known use, rather than an exhaustive list of that process's paths.
+    /// The same PID may also occur in `unreadable` for an incomplete independent probe.
     pub users: Vec<PathUse>,
+    /// Incomplete probes, retained independently when a caller filters known uses.
     pub unreadable: Vec<(u32, Option<PathBuf>)>,
+    /// Process probes performed, including those yielding both kinds of evidence.
     pub scanned: usize,
 }
 
@@ -45,6 +49,16 @@ pub fn scan_path_users(dirs: &[PathBuf], skip: &[u32]) -> io::Result<PathScan> {
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::Result<PathScan> {
+    scan_with(pids, dirs, skip, mac::uses)
+}
+
+#[cfg(target_vendor = "apple")]
+fn scan_with(
+    pids: &[u32],
+    dirs: &[PathBuf],
+    skip: &[u32],
+    mut uses: impl FnMut(u32, &[PathBuf]) -> mac::UseRead,
+) -> io::Result<PathScan> {
     let mut scan = PathScan::default();
     for &pid in pids {
         if skip.contains(&pid) {
@@ -52,15 +66,23 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
         }
         crate::progress::tick();
         scan.scanned += 1;
-        match mac::uses(pid, dirs) {
-            Ok(Some(found)) if !unexeced_fork(pid, skip) => scan.users.push(found),
-            Ok(Some(_)) => {}
-            Ok(None) | Err((super::Failed::Exited, _)) => {}
+        let failure = match uses(pid, dirs) {
+            Ok(Some(read)) => {
+                if !unexeced_fork(pid, skip) {
+                    scan.users.push(read.user);
+                }
+                read.failure
+            }
+            Ok(None) => None,
+            Err(failure) => Some(failure),
+        };
+        match failure {
+            None | Some((super::Failed::Exited, _)) => {}
             // A process of this user's that became a set-user-ID program (`/bin/ps`, `top`)
             // since the listing is refused (`EPERM`) and outside the scan, as it is once listed
             // so ([`super::runs_as_another_user`]).
-            Err(_) if super::runs_as_another_user(pid) => {}
-            Err((
+            Some(_) if super::runs_as_another_user(pid) => {}
+            Some((
                 super::Failed::Closed
                 | super::Failed::Dead
                 | super::Failed::Refused
@@ -506,11 +528,33 @@ mod mac {
         }
     }
 
-    /// The first use `pid` makes of a path under `dirs`.
-    pub(super) fn uses(
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct ObservedUse {
+        pub(super) user: PathUse,
+        pub(super) failure: Option<(Failed, Option<PathBuf>)>,
+    }
+
+    impl ObservedUse {
+        fn known(user: PathUse) -> Self {
+            Self {
+                user,
+                failure: None,
+            }
+        }
+    }
+
+    pub(super) type UseRead = Result<Option<ObservedUse>, (Failed, Option<PathBuf>)>;
+
+    /// The first use `pid` makes of a path under `dirs`, with any incomplete independent probe.
+    pub(super) fn uses(pid: u32, dirs: &[PathBuf]) -> UseRead {
+        uses_with_mappings(pid, dirs, super::mappings::mac_uses)
+    }
+
+    pub(super) fn uses_with_mappings(
         pid: u32,
         dirs: &[PathBuf],
-    ) -> Result<Option<PathUse>, (Failed, Option<PathBuf>)> {
+        mappings: impl FnOnce(u32, &[PathBuf]) -> Result<Option<PathUse>, Failed>,
+    ) -> UseRead {
         let n = i32::try_from(pid).map_err(|_| (Failed::Other, None))?;
         let hit = |how: &'static str, path: Option<PathBuf>| {
             path.and_then(|p| placed(&p, dirs))
@@ -519,7 +563,7 @@ mod mac {
         let exe = exe(n).map_err(|f| (f, None))?;
         let fail = |f: Failed| (f, exe.clone());
         if let Some(found) = hit("exe", exe.clone()) {
-            return Ok(Some(found));
+            return Ok(Some(ObservedUse::known(found)));
         }
         let cwd = match cwd(n) {
             Ok(path) => path,
@@ -527,35 +571,51 @@ mod mac {
             Err(other) => return Err(fail(other)),
         };
         if let Some(found) = hit("cwd", cwd) {
-            return Ok(Some(found));
+            return Ok(Some(ObservedUse::known(found)));
         }
         // A remover may ignore its own lock descriptors; they must not hide a mapping.
-        if let Some(found) = super::mappings::mac_uses(pid, dirs).map_err(fail)? {
-            return Ok(Some(found));
-        }
-        let mut unreadable = false;
-        let fds = list_fds(n).map_err(fail)?;
-        #[cfg(test)]
-        super::super::hook::after_listing(n, &fds);
-        for (fd, kind) in fds {
-            if kind != ffi::PROX_FDTYPE_VNODE {
-                continue;
-            }
-            match fd_path(n, fd) {
-                Ok(p) => {
-                    if let Some(found) = hit("fd", p) {
-                        return Ok(Some(found));
-                    }
+        let mapping_failure = match mappings(pid, dirs) {
+            Ok(Some(found)) => return Ok(Some(ObservedUse::known(found))),
+            Ok(None) => None,
+            Err(Failed::Exited) => return Err(fail(Failed::Exited)),
+            Err(failed) => Some(failed),
+        };
+        let descriptors = || {
+            let mut unreadable = false;
+            let fds = list_fds(n)?;
+            #[cfg(test)]
+            super::super::hook::after_listing(n, &fds);
+            for (fd, kind) in fds {
+                if kind != ffi::PROX_FDTYPE_VNODE {
+                    continue;
                 }
-                Err(Failed::Exited) => return Err(fail(Failed::Exited)),
-                Err(Failed::Closed | Failed::Dead) => {}
-                Err(Failed::Refused | Failed::Other) => unreadable = true,
+                match fd_path(n, fd) {
+                    Ok(p) => {
+                        if let Some(found) = hit("fd", p) {
+                            return Ok(Some(found));
+                        }
+                    }
+                    Err(Failed::Exited) => return Err(Failed::Exited),
+                    Err(Failed::Closed | Failed::Dead) => {}
+                    Err(Failed::Refused | Failed::Other) => unreadable = true,
+                }
             }
-        }
-        if unreadable {
-            Err(fail(Failed::Other))
-        } else {
-            Ok(None)
+            if unreadable {
+                Err(Failed::Other)
+            } else {
+                Ok(None)
+            }
+        };
+        match (mapping_failure, descriptors()) {
+            (failure, Ok(Some(user))) => Ok(Some(ObservedUse {
+                user,
+                failure: failure.map(fail),
+            })),
+            // Keep the original uncertainty even if the later probe ends. A proved use
+            // carries that uncertainty too: a caller may ignore its own lock descriptor.
+            (Some(failed), _) => Err(fail(failed)),
+            (None, Ok(None)) => Ok(None),
+            (None, Err(failed)) => Err(fail(failed)),
         }
     }
 }

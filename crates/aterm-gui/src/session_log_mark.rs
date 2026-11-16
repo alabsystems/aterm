@@ -8,9 +8,10 @@ use super::SessionLog;
 impl SessionLog {
     /// THE `status` FIELDS (phase 3A), printed before the `gen=`/`seq=`/
     /// `hash=` stamp: `log_seq=<n> log_ep=<e> log_base=<b> run=<r|-> turn=<t|-> step=<p|->
-    /// need=<w|-> need_since_ms=<ms|->` (`log_base=` the log's identity, `Log::base_ep`, which a
-    /// reader passes back as `base=` beside `since=`/`ep=` so another log's cursor resets, audit
-    /// fix C13).
+    /// need=<w|-> need_since_ms=<ms|-> opened_ms=<unix ms|->` (`log_base=` the log's identity,
+    /// `Log::base_ep`, which a reader passes back as `base=` beside `since=`/`ep=` so another
+    /// log's cursor resets, audit fix C13; `opened_ms=` the lineage's first open,
+    /// [`Self::opened_ms`], after the eight words a supervise log wait reads from `log_seq=` on).
     pub(crate) fn status_fields(&self, now_wall: u64) -> String {
         let log = &self.log;
         let st = log.reader_state();
@@ -23,7 +24,8 @@ impl SessionLog {
             .flatten()
             .find(|n| n.src != aterm_slog::Src::Mark);
         format!(
-            "log_seq={} log_ep={} log_base={} run={} turn={} step={} need={} need_since_ms={}",
+            "log_seq={} log_ep={} log_base={} run={} turn={} step={} need={} need_since_ms={} \
+             opened_ms={}",
             log.reader_last_seq(),
             log.ep(),
             log.base_ep(),
@@ -35,6 +37,8 @@ impl SessionLog {
                 || "-".to_string(),
                 |n| now_wall.saturating_sub(n.t).to_string()
             ),
+            self.opened_ms()
+                .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
         )
     }
 }
@@ -412,7 +416,9 @@ pub(crate) fn validate_cause(ctx: &crate::SessionCtx, cause: CauseRef) -> Result
 
 /// The `mark` verb's usage line.
 pub(crate) const MARK_USAGE: &str = "ERR usage: mark <node|-> note|verdict|label|need|clear|act \
-     [word=<w>] [text=<pct>] [re=<seq|@off>] [as=<name>] [ttl=<s>] [rule=<id>]\n";
+     [word=<w>] [text=<pct>] [re=<seq|@off>] [as=<name>] [ttl=<s>] [rule=<id>]; \
+     mark <-|r<n>> desc field=<slot> [value=<pct>] [upto=<seq>] [ttl=<s>] [as=<name>] \
+     [re=<seq|@off>]\n";
 
 const VERDICT_WORDS: &[&str] = &[
     "on-track",
@@ -439,11 +445,178 @@ const LABEL_MAX_GRAPHEMES: usize = 32;
 const LABEL_MAX_BYTES: usize = 40;
 const LABEL_TTL_MAX_S: u64 = 3600;
 
+/// The most percent-encoded bytes a description claim's text holds ([`Key::Value`]'s cap): a
+/// longer one is refused, never cut.
+pub(crate) const DESC_VALUE_MAX: usize = 256;
+/// The longest a description claim may ask to stand: a day.
+const DESC_TTL_MAX_S: u64 = 86_400;
+/// How many more times a redacted, capped description is redacted and capped again before it
+/// must have stopped changing ([`redacted_to_cap`]).
+const DESC_SETTLE: usize = 4;
+
+/// What a description claim describes, as its writer names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescOn {
+    /// The session's open agent run (the newest still open), else the session: `mark - desc`.
+    Front,
+    /// The session itself, whatever runs in it: a tab's title, which no agent's exit lapses.
+    Session,
+    /// One run, which must be an open agent run: `mark r<n> desc`.
+    Agent(Node),
+}
+
+/// One description claim to write ([`SessionLog::claim_desc`]): `value` is the text as its
+/// writer gave it (already percent-decoded), and `None` withdraws the author's own claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescWrite<'a> {
+    pub(crate) on: DescOn,
+    pub(crate) slot: &'a str,
+    pub(crate) value: Option<&'a str>,
+    pub(crate) upto: Option<u64>,
+    pub(crate) ttl: Option<u64>,
+    pub(crate) as_name: Option<&'a str>,
+    pub(crate) re: Option<ShortId>,
+}
+
+impl<'a> DescWrite<'a> {
+    /// A claim of the session's own `slot` with nothing but its text (`None` withdraws).
+    pub(crate) const fn of_session(slot: &'a str, value: Option<&'a str>) -> DescWrite<'a> {
+        DescWrite {
+            on: DescOn::Session,
+            slot,
+            value,
+            upto: None,
+            ttl: None,
+            as_name: None,
+            re: None,
+        }
+    }
+}
+
+/// Why a description claim was not written ([`SessionLog::claim_desc`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescRefused {
+    /// The slot is not a canonical [`Key::Field`] token.
+    Slot,
+    /// The text is empty once trimmed (a withdrawal is the absence of a text).
+    Empty,
+    /// The text is not one line of visible characters.
+    Formatting,
+    /// The text is over [`DESC_VALUE_MAX`] bytes percent-encoded.
+    TooLong,
+    /// Nothing but redaction notices is left of the text once redacted, or the text never
+    /// stopped changing under the redactor.
+    Credential,
+    /// No such node was ever issued.
+    NoNode(Node),
+    /// The node is closed.
+    NotOpen(Node),
+    /// The node is open and is no agent run.
+    NotAgent(Node),
+    /// `upto=` names a seq past the record the claim would become.
+    UptoAhead(u64),
+    /// The author's bucket is short of a token for this many ms.
+    Busy(u64),
+    /// The log itself refused the record (a closed session's).
+    Log(aterm_slog::Refused),
+}
+
+impl DescRefused {
+    /// The `mark` verb's reply for this refusal.
+    pub(crate) fn mark_reply(self) -> String {
+        match self {
+            DescRefused::Slot => {
+                "ERR mark: field= is a slot name of lower-case [a-z0-9.-], at most 24\n".to_string()
+            }
+            DescRefused::Empty => "ERR mark: value is empty\n".to_string(),
+            DescRefused::Formatting => "ERR mark: value has forbidden formatting\n".to_string(),
+            DescRefused::TooLong => {
+                format!("ERR mark: value over {DESC_VALUE_MAX} bytes encoded\n")
+            }
+            DescRefused::Credential => "ERR mark: value reads as a credential\n".to_string(),
+            DescRefused::NoNode(node) => format!("ERR mark: no node {node}\n"),
+            DescRefused::NotOpen(node) => format!("ERR mark: {node} is not open\n"),
+            DescRefused::NotAgent(node) => format!("ERR mark: {node} is not an agent run\n"),
+            DescRefused::UptoAhead(upto) => {
+                format!("ERR mark: upto={upto} is ahead of the log\n")
+            }
+            DescRefused::Busy(retry_ms) => format!("ERR busy retry_ms={retry_ms}\n"),
+            DescRefused::Log(e) => format!("ERR mark: {e:?}\n"),
+        }
+    }
+}
+
+/// A description's text as its writer gave it, checked for shape before anything judges what
+/// it says: trimmed, not empty, one line with no control, bidi or invisible formatting
+/// character, and at most [`DESC_VALUE_MAX`] bytes percent-encoded.
+fn desc_text(raw: &str) -> Result<&str, DescRefused> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err(DescRefused::Empty);
+    }
+    if crate::session_timeline::metadata_has_forbidden_formatting(text) {
+        return Err(DescRefused::Formatting);
+    }
+    if aterm_slog::field::encoded_len(text) > DESC_VALUE_MAX {
+        return Err(DescRefused::TooLong);
+    }
+    Ok(text)
+}
+
+/// `text` with its credentials redacted ([`crate::survey::redact`]) and cut at a character
+/// boundary to [`DESC_VALUE_MAX`] encoded bytes, then redacted and cut again until nothing
+/// changes: a redaction can lengthen a line, and a cut inside a word can leave one the
+/// redactor judges anew. Refused where nothing but redaction notices is left
+/// ([`crate::survey::only_redaction`]: the whole-line notice, or word notices alone, which
+/// say nothing about the session and would stand over a useful claim of a lower rank), where
+/// nothing is left at all, and where the text does not settle.
+fn redacted_to_cap(text: &str) -> Result<String, DescRefused> {
+    let judged = |t: &str| {
+        let redacted = crate::survey::redact(t);
+        aterm_slog::field::clamp_encoded(&redacted, DESC_VALUE_MAX)
+            .trim()
+            .to_string()
+    };
+    let mut line = judged(text);
+    let mut settled = false;
+    for _ in 0..DESC_SETTLE {
+        let again = judged(&line);
+        if again == line {
+            settled = true;
+            break;
+        }
+        line = again;
+    }
+    if settled && !line.is_empty() && !crate::survey::only_redaction(&line) {
+        Ok(line)
+    } else {
+        Err(DescRefused::Credential)
+    }
+}
+
+/// THE TEXT A DESCRIPTION CLAIM BY `by` HOLDS for the text `raw` its writer gave: a person's
+/// as typed, every other author's redacted ([`redacted_to_cap`]), each checked for shape
+/// ([`desc_text`]) and held to what [`Key::Value`] stores whole. Pure, so a writer that must
+/// know whether a claim would repeat one already held can ask before it writes.
+pub(crate) fn desc_stored(raw: &str, by: Actor) -> Result<String, DescRefused> {
+    let text = desc_text(raw)?;
+    let text = if by == Actor::Human {
+        text.to_string()
+    } else {
+        redacted_to_cap(text)?
+    };
+    if aterm_slog::BoundedText::new(Key::Value, &text).is_none_or(|t| t.as_str() != text) {
+        return Err(DescRefused::Formatting);
+    }
+    Ok(text)
+}
+
 /// A parsed `mark` request: what it asks to write, checked for shape (the
 /// session's own facts — the node, `re=` — are checked under its locks).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MarkReq {
-    /// The node named (`None`: `-`, the deepest open node).
+    /// The node named (`None`: `-`, the deepest open node; for a `desc`, the open agent run,
+    /// else the session).
     node: Option<Node>,
     kind: Kind,
     word: Option<&'static str>,
@@ -452,6 +625,12 @@ pub(crate) struct MarkReq {
     as_name: Option<String>,
     ttl: Option<u64>,
     rule: Option<ShortId>,
+    /// A `desc`'s slot (`field=`).
+    slot: Option<String>,
+    /// A `desc`'s text (`value=`, decoded); with none the `desc` withdraws.
+    value: Option<String>,
+    /// The seq a `desc`'s writer had read the log up to (`upto=`).
+    upto: Option<u64>,
 }
 
 fn is_as_name(s: &str) -> bool {
@@ -506,8 +685,14 @@ impl MarkReq {
             "need" => Kind::Need,
             "clear" => Kind::Clear,
             "act" => Kind::Act,
+            "desc" => Kind::Desc,
             _ => return Err(usage()),
         };
+        if kind == Kind::Desc && node.is_some_and(|n| n.lvl != aterm_slog::Lvl::Run) {
+            return Err(
+                "ERR mark: a desc is the session's (-) or an open agent run's (r<n>)\n".to_string(),
+            );
+        }
         let mut req = MarkReq {
             node,
             kind,
@@ -517,18 +702,23 @@ impl MarkReq {
             as_name: None,
             ttl: None,
             rule: None,
+            slot: None,
+            value: None,
+            upto: None,
         };
-        let (words, takes_text, takes_ttl, takes_rule): (
+        let desc = kind == Kind::Desc;
+        let (words, takes_text, ttl_max, takes_rule): (
             Option<&[&'static str]>,
             bool,
-            bool,
+            Option<u64>,
             bool,
         ) = match kind {
-            Kind::Note => (None, true, false, false),
-            Kind::Verdict => (Some(VERDICT_WORDS), false, false, false),
-            Kind::Label => (None, true, true, false),
-            Kind::Need | Kind::Clear => (Some(NEED_MARK_WORDS), false, false, false),
-            _ => (Some(ACT_WORDS), false, false, true),
+            Kind::Note => (None, true, None, false),
+            Kind::Verdict => (Some(VERDICT_WORDS), false, None, false),
+            Kind::Label => (None, true, Some(LABEL_TTL_MAX_S), false),
+            Kind::Need | Kind::Clear => (Some(NEED_MARK_WORDS), false, None, false),
+            Kind::Desc => (None, false, Some(DESC_TTL_MAX_S), false),
+            _ => (Some(ACT_WORDS), false, None, true),
         };
         let mut seen: Vec<&str> = Vec::new();
         for tok in toks {
@@ -550,16 +740,38 @@ impl MarkReq {
                     req.word = Some(w);
                 }
                 "text" if takes_text => req.text = Some(mark_text(v)?),
-                "ttl" if takes_ttl => {
+                "ttl" if ttl_max.is_some() => {
+                    let max = ttl_max.unwrap_or(0);
                     match v
                         .bytes()
                         .all(|b| b.is_ascii_digit())
                         .then(|| v.parse::<u64>().ok())
                         .flatten()
                     {
-                        Some(s) if (1..=LABEL_TTL_MAX_S).contains(&s) => req.ttl = Some(s),
-                        _ => return Err("ERR mark: ttl is 1..=3600\n".to_string()),
+                        Some(s) if (1..=max).contains(&s) => req.ttl = Some(s),
+                        _ => return Err(format!("ERR mark: ttl is 1..={max}\n")),
                     }
+                }
+                "field" if desc => {
+                    if aterm_slog::BoundedToken::new(Key::Field, v).is_none_or(|t| t.as_str() != v)
+                    {
+                        return Err(DescRefused::Slot.mark_reply());
+                    }
+                    req.slot = Some(v.to_string());
+                }
+                "value" if desc => {
+                    let decoded = aterm_codec::pct::decode(v);
+                    let text = desc_text(&decoded).map_err(DescRefused::mark_reply)?;
+                    req.value = Some(text.to_string());
+                }
+                "upto" if desc => {
+                    req.upto = Some(
+                        v.bytes()
+                            .all(|b| b.is_ascii_digit())
+                            .then(|| v.parse::<u64>().ok())
+                            .flatten()
+                            .ok_or_else(usage)?,
+                    );
                 }
                 "rule" if takes_rule => {
                     req.rule = Some(
@@ -580,6 +792,7 @@ impl MarkReq {
         let missing = match kind {
             Kind::Note | Kind::Label => req.text.is_none(),
             Kind::Verdict | Kind::Need | Kind::Act => req.word.is_none(),
+            Kind::Desc => req.slot.is_none(),
             _ => false,
         };
         if missing {
@@ -628,7 +841,7 @@ impl MarkReq {
 
 impl SessionLog {
     /// WRITE A CLAIM (design §7.4): `req` by `by` (the connection's actor),
-    /// `re` already checked.
+    /// `re` already checked. A `desc` is written by [`Self::claim_desc`].
     pub(crate) fn mark_claim(
         &mut self,
         req: &MarkReq,
@@ -636,6 +849,21 @@ impl SessionLog {
         re: Option<ShortId>,
         at: Stamp,
     ) -> Result<(u64, Node, bool), String> {
+        if req.kind == Kind::Desc {
+            let write = DescWrite {
+                on: req.node.map_or(DescOn::Front, DescOn::Agent),
+                slot: req.slot.as_deref().unwrap_or(""),
+                value: req.value.as_deref(),
+                upto: req.upto,
+                ttl: req.ttl,
+                as_name: req.as_name.as_deref(),
+                re,
+            };
+            let (seq, node) = self
+                .claim_desc(&write, by, at)
+                .map_err(DescRefused::mark_reply)?;
+            return Ok((seq, node, self.take_log_wake()));
+        }
         if let Some(node) = req.node
             && !self.log.is_open(node)
         {
@@ -666,6 +894,86 @@ impl SessionLog {
             .find(|r| r.seq == seq)
             .map_or(Node::SESSION, |r| r.node);
         Ok((seq, node, self.take_log_wake()))
+    }
+
+    /// WRITE A DESCRIPTION CLAIM: the one place a `desc` record is appended, for the `mark`
+    /// verb and for a title write alike, so no claim reaches the log (and from it the journal
+    /// and the `subscribe` log stream) without these checks. The slot is a canonical token and
+    /// is never rewritten. The text of every author but a person is redacted and held to
+    /// [`DESC_VALUE_MAX`] encoded bytes before the record is built ([`desc_stored`]); a
+    /// person's is stored as typed. The claim lands on the session, on its open agent run, or
+    /// on a named open agent run ([`DescOn`]). `upto` may not be past the record itself. Every
+    /// author but a person spends from the mark limiter. Returns the record's seq and node.
+    pub(crate) fn claim_desc(
+        &mut self,
+        write: &DescWrite<'_>,
+        by: Actor,
+        at: Stamp,
+    ) -> Result<(u64, Node), DescRefused> {
+        let slot = aterm_slog::BoundedToken::new(Key::Field, write.slot)
+            .filter(|t| t.as_str() == write.slot)
+            .ok_or(DescRefused::Slot)?;
+        let value = write.value.map(|v| desc_stored(v, by)).transpose()?;
+        let node = match write.on {
+            DescOn::Session => Node::SESSION,
+            DescOn::Front => self
+                .log
+                .state()
+                .desc
+                .open_agent()
+                .filter(|n| self.log.is_open(*n))
+                .unwrap_or(Node::SESSION),
+            DescOn::Agent(node) => match self.log.open_entry(node) {
+                Some(e) if e.kind == Kind::Agent => node,
+                Some(_) => return Err(DescRefused::NotAgent(node)),
+                None if self.log.issued(node) => return Err(DescRefused::NotOpen(node)),
+                None => return Err(DescRefused::NoNode(node)),
+            },
+        };
+        if let Some(upto) = write.upto
+            && upto > self.log.last_seq().saturating_add(1)
+        {
+            return Err(DescRefused::UptoAhead(upto));
+        }
+        let limited = by != Actor::Human;
+        if limited && let Err(retry_ms) = self.consumers.limiter.peek(&by, at.mono_ms) {
+            return Err(DescRefused::Busy(retry_ms));
+        }
+        let mut f = Fields::new();
+        let _ = f.set(Key::Field, aterm_slog::Val::Tok(slot));
+        if let Some(t) = value
+            .as_deref()
+            .and_then(|v| aterm_slog::BoundedText::new(Key::Value, v))
+        {
+            let _ = f.set(Key::Value, aterm_slog::Val::Text(t));
+        }
+        if let Some(upto) = write.upto {
+            let _ = f.set(Key::Upto, aterm_slog::Val::U(upto));
+        }
+        if let Some(s) = write.ttl {
+            let _ = f.set(Key::Ttl, aterm_slog::Val::U(s));
+        }
+        if let Some(a) = write
+            .as_name
+            .and_then(|a| aterm_slog::BoundedText::new(Key::As, a))
+        {
+            let _ = f.set(Key::As, aterm_slog::Val::Text(a));
+        }
+        if let Some(r) = write.re {
+            let _ = f.set(Key::Re, aterm_slog::Val::Id(r));
+        }
+        let mark = Mark::new(Kind::Desc, Src::Mark, Conf::Claim)
+            .at(node)
+            .by(by)
+            .fields(f);
+        let seq = self.log.mark(mark, at).map_err(|e| match e {
+            aterm_slog::Refused::UptoAhead(upto) => DescRefused::UptoAhead(upto),
+            e => DescRefused::Log(e),
+        })?;
+        if limited {
+            self.consumers.limiter.spend(&by, at.mono_ms);
+        }
+        Ok((seq, node))
     }
 
     /// A SELF-SUPERVISED AGENT'S ACT: what a
@@ -727,7 +1035,11 @@ impl SessionLog {
 
 /// THE `mark` VERB (design §7.4): parse, check `re=` against what this session
 /// holds (the inbox lock alone, then the timeline's), then write the claim
-/// under the timeline's leaf lock alone ([`SessionLog::mark_claim`]).
+/// under the timeline's leaf lock alone ([`SessionLog::mark_claim`]). A writer
+/// that may not read the log names no node, no `re=` and no `upto=`: each
+/// refusal would tell it a position in a log it may not see. It never takes
+/// the session's metadata lock, so a `desc field=title` claim does not move
+/// the tab's pinned title.
 pub(crate) fn cmd_mark(
     ctx: &crate::SessionCtx,
     by: Actor,
@@ -738,7 +1050,7 @@ pub(crate) fn cmd_mark(
         Ok(req) => req,
         Err(refusal) => return (refusal, false),
     };
-    if !reads && (req.re.is_some() || req.node.is_some()) {
+    if !reads && (req.re.is_some() || req.node.is_some() || req.upto.is_some()) {
         return ("ERR denied\n".to_string(), false);
     }
     let re = match req.re {

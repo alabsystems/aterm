@@ -84,17 +84,26 @@ pub(super) fn actual_offline_fetch(world: &Path, seat: &Seat<'_>) {
         cache_locked(&cache),
         "native completion still owns the cache"
     );
-    let attempt = completed
-        .try_into_retained::<MaterializationAttempt>()
+    let completed = completed.try_into_materialization().unwrap();
+    completed.check_current().unwrap();
+    assert_eq!(completed.path(), destination);
+    assert_eq!(completed.cargo_home(), cache);
+    let input = completed
+        .finish_with(|original| {
+            assert_eq!(original.path(), destination);
+            assert_eq!(original.cargo_home(), cache);
+            assert!(original.path().join("Cargo.lock").is_file());
+            original.check_current()
+        })
         .unwrap();
-    attempt.check_current().unwrap();
-    assert_eq!(attempt.path(), destination);
-    assert_eq!(attempt.cargo_home(), cache);
+    input.check_current().unwrap();
+    assert_eq!(input.path(), destination);
+    assert_eq!(input.cargo_home(), cache);
     assert!(
         cache_locked(&cache),
         "same returned bundle retains the lock"
     );
-    drop(attempt);
+    drop(input);
     assert!(!cache_locked(&cache));
     assert!(
         MaterializationAttempt::create(
@@ -134,4 +143,76 @@ pub(super) fn revoked_input_starts_no_child(world: &Path, seat: &Seat<'_>) {
     );
     drop(refused);
     assert!(!cache_locked(&cache));
+}
+
+pub(super) fn a_different_success_cannot_finish_materialization(world: &Path, seat: &Seat<'_>) {
+    let source = Producer::create(world, "source").unwrap().finish().unwrap();
+    let attempt = MaterializationAttempt::create(
+        world,
+        "failed-materialization",
+        vec![source.lend().unwrap()],
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    let cache = attempt.cargo_home().to_owned();
+    let mut jobs = Jobs::new(1).unwrap();
+    let mut target = command("/bin/sh");
+    target
+        .args([
+            "-c",
+            "printf 'materialization-ready\\n'; read input; exit 7",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let ticket = jobs
+        .submit_returning(held(world, seat), &mut target, Duration::ZERO, attempt)
+        .unwrap();
+    assert!(until(&mut jobs, |jobs| !jobs.jobs[&ticket.id.sequence].starting).is_empty());
+    let child = jobs
+        .jobs
+        .get_mut(&ticket.id.sequence)
+        .unwrap()
+        .owned
+        .as_mut()
+        .unwrap()
+        .child_mut();
+    // Establish execution before triggering the intended nonzero exit. An
+    // early launcher/transport refusal is a different hostile control.
+    aterm_uds::deadline::prints(
+        child,
+        "materialization-ready",
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    drop(child.stdin.take());
+    let mut failed = until(&mut jobs, Jobs::is_empty).pop().unwrap();
+    assert!(!failed.result.as_ref().unwrap().succeeded());
+    jobs.submit_retained(
+        held(world, seat),
+        &mut command("/usr/bin/true"),
+        Duration::ZERO,
+        (),
+    )
+    .unwrap();
+    let successful = until(&mut jobs, Jobs::is_empty).pop().unwrap();
+    assert!(successful.result.as_ref().unwrap().succeeded());
+    assert_ne!(failed.id, successful.id);
+    failed.id = successful.id;
+    failed.result = successful.result;
+    let refused = failed
+        .try_into_materialization()
+        .err()
+        .expect("edited public success cannot finish the failed original materialization");
+    assert!(cache_locked(&cache));
+    assert!(
+        std::fs::read_to_string(world.join("failed-materialization/.input-owner"))
+            .unwrap()
+            .contains("materializing")
+    );
+    drop(refused);
+    assert!(!cache_locked(&cache));
+    assert!(
+        std::fs::read_to_string(world.join("failed-materialization/.input-owner"))
+            .unwrap()
+            .contains("quarantined")
+    );
 }

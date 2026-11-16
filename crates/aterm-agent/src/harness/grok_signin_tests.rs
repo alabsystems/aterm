@@ -51,6 +51,7 @@ fn a_need_handoff_distinguishes_sleep_expiry_from_actual_native_completion() {
             hang: Duration::from_secs(1),
             wait: true,
             ack: false,
+            person: false,
             stopped: &|| false,
             now: &|| 1000,
             begin: &|_, _| panic!("a handoff cannot begin another provider"),
@@ -565,6 +566,13 @@ fn gate_run_as(
         hang,
         wait,
         ack,
+        // A terminal is a person's unless an agent's marker says the tab is an agent's, as
+        // `cli::person_at_terminal` reads it.
+        person: ack
+            && aterm_types::domain::agent_marker(&|name| {
+                var(name).map(|value| value.to_string_lossy().into_owned())
+            })
+            .is_none(),
         stopped,
         now: &clock,
         begin: &begin,
@@ -1191,6 +1199,7 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
         t: 100,
         outcome: "hung".to_owned(),
         by: false,
+        checked: None,
     };
     assert_eq!(Record::parse(&record.line()), record);
     assert!(record.unsigned());
@@ -1202,6 +1211,60 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
     };
     assert_eq!(Record::parse(&refused.line()), refused);
     assert!(refused.line().ends_with(" by=headless\n"));
+    let checked = Record {
+        outcome: "bot-check".to_owned(),
+        by: false,
+        ..record
+    };
+    assert_eq!(Record::parse(&checked.line()), checked);
+    assert!(checked.bot_protected() && checked.unsigned());
+    assert!(
+        !record.bot_protected() && !refused.bot_protected() && !Record::default().bot_protected(),
+        "CONTROL: an end no bot protection made waits out its backoff alone"
+    );
+    // A later end that made no login keeps the check it followed; a login ends it.
+    let kept = Record {
+        t: 160,
+        checked: Some(100),
+        ..record.clone()
+    };
+    assert_eq!(Record::parse(&kept.line()), kept);
+    assert_eq!(kept.checked_at(), Some(100));
+    for login in ["signed-in", "signed-in-elsewhere"] {
+        let signed = Record {
+            outcome: login.to_owned(),
+            ..kept.clone()
+        };
+        assert_eq!(signed.checked_at(), None, "{login}");
+    }
+}
+
+/// A background caller held after a bot protection stopped the last Grok Build sign-in is told
+/// there is no time to wait for, and that a person's launch from a terminal goes on. CONTROL: one
+/// held after another end is told until when.
+#[test]
+fn a_bot_protected_grok_sign_in_names_no_time_to_wait_for() {
+    let held = Ended::Backoff {
+        outcome: "bot-check".to_owned(),
+        until: None,
+    };
+    let line = held.line();
+    assert!(
+        line.contains("bot protection")
+            && line.contains("a launch from a terminal starts a new one")
+            && line.contains("a background one starts none"),
+        "{line}"
+    );
+    let waits = Ended::Backoff {
+        outcome: "refused".to_owned(),
+        until: Some(1_000 + PERSON_BACKOFF_SECS),
+    };
+    assert!(
+        waits.line().contains("waits until"),
+        "CONTROL: {}",
+        waits.line()
+    );
+    assert_eq!(held.exit(), waits.exit());
 }
 
 /// The ledger's line keeps every rung whole within a sign-in row's bound: at the longest label,
@@ -1416,6 +1479,7 @@ fn a_waiter_is_told_of_a_sign_in_only_while_one_runs() {
                 hang: Duration::from_secs(60),
                 wait: true,
                 ack: true,
+                person: true,
                 stopped: &polled,
                 now: &clock,
                 begin: &|_, queued| {
@@ -2055,6 +2119,49 @@ fn a_bot_check_ends_the_sign_in_on_record_and_asks_nobody() {
     );
     assert_eq!(read_record(&bed.state()).outcome, "bot-check");
     assert!(!read_record(&bed.state()).by, "not the rung's refusal");
+    // A day on, a background caller still starts none: the check holds on no clock.
+    let mut record = read_record(&bed.state());
+    record.t -= 25 * 60 * 60;
+    write_record(&bed.state(), &record).unwrap();
+    let runs = bed.runs();
+    let (background, _) =
+        gate_run_with(&bed, sandbox, (true, false), vec![], &mut rung, &mut owner);
+    assert!(
+        matches!(&background, Ended::Backoff { outcome, until: None } if outcome == "bot-check"),
+        "{background:?}"
+    );
+    assert_eq!(bed.runs(), runs, "nothing ran");
+    assert_eq!(rung.asked, 1, "the rung was not asked again");
+    // An agent's tab is nobody at this Mac, whatever its terminal acknowledges (`CLAUDECODE`).
+    let (agent, _) = gate_run_with(
+        &bed,
+        sandbox,
+        (true, true),
+        vec![("CLAUDECODE", "1".into())],
+        &mut rung,
+        &mut owner,
+    );
+    assert!(
+        matches!(&agent, Ended::Backoff { outcome, until: None } if outcome == "bot-check"),
+        "an agent's acknowledged run: {agent:?}"
+    );
+    assert_eq!(bed.runs(), runs, "an agent's tab ran nothing");
+    // A later end no login made keeps the check standing, past that end's own backoff.
+    let at = record.checked_at().expect("the check is on record");
+    let later = Record {
+        generation: record.generation + 1,
+        t: at + 60,
+        outcome: "hung".to_owned(),
+        by: false,
+        checked: Some(at),
+    };
+    write_record(&bed.state(), &later).unwrap();
+    let (after, _) = gate_run_with(&bed, sandbox, (true, false), vec![], &mut rung, &mut owner);
+    assert!(
+        matches!(&after, Ended::Backoff { outcome, until: None } if outcome == "bot-check"),
+        "a later end no login made: {after:?}"
+    );
+    assert_eq!(bed.runs(), runs, "nothing ran");
 }
 
 /// With no headless browser, or neither a profile nor a mailbox, the automatic rung is never
@@ -2588,6 +2695,7 @@ fn the_persons_rung_ends_once_its_host_slept_past_its_deadline() {
             hang: HOUR,
             wait: false,
             ack: true,
+            person: true,
             stopped: &never,
             now: &clock,
             begin: &begin,

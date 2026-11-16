@@ -46,21 +46,3 @@ fn a_twin_that_does_not_compile_is_refused_with_the_drivers_log() {
         "the driver log is carried: {err}"
     );
 }
-
-#[test]
-fn compose_selects_the_stage_and_the_row() {
-    let src = "#version 300 es\nprecision highp float;\n";
-    let v = compose(src, true, "vs_x", "fs_y").expect("compose");
-    assert!(
-        v.starts_with("#version 300 es\n#define ATERM_VERTEX 1\n"),
-        "{v}"
-    );
-    assert!(v.contains("#define ATERM_VS_vs_x 1\n#define ATERM_FS_fs_y 1\n#line 2\n"));
-    assert!(v.contains("vs_x();\n    gl_Position.yz = vec2(-gl_Position.y"));
-    let f = compose(src, false, "vs_x", "fs_y").expect("compose");
-    assert!(
-        f.contains("#define ATERM_FRAGMENT 1") && f.contains("fs_y();"),
-        "{f}"
-    );
-    compose("precision highp float;\n", true, "a", "b").expect_err("no version line");
-}

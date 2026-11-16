@@ -8,7 +8,7 @@
 //! The harness renders the files older Macs still read (`fleet-accounts.toml`, each other
 //! pooled CLI's `ai-accounts-<cli>.toml`, `ai-pool.toml`) from the registry and the journal's
 //! place rows ([`Vendors::exports`], which only the `aterm` executable links); this module stamps
-//! each with the generator's seal (`aterm_census::seal`), compares it with what the vault holds
+//! each with the generator's seal (`aterm_seal`), compares it with what the vault holds
 //! and, with `--apply`, sets every changed entry the vault already holds (it never creates one:
 //! [`plan`]) and every roster `hw_hint` the facts rows state (§4.7) in one admin publish. An unchanged lab publishes nothing (compare-before-write), so no
 //! Mac's subscriber wakes for it. Nothing here runs on a timer: the exports change only when the
@@ -24,8 +24,8 @@ use super::journal::place::Places;
 use super::view::LabView;
 use crate::typed::owned::OwnedRead;
 use crate::{Error, Result};
-use aterm_census::seal;
 use aterm_json::{Value, json};
+use aterm_seal as seal;
 use aterm_secrets::{
     client::Paths,
     swarm_roster::{ROSTER_ENTRY, SwarmRoster},

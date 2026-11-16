@@ -64,6 +64,17 @@ impl ProgramWatch {
         }
     }
 
+    /// A watch of the file at `path` as it is now, with no loaded image: a test's stand-in for
+    /// a service's own program.
+    #[cfg(test)]
+    pub(crate) fn stand_in(path: PathBuf) -> Self {
+        Self {
+            started: metadata(&path).as_ref().map(stamp),
+            path: Some(path),
+            image: None,
+        }
+    }
+
     /// The path the supervisor starts next.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host integration for the Tables page ([`crate::native_tables`]): opening its one tab, and
-//! taking its reader's answers when the reader wakes the loop.
+//! Host integration for the Tables page ([`crate::native_tables`]): opening its one tab from
+//! the menu, the palette, `aterm ctl open app tables` or a restore, and taking its reader's
+//! answers when the reader wakes the loop.
 
 use crate::native_app::{AppIcon, AppKind};
 use crate::native_tables::{TABLES_TITLE, TablesApp};
@@ -11,6 +12,13 @@ impl crate::App {
     /// `aterm ctl open app tables`: focus the Tables tab, or open one in the front window.
     pub(crate) fn open_tables_tab(&mut self) -> Result<(), String> {
         self.open_tables_tab_at(None)
+    }
+
+    /// aterm ▸ Tables… and its palette row (`MenuAction::Tables`).
+    pub(crate) fn open_tables_from_menu(&mut self) {
+        if let Err(why) = self.open_app(crate::app_control::OpenRequest::Tables) {
+            self.pending_action_refusal = Some(why);
+        }
     }
 
     /// [`Self::open_tables_tab`], reading the registry at `paths` (this Mac's where `None`).
@@ -47,10 +55,11 @@ impl crate::App {
             Some(placed) => placed,
             None => self.stage_tables_tab(wid, paths)?,
         };
-        let window = self
+        let mut route_guard_window = self
             .windows
             .get_mut(&wid)
             .ok_or_else(|| "the window closed".to_string())?;
+        let window = &mut **route_guard_window;
         if !window.tab_set.switch_to(tab)
             || !window
                 .tab_set
@@ -61,21 +70,25 @@ impl crate::App {
         }
         crate::app_tabs::cancel_pending_close(window);
         window.last_present = None;
+        drop(route_guard_window);
         self.resync_active_or_window(wid);
         self.sync_active_session();
         self.request_redraw_all_windows();
         Ok(())
     }
 
-    fn stage_tables_tab(
+    /// Mint a view of the Tables page at `target`: a tab of a window, or the leaf a restore is
+    /// building. One page serves every view.
+    pub(crate) fn stage_tables_tab(
         &mut self,
-        wid: crate::WindowId,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
         paths: Option<crate::tables_store::Paths>,
     ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), String> {
+        let target = target.into();
         let proxy = self.proxy.clone();
         let presentation = crate::tab_model::TabPresentation {
             title: TABLES_TITLE.into(),
-            icon: Some(AppIcon::Editor),
+            icon: Some(AppIcon::Tables),
             indicators: crate::tab_model::TabIndicators::default(),
             conn: None,
             closable: true,
@@ -84,7 +97,7 @@ impl crate::App {
         let state = crate::native_app::AppViewState::Tables(Box::default());
         let installed =
             if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::Tables) {
-                self.install_native_tab(wid, instance, state, presentation)
+                self.install_native_tab(target, instance, state, presentation)
             } else {
                 let model = TablesApp::new(paths, move || {
                     if let Some(proxy) = &proxy {
@@ -92,7 +105,7 @@ impl crate::App {
                     }
                 })?;
                 self.install_new_native_tab(
-                    wid,
+                    target,
                     crate::native_app::NativeApp::Tables(Box::new(model)),
                     state,
                     presentation,
@@ -104,7 +117,8 @@ impl crate::App {
 
     pub(crate) fn on_tables_changed(&mut self) {
         if self.native_runtime.poll_tables() {
-            for window in self.windows.values_mut() {
+            for mut route_guard_window in self.windows.values_mut() {
+                let window = &mut **route_guard_window;
                 window.last_present = None;
             }
             self.request_redraw_all_windows();

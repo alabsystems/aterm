@@ -166,7 +166,7 @@ fn rest_wake_after(
     now: u64,
     key: bool,
 ) -> u64 {
-    let ws = app.windows.get_mut(&wid).expect("the window");
+    let mut ws = app.windows.get_mut(&wid).expect("the window");
     let _ = present_at(m, now, 0, key, &mut ws.present_metrics, observer);
     m.window.input.rest_wake_key.get()
 }

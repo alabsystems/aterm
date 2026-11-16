@@ -7,7 +7,7 @@
 //! close, attributed only by an input that dismissed it.
 
 use aterm_slog::{
-    ActWord, Actor, AttributionView, Binding, BoxWord, Chose, Claimed, ClaimedBox, ClaimedReport,
+    ActWord, Actor, AttributionView, Binding, BoxWord, Chose, ClaimEdge, ClaimedBox, ClaimedReport,
     Log, Node, ScreenStep, ShortId, TurnTracker, TxEvent, TxPos, TxState, Verdict,
 };
 
@@ -25,16 +25,18 @@ const fn report(boxed: Option<ClaimedBox>, began: u64) -> ClaimedReport {
     ClaimedReport { boxed, began }
 }
 
-/// The host's write of a program mark claiming a turn runs (`working` or `blocked`) and
-/// showing `boxed`: the claim's turn first, then its box (`SessionLog::write_program`).
+/// The host feeding a turn that runs (`working` or `blocked`), then writing the program mark
+/// showing `boxed`: the turn's edge first, a resumed one, which opens the turn where none runs and
+/// finds it running after, then its box (`SessionLog::write_program`).
 fn shown(log: &mut Log, tr: &mut TurnTracker, boxed: Option<ClaimedBox>, began: u64, ms: u64) {
-    let _ = tr.claim(log, Claimed::Working, at(ms));
+    let _ = tr.claim_edge(log, ClaimEdge::Resumed, at(ms), &mut || true);
     let _ = tr.claim_box(log, report(boxed, began), at(ms));
 }
 
-/// The host's write of a program mark claiming a rest (`idle`): the turn's close, then the box.
+/// The host feeding a turn's rest (`idle`), then writing its program mark: the turn's close,
+/// then the box.
 fn rested(log: &mut Log, tr: &mut TurnTracker, began: u64, ms: u64) {
-    let _ = tr.claim(log, Claimed::Rested, at(ms));
+    let _ = tr.claim_edge(log, ClaimEdge::Rested, at(ms), &mut || true);
     let _ = tr.claim_box(log, report(None, began), at(ms));
 }
 
@@ -336,7 +338,7 @@ fn inputs_bind_to_the_claim_step() {
     assert_eq!(tr.person(&log, None, at(1_200)), Binding::Step(p1));
 
     let (mut log, _run, mut tr) = run();
-    let _ = tr.claim(&mut log, Claimed::Working, at(100));
+    let _ = tr.claim_edge(&mut log, ClaimEdge::Began, at(100), &mut || true);
     let adm = tr.admit(at(700));
     assert_eq!(
         tr.accept(&log, Actor::Ctl, Some(ActWord::Approve), adm, at(700)),

@@ -65,14 +65,10 @@ impl UsageReader for Provider {
         assert!(!wait.is_zero());
         self.calls.borrow_mut().push(path.to_owned());
         if path != self.source {
-            return self
-                .target
-                .borrow()
-                .clone()
-                .map_or(IdentifiedRead::Unread, IdentifiedRead::Usage);
+            return self.target.borrow().clone().into();
         }
         if self.works.get() {
-            return IdentifiedRead::Usage(usage("source", false));
+            return IdentifiedRead::Usage(Box::new(usage("source", false)));
         }
         let home = path.parent().unwrap();
         match crate::harness::codex_app_login::refusal_standing(home, None, now) {
@@ -530,7 +526,7 @@ fn a_spent_presentation_or_confirming_read_is_not_made_again() {
             self.0.calls.borrow_mut().push(path.to_owned());
             match self.1 {
                 First::Silent => IdentifiedRead::Unread,
-                First::Usage => IdentifiedRead::Usage(usage("source", false)),
+                First::Usage => IdentifiedRead::Usage(Box::new(usage("source", false))),
             }
         }
     }
@@ -865,4 +861,73 @@ fn a_busy_activity_lock_is_waited_out_and_changes_no_answer() {
     holder.join().unwrap();
     assert_eq!(moved_to(&decision), Some("work".into()), "{decision:?}");
     assert_eq!(*reader.calls.borrow(), vec![lost.target.join("auth.json")]);
+}
+
+/// A WORKING LOGIN READ SPENT ON ANOTHER LIMIT KEEPS THE OWNER'S PIN: the owner pinned `main`,
+/// whose session lost its login; the confirming read finds the login serving usage, its codex
+/// bucket roomy and `codex_other` spent, so no move is made (`LoginWorks`). That read is recorded,
+/// `codex_other`'s wall in `main`'s limit walls, and the pin stands: a wall of one model's limit
+/// is no wall of the row. CONTROL: the same read with the codex bucket's five-hour window spent
+/// records that wall, which ends the pin.
+#[test]
+fn a_working_login_read_spent_on_another_limit_keeps_the_owners_pin() {
+    /// A provider whose `main` serves `read`.
+    struct Serving(PathBuf, IdentifiedUsage, RefCell<usize>);
+    impl UsageReader for Serving {
+        fn read(
+            &self,
+            path: &Path,
+            _: Option<&str>,
+            now: i64,
+            _: Duration,
+            use_token: crate::harness::provider_read::Use,
+        ) -> IdentifiedRead {
+            if use_token
+                .begin_home(
+                    crate::harness::provider_read::Read::CodexEndpoint,
+                    path,
+                    now,
+                )
+                .is_err()
+            {
+                return IdentifiedRead::Unread;
+            }
+            *self.2.borrow_mut() += 1;
+            if path == self.0 {
+                IdentifiedRead::Usage(Box::new(self.1.clone()))
+            } else {
+                IdentifiedRead::Unread
+            }
+        }
+    }
+    for (codex, pinned) in [((10, 10), true), ((100, 10), false)] {
+        let lost = lost("login-works-pinned");
+        lost.world
+            .seat()
+            .store(Cli::Codex)
+            .transact(NOW, &mut None, |state| {
+                state.pinned = true;
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let reader = Serving(
+            lost.source.join("auth.json"),
+            read_with_limit("source", codex, Some(100)),
+            RefCell::new(0),
+        );
+        assert_eq!(
+            decide(&lost, &reader, NOW, &mut ReadLedger::default()),
+            not_needed(LostLoginEnd::LoginWorks),
+            "{codex:?}"
+        );
+        assert_eq!(*reader.2.borrow(), 1, "{codex:?}");
+        let state = lost.world.load(Cli::Codex);
+        assert_eq!(state.pinned, pinned, "{codex:?}");
+        assert!(
+            state.accounts["main"]
+                .limit_wall_until(OTHER, NOW)
+                .is_some(),
+            "{codex:?}"
+        );
+    }
 }

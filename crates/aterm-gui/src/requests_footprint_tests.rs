@@ -8,7 +8,7 @@ use crate::session_store::{new_store, test_handle};
 const NODE: &str = "87be5228c0ffee0087be5228c0ffee00";
 /// A drive of [`NODE`] that names no requester session.
 const BY: &str = "fleet:87be5228:-";
-const PERSON: &str = "s-ffffffffffffffffffff";
+const PERSON: &str = "tffffffffff";
 /// A hang detector for the requests' threads.
 const MUST: Duration = Duration::from_secs(60);
 

@@ -3,7 +3,10 @@
 
 use super::*;
 use std::cell::Cell;
-use std::os::unix::process::ExitStatusExt as _;
+use std::collections::BTreeSet;
+
+// The write half (push, the intent watch, the commit import, push admission) builds where
+// `verify land` does (remote.rs), so its tests and their diagnostics are unix-only.
 
 const BEFORE: &str = "1111111111111111111111111111111111111111";
 const AFTER: &str = "2222222222222222222222222222222222222222";
@@ -39,9 +42,23 @@ fn github_commands_use_the_linked_host_instead_of_path_agh() {
     );
 }
 
+/// The status of a process that exited with `code`.
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt as _;
+        std::process::ExitStatus::from_raw(code.cast_unsigned())
+    }
+}
+
 fn out(code: i32, text: &str) -> Output {
     Output {
-        status: std::process::ExitStatus::from_raw(code << 8),
+        status: exit_status(code),
         stdout: text.as_bytes().to_vec(),
         stderr: if code == 0 {
             Vec::new()
@@ -74,6 +91,296 @@ fn input(args: &[OsString]) -> Value {
         .position(|word| word == "--input")
         .expect("structured input");
     aterm_json::from_slice(&std::fs::read(&args[index + 1]).expect("live input")).expect("JSON")
+}
+
+const JOURNAL_TIMEOUT: &str = "injected journal transport timeout";
+const PRIVATE_REMOTE: &str = "ls96-remote-private";
+const PRIVATE_SLUG: &str = "ls96-owner-private/ls96-repo-private";
+const PRIVATE_URL: &str = "https://github.com/ls96-owner-private/ls96-repo-private.git";
+const PRIVATE_REF: &str = "refs/aterm/ls96-ref-private";
+
+fn assert_journal_timeout(error: &str, step: ReadStep) {
+    assert_eq!(error, format!("{}: {JOURNAL_TIMEOUT}", step.context()));
+    for private in [
+        PRIVATE_REMOTE,
+        "ls96-owner-private",
+        "ls96-repo-private",
+        "ls96-local-url-private",
+        "ls96-ref-private",
+        "ls96-argv-private",
+        BEFORE,
+    ] {
+        assert!(
+            !error.contains(private),
+            "private input entered the context"
+        );
+    }
+}
+
+#[test]
+fn journal_timeout_names_url_discovery_and_preserves_failed_output_redaction() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut timeouts = BTreeSet::new();
+    let mut failed_outputs = BTreeSet::new();
+    for (failed_call, step) in [(0, ReadStep::FetchUrl), (1, ReadStep::PushUrl)] {
+        for nonzero in [false, true] {
+            let calls = Cell::new(0);
+            let run = |tool, args: &[OsString]| {
+                let call = calls.get();
+                calls.set(call + 1);
+                assert_eq!(tool, Tool::Git);
+                assert_eq!(
+                    args,
+                    if call == 0 {
+                        words(&["remote", "get-url", "--all", PRIVATE_REMOTE])
+                    } else {
+                        assert_eq!(call, 1, "nothing after URL discovery fails");
+                        words(&["remote", "get-url", "--all", "--push", PRIVATE_REMOTE])
+                    }
+                );
+                if call == failed_call {
+                    if nonzero {
+                        let mut failed = out(128, PRIVATE_URL);
+                        failed.stderr =
+                            format!("{PRIVATE_REMOTE}: {PRIVATE_URL} {PRIVATE_REF}").into_bytes();
+                        Ok(failed)
+                    } else {
+                        Err(JOURNAL_TIMEOUT.to_owned())
+                    }
+                } else {
+                    Ok(out(0, &format!("{PRIVATE_URL}\n")))
+                }
+            };
+            let error = Remote::open(root.path(), PRIVATE_REMOTE, &run)
+                .err()
+                .expect("URL discovery fails");
+            if nonzero {
+                assert!(error.starts_with(step.context()));
+                assert!(error.contains("cannot read"));
+                for private in [
+                    PRIVATE_REMOTE,
+                    PRIVATE_URL,
+                    PRIVATE_REF,
+                    "ls96-owner-private",
+                    "ls96-repo-private",
+                ] {
+                    assert!(!error.contains(private));
+                }
+                failed_outputs.insert(error);
+            } else {
+                assert_journal_timeout(&error, step);
+                timeouts.insert(error);
+            }
+            assert_eq!(
+                calls.get(),
+                failed_call + 1,
+                "no later discovery or transport"
+            );
+        }
+    }
+    assert_eq!(
+        timeouts.len(),
+        2,
+        "URL stages need distinct timeout diagnostics"
+    );
+    assert_eq!(
+        failed_outputs.len(),
+        2,
+        "failed URL output keeps its read stage"
+    );
+}
+
+#[test]
+fn journal_timeout_names_each_github_fetch_stage_and_stops() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path().join("ls96-argv-private");
+    std::fs::create_dir(&root).unwrap();
+    let mut diagnostics = BTreeSet::new();
+    for (failed_call, step) in [
+        (0, ReadStep::GithubRef),
+        (1, ReadStep::GithubSnapshot),
+        (2, ReadStep::CommitInspection),
+    ] {
+        let calls = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            let call = calls.get();
+            calls.set(call + 1);
+            let reply = match call {
+                0 => {
+                    assert_eq!(tool, Tool::Agh);
+                    assert_eq!(
+                        args,
+                        words(&["repo", "refs", PRIVATE_SLUG, "--ref", PRIVATE_REF])
+                    );
+                    json!([{"ref":PRIVATE_REF,"oid":BEFORE}]).to_string()
+                }
+                1 => {
+                    assert_eq!(tool, Tool::Agh);
+                    assert_eq!(&args[..3], words(&["repo", "fetch", PRIVATE_SLUG]));
+                    assert_eq!(args[3], root.as_os_str());
+                    assert_eq!(
+                        input(args),
+                        json!([{
+                            "source":BEFORE,
+                            "into":"refs/agh/verify/aterm/ls96-ref-private",
+                            "expected_oid":BEFORE,
+                        }])
+                    );
+                    String::new()
+                }
+                2 => {
+                    assert_eq!(tool, Tool::Git);
+                    assert_eq!(args, words(&["cat-file", "-t", BEFORE]));
+                    "commit\n".to_owned()
+                }
+                _ => panic!("nothing after the failed journal read"),
+            };
+            if call == failed_call {
+                Err(JOURNAL_TIMEOUT.to_owned())
+            } else {
+                Ok(out(0, &reply))
+            }
+        };
+        let remote = Remote {
+            root: &root,
+            name: PRIVATE_REMOTE,
+            kind: Kind::Github(PRIVATE_SLUG.to_owned()),
+            run: &run,
+        };
+        let error = remote.fetch(PRIVATE_REF).unwrap_err();
+        assert_journal_timeout(&error, step);
+        diagnostics.insert(error);
+        assert_eq!(
+            calls.get(),
+            failed_call + 1,
+            "no import, inspection or retry after failure"
+        );
+    }
+    assert_eq!(
+        diagnostics.len(),
+        3,
+        "each failed stage has its own diagnostic"
+    );
+}
+
+#[test]
+fn journal_timeout_names_each_local_fetch_stage_and_stops() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut diagnostics = BTreeSet::new();
+    for (failed_call, step) in [(0, ReadStep::LocalRef), (1, ReadStep::LocalSnapshot)] {
+        let calls = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            let call = calls.get();
+            calls.set(call + 1);
+            assert_eq!(tool, Tool::Git);
+            let reply = match call {
+                0 => {
+                    assert_eq!(
+                        args,
+                        local_words(&["ls-remote", PRIVATE_REMOTE, PRIVATE_REF])
+                    );
+                    format!("{BEFORE}\t{PRIVATE_REF}\n")
+                }
+                1 => {
+                    assert_eq!(
+                        args,
+                        local_words(&["fetch", "--quiet", "--no-tags", PRIVATE_REMOTE, BEFORE])
+                    );
+                    String::new()
+                }
+                _ => panic!("nothing after the failed local journal read"),
+            };
+            if call == failed_call {
+                Err(JOURNAL_TIMEOUT.to_owned())
+            } else {
+                Ok(out(0, &reply))
+            }
+        };
+        let remote = Remote {
+            root: root.path(),
+            name: PRIVATE_REMOTE,
+            kind: Kind::Local("../ls96-local-url-private/repo.git".to_owned()),
+            run: &run,
+        };
+        let error = remote.fetch(PRIVATE_REF).unwrap_err();
+        assert_journal_timeout(&error, step);
+        diagnostics.insert(error);
+        assert_eq!(
+            calls.get(),
+            failed_call + 1,
+            "no import or retry after failure"
+        );
+    }
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "each failed stage has its own diagnostic"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_timeout_names_local_commit_import_and_inspection() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut diagnostics = BTreeSet::new();
+    for (failed_call, step) in [
+        (0, ReadStep::LocalSnapshot),
+        (1, ReadStep::CommitInspection),
+    ] {
+        let calls = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            let call = calls.get();
+            calls.set(call + 1);
+            assert_eq!(tool, Tool::Git);
+            let reply = match call {
+                0 => {
+                    let into = format!("+{BEFORE}:{PRIVATE_REF}");
+                    assert_eq!(
+                        args,
+                        local_words(&[
+                            "fetch",
+                            "--quiet",
+                            "--no-tags",
+                            "--no-write-fetch-head",
+                            "--recurse-submodules=no",
+                            PRIVATE_REMOTE,
+                            &into,
+                        ])
+                    );
+                    ""
+                }
+                1 => {
+                    assert_eq!(args, words(&["cat-file", "-t", BEFORE]));
+                    "commit\n"
+                }
+                _ => panic!("nothing after the failed commit import"),
+            };
+            if call == failed_call {
+                Err(JOURNAL_TIMEOUT.to_owned())
+            } else {
+                Ok(out(0, reply))
+            }
+        };
+        let remote = Remote {
+            root: root.path(),
+            name: PRIVATE_REMOTE,
+            kind: Kind::Local("../ls96-local-url-private/repo.git".to_owned()),
+            run: &run,
+        };
+        let error = remote.import_commit(BEFORE, PRIVATE_REF).unwrap_err();
+        assert_journal_timeout(&error, step);
+        diagnostics.insert(error);
+        assert_eq!(
+            calls.get(),
+            failed_call + 1,
+            "no inspection or retry after failure"
+        );
+    }
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "each failed stage has its own diagnostic"
+    );
 }
 
 #[test]
@@ -216,7 +523,7 @@ fn main_refresh_is_its_own_fetch_even_when_a_sibling_rewrites_the_shared_ref() {
 #[test]
 fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
     let root = aterm_tempfile::tempdir().expect("root");
-    for reference in ["refs/heads/main", "refs/aterm/judged"] {
+    for reference in ["refs/heads/main", "refs/aterm/record"] {
         let calls = Cell::new(0);
         let current = Cell::new(BEFORE);
         let imported = Cell::new(false);
@@ -288,15 +595,17 @@ fn only_a_successful_exact_ref_listing_can_report_absence() {
             assert_eq!(&args[..2], words(&["repo", "refs"]));
             Ok(out(
                 code,
-                &json!([{"ref":"refs/aterm/judged-other","oid":BEFORE}]).to_string(),
+                &json!([{"ref":"refs/aterm/record-other","oid":BEFORE}]).to_string(),
             ))
         };
         let remote = Remote::open(root.path(), "origin", &run).unwrap();
-        let fetched = remote.fetch("refs/aterm/judged");
+        let fetched = remote.fetch("refs/aterm/record");
         if code == 0 {
             assert_eq!(fetched, Ok(None))
         } else {
-            assert!(fetched.is_err())
+            let error = fetched.unwrap_err();
+            assert!(error.starts_with(ReadStep::GithubRef.context()));
+            assert!(error.contains("recorded refusal"));
         }
         assert_eq!(calls.get(), 1, "no import after absence or refusal");
     }
@@ -344,7 +653,7 @@ fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
             if args[1] == "refs" {
                 return Ok(out(
                     0,
-                    &json!([{"ref":"refs/aterm/judged", "oid":BEFORE}]).to_string(),
+                    &json!([{"ref":"refs/aterm/record", "oid":BEFORE}]).to_string(),
                 ));
             }
             Ok(out(0, ""))
@@ -352,7 +661,7 @@ fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
         assert!(
             Remote::open(root.path(), "origin", &run)
                 .unwrap()
-                .fetch("refs/aterm/judged")
+                .fetch("refs/aterm/record")
                 .is_err()
         );
     }
@@ -361,6 +670,7 @@ fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
 /// A GITHUB PUSH IS ONE WRITE: agh's write makes every check its dry run makes before it sends,
 /// and each agh push re-verifies the pushed history while the expected ref is free to move, so
 /// no rehearsal comes first.
+#[cfg(unix)]
 #[test]
 fn github_push_is_one_write_of_the_exact_graph_and_lease() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -376,13 +686,13 @@ fn github_push_is_one_write_of_the_exact_graph_and_lease() {
             assert!(args.iter().all(|word| word != "--dry-run"), "{args:?}");
             assert_eq!(
                 input(args),
-                json!([{"ref":"refs/aterm/judged","before":before.unwrap_or(ZERO),"after":AFTER}])
+                json!([{"ref":"refs/aterm/record","before":before.unwrap_or(ZERO),"after":AFTER}])
             );
             Ok(out(0, ""))
         };
         assert!(matches!(
             Remote::open(root.path(), "origin", &run).unwrap().push(
-                "refs/aterm/judged",
+                "refs/aterm/record",
                 before,
                 AFTER
             ),
@@ -395,6 +705,7 @@ fn github_push_is_one_write_of_the_exact_graph_and_lease() {
 /// A write agh refused for the expected ref is a rejection; any other failure with no typed
 /// diagnostic (an unknown outcome, a could-not-run or an authentication failure that names no
 /// side effect) is an error, and the write is never made a second time here.
+#[cfg(unix)]
 #[test]
 fn a_rejected_write_is_typed_and_an_untyped_failure_never_replays() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -422,6 +733,7 @@ fn a_rejected_write_is_typed_and_an_untyped_failure_never_replays() {
 }
 
 /// agh's own diagnostic of `error`, as its failed command prints it on stderr.
+#[cfg(unix)]
 fn diagnosed(error: &agh::error::Error) -> Output {
     let mut result = out(i32::from(error.exit()), "");
     result.stderr = format!(
@@ -437,6 +749,7 @@ fn diagnosed(error: &agh::error::Error) -> Output {
 /// CONTROLS: the same failure with an unknown or applied side effect, for another repository,
 /// with a second diagnostic, with an exit its diagnostic does not name, and a refusal of any
 /// other kind, stay errors.
+#[cfg(unix)]
 #[test]
 fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
     use agh::error::{Error, Kind, SideEffect};
@@ -477,7 +790,7 @@ fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
         twice.stderr.extend(again);
         assert!(pushed(twice).is_err(), "{kind:?} with two diagnostics");
         let mut other_exit = diagnosed(&error);
-        other_exit.status = std::process::ExitStatus::from_raw(4 << 8);
+        other_exit.status = exit_status(4);
         assert!(pushed(other_exit).is_err(), "{kind:?} under another exit");
     }
     for kind in [
@@ -494,8 +807,10 @@ fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
     }
 }
 
+#[cfg(unix)]
 const INTENT: &str = "66-fc387e8b41a0";
 
+#[cfg(unix)]
 fn intent_refusal() -> Value {
     agh::error::Error::new(
         agh::error::Kind::OutcomeUnknown,
@@ -508,12 +823,14 @@ fn intent_refusal() -> Value {
     .to_json(&agh::redact::Redactor::new())
 }
 
+#[cfg(unix)]
 fn refused_out(value: &Value) -> Output {
     let mut result = out(13, "");
     result.stderr = format!("human diagnostic is not parsed\n{value}\n").into_bytes();
     result
 }
 
+#[cfg(unix)]
 #[test]
 fn only_exact_structured_presend_intent_refusals_allow_observation() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -568,6 +885,7 @@ fn only_exact_structured_presend_intent_refusals_allow_observation() {
     assert_eq!(calls.get(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn observing_a_foreign_intent_never_writes_and_requires_its_exact_identity() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -667,6 +985,7 @@ fn several_or_different_expanded_urls_stop_before_network_or_write() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn local_transport_allows_only_the_file_protocol_even_if_configuration_changes() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -698,6 +1017,7 @@ fn local_transport_allows_only_the_file_protocol_even_if_configuration_changes()
     assert_eq!(operations.get(), 3);
 }
 
+#[cfg(unix)]
 #[test]
 fn push_source_admission_is_strict_for_github_and_absent_for_local_remotes() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -738,6 +1058,7 @@ fn push_source_admission_is_strict_for_github_and_absent_for_local_remotes() {
 /// that object into the named ref, then a local type check; raw git never reaches the network.
 /// NEGATIVE CONTROLS: a malformed ID asks nothing; a refused fetch is not type-checked; an object
 /// that arrives as anything but a commit is refused.
+#[cfg(unix)]
 #[test]
 fn a_github_commit_import_is_one_exact_agh_fetch_then_a_type_check() {
     let root = aterm_tempfile::tempdir().expect("root");
@@ -770,12 +1091,13 @@ fn a_github_commit_import_is_one_exact_agh_fetch_then_a_type_check() {
             }
         };
         let remote = Remote::open(root.path(), "origin", &run).unwrap();
-        assert_eq!(
-            remote
-                .import_commit(BEFORE, "refs/agh/verify/gitlink")
-                .is_ok(),
-            landed
-        );
+        let result = remote.import_commit(BEFORE, "refs/agh/verify/gitlink");
+        assert_eq!(result.is_ok(), landed);
+        if fetched != 0 {
+            let error = result.unwrap_err();
+            assert!(error.starts_with(ReadStep::GithubSnapshot.context()));
+            assert!(error.contains("recorded refusal"));
+        }
         assert_eq!(calls.get(), if fetched == 0 { 2 } else { 1 });
         assert!(
             remote

@@ -498,13 +498,8 @@ fn a_private_document_tab_is_neither_restored_nor_reopened() {
             app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Vertical);
         for focus in [terminal, editor] {
             let tab = {
-                let tab = app
-                    .windows
-                    .get_mut(&wid)
-                    .unwrap()
-                    .tab_set
-                    .active_mut()
-                    .unwrap();
+                let mut payload_guard_tab = app.windows.get_mut(&wid).unwrap();
+                let tab = payload_guard_tab.tab_set.active_mut().unwrap();
                 assert!(tab.set_focus(focus));
                 tab.clone()
             };

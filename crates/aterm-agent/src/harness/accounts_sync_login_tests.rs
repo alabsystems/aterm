@@ -1743,6 +1743,7 @@ fn a_label_the_fleet_gives_another_account_takes_none_of_the_default_logins_reco
 /// the vault's entry is left as it was; a default login it does not list is still the default
 /// row of this machine's roster alone.
 #[test]
+#[cfg(unix)]
 fn a_fleet_a_vault_delivered_is_never_added_to() {
     let desk = Desk::new("m27");
     desk.default_login("sol-m27@example.test");

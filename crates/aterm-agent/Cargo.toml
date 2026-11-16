@@ -97,6 +97,9 @@ aterm-durable = { workspace = true }
 # Not a new edge in the BUILD graph: `aterm-ctl` above already pulls aterm-types.
 aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
+# The landing trailers' one reader (`Stated::of_trailers`), which the harness's land receipt
+# reads off the merge `verify land` pushed. Std only.
+aterm-land-trailer = { workspace = true }
 # The workspace's one epoch-clock read (`aterm_time::unix_secs` and kin).
 aterm-time = { workspace = true }
 # Claude Code's statusLine input and transcript usage rows.
@@ -250,6 +253,10 @@ aterm-pty = { workspace = true }
 # act gets must hold (`harness::acts::self_claim_act`'s table test). No
 # cycle: aterm-slog depends on neither aterm-agent nor anything above it.
 aterm-slog = { workspace = true }
+# The loopback provider the native fixture's read is tested against serves TLS under a test
+# CA (`harness/codex_app_login_fixture_roots_tests.rs`). Already in the graph through
+# `aterm-http`: an edge, not a crate.
+rustls = { workspace = true }
 
 # ---- integration tests (autotests = false above) ----------------------------
 

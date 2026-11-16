@@ -54,10 +54,6 @@ fn main() -> std::process::ExitCode {
     {
         std::process::exit(aterm_verify::perf::arena_inner(&args[1..]));
     }
-    #[cfg(unix)]
-    if let Some(code) = aterm_verify::watch::background_entry(&raw) {
-        std::process::exit(code);
-    }
     let remote_host = match aterm_verify::remote_host::pin() {
         Ok(host) => host,
         Err(why) => {

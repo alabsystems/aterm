@@ -153,7 +153,7 @@ impl KnownCargoCache {
                 return Err(refused());
             }
             // This is only a regular-file observation, not compiler/fingerprint proof.
-            if !super::adoption::compiler_info(held)
+            if !super::adoption::rustc_facts(held)
                 && !aterm_dirfd::fstatat(
                     held,
                     ".rustc_info.json",

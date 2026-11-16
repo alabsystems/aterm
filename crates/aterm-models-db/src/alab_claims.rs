@@ -68,11 +68,12 @@ macro_rules! claim_model {
                 read = 1;
                 accepted = if Mode == 5 {if Buggy == 5 {1} else {0}}
                     else {if Mode == 6 {if Buggy == 7 {1} else {0}} else {1}};
-                holders = if Mode > 4 || (Mode == 4 && (4 > Buggy || Buggy > 4)) || (Mode == 1 && Buggy == 1) {0}
+                holders = if (Mode > 4 && 7 > Mode) || (Mode == 4 && (4 > Buggy || Buggy > 4))
+                    || (Mode == 1 && Buggy == 1) || (Mode == 7 && Buggy == 8) {0}
                     else {if Buggy == 6 {3} else {1}};
                 tenure = if Mode == 3 {5} else {
                     if Mode == 2 && Buggy == 2 {40} else {
-                        if Mode > 3 {0} else {
+                        if (Mode > 3 && 7 > Mode) || (Mode == 7 && Buggy == 8) {0} else {
                             if Order <= 1 {10} else {if Order == 2 || Order == 4 {20} else {30}}
                         }
                     }
@@ -90,7 +91,8 @@ macro_rules! claim_model {
                         }
                     }
                 };
-                shown = if Mode > 4 || (Mode == 4 && (4 > Buggy || Buggy > 4)) || (Mode == 1 && Buggy == 1) {0} else {
+                shown = if (Mode > 4 && 7 > Mode) || (Mode == 4 && (4 > Buggy || Buggy > 4))
+                    || (Mode == 1 && Buggy == 1) || (Mode == 7 && Buggy == 8) {0} else {
                     if Buggy == 3 || (Mode == 4 && Buggy == 4) {
                         if Order <= 1 {1} else {if Order == 2 || Order == 3 {2} else {3}}
                     } else {
@@ -111,19 +113,23 @@ macro_rules! claim_model {
                 };
             }
 
-            invariant CausalWinner: read == 0 || mode > 3 || shown == expected;
+            invariant CausalWinner: read == 0 || (mode > 3 && 7 > mode) || shown == expected;
             invariant UniqueExposure: holders <= 1;
             invariant SameValueKeepsTenure: read == 0 || 2 > mode || mode > 2
                 || tenure == (if order <= 1 {10} else {if order == 2 || order == 4 {20} else {30}});
             invariant MissingHistoryWithholds: read == 0 || 4 > mode || mode > 4 || shown == 0;
-            invariant RetirementHasUsableSource: read == 0 || 5 > mode || accepted == 0;
-            bound Cases: 0 <= order && order <= 5 && 0 <= mode && mode <= 6;
+            invariant RetirementHasUsableSource: read == 0 || 5 > mode || mode > 6 || accepted == 0;
+            invariant CarriedLifecycleKeepsNativeTenure: read == 0 || 7 > mode
+                || tenure == (if order <= 1 {10} else {if order == 2 || order == 4 {20} else {30}});
+            bound Cases: 0 <= order && order <= 5 && 0 <= mode && mode <= 7;
         }
     }
     };
 }
 
-/// Every dependency subset, digest ordering and native/carried/tenure/source-read mode.
+/// Every dependency subset, digest ordering and native/carried/tenure/source-read mode. Mode 7
+/// is the native claims written after a roll that carried every row's lifecycle with no proof
+/// of its period (0.199.0's): they elect and keep tenure as native claims do.
 /// Only judging the held claims is a source transition; scenarios exhaust the input product.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -135,6 +141,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 0, 4),
         (0, 0, 0, 0, 5),
         (0, 0, 0, 0, 6),
+        (0, 0, 0, 0, 7),
         (0, 0, 0, 1, 0),
         (0, 0, 0, 1, 1),
         (0, 0, 0, 1, 2),
@@ -142,6 +149,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 1, 4),
         (0, 0, 0, 1, 5),
         (0, 0, 0, 1, 6),
+        (0, 0, 0, 1, 7),
         (0, 0, 0, 2, 0),
         (0, 0, 0, 2, 1),
         (0, 0, 0, 2, 2),
@@ -149,6 +157,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 2, 4),
         (0, 0, 0, 2, 5),
         (0, 0, 0, 2, 6),
+        (0, 0, 0, 2, 7),
         (0, 0, 0, 3, 0),
         (0, 0, 0, 3, 1),
         (0, 0, 0, 3, 2),
@@ -156,6 +165,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 3, 4),
         (0, 0, 0, 3, 5),
         (0, 0, 0, 3, 6),
+        (0, 0, 0, 3, 7),
         (0, 0, 0, 4, 0),
         (0, 0, 0, 4, 1),
         (0, 0, 0, 4, 2),
@@ -163,6 +173,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 4, 4),
         (0, 0, 0, 4, 5),
         (0, 0, 0, 4, 6),
+        (0, 0, 0, 4, 7),
         (0, 0, 0, 5, 0),
         (0, 0, 0, 5, 1),
         (0, 0, 0, 5, 2),
@@ -170,6 +181,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 0, 5, 4),
         (0, 0, 0, 5, 5),
         (0, 0, 0, 5, 6),
+        (0, 0, 0, 5, 7),
         (0, 0, 1, 0, 0),
         (0, 0, 1, 0, 1),
         (0, 0, 1, 0, 2),
@@ -177,6 +189,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 0, 4),
         (0, 0, 1, 0, 5),
         (0, 0, 1, 0, 6),
+        (0, 0, 1, 0, 7),
         (0, 0, 1, 1, 0),
         (0, 0, 1, 1, 1),
         (0, 0, 1, 1, 2),
@@ -184,6 +197,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 1, 4),
         (0, 0, 1, 1, 5),
         (0, 0, 1, 1, 6),
+        (0, 0, 1, 1, 7),
         (0, 0, 1, 2, 0),
         (0, 0, 1, 2, 1),
         (0, 0, 1, 2, 2),
@@ -191,6 +205,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 2, 4),
         (0, 0, 1, 2, 5),
         (0, 0, 1, 2, 6),
+        (0, 0, 1, 2, 7),
         (0, 0, 1, 3, 0),
         (0, 0, 1, 3, 1),
         (0, 0, 1, 3, 2),
@@ -198,6 +213,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 3, 4),
         (0, 0, 1, 3, 5),
         (0, 0, 1, 3, 6),
+        (0, 0, 1, 3, 7),
         (0, 0, 1, 4, 0),
         (0, 0, 1, 4, 1),
         (0, 0, 1, 4, 2),
@@ -205,6 +221,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 4, 4),
         (0, 0, 1, 4, 5),
         (0, 0, 1, 4, 6),
+        (0, 0, 1, 4, 7),
         (0, 0, 1, 5, 0),
         (0, 0, 1, 5, 1),
         (0, 0, 1, 5, 2),
@@ -212,6 +229,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 0, 1, 5, 4),
         (0, 0, 1, 5, 5),
         (0, 0, 1, 5, 6),
+        (0, 0, 1, 5, 7),
         (0, 1, 0, 0, 0),
         (0, 1, 0, 0, 1),
         (0, 1, 0, 0, 2),
@@ -219,6 +237,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 0, 4),
         (0, 1, 0, 0, 5),
         (0, 1, 0, 0, 6),
+        (0, 1, 0, 0, 7),
         (0, 1, 0, 1, 0),
         (0, 1, 0, 1, 1),
         (0, 1, 0, 1, 2),
@@ -226,6 +245,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 1, 4),
         (0, 1, 0, 1, 5),
         (0, 1, 0, 1, 6),
+        (0, 1, 0, 1, 7),
         (0, 1, 0, 2, 0),
         (0, 1, 0, 2, 1),
         (0, 1, 0, 2, 2),
@@ -233,6 +253,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 2, 4),
         (0, 1, 0, 2, 5),
         (0, 1, 0, 2, 6),
+        (0, 1, 0, 2, 7),
         (0, 1, 0, 3, 0),
         (0, 1, 0, 3, 1),
         (0, 1, 0, 3, 2),
@@ -240,6 +261,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 3, 4),
         (0, 1, 0, 3, 5),
         (0, 1, 0, 3, 6),
+        (0, 1, 0, 3, 7),
         (0, 1, 0, 4, 0),
         (0, 1, 0, 4, 1),
         (0, 1, 0, 4, 2),
@@ -247,6 +269,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 4, 4),
         (0, 1, 0, 4, 5),
         (0, 1, 0, 4, 6),
+        (0, 1, 0, 4, 7),
         (0, 1, 0, 5, 0),
         (0, 1, 0, 5, 1),
         (0, 1, 0, 5, 2),
@@ -254,6 +277,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 0, 5, 4),
         (0, 1, 0, 5, 5),
         (0, 1, 0, 5, 6),
+        (0, 1, 0, 5, 7),
         (0, 1, 1, 0, 0),
         (0, 1, 1, 0, 1),
         (0, 1, 1, 0, 2),
@@ -261,6 +285,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 0, 4),
         (0, 1, 1, 0, 5),
         (0, 1, 1, 0, 6),
+        (0, 1, 1, 0, 7),
         (0, 1, 1, 1, 0),
         (0, 1, 1, 1, 1),
         (0, 1, 1, 1, 2),
@@ -268,6 +293,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 1, 4),
         (0, 1, 1, 1, 5),
         (0, 1, 1, 1, 6),
+        (0, 1, 1, 1, 7),
         (0, 1, 1, 2, 0),
         (0, 1, 1, 2, 1),
         (0, 1, 1, 2, 2),
@@ -275,6 +301,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 2, 4),
         (0, 1, 1, 2, 5),
         (0, 1, 1, 2, 6),
+        (0, 1, 1, 2, 7),
         (0, 1, 1, 3, 0),
         (0, 1, 1, 3, 1),
         (0, 1, 1, 3, 2),
@@ -282,6 +309,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 3, 4),
         (0, 1, 1, 3, 5),
         (0, 1, 1, 3, 6),
+        (0, 1, 1, 3, 7),
         (0, 1, 1, 4, 0),
         (0, 1, 1, 4, 1),
         (0, 1, 1, 4, 2),
@@ -289,6 +317,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 4, 4),
         (0, 1, 1, 4, 5),
         (0, 1, 1, 4, 6),
+        (0, 1, 1, 4, 7),
         (0, 1, 1, 5, 0),
         (0, 1, 1, 5, 1),
         (0, 1, 1, 5, 2),
@@ -296,6 +325,7 @@ pub fn alab_identity_claims_model() -> Model {
         (0, 1, 1, 5, 4),
         (0, 1, 1, 5, 5),
         (0, 1, 1, 5, 6),
+        (0, 1, 1, 5, 7),
         (1, 0, 0, 0, 0),
         (1, 0, 0, 0, 1),
         (1, 0, 0, 0, 2),
@@ -303,6 +333,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 0, 4),
         (1, 0, 0, 0, 5),
         (1, 0, 0, 0, 6),
+        (1, 0, 0, 0, 7),
         (1, 0, 0, 1, 0),
         (1, 0, 0, 1, 1),
         (1, 0, 0, 1, 2),
@@ -310,6 +341,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 1, 4),
         (1, 0, 0, 1, 5),
         (1, 0, 0, 1, 6),
+        (1, 0, 0, 1, 7),
         (1, 0, 0, 2, 0),
         (1, 0, 0, 2, 1),
         (1, 0, 0, 2, 2),
@@ -317,6 +349,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 2, 4),
         (1, 0, 0, 2, 5),
         (1, 0, 0, 2, 6),
+        (1, 0, 0, 2, 7),
         (1, 0, 0, 3, 0),
         (1, 0, 0, 3, 1),
         (1, 0, 0, 3, 2),
@@ -324,6 +357,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 3, 4),
         (1, 0, 0, 3, 5),
         (1, 0, 0, 3, 6),
+        (1, 0, 0, 3, 7),
         (1, 0, 0, 4, 0),
         (1, 0, 0, 4, 1),
         (1, 0, 0, 4, 2),
@@ -331,6 +365,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 4, 4),
         (1, 0, 0, 4, 5),
         (1, 0, 0, 4, 6),
+        (1, 0, 0, 4, 7),
         (1, 0, 0, 5, 0),
         (1, 0, 0, 5, 1),
         (1, 0, 0, 5, 2),
@@ -338,6 +373,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 0, 5, 4),
         (1, 0, 0, 5, 5),
         (1, 0, 0, 5, 6),
+        (1, 0, 0, 5, 7),
         (1, 0, 1, 0, 0),
         (1, 0, 1, 0, 1),
         (1, 0, 1, 0, 2),
@@ -345,6 +381,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 0, 4),
         (1, 0, 1, 0, 5),
         (1, 0, 1, 0, 6),
+        (1, 0, 1, 0, 7),
         (1, 0, 1, 1, 0),
         (1, 0, 1, 1, 1),
         (1, 0, 1, 1, 2),
@@ -352,6 +389,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 1, 4),
         (1, 0, 1, 1, 5),
         (1, 0, 1, 1, 6),
+        (1, 0, 1, 1, 7),
         (1, 0, 1, 2, 0),
         (1, 0, 1, 2, 1),
         (1, 0, 1, 2, 2),
@@ -359,6 +397,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 2, 4),
         (1, 0, 1, 2, 5),
         (1, 0, 1, 2, 6),
+        (1, 0, 1, 2, 7),
         (1, 0, 1, 3, 0),
         (1, 0, 1, 3, 1),
         (1, 0, 1, 3, 2),
@@ -366,6 +405,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 3, 4),
         (1, 0, 1, 3, 5),
         (1, 0, 1, 3, 6),
+        (1, 0, 1, 3, 7),
         (1, 0, 1, 4, 0),
         (1, 0, 1, 4, 1),
         (1, 0, 1, 4, 2),
@@ -373,6 +413,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 4, 4),
         (1, 0, 1, 4, 5),
         (1, 0, 1, 4, 6),
+        (1, 0, 1, 4, 7),
         (1, 0, 1, 5, 0),
         (1, 0, 1, 5, 1),
         (1, 0, 1, 5, 2),
@@ -380,6 +421,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 0, 1, 5, 4),
         (1, 0, 1, 5, 5),
         (1, 0, 1, 5, 6),
+        (1, 0, 1, 5, 7),
         (1, 1, 0, 0, 0),
         (1, 1, 0, 0, 1),
         (1, 1, 0, 0, 2),
@@ -387,6 +429,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 0, 4),
         (1, 1, 0, 0, 5),
         (1, 1, 0, 0, 6),
+        (1, 1, 0, 0, 7),
         (1, 1, 0, 1, 0),
         (1, 1, 0, 1, 1),
         (1, 1, 0, 1, 2),
@@ -394,6 +437,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 1, 4),
         (1, 1, 0, 1, 5),
         (1, 1, 0, 1, 6),
+        (1, 1, 0, 1, 7),
         (1, 1, 0, 2, 0),
         (1, 1, 0, 2, 1),
         (1, 1, 0, 2, 2),
@@ -401,6 +445,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 2, 4),
         (1, 1, 0, 2, 5),
         (1, 1, 0, 2, 6),
+        (1, 1, 0, 2, 7),
         (1, 1, 0, 3, 0),
         (1, 1, 0, 3, 1),
         (1, 1, 0, 3, 2),
@@ -408,6 +453,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 3, 4),
         (1, 1, 0, 3, 5),
         (1, 1, 0, 3, 6),
+        (1, 1, 0, 3, 7),
         (1, 1, 0, 4, 0),
         (1, 1, 0, 4, 1),
         (1, 1, 0, 4, 2),
@@ -415,6 +461,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 4, 4),
         (1, 1, 0, 4, 5),
         (1, 1, 0, 4, 6),
+        (1, 1, 0, 4, 7),
         (1, 1, 0, 5, 0),
         (1, 1, 0, 5, 1),
         (1, 1, 0, 5, 2),
@@ -422,6 +469,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 0, 5, 4),
         (1, 1, 0, 5, 5),
         (1, 1, 0, 5, 6),
+        (1, 1, 0, 5, 7),
         (1, 1, 1, 0, 0),
         (1, 1, 1, 0, 1),
         (1, 1, 1, 0, 2),
@@ -429,6 +477,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 0, 4),
         (1, 1, 1, 0, 5),
         (1, 1, 1, 0, 6),
+        (1, 1, 1, 0, 7),
         (1, 1, 1, 1, 0),
         (1, 1, 1, 1, 1),
         (1, 1, 1, 1, 2),
@@ -436,6 +485,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 1, 4),
         (1, 1, 1, 1, 5),
         (1, 1, 1, 1, 6),
+        (1, 1, 1, 1, 7),
         (1, 1, 1, 2, 0),
         (1, 1, 1, 2, 1),
         (1, 1, 1, 2, 2),
@@ -443,6 +493,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 2, 4),
         (1, 1, 1, 2, 5),
         (1, 1, 1, 2, 6),
+        (1, 1, 1, 2, 7),
         (1, 1, 1, 3, 0),
         (1, 1, 1, 3, 1),
         (1, 1, 1, 3, 2),
@@ -450,6 +501,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 3, 4),
         (1, 1, 1, 3, 5),
         (1, 1, 1, 3, 6),
+        (1, 1, 1, 3, 7),
         (1, 1, 1, 4, 0),
         (1, 1, 1, 4, 1),
         (1, 1, 1, 4, 2),
@@ -457,6 +509,7 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 4, 4),
         (1, 1, 1, 4, 5),
         (1, 1, 1, 4, 6),
+        (1, 1, 1, 4, 7),
         (1, 1, 1, 5, 0),
         (1, 1, 1, 5, 1),
         (1, 1, 1, 5, 2),
@@ -464,5 +517,6 @@ pub fn alab_identity_claims_model() -> Model {
         (1, 1, 1, 5, 4),
         (1, 1, 1, 5, 5),
         (1, 1, 1, 5, 6),
+        (1, 1, 1, 5, 7),
     }
 }

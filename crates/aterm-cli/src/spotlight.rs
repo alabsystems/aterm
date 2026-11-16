@@ -517,6 +517,7 @@ fn mdfind(dir: &Path, pattern: &str) -> Result<String, String> {
         || mdfind_run(dir, pattern, true),
         || mdfind_run(dir, pattern, false),
     )
+    .map_err(|why| format!("Spotlight query {pattern:?} under {dir:?}: {why}"))
 }
 
 /// `list`'s answer, or nothing when `count` says there is nothing to list; a count that reads

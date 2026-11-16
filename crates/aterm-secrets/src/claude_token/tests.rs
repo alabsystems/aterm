@@ -10,7 +10,9 @@ use super::*;
 use crate::claude_token::{
     Check, ExpiryFrom, Key, Lookup, Meta, MintedBy, Mismatch, SOON_SECS, Standing, State, Verified,
 };
+use crate::membership_log::MemberId;
 use crate::membership_log::entries::OUTER_ONLY;
+use std::collections::BTreeSet;
 
 /// The fixture token: inert, in the setup-token grammar.
 const TOKEN: &[u8] = concat!("sk-ant-", "oat01-inert_fixture-token-0123456789").as_bytes();
@@ -358,11 +360,12 @@ fn a_value_outside_the_grammar_or_the_draft_is_mismatched() {
 /// A NEW TOKEN IS `unverified` UNTIL VERIFIED, THEN `active`, `soon` AND `ended` BY THE CLOCK,
 /// AND ITS ROUTE SAYS WHERE IT IS IN USE MEANWHILE: m7 made it in aterm's window, so it is in use
 /// on every Mac from mint, m7 and m22 alike ([`Standing::serves_here`]). m7's `--replace` made at
-/// a terminal is in use on m7 alone until m7 verifies it, in one draft that keeps its route; then
-/// it is `active` on every Mac, and it turns `soon` within 30 days of its end and `ended` at it.
-/// Another Mac's `verify` is refused. NEGATIVE CONTROL: a route that serves nothing beyond its
-/// minting Mac (`MintedBy::serves_unverified` keyed on `minted_here` alone) fails `in use on every
-/// Mac from mint`.
+/// a terminal is in use on m7 alone until a Mac verifies it: m22, which did not mint it, does, in
+/// one draft that keeps its route, and the verification names m22, whatever its evidence said;
+/// then it is `active` on every Mac, and it turns `soon` within 30 days of its end and `ended` at
+/// it. NEGATIVE CONTROL: a route that serves nothing beyond its minting Mac
+/// (`MintedBy::serves_unverified` keyed on `minted_here` alone) fails `in use on every Mac from
+/// mint`; with the minting Mac's gate on `verify` put back, m22's verification is refused.
 #[test]
 fn a_token_is_unverified_until_verified_then_active_soon_and_ended_by_the_clock() {
     let lab = Lab::new().minted_by(Some(MintedBy::Window));
@@ -436,19 +439,23 @@ fn a_token_is_unverified_until_verified_then_active_soon_and_ended_by_the_clock(
         seven_day_resets_at: Some(now + 86_400),
         five_hour_resets_at: None,
     };
-    assert!(matches!(
-        crate::claude_token::verify(m22, &key(), made, evidence.clone(), refuse()).unwrap(),
-        MemberWritten::Refused(_)
-    ));
     assert_eq!(
-        crate::claude_token::verify(m7, &key(), made, evidence.clone(), refuse()).unwrap(),
-        MemberWritten::Posted
+        crate::claude_token::verify(m22, &key(), made, evidence.clone(), refuse()).unwrap(),
+        MemberWritten::Posted,
+        "a Mac that did not mint the token verifies it"
     );
     sync(m22, None).unwrap();
     let verified = standing_of(m22);
     assert_eq!(verified.check, Check::Readable, "verify writes one draft");
     let stamped = verified.meta.as_ref().expect("a meta");
-    assert_eq!(stamped.verified, Some(evidence));
+    assert_eq!(
+        stamped.verified,
+        Some(Verified {
+            on: "m22".into(),
+            ..evidence
+        }),
+        "the verification names the Mac that wrote it"
+    );
     assert_eq!(
         stamped.minted_by,
         Some(MintedBy::Terminal),
@@ -1678,9 +1685,13 @@ fn a_need_of_a_token_ends_once_a_token_in_use_arrives_and_no_file_holds_it() {
     let Lookup::Found(verified) = crate::claude_token::standing(&lab.m40, &key()).unwrap() else {
         panic!("m40 reads the token's standing");
     };
-    assert!(crate::claude_token::note_refused(&lab.m40, &verified, now).unwrap());
+    assert!(crate::claude_token::note_refused(&lab.m40, &verified, 401, now).unwrap());
+    assert_eq!(
+        crate::claude_token::refused_status(&lab.m40, &verified),
+        Some(401)
+    );
     assert!(
-        !crate::claude_token::note_refused(&lab.m40, &verified, now + 60).unwrap(),
+        !crate::claude_token::note_refused(&lab.m40, &verified, 401, now + 60).unwrap(),
         "the first refusal stands"
     );
     let Lookup::Found(refused) = crate::claude_token::standing(&lab.m40, &key()).unwrap() else {
@@ -1729,5 +1740,802 @@ fn a_need_of_a_token_ends_once_a_token_in_use_arrives_and_no_file_holds_it() {
             .any(|file| holds_token_value(&std::fs::read(file).unwrap())),
         "CONTROL: the scan finds a file that holds part of it"
     );
+    lab.macs.server.stop();
+}
+
+/// A third fixture token, inert too: another Mac's concurrent `--replace`.
+const THIRD: &[u8] = concat!("sk-ant-", "oat01-inert_fixture-token-concurrent").as_bytes();
+
+/// The fixture meta, made in aterm's window, carrying a refutation by `on` at `now`, as a later
+/// build writes one (FL-132): a meta of schema 2, which no build that reads only schema 1 parses,
+/// so none can write it back without the refutation.
+fn refuted_json(on: &str, now: u64) -> String {
+    let json = Meta {
+        minted_by: Some(MintedBy::Window),
+        ..meta(a_year())
+    }
+    .to_json();
+    assert!(json.contains(r#""schema":1"#), "PRECONDITION: {json}");
+    json.replacen(r#""schema":1"#, r#""schema":2"#, 1).replacen(
+        '{',
+        &format!(
+            r#"{{"refuted":{{"on":"{on}","at":{now},"seven_day_resets_at":{},"five_hour_resets_at":null}},"#,
+            now + 86_400
+        ),
+        1,
+    )
+}
+
+/// m7 verifies its window-made token while m22, which has not read that verification, writes the
+/// pair again with a refuted meta (schema 2): two concurrent drafts, and every Mac syncs. Returns
+/// the refuted meta's bytes.
+fn verified_and_refuted(lab: &Lab, now: u64) -> String {
+    let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
+    assert_eq!(
+        crate::claude_token::verify(m7, &key(), meta(0).minted_at, verified_at(now), refuse())
+            .unwrap(),
+        MemberWritten::Posted
+    );
+    let refuted = refuted_json("m22", now);
+    test_put_everyone_draft(
+        m22,
+        &[
+            (&key().entry(), TOKEN),
+            (&key().meta_entry(), refuted.as_bytes()),
+        ],
+    )
+    .unwrap();
+    lab.sync_all();
+    refuted
+}
+
+/// `paths`' settle of the pair at `now`.
+fn settle_at(paths: &Paths, now: u64) -> crate::claude_token::Settled {
+    crate::claude_token::settle(paths, &key(), now, soon()).unwrap()
+}
+
+/// `paths`' settle of the pair now.
+fn settle(paths: &Paths) -> crate::claude_token::Settled {
+    settle_at(paths, aterm_time::unix_secs().unwrap())
+}
+
+impl Lab {
+    /// The Mac labelled `label`.
+    fn named(&self, label: &str) -> &Paths {
+        match label {
+            "m22" => &self.macs.m22,
+            "m7" => &self.macs.m7,
+            "m40" => &self.m40,
+            _ => panic!("no Mac {label}"),
+        }
+    }
+
+    /// The seat of the Mac labelled `label`, as m22's log holds it.
+    fn seat(&self, label: &str) -> MemberId {
+        let log = log_of(&self.macs.m22);
+        let membership = log.membership_ref();
+        membership
+            .members()
+            .keys()
+            .copied()
+            .find(|seat| membership.label(seat) == Some(label))
+            .expect("a seat")
+    }
+
+    /// `labels` in seat order: the order a settle's turns take them in.
+    fn by_seat<'a>(&self, labels: &[&'a str]) -> Vec<&'a str> {
+        let mut ordered = labels.to_vec();
+        ordered.sort_by_key(|label| self.seat(label));
+        ordered
+    }
+}
+
+/// The value the register `name` holds on `paths`' log, its winner opened from its inner seal:
+/// what a settle wrote, whether or not this build reads the pair it stands in.
+fn held_value(paths: &Paths, name: &str) -> Option<Vec<u8>> {
+    let identity = crate::client::machine_identity(paths).unwrap();
+    let log = log_of(paths);
+    let opened = log.open_audience_entries(&identity).unwrap()?;
+    let value = &opened
+        .by_audience
+        .get(&Audience::Everyone)?
+        .get(name)?
+        .value;
+    match crate::membership_log::entries::inner::of(value.as_slice()) {
+        crate::membership_log::entries::inner::Form::Opened(bytes) => Some(bytes.to_vec()),
+        _ => None,
+    }
+}
+
+/// How many ops the register `name` holds on `paths`' log.
+fn ops_of(paths: &Paths, name: &str) -> usize {
+    let identity = crate::client::machine_identity(paths).unwrap();
+    let log = log_of(paths);
+    let opened = log
+        .open_audience_entries(&identity)
+        .unwrap()
+        .expect("opens");
+    opened.everyone_ops(name).len()
+}
+
+/// TWO MACS' CONCURRENT VERIFY AND REFUTE ARE SETTLED BY ONE WRITE, WITH NO NEW MINT: m7's
+/// verification and m22's refutation (a meta of schema 2, as a later build writes it) of the same
+/// token split the pair: `mismatched (draft)` on every Mac, whichever sibling wins the meta's
+/// register, the refutation this build does not parse included. Their writers are m7 and m22, so
+/// the one with the lower seat settles at once; the other writer and m40 read `Theirs`, naming
+/// it, and write nothing. It writes the token again beside the refuted meta, byte for byte (a
+/// refutation outweighs a verification), in one draft: every Mac reads one draft, of a schema it
+/// does not read (`mismatched (value)`, served nowhere), holding the same token. A later
+/// verification is refused, and a second settle finds nothing. NEGATIVE CONTROL (by hand, then
+/// restored): with `merged_meta`'s merit reversed, the pair reads `active`.
+#[test]
+fn a_concurrent_verify_and_refute_are_settled_by_one_seat_with_no_new_mint() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let now = aterm_time::unix_secs().unwrap();
+    let refuted = verified_and_refuted(&lab, now);
+    for paths in lab.all() {
+        let split = read(paths);
+        assert_eq!(split.standing.check, Check::Mismatched(Mismatch::Draft));
+        assert!(split.token().is_none(), "a split pair serves nothing");
+    }
+    let [settler, other] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    let before = convergence::ids(lab.named(other));
+    for waits in [other, "m40"] {
+        assert_eq!(
+            settle(lab.named(waits)),
+            Settled::Theirs(settler.into()),
+            "{waits}"
+        );
+    }
+    assert_eq!(
+        convergence::ids(lab.named(other)),
+        before,
+        "a Mac whose turn it is not signs nothing"
+    );
+    assert_eq!(
+        settle(lab.named(settler)),
+        Settled::Written(MemberWritten::Posted)
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        let read = read(paths);
+        assert_eq!(
+            read.standing.check,
+            Check::Mismatched(Mismatch::Value),
+            "one draft, of a schema this build does not read"
+        );
+        assert!(read.token().is_none(), "served nowhere");
+        assert_eq!(
+            held_value(paths, &key().entry()).as_deref(),
+            Some(TOKEN),
+            "the same token: nothing minted"
+        );
+        assert_eq!(
+            held_value(paths, &key().meta_entry()).as_deref(),
+            Some(refuted.as_bytes()),
+            "the refutation, byte for byte"
+        );
+    }
+    assert!(matches!(
+        crate::claude_token::verify(
+            &lab.macs.m7,
+            &key(),
+            meta(0).minted_at,
+            verified_at(now),
+            refuse()
+        )
+        .unwrap(),
+        MemberWritten::Refused(why) if why.contains("mismatched (value)")
+    ));
+    assert_eq!(settle(lab.named(settler)), Settled::Nothing, "settled once");
+    lab.macs.server.stop();
+}
+
+/// TWO CONCURRENT VERIFICATIONS SETTLE TO A VERIFIED PAIR: m7 and m22 each verify m7's token
+/// before reading the other's, so the pair splits; the writer with the lower seat settles it with
+/// one of the two verified metas, and every Mac reads it `active`, the token the one minted.
+#[test]
+fn two_concurrent_verifications_settle_to_a_verified_pair() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
+    let now = aterm_time::unix_secs().unwrap();
+    for paths in [m7, m22] {
+        assert_eq!(
+            crate::claude_token::verify(
+                paths,
+                &key(),
+                meta(0).minted_at,
+                verified_at(now),
+                refuse()
+            )
+            .unwrap(),
+            MemberWritten::Posted
+        );
+    }
+    lab.sync_all();
+    assert_eq!(standing_of(m7).check, Check::Mismatched(Mismatch::Draft));
+    let [settler, other] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    assert_eq!(settle(lab.named(other)), Settled::Theirs(settler.into()));
+    assert_eq!(
+        settle(lab.named(settler)),
+        Settled::Written(MemberWritten::Posted)
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        let standing = standing_of(paths);
+        assert_eq!(standing.check, Check::Readable);
+        assert_eq!(standing.state(now), State::Active);
+        let on = &standing
+            .meta
+            .as_ref()
+            .unwrap()
+            .verified
+            .as_ref()
+            .unwrap()
+            .on;
+        assert!(on == "m7" || on == "m22", "{on}");
+        assert!(returns_token(paths));
+    }
+    lab.macs.server.stop();
+}
+
+/// Twelve accounts' keys: which of two concurrent ops a register puts first is the order of two
+/// record ids, so a rule that follows it holds on some keys and not others.
+fn twelve_keys() -> Vec<Key> {
+    (0..12)
+        .map(|n| Key::parse(&format!("ac-{n:016x}")).unwrap())
+        .collect()
+}
+
+/// `paths`' read of `key`'s pair.
+fn read_of(paths: &Paths, key: &Key) -> crate::claude_token::TokenRead {
+    match crate::claude_token::read(paths, key, std::time::Duration::from_secs(60)).unwrap() {
+        Lookup::Found(read) => read,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// CONCURRENT REPLACEMENTS SETTLE ON THE LATEST MINT, BY ITS WRITER (FL-134): for each of twelve
+/// accounts, m7 and m22, neither having read the other's, replace the token at once, one with a
+/// token made at 2 000 and the other with one made at 3 000; which Mac makes the later mint
+/// alternates by account, so neither the register's winner nor seat order picks it. Exactly one
+/// Mac settles each, the writer of the later mint: the others read `Theirs` naming it. Every Mac
+/// then reads one draft holding the later mint beside its own meta, whichever token won the
+/// register, so the Mac whose row moved to the later token never holds a row of a token the
+/// settle dropped. NEGATIVE CONTROLS (by hand, then restored): with the kept token the register's
+/// winner, an account whose register puts the earlier mint first settles on it; with the kept
+/// token the lowest seat's (`Reverse` of its draft's seat for `minted_at_of`), half the accounts
+/// settle on the earlier mint, by its writer, in every run.
+#[test]
+fn concurrent_replacements_settle_on_the_latest_mint_by_its_writer() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new();
+    let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
+    let keys = twelve_keys();
+    let now = aterm_time::unix_secs().unwrap();
+    for key in &keys {
+        let minted = crate::claude_token::write(
+            m7,
+            key,
+            &SecretBytes::from(TOKEN),
+            &meta(a_year()),
+            refuse(),
+        )
+        .unwrap();
+        assert_eq!(minted, MemberWritten::Posted);
+    }
+    lab.sync_all();
+    // The Mac that makes the later mint of each account: m7 for the even ones, m22 for the odd.
+    let later = |at: usize| if at % 2 == 0 { "m7" } else { "m22" };
+    for (at, key) in keys.iter().enumerate() {
+        let (earlier, latest) = if later(at) == "m7" {
+            (m22, m7)
+        } else {
+            (m7, m22)
+        };
+        for (paths, token, minted_at) in [(earlier, NEXT, 2_000), (latest, THIRD, 3_000)] {
+            let replaced = crate::claude_token::write(
+                paths,
+                key,
+                &SecretBytes::from(token),
+                &Meta {
+                    minted_at,
+                    ..meta(a_year())
+                },
+                refuse(),
+            )
+            .unwrap();
+            assert_eq!(replaced, MemberWritten::Posted);
+        }
+    }
+    lab.sync_all();
+    for (at, key) in keys.iter().enumerate() {
+        assert_eq!(
+            read_of(m7, key).standing.check,
+            Check::Mismatched(Mismatch::Draft)
+        );
+        let settled: Vec<(&str, Settled)> = ["m22", "m7", "m40"]
+            .into_iter()
+            .map(|label| {
+                let settled =
+                    crate::claude_token::settle(lab.named(label), key, now, soon()).unwrap();
+                (label, settled)
+            })
+            .collect();
+        for (label, settled) in &settled {
+            let want = if *label == later(at) {
+                Settled::Written(MemberWritten::Posted)
+            } else {
+                Settled::Theirs(later(at).to_owned())
+            };
+            assert_eq!(*settled, want, "{key:?} on {label}: {settled:?}");
+        }
+    }
+    lab.sync_all();
+    for key in &keys {
+        for paths in lab.all() {
+            let read = read_of(paths, key);
+            assert_eq!(read.standing.check, Check::Readable, "one draft");
+            assert!(read.token().is_some_and(|held| held.as_slice() == THIRD));
+            assert_eq!(read.standing.meta.as_ref().unwrap().minted_at, 3_000);
+        }
+    }
+    lab.macs.server.stop();
+}
+
+/// A RESEAL BETWEEN CONCURRENT WRITES AND THEIR SETTLE PAIRS NO TOKEN WITH ANOTHER TOKEN'S META
+/// (FL-134): for each of twelve accounts, m22 verifies m7's window token while m7, not having read
+/// that, replaces it with a terminal one (made at 2 000), and every Mac receives both: the token's
+/// register holds the replacement alone, the meta's both metas. Before any settle, m40 seals every
+/// entry again under a fresh epoch (a member unset of another name): its reseal re-puts each
+/// register's winner in one draft of its own, which for the meta may be m22's verification of the
+/// replaced token, beside the replacement. That re-put carries each value; it writes no pair. The
+/// settle, made by whichever Mac's turn it is, still puts the replacement beside its own meta,
+/// unverified, on every account: a verification of the token a replacement replaced never marks
+/// the replacement, through a reseal either. NEGATIVE CONTROL (by hand, then restored): with each
+/// meta paired by its own draft, not the draft of the write it carries (`settle` reading
+/// `draft_of(id)` for `draft_of(&opened.stands_for(id))`), an account whose meta register's winner
+/// is m22's verification settles the replacement under it.
+#[test]
+fn a_reseal_before_the_settle_pairs_no_token_with_another_tokens_meta() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new();
+    let (m22, m7, m40) = (&lab.macs.m22, &lab.macs.m7, &lab.m40);
+    let now = aterm_time::unix_secs().unwrap();
+    let keys = twelve_keys();
+    let minted = Meta {
+        minted_by: Some(MintedBy::Window),
+        ..meta(a_year())
+    };
+    let replacement = Meta {
+        minted_at: 2_000,
+        minted_by: Some(MintedBy::Terminal),
+        ..meta(a_year())
+    };
+    for key in &keys {
+        assert_eq!(
+            crate::claude_token::write(m7, key, &SecretBytes::from(TOKEN), &minted, refuse())
+                .unwrap(),
+            MemberWritten::Posted
+        );
+    }
+    lab.sync_all();
+    for key in &keys {
+        assert_eq!(
+            crate::claude_token::verify(m22, key, minted.minted_at, verified_at(now), refuse())
+                .unwrap(),
+            MemberWritten::Posted
+        );
+        // m7 has not read m22's verification.
+        assert_eq!(
+            crate::claude_token::write(m7, key, &SecretBytes::from(NEXT), &replacement, refuse())
+                .unwrap(),
+            MemberWritten::Posted
+        );
+    }
+    lab.sync_all();
+    assert_eq!(
+        member_unset(m40, "shared", soon()).unwrap(),
+        MemberUnset::Posted,
+        "m40 seals every entry again"
+    );
+    lab.sync_all();
+    for key in &keys {
+        assert_eq!(
+            read_of(m40, key).standing.check,
+            Check::Mismatched(Mismatch::Draft),
+            "CONTROL: still concurrent after the reseal"
+        );
+        let wrote: Vec<&str> = ["m22", "m7", "m40"]
+            .into_iter()
+            .filter(|label| {
+                crate::claude_token::settle(lab.named(label), key, now, soon()).unwrap()
+                    == Settled::Written(MemberWritten::Posted)
+            })
+            .collect();
+        assert_eq!(wrote.len(), 1, "{key:?}: one Mac's turn: {wrote:?}");
+    }
+    lab.sync_all();
+    for key in &keys {
+        for paths in lab.all() {
+            let read = read_of(paths, key);
+            assert_eq!(read.standing.check, Check::Readable, "one draft");
+            assert!(
+                read.token().is_some_and(|held| held.as_slice() == NEXT),
+                "the replacement"
+            );
+            assert_eq!(
+                read.standing.meta.as_ref(),
+                Some(&replacement),
+                "{key:?}: the replacement beside its own meta, never compared"
+            );
+        }
+    }
+    lab.macs.server.stop();
+}
+
+/// A REFUTED TOKEN NEVER OUTRANKS A CONCURRENT REPLACEMENT (FL-134 review): m7 stores a token made
+/// at 3 000, and m22, having read it, refutes it (a later build's schema-2 meta, the token put
+/// again beside it), while m40, having read neither, stores a token made at 2 000 by its own
+/// clock. The pair reads `mismatched (draft)`. The token kept is m40's, though its mint is the
+/// earlier: a refuted token is never served, so a settle that kept it would leave the account
+/// with no token any Mac uses, beside one that may still verify. Exactly one Mac writes (m40,
+/// the kept pair's writer), and every Mac then reads m40's token beside its own meta. NEGATIVE
+/// CONTROL (by hand, then restored): with the settle's ranking by `minted_at` alone, the refuted
+/// token is kept.
+#[test]
+fn a_refuted_token_never_outranks_a_concurrent_replacement() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new();
+    let (m22, m7, m40) = (&lab.macs.m22, &lab.macs.m7, &lab.m40);
+    let now = aterm_time::unix_secs().unwrap();
+    let later = Meta {
+        minted_at: 3_000,
+        minted_by: Some(MintedBy::Window),
+        ..meta(a_year())
+    };
+    assert_eq!(
+        crate::claude_token::write(m7, &key(), &SecretBytes::from(THIRD), &later, refuse())
+            .unwrap(),
+        MemberWritten::Posted
+    );
+    sync(m22, None).unwrap();
+    let refuted = refuted_json("m22", now);
+    assert!(
+        refuted.contains(r#""minted_at":1000"#),
+        "PRECONDITION: {refuted}"
+    );
+    let refuted = refuted.replacen(r#""minted_at":1000"#, r#""minted_at":3000"#, 1);
+    test_put_everyone_draft(
+        m22,
+        &[
+            (&key().entry(), THIRD),
+            (&key().meta_entry(), refuted.as_bytes()),
+        ],
+    )
+    .unwrap();
+    let earlier = Meta {
+        minted_at: 2_000,
+        minted_on: "m40".into(),
+        ..meta(a_year())
+    };
+    // m40 has read neither m7's token nor m22's refutation.
+    assert_eq!(
+        crate::claude_token::write(m40, &key(), &SecretBytes::from(NEXT), &earlier, refuse())
+            .unwrap(),
+        MemberWritten::Posted
+    );
+    lab.sync_all();
+    assert_eq!(standing_of(m7).check, Check::Mismatched(Mismatch::Draft));
+    let settled: Vec<(&str, Settled)> = ["m22", "m7", "m40"]
+        .into_iter()
+        .map(|label| (label, settle_at(lab.named(label), now)))
+        .collect();
+    for (label, settled) in &settled {
+        let want = if *label == "m40" {
+            Settled::Written(MemberWritten::Posted)
+        } else {
+            Settled::Theirs("m40".to_owned())
+        };
+        assert_eq!(*settled, want, "{label}: {settled:?}");
+    }
+    lab.sync_all();
+    for paths in lab.all() {
+        let read = read(paths);
+        assert_eq!(read.standing.check, Check::Readable, "one draft");
+        assert!(
+            read.token().is_some_and(|held| held.as_slice() == NEXT),
+            "the replacement no Mac refuted"
+        );
+        assert_eq!(read.standing.meta.as_ref(), Some(&earlier));
+    }
+    lab.macs.server.stop();
+}
+
+/// A VERIFICATION THAT RACES A REPLACEMENT NEVER LENDS THE NEW TOKEN ITS META: m22 verifies m7's
+/// token while m7, before reading that verification, replaces it (`claude_token::write`, a token
+/// made at 2 000). m22's draft puts the token it compared again beside its verified meta; that
+/// put of a value the register held is taken out by m7's replacement, made over the token it
+/// carries, so the token's register holds m7's token alone while the meta's holds both metas, and
+/// the pair reads `mismatched (draft)`. The settle keeps only the meta whose draft wrote a token
+/// the register holds: every Mac then reads m7's new token beside its own meta, unverified and
+/// made at 2 000, never beside the verification of the token it replaced. NEGATIVE CONTROL (by
+/// hand, then restored): with the settle's draft filter cut, the verified meta of the token made
+/// at 1 000 lands beside the new token.
+#[test]
+fn a_verification_racing_a_replacement_settles_to_the_new_token_beside_its_own_meta() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
+    let now = aterm_time::unix_secs().unwrap();
+    assert_eq!(
+        crate::claude_token::verify(m22, &key(), meta(0).minted_at, verified_at(now), refuse())
+            .unwrap(),
+        MemberWritten::Posted,
+        "m22 verifies the token it compared"
+    );
+    let replaced = crate::claude_token::write(
+        m7,
+        &key(),
+        &SecretBytes::from(NEXT),
+        &Meta {
+            minted_at: 2_000,
+            ..meta(a_year())
+        },
+        refuse(),
+    )
+    .unwrap();
+    assert_eq!(replaced, MemberWritten::Posted, "m7 replaces it meanwhile");
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(standing_of(paths).check, Check::Mismatched(Mismatch::Draft));
+        assert_eq!(
+            ops_of(paths, &key().entry()),
+            1,
+            "PRECONDITION: the replacement took the verification's put of the old token out"
+        );
+        assert_eq!(ops_of(paths, &key().meta_entry()), 2, "both metas");
+    }
+    let [settler, other] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    assert_eq!(settle(lab.named(other)), Settled::Theirs(settler.into()));
+    assert_eq!(
+        settle(lab.named(settler)),
+        Settled::Written(MemberWritten::Posted)
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        let read = read(paths);
+        assert_eq!(read.standing.check, Check::Readable, "one draft");
+        assert!(
+            read.token().is_some_and(|held| held.as_slice() == NEXT),
+            "m7's new token"
+        );
+        let kept = read.standing.meta.as_ref().expect("a meta");
+        assert_eq!(kept.minted_at, 2_000, "its own meta");
+        assert_eq!(
+            kept.verified, None,
+            "no verification it was never compared for"
+        );
+    }
+    lab.macs.server.stop();
+}
+
+/// TWO CONCURRENT REFUTATIONS OF A LATER SCHEMA READ SPLIT, AND ONE SEAT SETTLES THEM: m7 and m22
+/// each write the pair again refuted (a meta of schema 2, which this build does not parse) before
+/// reading the other's. Whichever wins the meta's register does not parse here, yet every Mac
+/// reads `mismatched (draft)`, not `mismatched (value)`, so the settle is reached: the writer with
+/// the lower seat writes one of the two refutations beside the same token, in one draft, which
+/// every Mac then reads `mismatched (value)` and serves nowhere. NEGATIVE CONTROL (by hand, then
+/// restored): with `judge` parsing the meta before it looks at the drafts, every Mac reads
+/// `mismatched (value)` and nothing reaches the settle.
+#[test]
+fn two_concurrent_refutations_of_a_later_schema_read_split_and_one_seat_settles_them() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let now = aterm_time::unix_secs().unwrap();
+    let refutations = [refuted_json("m7", now), refuted_json("m22", now)];
+    for (paths, refuted) in [&lab.macs.m7, &lab.macs.m22].into_iter().zip(&refutations) {
+        test_put_everyone_draft(
+            paths,
+            &[
+                (&key().entry(), TOKEN),
+                (&key().meta_entry(), refuted.as_bytes()),
+            ],
+        )
+        .unwrap();
+    }
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(
+            standing_of(paths).check,
+            Check::Mismatched(Mismatch::Draft),
+            "split, though the meta that wins does not parse here"
+        );
+    }
+    let [settler, other] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    assert_eq!(settle(lab.named(other)), Settled::Theirs(settler.into()));
+    assert_eq!(
+        settle(lab.named(settler)),
+        Settled::Written(MemberWritten::Posted)
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        let read = read(paths);
+        assert_eq!(read.standing.check, Check::Mismatched(Mismatch::Value));
+        assert!(read.token().is_none(), "served nowhere");
+        assert_eq!(held_value(paths, &key().entry()).as_deref(), Some(TOKEN));
+        let meta = held_value(paths, &key().meta_entry()).expect("a meta");
+        assert!(
+            refutations.iter().any(|refuted| refuted.as_bytes() == meta),
+            "one of the two refutations"
+        );
+    }
+    assert_eq!(settle(lab.named(settler)), Settled::Nothing, "settled once");
+    lab.macs.server.stop();
+}
+
+/// A SEAT WHOSE TURN PASSES HANDS THE SETTLE ON: m7's verification and m22's refutation split the
+/// pair, and the writer with the lower seat never settles it (off the LAN, asleep, or on a build
+/// with no settle). Its turn lasts [`crate::claude_token::SETTLE_TURN_SECS`] from the split: then
+/// the other writer's turn begins, and the first reads `Theirs` naming it; a turn later m40's, a
+/// Mac that wrote nothing, which settles it there. Every Mac then reads one draft.
+#[test]
+fn a_seat_whose_turn_passes_hands_the_settle_on() {
+    use crate::claude_token::{SETTLE_TURN_SECS, Settled};
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let _ = verified_and_refuted(&lab, aterm_time::unix_secs().unwrap());
+    // Read after both drafts, so no turn below is measured from before the split.
+    let now = aterm_time::unix_secs().unwrap();
+    let [first, second] = lab.by_seat(&["m22", "m7"])[..] else {
+        unreachable!()
+    };
+    for (at, turn) in [(now, first), (now + SETTLE_TURN_SECS, second)] {
+        for label in ["m22", "m7", "m40"]
+            .into_iter()
+            .filter(|label| *label != turn)
+        {
+            assert_eq!(
+                settle_at(lab.named(label), at),
+                Settled::Theirs(turn.into()),
+                "{label} at +{}",
+                at - now
+            );
+        }
+    }
+    let later = now + 2 * SETTLE_TURN_SECS;
+    for label in [first, second] {
+        assert_eq!(
+            settle_at(lab.named(label), later),
+            Settled::Theirs("m40".into()),
+            "{label}: m40's turn"
+        );
+    }
+    assert_eq!(
+        settle_at(&lab.m40, later),
+        Settled::Written(MemberWritten::Posted),
+        "m40 settles a pair it never wrote"
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        assert_eq!(standing_of(paths).check, Check::Mismatched(Mismatch::Value));
+        assert_eq!(held_value(paths, &key().entry()).as_deref(), Some(TOKEN));
+    }
+    lab.macs.server.stop();
+}
+
+/// TURNS ARE SEATS, NEVER LABELS: the order a settle's turns take is the token winner's writer
+/// (where named), then the other writers, then every other seat, each group in seat order, each
+/// turn [`crate::claude_token::SETTLE_TURN_SECS`] long from the split, round and round. Two seats
+/// are two turns whatever their labels (two Macs that both took `m40-3fa2` stay two seats), so
+/// one seat settles at a time. A clock behind the split reads the first turn; no seat, none.
+#[test]
+fn settle_turns_are_seats_in_order_never_labels() {
+    use crate::claude_token::{SETTLE_TURN_SECS, settle_turn};
+    let seat = |n: u8| [n; 48];
+    let writers = BTreeSet::from([seat(9), seat(2)]);
+    let members = BTreeSet::from([seat(1), seat(2), seat(5), seat(9)]);
+    let split = 1_000_000;
+    let turns = |first: Option<MemberId>| {
+        (0..6)
+            .map(|turn| {
+                settle_turn(
+                    first,
+                    &writers,
+                    &members,
+                    split,
+                    split + turn * SETTLE_TURN_SECS,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        turns(None),
+        [2, 9, 1, 5, 2, 9].map(|n| Some(seat(n))),
+        "writers first, then the other seats, each in seat order, round and round"
+    );
+    assert_eq!(
+        turns(Some(seat(9))),
+        [9, 2, 1, 5, 9, 2].map(|n| Some(seat(n))),
+        "the token winner's writer first"
+    );
+    assert_eq!(
+        settle_turn(
+            None,
+            &writers,
+            &members,
+            split,
+            split + SETTLE_TURN_SECS - 1
+        ),
+        Some(seat(2)),
+        "a turn lasts its whole length"
+    );
+    assert_eq!(
+        settle_turn(None, &writers, &members, split, split - 3_600),
+        Some(seat(2)),
+        "a clock behind the split reads the first turn"
+    );
+    assert_eq!(
+        settle_turn(None, &BTreeSet::new(), &BTreeSet::new(), split, split),
+        None
+    );
+}
+
+/// A SETTLE NEVER REPLACES A WRITE IT DID NOT READ: the Mac whose turn it is reads the split pair
+/// and, before its draft, its own `--replace` commits another token (as a vault pass applying
+/// another Mac's would). The settle stands on the siblings it read
+/// ([`crate::client::MemberEntry::settles`]), which the log no longer holds: it is refused and
+/// signs nothing, and the replacement stands. NEGATIVE CONTROL (by hand, then restored): with the
+/// draft's check of the settled ops cut, the settle signs the refuted pair over the replacement.
+#[test]
+fn a_settle_never_replaces_a_write_it_did_not_read() {
+    use crate::claude_token::Settled;
+    let lab = Lab::new().minted_by(Some(MintedBy::Window));
+    let now = aterm_time::unix_secs().unwrap();
+    let _ = verified_and_refuted(&lab, now);
+    let settler = lab.named(lab.by_seat(&["m22", "m7"])[0]);
+    let writer = settler.clone();
+    log_entries::BEFORE_DRAFT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let replaced = crate::claude_token::write(
+                &writer,
+                &key(),
+                &SecretBytes::from(NEXT),
+                &Meta {
+                    minted_at: 5_000,
+                    ..meta(a_year())
+                },
+                refuse(),
+            )
+            .unwrap();
+            assert_eq!(replaced, MemberWritten::Posted, "the replacement commits");
+        }));
+    });
+    let settled = settle(settler);
+    assert!(
+        log_entries::BEFORE_DRAFT.with(|slot| slot.borrow_mut().take().is_none()),
+        "the replacement committed between the settle's read and its draft"
+    );
+    assert!(
+        matches!(&settled, Settled::Written(MemberWritten::Refused(why))
+            if why.contains("holds other writes than this settle read")),
+        "{settled:?}"
+    );
+    lab.sync_all();
+    for paths in lab.all() {
+        let read = read(paths);
+        assert_eq!(read.standing.check, Check::Readable);
+        assert!(read.token().is_some_and(|held| held.as_slice() == NEXT));
+        assert_eq!(read.standing.meta.as_ref().unwrap().minted_at, 5_000);
+    }
     lab.macs.server.stop();
 }

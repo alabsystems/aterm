@@ -49,10 +49,19 @@ fn a_client_registration_the_vault_lacks_is_filed_and_one_it_holds_is_read() {
     let want = Want::Entry(entry.to_owned());
     let filed = filed.iter().find(|need| need.want == want).expect("filed");
     assert_eq!(filed.purpose, Purpose::HarnessSignIn);
-    crate::vault_entry::put(home.path(), entry, "{}");
+    crate::vault_entry::put(home.path(), entry, b"{}");
     let read = read_client(home.path())
         .err()
         .expect("an empty registration")
         .message;
     assert!(!read.contains("not in this Mac's vault"), "{read}");
+    assert_eq!(
+        read,
+        failure(
+            oauth::enrollment::Client::decode(b"{}")
+                .err()
+                .expect("empty registration")
+        )
+        .message
+    );
 }

@@ -324,6 +324,22 @@ async function gpuDiff(mod, spec, font, timings, on, canvas) {
     frames.push(presented(canvas, timings))
     await waitFrame(timings)
   }
+  for (const [name, change] of [
+    ['font size', () => term.set_px(spec.px + 4)],
+    ['line height', () => term.set_line_height(1.5)],
+  ]) {
+    const before = [canvas.width, canvas.height]
+    change()
+    term.set_chrome(0, 0)
+    term.render_offscreen()
+    if (term.width === before[0] && term.height === before[1]) {
+      throw new Error(`${name}: fixture did not change the framebuffer geometry`)
+    }
+    if (canvas.width !== term.width || canvas.height !== term.height) {
+      throw new Error(`unchanged chrome after ${name}: canvas ${canvas.width}x${canvas.height} differs from frame ${term.width}x${term.height}`)
+    }
+    term.render()
+  }
   t0 = performance.now()
   term.free()
   timings.free_ms = Math.round((timings.free_ms + ms(t0)) * 1000) / 1000

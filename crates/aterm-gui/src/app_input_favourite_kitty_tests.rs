@@ -79,10 +79,8 @@ fn favourite_promotes_the_launch_kitty() {
     assert_eq!(row.iris, look.iris);
 
     assert!(app.windows[&wid].fx.companions().cursor_cat.is_active());
-    let frame = app
-        .windows
-        .get_mut(&wid)
-        .expect("the window is live")
+    let mut payload_guard_frame = app.windows.get_mut(&wid).expect("the window is live");
+    let frame = payload_guard_frame
         .fx
         .companions_mut()
         .cursor_cat
@@ -236,13 +234,8 @@ fn wearing_a_collected_cat_by_name_switches_the_companion() {
         look: KittyLook::for_app("claude"),
     };
     {
-        let gate = app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .look_mut()
-            .tenure_mut();
+        let mut payload_guard_gate = app.windows.get_mut(&wid).expect("window");
+        let gate = payload_guard_gate.fx.look_mut().tenure_mut();
         gate.observe(Some(&claude), t0);
         assert!(
             gate.observe(Some(&claude), t0 + TENURE).is_some(),
@@ -287,11 +280,9 @@ fn wearing_a_collected_cat_by_name_switches_the_companion() {
     );
     let (worn, _) = app.kitty_log.wearable();
     assert_eq!(worn.as_deref(), Some(want.as_str()), "the list agrees");
+    let mut payload_guard_frame = app.windows.get_mut(&wid).expect("the window is live");
 
-    let frame = app
-        .windows
-        .get_mut(&wid)
-        .expect("the window is live")
+    let frame = payload_guard_frame
         .fx
         .companions_mut()
         .cursor_cat
@@ -301,6 +292,7 @@ fn wearing_a_collected_cat_by_name_switches_the_companion() {
         "a deliberate pick is a reason to change the identity"
     );
 
+    drop(payload_guard_frame);
     let before = app.companion_verdict(wid, 0, t0 + TENURE);
     let refused = app
         .wear_kitty(wid, "no-such-cat", t0 + TENURE)
@@ -337,13 +329,8 @@ fn next_kitty_walks_the_collection_and_comes_back_round() {
         look: KittyLook::for_app("claude"),
     };
     {
-        let gate = app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .look_mut()
-            .tenure_mut();
+        let mut window = app.windows.get_mut(&wid).expect("window");
+        let gate = window.fx.look_mut().tenure_mut();
         gate.observe(Some(&claude), t0);
         assert!(gate.observe(Some(&claude), t0 + TENURE).is_some());
     }

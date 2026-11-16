@@ -22,7 +22,7 @@ mod alias_admission_tests;
 #[path = "accounts_provider_commit_tests.rs"]
 mod provider_commit_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "accounts_source_presence_tests.rs"]
 mod source_presence;
 
@@ -32,6 +32,7 @@ mod source_pending;
 const NOW: i64 = 1_792_660_000;
 
 #[test]
+#[cfg(unix)]
 fn refused_empty_pool_fleet_publication_preserves_account_state() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
     let bed = Bed::new("empty-pool-publication");
@@ -88,6 +89,7 @@ fn refused_empty_pool_fleet_publication_preserves_account_state() {
 }
 
 #[test]
+#[cfg(unix)]
 fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
         let member = csv_columns(cli)[0];
@@ -166,6 +168,7 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
 /// naming this Mac alone, a CLI pool's conflict is still named while pending (`left: [SheetConflict
 /// { cli: Codex, .. }] right: []`).
 #[test]
+#[cfg(unix)]
 fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
         let member = csv_columns(cli)[0];
@@ -237,6 +240,7 @@ fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
 /// conflict is still named. NEGATIVE CONTROL: without [`carry_conflicting`] the second sync
 /// drops the row.
 #[test]
+#[cfg(unix)]
 fn a_conflicting_sheet_address_this_machine_lists_keeps_its_row() {
     let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
     let member = "alt@example.test,m16,1,\n";
@@ -292,6 +296,7 @@ fn a_conflicting_sheet_address_this_machine_lists_keeps_its_row() {
 /// no conflict, the plain drop of the CONTROL, one row `alt@,m22`. NEGATIVE CONTROL: a carry
 /// that looked at the address alone kept `m16-2`, while nothing on m16 said why.
 #[test]
+#[cfg(unix)]
 fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
     let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
     for later in [
@@ -359,6 +364,7 @@ fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
 /// against came from the sheet before the carry, which lists no `alt@`, so the wall went
 /// nowhere.
 #[test]
+#[cfg(unix)]
 fn a_row_a_conflict_carries_gets_its_transcript_walls() {
     let head = "email,computer,claude,notes\nkeep@example.test,m16,1,\n";
     let bed = Bed::new("sheet-conflict-walls");
@@ -421,6 +427,7 @@ fn a_row_a_conflict_carries_gets_its_transcript_walls() {
 /// says the CLI and the rows, never the address. CONTROL: the same exits with no conflict say
 /// none. NEGATIVE CONTROL: before, only init, doctor and the upkeep's log said it.
 #[test]
+#[cfg(unix)]
 fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
     let mut wrong = Vec::new();
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -501,6 +508,7 @@ fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
 /// account is missing. CONTROL: a sheet whose rows agree says none. NEGATIVE CONTROL: before,
 /// only the window's digest said it.
 #[test]
+#[cfg(unix)]
 fn an_accounts_sync_names_the_sheets_conflicting_rows() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
         let member = csv_columns(cli)[0];
@@ -569,6 +577,7 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
 /// (the CLI and its rows, never the address) once, again when they change, and once when the
 /// rows agree. NEGATIVE CONTROL: before, the upkeep logged none.
 #[test]
+#[cfg(unix)]
 fn the_upkeep_logs_a_sheet_conflict_once_per_change() {
     let bed = Bed::new("sheet-conflict-log");
     bed.keep_roster(Cli::Kimi);
@@ -640,6 +649,7 @@ fn the_upkeep_logs_a_sheet_conflict_once_per_change() {
 /// the log says once that whether its rows conflict is not known. NEGATIVE CONTROL: before, a
 /// removed or broken sheet was logged as rows that agree.
 #[test]
+#[cfg(unix)]
 fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
     let bed = Bed::new("sheet-conflict-unread");
     bed.keep_roster(Cli::Kimi);
@@ -702,6 +712,7 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
 /// none. That is read once per process ([`detected_machine`]), never two `scutil`s and a
 /// `hostname` per look. NEGATIVE CONTROL: [`machine_for`] asked the host on every call.
 #[test]
+#[cfg(unix)]
 fn a_look_at_the_sheet_asks_the_host_its_name_once() {
     let bed = Bed::new("host-once");
     crate::test_config::write(bed.aterm_toml(), "").unwrap();
@@ -720,6 +731,7 @@ fn a_look_at_the_sheet_asks_the_host_its_name_once() {
 }
 
 #[test]
+#[cfg(unix)]
 fn automatic_sync_refuses_a_new_label_with_retained_login_state() {
     for cli in OTHER_CLIS {
         let bed = Bed::new("retained-sync-label");
@@ -822,11 +834,13 @@ impl Bed {
         accounts::roster_beside_for(&self.aterm_toml(), cli).expect("a roster path")
     }
 
+    #[cfg(unix)]
     fn secrets(&self) -> PathBuf {
         self.home.join(".secrets")
     }
 
     /// Publishes `text` as the vault entry `name` this Mac reads; empty text removes it.
+    #[cfg(unix)]
     fn secret(&self, name: &str, text: &str) {
         crate::vault_entry::seed(&self.home, &[(name, text.as_bytes())]);
     }
@@ -862,6 +876,7 @@ impl Bed {
                         by: "m16".into(),
                         attempts: 1,
                         cleared: false,
+                        seen: None,
                     },
                 )]),
                 ..accounts::Account::default()
@@ -934,6 +949,7 @@ fn read_named(_: &Env, source: &str) -> Result<String, String> {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_source_table_includes_pending_rows_without_a_sync_or_machine_id() {
     let bed = Bed::new("source-table");
     bed.secret(
@@ -1036,6 +1052,7 @@ fn background_signins_refuse_unknown_records_before_dispatch_or_locks() {
 }
 
 #[test]
+#[cfg(unix)]
 fn codex_sync_preserves_explicit_identity_when_appending_a_row() {
     for login in ["email='alias@example.test'\n", ""] {
         for (label, email) in [
@@ -1062,6 +1079,7 @@ fn codex_sync_preserves_explicit_identity_when_appending_a_row() {
     }
 }
 
+#[cfg(unix)]
 const KIMI_FLEET: &str = "\
 [[account]]
 label = \"kimi-1\"
@@ -1077,6 +1095,7 @@ region = \"mainland-cn\"
 ";
 
 /// Claude Code's old fleet file, whose rows are Claude Code's alone.
+#[cfg(unix)]
 const CLAUDE_FLEET: &str = "\
 [[account]]
 label = \"m16\"
@@ -1084,6 +1103,7 @@ email = \"claude-one@example.com\"
 machines = [\"m16\"]
 ";
 
+#[cfg(unix)]
 fn labels(rows: &[&FleetAccount]) -> Vec<String> {
     rows.iter().map(|a| a.label.clone()).collect()
 }
@@ -1093,6 +1113,7 @@ fn labels(rows: &[&FleetAccount]) -> Vec<String> {
 /// Claude Code's old `fleet-accounts.toml` never fills Kimi's pool, beside the vault's file or
 /// alone.
 #[test]
+#[cfg(unix)]
 fn kimis_fleet_file_gives_this_machine_its_rows_and_never_claudes() {
     let fleet = FleetRoster::from_toml_for(Cli::Kimi, KIMI_FLEET, "ai-accounts-kimi.toml")
         .expect("the fixture admits");
@@ -1238,18 +1259,21 @@ fn the_vault_sheets_x_column_is_grok_builds() {
     );
     assert_eq!(grok.roster.accounts[1].vendor.flow, Some(Flow::Device));
 
-    let bed = Bed::new("grok-x-column");
-    bed.keep_roster(Cli::Grok);
-    bed.secret(ACCOUNTS_CSV_FILE, VAULT_SHEET);
-    let Ok(CliSync::Synced(synced)) = bed.sync(Cli::Grok, None) else {
-        panic!("a Grok roster syncs from the vault's sheet");
-    };
-    assert!(
-        synced.source.ends_with(ACCOUNTS_CSV_FILE),
-        "{}",
-        synced.source
-    );
-    assert_eq!(synced.added, ["grok-m16", "grok-m16-3"]);
+    #[cfg(unix)]
+    {
+        let bed = Bed::new("grok-x-column");
+        bed.keep_roster(Cli::Grok);
+        bed.secret(ACCOUNTS_CSV_FILE, VAULT_SHEET);
+        let Ok(CliSync::Synced(synced)) = bed.sync(Cli::Grok, None) else {
+            panic!("a Grok roster syncs from the vault's sheet");
+        };
+        assert!(
+            synced.source.ends_with(ACCOUNTS_CSV_FILE),
+            "{}",
+            synced.source
+        );
+        assert_eq!(synced.added, ["grok-m16", "grok-m16-3"]);
+    }
 
     let codex = parse_accounting_csv_for(Cli::Codex, VAULT_SHEET, "ai-accounts.csv").unwrap();
     assert_eq!(
@@ -1300,6 +1324,7 @@ fn a_notes_x_names_no_vendor_so_x_banned_drops_every_pool() {
 }
 
 #[test]
+#[cfg(unix)]
 fn provider_sync_recovers_missing_login_directories_with_unchanged_roster_bytes() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
 
@@ -1356,6 +1381,7 @@ fn provider_sync_recovers_missing_login_directories_with_unchanged_roster_bytes(
 /// directories under `~/.aterm/logins/kimi/`, and nothing under `~/.secrets`. CONTROL: Claude
 /// Code's sync in the same home still writes its own `fleet-accounts.toml` beside `aterm.toml`.
 #[test]
+#[cfg(unix)]
 fn a_clis_sync_writes_its_roster_beside_aterm_toml_and_nothing_under_secrets() {
     let bed = Bed::new("kimi-writes");
     bed.keep_roster(Cli::Kimi);
@@ -1408,73 +1434,79 @@ fn a_clis_sync_writes_its_roster_beside_aterm_toml_and_nothing_under_secrets() {
 #[test]
 fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources() {
     for cli in OTHER_CLIS {
+        // Off unix only the source check runs; the sync it settles reads a test vault.
+        #[cfg(not(unix))]
+        let _ = cli;
         let bed = Bed::new("resync-pool-source");
         let roster = bed.config.join(accounts::ACCOUNTS_FILE);
         let read = Mutex::new(Rediscovery::default());
         let probe = || read_resync_with(&bed.home, &bed.state, &roster, NOW, &read);
         assert_eq!(probe(), ResyncRead::NoSource);
-        let region = if cli == Cli::Kimi {
-            "region = 'global'\n"
-        } else {
-            ""
-        };
-        let fleet = format!(
-            "[[account]]\nlabel='source-one'\nemail='source-one@example.com'\n\
+        #[cfg(unix)]
+        {
+            let region = if cli == Cli::Kimi {
+                "region = 'global'\n"
+            } else {
+                ""
+            };
+            let fleet = format!(
+                "[[account]]\nlabel='source-one'\nemail='source-one@example.com'\n\
              machines=['m16']\n{region}"
-        );
-        bed.secret(&cli_fleet_file(cli), &fleet);
-        assert!(
-            matches!(probe(), ResyncRead::Due(_)),
-            "{cli:?}: a listed pool syncs by default without a local roster"
-        );
-        bed.keep_roster(cli);
-        assert!(
-            matches!(probe(), ResyncRead::Due(_)),
-            "{cli:?}: a kept roster still has its source"
-        );
-        assert!(fs::read(bed.roster(cli)).unwrap().is_empty());
-        assert!(!bed.state.exists(), "a source read writes no account state");
+            );
+            bed.secret(&cli_fleet_file(cli), &fleet);
+            assert!(
+                matches!(probe(), ResyncRead::Due(_)),
+                "{cli:?}: a listed pool syncs by default without a local roster"
+            );
+            bed.keep_roster(cli);
+            assert!(
+                matches!(probe(), ResyncRead::Due(_)),
+                "{cli:?}: a kept roster still has its source"
+            );
+            assert!(fs::read(bed.roster(cli)).unwrap().is_empty());
+            assert!(!bed.state.exists(), "a source read writes no account state");
 
-        assert!(matches!(bed.sync(cli, None), Ok(CliSync::Synced(_))));
-        assert_eq!(
-            probe(),
-            ResyncRead::Current,
-            "{cli:?}: the actual sync settled its pool"
-        );
+            assert!(matches!(bed.sync(cli, None), Ok(CliSync::Synced(_))));
+            assert_eq!(
+                probe(),
+                ResyncRead::Current,
+                "{cli:?}: the actual sync settled its pool"
+            );
 
-        bed.secret(&cli_fleet_file(cli), "[[account]\n");
-        assert!(
-            matches!(probe(), ResyncRead::Due(_)),
-            "{cli:?}: a refused source must be reported"
-        );
-        let before = Bed::tree(bed._dir.path());
-        assert!(bed.sync(cli, None).is_err());
-        assert_eq!(
-            Bed::tree(bed._dir.path()),
-            before,
-            "a refused source changes no account records"
-        );
-        assert_eq!(
-            crate::vault_entry::read_text(&bed.home, &cli_fleet_file(cli), 1 << 20).text(),
-            Some("[[account]\n")
-        );
-        fs::remove_file(bed.roster(cli)).unwrap();
-        assert!(
-            matches!(probe(), ResyncRead::Due(_)),
-            "{cli:?}: a refused source is reported without a local roster"
-        );
-        crate::test_config::write(
-            bed.aterm_toml(),
-            "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
-        )
-        .unwrap();
-        let before = Bed::tree(bed._dir.path());
-        assert_eq!(
-            resync_for_setup(&bed.home, &bed.state, &roster, NOW, false),
-            Resync::default(),
-            "{cli:?}: Off holds the automatic sync over a refused source"
-        );
-        assert_eq!(Bed::tree(bed._dir.path()), before);
+            bed.secret(&cli_fleet_file(cli), "[[account]\n");
+            assert!(
+                matches!(probe(), ResyncRead::Due(_)),
+                "{cli:?}: a refused source must be reported"
+            );
+            let before = Bed::tree(bed._dir.path());
+            assert!(bed.sync(cli, None).is_err());
+            assert_eq!(
+                Bed::tree(bed._dir.path()),
+                before,
+                "a refused source changes no account records"
+            );
+            assert_eq!(
+                crate::vault_entry::read_text(&bed.home, &cli_fleet_file(cli), 1 << 20).text(),
+                Some("[[account]\n")
+            );
+            fs::remove_file(bed.roster(cli)).unwrap();
+            assert!(
+                matches!(probe(), ResyncRead::Due(_)),
+                "{cli:?}: a refused source is reported without a local roster"
+            );
+            crate::test_config::write(
+                bed.aterm_toml(),
+                "[fleet]\nmachine = 'm16'\n[harness]\naccounts = 'off'\n",
+            )
+            .unwrap();
+            let before = Bed::tree(bed._dir.path());
+            assert_eq!(
+                resync_for_setup(&bed.home, &bed.state, &roster, NOW, false),
+                Resync::default(),
+                "{cli:?}: Off holds the automatic sync over a refused source"
+            );
+            assert_eq!(Bed::tree(bed._dir.path()), before);
+        }
     }
 }
 
@@ -1484,6 +1516,7 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
 /// NEGATIVE CONTROL: a read that never looks at the other CLIs' pools reads the added row as
 /// nothing due.
 #[test]
+#[cfg(unix)]
 fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
     let bed = Bed::new("pool-due");
     bed.keep_roster(Cli::Kimi);
@@ -1568,6 +1601,7 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
 /// The converge reader and a default Codex sync make the same admission: an unlisted machine
 /// or retained row stays out, while a new machine or unrelated retained label can join.
 #[test]
+#[cfg(unix)]
 fn a_default_pools_converge_read_matches_the_syncs_admission() {
     for (tag, machine, retained, admitted) in [
         ("unlisted", "m22", None, false),
@@ -1764,6 +1798,7 @@ fn with_logged_effects<R>(
 
 /// `[harness] accounts = "off"` over a home whose `~/.secrets` holds Claude Code's fleet and
 /// Kimi's, and which keeps a roster of Kimi's; with `off` false, the same home without it.
+#[cfg(unix)]
 fn accounts_bed(tag: &str, off: bool) -> Bed {
     let bed = Bed::new(tag);
     if off {
@@ -1784,6 +1819,7 @@ fn accounts_bed(tag: &str, off: bool) -> Bed {
 /// `sync_cli_accounts_for_init` read no source and write no roster, Claude Code's or Kimi's.
 /// CONTROL: the same home without the switch syncs both pools at each of them.
 #[test]
+#[cfg(unix)]
 fn harness_accounts_off_turns_every_automatic_sync_off() {
     // What each caller left: Claude Code's roster written, and Kimi's holding rows.
     let synced = |bed: &Bed| {
@@ -1873,11 +1909,24 @@ fn harness_accounts_off_turns_every_automatic_sync_off() {
 /// Signs `label` of Kimi's pool in here (a placeholder login file) and marks it signed out, so
 /// its renewal is due; a session here ran on it an hour before `now` and has ended, so this Mac
 /// uses it ([`accounts::used_here`]).
+#[cfg(unix)]
 fn signed_out_kimi_login(bed: &Bed, label: &str, now: i64) {
     let login = bed.home.join(".aterm/logins/kimi").join(label);
     fs::create_dir_all(login.join("credentials")).unwrap();
     fs::write(login.join("credentials/kimi-code.json"), "{}").unwrap();
-    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    signed_out_here(bed, Cli::Kimi, label, now);
+}
+
+/// Marks `label` of `cli`'s pool signed out here on record, a session here having run on it an
+/// hour before `now` ([`used_here`]). Codex's store takes the sign-out staged in the context of the
+/// login its row routes to ([`accounts::stage_login_end`]), as its own reads stage it.
+#[cfg(unix)]
+fn signed_out_here(bed: &Bed, cli: Cli, label: &str, now: i64) {
+    let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+    if cli == Cli::Codex {
+        codex_login_ended(bed, label, (NOW, now), |state| used_here(state, label, now));
+        return;
+    }
     let (mut state, _) = store.load(now).unwrap_or_default();
     let mut logins = accounts::Logins::default();
     let _ = accounts::note_login_end(&mut state, &mut logins, label, NOW);
@@ -1885,8 +1934,34 @@ fn signed_out_kimi_login(bed: &Bed, label: &str, now: i64) {
     store.save(&state).unwrap();
 }
 
+/// Puts the end of the login Codex's row `label` routes to on record at `ended`, staged in that
+/// login's context ([`accounts::stage_login_end`]) as Codex's own reads stage it, in one
+/// transaction at `now` with `then`'s edit.
+#[cfg(unix)]
+fn codex_login_ended(
+    bed: &Bed,
+    label: &str,
+    (ended, now): (i64, i64),
+    then: impl FnOnce(&mut accounts::State),
+) {
+    let store = accounts::Store::at_for(&bed.state, Cli::Codex, &bed.home);
+    let raw = Roster::load_for(Cli::Codex, &bed.roster(Cli::Codex)).unwrap();
+    store
+        .transact_logins(now, &mut None, |state, logins| {
+            let effective = accounts::bound(&raw, logins);
+            let context = store
+                .capture_auth_context(effective.row(label).unwrap())
+                .expect("the row's login here has a context");
+            accounts::stage_login_end(state, raw.row(label).unwrap(), logins, context, ended);
+            then(state);
+            Ok(Vec::new())
+        })
+        .unwrap();
+}
+
 /// A session here ran on `label` an hour before `now` and has ended: this Mac uses its login
 /// ([`accounts::used_here`]), so the upkeep may renew it when it is due.
+#[cfg(unix)]
 fn used_here(state: &mut accounts::State, label: &str, now: i64) {
     let _ = accounts::note_session(state, &format!("ran-{label}"), label, None, now - 3600);
     state
@@ -1895,6 +1970,7 @@ fn used_here(state: &mut accounts::State, label: &str, now: i64) {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_vault_pool_imports_without_a_local_roster() {
     let bed = Bed::new("default-import");
     bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
@@ -1910,6 +1986,7 @@ fn a_vault_pool_imports_without_a_local_roster() {
 /// sign-ins off; Claude Code's own switch leaves them on
 /// ([`each_pools_sign_ins_read_the_harness_and_its_own_switch`] holds the rule for every CLI).
 #[test]
+#[cfg(unix)]
 fn a_kept_pools_due_login_renews_unless_its_sign_ins_are_off() {
     let bed = Bed::new("renew-switches");
     bed.secret(&cli_fleet_file(Cli::Kimi), KIMI_FLEET);
@@ -2130,6 +2207,7 @@ fn claude_roster(bed: &Bed) -> PathBuf {
 }
 
 /// The setup pass's resync over `bed`, renewals inert and no fetch.
+#[cfg(unix)]
 fn resync_over(bed: &Bed) -> Resync {
     with_effects(&|_work| Ok(()), &read_named, |fx| {
         resync_with(&bed.home, &bed.state, (&claude_roster(bed), NOW, false), fx)
@@ -2137,6 +2215,7 @@ fn resync_over(bed: &Bed) -> Resync {
 }
 
 /// Codex's rows of `bed`'s roster, by label.
+#[cfg(unix)]
 fn codex_labels(bed: &Bed) -> Vec<String> {
     bed.rows(Cli::Codex).into_iter().map(|r| r.label).collect()
 }
@@ -2147,6 +2226,7 @@ fn codex_labels(bed: &Bed) -> Vec<String> {
 /// own login (`main`) first, each fleet row with an empty login directory of its own (no login
 /// is copied), and write nothing under `~/.secrets`. Grok Build and Kimi import their rows too.
 #[test]
+#[cfg(unix)]
 fn codex_rows_sync_by_default_with_no_roster_file() {
     let want = [ACCOUNTS_OWN_LABEL, "codex-m16", "codex-m16-2"];
 
@@ -2218,6 +2298,7 @@ fn codex_rows_sync_by_default_with_no_roster_file() {
 /// codex` still syncs. CONTROL: the same home without the switch syncs
 /// ([`codex_rows_sync_by_default_with_no_roster_file`]).
 #[test]
+#[cfg(unix)]
 fn harness_accounts_off_still_stops_codex_rows_syncing_by_default() {
     let off = |tag: &str| {
         let bed = Bed::new(tag);
@@ -2269,6 +2350,7 @@ fn harness_accounts_off_still_stops_codex_rows_syncing_by_default() {
 /// CONTROL: the same sheet for m16 writes its roster
 /// ([`codex_rows_sync_by_default_with_no_roster_file`]).
 #[test]
+#[cfg(unix)]
 fn codex_by_default_writes_nothing_where_the_fleet_lists_no_row_of_this_macs() {
     let bed = Bed::new("codex-unlisted");
     crate::test_config::write(bed.aterm_toml(), "[fleet]\nmachine = \"m9\"\n").unwrap();
@@ -2408,6 +2490,7 @@ fn an_unlisted_mac_syncs_codex_again_only_once_its_inputs_change() {
 }
 
 #[test]
+#[cfg(unix)]
 fn retired_provider_sources_do_not_lift_retry_holds() {
     use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
     let _source = TestSourceOverride::new(SourceSnapshot::Absent);
@@ -2472,6 +2555,7 @@ fn retired_provider_sources_do_not_lift_retry_holds() {
 /// window's upkeep holds it. CONTROL: the records of a row the sync would not add (`retired`)
 /// leave the default sync free.
 #[test]
+#[cfg(unix)]
 fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
     for (label, left) in [
         (ACCOUNTS_OWN_LABEL, true),
@@ -2531,6 +2615,7 @@ fn a_mac_that_removed_its_codex_roster_stays_out_of_the_pool() {
 /// (`Cli::sign_in_verb`): a Kimi row's renewal, once a person has opened its browser, and a Grok
 /// row's `accounts login`, since its renewals stop at accounts.x.ai's block page.
 #[test]
+#[cfg(unix)]
 fn a_sync_names_each_added_rows_sign_in_by_its_verb() {
     const GROK_FLEET: &str = "\
 [[account]]
@@ -2582,6 +2667,7 @@ machines = [\"m16\"]
 /// for a row with no email, which no renewal signs in. CONTROL: a machine that keeps none gets no
 /// card, so a Claude-Code-only dashboard is the page it was.
 #[test]
+#[cfg(unix)]
 fn the_dashboard_shows_a_card_per_kept_pool_and_none_where_none_is_kept() {
     let bed = Bed::new("dashboard");
     assert_eq!(
@@ -2967,6 +3053,7 @@ fn interrupted_vendor_staging_renewal_recovers_binding_and_proof_only_when_compl
 }
 
 #[test]
+#[cfg(unix)]
 fn vendor_renewal_holds_without_cooldown_on_signin_lock_or_wrong_account_and_skips_limited_rows() {
     let bed = Bed::new("vendor-admission");
     fake_headless_browser(&bed.home);
@@ -3080,9 +3167,11 @@ region = \"global\"
         "wrong_at cooldown must not stamp AutoRenewGuard::last_attempt"
     );
 
-    let shared = store.shared_dir();
-    aterm_types::fs_restricted::ensure_private_dir(&shared).unwrap();
-    let mailbox_toml = shared.join("mailbox.toml");
+    let mailbox_store = accounts::Store::at(&bed.state);
+    aterm_types::fs_restricted::ensure_private_dir(&mailbox_store.dir).unwrap();
+    let mailbox_toml = mailbox_store
+        .dir
+        .join(crate::harness::headless_oauth::MAILBOX_TOML_FILE);
     fs::write(&mailbox_toml, "# updated mailbox routing\n").unwrap();
     let updated_time =
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(now - 10).unwrap());
@@ -3174,6 +3263,7 @@ region = \"global\"
 /// upkeep starts its renewal again with nothing a person does. CONTROL: within the hold nothing
 /// starts, and no cooldown is burnt.
 #[test]
+#[cfg(unix)]
 fn a_pool_rows_wrong_account_is_signed_in_again_by_the_upkeep() {
     let bed = Bed::new("vendor-wrong-again");
     fake_headless_browser(&bed.home);
@@ -3253,55 +3343,39 @@ region = \"global\"
     }
 }
 
-/// The upkeep's renewal of Kimi's pool over `bed` at `now` ([`renew_pool_due`]) under `guard`,
-/// its renewals started by a seam that runs nothing; whether one started.
+/// The upkeep's renewal of Kimi's pool over `bed` at `now` ([`pool_upkeep_of`]).
 #[cfg(unix)]
 fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> bool {
+    pool_upkeep_of(bed, Cli::Kimi, guard, now)
+}
+
+/// The upkeep's renewal of `cli`'s pool over `bed` at `now` ([`renew_pool_due`]) under `guard`,
+/// its renewals started by a seam that runs nothing; whether one started.
+#[cfg(unix)]
+fn pool_upkeep_of(bed: &Bed, cli: Cli, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> bool {
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
-    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
-    let cooldown = Mutex::new(None);
-    let fx = UpkeepEffects {
-        scope: None,
-        fetch: &fetch,
-        spawn_renewal: &spawn,
-        sync_cooldown: &cooldown,
-        rediscovery: &Mutex::new(Rediscovery::default()),
-        renew_guard: guard,
-        find_browser: &|_: &Path| false,
-        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
-        default_check: |_: &Path, _scope| {
-            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
-        },
-        spawn_vault: &|_work| Ok(()),
-        mailbox: &ladder_mailbox_files,
-        log: std::sync::Arc::new(|_: &str| {}),
-        run_attempt: None,
-        tokens_here: |_, _, _, _| None,
-        shared: shared_renewal::Effects::default(),
-    };
-    renew_pool_due(
-        Cli::Kimi,
-        &bed.home,
-        &bed.state,
-        &bed.roster(Cli::Kimi),
-        now,
-        &fx,
-    )
+    with_pool_effects(guard, &spawn, |fx| {
+        renew_pool_due(cli, &bed.home, &bed.state, &bed.roster(cli), now, &fx)
+    })
 }
 
 /// A renewal host standing in for [`super::super::cli::LiveAccounts`] under
 /// `spawn_vendor_renewal_with`'s worker: its vendor sign-in runs no child and ends `outcome` on
-/// www.kimi.ai at `now`, leaving Kimi's login file in the staging home where it signed in.
+/// `cli`'s page at `now`, leaving the CLI's login file in the staging home where it signed in.
 #[cfg(unix)]
 struct EndsOn {
+    cli: Cli,
     outcome: super::super::login_drive::Outcome,
     now: i64,
+    /// Whether a person runs it at this Mac's terminal, as `accounts renew` there does; the
+    /// background worker is nobody there.
+    person: bool,
 }
 
 #[cfg(unix)]
 impl super::super::cli::AccountsHost for EndsOn {
     fn stdin_is_terminal(&self) -> bool {
-        false
+        self.person
     }
     fn auth_status(&self, login: &str) -> Result<super::super::align::Captured, String> {
         panic!("a Kimi renewal runs no `claude` (asked under {login:?})")
@@ -3319,24 +3393,23 @@ impl super::super::cli::AccountsHost for EndsOn {
         &self,
         req: &super::super::login_drive::Request<'_>,
     ) -> super::super::login_drive::Drove {
-        if matches!(
-            self.outcome,
-            super::super::login_drive::Outcome::SignedIn { .. }
-        ) {
-            fs::create_dir_all(req.staging.join("credentials")).unwrap();
-            fs::write(req.staging.join("credentials/kimi-code.json"), "{}").unwrap();
+        if let super::super::login_drive::Outcome::SignedIn { email, .. } = &self.outcome {
+            let login = req.staging.join(self.cli.connector().stores[0]);
+            fs::create_dir_all(login.parent().unwrap()).unwrap();
+            if self.cli == Cli::Codex {
+                fs::write(login, codex_auth_json(email.as_deref().unwrap_or_default())).unwrap();
+            } else {
+                fs::write(login, "{}").unwrap();
+            }
         }
         super::super::login_drive::Drove {
             outcome: self.outcome.clone(),
-            host: Some("www.kimi.ai".to_owned()),
+            host: Some(vendor_host(self.cli).to_owned()),
         }
     }
 }
 
-/// One renewal of `bed`'s Kimi row `label` by [`super::super::cli::renew_one_for`], as
-/// `spawn_vendor_renewal_with`'s worker runs it (the row and records [`renew_pool_due`] reads,
-/// the roster's own directory), its sign-in ending `outcome` at `now`: what it ended, its line
-/// on record written as a real renewal writes it.
+/// One renewal of `bed`'s Kimi row `label` ([`renewal_ending_of`]).
 #[cfg(unix)]
 fn kimi_renewal_ending(
     bed: &Bed,
@@ -3344,16 +3417,83 @@ fn kimi_renewal_ending(
     outcome: super::super::login_drive::Outcome,
     now: i64,
 ) -> super::super::cli::Renewal {
-    let roster_path = bed.roster(Cli::Kimi);
-    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
-    let candidates = read_renewal_candidates(
-        Cli::Kimi,
-        &store,
-        (&bed.home, &bed.state),
-        &roster_path,
+    renewal_ending_of(bed, Cli::Kimi, label, outcome, now)
+}
+
+/// The host of `cli`'s sign-in page in these fixtures.
+#[cfg(unix)]
+fn vendor_host(cli: Cli) -> &'static str {
+    match cli {
+        Cli::Kimi => "www.kimi.ai",
+        _ => "auth.openai.com",
+    }
+}
+
+/// One renewal of `bed`'s row `label` of `cli`'s pool by [`super::super::cli::renew_one_for`], as
+/// `spawn_vendor_renewal_with`'s worker runs it (the row and records [`renew_pool_due`] reads,
+/// the roster's own directory), its sign-in ending `outcome` at `now`: what it ended, its line
+/// on record written as a real renewal writes it.
+#[cfg(unix)]
+fn renewal_ending_of(
+    bed: &Bed,
+    cli: Cli,
+    label: &str,
+    outcome: super::super::login_drive::Outcome,
+    now: i64,
+) -> super::super::cli::Renewal {
+    renewal_by(
+        bed,
+        cli,
+        label,
+        &EndsOn {
+            cli,
+            outcome,
+            now,
+            person: false,
+        },
         now,
     )
-    .expect("the records");
+}
+
+/// [`renewal_ending_of`] run by a person at this Mac's terminal, as their `accounts renew` runs
+/// it.
+#[cfg(unix)]
+fn person_renewal_ending_of(
+    bed: &Bed,
+    cli: Cli,
+    label: &str,
+    outcome: super::super::login_drive::Outcome,
+    now: i64,
+) -> super::super::cli::Renewal {
+    renewal_by(
+        bed,
+        cli,
+        label,
+        &EndsOn {
+            cli,
+            outcome,
+            now,
+            person: true,
+        },
+        now,
+    )
+}
+
+/// One renewal of `bed`'s row `label` of `cli`'s pool by [`super::super::cli::renew_one_for`] on
+/// `host` at `now` ([`renewal_ending_of`]).
+#[cfg(unix)]
+fn renewal_by(
+    bed: &Bed,
+    cli: Cli,
+    label: &str,
+    host: &dyn super::super::cli::AccountsHost,
+    now: i64,
+) -> super::super::cli::Renewal {
+    let roster_path = bed.roster(cli);
+    let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+    let candidates =
+        read_renewal_candidates(cli, &store, (&bed.home, &bed.state), &roster_path, now)
+            .expect("the records");
     let (_, row) = candidates
         .tiered
         .into_iter()
@@ -3365,14 +3505,14 @@ fn kimi_renewal_ending(
         .row(label)
         .and_then(|r| r.dir.clone());
     super::super::cli::renew_one_for(
-        Cli::Kimi,
+        cli,
         now,
-        &EndsOn { outcome, now },
+        host,
         &store,
         (&row, &roster_path, &candidates.records.logins),
         (
             own_dir.as_deref(),
-            crate::harness::sign_in_ladder::asked_fixture(Cli::Kimi, label),
+            crate::harness::sign_in_ladder::asked_fixture(cli, label),
         ),
         &mut io::sink(),
         &mut io::sink(),
@@ -3389,6 +3529,7 @@ fn kimi_bot_check() -> super::super::login_drive::Outcome {
 }
 
 /// Publish a scripted browser result with the row and workflow the window inspected.
+#[cfg(unix)]
 fn record_kimi_browser_window(bed: &Bed, label: &str, at: i64, why: &str) {
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
     let path = bed.roster(Cli::Kimi);
@@ -3410,21 +3551,114 @@ fn record_kimi_browser_window(bed: &Bed, label: &str, at: i64, why: &str) {
         .unwrap();
 }
 
-/// A POOL ROW WHOSE BACKGROUND RENEWAL MET CLOUDFLARE'S BOT CHECK IS LEFT ALONE PAST THE
-/// 15-MINUTE COOLDOWN, with its human login task retained quietly:
-/// each try starts a live sign-in at the vendor that the check ends again, so the cooldown alone
-/// tried it again every 15 minutes. Driven through the upkeep's own path ([`renew_pool_due`],
-/// its seam running nothing), the try itself run by `renew_one_for` ([`kimi_renewal_ending`]),
-/// which writes its end on record, its end noted as `spawn_vendor_renewal_with`'s worker notes
-/// it and the guard's clocks set back to stand for the time passed, for a row never signed in
-/// here and for one already bound here. A restart, which forgets the guard, keeps the hold
-/// from the bot check and its human task on record.
-/// CONTROL: a plain failure is tried again once its cooldown has passed; the bot-checked row
-/// at once on a person's own selection ([`renew_requested_pin_for`]), and after a restart once
-/// [`PERSON_BACKOFF_SECS`] has passed. A browser window alone does not complete the login task.
+/// A pool row `label` of `cli`'s (Kimi Code's or Codex's), for `email`, on this Mac (`m16`), whose
+/// login here a session ran on and that has signed out, so the upkeep renews it, with a headless
+/// browser to do it: the bed and a clock a little ahead of the wall's.
+#[cfg(unix)]
+fn signed_out_pool_row(tag: &str, cli: Cli, label: &str, email: &str) -> (Bed, i64) {
+    signed_out_pool_rows(tag, cli, &[(label, email)])
+}
+
+/// [`signed_out_pool_row`] for each of `rows`, by label and address, in one pool and realm.
+#[cfg(unix)]
+fn signed_out_pool_rows(tag: &str, cli: Cli, rows: &[(&str, &str)]) -> (Bed, i64) {
+    let bed = Bed::new(tag);
+    fake_headless_browser(&bed.home);
+    bed.keep_roster(cli);
+    let region = if cli == Cli::Kimi {
+        "region = \"global\"\n"
+    } else {
+        ""
+    };
+    bed.secret(
+        &cli_fleet_file(cli),
+        &rows
+            .iter()
+            .map(|(label, email)| {
+                format!(
+                    "[[account]]\nlabel = \"{label}\"\nemail = \"{email}\"\nmachines = [\"m16\"]\n{region}"
+                )
+            })
+            .collect::<String>(),
+    );
+    let now = crate::supervise::limit::unix_now() + 1_000;
+    assert!(matches!(bed.sync(cli, None), Ok(CliSync::Synced(_))));
+    for (label, email) in rows {
+        if cli == Cli::Kimi {
+            signed_out_kimi_login(&bed, label, now);
+        } else {
+            let dir = codex_login_dir(&bed, label);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("auth.json"), codex_auth_json(email)).unwrap();
+            signed_out_here(&bed, cli, label, now);
+        }
+    }
+    (bed, now)
+}
+
+/// The home of Codex's row `label`'s login here: the row's own directory, or the CLI's default
+/// home for the row on the default login (no `dir`), where its `auth.json` names its address.
+#[cfg(unix)]
+fn codex_login_dir(bed: &Bed, label: &str) -> PathBuf {
+    Roster::load_for(Cli::Codex, &bed.roster(Cli::Codex))
+        .unwrap()
+        .row(label)
+        .and_then(|row| row.dir.clone())
+        .map_or_else(|| bed.home.join(".codex"), PathBuf::from)
+}
+
+/// A Codex `auth.json` whose ChatGPT login names `email`.
+#[cfg(unix)]
+fn codex_auth_json(email: &str) -> Vec<u8> {
+    let token = super::super::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": email,
+            "chatgpt_account_id": "fixture-workspace"
+        }
+    }));
+    aterm_json::to_vec(&aterm_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"id_token": token, "access_token": token}
+    }))
+    .unwrap()
+}
+
+/// The bot check [`renewal_ending_of`] meets on `cli`'s page.
+#[cfg(unix)]
+fn bot_check_of(cli: Cli) -> super::super::login_drive::Outcome {
+    super::super::login_drive::Outcome::BotCheck(format!(
+        "Cloudflare's bot check on `{}` did not clear in 90 s",
+        vendor_host(cli)
+    ))
+}
+
+/// Whether an upkeep with a fresh guard, as after a restart, tries `label` of `cli`'s pool at
+/// `at`.
+#[cfg(unix)]
+fn restarted_upkeep_tries(bed: &Bed, cli: Cli, label: &str, at: i64) -> bool {
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    pool_upkeep_of(bed, cli, &guard, at);
+    let held = guard.lock().unwrap();
+    held.last_attempt
+        .contains_key(&format!("{}:{label}", cli.id()))
+}
+
+/// A POOL ROW WHOSE BACKGROUND RENEWAL MET A BOT PROTECTION IS HELD ON NO CLOCK: past the
+/// 15-minute cooldown, past [`PERSON_BACKOFF_SECS`] and a day on, in this process and after a
+/// restart, which forgets the guard and keeps the check on record as its account's
+/// [`accounts::CheckStop`], for a row never signed in here and for one already bound here. Driven
+/// through the upkeep's own path ([`renew_pool_due`], its seam running nothing), the try itself
+/// run by `renew_one_for` ([`kimi_renewal_ending`]), which writes its end on record, its end
+/// noted as `spawn_vendor_renewal_with`'s worker notes it and the guard's clocks set back to
+/// stand for the time passed. A saved choice a tick resumes with nobody at this desk does not
+/// start it either ([`renew_requested_pin_at`]), nor does a person's click at this desk
+/// ([`renew_requested_pin_for`]): its headless page meets the same check, and only their
+/// `accounts login` at a terminal goes on. CONTROL: a plain failure is tried again once its
+/// cooldown has passed, and a click on a row with no check on record starts it at once.
 #[cfg(unix)]
 #[test]
-fn a_pool_rows_bot_check_is_left_alone_past_the_cooldown() {
+fn a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart() {
     use super::super::cli::Renewal;
     use super::super::login_drive::Outcome;
     const KEY: &str = "kimi:kimi-1";
@@ -3443,11 +3677,7 @@ fn a_pool_rows_bot_check_is_left_alone_past_the_cooldown() {
             {
                 let mut held = guard.lock().unwrap();
                 let held = &mut *held;
-                for clock in [
-                    &mut held.last_attempt,
-                    &mut held.parked,
-                    &mut held.bot_checked,
-                ] {
+                for clock in [&mut held.last_attempt, &mut held.parked] {
                     if let Some(at) = clock.get_mut(KEY) {
                         *at = at
                             .checked_sub(Duration::from_secs(ago))
@@ -3458,33 +3688,16 @@ fn a_pool_rows_bot_check_is_left_alone_past_the_cooldown() {
             kimi_pool_upkeep(bed, guard, now + i64::try_from(ago).unwrap())
         };
     for bound in [false, true] {
-        let bed = Bed::new(if bound {
-            "vendor-bot-check-bound"
-        } else {
-            "vendor-bot-check"
-        });
-        fake_headless_browser(&bed.home);
-        bed.keep_roster(Cli::Kimi);
-        bed.secret(
-            &cli_fleet_file(Cli::Kimi),
-            "\
-[[account]]
-label = \"kimi-1\"
-email = \"kimi-one@example.com\"
-machines = [\"m16\"]
-region = \"global\"
-",
+        let (bed, now) = signed_out_pool_row(
+            if bound {
+                "vendor-bot-check-bound"
+            } else {
+                "vendor-bot-check"
+            },
+            Cli::Kimi,
+            "kimi-1",
+            "kimi-one@example.com",
         );
-        let now = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap()
-            + 1_000;
-        assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-        signed_out_kimi_login(&bed, "kimi-1", now);
         let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
         if bound {
             store
@@ -3506,56 +3719,57 @@ region = \"global\"
         assert_eq!(logins.get("kimi-1").is_some(), bound, "bound: {bound}");
         assert!(logins.get("kimi-1").and_then(|b| b.sign_in_task).is_none());
 
-        // The bot check last: its line on record holds the next first try.
-        for (end, ago, again) in [
-            (Renewal::Failed, 600, false),
-            (Renewal::Failed, 901, true),
-            (Renewal::BotCheck, 901, false),
-        ] {
+        for (ago, again) in [(600, false), (901, true)] {
             let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
             assert_eq!(
-                try_again(&bed, &guard, end, now, ago),
+                try_again(&bed, &guard, Renewal::Failed, now, ago),
                 again,
-                "{end:?}, then the upkeep {ago} s later (bound here: {bound})"
+                "CONTROL: a plain failure, then the upkeep {ago} s later (bound here: {bound})"
             );
         }
 
-        // A restart forgets the guard, not the ledger's bot check.
-        let restarted = || Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
         assert!(
-            !kimi_pool_upkeep(&bed, &restarted(), now + 60),
-            "a restart a minute after the bot check (bound here: {bound})"
+            !try_again(&bed, &guard, Renewal::BotCheck, now, 901),
+            "the bot check, then the upkeep 901 s later (bound here: {bound})"
         );
-        assert!(
-            kimi_pool_upkeep(&bed, &restarted(), now + PERSON_BACKOFF_SECS),
-            "CONTROL: a restart once the backoff has passed (bound here: {bound})"
-        );
-        // That try's end, a plain failure, is the newest on record.
+        let (logins, _) = store.load_logins(now).unwrap();
         assert_eq!(
-            kimi_renewal_ending(&bed, "kimi-1", Outcome::Failed, now + PERSON_BACKOFF_SECS),
-            Renewal::Failed
+            logins
+                .get("kimi-1")
+                .and_then(|binding| binding.check_stop.as_ref())
+                .map(|check| check.account.as_deref()),
+            Some(Some("kimi-one@example.com")),
+            "the check is its account's, on record (bound here: {bound})"
         );
+        for later in [60, PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+            assert!(
+                !kimi_pool_upkeep(&bed, &guard, now + later),
+                "{later} s on (bound here: {bound})"
+            );
+            assert!(
+                !restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + later),
+                "{later} s on, after a restart (bound here: {bound})"
+            );
+        }
 
-        // Start a later challenge episode after the preceding task's wait has elapsed.
-        let now = now + PERSON_BACKOFF_SECS + 1;
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        assert!(!try_again(&bed, &guard, Renewal::BotCheck, now, 901));
-        record_kimi_browser_window(
-            &bed,
-            "kimi-1",
-            now + 901,
-            "www.kimi.ai window done session-kept",
-        );
-        assert!(
-            !kimi_pool_upkeep(&bed, &guard, now + 902),
-            "a window alone does not complete the native login task (bound here: {bound})"
-        );
-
-        let now = now + PERSON_BACKOFF_SECS + 1;
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        assert!(!try_again(&bed, &guard, Renewal::BotCheck, now, 901));
-        let request = store.request_pin("kimi-1", now + 901).unwrap();
         let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+        let at = now + 25 * 3_600;
+        let request = store.request_pin("kimi-1", at).unwrap();
+        assert_eq!(
+            renew_requested_pin_at(
+                Cli::Kimi,
+                (&bed.home, &bed.state, &bed.roster(Cli::Kimi)),
+                request,
+                at,
+                (&guard, &spawn, None),
+                None,
+                false,
+            ),
+            RenewalDispatch::Failed,
+            "a saved choice a tick resumed, nobody at this desk (bound here: {bound})"
+        );
+        let request = store.request_pin("kimi-1", at + 1).unwrap();
         assert_eq!(
             renew_requested_pin_for(
                 Cli::Kimi,
@@ -3563,95 +3777,993 @@ region = \"global\"
                 &bed.state,
                 &bed.roster(Cli::Kimi),
                 request,
-                now + 901,
+                at + 1,
                 &guard,
                 &spawn,
                 None,
                 None,
             ),
-            RenewalDispatch::Started,
-            "CONTROL: a person's own selection starts at once (bound here: {bound})"
+            RenewalDispatch::Failed,
+            "a person's click at this desk loads no headless page either (bound here: {bound})"
         );
     }
+    let (bed, now) = signed_out_pool_row(
+        "vendor-bot-check-click-control",
+        Cli::Kimi,
+        "kimi-1",
+        "kimi-one@example.com",
+    );
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let request = store.request_pin("kimi-1", now).unwrap();
+    let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+    assert_eq!(
+        renew_requested_pin_for(
+            Cli::Kimi,
+            &bed.home,
+            &bed.state,
+            &bed.roster(Cli::Kimi),
+            request,
+            now,
+            &Arc::new(Mutex::new(AutoRenewGuard::default())),
+            &spawn,
+            None,
+            None,
+        ),
+        RenewalDispatch::Started,
+        "CONTROL: a click at this desk on a row with no check on record starts it at once"
+    );
 }
 
-/// A LATER END ON RECORD LIFTS THE BOT CHECK'S HOLD ACROSS A RESTART ([`bot_check_on_record_at`]):
-/// after a background renewal of `kimi-1` met the bot check, a renewal by `renew_one_for` that
-/// signed in another account (once that end's own 15-minute hold has passed) or one that bound a
-/// new login (its login signed out again after) is the newest end on record, so a restarted
-/// upkeep tries the row again before [`PERSON_BACKOFF_SECS`] has passed. CONTROL: with only the
-/// bot check on record, a restart is held.
+/// ONLY A PERSON'S ACT ENDS A VENDOR ROW'S BOT CHECK HOLD, across a restart: after a background
+/// renewal of `kimi-1` met the bot check, a person's renewal at this terminal by `renew_one_for`
+/// that bound a new login (its login signed out again after), or a signed-in `accounts browser`
+/// window on record since,
+/// lets a restarted upkeep try the row again once the login task the check set has waited out
+/// its own [`PERSON_BACKOFF_SECS`]. CONTROL: a person's renewal that signed in another account
+/// ends nothing, and the row stays held then and a day on.
 #[cfg(unix)]
 #[test]
-fn a_later_renewal_or_wrong_account_lifts_the_bot_check_hold_after_a_restart() {
+fn only_a_bound_login_or_a_signed_in_window_lifts_a_vendor_rows_bot_check_hold() {
     use super::super::cli::Renewal;
     use super::super::login_drive::Outcome;
     let signed_in_as = |email: &str| Outcome::SignedIn {
         email: Some(email.to_owned()),
         page: false,
     };
-    // Whether an upkeep with a fresh guard, as after a restart, tries `kimi-1` at `at`.
-    let restarted_tries = |bed: &Bed, at: i64| {
-        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
-        kimi_pool_upkeep(bed, &guard, at);
-        let held = guard.lock().unwrap();
-        held.last_attempt.contains_key("kimi:kimi-1")
-    };
-    for (later, ends, after) in [
-        (
-            signed_in_as("someone-else@example.com"),
-            Renewal::WrongAccount,
-            901,
-        ),
-        (signed_in_as("kimi-one@example.com"), Renewal::Renewed, 60),
-    ] {
-        let bed = Bed::new(&format!("bot-check-lifted-{}", ends == Renewal::Renewed));
-        fake_headless_browser(&bed.home);
-        bed.keep_roster(Cli::Kimi);
-        bed.secret(
-            &cli_fleet_file(Cli::Kimi),
-            "\
-[[account]]
-label = \"kimi-1\"
-email = \"kimi-one@example.com\"
-machines = [\"m16\"]
-region = \"global\"
-",
+    for case in ["wrong-account", "renewed", "window"] {
+        let (bed, now) = signed_out_pool_row(
+            &format!("bot-check-lifted-{case}"),
+            Cli::Kimi,
+            "kimi-1",
+            "kimi-one@example.com",
         );
-        let now = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap()
-            + 1_000;
-        assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-        signed_out_kimi_login(&bed, "kimi-1", now);
         assert_eq!(
             kimi_renewal_ending(&bed, "kimi-1", kimi_bot_check(), now),
             Renewal::BotCheck
         );
         assert!(
-            !restarted_tries(&bed, now + 60),
-            "CONTROL: the bot check on record holds a restart ({ends:?})"
+            !restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + 60),
+            "CONTROL: the bot check on record holds a restart ({case})"
         );
-        assert_eq!(kimi_renewal_ending(&bed, "kimi-1", later, now + 120), ends);
-        if ends == Renewal::Renewed {
-            accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home)
-                .transact_logins(now + 150, &mut None, |state, logins| {
-                    Ok(accounts::note_login_end(state, logins, "kimi-1", now + 150))
+        let lifted = match case {
+            "wrong-account" => {
+                assert_eq!(
+                    person_renewal_ending_of(
+                        &bed,
+                        Cli::Kimi,
+                        "kimi-1",
+                        signed_in_as("someone-else@example.com"),
+                        now + 120
+                    ),
+                    Renewal::WrongAccount
+                );
+                false
+            }
+            "renewed" => {
+                assert_eq!(
+                    person_renewal_ending_of(
+                        &bed,
+                        Cli::Kimi,
+                        "kimi-1",
+                        signed_in_as("kimi-one@example.com"),
+                        now + 120
+                    ),
+                    Renewal::Renewed
+                );
+                accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home)
+                    .transact_logins(now + 150, &mut None, |state, logins| {
+                        Ok(accounts::note_login_end(state, logins, "kimi-1", now + 150))
+                    })
+                    .unwrap();
+                true
+            }
+            _ => {
+                record_kimi_browser_window(
+                    &bed,
+                    "kimi-1",
+                    now + 120,
+                    "www.kimi.ai window done session-kept",
+                );
+                true
+            }
+        };
+        assert_eq!(
+            restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + PERSON_BACKOFF_SECS + 60),
+            lifted,
+            "{case}, six hours and a minute on"
+        );
+        if !lifted {
+            assert!(
+                !restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + 25 * 3_600),
+                "CONTROL: {case}, a day on"
+            );
+        }
+    }
+}
+
+/// The vendor controls of `ladder_tests::a_claude_row_a_check_stopped_waits_for_a_person_at_every_door`:
+/// a row of `cli`'s pool whose background renewal ended `outcome`, and whether an upkeep with a
+/// fresh guard, as after a restart, tries the row an hour later, six hours and a minute later
+/// and a day later. A bot protection's stop holds on no clock (its account's
+/// [`accounts::CheckStop`], [`left_to_a_person`]); any other stop for a person holds for
+/// [`PERSON_BACKOFF_SECS`] (the sign-in task it set).
+#[cfg(unix)]
+pub(super) fn a_vendor_rows_stop_is_tried(
+    cli: Cli,
+    outcome: super::super::login_drive::Outcome,
+) -> (super::super::cli::Renewal, [bool; 3]) {
+    let (bed, now) = signed_out_pool_row(
+        &format!("vendor-stop-clock-{}", cli.id()),
+        cli,
+        "row-1",
+        "row-one@example.com",
+    );
+    assert!(
+        restarted_upkeep_tries(&bed, cli, "row-1", now),
+        "{cli:?}: CONTROL: with nothing on record the upkeep tries the row"
+    );
+    let ended = renewal_ending_of(&bed, cli, "row-1", outcome, now);
+    let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+    let recorded = store
+        .tail(accounts::LEDGER_KEEP_ROWS)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|event| event.account == "row-1" && event.kind == accounts::Kind::SignIn)
+        .and_then(|event| accounts::AttemptOutcome::of_sign_in(&event.why));
+    assert_eq!(
+        recorded,
+        Some(if ended == super::super::cli::Renewal::BotCheck {
+            accounts::AttemptOutcome::Blocked
+        } else {
+            accounts::AttemptOutcome::Failed
+        }),
+        "{cli:?} {ended:?}"
+    );
+    (
+        ended,
+        [60 * 60, PERSON_BACKOFF_SECS + 60, 25 * 3_600]
+            .map(|later| restarted_upkeep_tries(&bed, cli, "row-1", now + later)),
+    )
+}
+
+/// Who runs `accounts renew <label> --cli <id>` ([`VendorDesk`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Who {
+    /// A person at this Mac's terminal.
+    Person,
+    /// An agent at this Mac (`CLAUDECODE` set).
+    Agent,
+    /// Another Mac, over the fleet.
+    OtherMac,
+}
+
+/// `accounts renew` as [`Who`] runs it: a vendor sign-in that ends `outcome` on `cli`'s page,
+/// counted, leaving the CLI's login file where it signed in.
+#[cfg(unix)]
+struct VendorDesk<'a> {
+    ends: EndsOn,
+    who: Who,
+    email: &'static str,
+    ran: std::cell::Cell<usize>,
+    /// What changes while its sign-in runs.
+    during: &'a dyn Fn(),
+}
+
+#[cfg(unix)]
+impl super::super::cli::AccountsHost for VendorDesk<'_> {
+    fn stdin_is_terminal(&self) -> bool {
+        true
+    }
+    fn auth_status(&self, login: &str) -> Result<super::super::align::Captured, String> {
+        self.ends.auth_status(login)
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        Err("not here".to_owned())
+    }
+    fn now(&self) -> i64 {
+        self.ends.now
+    }
+    fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {
+        (self.who == Who::Agent && name == "CLAUDECODE").then(|| "1".into())
+    }
+    fn driven_over_the_fleet(&self) -> bool {
+        self.who == Who::OtherMac
+    }
+    fn codex_account(&self, _: &Path) -> Option<String> {
+        Some(self.email.to_owned())
+    }
+    fn vendor_sign_in(
+        &self,
+        req: &super::super::login_drive::Request<'_>,
+    ) -> super::super::login_drive::Drove {
+        self.ran.set(self.ran.get() + 1);
+        (self.during)();
+        self.ends.vendor_sign_in(req)
+    }
+}
+
+/// Runs `accounts renew row-1 --cli <id>` at `at` on `bed` as `who`, its sign-in ending
+/// `outcome`: its exit, how many sign-ins it ran and what it said.
+#[cfg(unix)]
+fn renew_vendor_row(
+    bed: &Bed,
+    cli: Cli,
+    who: Who,
+    outcome: super::super::login_drive::Outcome,
+    at: i64,
+) -> (ExitCode, usize, String) {
+    renew_vendor_row_as(
+        bed,
+        (cli, "row-1", "row-one@example.com"),
+        who,
+        (outcome, &|| {}),
+        at,
+    )
+}
+
+/// [`renew_vendor_row`] of `cli`'s row `label`, signed in as `email`, whose sign-in ends
+/// `outcome` once `during` has run.
+#[cfg(unix)]
+fn renew_vendor_row_as(
+    bed: &Bed,
+    (cli, label, email): (Cli, &str, &'static str),
+    who: Who,
+    (outcome, during): (super::super::login_drive::Outcome, &dyn Fn()),
+    at: i64,
+) -> (ExitCode, usize, String) {
+    let host = VendorDesk {
+        ends: EndsOn {
+            cli,
+            outcome,
+            now: at,
+            person: false,
+        },
+        who,
+        email,
+        ran: std::cell::Cell::new(0),
+        during,
+    };
+    let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), at);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = super::super::cli::run_accounts_of(
+        &super::super::cli::AccountsOf {
+            cli,
+            form: super::super::cli::AccountsCmd::Renew {
+                labels: vec![label.to_owned()],
+                due: false,
+                on: None,
+            },
+            vendor: accounts::Vendor::default(),
+        },
+        &env,
+        &host,
+        &mut out,
+        &mut err,
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    (code, host.ran.get(), said)
+}
+
+/// EVERY VENDOR'S BOT CHECK HOLDS THE ROW WITH NO CLOCK UNTIL A PERSON SIGNS IT IN
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): for a Kimi Code and a Codex row whose
+/// background renewal met a bot protection, no door with nobody at this Mac starts its sign-in
+/// on any clock: not the upkeep, in this process or after a restart, past the cooldown, past
+/// [`PERSON_BACKOFF_SECS`] and a day on; not a saved choice a tick resumes; not an agent's
+/// `accounts renew --cli`, nor another Mac's, each of which names the person's step
+/// ([`super::super::cli::left_words`]) and runs no sign-in. A person's renewal at this terminal
+/// runs it, and the login it binds ends the hold. CONTROL: once that login has signed out again,
+/// a restarted upkeep tries the row, so the check alone held it.
+#[cfg(unix)]
+#[test]
+fn a_kimi_rows_bot_check_holds_it_with_no_clock_until_a_person_signs_it_in() {
+    vendor_bot_check_holds_until_a_person_signs_in(Cli::Kimi);
+}
+
+/// [`a_kimi_rows_bot_check_holds_it_with_no_clock_until_a_person_signs_it_in`] for a Codex row.
+#[cfg(unix)]
+#[test]
+fn a_codex_rows_bot_check_holds_it_with_no_clock_until_a_person_signs_it_in() {
+    vendor_bot_check_holds_until_a_person_signs_in(Cli::Codex);
+}
+
+/// The body of the vendor tests above, for `cli`'s pool.
+#[cfg(unix)]
+fn vendor_bot_check_holds_until_a_person_signs_in(cli: Cli) {
+    use super::super::cli::Renewal;
+    use super::super::login_drive::Outcome;
+    {
+        let (bed, now) = signed_out_pool_row(
+            &format!("every-vendor-{}", cli.id()),
+            cli,
+            "row-1",
+            "row-one@example.com",
+        );
+        let key = format!("{}:row-1", cli.id());
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        assert!(
+            pool_upkeep_of(&bed, cli, &guard, now),
+            "{cli:?}: the first try starts"
+        );
+        assert_eq!(
+            renewal_ending_of(&bed, cli, "row-1", bot_check_of(cli), now),
+            Renewal::BotCheck,
+            "{cli:?}"
+        );
+        note_background_end(&guard, &key, Renewal::BotCheck, Instant::now());
+        guard.lock().unwrap().last_attempt.remove(&key);
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        assert_eq!(
+            store
+                .load_logins(now)
+                .unwrap()
+                .0
+                .get("row-1")
+                .and_then(|binding| binding.check_stop.as_ref())
+                .map(|check| check.account.clone()),
+            Some(Some("row-one@example.com".to_owned())),
+            "{cli:?}: the check is the row's account's, on record"
+        );
+        for later in [901, PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+            assert!(
+                !pool_upkeep_of(&bed, cli, &guard, now + later),
+                "{cli:?}: the upkeep {later} s on"
+            );
+            assert!(
+                !restarted_upkeep_tries(&bed, cli, "row-1", now + later),
+                "{cli:?}: the upkeep {later} s on, after a restart"
+            );
+        }
+        let at = now + 25 * 3_600;
+        if cli == Cli::Codex {
+            // With its file gone, the choice of Codex's row has no login to complete onto, so
+            // only a sign-in could serve it, as for Kimi's signed-out row.
+            fs::remove_file(codex_login_dir(&bed, "row-1").join("auth.json")).unwrap();
+        }
+        let request = store.request_pin("row-1", at).unwrap();
+        let spawned = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = |_work: Box<dyn FnOnce() + Send>| {
+            spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let dispatch = renew_requested_pin_at(
+            cli,
+            (&bed.home, &bed.state, &bed.roster(cli)),
+            request,
+            at,
+            (&guard, &spawn, None),
+            None,
+            false,
+        );
+        assert_eq!(
+            (dispatch, spawned.load(std::sync::atomic::Ordering::SeqCst)),
+            (RenewalDispatch::Failed, 0),
+            "{cli:?}: a saved choice a tick resumed, nobody at this desk"
+        );
+        // The saved choice as a later tick resumes it under the upkeep's scope: its worker
+        // serves the selection on behalf of nobody (`Gesture::Resumed`), here with the test's
+        // spawn seam in place of the live one, and starts no sign-in.
+        let Some(saved) = store.load(at + 1).unwrap().0.pending_pin else {
+            panic!("{cli:?}: the choice is still saved");
+        };
+        let owner = ManualSelectionOwner::claim(&guard, &store, cli, saved, None, at + 1)
+            .expect("the tick's worker owns the choice");
+        let lifetime = super::super::account_work::Lifetime::default();
+        let resumed = with_pool_effects(&guard, &spawn, |fx| {
+            with_scope_effects(lifetime.enter().unwrap(), fx, |fx| {
+                manual_selection_owned(
+                    cli,
+                    &bed.home,
+                    &bed.state,
+                    &bed.roster(cli),
+                    (owner, Gesture::Resumed),
+                    at + 1,
+                    fx,
+                )
+            })
+        });
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{cli:?}: the choice a tick resumed in scope: {resumed:?}"
+        );
+        // The choice is the test's to clear: a later pass serves rows, not that request.
+        if let Some(accounts::PendingSelection::Account(saved)) =
+            store.load(at + 1).unwrap().0.pending_pin
+        {
+            store.cancel_pin_request(&saved, at + 1).unwrap();
+        }
+        for who in [Who::Agent, Who::OtherMac] {
+            let (code, ran, said) = renew_vendor_row(&bed, cli, who, bot_check_of(cli), at);
+            assert_eq!(
+                (code, ran),
+                (ExitCode::from(1), 0),
+                "{cli:?} {who:?}: {said}"
+            );
+            assert!(
+                said.contains(&super::super::cli::left_words(cli, "row-1"))
+                    && said.contains(&format!(
+                        "a person runs `aterm harness accounts login row-1 --cli {}`",
+                        cli.id()
+                    )),
+                "{cli:?} {who:?}: it names the person's step: {said}"
+            );
+        }
+        let (code, ran, said) = renew_vendor_row(
+            &bed,
+            cli,
+            Who::Person,
+            Outcome::SignedIn {
+                email: Some("row-one@example.com".to_owned()),
+                page: false,
+            },
+            at + 60,
+        );
+        assert_eq!(
+            (code, ran),
+            (ExitCode::SUCCESS, 1),
+            "{cli:?}: a person's renewal: {said}"
+        );
+        let (logins, _) = store.load_logins(at + 60).unwrap();
+        assert_eq!(
+            logins
+                .get("row-1")
+                .and_then(|binding| binding.check_stop.as_ref()),
+            None,
+            "{cli:?}: the login made for the row ends its check"
+        );
+        if cli == Cli::Codex {
+            codex_login_ended(&bed, "row-1", (at + 120, at + 120), |_| {});
+        } else {
+            store
+                .transact_logins(at + 120, &mut None, |state, logins| {
+                    Ok(accounts::note_login_end(state, logins, "row-1", at + 120))
                 })
                 .unwrap();
         }
         assert!(
-            restarted_tries(&bed, now + 120 + after),
-            "a later {ends:?} on record lifts the hold after a restart"
+            restarted_upkeep_tries(&bed, cli, "row-1", at + 120 + 901),
+            "CONTROL {cli:?}: signed out again, the row is tried"
+        );
+    }
+}
+
+/// [`pool_upkeep_of`]'s effects, its renewals started by `spawn`, handed to `run`.
+#[cfg(unix)]
+fn with_pool_effects<T>(
+    guard: &Arc<Mutex<AutoRenewGuard>>,
+    spawn: &SpawnRenewal<'_>,
+    run: impl FnOnce(UpkeepEffects<'_>) -> T,
+) -> T {
+    let fetch = |_: &Env, s: &str| -> Result<String, String> { Err(s.to_owned()) };
+    let cooldown = Mutex::new(None);
+    let rediscovery = Mutex::new(Rediscovery::default());
+    run(UpkeepEffects {
+        scope: None,
+        fetch: &fetch,
+        spawn_renewal: spawn,
+        sync_cooldown: &cooldown,
+        rediscovery: &rediscovery,
+        renew_guard: guard,
+        find_browser: &|_: &Path| false,
+        vault_sync: |_: &Path, _scope| crate::harness::sign_in_ladder::Vault::NotMember,
+        default_check: |_: &Path, _scope| {
+            crate::harness::cli::LoginCheck::CouldNotRun(String::new())
+        },
+        spawn_vault: &|_work| Ok(()),
+        mailbox: &ladder_mailbox_files,
+        log: std::sync::Arc::new(|_: &str| {}),
+        run_attempt: None,
+        tokens_here: |_, _, _, _| None,
+        shared: shared_renewal::Effects::default(),
+    })
+}
+
+/// A VENDOR'S BOT CHECK HOLDS EVERY ROW OF ITS POOL AND REALM HERE, since its page answers this
+/// Mac's headless browser, not one account: once `row-1`'s background renewal met it, `row-2`
+/// (signed out and due) is started by no door with nobody at this Mac: not the upkeep, in this
+/// process or after a restart, past the cooldown, six hours and a minute and a day on; not a
+/// saved choice a tick resumes (Kimi's, which only a sign-in serves); not an agent's `accounts
+/// renew`, which names the stop of `row-1` and the person's step
+/// ([`super::super::cli::held_words`]) and runs no sign-in. CONTROL: once a person's renewal at
+/// this terminal has signed `row-1` in, the upkeep tries `row-2`.
+#[cfg(unix)]
+#[test]
+fn a_kimi_rows_bot_check_holds_its_pools_other_rows_until_a_person_answers_it() {
+    pool_bot_check_holds_the_pool(Cli::Kimi);
+}
+
+/// [`a_kimi_rows_bot_check_holds_its_pools_other_rows_until_a_person_answers_it`] for Codex.
+#[cfg(unix)]
+#[test]
+fn a_codex_rows_bot_check_holds_its_pools_other_rows_until_a_person_answers_it() {
+    pool_bot_check_holds_the_pool(Cli::Codex);
+}
+
+/// The body of the pool tests above, for `cli`'s pool.
+#[cfg(unix)]
+fn pool_bot_check_holds_the_pool(cli: Cli) {
+    use super::super::cli::Renewal;
+    use super::super::login_drive::Outcome;
+    let (bed, now) = signed_out_pool_rows(
+        &format!("pool-bot-check-{}", cli.id()),
+        cli,
+        &[
+            ("row-1", "row-one@example.com"),
+            ("row-2", "row-two@example.com"),
+        ],
+    );
+    let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+    assert_eq!(
+        renewal_ending_of(&bed, cli, "row-1", bot_check_of(cli), now),
+        Renewal::BotCheck,
+        "{cli:?}"
+    );
+    for later in [901, PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        assert!(
+            !pool_upkeep_of(&bed, cli, &guard, now + later),
+            "{cli:?}: the upkeep {later} s on starts no row of the pool"
+        );
+        assert!(
+            !restarted_upkeep_tries(&bed, cli, "row-2", now + later),
+            "{cli:?}: row-2, {later} s on"
+        );
+    }
+    let at = now + 25 * 3_600;
+    // A saved choice of Kimi's signed-out row can only be served by a sign-in. (Codex's keeps
+    // its login file, onto which its choice completes with no sign-in; with that file gone the
+    // row is no longer one the upkeep renews here, so the control below would say nothing. The
+    // gate a choice passes is the upkeep's own, held above.)
+    if cli == Cli::Kimi {
+        let request = store.request_pin("row-2", at).unwrap();
+        let spawned = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = |_work: Box<dyn FnOnce() + Send>| {
+            spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        assert_eq!(
+            (
+                renew_requested_pin_at(
+                    cli,
+                    (&bed.home, &bed.state, &bed.roster(cli)),
+                    request,
+                    at,
+                    (&guard, &spawn, None),
+                    None,
+                    false,
+                ),
+                spawned.load(std::sync::atomic::Ordering::SeqCst)
+            ),
+            (RenewalDispatch::Failed, 0),
+            "{cli:?}: a saved choice of row-2 a tick resumed"
+        );
+        if let Some(accounts::PendingSelection::Account(saved)) =
+            store.load(at).unwrap().0.pending_pin
+        {
+            store.cancel_pin_request(&saved, at).unwrap();
+        }
+    }
+    let (code, ran, said) = renew_vendor_row_as(
+        &bed,
+        (cli, "row-2", "row-two@example.com"),
+        Who::Agent,
+        (bot_check_of(cli), &|| {}),
+        at,
+    );
+    assert_eq!((code, ran), (ExitCode::from(1), 0), "{cli:?}: {said}");
+    assert!(
+        said.contains(&super::super::cli::held_words(
+            cli,
+            "row-2",
+            &PersonHold::Pool("row-1".to_owned())
+        )),
+        "{cli:?}: an agent's renewal names row-1's stop and the person's step: {said}"
+    );
+    let (code, ran, said) = renew_vendor_row_as(
+        &bed,
+        (cli, "row-1", "row-one@example.com"),
+        Who::Person,
+        (
+            Outcome::SignedIn {
+                email: Some("row-one@example.com".to_owned()),
+                page: false,
+            },
+            &|| {},
+        ),
+        at + 60,
+    );
+    assert_eq!(
+        (code, ran),
+        (ExitCode::SUCCESS, 1),
+        "{cli:?}: a person signs row-1 in: {said}"
+    );
+    assert!(
+        restarted_upkeep_tries(&bed, cli, "row-2", at + 60 + 901),
+        "CONTROL {cli:?}: with row-1's stop answered, row-2 is tried"
+    );
+}
+
+/// AN EARLIER BUILD'S RECORD OF A VENDOR'S BOT CHECK HOLDS THE ROW ON NO CLOCK: that build wrote
+/// only the ledger's line of the row's workflow (`www.kimi.ai device bot-check`) and a `login`
+/// task that ran out in [`PERSON_BACKOFF_SECS`], and no check on the account; read as the
+/// account's check ([`check_standing_at`]), it holds the row six hours and a minute and a day
+/// on, after a restart, and against a saved choice a tick resumes; a later renewal that signed
+/// in another account leaves it standing. CONTROL: the same record of a stop no bot protection
+/// made (`needs-sign-in`) is tried once its task has run out.
+#[cfg(unix)]
+#[test]
+fn an_earlier_builds_ledger_line_of_a_bot_check_holds_a_vendor_row_on_no_clock() {
+    use super::super::login_drive::Outcome;
+    for word in ["bot-check", "needs-sign-in"] {
+        let held = word == "bot-check";
+        let (bed, now) = signed_out_pool_row(
+            &format!("ledger-{word}"),
+            Cli::Kimi,
+            "kimi-1",
+            "kimi-one@example.com",
+        );
+        let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+        store
+            .transact_pool_logins_within(
+                &[],
+                &bed.roster(Cli::Kimi),
+                now,
+                &mut None,
+                |_, _, logins| {
+                    accounts::admit_workflow(logins, "kimi-1")?;
+                    accounts::note_sign_in_task(
+                        logins,
+                        "kimi-1",
+                        accounts::SignInAction::Login,
+                        now,
+                    );
+                    Ok(Vec::new())
+                },
+            )
+            .unwrap();
+        record_kimi_browser_window(&bed, "kimi-1", now, &format!("www.kimi.ai device {word}"));
+        assert_eq!(
+            store
+                .load_logins(now)
+                .unwrap()
+                .0
+                .get("kimi-1")
+                .and_then(|binding| binding.check_stop.clone()),
+            None,
+            "{word}: no check on the account, as that build wrote it"
+        );
+        if held {
+            assert_eq!(
+                renewal_ending_of(
+                    &bed,
+                    Cli::Kimi,
+                    "kimi-1",
+                    Outcome::SignedIn {
+                        email: Some("someone-else@example.com".to_owned()),
+                        page: false,
+                    },
+                    now + 60,
+                ),
+                super::super::cli::Renewal::Failed,
+                "the page step loads no page for the row"
+            );
+        }
+        for later in [PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+            assert_eq!(
+                restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + later),
+                !held,
+                "{word}, {later} s on"
+            );
+        }
+        if held {
+            let at = now + 25 * 3_600;
+            let request = store.request_pin("kimi-1", at).unwrap();
+            let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
+            assert_eq!(
+                renew_requested_pin_at(
+                    Cli::Kimi,
+                    (&bed.home, &bed.state, &bed.roster(Cli::Kimi)),
+                    request,
+                    at,
+                    (
+                        &Arc::new(Mutex::new(AutoRenewGuard::default())),
+                        &spawn,
+                        None
+                    ),
+                    None,
+                    false,
+                ),
+                RenewalDispatch::Failed,
+                "a saved choice a tick resumed"
+            );
+        }
+    }
+}
+
+/// A BOT PROTECTION'S STOP IS RECORDED WHERE THE RENEWAL'S OWN RECORD DOES NOT LAND: an agent's
+/// `accounts renew` of a row with nothing on record runs its sign-in; while it runs the row's
+/// order (`class`) changes, so the renewal's record is refused as written for another row, and
+/// the sign-in meets a bot protection. The account's check is on record all the same, and a
+/// restarted upkeep holds the row past the cooldown, six hours and a minute and a day on, with
+/// the roster as it was. CONTROL: the same run ending in a plain failure leaves nothing that
+/// holds the row.
+#[cfg(unix)]
+#[test]
+fn a_check_met_by_a_renewal_whose_record_did_not_land_is_recorded_alone() {
+    use super::super::login_drive::Outcome;
+    for (cli, bot) in [(Cli::Kimi, true), (Cli::Codex, true), (Cli::Kimi, false)] {
+        let (bed, now) = signed_out_pool_row(
+            &format!("unlanded-{}-{bot}", cli.id()),
+            cli,
+            "row-1",
+            "row-one@example.com",
+        );
+        let roster = bed.roster(cli);
+        let before = fs::read_to_string(&roster).unwrap();
+        let (shared, preferred) = (
+            "label = \"row-1\"\nclass = \"shared\"",
+            "label = \"row-1\"\nclass = \"dedicated\"",
+        );
+        let changed = if before.contains(shared) {
+            before.replacen(shared, preferred, 1)
+        } else {
+            before.replacen(preferred, shared, 1)
+        };
+        assert_ne!(changed, before, "{cli:?}: the roster names row-1's order");
+        let during = || fs::write(&roster, &changed).unwrap();
+        let outcome = if bot {
+            bot_check_of(cli)
+        } else {
+            Outcome::Failed
+        };
+        let (code, ran, said) = renew_vendor_row_as(
+            &bed,
+            (cli, "row-1", "row-one@example.com"),
+            Who::Agent,
+            (outcome, &during),
+            now,
+        );
+        assert_eq!(ran, 1, "{cli:?} bot={bot}: the sign-in ran: {said}");
+        assert_ne!(code, ExitCode::SUCCESS, "{cli:?} bot={bot}: {said}");
+        fs::write(&roster, &before).unwrap();
+        let store = accounts::Store::at_for(&bed.state, cli, &bed.home);
+        assert_eq!(
+            store
+                .load_logins(now)
+                .unwrap()
+                .0
+                .get("row-1")
+                .and_then(|binding| binding.check_stop.clone())
+                .map(|check| check.account),
+            bot.then(|| Some("row-one@example.com".to_owned())),
+            "{cli:?} bot={bot}: {said}"
+        );
+        for later in [901, PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+            assert_eq!(
+                restarted_upkeep_tries(&bed, cli, "row-1", now + later),
+                !bot,
+                "{cli:?} bot={bot}: {later} s on"
+            );
+        }
+    }
+}
+
+/// THE PAGE STEP LOADS NO PAGE FOR A HELD ROW WITH NOBODY AT THIS MAC: `renew_one_for`, which
+/// every door's renewal runs, ends a row whose bot check stands `Failed` with no sign-in run
+/// when an agent or another Mac runs it, whatever door let it through. CONTROL: a person at this
+/// Mac's terminal runs it.
+#[cfg(unix)]
+#[test]
+fn the_page_step_loads_no_page_for_a_held_row_with_nobody_at_this_mac() {
+    use super::super::cli::Renewal;
+    use super::super::login_drive::Outcome;
+    for cli in [Cli::Kimi, Cli::Codex] {
+        let (bed, now) = signed_out_pool_row(
+            &format!("page-step-{}", cli.id()),
+            cli,
+            "row-1",
+            "row-one@example.com",
+        );
+        assert_eq!(
+            renewal_ending_of(&bed, cli, "row-1", bot_check_of(cli), now),
+            Renewal::BotCheck,
+            "{cli:?}"
+        );
+        for who in [Who::Agent, Who::OtherMac, Who::Person] {
+            let host = VendorDesk {
+                ends: EndsOn {
+                    cli,
+                    outcome: Outcome::SignedIn {
+                        email: Some("row-one@example.com".to_owned()),
+                        page: false,
+                    },
+                    now: now + 60,
+                    person: false,
+                },
+                who,
+                email: "row-one@example.com",
+                ran: std::cell::Cell::new(0),
+                during: &|| {},
+            };
+            let ended = renewal_by(&bed, cli, "row-1", &host, now + 60);
+            assert_eq!(
+                host.ran.get(),
+                usize::from(who == Who::Person),
+                "{cli:?} {who:?}: {ended:?}"
+            );
+            if who != Who::Person {
+                assert_eq!(ended, Renewal::Failed, "{cli:?} {who:?}");
+            }
+        }
+    }
+}
+
+/// A NEXT SELECTION STARTS NO ROW A BOT PROTECTION STOPPED: a person's click on the next
+/// account at this desk, and the same selection a tick resumes, pass over a row whose check
+/// stands and start no sign-in. CONTROL: with no check on record, the click starts the row's.
+#[cfg(unix)]
+#[test]
+fn a_next_selection_starts_no_row_a_bot_protection_stopped() {
+    for (checked, clicked) in [(true, true), (true, false), (false, true)] {
+        let (bed, now) = signed_out_pool_row(
+            &format!("next-{checked}-{clicked}"),
+            Cli::Kimi,
+            "kimi-1",
+            "kimi-one@example.com",
+        );
+        if checked {
+            assert_eq!(
+                kimi_renewal_ending(&bed, "kimi-1", kimi_bot_check(), now),
+                super::super::cli::Renewal::BotCheck
+            );
+        }
+        let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+        let at = now + 25 * 3_600;
+        let request = store.request_next(at).unwrap();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        let owner = ManualSelectionOwner::claim(
+            &guard,
+            &store,
+            Cli::Kimi,
+            accounts::PendingSelection::Next(request),
+            None,
+            at,
+        )
+        .unwrap();
+        let spawned = std::sync::atomic::AtomicUsize::new(0);
+        let spawn = |_work: Box<dyn FnOnce() + Send>| {
+            spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let lifetime = super::super::account_work::Lifetime::default();
+        let dispatch = with_pool_effects(&guard, &spawn, |fx| {
+            with_scope_effects(lifetime.enter().unwrap(), fx, |fx| {
+                manual_selection_owned(
+                    Cli::Kimi,
+                    &bed.home,
+                    &bed.state,
+                    &bed.roster(Cli::Kimi),
+                    (
+                        owner,
+                        if clicked {
+                            Gesture::Clicked
+                        } else {
+                            Gesture::Resumed
+                        },
+                    ),
+                    at,
+                    fx,
+                )
+            })
+        });
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(!checked),
+            "check on record: {checked}, clicked: {clicked}: {dispatch:?}"
+        );
+    }
+}
+
+/// A BOT PROTECTION'S STOP THIS PROCESS COULD NOT RECORD HOLDS THE ROW UNTIL IT IS WRITTEN, THEN
+/// ON NO CLOCK: a background renewal of `kimi-1` met the check while `accounts.lock` stayed
+/// held, so this process kept it ([`AutoRenewGuard::unrecorded_checks`]); the upkeep past the
+/// cooldown starts nothing and writes the account's check, which then holds the row six hours
+/// and a minute and a day on, after a restart too. A plain failure tried again past its cooldown
+/// is the control ([`a_pool_rows_bot_check_holds_it_with_no_clock_past_the_cooldown_and_a_restart`]).
+#[cfg(unix)]
+#[test]
+fn a_vendor_rows_unrecorded_check_holds_it_until_a_pass_writes_it() {
+    use super::super::cli::Renewal;
+    const KEY: &str = "kimi:kimi-1";
+    let (bed, now) = signed_out_pool_row(
+        "vendor-unrecorded-check",
+        Cli::Kimi,
+        "kimi-1",
+        "kimi-one@example.com",
+    );
+    let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
+    let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+    assert!(kimi_pool_upkeep(&bed, &guard, now), "the first try starts");
+    let roster_path = bed.roster(Cli::Kimi);
+    let records = store.read_account_records(Some(&roster_path), now).unwrap();
+    let check = PendingCheck {
+        roster_path,
+        row: records.raw_roster.row("kimi-1").unwrap().clone(),
+        generation: records
+            .logins
+            .get("kimi-1")
+            .map(|binding| binding.renewal_generation),
+        at: now,
+    };
+    {
+        let _held = store.acquire().expect("the test holds accounts.lock");
+        hold_for_a_person(&guard, &store, KEY.to_owned(), check);
+    }
+    let on_record = || {
+        store
+            .load_logins(now)
+            .unwrap()
+            .0
+            .get("kimi-1")
+            .and_then(|binding| binding.check_stop.clone())
+    };
+    assert!(
+        guard.lock().unwrap().unrecorded_checks.contains_key(KEY),
+        "this process keeps it"
+    );
+    assert_eq!(on_record(), None, "not on record under the held lock");
+    note_background_end(&guard, KEY, Renewal::BotCheck, Instant::now());
+    guard.lock().unwrap().last_attempt.remove(KEY);
+    assert!(
+        !kimi_pool_upkeep(&bed, &guard, now + 901),
+        "the upkeep past the cooldown"
+    );
+    assert!(on_record().is_some(), "that pass wrote it");
+    assert!(
+        !guard.lock().unwrap().unrecorded_checks.contains_key(KEY),
+        "and forgot it"
+    );
+    for later in [PERSON_BACKOFF_SECS + 60, 25 * 3_600] {
+        assert!(!kimi_pool_upkeep(&bed, &guard, now + later), "{later} s on");
+        assert!(
+            !restarted_upkeep_tries(&bed, Cli::Kimi, "kimi-1", now + later),
+            "{later} s on, after a restart"
         );
     }
 }
 
 #[test]
+#[cfg(unix)]
 fn durable_sign_in_tasks_hold_across_restarts_sort_last_and_unpark_after_browser_sign_in() {
     let bed = Bed::new("durable-signin-task");
     fake_headless_browser(&bed.home);
@@ -3974,6 +5086,7 @@ region = \"global\"
 /// in here. Once a session here runs on `kimi-2` and its login is signed out, the upkeep signs it
 /// in (CONTROL).
 #[test]
+#[cfg(unix)]
 fn a_walled_vendor_pool_leaves_an_unused_successor_to_a_session_or_a_person() {
     let bed = Bed::new("vendor-wall-recovery");
     fake_headless_browser(&bed.home);
@@ -4396,6 +5509,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
 /// sign-in even when standing rosters, mailbox routes and `logins = "renew"` are present).
 /// NEGATIVE CONTROL: the identical home with `accounts = "early"` dispatches both renewals.
 #[test]
+#[cfg(unix)]
 fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
     for off in [true, false] {
         let bed = Bed::new(if off { "upkeep-off" } else { "upkeep-early" });
@@ -4658,37 +5772,40 @@ fn a_row_its_source_gives_other_macs_alone_reads_as_theirs() {
             accounts::OtherMacs::NONE,
             "{cli:?}: CONTROL: no source says nothing"
         );
-        bed.secret(
-            ACCOUNTS_CSV_FILE,
-            &sheet_giving(cli, "other@example.test", "m22"),
-        );
-        assert_eq!(other_macs_of(&bed, cli), other_held_by("m22"), "{cli:?}");
-        let records = accounts::Store::at_for(&bed.state, cli, &bed.home)
-            .read_account_records(Some(&bed.roster(cli)), NOW)
-            .unwrap();
-        assert_eq!(
-            records.raw_roster.row("other").unwrap().held_by,
-            None,
-            "{cli:?}: nothing is kept that would refuse a person naming the row"
-        );
-        bed.secret(
-            ACCOUNTS_CSV_FILE,
-            &sheet_giving(cli, "someone@example.test", "m22"),
-        );
-        assert_eq!(
-            other_macs_of(&bed, cli),
-            accounts::OtherMacs::NONE,
-            "{cli:?}: CONTROL: an account it does not know"
-        );
-        bed.secret(
-            ACCOUNTS_CSV_FILE,
-            &sheet_giving(cli, "other@example.test", "m16"),
-        );
-        assert_eq!(
-            other_macs_of(&bed, cli),
-            accounts::OtherMacs::NONE,
-            "{cli:?}: CONTROL: the source names this Mac"
-        );
+        #[cfg(unix)]
+        {
+            bed.secret(
+                ACCOUNTS_CSV_FILE,
+                &sheet_giving(cli, "other@example.test", "m22"),
+            );
+            assert_eq!(other_macs_of(&bed, cli), other_held_by("m22"), "{cli:?}");
+            let records = accounts::Store::at_for(&bed.state, cli, &bed.home)
+                .read_account_records(Some(&bed.roster(cli)), NOW)
+                .unwrap();
+            assert_eq!(
+                records.raw_roster.row("other").unwrap().held_by,
+                None,
+                "{cli:?}: nothing is kept that would refuse a person naming the row"
+            );
+            bed.secret(
+                ACCOUNTS_CSV_FILE,
+                &sheet_giving(cli, "someone@example.test", "m22"),
+            );
+            assert_eq!(
+                other_macs_of(&bed, cli),
+                accounts::OtherMacs::NONE,
+                "{cli:?}: CONTROL: an account it does not know"
+            );
+            bed.secret(
+                ACCOUNTS_CSV_FILE,
+                &sheet_giving(cli, "other@example.test", "m16"),
+            );
+            assert_eq!(
+                other_macs_of(&bed, cli),
+                accounts::OtherMacs::NONE,
+                "{cli:?}: CONTROL: the source names this Mac"
+            );
+        }
     }
 }
 
@@ -4746,6 +5863,7 @@ fn renewal_of_a_used_gone_row(
 /// sheet gives its account to this Mac, and neither ranked, due nor admitted by the renewal door
 /// once the sheet gives it to m22 alone. CONTROL: the sheet naming this Mac.
 #[test]
+#[cfg(unix)]
 fn a_used_row_whose_login_went_is_not_renewed_where_its_source_gives_it_to_another_mac() {
     for (computer, ours) in [("m16", true), ("m22", false)] {
         let bed = Bed::new("other-macs-renewal");
@@ -4847,6 +5965,7 @@ fn an_account_named_for_this_mac_among_others_is_not_another_macs() {
 /// A LOGIN ALREADY HERE IS THIS MAC'S, whoever the source gives it to: a person's own borrowing
 /// keeps working once made, signed out included.
 #[test]
+#[cfg(unix)]
 fn a_login_already_here_is_this_macs_whoever_the_source_gives_it_to() {
     let bed = Bed::new("other-macs-login");
     keep_a_row_with_no_login(&bed, Cli::Kimi);
@@ -4867,6 +5986,7 @@ fn a_login_already_here_is_this_macs_whoever_the_source_gives_it_to() {
 /// gives its account to. With no login there it has none here at all, as `aterm ai` reads it, and
 /// is another Mac's like any other row.
 #[test]
+#[cfg(unix)]
 fn the_row_on_the_default_login_is_this_macs_while_its_login_stands() {
     let bed = Bed::new("other-macs-default");
     fs::write(
@@ -5115,6 +6235,7 @@ fn a_vault_that_cannot_be_read_leaves_the_row_unread() {
 /// Mac: the sheet moved it off this one ([`carry_conflicting`]), so the first it names holds it.
 /// `CONTROL`: one of them names this Mac, and the row stays this Mac's while they disagree.
 #[test]
+#[cfg(unix)]
 fn sheet_rows_that_conflict_over_an_account_say_whose_it_is() {
     let bed = Bed::new("other-macs-conflict");
     keep_a_row_with_no_login(&bed, Cli::Claude);
@@ -5213,4 +6334,11 @@ fn a_syncs_receipt_lists_no_sign_in_of_another_macs_account() {
     };
     assert_eq!(needs("m16"), 1, "CONTROL");
     assert_eq!(needs("m22"), 0);
+}
+
+#[test]
+#[cfg(not(unix))]
+fn source_presence_model_holds_on_every_target() {
+    let model = aterm_models_harness::account_source_presence_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
 }

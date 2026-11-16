@@ -93,6 +93,24 @@ fn wanted<'p>(plan: &'p Plan, pk: &str, column: &str) -> Option<&'p Value> {
         .map(|p| &p.x)
 }
 
+/// The members `plan` wants in the text set `column` of the machine row `pk`.
+fn wanted_members<'p>(plan: &'p Plan, pk: &str, column: &str) -> Vec<&'p str> {
+    let prefix = format!("{column}.");
+    plan.planned
+        .iter()
+        .filter(|p| p.collection == MACHINE.name && p.pk == pk && p.column.starts_with(&prefix))
+        .filter_map(|p| p.x.as_str())
+        .collect()
+}
+
+/// The owner's cell `column` of the machine row `pk`: a host is a member of its text set.
+fn held(pk: &str, column: &str, x: Value) -> crate::database::Change {
+    match (column, x.as_str()) {
+        ("hosts", Some(host)) => elem(&MACHINE, pk, column, host),
+        _ => put(&MACHINE, pk, column, x),
+    }
+}
+
 /// A node-bound row under the Mac's old label, carrying the new name as an alias.
 fn relabelled(book: &mut Book) -> String {
     let pk = keys::machine_pk("m36");
@@ -174,7 +192,7 @@ fn a_node_then_a_host_match_before_a_name() {
         &[],
         vec![
             put(&MACHINE, &host_row, "label", json!("m50")),
-            put(&MACHINE, &host_row, "hosts", json!(["studio.local"])),
+            elem(&MACHINE, &host_row, "hosts", "studio.local"),
             put(&MACHINE, &host_row, "row", json!("live")),
         ],
     );
@@ -248,7 +266,7 @@ fn a_name_read_before_its_computers_row_finds_the_row_its_node_or_host_finds() {
             vec![
                 put(&MACHINE, &row, "label", json!("m36")),
                 put(&MACHINE, &row, "fleet_node", json!(NODE)),
-                put(&MACHINE, &row, "hosts", json!(["desk.local"])),
+                elem(&MACHINE, &row, "hosts", "desk.local"),
                 put(&MACHINE, &row, "status", json!("active")),
                 put(&MACHINE, &row, "row", json!("live")),
             ],
@@ -289,8 +307,8 @@ fn a_host_never_crosses_a_node() {
     let first = plan(&input(&sheets, &[]), &book.cells()).unwrap();
     assert_eq!(new_machines(&first), 2, "{:?}", first.counts);
     let (one, two) = (keys::machine_pk("m1"), keys::machine_pk("m2"));
-    assert_eq!(wanted(&first, &one, "hosts"), Some(&json!(["Studio"])));
-    assert_eq!(wanted(&first, &two, "hosts"), None);
+    assert_eq!(wanted_members(&first, &one, "hosts"), ["Studio"]);
+    assert!(wanted_members(&first, &two, "hosts").is_empty());
     assert_eq!(wanted(&first, &two, "fleet_node"), Some(&json!(OTHER_NODE)));
     assert!(first.findings.iter().any(|f| f.kind == Kind::HostAmbiguous
         && f.pk.as_deref() == Some(two.as_str())
@@ -311,7 +329,7 @@ fn a_host_never_crosses_a_node() {
         vec![
             put(&MACHINE, &one, "label", json!("m1")),
             put(&MACHINE, &one, "node", json!(OTHER_PRINCIPAL)),
-            put(&MACHINE, &one, "hosts", json!(["Studio"])),
+            elem(&MACHINE, &one, "hosts", "Studio"),
             put(&MACHINE, &one, "row", json!("live")),
         ],
     );
@@ -337,7 +355,7 @@ fn a_default_hostname_states_no_host() {
         &[],
         vec![
             put(&MACHINE, &row, "label", json!("m50")),
-            put(&MACHINE, &row, "hosts", json!(["m201.local"])),
+            elem(&MACHINE, &row, "hosts", "m201.local"),
             put(&MACHINE, &row, "row", json!("live")),
         ],
     );
@@ -708,7 +726,8 @@ fn a_host_the_row_answers_is_covered() {
         &[],
         vec![
             put(&MACHINE, &row, "label", json!("m36")),
-            put(&MACHINE, &row, "hosts", json!(["Studio-MBP", "Studio MBP"])),
+            elem(&MACHINE, &row, "hosts", "Studio-MBP"),
+            elem(&MACHINE, &row, "hosts", "Studio MBP"),
             put(&MACHINE, &row, "status", json!("active")),
             put(&MACHINE, &row, "row", json!("live")),
         ],
@@ -811,7 +830,7 @@ fn what_a_replica_disputes_finds_no_row() {
         vec![
             put(&MACHINE, &row, "label", json!("m36")),
             put(&MACHINE, &row, "fleet_node", json!(NODE)),
-            put(&MACHINE, &row, "hosts", json!(["desk.local"])),
+            elem(&MACHINE, &row, "hosts", "desk.local"),
             put(&MACHINE, &row, "row", json!("live")),
         ],
     );
@@ -951,7 +970,7 @@ fn two_rows_on_one_host_are_a_finding() {
             &[],
             vec![
                 put(&MACHINE, &pk, "label", json!(label)),
-                put(&MACHINE, &pk, "hosts", json!(["studio"])),
+                elem(&MACHINE, &pk, "hosts", "studio"),
                 put(&MACHINE, &pk, "row", json!("live")),
             ],
         );
@@ -2327,7 +2346,7 @@ fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
     for (stating, more, (theirs, their_id)) in [
         (
             json!({"label": "m104", "hostname": "Studio", "status": "active"}),
-            ("hosts", json!(["Studio"])),
+            ("hosts", json!("Studio")),
             transport.clone(),
         ),
         (
@@ -2348,7 +2367,7 @@ fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
         let mut book = Book::new();
         let mut rows = vec![
             put(&MACHINE, &holder, "label", json!("m5")),
-            put(&MACHINE, &holder, more.0, more.1),
+            held(&holder, more.0, more.1),
             put(&MACHINE, &holder, "row", json!("live")),
         ];
         rows.extend(other_row(theirs));
@@ -2392,7 +2411,7 @@ fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
         (
             mac(|mac| mac.hosts = vec!["Studio".to_owned()]),
             &holder,
-            Some(("hosts", json!(["Studio"]))),
+            Some(("hosts", json!("Studio"))),
         ),
     ] {
         let mut book = Book::new();
@@ -2405,7 +2424,7 @@ fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
         apply(&mut book, &first);
         let seen = book.all();
         let mut rows = other_row(transport.0.clone());
-        rows.extend(cell.map(|(column, x)| put(&MACHINE, pk, column, x)));
+        rows.extend(cell.map(|(column, x)| held(pk, column, x)));
         book.write(2, &seen, rows);
         assert_eq!(aliases_of(&book.cells(), pk), ["m104"]);
         let mut sheets = vec![computers_sheet(&["m5,Apple,,,,,,,,,,"])];
@@ -2670,4 +2689,39 @@ fn a_roster_name_a_conflicted_label_shows_wants_no_alias() {
             read.planned
         );
     }
+}
+
+/// A host a replica still states stays, whichever other source states the row's hosts beside it
+/// (LT-15B): on registry.4, where a Mac's hosts are a text set, a replica stating a host the row
+/// holds restates that member, so the roster's other host never reads as the replica dropping it,
+/// and a re-run writes nothing.
+/// NEGATIVE CONTROL (run 2026-11-15): each of two rules holds this alone. With both undone
+/// (`want_host` wanting nothing where the row answers the host, and the import's retraction taking
+/// back a member whenever any source states the set), the re-run writes `hosts.… false` for the
+/// replica's host; with either undone alone the test passes.
+#[test]
+fn a_host_a_replica_still_states_stays_beside_the_rosters() {
+    let row = keys::machine_pk("m36");
+    let sheets = replica(
+        json!([{"label": "m36", "hostname": "m36-studio", "status": "active"}]),
+        Mode::Authoritative,
+    );
+    let mut mac = roster(36, &[], None);
+    mac.hosts = vec!["m36.lan".to_owned()];
+    let macs = [mac];
+    let mut book = Book::new();
+    let first = plan(&input(&sheets, &macs), &book.cells()).unwrap();
+    let cells = apply(&mut book, &first);
+    let hosts = |cells: &Cells| {
+        let mut hosts = cell::texts(
+            cell::project(&MACHINE, cells).rows[&row]
+                .fields
+                .get("hosts"),
+        );
+        hosts.sort_unstable();
+        hosts
+    };
+    assert_eq!(hosts(&cells), ["m36-studio", "m36.lan"]);
+    let again = plan(&input(&sheets, &macs), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.planned);
 }

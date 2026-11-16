@@ -7,10 +7,7 @@
 /// files under `changes/` ([`super::fragments`]), above the releases before.
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
-/// The head of the harness-versions announcement the release derives and writes into its own
-/// section (aterm-release's `harness_versions`): generated, so it never counts as a section's
-/// release notes.
-pub const HARNESS_ENTRY_HEAD: &str = "- **Harness versions since v";
+pub use aterm_census::release_notes::{HARNESS_ENTRY_HEAD, KINDS};
 
 /// What the pre-claim gate learned about a section: `entries`, the count of top-level bullets in the real body, for the transcript only.
 #[derive(Debug)]
@@ -118,17 +115,6 @@ fn entry_above_every_section(text: &str) -> Option<usize> {
     }
     None
 }
-
-/// Keep a Changelog's section order, shared with the release's assembly of `[Unreleased]` from
-/// the entry files under `changes/<kind>/` ([`super::fragments`]).
-pub const KINDS: [&str; 6] = [
-    "Added",
-    "Changed",
-    "Deprecated",
-    "Removed",
-    "Fixed",
-    "Security",
-];
 
 /// Every structural finding in the section being shipped, plus entries outside all sections.
 /// Historical sections remain verbatim; a recut judges its selected historical section.

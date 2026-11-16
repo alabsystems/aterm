@@ -21,7 +21,7 @@ fn row(at_ms: u64) -> PresenceRow {
 }
 
 fn needs() -> NeedsRow {
-    let sid = aterm_metrics::row::Sid::parse("s-0123456789abcdef0123").expect("a sid");
+    let sid = aterm_metrics::row::Sid::from_bits(1);
     NeedsRow {
         at: 1_793_836_800,
         needs: vec![NeedEntry {
@@ -47,7 +47,7 @@ fn activity() -> ActivityRow {
         busy: 2,
         walled: 1,
         sessions: vec![AgentEntry {
-            sid: aterm_metrics::row::Sid::parse("s-0123456789abcdef0123").expect("a sid"),
+            sid: aterm_metrics::row::Sid::from_bits(1),
             word: aterm_metrics::row::Word::new("walled").expect("a word"),
             detail: aterm_metrics::row::Word::new("usage-weekly"),
         }],

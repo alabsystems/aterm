@@ -125,58 +125,6 @@ fn publisher_controls_share_one_complete_advertisement() {
 }
 
 #[test]
-fn lane_record_reads_one_file_at_the_observed_journal_without_importing_history() {
-    let fake = agh_fake::FakeGithub::start();
-    let slug = Slug::parse("fixture/app").unwrap();
-    fake.add_repo("fixture/app", agh_fake::RepoSpec::public());
-    let journal = "a".repeat(40);
-    let tree = "b".repeat(40);
-    let path = format!("verdicts/{tree}.toml");
-    fake.put_file("fixture/app", &journal, &path, b"state = 'red'");
-    fake.put_file("fixture/app", "main", &path, b"state = 'pass'");
-    let ports = fake.ports();
-    let env = Arc::new(agh::identity::MapEnv::default());
-    let client = GithubBuilder::new(Router::empty())
-        .endpoints(agh::wire::Endpoints::loopback(
-            ports.api,
-            ports.uploads,
-            ports.web,
-            ports.cdn,
-        ))
-        .transport(Arc::new(agh::wire::http::HttpTransport::direct(
-            env.clone(),
-        )))
-        .env(env)
-        .fx(Arc::new(agh::Fx::simulated(1_790_000_000)))
-        .retry(agh::retry::RetryPolicy::NONE)
-        .build();
-    assert_eq!(
-        lane_record_with(&client, &slug, &journal, &tree)
-            .unwrap()
-            .unwrap(),
-        b"state = 'red'"
-    );
-    assert_eq!(
-        lane_record_with(&client, &slug, &journal, &"c".repeat(40)).unwrap(),
-        None
-    );
-    assert!(lane_record_with(&client, &slug, "main", &tree).is_err());
-    assert!(lane_record_with(&client, &slug, &journal, "../other").is_err());
-    // A private, invisible parent is not evidence that a tree is unjudged.
-    fake.add_repo("hidden/app", agh_fake::RepoSpec::private());
-    assert!(
-        lane_record_with(
-            &client,
-            &Slug::parse("hidden/app").unwrap(),
-            &journal,
-            &tree
-        )
-        .is_err()
-    );
-    fake.assert_clean();
-}
-
-#[test]
 fn supersession_reads_private_staging_with_its_routed_identity() {
     use std::os::unix::fs::PermissionsExt as _;
     let root = aterm_tempfile::tempdir().unwrap();

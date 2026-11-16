@@ -9,12 +9,15 @@ use super::super::tests::{Stand, put_all, store};
 use super::*;
 use crate::{
     alab::{
-        import::{Input, Plan, Step, Terms, Vendors, plan_cells as plan},
-        registry::{ADDRESS, MACHINE as MACHINE_TABLE, MAILBOX, PHONE, SOURCE},
+        import::{Input, Plan, Step, Terms, Vendors, plan_cells as plan, plan_cells_at},
+        registry::{
+            ADDRESS, MACHINE as MACHINE_TABLE, MAILBOX, PHONE, REGISTRY_3, REGISTRY_4, SOURCE,
+        },
     },
     typed::{
+        Table,
         cell::{self, Cells},
-        grid::tests::{Book, put},
+        grid::tests::{Book, elem, put},
         secret,
     },
 };
@@ -26,7 +29,12 @@ const KEY: [u8; 32] = [0x5a; 32];
 
 /// The plan of `sheets` over `cells`.
 fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
-    plan(
+    planned_at(sheets, &REGISTRY_4, cells)
+}
+
+/// [`planned`] against the generation `table`.
+fn planned_at(sheets: &[Sheet], table: &'static Table, cells: &Cells) -> Plan {
+    plan_cells_at(
         &Input {
             sheets,
             macs: &[],
@@ -36,6 +44,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
             births: crate::alab::import::Births::Named,
             unread: &[],
         },
+        table,
         cells,
     )
     .unwrap()
@@ -72,6 +81,19 @@ fn value<'p>(plan: &'p Plan, collection: &str, pk: &str, column: &str) -> Option
         .iter()
         .find(|p| p.collection == collection && p.pk == pk && p.column == column)
         .map(|p| &p.x)
+}
+
+/// The members `plan` states in the text set `column` of `collection.pk`, sorted.
+fn members<'p>(plan: &'p Plan, collection: &str, pk: &str, column: &str) -> Vec<&'p str> {
+    let prefix = format!("{column}.");
+    let mut members: Vec<&str> = plan
+        .planned
+        .iter()
+        .filter(|p| p.collection == collection && p.pk == pk && p.column.starts_with(&prefix))
+        .filter_map(|p| p.x.as_str())
+        .collect();
+    members.sort_unstable();
+    members
 }
 
 fn kinds(plan: &Plan) -> Vec<&'static str> {
@@ -341,14 +363,17 @@ fn every_fleet_db_column_is_carried() {
         ("disk_gb", json!(2000)),
         ("aliases.m30", json!(true)),
         ("nickname", json!("studio")),
-        ("nickname_aliases", json!(["fb", "redballoon"])),
         ("location", json!("SF")),
         ("fleet_node", json!("00112233445566778899aabbccddeeff")),
-        ("hosts", json!(["studio.lan"])),
         ("note", json!("desk Mac")),
     ] {
         assert_eq!(machine_value(column), Some(x), "{column}");
     }
+    assert_eq!(
+        members(&plan, "machine", &m, "nickname_aliases"),
+        ["fb", "redballoon"]
+    );
+    assert_eq!(members(&plan, "machine", &m, "hosts"), ["studio.lan"]);
     // A word other than the `active` fleet_db wrote for every row is a statement: carried on a
     // birth too.
     assert_eq!(machine_value("status"), Some(json!("parked")));
@@ -698,7 +723,7 @@ fn a_protected_row_refuses_a_password() {
         )],
     );
     let cells = book.cells();
-    let (_, found) = crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &cells);
+    let (_, found) = crate::alab::checks::lab(&crate::alab::registry::REGISTRY_4, &cells);
     assert!(found.iter().any(|f| matches!(f,
         crate::typed::check::Finding::Protected { pk, column, .. } if *pk == two && column == "password")),
         "{found:?}");
@@ -1562,10 +1587,6 @@ fn a_cell_a_guard_refuses_keeps_the_replica_uncovered() {
             "nickname_aliases",
             machine(&[("nickname_aliases", json!(["red@balloon"]))]),
         ),
-        (
-            "nickname_aliases",
-            machine(&[("nickname_aliases", json!(aliases))]),
-        ),
         ("node_id", machine(&[("node_id", json!("not-a-node"))])),
         ("hostname", machine(&[("hostname", json!("a@b.example"))])),
         ("status", machine(&[("status", json!("retired"))])),
@@ -1587,6 +1608,25 @@ fn a_cell_a_guard_refuses_keeps_the_replica_uncovered() {
             "{column}: {dump:?}"
         );
     }
+    // Nine nickname aliases: registry.4 holds them as a text set, which has no count cap, where
+    // registry.3's list held eight.
+    let nine = machine(&[("nickname_aliases", json!(aliases))]);
+    assert_eq!(
+        left_uncovered(&nine, Mode::Authoritative),
+        Vec::<String>::new()
+    );
+    let at_3 = planned_at(
+        &sheets(&nine, Mode::Authoritative),
+        &REGISTRY_3,
+        &Cells::new(),
+    );
+    assert!(
+        at_3.findings
+            .iter()
+            .any(|f| f.kind.word() == "unmapped" && f.column.as_deref() == Some("nickname_aliases")),
+        "{:?}",
+        at_3.findings
+    );
     let clean = machine(&[
         ("chip", json!("M3 Max")),
         ("memory_gb", json!(64)),
@@ -1708,7 +1748,7 @@ fn a_replica_row_finds_its_mac_by_its_mesh_id() {
                 "node",
                 json!("fedcba9876543210"),
             ),
-            put(&MACHINE_TABLE, &elsewhere, "hosts", json!(["studio.local"])),
+            elem(&MACHINE_TABLE, &elsewhere, "hosts", "studio.local"),
             put(&MACHINE_TABLE, &elsewhere, "row", json!("live")),
         ],
     );
@@ -2469,8 +2509,8 @@ fn a_list_column_is_read_item_by_item() {
         Some(&json!(true))
     );
     assert_eq!(
-        value(&plan, "machine", &machine, "nickname_aliases"),
-        Some(&json!(["old m12", "Red Balloon"]))
+        members(&plan, "machine", &machine, "nickname_aliases"),
+        ["Red Balloon", "old m12"]
     );
     let plan = planned(
         &sheets(
@@ -2865,7 +2905,7 @@ fn a_cell_an_edit_clears_is_reported() {
         "ram_gb",
         "disk_gb",
         "nickname",
-        "nickname_aliases",
+        &format!("nickname_aliases.{}", keys::text_elem("fb")),
         "location",
         "note",
     ] {
@@ -3064,7 +3104,7 @@ fn a_row_protected_later_gives_back_its_mailbox_and_hint() {
     );
     apply(&mut book, &plan);
     let (lab, generic) =
-        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &book.cells());
+        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_4, &book.cells());
     assert!(lab.is_empty(), "{lab:?}");
     assert!(generic.is_empty(), "{generic:?}");
 
@@ -3582,4 +3622,51 @@ fn an_edit_to_one_table_takes_nothing_back_through_another() {
             kinds(&plan)
         );
     }
+}
+
+/// Another source stating a Mac's nickname aliases never takes back a member the computers sheet
+/// wrote (LT-15B): on registry.4, where a later read of the sheet leaves the column blank and a
+/// replica's dump states another alias, the sheet's member stays beside the dump's.
+/// NEGATIVE CONTROL (run 2026-11-15): with the import's retraction taking back a member whenever
+/// any source states the set, the dump's alias takes the sheet's `mini` away: `` left: ["studio"]
+/// right: ["mini", "studio"] ``.
+#[test]
+fn another_sources_aliases_leave_a_sheets_member() {
+    let machine = keys::planned_machine_pk("m3", |_| false).unwrap();
+    let sheet = |aliases: &str| {
+        Sheet::parse(
+            SheetKind::Computers,
+            "alab-computers.csv",
+            format!(
+                "ID,Make,Arch,OS,Processor,RAM,HD,Aliases,Nickname,Nickname Aliases,Location,Notes\n\
+                 m3,Apple,,,,,,,,{aliases},,\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap()
+    };
+    let first = sheet("mini");
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &planned(std::slice::from_ref(&first), &Cells::new()),
+    );
+    let mut edited = sheet("");
+    edited.earlier = BTreeSet::from([first.source.clone()]);
+    let mut read = sheets(
+        &computers(json!({"label": "m3", "nickname_aliases": ["studio"]})),
+        Mode::Authoritative,
+    );
+    read.push(edited);
+    let cells = apply(&mut book, &planned(&read, &cells));
+    let column = MACHINE_TABLE.column("nickname_aliases").unwrap();
+    let machines = cell::project(&MACHINE_TABLE, &cells);
+    let mut held: Vec<&str> = cell::members(
+        column,
+        machines.rows[&machine].fields.get("nickname_aliases"),
+    )
+    .into_iter()
+    .collect();
+    held.sort_unstable();
+    assert_eq!(held, ["mini", "studio"]);
 }

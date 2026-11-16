@@ -449,7 +449,8 @@ fn check(files: Vec<(&str, io::Result<Vec<u8>>)>, image: Part, plist: Part) {
 }
 
 /// Current files and adoptable signed images need a running service. File repairs do not
-/// need a service probe; unknown file or service readings authorize no additional repair.
+/// need a service probe; unknown file or service readings authorize no additional repair. A job
+/// launchd cannot say is switched off keeps the debt as it reads.
 #[test]
 fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
     for image in [Part::Current, Part::Adopting("ABCDE12345".into())] {
@@ -457,9 +458,10 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
             image,
             plist: Part::Current,
         };
-        assert!(!reading.owed_with_running(|| Some(true)));
-        assert!(reading.owed_with_running(|| Some(false)));
-        assert!(!reading.owed_with_running(|| None));
+        assert!(!reading.owed_with_job(|| Some(true), || panic!("nothing owed asks no switch")));
+        assert!(reading.owed_with_job(|| Some(false), || Some(false)));
+        assert!(reading.owed_with_job(|| Some(false), || None));
+        assert!(!reading.owed_with_job(|| None, || panic!("nothing owed asks no switch")));
     }
     for reading in [
         Reading {
@@ -471,7 +473,11 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
             plist: Part::Differs,
         },
     ] {
-        assert!(reading.owed_with_running(|| panic!("file repair needs no service probe")));
+        assert!(reading.owed_with_job(
+            || panic!("file repair needs no service probe"),
+            || Some(false)
+        ));
+        assert!(reading.owed_with_job(|| panic!("file repair needs no service probe"), || None));
     }
     for reading in [
         Reading {
@@ -483,7 +489,34 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
             plist: Part::Unread("denied".into()),
         },
     ] {
-        assert!(!reading.owed_with_running(|| panic!("unread files authorize no service repair")));
+        assert!(!reading.owed_with_job(
+            || panic!("unread files authorize no service repair"),
+            || panic!("nothing owed asks no switch")
+        ));
+    }
+}
+
+/// A broker job a person switched off (its background item in Login Items, or `launchctl
+/// disable`) is owed nothing, stopped or running, its files current, adoptable, missing or
+/// another build's: no password is asked to undo their choice.
+/// MUTANT: `owed_with_job` ignoring `switched_off` owes every one of them.
+#[test]
+fn a_job_the_person_switched_off_is_owed_nothing() {
+    let parts = [
+        (Part::Current, Part::Current),
+        (Part::Adopting("ABCDE12345".into()), Part::Current),
+        (Part::Missing, Part::Missing),
+        (Part::Differs, Part::Current),
+        (Part::Current, Part::Differs),
+    ];
+    for (image, plist) in parts {
+        let reading = Reading { image, plist };
+        for running in [Some(false), Some(true), None] {
+            assert!(
+                !reading.owed_with_job(|| running, || Some(true)),
+                "{reading:?} running {running:?}"
+            );
+        }
     }
 }
 

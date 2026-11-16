@@ -44,9 +44,9 @@ fn ask(
         asked.push((r.pid, tokens));
         match r.pid {
             7 => Ok(vec![
-                "brief sid=s-1 v=2 as_of=40 ep=1 budget=300 used=80".to_string(),
+                "brief sid=t1xxxxxxxxx v=2 as_of=40 ep=1 budget=300 used=80".to_string(),
                 "agent claude busy 2m · t3 open 40s by=ctl ledger=3".to_string(),
-                "brief sid=s-2 v=2 as_of=9 ep=1 budget=300 used=40".to_string(),
+                "brief sid=t2xxxxxxxxx v=2 as_of=9 ep=1 budget=300 used=40".to_string(),
             ]),
             _ => Err("server replied: ERR denied: brief all is the owner's".to_string()),
         }
@@ -76,7 +76,7 @@ fn the_local_brief_heads_each_instance_and_keeps_its_gap_lines() {
     assert_eq!(&lines[2..6], &newer().node.unwrap()[..]);
     assert_eq!(
         lines[6],
-        "brief sid=s-1 v=2 as_of=40 ep=1 budget=300 used=80"
+        "brief sid=t1xxxxxxxxx v=2 as_of=40 ep=1 budget=300 used=80"
     );
     assert_eq!(
         lines[9],
@@ -232,7 +232,7 @@ fn an_instance_that_refuses_log_n_still_gets_its_brief() {
         |r, tokens| {
             asked.push((r.pid, tokens));
             Ok(vec![
-                "brief sid=s-1 v=2 as_of=40 ep=1 budget=300 used=80".to_string(),
+                "brief sid=t1xxxxxxxxx v=2 as_of=40 ep=1 budget=300 used=80".to_string(),
                 "agent claude idle 2m".to_string(),
             ])
         },
@@ -248,7 +248,7 @@ fn an_instance_that_refuses_log_n_still_gets_its_brief() {
     assert_eq!(
         &lines[2..],
         [
-            "brief sid=s-1 v=2 as_of=40 ep=1 budget=300 used=80",
+            "brief sid=t1xxxxxxxxx v=2 as_of=40 ep=1 budget=300 used=80",
             "agent claude idle 2m"
         ]
     );

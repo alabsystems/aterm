@@ -37,9 +37,9 @@ use crate::client::{Github, Meter};
 use crate::config::{self, DefaultRow, OwnerRow, ProfileRow, WriteField};
 use crate::config::{AghConfig, ConfigFault, Dirs, Validated};
 use crate::error::{Error, IdentityRef, Kind, Result, Sub};
+use crate::identity::{Credential, Profile, Source, TokenKind};
 #[cfg(unix)]
-use crate::identity::LoadError;
-use crate::identity::{Credential, Profile, Source, TokenKind, tilde};
+use crate::identity::{LoadError, tilde};
 use crate::policy::{RefusalCode, Router, Tier};
 
 /// The adoption record, in `Dirs::config`.
@@ -1662,9 +1662,9 @@ pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Re
 }
 
 /// Tests: vault entry `name` of the store under `home` set to `value` (`None` removes it), in a
-/// signed file vault this home's Mac administers, which the first call creates beside the home
-/// (`<home>.vault`). The store is what agh reads; no file under `home/.secrets` is read, though
-/// the vault's own subscriber may still write one there.
+/// signed file vault this home's Mac administers. A home with no vault configuration gets one
+/// at `<home>.vault.d/fixture.vault`. The store is what agh reads; this fixture exports no
+/// plaintext file under `home/.secrets`.
 /// # Panics
 /// When the vault cannot be created, opened or published: a test's fixture failed.
 #[cfg(all(unix, any(test, debug_assertions)))]

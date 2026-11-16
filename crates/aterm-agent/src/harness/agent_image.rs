@@ -48,6 +48,8 @@ use std::path::{Path, PathBuf};
 use aterm_phase::Program;
 use atpkg::image::{ImageRoots, ImageSource};
 
+use super::upgrade_drive::{NotRead, read_not_made};
+
 /// Claude Code's signing team: `TeamIdentifier=Q6L2SF6YDW` (`codesign -dv`, keys only, on the
 /// native 2.1.227, 2.1.270 and 2.1.271 builds, the atpkg store build 2.1.316 and the Homebrew
 /// 2.1.170, 2026-10-31; `Authority=Developer ID Application: Anthropic PBC (Q6L2SF6YDW)`), and the
@@ -380,16 +382,34 @@ pub const fn vendor_team(agent: Program) -> Option<&'static str> {
 /// - Grok Build, Kimi Code and anything else: none (the harness drives none of them).
 #[must_use]
 pub fn in_vendor_layout(agent: Program, image: &Image<'_>, places: &Places<'_>) -> bool {
+    vendor_layout_read(agent, image, places) == Ok(true)
+}
+
+/// [`in_vendor_layout`] as the reads it rests on came to it: `Ok(false)` only where they were
+/// read and say `image` is no install of `agent`'s, and [`NotRead`] where one failed and nothing
+/// else confirms it: for codex-alab its package's manifest or marker
+/// ([`super::codex_alab::alab_package`]), for Claude Code its native entry or the image's own
+/// identity ([`claude_native_read`]). A failed read is never the answer that a live agent is no
+/// lane's (LS-15).
+pub(super) fn vendor_layout_read(
+    agent: Program,
+    image: &Image<'_>,
+    places: &Places<'_>,
+) -> Result<bool, NotRead> {
     match agent {
         Program::Claude => {
-            places
+            let native = places
                 .claude_versions
-                .is_some_and(|versions| claude_native(image, versions))
-                || stored(agent, image, places)
+                .map_or(Ok(false), |versions| claude_native_read(image, versions));
+            if native == Ok(true) || stored(agent, image, places) {
+                Ok(true)
+            } else {
+                native
+            }
         }
-        Program::Codex => super::codex_alab::alab_bytes(image.exe),
-        Program::Agy | Program::Muse => stored(agent, image, places),
-        Program::Grok | Program::Kimi | Program::Generic => false,
+        Program::Codex => super::codex_alab::alab_package(image.exe),
+        Program::Agy | Program::Muse => Ok(stored(agent, image, places)),
+        Program::Grok | Program::Kimi | Program::Generic => Ok(false),
     }
 }
 
@@ -399,18 +419,34 @@ pub fn in_vendor_layout(agent: Program, image: &Image<'_>, places: &Places<'_>) 
 /// names the link's target, and the entry is a link.
 #[must_use]
 pub fn claude_native(image: &Image<'_>, versions: &Path) -> bool {
+    claude_native_read(image, versions) == Ok(true)
+}
+
+/// [`claude_native`] as its reads came to it: `Ok(false)` where the image's name is no version's
+/// or `versions` was read and holds no regular file of that name (its stat answered with absence
+/// or another lasting state, such as a permission, that every later stat finds again), [`NotRead`]
+/// where that entry's stat was not made ([`read_not_made`]) or the image's own identity failed
+/// (LS-72).
+fn claude_native_read(image: &Image<'_>, versions: &Path) -> Result<bool, NotRead> {
     let Some(name) = image.exe.file_name() else {
-        return false;
+        return Ok(false);
     };
     if name
         .to_str()
         .and_then(atpkg::vendor_direct::Version::parse)
         .is_none()
     {
-        return false;
+        return Ok(false);
     }
-    let entry = FileId::of_entry(&versions.join(name));
-    entry.is_some() && entry == image.mapped()
+    let path = versions.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if !meta.file_type().is_file() => return Ok(false),
+        Ok(_) => {}
+        Err(e) if read_not_made(&e) => return Err(NotRead),
+        Err(_) => return Ok(false),
+    }
+    let entry = FileId::of_entry(&path).ok_or(NotRead)?;
+    Ok(entry == image.mapped().ok_or(NotRead)?)
 }
 
 /// Whether `image` is an atpkg store build registered as `agent`'s, the store's own entry being
@@ -456,7 +492,25 @@ pub fn proof_among(
     places: &Places<'_>,
     standins: &[FileId],
 ) -> Option<Proof> {
-    if in_vendor_layout(agent, image, places) {
+    proof_laid(
+        in_vendor_layout(agent, image, places),
+        agent,
+        image,
+        standins,
+    )
+}
+
+/// [`proof_among`] with [`in_vendor_layout`] already read (`laid`): a caller that reads the layout
+/// to decide another read (the team's) passes that one result here, so no second layout read
+/// can contradict the first.
+#[must_use]
+pub fn proof_laid(
+    laid: bool,
+    agent: Program,
+    image: &Image<'_>,
+    standins: &[FileId],
+) -> Option<Proof> {
+    if laid {
         Some(Proof::Layout)
     } else if signed_by_vendor(agent, image) {
         Some(Proof::Team)

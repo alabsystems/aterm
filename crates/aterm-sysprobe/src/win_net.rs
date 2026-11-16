@@ -142,6 +142,7 @@ pub fn link_of_row(row: &[u8]) -> Option<LinkReading> {
         loopback: if_type == IF_TYPE_LOOPBACK,
         physical: Some(flags & FLAG_CONNECTOR != 0),
         rate_bps: speed(u64_at(row, IF_RX_SPEED)?).or_else(|| speed(u64_at(row, IF_TX_SPEED)?)),
+        byte_counter: crate::LinkByteCounter::Cumulative64,
         rx: counters(row, IF_IN_OCTETS),
         tx: counters(row, IF_OUT_OCTETS),
     })

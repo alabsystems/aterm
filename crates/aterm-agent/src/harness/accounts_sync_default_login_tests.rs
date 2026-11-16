@@ -460,15 +460,18 @@ fn a_sync_with_nothing_to_read_names_the_pool_file() {
     let err = run();
     assert!(err.contains("nothing to read"), "{err}");
     assert!(err.contains(pool_file), "{err}");
-    crate::vault_entry::seed(
+    #[cfg(unix)]
+    {
+        crate::vault_entry::seed(
         bed.env.home.as_deref().unwrap(),
         &[(
             pool_file,
             b"version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"ann@example.com\"\nwarm = [\"m16\"]\n",
         )],
     );
-    let err = run();
-    assert!(!err.contains("nothing to read"), "CONTROL: {err}");
+        let err = run();
+        assert!(!err.contains("nothing to read"), "CONTROL: {err}");
+    }
 }
 
 /// ONE ACCOUNT LISTED TWICE IS MERGED ON A LATER SYNC WHERE NOTHING WOULD BE LOST, KEEPING THE LABEL
@@ -641,6 +644,7 @@ fn a_native_quota_forecast_refuses_each_login_naming_another_account() {
 
 /// One thing [`merge_default_twin`] keeps a twin of the default row for, each on a world that folds
 /// but for it.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TwinGuard {
     /// The control: nothing stands in the way.
@@ -660,6 +664,7 @@ enum TwinGuard {
 /// A completed local check keeps its named recovery route even when the twin's bound
 /// directory is empty. The same roster without staged work still folds.
 #[test]
+#[cfg(unix)]
 fn a_local_completed_checkpoint_keeps_its_default_twin_recoverable() {
     let cli = Cli::Codex;
     let label = "codex-aaaaaa";
@@ -911,6 +916,7 @@ fn unavailable_checkpoint_io_does_not_establish_an_empty_twin() {
 
 impl Bed {
     /// The vault's fleet entry of `accounts`, each `(label, address)`, for machine `m16`.
+    #[cfg(unix)]
     fn fleet_file(&self, cli: Cli, accounts: &[(&str, &str)]) {
         let home = self.env.home.as_deref().unwrap();
         let rows: String = accounts
@@ -926,6 +932,7 @@ impl Bed {
     }
 
     /// `accounts sync --cli <id>` with no source named, `--json`: its exit, document and stderr.
+    #[cfg(unix)]
     fn sync_plain(&self, cli: Cli) -> (ExitCode, Value, String) {
         let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source is fetched") };
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -943,6 +950,7 @@ impl Bed {
     }
 
     /// [`Self::sync_plain`], whatever it answers: a refusal prints no document.
+    #[cfg(unix)]
     fn sync_plain_any(&self, cli: Cli) -> (ExitCode, Value, String) {
         let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("no source is fetched") };
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -958,6 +966,7 @@ impl Bed {
     }
 
     /// A shared renewal `label` began and whose outcome is unknown: the row is in shared custody.
+    #[cfg(unix)]
     fn in_custody(&self, cli: Cli, label: &str, email: &str) {
         let store = self.store(cli);
         let staging = store.claim_staging_dir(label).unwrap();
@@ -994,6 +1003,7 @@ impl Bed {
 /// keeps a twin of the default row for, the rows stay, and what the report reads to name that sync
 /// says what the sync then does. CONTROL: with nothing in the way the same world folds.
 #[test]
+#[cfg(unix)]
 fn each_thing_a_twin_or_the_default_row_holds_keeps_both_rows() {
     use TwinGuard::{
         Nothing, OwnHeld, OwnInCustody, OwnSignedOut, SourceNamesOwn, TwinBoundElsewhere, TwinHeld,
@@ -1410,50 +1420,54 @@ fn the_report_and_the_sync_judge_a_source_that_changes_a_hold_alike() {
         "{named:?}: {doc}"
     );
 
-    // A source this Mac is in no row of: a sync refuses, and the report names no sync.
-    let bed = Bed::new();
-    let ann = email("ann");
-    bed.fleet_file(cli, &[("codex-aaaaaa", &ann)]);
-    crate::test_config::write(&bed.toml, "").unwrap();
-    seed(&bed, &ann, false);
-    let (code, doc, err) = bed.sync_plain_any(cli);
-    if code == ExitCode::SUCCESS {
-        assert_eq!(report_folds(&bed, cli, &ann, None), Ok(()), "{doc}");
-    } else {
-        assert_eq!(
-            report_folds(&bed, cli, &ann, None),
-            Err(TwinKept::NoSync),
-            "{err}"
-        );
-    }
-
-    for (warm, folds) in [("m3", false), ("m16", true)] {
+    #[cfg(unix)]
+    {
+        // A source this Mac is in no row of: a sync refuses, and the report names no sync.
         let bed = Bed::new();
         let ann = email("ann");
-        crate::vault_entry::seed(
-            bed.env.home.as_deref().unwrap(),
-            &[(
-                crate::harness::ai_pool::AI_POOL_FILE,
-                format!(
-                    "version = 1\n\n[last_heard]\nm3 = \"2026-10-27\"\nm16 = \"2026-10-27\"\n\n\
-                     [[account]]\nprovider = \"codex\"\nemail = \"{ann}\"\nwarm = [\"{warm}\"]\n"
-                )
-                .as_bytes(),
-            )],
-        );
-        crate::test_config::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+        bed.fleet_file(cli, &[("codex-aaaaaa", &ann)]);
+        crate::test_config::write(&bed.toml, "").unwrap();
         seed(&bed, &ann, false);
-        let named = report_folds(&bed, cli, &ann, None);
-        let (code, doc, err) = bed.sync_plain(cli);
-        assert_eq!(code, ExitCode::SUCCESS, "{warm}: {err}");
-        assert_eq!(named.is_ok(), folds, "{warm}: {named:?}: {doc}");
-        assert_eq!(doc["twin_merged"] != Value::Null, folds, "{warm}: {doc}");
+        let (code, doc, err) = bed.sync_plain_any(cli);
+        if code == ExitCode::SUCCESS {
+            assert_eq!(report_folds(&bed, cli, &ann, None), Ok(()), "{doc}");
+        } else {
+            assert_eq!(
+                report_folds(&bed, cli, &ann, None),
+                Err(TwinKept::NoSync),
+                "{err}"
+            );
+        }
+
+        for (warm, folds) in [("m3", false), ("m16", true)] {
+            let bed = Bed::new();
+            let ann = email("ann");
+            crate::vault_entry::seed(
+                bed.env.home.as_deref().unwrap(),
+                &[(
+                    crate::harness::ai_pool::AI_POOL_FILE,
+                    format!(
+                        "version = 1\n\n[last_heard]\nm3 = \"2026-10-27\"\nm16 = \"2026-10-27\"\n\n\
+                     [[account]]\nprovider = \"codex\"\nemail = \"{ann}\"\nwarm = [\"{warm}\"]\n"
+                    )
+                    .as_bytes(),
+                )],
+            );
+            crate::test_config::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
+            seed(&bed, &ann, false);
+            let named = report_folds(&bed, cli, &ann, None);
+            let (code, doc, err) = bed.sync_plain(cli);
+            assert_eq!(code, ExitCode::SUCCESS, "{warm}: {err}");
+            assert_eq!(named.is_ok(), folds, "{warm}: {named:?}: {doc}");
+            assert_eq!(doc["twin_merged"] != Value::Null, folds, "{warm}: {doc}");
+        }
     }
 }
 
 /// A RENEWAL'S COMPLETION THAT NAMES THE TWIN KEEPS IT ON BOTH SURFACES, for that reason and no
 /// other. CONTROL: with no completion both fold.
 #[test]
+#[cfg(unix)]
 fn a_completion_that_names_the_twin_keeps_it_on_the_report_and_the_sync() {
     let cli = Cli::Codex;
     let label = "codex-aaaaaa";

@@ -400,6 +400,10 @@ pub(crate) fn install_session_config(session: &crate::Session, config: &Arc<Term
         .then(|| term.take_response())
         .flatten()
     };
+    // The install may move what a keeper META's fingerprint reads (the host's mode policy, the
+    // color scheme, keyboard enables) with no output for the reader to see.
+    #[cfg(unix)]
+    crate::keeper_link::ring_meta();
     if let Some(push) = push {
         crate::app_input::write_ui_report(
             &session.term,

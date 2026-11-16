@@ -283,7 +283,9 @@ fn read_back(path: &Path) -> Result<String> {
 /// `open` shows the file and returns once it is closed; `report` hears each problem and stale
 /// cell, by row and column, never a value. The file lives in a private folder amacs keeps
 /// no draft of and serves no `doc read` of ([`aterm_types::private_edit`]), removed when the
-/// session ends; one a killed session left is swept at the next.
+/// session ends; one a killed session left is swept at the next. The grid is laid out, read and
+/// written as the generation the handle reaches declares `collection` (registry.4 holds a Mac's
+/// hosts as a text set, the generations before it as a list).
 ///
 /// # Errors
 /// The table cannot be read or written, the scratch folder cannot be made, or `open` fails.
@@ -295,6 +297,10 @@ pub fn edit(
     report: &mut dyn FnMut(&str),
 ) -> Result<Edited> {
     let compiled = handle.compiled();
+    let collection = compiled
+        .table
+        .collection(collection.name)
+        .unwrap_or(collection);
     let scratch = scratch()?;
     let export = |view: &super::View, filters: &[Where]| -> Result<grid::Export> {
         Ok(view

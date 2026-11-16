@@ -220,51 +220,27 @@ fn scan(
     arm: Arm,
 ) -> Result<usize, String> {
     let mut d = state.lock().unwrap_or_else(PoisonError::into_inner);
-    let generation = d.generation();
+    let look = d.begin_look();
     let mut attempts = 0;
     let mut error = None;
+    let enter = |need, place: Option<&aterm_capacity::admit::Place>| {
+        enter_in(Some(ledger), machine, need, place)
+    };
+    let asking = Asking {
+        ledger: Some(ledger),
+        machine,
+        enter: &enter,
+    };
     let started = d.next_with(0.0, &mut |b| {
         attempts += 1;
-        let mut global_wait = None;
-        let mut core_wait = None;
-        let outcome = binary_permit_noting(
+        let (outcome, wait) = binary_permit_in(
             Some(ctx),
             None,
             b,
-            &mut |need, mode| {
-                if mode.is_some() {
-                    return Err(aterm_capacity::Error::Ledger(std::io::Error::other(
-                        "unexpected overriding admission",
-                    )));
-                }
-                let result = waiters.poll_noting(
-                    b.index,
-                    need,
-                    machine,
-                    |need| {
-                        aterm_capacity::admit::Waiter::enter(ledger, machine, need)
-                            .map_err(aterm_capacity::Error::Ledger)
-                    },
-                    &mut |need| {
-                        (arm == Arm::Probe)
-                            .then(|| {
-                                pass.lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .rejection(generation, ledger, machine, need, &Instant::now)
-                            })
-                            .flatten()
-                    },
-                    &mut global_wait,
-                );
-                if matches!(&result, Ok(Some(_))) {
-                    pass.lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .acquired();
-                }
-                result
-            },
+            waiters,
             &|| false,
-            &mut core_wait,
+            (arm == Arm::Probe).then_some((pass, look)),
+            &asking,
         );
         if let Some(result) = outcome {
             error = Some(match result {
@@ -274,7 +250,7 @@ fn scan(
                 }
                 Err(why) => why.to_string(),
             });
-        } else if let Some(reason) = core_wait.or(global_wait) {
+        } else if let Some(test_waits::Wait::For(reason)) = wait {
             let (source, kinds) = reason.classification();
             if source != "ledger" || !kinds.contains(&"memory") {
                 error = Some("blocked fixture returned a non-memory wait reason".into());
@@ -285,6 +261,7 @@ fn scan(
         }
         false // A measurement never dispatches work, even if the safety oracle fails.
     });
+    d.looked(look, Instant::now(), LOOK_AGAIN);
     if started.is_some() || error.is_some() || attempts != CANDIDATES {
         return Err(error.unwrap_or_else(|| format!("rejected scan visited {attempts} candidates")));
     }

@@ -164,10 +164,12 @@ fn ctx<'a>(w: &'a World, s: &'a Snapshot, caller: Option<&'a [u64]>) -> Ctx<'a> 
         volume: None,
         roots: &[],
         disk: None,
+        stores: &[],
         home: None,
         events: &[],
         gap: None,
         head_seq: 0,
+        held: None,
     }
 }
 

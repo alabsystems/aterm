@@ -778,17 +778,17 @@ fn simulated() -> std::time::Instant {
         .expect("the simulated clock is set")
 }
 
-/// The desk lane looks at this Mac's membership every [`LOCAL_EVERY`] and at every network move,
-/// and reads the vault again only once a file it is read from moved since a settled read: over
-/// ten looks, each followed by a network move and the loop's next look, a member whose vault
-/// stands still is read once. Its removal moves the vault, so the next look reads it and drops the
-/// desk, and a Mac that left is not read again while its vault stands still either. Counted on a
-/// simulated clock, never timed.
+/// The desk lane looks at this Mac's membership at every change its watch hears and at every
+/// network move, and reads the vault again only once a file it is read from moved since a settled
+/// read: over ten looks, each followed by a network move and the loop's next look, a member whose
+/// vault stands still is read once. Its removal moves the vault, so the next look reads it and
+/// drops the desk, and a Mac that left is not read again while its vault stands still either.
+/// Counted on a simulated clock, never timed.
 ///
-/// NEGATIVE CONTROLS (2026-11-06): with `Lane::look` reading at every look whatever its inputs
-/// say (the lane before), the ten looks read ten times (`left: 10, right: 1`); with `Lane::moved`
-/// also starting a look at once (the lane's `looked = None` before), twenty (`left: 20, right:
-/// 1`).
+/// NEGATIVE CONTROLS (2026-11-15): with `Lane::look` reading at every look whatever its inputs
+/// say, the twenty looks read twenty times (`left: 20, right: 1`); with `Lane::moved` reading the
+/// vault again at every move (its `with_vault` arm's `settled = None` and `looked = None` for
+/// every desk), eleven, the first read and one after each move (`left: 11, right: 1`).
 #[test]
 fn the_lane_reads_the_vault_again_only_once_it_moved() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -820,9 +820,10 @@ fn the_lane_reads_the_vault_again_only_once_it_moved() {
 }
 
 /// A member a fault shaped (`Local::whole` false: a read that failed gave way to a default) shows
-/// on the desk, and the lane reads it again at every look while its vault stands still, where a
-/// whole member's is read once ([`the_lane_reads_the_vault_again_only_once_it_moved`]). Counted
-/// on a simulated clock, never timed.
+/// on the desk, and the lane reads it again at every look [`LOCAL_EVERY`] after its last read
+/// while its vault stands still, where a whole member's is read once
+/// ([`the_lane_reads_the_vault_again_only_once_it_moved`]). Counted on a simulated clock, never
+/// timed.
 ///
 /// NEGATIVE CONTROL (2026-11-09): with `follow_local` settling every member it read (`true` in
 /// place of `whole`), the three looks read once (`left: 1, right: 3`).
@@ -932,15 +933,18 @@ fn a_read_during_which_the_state_moved_and_came_back_is_read_again() {
 
 /// A debug build's lab vault names its home LAN in its own file (`members::lab_lan`), and its
 /// home is that file under this Mac's route at the read, so the lane reads that vault with its
-/// home at every look and at once after a network move, as it read every vault before it kept
-/// one that stood still: over ten looks, each followed by a move and the loop's next look, twenty
-/// reads. Counted on a simulated clock, never timed.
+/// home at once after each network move, and every [`LOCAL_EVERY`] whether or not a file moved,
+/// since the route can move with no event (the bound the lane's look every thirty seconds kept):
+/// over ten looks, each followed by a move and the loop's next look, the first read and one after
+/// each move, eleven; once the period passed, the next look reads again, and the look after it,
+/// with no period passed, reads nothing. Counted on a simulated clock, never timed.
 ///
-/// NEGATIVE CONTROL (2026-11-06): with the lane reading the home from the place for every desk
-/// (no `HomeFrom::Vault` arm, as first merged with the lab home), the ten looks read once (`left:
-/// 1, right: 20`) and the lab's home never follows the route.
+/// NEGATIVE CONTROLS (2026-11-15): with a network move reading nothing again for a home read with
+/// the vault (`Lane::moved` without its `with_vault` arm), the ten looks read once (`left: 1,
+/// right: 11`); with `Lane::look` reading a lab vault again only where a file moved (no
+/// `home_due`), the look after the period reads nothing (`left: 11, right: 12`).
 #[test]
-fn a_lab_vaults_home_is_read_with_its_vault_at_every_look_and_move() {
+fn a_lab_vaults_home_is_read_with_its_vault_at_every_move_and_period() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
     let cidr = members::lab_lan::Cidr::parse("192.168.64.0/24").expect("a lab home LAN");
@@ -953,9 +957,542 @@ fn a_lab_vaults_home_is_read_with_its_vault_at_every_look_and_move() {
         lane.look(slot);
         lane.moved(slot);
         lane.look(slot);
-        advance();
     }
     assert_eq!(home_from(slot), Some(HomeFrom::Vault), "the lab's desk");
-    assert_eq!(lane.reads, 20);
+    assert_eq!(lane.reads, 11);
+    assert_eq!(
+        lane.due(),
+        Some(simulated() + LOCAL_EVERY),
+        "due again a period after its read"
+    );
+    advance();
+    lane.look(slot);
+    assert_eq!(lane.reads, 12, "read again once the period passed");
+    lane.look(slot);
+    assert_eq!(lane.reads, 12, "CONTROL: nothing read within the period");
     fixture.server.stop();
+}
+
+/// The desk's rows change by themselves only as one lapses, and the lane wakes at that instant:
+/// a row heard at `t` lapses [`desk::STILL_ASKING`] later, and [`next_change`] finds it within
+/// [`CHANGE_GRAIN`] after, where the lane's look every two seconds found it up to two seconds
+/// late. A desk with nothing heard changes at no instant, and a Mac that asks again moves its
+/// row's lapse with its ask. Computed on the desk's own clock, never timed.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `next_change` searching only half of
+/// [`desk::STILL_ASKING`], it finds no lapse (`the row lapses`).
+#[test]
+fn the_lane_wakes_as_a_row_lapses() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let local = Local::with(device(root.path(), "m1"), TRUST, true, "m1").expect("member");
+    let mut desk = Desk::new(local);
+    let asked_at = aterm_time::Instant::now();
+    assert_eq!(
+        next_change(&desk, asked_at),
+        None,
+        "nothing heard changes at no instant"
+    );
+    let j = device(root.path(), "j");
+    let request = j.request(TRUST.network, TRUST.authority).expect("request");
+    let asked = signed_ask(&j, &desk, &request, "j");
+    desk.hear(&asked.asking(), [10, 0, 0, 9].into(), asked_at)
+        .expect("heard");
+    let lapse = asked_at + desk::STILL_ASKING;
+    let at = next_change(&desk, asked_at).expect("the row lapses");
+    assert!(
+        lapse <= at && at <= lapse + CHANGE_GRAIN,
+        "at its lapse, within the grain: {:?} after it",
+        at.saturating_duration_since(lapse)
+    );
+    assert!(desk.rows(at).is_empty(), "lapsed at the instant found");
+    assert_eq!(desk.rows(lapse - CHANGE_GRAIN).len(), 1, "not before it");
+    let again = asked_at + Duration::from_secs(60);
+    desk.hear(&asked.asking(), [10, 0, 0, 9].into(), again)
+        .expect("heard again");
+    let at = next_change(&desk, again).expect("the row lapses");
+    assert!(
+        again + desk::STILL_ASKING <= at,
+        "its lapse moved with its ask"
+    );
+}
+
+/// An ask on the desk reads the home ALab LAN as it begins, from the network as it is then: a
+/// member read on its home LAN that is on none now lets no Mac in by proving itself from it, and
+/// one back on it does, where the lane's look read the home every thirty seconds and at network
+/// moves. Driven by the reader handed in, never the network.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `serve_ask_at_home` reading no home, the desk keeps the
+/// home it was read with (`the ask read the home as it began`).
+#[test]
+fn an_ask_reads_the_home_lan_as_it_begins() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let local = Local::with(device(root.path(), "m1"), TRUST, true, "m1")
+        .expect("member")
+        .with_automatic_lan(Vec::new());
+    let desk: Shared = Arc::new(Mutex::new(Desk::new(local)));
+    let from: SocketAddr = "192.168.1.9:4000".parse().expect("an address");
+    let admits = || {
+        desk.lock_or_recover()
+            .local()
+            .automatically_admits(from.ip())
+    };
+    assert!(admits(), "PRECONDITION: read on its home LAN");
+    serve_ask_at_home(
+        Some(&desk),
+        &mut std::io::Cursor::new(Vec::new()),
+        from,
+        &|| None,
+    );
+    assert!(!admits(), "the ask read the home as it began: none now");
+    serve_ask_at_home(
+        Some(&desk),
+        &mut std::io::Cursor::new(Vec::new()),
+        from,
+        &|| Some(aterm_secrets::home_lan::HomeNet::test()),
+    );
+    assert!(admits(), "back on its home LAN at the next ask");
+}
+
+/// `f` run with this thread's route scripted onto the network behind `subnet`'s gateway, whose
+/// hardware address is read: the network key ([`aterm_secrets::heard::network_key`]) is that
+/// network's, whatever this Mac's routes say.
+fn on_network<R>(subnet: [u8; 3], f: impl FnOnce() -> R) -> R {
+    let [a, b, c] = subnet;
+    let route = aterm_netplace::RouteFacts {
+        interface: "en0".to_owned(),
+        address: std::net::Ipv4Addr::new(a, b, c, 5),
+        prefix: 24,
+        gateway: Some(std::net::Ipv4Addr::new(a, b, c, 1)),
+        gateway_hw: Some(vec![0xaa, 0xbb, 0xcc, a, b, c]),
+    };
+    let script = aterm_netplace::facts::Script {
+        facts: aterm_netplace::Facts {
+            route: Some(route),
+            ..aterm_netplace::Facts::default()
+        },
+        via: Vec::new(),
+    };
+    aterm_netplace::facts::script_here(script, f)
+}
+
+/// A member desk under `root`, told this Mac is on `subnet`'s network, that heard one Mac ask
+/// there: the desk, in a slot of its own.
+fn heard_on(root: &std::path::Path, subnet: [u8; 3]) -> &'static Slot {
+    let local = Local::with(device(root, "m1"), TRUST, true, "m1").expect("member");
+    let mut desk = Desk::new(local);
+    on_network(subnet, || {
+        desk.on_network(aterm_secrets::heard::network_key())
+    });
+    let j = device(root, "j");
+    let request = j.request(TRUST.network, TRUST.authority).expect("request");
+    let asked = signed_ask(&j, &desk, &request, "j");
+    desk.hear(
+        &asked.asking(),
+        [10, 0, 0, 9].into(),
+        aterm_time::Instant::now(),
+    )
+    .expect("heard");
+    Box::leak(Box::new(Mutex::new(Some(Arc::new(Mutex::new(desk))))))
+}
+
+/// How many rows the desk in `slot` shows now.
+fn rows_in(slot: &Slot) -> usize {
+    slot.lock_or_recover()
+        .clone()
+        .expect("the desk")
+        .lock_or_recover()
+        .rows(aterm_time::Instant::now())
+        .len()
+}
+
+/// While the desk files rows, the lane reads which network this Mac is on again every
+/// [`LOCAL_EVERY`], since no event tells of the default route moving between two networks this
+/// Mac holds at once, nor of ARP resolving a new network's gateway after the move: a move with no
+/// event drops the row heard before it once the period passed, the bound the lane's look every
+/// thirty seconds kept, and not before. A desk that files no rows has nothing such a move drops,
+/// and the lane reads the network on no clock. Counted on a simulated clock over a scripted
+/// route, never timed.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `Lane::follow_rows` reading the network only before its
+/// first read (no period), the row heard on the last network stays (`the move drops the row heard
+/// before it once the period passed`).
+#[test]
+fn while_rows_show_a_move_no_event_tells_of_drops_them_within_the_period() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let slot = heard_on(root.path(), [192, 168, 4]);
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = |by: Duration| SIMULATED.with(|now| now.set(Some(simulated() + by)));
+    let mut lane = Lane::new(Paths::for_home(root.path()), simulated);
+    on_network([192, 168, 4], || lane.follow_rows(slot));
+    assert_eq!(
+        rows_in(slot),
+        1,
+        "CONTROL: a row heard on this network stays"
+    );
+    assert_eq!(
+        lane.network_due(true),
+        Some(simulated() + LOCAL_EVERY),
+        "due again a period after its read"
+    );
+
+    advance(LOCAL_EVERY - CHANGE_GRAIN);
+    on_network([10, 0, 0], || lane.follow_rows(slot));
+    assert_eq!(rows_in(slot), 1, "not read again within the period");
+    advance(CHANGE_GRAIN);
+    on_network([10, 0, 0], || lane.follow_rows(slot));
+    assert_eq!(
+        rows_in(slot),
+        0,
+        "the move drops the row heard before it once the period passed"
+    );
+
+    let read = lane.networked;
+    assert_eq!(lane.network_due(false), None, "no rows, no clock");
+    advance(LOCAL_EVERY);
+    on_network([172, 16, 0], || lane.follow_rows(slot));
+    assert_eq!(lane.networked, read, "no rows, no read");
+}
+
+/// The lane waits until the first of its rows' next lapse and its next read of the network while
+/// rows show, whichever is sooner, and with no rows and no read due, on no clock: a row's lapse
+/// is still woken for within [`CHANGE_GRAIN`] where the network's read falls after it. Computed
+/// on the desk's own clock and instants handed in, never timed.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with `Lane::wake_at` leaving out the rows' lapse, it wakes for
+/// the network read after the lapse (`the row's lapse, sooner`); leaving out the network read, it
+/// wakes for the lapse, [`desk::STILL_ASKING`] on (`the network read, sooner`).
+#[test]
+fn the_lane_wakes_at_the_first_of_a_lapse_and_a_network_read() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let local = Local::with(device(root.path(), "m1"), TRUST, true, "m1").expect("member");
+    let mut desk = Desk::new(local);
+    let now = aterm_time::Instant::now();
+    SIMULATED.with(|clock| clock.set(Some(now)));
+    let mut lane = Lane::new(Paths::for_home(root.path()), simulated);
+    lane.networked = Some(now);
+    assert_eq!(lane.wake_at(None, now), None, "no desk, no clock");
+    assert_eq!(lane.wake_at(Some(&desk), now), None, "no rows, no clock");
+    let j = device(root.path(), "j");
+    let request = j.request(TRUST.network, TRUST.authority).expect("request");
+    let asked = signed_ask(&j, &desk, &request, "j");
+    desk.hear(&asked.asking(), [10, 0, 0, 9].into(), now)
+        .expect("heard");
+    assert_eq!(
+        lane.wake_at(Some(&desk), now),
+        Some(now + LOCAL_EVERY),
+        "the network read, sooner"
+    );
+    let lapse = now + desk::STILL_ASKING;
+    lane.networked = Some(lapse);
+    let at = lane.wake_at(Some(&desk), now).expect("a wake");
+    assert!(
+        lapse <= at && at <= lapse + CHANGE_GRAIN,
+        "the row's lapse, sooner: {:?} after it",
+        at.saturating_duration_since(lapse)
+    );
+}
+
+/// An ask on the desk reads which network this Mac is on as it begins, so a row it hears is
+/// heard on the network as it is then: a move no event told of drops the rows heard on the last
+/// network at the next ask, where the lane read the network every thirty seconds whatever asked.
+/// Driven by a scripted route, never the network.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `follow_here` reading no network, the row heard on the
+/// last network stays (`the ask read the network as it began`).
+#[test]
+fn an_ask_reads_the_network_as_it_begins() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let slot = heard_on(root.path(), [192, 168, 4]);
+    let desk = slot.lock_or_recover().clone().expect("the desk");
+    let from: SocketAddr = "10.0.0.9:4000".parse().expect("an address");
+    let ask = || {
+        serve_ask_at_home(
+            Some(&desk),
+            &mut std::io::Cursor::new(Vec::new()),
+            from,
+            &|| None,
+        );
+    };
+    on_network([192, 168, 4], ask);
+    assert_eq!(rows_in(slot), 1, "CONTROL: an ask on the same network");
+    on_network([10, 0, 0], ask);
+    assert_eq!(rows_in(slot), 0, "the ask read the network as it began");
+}
+
+/// A change made to the desk off its lane rings the lane's bell ([`RUNG`]), which then works out
+/// when the desk's rows next change and whether the network is due again: an ask served, which
+/// can hear a row, and a row ignored. Without the ring a lane that settled with no rows waits on
+/// no clock past a row it never saw, which lapses unfiled and whose network nothing reads again.
+///
+/// NEGATIVE CONTROLS (2026-11-15): with `touched` leaving out its ring, the ask rings nothing
+/// (`an ask served rings the lane`); with `App::ignore_member_request` leaving out its ring, the
+/// ignore rings nothing (`a row ignored rings the lane`).
+#[test]
+fn a_change_off_the_lane_rings_the_lane() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let (desk, request) = heard(root.path(), true);
+    let mut app = app_with(Arc::clone(&desk));
+    let rung = RUNG.renew();
+    assert!(app.ignore_member_request(request), "the row ignored");
+    assert!(rung.is_set(), "a row ignored rings the lane");
+    let from: SocketAddr = "10.0.0.9:4000".parse().expect("an address");
+    let rung = RUNG.renew();
+    serve_ask_at_home(
+        Some(&desk),
+        &mut std::io::Cursor::new(Vec::new()),
+        from,
+        &|| None,
+    );
+    assert!(rung.is_set(), "an ask served rings the lane");
+}
+
+/// Where no file watch started, the lane looks at the files this Mac's membership is read from
+/// every [`LOCAL_EVERY`], as before it waited on events: a move is read at the first look that
+/// period allows, and the lane is due again a period after each look. Under a watch the same move
+/// is read at the look its change wakes, and a settled read is due at no instant. Counted on a
+/// simulated clock, never timed.
+///
+/// NEGATIVE CONTROL (2026-11-14): with `Lane::look` reading at once whether or not a watch hears
+/// the files, the unwatched lane reads the move before its period (`left: 2, right: 1`).
+#[test]
+fn without_a_file_watch_the_lane_looks_on_todays_period() {
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    SIMULATED.with(|now| now.set(Some(std::time::Instant::now())));
+    let advance = || SIMULATED.with(|now| now.set(Some(simulated() + LOCAL_EVERY)));
+    let mut unwatched = Lane {
+        watched: false,
+        ..Lane::new(fixture.member.clone(), simulated)
+    };
+    let mut watched = Lane::new(fixture.member.clone(), simulated);
+    let other: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    unwatched.look(slot);
+    watched.look(other);
+    assert_eq!((unwatched.reads, watched.reads), (1, 1));
+    assert_eq!(unwatched.due(), Some(simulated() + LOCAL_EVERY));
+    assert_eq!(watched.due(), None, "a settled read under a watch");
+
+    client::remove_member(&fixture.admin, "member", false).expect("the admin removes the member");
+    client::sync(&fixture.member, None).expect("the member syncs its removal");
+    unwatched.look(slot);
+    watched.look(other);
+    assert_eq!(unwatched.reads, 1, "the move waits out the period");
+    assert_eq!(
+        watched.reads, 2,
+        "the move read at the look its change wakes"
+    );
+    advance();
+    unwatched.look(slot);
+    assert_eq!(unwatched.reads, 2, "the move read once the period passed");
+    assert!(slot.lock().unwrap().is_none(), "its desk is dropped");
+    assert_eq!(unwatched.due(), Some(simulated() + LOCAL_EVERY));
+    fixture.server.stop();
+}
+
+/// Wait until `parked` says the lane waits, or woke and is held at the gate, on the one-minute
+/// hang detector: a change made while the test holds the gate is read by the lane's next round
+/// whole.
+fn until_parked(parked: &AtomicBool) {
+    let began = std::time::Instant::now();
+    while !parked.load(Ordering::Acquire) {
+        assert!(
+            began.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the lane never waited"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+}
+
+/// The desk lane waits on events and on no clock: once its read of this Mac's membership
+/// settled, it waits with no deadline; an ask the desk hears wakes it to read which network this
+/// Mac is on again within [`LOCAL_EVERY`] while the row shows, before the row lapses; the row
+/// ignored, it waits on no clock again; the member's removal, which moves its vault, wakes it to
+/// read once more and drop the desk, which it then waits on no clock again. Two reads in all: at
+/// launch and after the removal. The bounds kept: a vault change is read at the look its change
+/// wakes (the watch's burst settling, `file_watch::QUIET` to `SETTLE_CAP`, where the lane looked
+/// every thirty seconds), and a move no event tells of drops the rows heard before it within
+/// [`LOCAL_EVERY`], as the lane's look every thirty seconds did. Each step waits on the
+/// one-minute hang detector, never a latency budget.
+///
+/// NEGATIVE CONTROLS: with `run` waiting at most [`READ_EVERY`] whatever it waits for (the lane
+/// before), the settled lane waits on a clock (`a settled lane waits on no clock`), and with the
+/// file watch never armed, the removal wakes nothing and its step meets the hang detector (`the
+/// removal drops the desk`) (2026-11-14); with `Lane::wake_at` leaving out
+/// [`Lane::network_due`], the round that saw the row waits for its lapse (`while the row shows,
+/// the lane reads the network again within the period`) (2026-11-15).
+#[test]
+fn the_desk_lane_wakes_for_its_files_and_its_rows_and_no_clock() {
+    use std::sync::mpsc;
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let fixture = client::test_commons_excluded(root.path()).expect("the excluded member");
+    let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+    let bell: &'static Bell = Box::leak(Box::new(Bell::new()));
+    let stop = Arc::new(aterm_uds::ready::Doorbell::new().expect("the test's stop"));
+    let parked = Arc::new(AtomicBool::new(false));
+    let gate: Arc<Mutex<()>> = Arc::default();
+    let (tell, rounds) = mpsc::channel::<(bool, Option<Instant>)>();
+    let lane = {
+        let (member, stop, parked, gate) = (
+            fixture.member.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&parked),
+            Arc::clone(&gate),
+        );
+        std::thread::spawn(move || {
+            let mut inputs = Inputs::start(bell).expect("the membership's watch");
+            let mut lane = Lane::new(member, std::time::Instant::now);
+            let mut wait = |rung: &Stop, deadline: Option<Instant>| {
+                let _ = tell.send((slot.lock_or_recover().is_some(), deadline));
+                parked.store(true, Ordering::Release);
+                let fds = [rung.bell().expect("the lane's bell"), stop.fd()];
+                let ready = aterm_uds::ready::any(&fds, deadline).expect("the lane's wait");
+                // Parked until it holds the gate: a lane woken while the test holds it reads
+                // nothing before the test lets go.
+                let _held = gate.lock_or_recover();
+                parked.store(false, Ordering::Release);
+                if stop.clear() {
+                    ControlFlow::Break(())
+                } else if ready.is_empty() {
+                    ControlFlow::Continue(Heard::Due)
+                } else {
+                    ControlFlow::Continue(Heard::Rung)
+                }
+            };
+            let flow = run(&mut lane, slot, Some(&mut inputs), bell, &mut wait);
+            (flow, lane.reads)
+        })
+    };
+    let until = |what: &str, done: &dyn Fn(bool, Option<Instant>) -> bool| {
+        let mut seen = Vec::new();
+        loop {
+            let (desk, deadline) = rounds
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap_or_else(|_| panic!("{what}: {seen:?}"));
+            seen.push((desk, deadline));
+            if done(desk, deadline) {
+                break seen;
+            }
+        }
+    };
+    let launch = until("the member's desk", &|desk, _| desk);
+    assert!(
+        launch.iter().all(|(_, deadline)| deadline.is_none()),
+        "a settled lane waits on no clock: {launch:?}"
+    );
+
+    let desk = slot.lock_or_recover().clone().expect("the member's desk");
+    let trust = desk.lock_or_recover().local().trust();
+    let j = device(root.path(), "j");
+    let request = j.request(trust.network, trust.authority).expect("request");
+    let asked_at = aterm_time::Instant::now();
+    {
+        let mut desk = desk.lock_or_recover();
+        let asked = signed_ask(&j, &desk, &request, "j");
+        desk.hear(&asked.asking(), [10, 0, 0, 9].into(), asked_at)
+            .expect("heard");
+    }
+    bell.ring();
+    let lapse = asked_at + desk::STILL_ASKING;
+    let filed = until("the row's network read again", &|_, deadline| {
+        deadline.is_some()
+    });
+    let told = std::time::Instant::now();
+    let (_, at) = filed.last().copied().expect("the round that saw the row");
+    let at = at.expect("a deadline");
+    assert!(
+        at <= told + LOCAL_EVERY && at < lapse,
+        "while the row shows, the lane reads the network again within the period, before the \
+         row lapses: {:?} after the round was told",
+        at.saturating_duration_since(told)
+    );
+
+    {
+        let mut desk = desk.lock_or_recover();
+        let id = desk.rows(asked_at)[0].id;
+        desk.ignore(id).expect("ignored");
+    }
+    bell.ring();
+    until("nothing left to lapse", &|_, deadline| deadline.is_none());
+
+    let held = gate.lock_or_recover();
+    until_parked(&parked);
+    client::remove_member(&fixture.admin, "member", false).expect("the admin removes the member");
+    client::sync(&fixture.member, None).expect("the member syncs its removal");
+    drop(held);
+    let removed = until("the removal drops the desk", &|desk, _| !desk);
+    assert!(
+        removed.iter().all(|(_, deadline)| deadline.is_none()),
+        "the lane that read the removal waits on no clock: {removed:?}"
+    );
+
+    stop.ring();
+    let (flow, reads) = lane.join().expect("the lane");
+    assert_eq!(flow, ControlFlow::Break(()));
+    assert_eq!(reads, 2, "read at launch and after the removal");
+    fixture.server.stop();
+}
+
+/// The desk lane's watch tells of each file this Mac's membership is read from and of no other
+/// file of the vault folder: a record put on the end of the membership records' data file in
+/// place, which no entry of any folder shows, is heard, and a file of the vault folder the desk
+/// never reads, replaced by rename as the vault replaces its files, tells nothing. The missing
+/// tell is shown by order, never by a wait for silence: the replacement comes first, and the next
+/// tell is the append's. Each step waits on the one-minute hang detector, never a latency budget.
+///
+/// NEGATIVE CONTROL (2026-11-14): with [`inputs_of`] watching the vault folder's entries in place
+/// of the standing files and [`VAULT_FILES`] (a watch of the folder, not of each file), the
+/// replacement tells and the append does not (`the next tell is the append's`).
+#[test]
+fn the_watch_hears_each_desk_input_and_no_other_file() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::mpsc;
+    let home = aterm_tempfile::tempdir().expect("a scratch home");
+    let paths = Paths::locate_for_home(home.path());
+    std::fs::create_dir_all(&paths.dir).expect("the scratch vault folder");
+    std::fs::set_permissions(&paths.dir, std::fs::Permissions::from_mode(0o700))
+        .expect("the scratch vault folder made private");
+    let data = paths
+        .standing_files()
+        .pop()
+        .expect("the records' data file");
+    std::fs::create_dir_all(data.parent().expect("the records' layout"))
+        .expect("the records' layout");
+    std::fs::write(&data, b"a record\n").expect("the records' data");
+    let (tell, told) = mpsc::channel::<u64>();
+    let mut inputs = Inputs {
+        watch: aterm_uds::file_watch::FileWatch::platform(
+            "members-desk-watch-test",
+            Box::new(move |key| {
+                let _ = tell.send(key);
+            }),
+        )
+        .expect("the membership's watch"),
+        keys: BTreeMap::new(),
+        next: 0,
+    };
+    inputs.arm(&paths);
+    let data_key = inputs.keys.get(&Input::File(data.clone())).copied();
+    let mut first = BTreeSet::new();
+    while first.len() < inputs.keys.len() {
+        first.insert(
+            told.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("each watched input's first look tells"),
+        );
+    }
+
+    let other = paths.dir.join("asking");
+    let next = paths.dir.join("asking.next");
+    std::fs::write(&next, b"not a desk input\n").expect("the other file");
+    std::fs::rename(&next, &other).expect("the other file renamed in");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&data)
+        .and_then(|mut file| file.write_all(b"another record\n"))
+        .expect("a record appended in place");
+    let heard = told
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the append is heard");
+    assert_eq!(Some(heard), data_key, "the next tell is the append's");
 }

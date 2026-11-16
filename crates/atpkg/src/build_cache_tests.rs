@@ -678,8 +678,10 @@ fn the_laid_shim_names_this_versions_cache_root() {
 
 /// A TEST RUN'S SCRATCH GOES QUIET: under every shell the block hands `targo --unverified test`
 /// (and `t`, `bench`) `$TMPDIR`'s `.ubd` folder once that folder is this user's, so what the
-/// tests make there never reaches fseventsd's clients. NEGATIVE CONTROL: a build, an absent
-/// folder, a link in its place, and a `$TMPDIR` already quiet keep `$TMPDIR` as it was.
+/// tests make there never reaches fseventsd's clients; behind a `-C` too, whose detached value
+/// is no verb and whose attached one (`-Cdir`, `-qCdir`) takes no word after it. NEGATIVE
+/// CONTROL: a build, an absent folder, a link in its place, and a `$TMPDIR` already quiet keep
+/// `$TMPDIR` as it was.
 #[cfg(unix)]
 #[test]
 fn a_test_run_gets_the_quiet_tmpdir_once_it_is_this_users() {
@@ -731,11 +733,18 @@ fn a_test_run_gets_the_quiet_tmpdir_once_it_is_this_users() {
     std::fs::remove_file(&quiet).unwrap();
     std::fs::create_dir(&quiet).unwrap();
     let moved = format!("{}/", quiet.display());
+    let here = ws.display().to_string();
+    let attached = format!("-C{here}");
+    let clustered = format!("-qC{here}");
     for shell in shells() {
         for args in [
             &test[..],
             &["--unverified", "t"],
             &["--unverified", "bench"],
+            &["-Zunstable-options", "-C", &here, "--unverified", "test"],
+            &["-Zunstable-options", "-qC", &here, "--unverified", "test"],
+            &["-Zunstable-options", "--unverified", &attached, "test"],
+            &["-Zunstable-options", "--unverified", &clustered, "test"],
         ] {
             assert_eq!(run(&shell, args, &tmpdir), moved, "{shell:?} {args:?}");
         }
@@ -755,8 +764,11 @@ fn a_test_run_gets_the_quiet_tmpdir_once_it_is_this_users() {
 /// THE SHIM RAISES A LOW SOFT DESCRIPTOR LIMIT to the floor its stages need
 /// (4096, capped at the hard limit) and never lowers one: a test binary's
 /// threads pass a stock shell's 256 together, so without this a direct
-/// `targo test` fails `Too many open files` on the caller's limit alone.
-/// NEGATIVE CONTROL: a soft limit already past the floor stands as it was.
+/// `targo test` fails `Too many open files` on the caller's limit alone; behind
+/// a `-C` too, whose detached value is no verb and whose attached one takes no
+/// word after it, and from a launcher outside `$HOME`. NEGATIVE CONTROL: a soft
+/// limit already past the floor stands as it was, and a verb that builds
+/// nothing leaves it alone.
 #[cfg(unix)]
 #[test]
 fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
@@ -768,7 +780,7 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
                cwd: &std::path::Path,
                soft: u64,
                hard: Option<u64>,
-               verb: &str|
+               words: &[&str]|
      -> (String, String, String) {
         let setup = hard.map_or_else(String::new, |hard| {
             format!("ulimit -Hn {hard} 2>/dev/null; ")
@@ -782,8 +794,7 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
                 block(tool)
             ))
             .arg("sh")
-            .arg("--unverified")
-            .arg(verb)
+            .args(words)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &f.home)
@@ -815,17 +826,55 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
     for shell in shells() {
         // A verb that builds nothing leaves the caller's limit alone (the
         // read that decides is a fork, paid only by verbs that need room).
-        let (before, after, _) = run(&shell, Tool::Targo, &ws, 256, None, "fmt");
+        let (before, after, _) = run(
+            &shell,
+            Tool::Targo,
+            &ws,
+            256,
+            None,
+            &["--unverified", "fmt"],
+        );
         assert_eq!(before, after, "{shell:?}: fmt raised {before} -> {after}");
-        // Outside $HOME the verb scan never runs, so a targo verb is unknown
-        // there and the limit stands; the tippy shim knows its own name
-        // without a scan and still raises.
-        let (before, after, _) = run(&shell, Tool::Targo, &outside, 256, None, "test");
+        // Outside $HOME the verb is scanned as well (a `-C` there may name a
+        // folder under it), so a targo test raises there as under $HOME, and
+        // one that builds nothing still leaves the limit alone; the tippy shim
+        // knows its own name without a scan and raises.
+        let (before, after, _) = run(
+            &shell,
+            Tool::Targo,
+            &outside,
+            256,
+            None,
+            &["--unverified", "fmt"],
+        );
         assert_eq!(
             before, after,
-            "{shell:?}: unscanned test raised {before} -> {after}"
+            "{shell:?}: fmt outside home raised {before} -> {after}"
         );
-        let (before, after, hard) = run(&shell, Tool::Tippy, &outside, 256, None, "test");
+        let (before, after, hard) = run(
+            &shell,
+            Tool::Targo,
+            &outside,
+            256,
+            None,
+            &["--unverified", "test"],
+        );
+        if let Some(want) = want(&before, &hard) {
+            asserted += 1;
+            assert_eq!(
+                after.parse::<u64>().ok(),
+                Some(want),
+                "{shell:?}: test outside home: soft {before} -> {after} (hard {hard})"
+            );
+        }
+        let (before, after, hard) = run(
+            &shell,
+            Tool::Tippy,
+            &outside,
+            256,
+            None,
+            &["--unverified", "test"],
+        );
         if let Some(want) = want(&before, &hard) {
             assert_eq!(
                 after.parse::<u64>().ok(),
@@ -834,7 +883,14 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
             );
         }
         for (soft, hard) in [(256_u64, None), (8192, None), (256, Some(1024))] {
-            let (before, after, hard) = run(&shell, Tool::Targo, &ws, soft, hard, "test");
+            let (before, after, hard) = run(
+                &shell,
+                Tool::Targo,
+                &ws,
+                soft,
+                hard,
+                &["--unverified", "test"],
+            );
             let Some(want) = want(&before, &hard) else {
                 continue;
             };
@@ -844,6 +900,28 @@ fn the_shim_raises_a_low_soft_descriptor_limit_and_never_lowers_one() {
                 Some(want),
                 "{shell:?}: soft {before} -> {after} (hard {hard})"
             );
+        }
+        let here = ws.display().to_string();
+        let attached = format!("-C{here}");
+        for moved in [
+            ["-Zunstable-options", "-C", &here, "--unverified", "build"],
+            [
+                "-Zunstable-options",
+                "--unverified",
+                &attached,
+                "build",
+                "-q",
+            ],
+        ] {
+            let (before, after, hard) = run(&shell, Tool::Targo, &ws, 256, None, &moved);
+            if let Some(want) = want(&before, &hard) {
+                asserted += 1;
+                assert_eq!(
+                    after.parse::<u64>().ok(),
+                    Some(want),
+                    "{shell:?}: behind {moved:?}: soft {before} -> {after} (hard {hard})"
+                );
+            }
         }
     }
     assert!(asserted > 0, "no shell rendered a numeric soft limit");
@@ -1452,6 +1530,28 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         "build = { rustflags = [\"#\"], target-dir = \"x\" }\n",
     );
     check(&f, &f.dir("home/inline"), &[], build, true);
+    // A line that closes a multi-line string may go on to name a directory though it starts with
+    // `#`, and an escape may spell a key no line spells: neither half reads either, so both leave
+    // the call as typed, as they leave one whose config spells `include`. Read as a comment or no
+    // key, the trust lane put its intermediates under the workspace's `target` where the visible
+    // key leaves them in the target it names, and the cache lane overrode a build directory.
+    for (name, text) in [
+        (
+            "hidden",
+            "build = { dep-info-basedir = \"\"\"\n#\"\"\", target-dir = \"x\" }\n",
+        ),
+        (
+            "hidden-literal",
+            "build = { dep-info-basedir = '''\n  #''', build-dir = 'b' }\n",
+        ),
+        ("escaped", "[build]\n\"target\\u002ddir\" = \"x\"\n"),
+        ("escaped-long", "[build]\n\"build\\U0000002ddir\" = \"b\"\n"),
+    ] {
+        f.file(&format!("home/{name}/.cargo/config.toml"), text);
+        let dir = f.dir(&format!("home/{name}"));
+        check(&f, &dir, &[], build, false);
+        check(&f, &dir, &[], trust, false);
+    }
     f.file("home/legacy/.cargo/config", "build.build-dir = 'b'");
     check(&f, &f.dir("home/legacy"), &[], build, false);
     f.file("home/up/.cargo/config.toml", "[build]\nbuild-dir = \"b\"\n");
@@ -1459,11 +1559,26 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
     check(&f, &up, &[], build, false);
     check(&f, &up, &[("CARGO_TARGET_DIR", "/x")], build, false);
     check(&f, &up, &[("CARGO_TARGET_DIR", "/x")], trust, false);
+    // `__CARGO_TEST_ROOT` stops Targo's walk, which the block cannot follow: neither half places
+    // a call made under one, whatever lies past it, an empty one too (the block reads it as set).
+    let stop = f.root.join("home/up/a").display().to_string();
+    check(&f, &up, &[("__CARGO_TEST_ROOT", &stop)], build, false);
+    check(&f, &ws, &[("__CARGO_TEST_ROOT", "")], build, false);
+    // A package home's `..` is folded as written by Targo, through the kernel by the block,
+    // which differ past a link: neither half places a call whose home has one, its `TARGO_HOME`
+    // too where that is read.
+    f.file("z/h/config.toml", "include = [\"x.toml\"]\n");
+    f.file("h/config.toml", "[net]\noffline = true\n");
+    std::fs::create_dir_all(f.root.join("z/y")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("z/y"), f.root.join("link")).unwrap();
+    let linked = format!("{}/link/../h", f.root.display());
+    check(&f, &ws, &[("CARGO_HOME", &linked)], build, false);
+    check(&f, &ws, &[("TARGO_HOME", &linked)], build, false);
     f.file("cargohome/config.toml", "[build]\ntarget-dir = \"t\"\n");
     let cargo_home = f.root.join("cargohome").display().to_string();
     check(&f, &ws, &[("CARGO_HOME", &cargo_home)], build, true);
     // `TARGO_HOME` is a home too where `CARGO_HOME` is unset (Trust's main reads it, against the
-    // working directory), beside `~/.cargo` (the store's Targo reads that); a set `CARGO_HOME`,
+    // working directory), beside `~/.cargo` (Targo 16387 reads that); a set `CARGO_HOME`,
     // even empty, hides it. A build directory it names leaves the call as typed.
     f.file("targohome/config.toml", "[build]\nbuild-dir = \"b\"\n");
     let targo_home = f.root.join("targohome").display().to_string();
@@ -1632,12 +1747,15 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &["--unverified", "build", "--manifest-path", &home],
         true,
     );
+    // An alias only a `TARGO_HOME` defines is one Trust's main expands and Targo 16387 never
+    // reads (its `xt` is no command of its own), so neither half places its call; its build
+    // directory, read by one build, still leaves a call as typed (above).
     check(
         &f,
         &ws,
         &[("TARGO_HOME", &cargo_home2)],
         &["--unverified", "xt"],
-        true,
+        false,
     );
     check(
         &f,
@@ -1645,6 +1763,17 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         &[("CARGO_HOME", &bare_home), ("TARGO_HOME", &cargo_home2)],
         &["--unverified", "xt"],
         false,
+    );
+    // NEGATIVE CONTROL: the alias a walked config defines is placed whatever a `TARGO_HOME`
+    // defines beside it, the nearer string winning for every build.
+    f.file("home/ws2/.cargo/config.toml", "[alias]\nxt = \"build\"\n");
+    let ws2 = f.dir("home/ws2");
+    check(
+        &f,
+        &ws2,
+        &[("TARGO_HOME", &cargo_home2)],
+        &["--unverified", "xt"],
+        true,
     );
 
     check(&f, &f.dir("elsewhere/ws"), &[], build, false);
@@ -1673,6 +1802,52 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         std::fs::remove_dir(&library).unwrap();
         check(&f, &ws, &[], build, true);
         check(&f, &f.dir("home/lab.noindex/ws"), &[], build, true);
+    }
+}
+
+/// A CONFIG REACHED THROUGH A LINK (a dotfile manager's `~/.cargo/config.toml`) IS READ THROUGH
+/// IT BY BOTH HALVES, under the front's own reader, which refuses a link: the block follows it
+/// (`[ -f ]`), so the rule must too, or the front holds the block's placement to a rule that
+/// places nothing and refuses the call. NEGATIVE CONTROL: a linked config that names a build
+/// directory leaves the call as typed in both.
+#[cfg(unix)]
+#[test]
+fn a_linked_config_is_placed_alike_under_the_fronts_reader() {
+    let f = Fixture::new("build-cache-linked-config");
+    let ws = f.dir("home/ws");
+    let front_read =
+        |path: &Path| match crate::metadata_io::read_bounded_regular_utf8(path, 1 << 20) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        };
+    let m = Machine {
+        root: None,
+        home: Some(&f.home),
+        cwd: Some(&ws),
+        env: &|_| None,
+        read: &front_read,
+        read_manifest: &front_read,
+        writable: &writable,
+    };
+    std::fs::create_dir_all(f.home.join(".cargo")).unwrap();
+    std::os::unix::fs::symlink(
+        f.root.join("dotfiles/cargo.toml"),
+        f.home.join(".cargo/config.toml"),
+    )
+    .unwrap();
+    let args = strings(&["--unverified", "build"]);
+    for (text, placed) in [
+        ("[net]\ngit-fetch-with-cli = true\n", true),
+        ("[build]\nbuild-dir = \"b\"\n", false),
+    ] {
+        f.file("dotfiles/cargo.toml", text);
+        assert_eq!(
+            decide(&args, Tool::Targo, &m),
+            placed.then(|| BuildDir::Cache(f.value())),
+            "{text}"
+        );
+        check(&f, &ws, &[], &["--unverified", "build"], placed);
     }
 }
 
@@ -2081,6 +2256,540 @@ fn a_working_directory_reached_through_a_link_is_left_alone() {
     );
 }
 
+/// A `-C` CALL IS PLACED AS THE SAME CALL TYPED FROM THE DIRECTORY TARGO CHANGES INTO, by both
+/// halves of the rule: Targo (`cli.rs`) changes into the directory, read back as the kernel
+/// resolves it (a link's target, a trailing `/` and a `..` folded), before it reads a config, an
+/// alias or a relative path, so the configs walk from there, a relative package home is found
+/// there and a relative `--target-dir` or `CARGO_TARGET_DIR` names a folder there. Each spelling
+/// clap reads (`-C d`, `-Cd`, `-C=d`, `-qC d`, `-qCd`), its directory relative and absolute, and
+/// each spelling of the gate Targo needs before the verb (`-Z unstable-options`). NEGATIVE
+/// CONTROL: wherever Targo would refuse the `-C` or resolve it otherwise, or this reader cannot
+/// tell, the call is left as typed: no gate, a gate only after the verb or replaced there (a
+/// `-Z` after the verb), a second `-C`, one after the verb, one with no value or an empty one, a
+/// directory that is missing, a file, HOME itself, outside HOME, in the shared cache or holding a
+/// brace, a channel this reader does not take for Targo's own, and the lint, whose words are its
+/// own. A config in the launcher's folder is not read, one in the directory's is.
+#[cfg(unix)]
+#[test]
+fn a_directory_call_is_placed_as_the_call_typed_from_its_directory() {
+    let f = Fixture::new("build-cache-directory");
+    let ws = f.dir("home/ws");
+    std::fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let launch = f.dir("home/launch");
+    let ws_abs = ws.display().to_string();
+    let elsewhere = f.dir("elsewhere").display().to_string();
+    let absolute_target = f.root.join("home/outputs.noindex").display().to_string();
+    // The leading words both halves add for `rest` typed from `from`, which must place it.
+    let added = |from: &Path, env: &[(&'static str, &str)], rest: &[String]| -> Vec<String> {
+        let env: HashMap<&str, String> = env.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
+        let placed = rust(&f.home, from, &env, rest, Tool::Targo);
+        assert_ne!(placed, rest, "{rest:?} is placed from {}", from.display());
+        assert!(placed.ends_with(rest), "{placed:?}");
+        placed[..placed.len() - rest.len()].to_vec()
+    };
+    // `args` typed at `launch` is placed with exactly what `rest` typed at `dir` is.
+    let placed_as = |dir: &Path, env: &[(&'static str, &str)], args: &[&str], rest: &[&str]| {
+        let args = strings(args);
+        let typed: HashMap<&str, String> = env.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
+        let m = Machine {
+            root: None,
+            home: Some(&f.home),
+            cwd: Some(&launch),
+            env: &|name| typed.get(name).map(OsString::from),
+            read: &read_config,
+            read_manifest: &read_config,
+            writable: &writable,
+        };
+        assert!(directory_honoured(&args, Tool::Targo, &m), "{args:?}");
+        let want: Vec<String> = added(dir, env, &strings(rest))
+            .into_iter()
+            .chain(args.iter().cloned())
+            .collect();
+        check_exact(Tool::Targo, &f.home, &launch, &typed, &args, &want);
+    };
+    let spellings = |dir: &str| -> Vec<Vec<String>> {
+        vec![
+            strings(&["-C", dir]),
+            vec![format!("-C{dir}")],
+            vec![format!("-C={dir}")],
+            strings(&["-qC", dir]),
+            vec![format!("-qC{dir}")],
+        ]
+    };
+    let targets: [&[&str]; 4] = [
+        &[],
+        &["--target-dir", "out"],
+        &["--target-dir", &absolute_target],
+        &["--target-dir=out"],
+    ];
+    for dir in ["../ws", ws_abs.as_str(), "../ws/", "../launch/../ws"] {
+        for spelling in spellings(dir) {
+            for target in targets {
+                let rest: Vec<&str> = ["--unverified", "build"]
+                    .into_iter()
+                    .chain(target.iter().copied())
+                    .collect();
+                let args: Vec<&str> = ["-Zunstable-options"]
+                    .into_iter()
+                    .chain(spelling.iter().map(String::as_str))
+                    .chain(rest.iter().copied())
+                    .collect();
+                placed_as(&ws, &[], &args, &rest);
+            }
+            // A relative target in the environment is the directory's too.
+            let args: Vec<&str> = ["-Zunstable-options"]
+                .into_iter()
+                .chain(spelling.iter().map(String::as_str))
+                .chain(["--unverified", "test"])
+                .collect();
+            for var in [
+                "CARGO_TARGET_DIR",
+                "TARGO_TARGET_DIR",
+                "CARGO_BUILD_TARGET_DIR",
+            ] {
+                placed_as(&ws, &[(var, "out")], &args, &["--unverified", "test"]);
+            }
+        }
+    }
+    // Every spelling of the gate before the verb, before the `-C` or after it, and the trust lane.
+    for gate in [
+        &["-Zunstable-options"][..],
+        &["-Z", "unstable-options"],
+        &["-Z=unstable-options"],
+        &["-qZunstable-options"],
+        &["-qZ", "unstable-options"],
+        &["-Zx", "-Zunstable-options"],
+    ] {
+        let mut args: Vec<&str> = gate.to_vec();
+        args.extend([
+            "-C",
+            "../ws",
+            "--unverified",
+            "build",
+            "--target-dir",
+            "out",
+        ]);
+        placed_as(
+            &ws,
+            &[],
+            &args,
+            &["--unverified", "build", "--target-dir", "out"],
+        );
+        let mut args: Vec<&str> = vec!["-C", "../ws"];
+        args.extend(gate);
+        args.extend(["--unverified", "check"]);
+        placed_as(&ws, &[], &args, &["--unverified", "check"]);
+    }
+    placed_as(
+        &ws,
+        &[],
+        &["-Zunstable-options", "-C", "../ws", "trust", "check"],
+        &["trust", "check"],
+    );
+    // The directory is the kernel's: through a link, its target's.
+    std::os::unix::fs::symlink(&ws, launch.join("linked")).unwrap();
+    placed_as(
+        &ws,
+        &[],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "linked",
+            "--unverified",
+            "build",
+            "--target-dir",
+            "out",
+        ],
+        &["--unverified", "build", "--target-dir", "out"],
+    );
+
+    // The configs walk from the directory: the launcher's is not read, the directory's is.
+    let configured = f.dir("home/configured");
+    f.file(
+        "home/launch/.cargo/config.toml",
+        "[build]\nbuild-dir = \"x\"\n",
+    );
+    f.file(
+        "home/configured/.cargo/config.toml",
+        "[build]\nbuild-dir = \"x\"\n",
+    );
+    check(&f, &launch, &[], &["--unverified", "build"], false);
+    placed_as(
+        &ws,
+        &[],
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "build"],
+        &["--unverified", "build"],
+    );
+    check(
+        &f,
+        &ws,
+        &[],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../configured",
+            "--unverified",
+            "build",
+        ],
+        false,
+    );
+    std::fs::remove_dir_all(launch.join(".cargo")).unwrap();
+    // A relative package home is the directory's: one in the launcher's folder is not read.
+    f.file("home/launch/hh/config.toml", "[build]\nbuild-dir = \"x\"\n");
+    f.file(
+        "home/configured/hh/config.toml",
+        "[build]\nbuild-dir = \"x\"\n",
+    );
+    std::fs::remove_dir_all(configured.join(".cargo")).unwrap();
+    check(
+        &f,
+        &launch,
+        &[("CARGO_HOME", "hh")],
+        &["--unverified", "build"],
+        false,
+    );
+    placed_as(
+        &ws,
+        &[("CARGO_HOME", "hh")],
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "build"],
+        &["--unverified", "build"],
+    );
+    for home in ["CARGO_HOME", "TARGO_HOME"] {
+        check(
+            &f,
+            &launch,
+            &[(home, "hh")],
+            &[
+                "-Zunstable-options",
+                "-C",
+                "../configured",
+                "--unverified",
+                "build",
+            ],
+            false,
+        );
+    }
+
+    // NEGATIVE CONTROL: left as typed.
+    std::fs::create_dir(f.home.join("b{x}")).unwrap();
+    let cached = f.dir("home/Library/Caches/aterm/.ubd/cargo-build.noindex/x");
+    let cached = cached.display().to_string();
+    let attached_missing = "-C../missing".to_owned();
+    for args in [
+        &["-C", "../ws", "--unverified", "build"][..],
+        &["-qC../ws", "--unverified", "build", "--target-dir", "out"],
+        &["-C", "../ws", "--unverified", "build", "-Zunstable-options"],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../ws",
+            "--unverified",
+            "build",
+            "-Zx",
+        ],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../ws",
+            "--unverified",
+            "build",
+            "-Z",
+            "x",
+        ],
+        &[
+            "-Zunstable-optionsx",
+            "-C",
+            "../ws",
+            "--unverified",
+            "build",
+        ],
+        &["-Zx", "-C", "../ws", "--unverified", "build"],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../ws",
+            "-C",
+            "../ws",
+            "--unverified",
+            "build",
+        ],
+        &[
+            "-Zunstable-options",
+            "-C../ws",
+            "-qC=../ws",
+            "--unverified",
+            "build",
+        ],
+        &["-Zunstable-options", "--unverified", "build", "-C", "../ws"],
+        &["-Zunstable-options", "--unverified", "build", "-C../ws"],
+        &["-Zunstable-options", "-C", "-q", "--unverified", "build"],
+        &["-Zunstable-options", "--unverified", "build", "-C"],
+        &["-Zunstable-options", "-C=", "--unverified", "build"],
+        &["-Zunstable-options", "-C", "", "--unverified", "build"],
+        &["-Zunstable-options", "-qC", "", "--unverified", "build"],
+        &[
+            "-Zunstable-options",
+            &attached_missing,
+            "--unverified",
+            "build",
+        ],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../ws/Cargo.toml",
+            "--unverified",
+            "build",
+        ],
+        &["-Zunstable-options", "-C", "..", "--unverified", "build"],
+        &[
+            "-Zunstable-options",
+            "-C",
+            &elsewhere,
+            "--unverified",
+            "build",
+        ],
+        &[
+            "-Zunstable-options",
+            "-C",
+            "../b{x}",
+            "--unverified",
+            "build",
+        ],
+        &["-Zunstable-options", "-C", &cached, "--unverified", "build"],
+    ] {
+        check(&f, &launch, &[], args, false);
+    }
+    let gated = ["-Zunstable-options", "-C", "../ws", "--unverified", "build"];
+    for channel in ["nightly", "stable"] {
+        check(
+            &f,
+            &launch,
+            &[("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", channel)],
+            &gated,
+            false,
+        );
+    }
+    check_tool(
+        &f,
+        Tool::Tippy,
+        &launch,
+        &[],
+        &["-Zunstable-options", "-C", "../ws", "--all-targets"],
+        Want::Typed,
+    );
+}
+
+/// A `-C` CALL IS PLACED WHATEVER ITS LAUNCHER AND WHATEVER SPELLING NAMES ITS DIRECTORY, by both
+/// halves: Targo resolves the `-C` from the launcher's folder and reads nothing else there, so a
+/// launcher a call typed there is left alone in (HOME itself, outside HOME, in the shared cache,
+/// holding a brace, reached through a link) still has its `-C` call placed as the same call
+/// typed from the directory. That directory is the one Targo's `getcwd` reads back (on macOS a
+/// folder named through the data volume's firmlink, `/System/Volumes/Data/...`, by its root
+/// spelling, where `realpath` keeps the one given). The directory's configs decide an alias and
+/// a relative `TARGO_HOME` is the directory's. NEGATIVE CONTROL: the same launchers' calls with
+/// no `-C` stay as typed, an alias defined only in the launcher's config leaves the `-C` call as
+/// typed (Targo never reads it), a relative `TARGO_HOME` in the launcher's folder is not read,
+/// and an upstream cargo's `-C` is left as typed, its channel unread, though the same call typed
+/// from the directory is placed. Trust's Cargo-compatible name, Targo's program on its channel,
+/// has its gated `-C` call placed as Targo's is.
+#[cfg(unix)]
+#[test]
+fn a_directory_call_is_placed_whatever_its_launcher_and_spelling() {
+    let f = Fixture::new("build-cache-directory-launcher");
+    let ws = f.dir("home/ws");
+    std::fs::write(ws.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let launch = f.dir("home/launch");
+    let ws_abs = ws.display().to_string();
+    // `args` typed at `launcher` (with `env`) is placed with exactly what `rest` typed at `dir`
+    // is, which must place it.
+    let placed_from = |launcher: &Path,
+                       dir: &Path,
+                       env: &[(&'static str, &str)],
+                       args: &[&str],
+                       rest: &[&str]| {
+        let typed: HashMap<&str, String> = env.iter().map(|(k, v)| (*k, (*v).to_owned())).collect();
+        let at_dir: HashMap<&str, String> = typed
+            .iter()
+            .filter(|(k, _)| **k != "PWD")
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let rest = strings(rest);
+        let placed = rust(&f.home, dir, &at_dir, &rest, Tool::Targo);
+        assert_ne!(placed, rest, "{rest:?} is placed from {}", dir.display());
+        let args = strings(args);
+        let want: Vec<String> = placed[..placed.len() - rest.len()]
+            .iter()
+            .chain(args.iter())
+            .cloned()
+            .collect();
+        check_exact(Tool::Targo, &f.home, launcher, &typed, &args, &want);
+    };
+    let run = |launcher: &Path, env: &[(&'static str, &str)], dir: &str| {
+        let args = vec!["-Zunstable-options", "-C", dir, "--unverified", "build"];
+        placed_from(launcher, &ws, env, &args, &["--unverified", "build"]);
+        let mut with_target = args.clone();
+        with_target.extend(["--target-dir", "out"]);
+        placed_from(
+            launcher,
+            &ws,
+            env,
+            &with_target,
+            &["--unverified", "build", "--target-dir", "out"],
+        );
+    };
+
+    // HOME itself, outside HOME, in the shared cache and holding a brace.
+    let elsewhere = f.dir("elsewhere");
+    let cached = f.dir("home/Library/Caches/aterm/.ubd/cargo-build.noindex/x");
+    let braced = f.dir("home/b{x}");
+    for (launcher, relative) in [
+        (&f.home, "ws"),
+        (&f.home, "./ws/"),
+        (&elsewhere, "../home/ws"),
+        (&cached, "../../../../../../ws"),
+        (&braced, "../ws"),
+    ] {
+        check(&f, launcher, &[], &["--unverified", "build"], false);
+        run(launcher, &[], relative);
+        run(launcher, &[], &ws_abs);
+    }
+    // A launcher reached through a link (a logical `$PWD`): a relative `-C` is resolved from the
+    // folder the link names, as the kernel resolves the shell's `$PWD/<dir>`.
+    let deep = f.dir("home/deep/launch");
+    let deep_ws = f.dir("home/deep/ws");
+    let logical = f.home.join("linked-launch");
+    std::os::unix::fs::symlink(&deep, &logical).unwrap();
+    let logical = logical.display().to_string();
+    let pwd = [("PWD", logical.as_str())];
+    let build = strings(&["--unverified", "build"]);
+    let typed: HashMap<&str, String> = HashMap::from([("PWD", logical.clone())]);
+    check_exact(Tool::Targo, &f.home, &deep, &typed, &build, &build);
+    placed_from(
+        &deep,
+        &deep_ws,
+        &pwd,
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "build"],
+        &["--unverified", "build"],
+    );
+    run(&deep, &pwd, &ws_abs);
+
+    // The directory Targo's `getcwd` reads back: on macOS a folder named through the data
+    // volume's firmlink is read back by its root spelling, which `realpath` keeps.
+    #[cfg(target_os = "macos")]
+    {
+        let data = Path::new("/System/Volumes/Data").join(ws.strip_prefix("/").unwrap());
+        assert_eq!(
+            std::fs::canonicalize(&data).unwrap(),
+            data,
+            "realpath keeps the firmlink's spelling"
+        );
+        run(&launch, &[], &data.display().to_string());
+        run(&f.home, &[], &data.display().to_string());
+        std::os::unix::fs::symlink(&data, launch.join("through-data")).unwrap();
+        run(&launch, &[], "through-data");
+    }
+
+    // The directory's configs decide an alias; the launcher's are never read.
+    f.file("home/ws/.cargo/config.toml", "[alias]\nxb = \"build\"\n");
+    f.file(
+        "home/launch/.cargo/config.toml",
+        "[alias]\nxc = \"build\"\n",
+    );
+    placed_from(
+        &launch,
+        &ws,
+        &[],
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "xb"],
+        &["--unverified", "xb"],
+    );
+    placed_from(
+        &f.home,
+        &ws,
+        &[],
+        &["-Zunstable-options", "-C", "ws", "--unverified", "xb"],
+        &["--unverified", "xb"],
+    );
+    let typed_xc = strings(&["--unverified", "xc"]);
+    assert_ne!(
+        rust(&f.home, &launch, &HashMap::new(), &typed_xc, Tool::Targo),
+        typed_xc,
+        "the launcher's own alias places a call typed there"
+    );
+    check(
+        &f,
+        &launch,
+        &[],
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "xc"],
+        false,
+    );
+    std::fs::remove_dir_all(ws.join(".cargo")).unwrap();
+    std::fs::remove_dir_all(launch.join(".cargo")).unwrap();
+
+    // A relative `TARGO_HOME` is the directory's: one in the launcher's folder is not read.
+    f.file("home/launch/hh/config.toml", "[build]\nbuild-dir = \"x\"\n");
+    check(
+        &f,
+        &launch,
+        &[("TARGO_HOME", "hh")],
+        &["--unverified", "build"],
+        false,
+    );
+    placed_from(
+        &launch,
+        &ws,
+        &[("TARGO_HOME", "hh")],
+        &["-Zunstable-options", "-C", "../ws", "--unverified", "build"],
+        &["--unverified", "build"],
+    );
+
+    // An upstream cargo's `-C` is left as typed, though clap would keep its gate and the same
+    // call typed from the directory is placed.
+    let upstream = strings(&["+nightly", "-Zunstable-options", "-C", "../ws", "build"]);
+    let m = Machine {
+        root: None,
+        home: Some(&f.home),
+        cwd: Some(&launch),
+        env: &|_| None,
+        read: &read_config,
+        read_manifest: &read_config,
+        writable: &writable,
+    };
+    assert!(directory_honoured(&upstream, Tool::Cargo, &m));
+    let typed_there = strings(&["+nightly", "build"]);
+    assert_ne!(
+        rust(&f.home, &ws, &HashMap::new(), &typed_there, Tool::Cargo),
+        typed_there
+    );
+    assert_eq!(
+        rust(&f.home, &launch, &HashMap::new(), &upstream, Tool::Cargo),
+        upstream
+    );
+    // Trust's Cargo-compatible name is Targo's program on Targo's channel: its gated `-C` call is
+    // placed as the same call typed from the directory, its `+toolchain` kept first.
+    let compat = strings(&["+trust", "-Zunstable-options", "-C", "../ws", "build"]);
+    let typed_there = strings(&["+trust", "build"]);
+    let placed_there = rust(
+        &f.home,
+        &ws,
+        &HashMap::new(),
+        &typed_there,
+        Tool::CargoCompat,
+    );
+    assert_ne!(placed_there, typed_there);
+    let mut want = placed_there[..placed_there.len() - 1].to_vec();
+    want.extend(compat[1..].iter().cloned());
+    assert_eq!(
+        rust(
+            &f.home,
+            &launch,
+            &HashMap::new(),
+            &compat,
+            Tool::CargoCompat
+        ),
+        want
+    );
+}
+
 /// A tool that starts a nested `targo` at a checkout it names gets the shim's answer for a build
 /// typed there, whatever `$PWD` it inherited; a checkout named through a link is left alone.
 #[cfg(unix)]
@@ -2367,15 +3076,21 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
         for (name, value) in env {
             command.env(name, value);
         }
-        let output =
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "shim route target={} cwd={} words={words:?} settings={env:?}: {error:?}",
-                        target.display(),
-                        cwd.display()
-                    )
-                });
+        let guard = std::time::Instant::now() + aterm_spec::wait::WORKING_GUARD;
+        let output = aterm_uds::deadline::output_from_while_process_progressing_unless(
+            &mut command,
+            aterm_uds::spawnfd::Stdio::null(),
+            aterm_spec::wait::MUST_HAPPEN,
+            "generated shim route",
+            &mut || std::time::Instant::now() >= guard,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "shim route target={} cwd={} words={words:?} settings={env:?}: {error:?}",
+                target.display(),
+                cwd.display()
+            )
+        });
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
@@ -6550,5 +7265,141 @@ fn a_run_end_trim_reads_the_locks_its_record_names() {
         inventory::scans_here(),
         scans,
         "a trim reads its record's profiles and makes no inventory"
+    );
+}
+
+/// OVER THE BUDGET ONLY AN UNKEPT LEAF OF THE SHARED CACHE WAITS AN HOUR: a stale part unwritten
+/// two hours goes from a workspace no live session keeps, and stays (as with room, three days)
+/// once `keeps` keeps it, the negative control. A whole build directory, and a leaf off the
+/// shared cache, wait as with room whatever `keeps` says.
+#[cfg(unix)]
+#[test]
+fn a_budget_policy_waits_an_hour_only_on_a_leaf_no_live_session_builds() {
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    for kept in [false, true] {
+        let f = Fixture::new("build-cache-budget-policy");
+        let root = cache_root(&f.home);
+        let workspace = f.dir("home/live");
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = lay(&root, &workspace, Duration::ZERO);
+        // The stale survey reads a profile through its cargo lock alone.
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        let incremental = leaf.join("debug/incremental/old");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("data"), b"compiler state").unwrap();
+        age_tree(&incremental, 2 * HOUR);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let keeps = |at: &Path, ws: &Path| {
+            asked
+                .borrow_mut()
+                .push((at.to_path_buf(), ws.to_path_buf()));
+            kept
+        };
+        let policy = ReclaimPolicy::Budget {
+            root: &root,
+            keeps: &keeps,
+        };
+        assert_eq!(policy.whole(), ReclaimAfter::CALM);
+        assert_eq!(
+            policy.leaf(&f.home.join("elsewhere").join(LEAF)),
+            ReclaimAfter::CALM,
+            "a leaf off the shared cache waits as with room"
+        );
+        assert_eq!(
+            policy.leaf(&leaf),
+            if kept {
+                ReclaimAfter::CALM
+            } else {
+                ReclaimAfter::OVER_BUDGET
+            }
+        );
+        let (removed, _) = reclaim_root_on(
+            &root,
+            Some(&f.home),
+            SystemTime::now(),
+            policy,
+            None,
+            &mut |_, _| true,
+            &fence::Fence::default(),
+        );
+        assert_eq!(incremental.is_dir(), kept, "kept={kept}: {removed:?}");
+        assert_eq!(removed.len(), usize::from(!kept), "{removed:?}");
+        if !kept {
+            assert!(matches!(
+                removed[0].1,
+                Unused::Stale { incremental: 1, after, .. } if after == RECLAIM_STALE_UNDER_PRESSURE
+            ));
+        }
+        assert!(!asked.borrow().is_empty());
+        assert!(
+            asked
+                .borrow()
+                .iter()
+                .all(|(at, ws)| *at == leaf && *ws == workspace),
+            "{:?}",
+            asked.borrow()
+        );
+        assert_eq!(
+            std::fs::read(leaf.join("debug/deps/x")).unwrap(),
+            b"0123456789"
+        );
+    }
+}
+
+/// THE OVER-BUDGET SWEEP WALKS THE SHARED CACHE ALONE: through [`reclaim_over_budget`], a stale
+/// part unwritten two hours in a shared-cache build directory no live session keeps goes, and
+/// stays once `keeps` keeps it; a build directory under the root the cache moved from, two hours
+/// quiet, stays either way, as `keeps` reads no session of that root's builds. NEGATIVE CONTROL:
+/// every root swept as with room ([`reclaim_roots`], [`ReclaimAfter::CALM`]) takes it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_over_budget_sweep_takes_an_unkept_stale_part_of_the_shared_cache_alone() {
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    for kept in [false, true] {
+        let f = Fixture::new("build-cache-over-budget");
+        let root = cache_root(&f.home);
+        let workspace = f.dir("home/live");
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = lay(&root, &workspace, Duration::ZERO);
+        // The stale survey reads a profile through its cargo lock alone.
+        std::fs::write(leaf.join("debug/.cargo-build-lock"), b"").unwrap();
+        let incremental = leaf.join("debug/incremental/old");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("data"), b"compiler state").unwrap();
+        age_tree(&incremental, 2 * HOUR);
+        let moved = lay(&moved_from(&f.home), &f.root.join("home/old"), 2 * HOUR);
+        let removed = reclaim_over_budget(
+            &f.home,
+            SystemTime::now(),
+            &|_, _| kept,
+            None,
+            &mut |_, _| true,
+        );
+        assert_eq!(incremental.is_dir(), kept, "kept={kept}: {removed:?}");
+        assert!(moved.is_dir(), "kept={kept}: {removed:?}");
+        let gone: Vec<&Path> = removed.iter().map(|(path, _)| path.as_path()).collect();
+        assert_eq!(gone.len(), usize::from(!kept), "{removed:?}");
+        assert!(
+            gone.iter().all(|path| path.starts_with(&root)),
+            "{removed:?}"
+        );
+    }
+
+    // NEGATIVE CONTROL: every root swept as with room takes the moved build directory.
+    let f = Fixture::new("build-cache-over-budget-control");
+    let moved = lay(&moved_from(&f.home), &f.root.join("home/old"), 2 * HOUR);
+    let removed = reclaim_roots(
+        &f.home,
+        SystemTime::now(),
+        ReclaimAfter::CALM.into(),
+        None,
+        true,
+        &fence::Fence::default(),
+        &mut |_, _| true,
+    );
+    assert!(!moved.exists(), "{removed:?}");
+    assert!(
+        removed.iter().any(|(path, _)| *path == moved),
+        "{removed:?}"
     );
 }

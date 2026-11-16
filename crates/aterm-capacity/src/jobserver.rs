@@ -1092,7 +1092,7 @@ impl Jobserver {
     }
 
     /// The latest record this handle wrote ([`Self::count_event`]).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn last_count(&self) -> Option<CountRecord> {
         self.notes
             .lock()

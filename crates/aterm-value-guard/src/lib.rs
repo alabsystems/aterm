@@ -38,6 +38,8 @@ pub enum Refusal {
     Phone,
     /// An account's name that names a machine.
     MachineLabel,
+    /// Nothing where the column needs something.
+    Empty,
 }
 
 impl Refusal {
@@ -53,6 +55,7 @@ impl Refusal {
             Self::MachineLabel => {
                 "an account's label names no machine: a preference row maps it to one"
             }
+            Self::Empty => "this column needs something in it",
         }
     }
 }
@@ -493,6 +496,270 @@ pub fn note_cell(value: &str, max: usize) -> Result<(), Refusal> {
         return Err(Refusal::CredentialShape);
     }
     Ok(())
+}
+
+/// Provider tokens by their prefix and the fewest characters of a real one's body (letters,
+/// digits, `_` and `-`, [`body_byte`]): what [`secret_shaped`] refuses at the start of a word. A
+/// prefix with less after it is a name in prose (`sk-ssh-ed25519-cert-v01`, `the ghp_ prefix`,
+/// `xoxb-/xoxp-`, `npm_config_cache=`), never a token.
+const TOKENS: [(&str, usize); 24] = [
+    ("github_pat_", 60),
+    ("ghp_", 30),
+    ("gho_", 30),
+    ("ghu_", 30),
+    ("ghs_", 30),
+    ("ghr_", 30),
+    ("glpat-", 20),
+    ("sk-ant-", 40),
+    ("sk-", 40),
+    ("xoxa-", 30),
+    ("xoxb-", 30),
+    ("xoxp-", 30),
+    ("xoxr-", 30),
+    ("xoxs-", 30),
+    ("xapp-", 30),
+    ("https://hooks.slack.com/services/", 20),
+    ("AGE-SECRET-KEY-1", 50),
+    ("AIza", 30),
+    ("xai-", 40),
+    ("ya29.", 30),
+    ("npm_", 30),
+    ("hf_", 30),
+    ("AKIA", 16),
+    ("ASIA", 16),
+];
+
+/// Whether a byte belongs to a provider token's body: a letter, a digit, `_` or `-` (a Slack
+/// webhook's `/` too, which the body of [`TOKENS`]' webhook row holds between its parts).
+const fn body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+/// The fewest characters of a run [`random_token`] judges.
+const RANDOM_RUN: usize = 32;
+/// The least share, in percent, of a random token's characters that are upper case, and again
+/// lower case.
+const RANDOM_CASE_PCT: usize = 15;
+/// The least share, in percent, of a random token's characters that start a run of their class
+/// (upper case, lower case, digit, `+` or `/`).
+const RANDOM_CHANGE_PCT: usize = 40;
+
+/// Whether `text` carries a real secret, the rule of the lab tracker's prose, command and path
+/// types (docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 13): a provider token, its prefix
+/// with a token's body after it ([`TOKENS`]); a PEM private key; an `otpauth://` URI with its
+/// seed; a TOTP seed on its own ([`seed_shaped`]); a URL carrying a password; or a run of
+/// random letters and digits ([`random_token`]). Unlike [`credential_shaped`], it refuses
+/// neither a 40-character run (a commit, a path, a test's name) nor a bare prefix in prose, and
+/// [`prose`] lets an `@` stand (`s-ed8f5c@m60`, `lean-init@v4.30.0`): the 821 of 1,121
+/// packages of publication 384b3a9f that [`text`] refuses hold no secret.
+#[must_use]
+pub fn secret_shaped(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (at, _) in text.char_indices() {
+        if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let rest = &text[at..];
+        if TOKENS.iter().any(|(prefix, body)| {
+            rest.strip_prefix(prefix).is_some_and(|after| {
+                let webhook = prefix.ends_with('/');
+                after
+                    .bytes()
+                    .take_while(|b| body_byte(*b) || (webhook && *b == b'/'))
+                    .count()
+                    >= *body
+            })
+        }) || pem_private_key(rest)
+            || otpauth_seed(rest)
+        {
+            return true;
+        }
+    }
+    seed_shaped(text) || url_password(text) || random_token(text)
+}
+
+/// Whether `rest` starts a PEM private key's header: five dashes and `BEGIN `, then `PRIVATE KEY`
+/// before the header's closing dashes (an OpenSSH, EC, RSA or PKCS#8 key). A certificate or a
+/// public key is no secret.
+fn pem_private_key(rest: &str) -> bool {
+    rest.strip_prefix("-----BEGIN ")
+        .and_then(|header| header.split("-----").next())
+        .is_some_and(|label| label.contains("PRIVATE KEY"))
+}
+
+/// Whether `rest` starts an `otpauth://` URI whose `secret=` holds a seed: it starts with at
+/// least [`SEED_CHARS`] base32 characters, whatever follows them (`&`, a quote, a `)`).
+fn otpauth_seed(rest: &str) -> bool {
+    let Some(uri) = rest.strip_prefix("otpauth://") else {
+        return false;
+    };
+    let uri = uri.split(char::is_whitespace).next().unwrap_or_default();
+    uri.match_indices("secret=").any(|(at, key)| {
+        uri[at + key.len()..]
+            .bytes()
+            .take_while(|b| b.is_ascii_alphabetic() || (b'2'..=b'7').contains(b))
+            .count()
+            >= SEED_CHARS
+    })
+}
+
+/// Whether `text` holds a TOTP seed as an authenticator shows one: a word of at least
+/// [`SEED_CHARS`] upper-case base32 characters (`JBSWY3DPEHPK3PXP`), or at least four
+/// space-separated groups of four in one case (`jbsw y3dp ehpk 3pxp`), with a digit `2`–`7` and
+/// a letter past `f`; lower-case groups hold such a digit in two of the four, since four short
+/// words with one digit among them are prose (`test ipv6 with real`). A lower-case run is not
+/// one: in the tracker's prose it is words written without spaces (`4alternatingpairs`,
+/// `baseline25requests`).
+fn seed_shaped(text: &str) -> bool {
+    if text.len() < SEED_CHARS {
+        return false;
+    }
+    let seeded = |word: &str| {
+        word.bytes().any(|b| (b'2'..=b'7').contains(&b))
+            && word.bytes().any(|b| b.to_ascii_lowercase() > b'f')
+    };
+    if text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| {
+            word.len() >= SEED_CHARS
+                && base32(word)
+                && !word.bytes().any(|b| b.is_ascii_lowercase())
+                && seeded(word)
+        })
+    {
+        return true;
+    }
+    const GROUP_RUN: usize = SEED_CHARS / 4;
+    let mut run = [""; GROUP_RUN];
+    let mut filled = 0usize;
+    for group in text.split(' ') {
+        if group.len() == 4 && base32(group) {
+            run.copy_within(1.., 0);
+            run[GROUP_RUN - 1] = group;
+            filled += 1;
+            let upper = run
+                .iter()
+                .all(|g| g.bytes().all(|b| !b.is_ascii_lowercase()));
+            let lower = run
+                .iter()
+                .all(|g| g.bytes().all(|b| !b.is_ascii_uppercase()));
+            let with_digit = run
+                .iter()
+                .filter(|g| g.bytes().any(|b| (b'2'..=b'7').contains(&b)))
+                .count();
+            if filled >= GROUP_RUN
+                && (upper || (lower && with_digit >= 2))
+                && run.iter().any(|g| seeded(g))
+            {
+                return true;
+            }
+        } else {
+            filled = 0;
+        }
+    }
+    false
+}
+
+/// Whether `text` holds a run of at least [`RANDOM_RUN`] letters, digits, `+` and `/` drawn at
+/// random (a base62 or base64 key of no known provider): upper and lower case each at least
+/// [`RANDOM_CASE_PCT`] percent of it, a digit, and its class (upper case, lower case, digit,
+/// `+` or `/`) changing at least [`RANDOM_CHANGE_PCT`] percent of the way along. A run is cut
+/// at [`HEX_CUT`] or more lower-case hex digits, so a commit inside words written without
+/// spaces (`LANDEDd7d2226…/normal7GREEN22s`) is no key. Such a key changes class at about three
+/// characters in five; words written without spaces
+/// (`Nativecoldquery160columns161allocationrequests`) keep one case for a word at a time, a
+/// CamelCase name has no digit, and a digest or a commit has no upper case. A key in one case
+/// is not judged: of the tracker's text, words glued to a commit (`source14c8f27715c7…`) read
+/// as one. Of the cells of publication 384b3a9f none is one; of random 40-character base64 keys
+/// about one in 300 is missed.
+fn random_token(text: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/'))
+        .flat_map(hex_cut)
+        .filter(|run| run.len() >= RANDOM_RUN)
+        .any(|run| {
+            let (mut upper, mut lower, mut digits, mut changes) = (0, 0, 0, 0);
+            let mut last = None;
+            for b in run.bytes() {
+                let class = if b.is_ascii_uppercase() {
+                    upper += 1;
+                    0
+                } else if b.is_ascii_lowercase() {
+                    lower += 1;
+                    1
+                } else if b.is_ascii_digit() {
+                    digits += 1;
+                    2
+                } else {
+                    3
+                };
+                if last != Some(class) {
+                    changes += 1;
+                }
+                last = Some(class);
+            }
+            let n = run.len();
+            upper * 100 >= RANDOM_CASE_PCT * n
+                && lower * 100 >= RANDOM_CASE_PCT * n
+                && digits > 0
+                && changes * 100 >= RANDOM_CHANGE_PCT * n
+        })
+}
+
+/// The fewest lower-case hex digits in a row that [`random_token`] cuts a run at.
+const HEX_CUT: usize = 7;
+
+/// `run`'s parts between its stretches of at least [`HEX_CUT`] lower-case hex digits.
+fn hex_cut(run: &str) -> Vec<&str> {
+    let bytes = run.as_bytes();
+    let hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    let mut parts = Vec::new();
+    let (mut start, mut at) = (0, 0);
+    while at < bytes.len() {
+        if hex(bytes[at]) {
+            let end = at + bytes[at..].iter().take_while(|b| hex(**b)).count();
+            if end - at >= HEX_CUT {
+                parts.push(&run[start..at]);
+                start = end;
+            }
+            at = end;
+        } else {
+            at += 1;
+        }
+    }
+    parts.push(&run[start..]);
+    parts
+}
+
+/// Check one value of the lab tracker's prose, of at most `max` bytes: no control character
+/// and no real secret ([`secret_shaped`]). An `@`, a commit, a path and a phone-like run of
+/// digits (`ATERM-KI-1114-533`) are the tracker's ordinary text, and a word that names a
+/// secret is a package about one.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn prose(value: &str, max: usize) -> Result<(), Refusal> {
+    if value.len() > max {
+        return Err(Refusal::Length);
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Refusal::Control);
+    }
+    if secret_shaped(value) {
+        return Err(Refusal::CredentialShape);
+    }
+    Ok(())
+}
+
+/// Check one shell command line of the lab tracker (a package's exit test, a measurement's
+/// source), of at most `max` bytes: [`prose`]'s rules, and something to run.
+///
+/// # Errors
+/// The rule it breaks; the value is never quoted.
+pub fn command(value: &str, max: usize) -> Result<(), Refusal> {
+    if value.trim().is_empty() {
+        return Err(Refusal::Empty);
+    }
+    prose(value, max)
 }
 
 /// Check a string a typed column holds other than free text (an enum word, a label, a URL):

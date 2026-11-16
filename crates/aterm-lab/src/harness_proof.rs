@@ -1438,14 +1438,15 @@ pub fn cmd_harness_proof(args: &[String]) -> Res {
     }
     let row = aterm_agent::harness::contract::row_named(s.id);
     println!(
-        "harness-proof {}: aterm {}; its contract 3 roster {}",
+        "harness-proof {}: aterm {}; its harness registry {}",
         s.id,
         aterm.display(),
         row.map_or_else(
             || format!(
                 "does NOT name {} (rows: {}), so its claim is a foreign one aterm never proves",
                 s.id,
-                aterm_agent::harness::contract::ROSTER
+                aterm_agent::harness::registry::current()
+                    .rows()
                     .iter()
                     .map(|r| r.id)
                     .collect::<Vec<_>>()

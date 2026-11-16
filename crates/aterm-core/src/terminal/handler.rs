@@ -111,7 +111,7 @@ define_terminal_handler! {
     iterm2: super::Iterm2State => iterm2,
     window_callback: Option<WindowCallback> => window_callback,
     taskbar_progress: Option<super::TaskbarProgress> => taskbar_progress,
-    program_state: super::program_state::ProgramStateReport => program_state,
+    program_state: super::program_state::ProgramStateRecord => program_state,
     clipboard_auth: super::clipboard_auth::ClipboardAuth => clipboard_auth,
     shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth
         => shell_integration_auth,

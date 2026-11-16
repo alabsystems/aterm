@@ -133,6 +133,7 @@ pub(crate) fn workspace_root() -> PathBuf {
 /// check run's logs and out of fseventsd and Spotlight as they are. An entry is local state, not
 /// part of the checkout: a number a claim rests on goes in the lab tracker with the command that
 /// produced it (`goals.py measure`).
+#[cfg(unix)]
 pub(crate) fn ledger_dir(ledger: &str) -> PathBuf {
     let root = crate::physical(&workspace_root());
     // The target `Ctx::new` gives the run, so this stays inside its `Ctx::state_dir`.

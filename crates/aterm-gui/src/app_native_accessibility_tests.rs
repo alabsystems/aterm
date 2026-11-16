@@ -318,6 +318,7 @@ fn title_advanced_after_staging_is_authoritative_in_the_same_publish() {
     let (_, view) = app.active_native_view(wid).expect("native Settings view");
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.leaf_render_cache.get_mut(&view))
         .and_then(|cache| cache.native.as_mut())
         .expect("retained native raster")
@@ -431,9 +432,10 @@ fn publish_leave(app: &mut App, wid: WindowId, view: ViewId) -> ActionRequest {
 fn vault_page_with_draft() -> (App, WindowId, ViewId, crate::native_app::AppInstanceId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.set_system_state_handlers_for_test(
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
@@ -509,10 +511,11 @@ fn launch_offer_ax_navigation(action: Action) {
     // A window 270 points tall (a headless window's scale is 1), whatever this platform's
     // face makes a row: the page's head shows and its accounts line lies below it.
     let (_, cell_h) = app.win_cell_size(wid);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = u16::try_from(270 / cell_h).unwrap();
     window.cols = 90;
     window.os_window_for_test = true;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.set_system_state_handlers_for_test(crate::InitialSetupHandlers::inert_for_test());
     let (_, view) = app.active_native_view(wid).unwrap();
@@ -660,9 +663,10 @@ mod exact_card_open {
         OPENED.with(|opened| opened.borrow_mut().clear());
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 90;
         window.cols = 160;
+        drop(window);
         assert!(app.open_system_state_tab());
         let (_, view) = app.active_native_view(wid).unwrap();
         app.set_system_state_handlers_for_test(
@@ -815,9 +819,10 @@ fn assert_deferred_setup_start(current: crate::SetupStatus, should_start: bool) 
     APPLIED.with(|applied| applied.set(0));
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     let (_, view) = app.active_native_view(wid).unwrap();
     app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
@@ -919,9 +924,10 @@ fn failed_rows_publish_no_press_and_aterm_alone_runs_the_plan_again_once() {
     use crate::system_state::SystemStateAction;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.set_system_state_handlers_for_test(
         crate::system_state_host::InitialSetupHandlers::inert_for_test(),
@@ -1001,7 +1007,7 @@ fn a_live_tree_is_the_presented_tree_while_the_model_stands_still() {
             app.backend.set_pad((12.0 * scale).round() as usize);
             app.seed_headless_boot_metrics();
             {
-                let window = app.windows.get_mut(&wid).unwrap();
+                let mut window = app.windows.get_mut(&wid).unwrap();
                 window.cols = 140;
                 window.rows = 48;
                 window.scale = scale;
@@ -1029,6 +1035,7 @@ fn a_live_tree_is_the_presented_tree_while_the_model_stands_still() {
                     assert!(
                         app.windows
                             .get_mut(&wid)
+                            .as_deref_mut()
                             .and_then(|ws| ws.tab_set.active_mut())
                             .is_some_and(|tab| tab.set_focus(view))
                     );
@@ -1067,7 +1074,7 @@ fn framed_tree(app: &mut App, wid: WindowId) -> aterm_a11y::model::TreeUpdate {
     } else {
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
     }
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     for leaf in &plan.leaves {
         if let Some(raster) = window
             .leaf_render_cache
@@ -1077,6 +1084,7 @@ fn framed_tree(app: &mut App, wid: WindowId) -> aterm_a11y::model::TreeUpdate {
             raster.presented = true;
         }
     }
+    drop(window);
     app.take_native_accessibility_update(wid)
         .expect("a native tree")
         .expect("the frame's tree")
@@ -1102,7 +1110,7 @@ fn a_live_tree_is_the_next_frame_when_the_layout_moves_under_it() {
             app.backend.set_pad((12.0 * scale).round() as usize);
             app.seed_headless_boot_metrics();
             {
-                let window = app.windows.get_mut(&wid).unwrap();
+                let mut window = app.windows.get_mut(&wid).unwrap();
                 window.cols = 140;
                 window.rows = 48;
                 window.scale = scale;
@@ -1116,6 +1124,7 @@ fn a_live_tree_is_the_next_frame_when_the_layout_moves_under_it() {
                     assert!(
                         app.windows
                             .get_mut(&wid)
+                            .as_deref_mut()
                             .and_then(|ws| ws.tab_set.active_mut())
                             .is_some_and(|tab| tab.set_focus(view))
                     );
@@ -1552,9 +1561,10 @@ fn a_tab_switch_in_a_window_that_cannot_present_reads_its_terminal() {
     crate::term_lock(&app.pool.get(second).unwrap().term).process(b"text of the second tab");
     app.switch_tab_in(wid, 0);
     app.redraw_window(wid);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.a11y_active = true;
     window.bootstrap_present_retry_available = false;
+    drop(window);
     app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
     assert!(app.windows[&wid].present_retry.parked, "CONTROL");
     app.windows.get_mut(&wid).unwrap().a11y_sent.clear();
@@ -1582,9 +1592,10 @@ fn parked_terminal() -> (App, WindowId) {
 
 fn park(app: &mut App, wid: WindowId) {
     app.redraw_window(wid);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.a11y_active = true;
     window.bootstrap_present_retry_available = false;
+    drop(window);
     app.push_a11y_tree(wid);
     app.rearm_dropped_present(wid, crate::metrics::PresentDropReason::GpuOccluded);
     assert!(app.windows[&wid].present_retry.parked, "CONTROL");
@@ -1659,10 +1670,11 @@ fn a_window_that_presents_again_owes_no_parked_tell() {
     crate::scripted_redraw_fixture::feed(&app, b" first");
     let at = app.windows[&wid].a11y_parked_next.unwrap();
     app.publish_in_a_parked_window(wid, at - PARKED_TELL_PACE / 2);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     assert!(window.a11y_parked_due.is_some(), "CONTROL");
     window.present_retry.parked = false;
 
+    drop(window);
     app.serve_parked_tells(at);
 
     assert!(app.windows[&wid].a11y_sent.is_empty());
@@ -1757,8 +1769,10 @@ fn a_session_field_in_a_parked_window_reaches_its_client_as_it_changes() {
     let sent = asked_at_the_pace(&mut app, wid);
     assert_eq!(sent.len(), 1, "it opened");
 
-    let edit = app.windows.get_mut(&wid).unwrap().rename_edit.as_mut();
-    edit.unwrap().text = "build".to_owned();
+    {
+        let mut window = app.windows.get_mut(&wid).unwrap();
+        window.routing.rename_mut().unwrap().text = "build".to_owned();
+    }
     let sent = asked_at_the_pace(&mut app, wid);
     assert_eq!(sent.len(), 1, "it changed");
     let field = aterm_a11y::model::Role::TextInput;
@@ -1771,7 +1785,11 @@ fn a_find_field_in_a_parked_window_reaches_its_client() {
     let (mut app, wid) = parked_terminal();
     let mut search = crate::app_search::SearchState::default();
     search.query = "ab".to_owned();
-    app.windows.get_mut(&wid).unwrap().search = Some(search);
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .routing
+        .set_search(Some(search));
 
     assert_eq!(asked_at_the_pace(&mut app, wid).len(), 1);
 }
@@ -1875,7 +1893,7 @@ fn mixed_tab_behind_a_terminal_tab() -> (App, WindowId, usize) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 120;
         window.rows = 42;
     }
@@ -2012,6 +2030,7 @@ fn a_focus_move_keeps_the_pane() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.tab_set.active_mut())
             .is_some_and(|tab| tab.set_focus(native))
     );
@@ -2035,7 +2054,7 @@ fn a_publish_compiles_only_the_pane_that_owes_a_paint() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 140;
         window.rows = 48;
     }
@@ -2210,9 +2229,10 @@ fn queued_accessibility_choice_cannot_answer_a_replacement_setup_offer() {
     for (by_offer, republish) in [(true, false), (true, true), (false, false), (false, true)] {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 90;
         window.cols = 160;
+        drop(window);
         assert!(app.open_system_state_tab());
         app.set_system_state_handlers_for_test(crate::system_state_host::InitialSetupHandlers {
             apply: |plan, _, _, receipt| {
@@ -2315,9 +2335,10 @@ fn a_check_intent_retires_a_queued_accessibility_choice_before_it_can_run() {
     }
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     app.publish_system_state(crate::SetupStatus {
         plan: Some(aterm_types::macos_setup::Plan::default()),
@@ -2598,7 +2619,7 @@ fn platform_focus_routes_to_exact_live_view_and_rejects_stale_generation() {
 fn platform_click_dispatches_the_published_key_action_pair() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 140;
         window.rows = 50;
     }
@@ -2658,7 +2679,7 @@ fn assert_native_sibling_geometry(scale: f64, axis: crate::tab_model::SplitAxis)
     app.backend.set_pad((12.0 * scale).round() as usize);
     app.seed_headless_boot_metrics();
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.cols = 140;
         window.rows = 48;
         window.scale = scale;
@@ -2842,7 +2863,7 @@ fn retained_pointer_hit_is_view_exact_and_rejects_staged_stale_or_torn_artifacts
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         {
-            let window = app.windows.get_mut(&wid).unwrap();
+            let mut window = app.windows.get_mut(&wid).unwrap();
             window.cols = 140;
             window.rows = 48;
             window.scale = scale;
@@ -2957,10 +2978,8 @@ fn retained_pointer_hit_is_view_exact_and_rejects_staged_stale_or_torn_artifacts
         );
         let card_width = app.windows[&wid].settings_card.as_ref().unwrap().pw;
         {
-            let raster = app
-                .windows
-                .get_mut(&wid)
-                .unwrap()
+            let mut window_guard = app.windows.get_mut(&wid).unwrap();
+            let raster = window_guard
                 .leaf_render_cache
                 .get_mut(&first)
                 .unwrap()
@@ -2989,6 +3008,7 @@ fn retained_native_pointer_and_accessibility_survive_a_signed_surface_crop() {
     assert!(app.prepare_native_input_scratch(wid));
     app.windows
         .get_mut(&wid)
+        .as_deref_mut()
         .and_then(|window| window.leaf_render_cache.get_mut(&view))
         .and_then(|cache| cache.native.as_mut())
         .expect("retained native raster")
@@ -3041,7 +3061,7 @@ fn retained_native_pointer_and_accessibility_survive_a_signed_surface_crop() {
 fn terminal_focus_keeps_visible_native_sibling_in_the_composite_tree() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 120;
         window.rows = 42;
     }
@@ -3111,7 +3131,7 @@ fn terminal_focus_keeps_visible_native_sibling_in_the_composite_tree() {
 fn a_mixed_tab_s_native_focus_keeps_its_terminal_sibling_readable() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 120;
         window.rows = 42;
     }
@@ -3123,6 +3143,7 @@ fn a_mixed_tab_s_native_focus_keeps_its_terminal_sibling_readable() {
     assert!(
         app.windows
             .get_mut(&wid)
+            .as_deref_mut()
             .and_then(|ws| ws.tab_set.active_mut())
             .is_some_and(|tab| tab.set_focus(native_view)),
         "the native leaf is live"
@@ -3170,7 +3191,7 @@ fn a_mixed_tab_s_terminal_text_moves_with_its_native_sibling_in_a_centred_frame(
 
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 120;
         window.rows = 42;
     }

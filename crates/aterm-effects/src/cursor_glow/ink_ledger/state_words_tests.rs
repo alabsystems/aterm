@@ -37,6 +37,7 @@ fn a_hashed_ink_ledger_field_moves_the_ledger_words() {
         x1: 15.0,
         y1: 28.0,
         share: 0.5,
+        hard: false,
     });
     let mut noted = InkLedger::EMPTY;
     noted.note_rail(2, 5);

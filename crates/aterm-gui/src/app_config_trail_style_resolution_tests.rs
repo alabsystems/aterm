@@ -172,8 +172,11 @@ fn the_one_rainbow_theme_draws_its_band() {
 
 #[test]
 fn immutable_catalog_caches_the_complete_trail_presentation() {
+    // The cat named: a config that names no pet keeps none where decorative effects are off
+    // by default (Windows, `default_cursor_pet`).
     let config = Config {
         cursor_trail_style: Some("rainbow".to_string()),
+        cursor_pet: Some("cat".to_string()),
         ..Config::default()
     };
     let catalog = config.resolve_trail_style_cache();

@@ -946,9 +946,13 @@ MENTAL MODEL
     install) is observed (`supervisor_act=observe`). `aterm drive` runs that supervisor's
     readers and tape tools from a terminal. Vendor `codex` reports through
     `status program_state=` and has no reader here; `codex-alab` supervises itself.
-    Driving a session is `aterm ctl` (`aterm ctl help`): `aterm ctl @self spawn
-    agent=claude -` starts a worker, `aterm ctl await task @<sid>,… since=0` waits
-    for it, `aterm ctl @<sid> result` reads its report; `turn`, `text`, `image` and
+    Prefer your harness's native subagents for same-machine delegation and its own
+    shell/background tools for commands and scripts. If native subagents are
+    unavailable, do routine work directly. A separate aterm session needs an explicit
+    request or a concrete need native tools cannot meet, such as another machine or
+    a persistent interactive terminal. State that reason before spawning.
+    `aterm help workers` explains the workflow for separate sessions.
+    Driving an existing session is `aterm ctl` (`aterm ctl help`): `turn`, `text`, `image` and
     `await agent idle,prompt,question,wall` drive and watch a Claude Code, agy or
     Muse Code session; for a codex (whose `agent=` stays `unknown`),
     `await log kind=program since=<log_seq> ep=<log_ep> base=<log_base>`, all three read
@@ -1125,10 +1129,10 @@ ERRORS
 
 EXAMPLES
     aterm drive classify 'git status --short && git pull | tail'
-    aterm drive phase @s-1e918c46
-    aterm ctl @s-1e918c46 meta set questions ask
-    aterm drive answer @s-1e918c46 'Use the existing schema'
-    aterm drive ledger @s-1e918c46 --format html --out /tmp/ledger.html";
+    aterm drive phase @tqn5r6e0148
+    aterm ctl @tqn5r6e0148 meta set questions ask
+    aterm drive answer @tqn5r6e0148 'Use the existing schema'
+    aterm drive ledger @tqn5r6e0148 --format html --out /tmp/ledger.html";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

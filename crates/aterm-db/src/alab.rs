@@ -11,6 +11,8 @@
 //! - [`seeds`]: the provider, CLI and plan rows every build compiles in, written only into
 //!   cells a complete scan found absent.
 //! - [`Registry`] (Unix): declare, read, seed and publish the registry's schema rows.
+//! - [`history`] (Unix): what a roll carries of a retired generation's history, a secret's
+//!   value withheld, and what a Mac's release of that generation waits for.
 //! - [`import`] (Unix): the owner's account sheets and the Macs this Mac knows of, planned as
 //!   three-way registry writes; [`command`] runs `aterm db alab import|check|adopt`, and
 //!   [`checks`] holds the lab's own rules.
@@ -27,6 +29,8 @@
 //!   preferring an account and where an address's codes arrive, projected once and cached.
 //! - [`discover`]: what a Mac records of a Proton mailbox's address list while the mailbox is open
 //!   to read a sign-in code.
+//! - [`sighted`]: where and when each account was sighted, one fold of every Mac's `account-obs`
+//!   rows and the journal's `seen` events for every reader that says so.
 //! - [`export`]: the files older Macs still read, generated from the registry and the journal's
 //!   place rows by the owner's one admin writer, and `check`'s drift of them.
 
@@ -36,6 +40,8 @@ pub mod command;
 pub mod discover;
 #[cfg(unix)]
 pub mod export;
+#[cfg(unix)]
+pub mod history;
 #[cfg(unix)]
 pub mod import;
 #[cfg(unix)]
@@ -49,6 +55,7 @@ pub mod registry;
 pub mod roll;
 pub mod secret;
 pub mod seeds;
+pub mod sighted;
 #[cfg(unix)]
 pub(super) mod store;
 #[cfg(unix)]

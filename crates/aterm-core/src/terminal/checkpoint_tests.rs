@@ -927,9 +927,10 @@ fn a_carried_synchronized_update_window_still_times_out() {
 
 /// A CODEX AT A BOX STAYS AT IT ACROSS A HANDOFF: the program's own report standing (OSC
 /// 7501) is carried, through the carry's meta too, and the adopting engine holds the same
-/// report, which begins no turn and keeps no turn edges; codex's re-send of it is the same
-/// box (where it began is kept). CONTROL: an engine with no report carries none, and the
-/// live engine drew one turn.
+/// report, which begins no turn and carries no turn edges, keeping the turn it installed
+/// running as one resumed at the restore; codex's re-send of it is the same box (where it
+/// began is kept). CONTROL: an engine with no report carries none, and the live engine drew
+/// one turn.
 #[test]
 fn the_programs_own_report_is_carried() {
     let mut t = Terminal::new(4, 20);
@@ -956,8 +957,14 @@ fn the_programs_own_report_is_carried() {
         let report = restored.program_state();
         assert_eq!(report.state, t.program_state().state, "{at}");
         assert_eq!(report.turns, 0, "{at}: a carried report begins no turn");
-        assert_eq!(t.program_state().turn_edges().count(), 1, "CONTROL");
-        assert_eq!(report.turn_edges().count(), 0, "{at}: and carries no edge");
+        assert_eq!(t.program_turns().iter().count(), 1, "CONTROL");
+        let kept: Vec<_> = restored.program_turns().iter().collect();
+        assert!(
+            matches!(kept.as_slice(), [turn] if turn.resumed && turn.ended.is_none()
+                && turn.began.is_some_and(|b| b.seq == report.seq && b.wall_ms.is_none())),
+            "{at}: it carries no edge, and keeps the turn it installed running as resumed: \
+             {kept:?}"
+        );
         restored.process(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
         assert_eq!(
             restored.program_state().began,
@@ -1054,6 +1061,7 @@ fn a_restored_output_state_goes_through_the_engines_own_doors() {
             },
         ],
         program_state: Some("state=blocked:app=codex:kind=coffee".into()),
+        other_program_state: Some("state=idle:app=Kimi".into()),
     };
     let mut restored = Terminal::new(4, 20);
     restored.process(b"Y\x1b]8;;https://example.com\x07\x1b[#{\x1b[?25s");
@@ -1095,6 +1103,7 @@ fn a_restored_output_state_goes_through_the_engines_own_doors() {
     cp.output_state.sgr_stack = (0..depth).map(|n| pushed(n, 0x21)).collect();
     cp.output_state.saved_modes.truncate(1);
     cp.output_state.program_state = Some("state=blocked:app=codex:kind=question".into());
+    cp.output_state.other_program_state = Some("state=idle:app=kimi-code".into());
     restored.restore_checkpoint(&cp);
     assert_eq!(
         restored.program_state().began,

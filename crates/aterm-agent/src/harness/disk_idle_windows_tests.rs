@@ -204,13 +204,19 @@ fn clause_4b_places_the_kernels_spelling_on_its_candidate() {
     let (repo, target) = checkout(&tmp);
     let table = aterm_sysprobe::volumes::table();
     let at = |path: PathBuf| {
-        move |_: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
+        let table = &table;
+        move |dirs: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> {
             Ok(PathScan {
-                users: vec![PathUse {
-                    pid: 42,
-                    how: "cwd",
-                    path: path.clone(),
-                }],
+                users: dirs
+                    .iter()
+                    .any(|dir| under(&path, dir, Some(table)) != Some(false))
+                    .then(|| PathUse {
+                        pid: 42,
+                        how: "cwd",
+                        path: path.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
                 ..PathScan::default()
             })
         }

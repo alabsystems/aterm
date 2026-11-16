@@ -31,6 +31,10 @@ pub(super) fn successful_producer(world: &Path, seat: &Seat<'_>) {
     // A wrong typed lookup must retain the same native capability and original
     // producer. There is no fallback to a pathname or deserialized lifecycle row.
     completed = completed.try_into_retained::<String>().unwrap_err();
+    completed = completed
+        .try_into_materialization()
+        .err()
+        .expect("a different original resource cannot become a materialization completion");
     assert!(
         std::fs::read_to_string(world.join("returning-producer/.input-owner"))
             .unwrap()

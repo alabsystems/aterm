@@ -63,7 +63,7 @@ fn drag_to_1x(app: &mut App, at: Instant) {
             (ws.rows, ws.cols)
         };
         let px = app.window_frame_px_for(wid, rows, cols);
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         let (from, m) = (ws.scale, ws.metrics);
         let size = crate::app_window::font_size_of_device_px(m.font_px, from);
         let device = |px: usize| crate::logical_to_device_px(px as f32 / from as f32, 1.0);
@@ -78,6 +78,7 @@ fn drag_to_1x(app: &mut App, at: Instant) {
             (f64::from(px.width) / from).round() as u32,
             (f64::from(px.height) / from).round() as u32,
         );
+        drop(ws);
         let _ = app.resize_window_to_px(wid, half);
     });
 }

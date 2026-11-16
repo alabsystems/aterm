@@ -2434,7 +2434,7 @@ fn a_busy_service_publisher_cannot_stall_the_network_ui_reader() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn a_busy_composition_reader_returns_no_sample_instead_of_startup_state() {
+fn a_busy_composition_reader_retains_and_expires_the_original_publications() {
     use aterm_types::network_state::{
         HistoryState, NetworkObservation, ServiceAvailability, ServiceStates, Visibility,
     };
@@ -2497,31 +2497,40 @@ fn a_busy_composition_reader_returns_no_sample_instead_of_startup_state() {
     entering.recv_timeout(Duration::from_secs(60)).unwrap();
     let foreground = read.clone();
     let (finished, result) = mpsc::channel();
-    let foreground = std::thread::spawn(move || {
+    let foreground_task = std::thread::spawn(move || {
         finished
             .send(foreground(aterm_gui::NetworkRead::WithServices))
             .unwrap()
     });
     let busy = result.recv_timeout(Duration::from_secs(60));
+    // The sampler is still paused. A wall-clock rollback that stays after the
+    // sample must not extend either producer's original monotonic lifetime.
+    *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(100_001));
+    let foreground = read.clone();
+    let (finished, result) = mpsc::channel();
+    let expiring = std::thread::spawn(move || {
+        finished
+            .send(foreground(aterm_gui::NetworkRead::WithServices))
+            .unwrap()
+    });
+    let expired = result.recv_timeout(Duration::from_secs(60));
     resume.send(()).unwrap();
     let resumed = background.join().unwrap().unwrap();
-    foreground.join().unwrap();
-    // The old WouldBlock => startup fallback policy returns Some here, erasing
-    // an already observed history and failed-refresh warning at the consumer.
-    assert!(
-        busy.expect("the composition reader must not block drawing")
-            .is_none()
+    foreground_task.join().unwrap();
+    expiring.join().unwrap();
+    let busy = busy
+        .expect("the composition reader must not block drawing")
+        .expect("a busy sampler retains its last publication");
+    assert!(Arc::ptr_eq(&first, &busy));
+    assert_eq!(busy.network.visibility, Visibility::Active);
+    assert_eq!(
+        busy.services.secrets.availability,
+        ServiceAvailability::Cached
     );
-    assert!(Arc::ptr_eq(&first, &resumed));
-    assert!(Arc::ptr_eq(
-        &first,
-        &read(aterm_gui::NetworkRead::WithServices).unwrap()
-    ));
-
-    // Recovery still uses the producer's original monotonic sample: even a
-    // wall-clock rollback that remains after observed_at cannot extend it.
-    *clock.lock().unwrap() = (at + Duration::from_secs(61), Some(100_001));
-    let expired = read(aterm_gui::NetworkRead::WithServices).unwrap();
+    assert!(busy.services.secrets.refresh_failed);
+    let expired = expired
+        .expect("expiry must not wait for the sampler")
+        .expect("expired evidence retains its history");
     assert_eq!(expired.network.visibility, Visibility::Unavailable);
     assert_eq!(expired.network.history, HistoryState::Ready);
     assert_eq!(expired.network.observed_at_ms, 100_000);
@@ -2536,6 +2545,11 @@ fn a_busy_composition_reader_returns_no_sample_instead_of_startup_state() {
     );
     assert!(expired.services.secrets.refresh_failed);
     assert!(expired.revision > first.revision);
+    assert!(Arc::ptr_eq(&expired, &resumed));
+    assert!(Arc::ptr_eq(
+        &expired,
+        &read(aterm_gui::NetworkRead::WithServices).unwrap()
+    ));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

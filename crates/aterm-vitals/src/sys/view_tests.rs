@@ -83,8 +83,8 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
             cached: 8 << 30,
             free: 9 << 30,
             available: 12 << 30,
-            swap_used: 1 << 30,
-            swap_total: 2 << 30,
+            swap_used: Some(1 << 30),
+            swap_total: Some(2 << 30),
             pressure: Pressure::Normal,
             counters: Some(MemCounters {
                 swapin_bytes: k * 2_000_000,
@@ -135,6 +135,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
         load: Some([2.5, 2.0, 1.5]),
         links: Some(vec![
             LinkSample {
+                byte_counter: crate::net_counter::ByteCounter::Cumulative64,
                 name: "en0".into(),
                 kind: LinkKind::Wifi,
                 up: true,
@@ -151,6 +152,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
                 ..LinkSample::default()
             },
             LinkSample {
+                byte_counter: crate::net_counter::ByteCounter::Cumulative64,
                 name: "lo0".into(),
                 kind: LinkKind::Other,
                 up: true,
@@ -516,6 +518,7 @@ struct World {
     volume: VolumeFacts,
     roots: Vec<Root>,
     disk: Option<crate::sys::DiskTotals>,
+    stores: Vec<crate::sys::StoreFact>,
     events: Vec<Event>,
 }
 
@@ -561,6 +564,7 @@ fn world() -> World {
             ..Root::default()
         }],
         disk: None,
+        stores: Vec::new(),
         events: vec![Event {
             seq: 2,
             at_ns: 11_000_000_000,
@@ -591,10 +595,12 @@ fn ctx<'a>(w: &'a World, s: Option<&'a Snapshot>, owner: bool, own_tab: bool) ->
         volume: Some(&w.volume),
         roots: &w.roots,
         disk: w.disk.as_ref(),
+        stores: &w.stores,
         home: Some("/Users//a"),
         events: &w.events,
         gap: None,
         head_seq: 0,
+        held: None,
     }
 }
 
@@ -1253,6 +1259,111 @@ fn overlapping_or_unread_vm_classes_do_not_claim_an_exact_partition() {
 }
 
 #[test]
+fn physical_memory_sys_keeps_the_shared_classes_and_platform_proof() {
+    let mut s = snapshot();
+    s.mem.as_mut().unwrap().sample = MemSample {
+        total: 32 << 30,
+        app: 12 << 30,
+        wired: 4 << 30,
+        compressed: Some(2 << 30),
+        cached: 8 << 30,
+        free: 4 << 30,
+        exact: true,
+        ..MemSample::default()
+    };
+    for (family, platform) in [
+        ("macOS", Some(words::Platform::MacOs)),
+        ("Linux", Some(words::Platform::Linux)),
+        ("Windows", Some(words::Platform::Windows)),
+        ("unknown", None),
+    ] {
+        let mut w = world();
+        w.machine.family = family;
+        let c = ctx(&w, Some(&s), true, true);
+        let exact = exact_partition(&c);
+        assert_eq!(exact, family == "macOS");
+        let m = s.mem.as_ref().unwrap();
+        let projected = m.sample.physical_classes(platform);
+        let classes = mem_classes(m, exact);
+        assert_eq!(
+            classes.map(|(_, bytes)| bytes),
+            projected.classes.map(|c| c.bytes)
+        );
+        assert_eq!(classes[5].1, Some(2 << 30));
+        assert_eq!(classes[5].0, if exact { "not_in_vm" } else { "unnamed" });
+        let json = render_json(&query(View::Mem, true), &c);
+        assert_eq!(
+            json.get("partition"),
+            Some(&Jv::s(if exact { "exact" } else { "remainder" }))
+        );
+        assert_eq!(json.get("class_overflow_bytes"), Some(&Jv::Int(0)));
+        assert_eq!(
+            json.get("classes"),
+            Some(&classes_json(m, exact, class_why(&c)))
+        );
+    }
+}
+
+#[test]
+fn physical_memory_sys_preserves_unknown_compressed_bytes() {
+    let mut s = snapshot();
+    s.mem.as_mut().unwrap().sample.compressed = None;
+    let mut w = world();
+    w.machine.family = "Linux";
+    let c = ctx(&w, Some(&s), true, true);
+    let json = render_json(&query(View::Mem, true), &c);
+    let Some(Jv::Arr(classes)) = json.get("classes") else {
+        panic!("the physical classes must remain available");
+    };
+    assert_eq!(classes.len(), 6);
+    assert_eq!(classes[2].get("bytes"), Some(&Jv::why("not_enabled:zswap")));
+    assert_eq!(classes[5].get("class"), Some(&Jv::s("unnamed")));
+    assert_eq!(classes[5].get("bytes"), Some(&Jv::u(2 << 30)));
+    assert_eq!(json.get("partition"), Some(&Jv::s("remainder")));
+}
+
+#[test]
+fn physical_memory_sys_detects_zero_capacity_and_unsaturated_excess() {
+    let mut s = snapshot();
+    let w = world();
+    s.mem.as_mut().unwrap().sample = MemSample {
+        total: u64::MAX,
+        app: u64::MAX,
+        wired: 1,
+        compressed: Some(0),
+        exact: true,
+        ..MemSample::default()
+    };
+    let c = ctx(&w, Some(&s), true, true);
+    assert!(!exact_partition(&c));
+    let json = render_json(&query(View::Mem, true), &c);
+    assert_eq!(json.get("class_overflow_bytes"), Some(&Jv::Int(1)));
+
+    let m = &mut s.mem.as_mut().unwrap().sample;
+    m.wired = u64::MAX;
+    m.compressed = Some(u64::MAX);
+    m.cached = u64::MAX;
+    m.free = u64::MAX;
+    let json = render_json(&query(View::Mem, true), &ctx(&w, Some(&s), true, true));
+    assert_eq!(
+        json.get("class_overflow_bytes"),
+        Some(&Jv::at_least(i64::MAX.unsigned_abs(), "integer_range"))
+    );
+    assert!(contract_violations(&json).is_empty());
+
+    s.mem.as_mut().unwrap().sample = MemSample {
+        compressed: Some(0),
+        exact: true,
+        ..MemSample::default()
+    };
+    let c = ctx(&w, Some(&s), true, true);
+    assert!(!exact_partition(&c));
+    let json = render_json(&query(View::Mem, true), &c);
+    assert_eq!(json.get("partition"), Some(&Jv::s("remainder")));
+    assert_eq!(json.get("class_overflow_bytes"), Some(&Jv::Int(0)));
+}
+
+#[test]
 fn no_foreign_text_and_paths_only_for_the_callers_own_tab() {
     let s = snapshot();
     let w = world();
@@ -1437,6 +1548,84 @@ fn procs_rows_carry_labels_states_and_base_units() {
     q.top = 1;
     let r = render_text(&q, &c);
     assert!(all_text(&r).contains("more=2 rows"), "{}", all_text(&r));
+}
+
+#[test]
+fn modulo_network_diagnostics_name_raw_counter_provenance_and_the_unknown_rate() {
+    use crate::net_counter::{ByteCounter, DeltaError};
+    let mut s = snapshot();
+    let net = s.net.as_mut().expect("fixture network");
+    net.rates = None;
+    net.rates_why = Some(DeltaError::AmbiguousWrap);
+    net.links[0].sample.byte_counter = ByteCounter::DarwinModulo32;
+    net.links[0].sample.rx = 4096;
+    net.links[0].rates = None;
+    net.links[0].rates_why = Some(DeltaError::AmbiguousWrap);
+    let w = world();
+    let c = ctx(&w, Some(&s), true, true);
+    let text = all_text(&render_text(&query(View::Net, false), &c));
+    assert!(
+        text.contains("unavailable(counter_wrap_ambiguous)"),
+        "{text}"
+    );
+    assert!(text.contains("rx_bytes=4096") && text.contains("byte_counter=darwin_iflist2_modulo32 byte_counter_bits=32 byte_counter_quantum_bytes=1024"), "{text}");
+    let j = render_json(&query(View::Net, true), &c);
+    assert!(contract_violations(&j).is_empty(), "{j:?}");
+    assert!(j.to_text().contains("counter_wrap_ambiguous"));
+    assert_eq!(
+        global_json(&s).get("net_rx_bytes_per_s"),
+        Some(&Jv::why("counter_wrap_ambiguous"))
+    );
+}
+
+#[test]
+fn unknown_swap_is_not_zero_in_memory_global_and_explanation_views() {
+    let mut s = snapshot();
+    let used = s.mem.as_ref().unwrap().sample.used();
+    let w = world();
+    for (measurement, total, expected, expected_total, words) in [
+        (
+            None,
+            None,
+            Jv::why("not_read"),
+            Jv::why("not_read"),
+            "swap unknown",
+        ),
+        (
+            None,
+            Some(1 << 30),
+            Jv::why("not_read"),
+            Jv::u(1 << 30),
+            "swap unknown",
+        ),
+        (Some(0), Some(0), Jv::u(0), Jv::u(0), "swap 0"),
+    ] {
+        let memory = &mut s.mem.as_mut().unwrap().sample;
+        memory.swap_used = measurement;
+        memory.swap_total = total;
+        let c = ctx(&w, Some(&s), true, true);
+        assert_eq!(global_json(&s).get("swap_used_bytes"), Some(&expected));
+        let json = render_json(&query(View::Mem, true), &c);
+        assert!(contract_violations(&json).is_empty(), "{json:?}");
+        let swap = json.get("swap").expect("mem JSON fields are top-level");
+        assert_eq!(swap.get("used_bytes"), Some(&expected));
+        assert_eq!(swap.get("total_bytes"), Some(&expected_total));
+        let text = all_text(&render_text(&query(View::Mem, false), &c));
+        if measurement.is_none() {
+            assert!(
+                text.contains("swap unavailable(not_read) used of"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains("swap 0 KiB used of 0 KiB"), "{text}");
+        }
+        if total == Some(1 << 30) {
+            assert!(text.contains("used of 1.0 GiB"), "{text}");
+        }
+        assert!(all_text(&render_text(&query(View::Overview, false), &c)).contains(words));
+        assert!(all_text(&render_text(&query(View::Why, false), &c)).contains(words));
+        assert_eq!(s.mem.as_ref().unwrap().sample.used(), used);
+    }
 }
 
 /// A process's wait, peak and write rate say why each is unread on its OS: Windows samples no
@@ -2955,7 +3144,7 @@ fn sys_net_reports_links_rates_and_tcp_connections_in_both_shapes() {
         "{text}"
     );
     assert!(
-        text.contains("link name=en0 kind=wifi up=1 loopback=0 counted=1 primary=1 rx_bps=2000000 tx_bps=500000 rx_pps=1500 tx_pps=400 rx_err_ps=0 tx_err_ps=0 rx_drop_ps=2 tx_drop_ps=unavailable(unsupported) rx_bytes=2000000 tx_bytes=500000 rx_packets=1500 tx_packets=400 rx_errors=0 tx_errors=0 rx_drops=2 tx_drops=unavailable(unsupported) link_bps=1000000000"),
+        text.contains("link name=en0 kind=wifi up=1 loopback=0 counted=1 primary=1 rx_bps=2000000 tx_bps=500000 rx_pps=1500 tx_pps=400 rx_err_ps=0 tx_err_ps=0 rx_drop_ps=2 tx_drop_ps=unavailable(unsupported) rx_bytes=2000000 tx_bytes=500000 byte_counter=cumulative64 byte_counter_bits=64 byte_counter_quantum_bytes=1 rx_packets=1500 tx_packets=400 rx_errors=0 tx_errors=0 rx_drops=2 tx_drops=unavailable(unsupported) link_bps=1000000000"),
         "{text}"
     );
     assert!(
@@ -3978,4 +4167,810 @@ fn sys_disk_prints_the_budget_record_in_text_and_json() {
         .map(|l| l.text.as_str())
         .collect();
     assert_eq!(lines, ["budget unavailable(not_sampled)"]);
+}
+
+/// The value at `path` (keys joined by `.`) of `j`.
+fn at<'a>(j: &'a Jv, path: &str) -> &'a Jv {
+    path.split('.').fold(j, |v, key| {
+        v.get(key)
+            .unwrap_or_else(|| panic!("no `{key}` of `{path}` in {}", j.to_text()))
+    })
+}
+
+/// Whether `j` holds a number or a boolean anywhere: a figure something read.
+fn holds_a_figure(j: &Jv) -> bool {
+    match j {
+        Jv::Int(_) | Jv::Bool(_) => true,
+        Jv::Str(_) => false,
+        Jv::Arr(items) => items.iter().any(holds_a_figure),
+        Jv::Obj(pairs) => pairs.iter().any(|(_, v)| holds_a_figure(v)),
+    }
+}
+
+/// A snapshot holding what N2's readers read on a MacBook Air at pressure Heavy: the heat chain
+/// with a cut Super clock, P10, three zombie piles (one under another app, one under this tab's
+/// cargo, one under another tab's program whose name no `exe=` word takes), two processes in an
+/// uninterruptible wait, the lid, AC with a charging battery, an
+/// external display, one sleep, a hotspot place and the computer's type.
+fn n2_snapshot() -> Snapshot {
+    use crate::blockage::{DStateView, DStuck, ZombiesView};
+    use crate::heat::{
+        Chain, ClockRange, Counters, HeatView, Judged, ThermalPressure, Verdict, Watts,
+    };
+    use crate::model::{PlaceKind, PlaceValue, PlaceView};
+    use crate::runq::{QueueBasis, RunQueue};
+    use crate::situation::{
+        Awake, Battery, Displays, Lid, LidReading, MachineType, Power, PowerSource, Situation,
+        SleepSpan,
+    };
+    let mut s = snapshot();
+    s.heat = HeatView {
+        pressure: Ok(ThermalPressure::Heavy),
+        watts: Watts {
+            cpu: Ok(9.4321),
+            gpu: Ok(1.25),
+            ane: Ok(0.0),
+        },
+        chain: Ok(Chain {
+            window_ns: 1_000_000_000,
+            counters: Counters::default(),
+            range: Ok(ClockRange {
+                p_mhz: (1260.0, 4464.0),
+                e_mhz: (972.0, 3048.0),
+            }),
+            judged: Judged {
+                p_mhz: Some(2512.4),
+                e_mhz: Some(3048.0),
+                ipj: Some(2_345_678_901.4),
+                p_time_share: Some(0.384),
+                p_instruction_share: Some(0.57),
+                cpu_w: 9.4321,
+                gpu_w: 1.25,
+                ..Judged::default()
+            },
+            decile: Some(9),
+            usual_mhz: Some(4113.0),
+            p_verdict: Verdict::Pass,
+            cut: Cut::Cut(4113.0 / 2512.4),
+            e_verdict: Verdict::Fail,
+        }),
+    };
+    s.facts.queue = Some(RunQueue {
+        threads: 12.25,
+        basis: QueueBasis::Runnable,
+    });
+    s.facts.zombies = Zombies::Read(ZombiesView {
+        count: 19,
+        piles: vec![
+            ZombieParent {
+                ppid: 1476,
+                name: "Safari".into(),
+                count: 14,
+                per_min_deci: 36,
+                tab: None,
+            },
+            ZombieParent {
+                ppid: 201,
+                name: "cargo".into(),
+                count: 3,
+                per_min_deci: 30,
+                tab: Some(7),
+            },
+            ZombieParent {
+                ppid: 310,
+                name: EVIL.into(),
+                count: 2,
+                per_min_deci: 10,
+                tab: Some(8),
+            },
+        ],
+        growing: false,
+        whole: true,
+        age_ms: 0,
+    });
+    s.facts.dstate = DState::Read(DStateView {
+        scope: DScope::Own,
+        procs: vec![
+            DStuck {
+                pid: 202,
+                name: EVIL.into(),
+                threads: Some(1),
+                threads_cut: false,
+                held: false,
+            },
+            DStuck {
+                pid: 900,
+                name: "Safari".into(),
+                threads: Some(2),
+                threads_cut: false,
+                held: true,
+            },
+        ],
+        blocked: None,
+        age_ms: 4_000,
+        whole: true,
+        pass: None,
+    });
+    s.situation = Situation {
+        machine: Reading::Read(std::sync::Arc::new(MachineType {
+            name: Some("MacBook Air".into()),
+            family: None,
+            model: Some("MacBook Air (15-inch, M5)".into()),
+            model_id: Some("Mac17,4".into()),
+        })),
+        lid: Reading::Read(LidReading {
+            lid: Lid::Open,
+            changed_ms: None,
+        }),
+        power: Reading::Read(Power {
+            source: PowerSource::Ac,
+            battery: Some(Battery {
+                pct: 53,
+                charging: true,
+            }),
+            adapter_w: Some(70),
+            changed_ms: None,
+        }),
+        displays: Reading::Read(Displays { external: 1 }),
+        awake: Reading::Read(Awake {
+            boot_ms: 1_759_000_000_000,
+            last_sleep: Some(SleepSpan {
+                from_ms: 1_759_990_000_000,
+                to_ms: 1_759_991_000_000,
+                cause: Some("Clamshell Sleep".into()),
+                wake: None,
+            }),
+        }),
+    };
+    s.place = Some(PlaceView {
+        line: "hotspot".into(),
+        fields: vec![
+            ("state", PlaceValue::Text("remote".into())),
+            ("kind", PlaceValue::Text("hotspot".into())),
+            ("since_ms", PlaceValue::Count(42)),
+        ],
+        kind: PlaceKind::Hotspot,
+    });
+    s
+}
+
+/// THE OVERVIEW PRINTS WHAT N2'S READERS READ (A4 §12.1, SD-01): `sys --json` carries the heat
+/// chain, the run queue beside `load_m`, the zombie piles and uninterruptible waits, the
+/// situation with the place beside it, and the computer's type, each figure a whole number in the
+/// unit its key names. A row that names a process outside the target's tab prints only for the
+/// owner class: a scoped caller reads its own tab's pile, the machine's counts and how many rows
+/// were withheld. `sys cores` no longer prints `threads.runnable`, the hard-coded `not_sampled`:
+/// `global.queue` carries the run queue. CONTROLS: the queue on the load average says `load1`; a
+/// sweep that stopped at its cap bounds the zombie count; a Linux sweep's waits are the
+/// machine's, with `procs_blocked` and no thread counts.
+#[test]
+fn the_overview_json_carries_heat_queue_blockage_situation_and_type() {
+    use crate::blockage::{DStateView, DStuck};
+    use crate::runq::{QueueBasis, RunQueue};
+    let w = world();
+    let s = n2_snapshot();
+    let owner = ctx(&w, Some(&s), true, true);
+    let j = render_json(&query(View::Overview, true), &owner);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+
+    assert_eq!(
+        at(&j, "heat"),
+        &Jv::obj([
+            ("pressure", Jv::s("heavy")),
+            ("thermal_state", Jv::s("nominal")),
+            (
+                "clock",
+                Jv::obj([
+                    ("p_mhz", Jv::u(2512)),
+                    ("e_mhz", Jv::u(3048)),
+                    ("e_verdict", Jv::s("fail")),
+                    ("basis", Jv::s("coalition_counters")),
+                    ("p_usual_mhz", Jv::u(4113)),
+                    (
+                        "cut",
+                        Jv::obj([("state", Jv::s("cut")), ("usual_over_clock_m", Jv::u(1637)),]),
+                    ),
+                ]),
+            ),
+            (
+                "watts",
+                Jv::obj([
+                    ("cpu_mw", Jv::u(9432)),
+                    ("gpu_mw", Jv::u(1250)),
+                    ("ane_mw", Jv::u(0)),
+                ]),
+            ),
+            ("ipj", Jv::u(2_345_678_901)),
+            (
+                "p_share",
+                Jv::obj([("time_pm", Jv::u(384)), ("instructions_pm", Jv::u(570))]),
+            ),
+        ]),
+    );
+    assert_eq!(at(&j, "heat.thermal_state"), at(&j, "global.thermal"));
+
+    let queue = Jv::obj([
+        ("threads_m", Jv::u(12_250)),
+        ("basis", Jv::s("runnable_10s")),
+    ]);
+    assert_eq!(at(&j, "global.queue"), &queue);
+    let Some(Jv::Obj(global)) = j.get("global") else {
+        panic!("{}", j.to_text());
+    };
+    let place_of = |key: &str| global.iter().position(|(k, _)| k == key);
+    assert_eq!(
+        place_of("queue"),
+        place_of("load_m").map(|i| i + 1),
+        "the queue stands beside load_m"
+    );
+
+    assert_eq!(
+        at(&j, "procs"),
+        &Jv::obj([
+            (
+                "zombies",
+                Jv::Arr(vec![
+                    Jv::obj([
+                        ("parent", Jv::u(1476)),
+                        ("exe", Jv::s("Safari")),
+                        ("count", Jv::u(14)),
+                        ("per_min_deci", Jv::u(36)),
+                    ]),
+                    Jv::obj([
+                        ("parent", Jv::u(201)),
+                        ("exe", Jv::s("cargo")),
+                        ("count", Jv::u(3)),
+                        ("per_min_deci", Jv::u(30)),
+                        ("local", Jv::u(7)),
+                        ("tab", Jv::u(1)),
+                    ]),
+                    Jv::obj([
+                        ("parent", Jv::u(310)),
+                        ("exe", Jv::s("-")),
+                        ("count", Jv::u(2)),
+                        ("per_min_deci", Jv::u(10)),
+                        ("local", Jv::u(8)),
+                    ]),
+                ]),
+            ),
+            ("zombie_count", Jv::u(19)),
+            ("zombies_age_ms", Jv::u(0)),
+            (
+                "dstate",
+                Jv::Arr(vec![
+                    Jv::obj([
+                        ("pid", Jv::u(900)),
+                        ("exe", Jv::s("Safari")),
+                        ("threads", Jv::u(2)),
+                        ("held", Jv::Bool(true)),
+                    ]),
+                    Jv::obj([
+                        ("pid", Jv::u(202)),
+                        ("exe", Jv::s("-")),
+                        ("threads", Jv::u(1)),
+                        ("held", Jv::Bool(false)),
+                    ]),
+                ]),
+            ),
+            ("dstate_count", Jv::u(2)),
+            ("dstate_held", Jv::u(1)),
+            ("dstate_age_ms", Jv::u(4_000)),
+            ("dstate_scope", Jv::s("own")),
+        ]),
+    );
+
+    assert_eq!(
+        at(&j, "situation"),
+        &Jv::obj([
+            ("lid", Jv::s("open")),
+            (
+                "power",
+                Jv::obj([
+                    ("source", Jv::s("ac")),
+                    ("battery_pct", Jv::u(53)),
+                    ("charging", Jv::Bool(true)),
+                ]),
+            ),
+            ("docked", Jv::Bool(true)),
+            ("awake_since_ms", Jv::Int(1_759_991_000_000)),
+            (
+                "last_sleep",
+                Jv::obj([
+                    ("from_ms", Jv::Int(1_759_990_000_000)),
+                    ("to_ms", Jv::Int(1_759_991_000_000)),
+                    ("cause", Jv::s("Clamshell Sleep")),
+                    ("wake", Jv::why("not_sampled")),
+                ]),
+            ),
+        ]),
+        "the place and Low Power Mode are not copied into it",
+    );
+    // The place stands beside the situation, as the global view's own `place` prints it.
+    let global_view = render_json(&query(View::Global, true), &owner);
+    assert_eq!(at(&j, "place.kind"), &Jv::s("hotspot"));
+    assert_eq!(j.get("place"), global_view.get("place"));
+
+    for view in [&j, &global_view] {
+        assert_eq!(at(view, "machine.type"), &Jv::s("MacBook Air"));
+        assert_eq!(
+            at(view, "machine.model"),
+            &Jv::s("MacBook Air (15-inch, M5)")
+        );
+        assert_eq!(at(view, "machine.model_id"), &Jv::s("Mac17,4"));
+        assert_eq!(at(view, "machine.cpu_name"), &Jv::s("Apple M5"));
+        assert_eq!(at(view, "global.queue"), &queue);
+    }
+    assert!(contract_violations(&global_view).is_empty());
+
+    // `sys cores`: the hard-coded figure is gone, the waits it stood beside stay.
+    let cores = render_json(&query(View::Cores, true), &owner);
+    assert!(at(&cores, "threads").get("runnable").is_none());
+    assert!(at(&cores, "threads").get("wait_mc").is_some());
+    assert!(at(&cores, "threads").get("tab_wait_mc").is_some());
+
+    // A scoped caller: its own tab's pile, the machine's counts, and how many rows it may not
+    // read. No name of a process outside the tab is in the reply.
+    // The rule is the target's tab, whichever tab the caller sits in (its own, then another).
+    for own_tab in [true, false] {
+        let scoped = ctx(&w, Some(&s), false, own_tab);
+        let j = render_json(&query(View::Overview, true), &scoped);
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        assert_eq!(
+            at(&j, "procs.zombies"),
+            &Jv::Arr(vec![Jv::obj([
+                ("parent", Jv::u(201)),
+                ("exe", Jv::s("cargo")),
+                ("count", Jv::u(3)),
+                ("per_min_deci", Jv::u(30)),
+                ("local", Jv::u(7)),
+                ("tab", Jv::u(1)),
+            ])]),
+            "own_tab={own_tab}",
+        );
+        assert_eq!(at(&j, "procs.zombies_withheld"), &Jv::u(2));
+        assert_eq!(at(&j, "procs.zombie_count"), &Jv::u(19));
+        assert_eq!(at(&j, "procs.dstate"), &Jv::Arr(Vec::new()));
+        assert_eq!(at(&j, "procs.dstate_withheld"), &Jv::u(2));
+        assert_eq!(at(&j, "procs.dstate_count"), &Jv::u(2));
+        assert_eq!(at(&j, "procs.dstate_held"), &Jv::u(1));
+        assert!(!j.to_text().contains("Safari"), "{}", j.to_text());
+    }
+
+    // `top=` cuts each list as it cuts every other, largest pile and held wait first, and says
+    // how many rows it left out.
+    let mut one = query(View::Overview, true);
+    one.top = 1;
+    let j = render_json(&one, &owner);
+    let first = |key: &str| match at(&j, key) {
+        Jv::Arr(rows) if rows.len() == 1 => rows[0].clone(),
+        other => panic!("{key}: {other:?}"),
+    };
+    assert_eq!(first("procs.zombies").get("parent"), Some(&Jv::u(1476)));
+    assert_eq!(at(&j, "procs.zombies_more"), &Jv::u(2));
+    assert_eq!(first("procs.dstate").get("pid"), Some(&Jv::u(900)));
+    assert_eq!(at(&j, "procs.dstate_more"), &Jv::u(1));
+    assert_eq!(at(&j, "procs.zombie_count"), &Jv::u(19));
+    assert_eq!(at(&j, "procs.dstate_count"), &Jv::u(2));
+
+    // CONTROL: P10 unread, so the over rule reads the load average and the queue says so.
+    let mut load = s.clone();
+    load.facts.queue = Some(RunQueue {
+        threads: 2.5,
+        basis: QueueBasis::Load1,
+    });
+    let j = render_json(
+        &query(View::Overview, true),
+        &ctx(&w, Some(&load), true, true),
+    );
+    assert_eq!(
+        at(&j, "global.queue"),
+        &Jv::obj([("threads_m", Jv::u(2500)), ("basis", Jv::s("load1"))]),
+    );
+
+    // CONTROL: a sweep that stopped at its cap counts at least these.
+    let mut capped = s.clone();
+    if let Zombies::Read(v) = &mut capped.facts.zombies {
+        v.whole = false;
+        v.age_ms = 2_000;
+    }
+    // CONTROL: Linux's sweep reads every user's process states and no thread counts, and the
+    // same cut sweep leaves its `D` processes a lower bound too.
+    capped.facts.dstate = DState::Read(DStateView {
+        scope: DScope::Machine,
+        procs: vec![DStuck {
+            pid: 900,
+            name: "Safari".into(),
+            threads: None,
+            threads_cut: false,
+            held: true,
+        }],
+        blocked: Some(3),
+        age_ms: 0,
+        whole: false,
+        pass: None,
+    });
+    let j = render_json(
+        &query(View::Overview, true),
+        &ctx(&w, Some(&capped), true, true),
+    );
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    assert_eq!(at(&j, "procs.zombie_count"), &Jv::at_least(19, "truncated"));
+    assert_eq!(at(&j, "procs.zombies_age_ms"), &Jv::u(2_000));
+    assert_eq!(at(&j, "procs.dstate_scope"), &Jv::s("machine"));
+    assert_eq!(at(&j, "procs.dstate_blocked"), &Jv::u(3));
+    assert_eq!(at(&j, "procs.dstate_count"), &Jv::at_least(1, "truncated"));
+    assert_eq!(at(&j, "procs.dstate_held"), &Jv::at_least(1, "truncated"));
+    assert_eq!(
+        at(&j, "procs.dstate"),
+        &Jv::Arr(vec![Jv::obj([
+            ("pid", Jv::u(900)),
+            ("exe", Jv::s("Safari")),
+            ("threads", Jv::why("unsupported")),
+            ("held", Jv::Bool(true)),
+        ])]),
+    );
+    // A `/proc/stat` that gave no `procs_blocked` says so, never 0.
+    if let DState::Read(v) = &mut capped.facts.dstate {
+        v.blocked = None;
+    }
+    let j = render_json(
+        &query(View::Overview, true),
+        &ctx(&w, Some(&capped), true, true),
+    );
+    assert_eq!(at(&j, "procs.dstate_blocked"), &Jv::why("not_sampled"));
+
+    // CONTROL: a census pass that did not read every process it listed (its cover is open, or
+    // took two passes) counts at least what it found; one that was its whole cover is exact,
+    // unless a read of it was cut at a cap, which counts at least too. The open cover, the wider
+    // gap, is the cause named where both hold.
+    for (cover_done, passes_in_cover, whole, bound) in [
+        (false, 0, true, Some("partial_census")),
+        (true, 2, true, Some("partial_census")),
+        (true, 1, true, None),
+        (true, 1, false, Some("truncated")),
+        (true, 2, false, Some("partial_census")),
+    ] {
+        let mut census = s.clone();
+        if let DState::Read(v) = &mut census.facts.dstate {
+            v.whole = whole;
+            v.pass = Some(std::sync::Arc::new(crate::blockage::CensusPass {
+                cover_done,
+                passes_in_cover,
+                ..crate::blockage::CensusPass::default()
+            }));
+        }
+        let j = render_json(
+            &query(View::Overview, true),
+            &ctx(&w, Some(&census), true, true),
+        );
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        let figure = |n| bound.map_or_else(|| Jv::u(n), |cause| Jv::at_least(n, cause));
+        let case = format!("{cover_done} {passes_in_cover} {whole}");
+        assert_eq!(at(&j, "procs.dstate_count"), &figure(2), "{case}");
+        assert_eq!(at(&j, "procs.dstate_held"), &figure(1), "{case}");
+    }
+
+    // A process with more threads than the census reads counts at least the threads read; the
+    // counts of processes stay exact, since it was found. CONTROL: the row beside it is exact.
+    let mut cut = s.clone();
+    if let DState::Read(v) = &mut cut.facts.dstate {
+        v.procs[1].threads = Some(256);
+        v.procs[1].threads_cut = true;
+    }
+    let j = render_json(
+        &query(View::Overview, true),
+        &ctx(&w, Some(&cut), true, true),
+    );
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    let Jv::Arr(rows) = at(&j, "procs.dstate") else {
+        panic!("{}", j.to_text())
+    };
+    let threads: Vec<&Jv> = rows.iter().map(|r| at(r, "threads")).collect();
+    assert_eq!(threads, [&Jv::at_least(256, "truncated"), &Jv::u(1)]);
+    assert_eq!(at(&j, "procs.dstate_count"), &Jv::u(2));
+    assert_eq!(at(&j, "procs.dstate_held"), &Jv::u(1));
+}
+
+/// A VALUE THAT IS NOT A READING PRINTS ITS WORD, NEVER A ZERO (A4 §8, §12.1): every heat,
+/// queue, blockage, situation and type value says `not_sampled` where its reader gave nothing and
+/// `unsupported` where this system has none, with the reader's reason where it names one, and the
+/// reply holds no number or boolean in their place. What a machine lacks is a reading of its own
+/// (`none`), not a word. CONTROL: a reader that read nothing prints 0 and an empty list.
+#[test]
+fn an_unread_heat_or_situation_reading_prints_its_word_never_zero() {
+    use crate::blockage::{DStateView, ZombiesView};
+    use crate::heat::{HeatView, Watts};
+    use crate::model::Unread;
+    use crate::situation::{Awake, Displays, Lid, LidReading, MachineType, Power, PowerSource};
+    let w = world();
+    let overview = |s: &Snapshot| {
+        let j = render_json(&query(View::Overview, true), &ctx(&w, Some(s), true, true));
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        j
+    };
+    let no_figure = |j: &Jv| {
+        for part in ["heat", "procs", "situation", "place", "global.queue"] {
+            assert!(!holds_a_figure(at(j, part)), "{part}: {}", j.to_text());
+        }
+    };
+    let read = n2_snapshot();
+    // CONTROL: the snapshot the readers read holds figures in each of them.
+    for part in ["heat", "procs", "situation", "place", "global.queue"] {
+        assert!(holds_a_figure(at(&overview(&read), part)), "CONTROL {part}");
+    }
+
+    // No reader has answered yet.
+    let mut s = read.clone();
+    s.heat = HeatView::default();
+    s.thermal = None;
+    s.facts.queue = None;
+    s.facts.runnable = Runnable::Unread(Unread::NotSampled);
+    s.facts.zombies = Zombies::default();
+    s.facts.dstate = DState::default();
+    s.situation = crate::situation::Situation::default();
+    s.place = None;
+    let j = overview(&s);
+    no_figure(&j);
+    let unread = || Jv::why("not_sampled");
+    let not_read = || Jv::why("not_sampled:not_read");
+    assert_eq!(
+        at(&j, "heat"),
+        &Jv::obj([
+            ("pressure", not_read()),
+            ("thermal_state", Jv::why("unsupported")),
+            ("clock", not_read()),
+            (
+                "watts",
+                Jv::obj([
+                    ("cpu_mw", not_read()),
+                    ("gpu_mw", not_read()),
+                    ("ane_mw", not_read()),
+                ]),
+            ),
+            ("ipj", not_read()),
+            ("p_share", not_read()),
+        ]),
+    );
+    assert_eq!(at(&j, "global.queue"), &unread());
+    assert_eq!(
+        at(&j, "procs"),
+        &Jv::obj([
+            ("zombies", unread()),
+            ("zombie_count", unread()),
+            ("dstate", unread()),
+            ("dstate_count", unread()),
+            ("dstate_held", unread()),
+            ("dstate_scope", unread()),
+        ]),
+    );
+    assert_eq!(
+        at(&j, "situation"),
+        &Jv::obj([
+            ("lid", unread()),
+            ("power", unread()),
+            ("docked", unread()),
+            ("awake_since_ms", unread()),
+            ("last_sleep", unread()),
+        ]),
+    );
+    assert_eq!(at(&j, "place"), &unread());
+    for key in ["machine.type", "machine.model", "machine.model_id"] {
+        assert_eq!(at(&j, key), &unread(), "{key}");
+    }
+
+    // A system with no reader of them (Windows): each says so, with the reader's reason.
+    let none = |reason| NoHeat::NotSupported(reason);
+    s.heat = HeatView {
+        pressure: Err(none("no_pressure_level")),
+        watts: Watts {
+            ane: Err(none("no_neural_engine")),
+            ..Watts::none(none("no_power_reader"))
+        },
+        chain: Err(none("no_coalitions")),
+    };
+    s.facts.runnable = Runnable::Unread(Unread::Unsupported);
+    s.facts.zombies = Zombies::Unread(Unread::Unsupported);
+    s.facts.dstate = DState::Unread(Unread::Unsupported);
+    s.situation = crate::situation::Situation {
+        machine: Reading::Unsupported,
+        lid: Reading::Unsupported,
+        power: Reading::Unsupported,
+        displays: Reading::Unsupported,
+        awake: Reading::Unsupported,
+    };
+    let j = overview(&s);
+    no_figure(&j);
+    let unsupported = || Jv::why("unsupported");
+    assert_eq!(
+        at(&j, "heat.pressure"),
+        &Jv::why("unsupported:no_pressure_level")
+    );
+    assert_eq!(at(&j, "heat.clock"), &Jv::why("unsupported:no_coalitions"));
+    assert_eq!(at(&j, "heat.ipj"), &Jv::why("unsupported:no_coalitions"));
+    assert_eq!(
+        at(&j, "heat.watts.cpu_mw"),
+        &Jv::why("unsupported:no_power_reader")
+    );
+    assert_eq!(
+        at(&j, "heat.watts.ane_mw"),
+        &Jv::why("unsupported:no_neural_engine")
+    );
+    assert_eq!(at(&j, "global.queue"), &unsupported());
+    for key in [
+        "procs.zombies",
+        "procs.zombie_count",
+        "procs.dstate",
+        "procs.dstate_count",
+        "procs.dstate_held",
+        "procs.dstate_scope",
+        "situation.lid",
+        "situation.power",
+        "situation.docked",
+        "situation.awake_since_ms",
+        "situation.last_sleep",
+        "machine.type",
+        "machine.model",
+        "machine.model_id",
+    ] {
+        assert_eq!(at(&j, key), &unsupported(), "{key}");
+    }
+
+    // A census whose process list the OS refused says refused, never an empty census.
+    s.facts.dstate = DState::Unread(Unread::Refused);
+    // A reason no unavailable word takes is left off: the reply keeps its contract.
+    s.heat.pressure = Err(NoHeat::Unread("no such word!"));
+    let j = overview(&s);
+    no_figure(&j);
+    assert_eq!(at(&j, "procs.dstate"), &Jv::why("refused"));
+    assert_eq!(at(&j, "heat.pressure"), &unread());
+
+    // A chain that read, with values it could not give: each says which.
+    let mut partial = read.clone();
+    let Ok(chain) = partial.heat.chain.as_mut() else {
+        panic!("the fixture's chain");
+    };
+    chain.range = Err(none("no_clock_table"));
+    chain.judged = crate::heat::Judged::default();
+    chain.decile = None;
+    chain.usual_mhz = None;
+    chain.cut = Cut::Unread;
+    partial.heat.watts.cpu = Ok(f64::NAN);
+    let j = overview(&partial);
+    let too_little = Jv::why("not_sampled:too_little_core_time");
+    for key in ["heat.clock.p_mhz", "heat.clock.e_mhz"] {
+        assert_eq!(at(&j, key), &Jv::why("unsupported:no_clock_table"), "{key}");
+    }
+    assert_eq!(
+        at(&j, "heat.clock.p_usual_mhz"),
+        &Jv::why("not_sampled:no_busy_decile")
+    );
+    assert_eq!(at(&j, "heat.clock.cut"), &unread());
+    assert_eq!(at(&j, "heat.ipj"), &too_little);
+    assert_eq!(at(&j, "heat.p_share.time_pm"), &too_little);
+    assert_eq!(at(&j, "heat.p_share.instructions_pm"), &too_little);
+    assert_eq!(at(&j, "heat.watts.cpu_mw"), &Jv::why("unread_format"));
+    // With a table, an idle window gives no clock, and an Efficiency clock past its table is
+    // refused alone; a decile that has not learned its usual clock says so.
+    let Ok(chain) = partial.heat.chain.as_mut() else {
+        panic!("the fixture's chain");
+    };
+    chain.range = read.heat.chain.expect("the fixture's chain").range;
+    chain.judged.e_refused = true;
+    chain.decile = Some(3);
+    chain.cut = Cut::Gated(crate::heat::Verdict::Unmeasured);
+    let j = overview(&partial);
+    assert_eq!(at(&j, "heat.clock.p_mhz"), &too_little);
+    assert_eq!(
+        at(&j, "heat.clock.e_mhz"),
+        &Jv::why("not_sampled:past_table")
+    );
+    assert_eq!(
+        at(&j, "heat.clock.p_usual_mhz"),
+        &Jv::why("not_sampled:unlearned")
+    );
+    assert_eq!(
+        at(&j, "heat.clock.cut"),
+        &Jv::obj([("state", Jv::s("gated")), ("verdict", Jv::s("unmeasured")),]),
+    );
+    // Each other judgement of the cut says its own state, and a share past the whole (the Super
+    // time and the QoS time are two accounts) is the whole.
+    let state = |word: &str| Jv::obj([("state", Jv::s(word))]);
+    for (cut, want) in [
+        (Cut::NotJudged, state("not_judged")),
+        (Cut::Unlearned, state("unlearned")),
+        (
+            Cut::Within(1.02),
+            Jv::obj([
+                ("state", Jv::s("within")),
+                ("usual_over_clock_m", Jv::u(1020)),
+            ]),
+        ),
+    ] {
+        let Ok(chain) = partial.heat.chain.as_mut() else {
+            panic!("the fixture's chain");
+        };
+        chain.cut = cut;
+        chain.judged.p_time_share = Some(1.004);
+        let j = overview(&partial);
+        assert_eq!(at(&j, "heat.clock.cut"), &want, "{cut:?}");
+        assert_eq!(at(&j, "heat.p_share.time_pm"), &Jv::u(1000));
+    }
+
+    // What a machine lacks is a reading: a desktop that has not slept, whose firmware names no
+    // model, says `none` for its lid, battery, docked and last sleep, and a word for no field.
+    let mut desktop = read.clone();
+    desktop.situation = crate::situation::Situation {
+        machine: Reading::Read(std::sync::Arc::new(MachineType {
+            name: Some("Mac mini".into()),
+            ..MachineType::default()
+        })),
+        lid: Reading::Read(LidReading {
+            lid: Lid::None,
+            changed_ms: None,
+        }),
+        power: Reading::Read(Power {
+            source: PowerSource::Ac,
+            battery: None,
+            adapter_w: None,
+            changed_ms: None,
+        }),
+        displays: Reading::Read(Displays { external: 2 }),
+        awake: Reading::Read(Awake {
+            boot_ms: 1_759_000_000_000,
+            last_sleep: None,
+        }),
+    };
+    let j = overview(&desktop);
+    let none_word = Jv::s("none");
+    assert_eq!(
+        at(&j, "situation"),
+        &Jv::obj([
+            ("lid", none_word.clone()),
+            (
+                "power",
+                Jv::obj([
+                    ("source", Jv::s("ac")),
+                    ("battery_pct", none_word.clone()),
+                    ("charging", none_word.clone()),
+                ]),
+            ),
+            ("docked", none_word.clone()),
+            ("awake_since_ms", Jv::Int(1_759_000_000_000)),
+            ("last_sleep", none_word),
+        ]),
+    );
+    assert_eq!(at(&j, "machine.type"), &Jv::s("Mac mini"));
+    for key in ["machine.model", "machine.model_id"] {
+        assert_eq!(
+            at(&j, key),
+            &Jv::why("not_sampled:firmware_gave_none"),
+            "{key}"
+        );
+    }
+
+    // CONTROL: a reader that read nothing prints its 0 and its empty list.
+    let mut quiet = read;
+    quiet.facts.zombies = Zombies::Read(ZombiesView {
+        whole: true,
+        ..ZombiesView::default()
+    });
+    quiet.facts.dstate = DState::Read(DStateView {
+        scope: DScope::Own,
+        procs: Vec::new(),
+        blocked: None,
+        age_ms: 0,
+        whole: true,
+        pass: None,
+    });
+    quiet.facts.queue = Some(crate::runq::RunQueue {
+        threads: 0.0,
+        basis: crate::runq::QueueBasis::Runnable,
+    });
+    let j = overview(&quiet);
+    assert_eq!(at(&j, "procs.zombies"), &Jv::Arr(Vec::new()));
+    assert_eq!(at(&j, "procs.zombie_count"), &Jv::u(0));
+    assert_eq!(at(&j, "procs.dstate"), &Jv::Arr(Vec::new()));
+    assert_eq!(at(&j, "procs.dstate_count"), &Jv::u(0));
+    assert_eq!(at(&j, "global.queue.threads_m"), &Jv::u(0));
+    assert_eq!(at(&j, "heat.watts.ane_mw"), &Jv::u(0));
 }

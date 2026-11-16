@@ -389,6 +389,7 @@ impl DeckImageRig {
             network: None,
             network_place: None,
             network_target: crate::network_deck::Target::Overview,
+            disk_span: crate::stats_lens::DiskSpan::Day,
             lab: None,
             fleet: None,
             snap: Some(&self.snap),
@@ -565,8 +566,8 @@ fn reading(overview: &Value, last: i64, k: u64) -> Result<Sample, String> {
         compressed: Some(gib(MEM_GIB[2])),
         cached: gib(MEM_GIB[3]),
         free: gib(MEM_GIB[4]),
-        swap_used: (SWAP_MIB.0 * 1_048_576.0) as u64,
-        swap_total: (SWAP_MIB.1 * 1_048_576.0) as u64,
+        swap_used: Some((SWAP_MIB.0 * 1_048_576.0) as u64),
+        swap_total: Some((SWAP_MIB.1 * 1_048_576.0) as u64),
         available: n("/global/mem_available_bytes")? as u64,
         pressure: Pressure::Normal,
         memorystatus_level_pct: Some(MEMORYSTATUS_LEVEL_PCT),
@@ -574,6 +575,7 @@ fn reading(overview: &Value, last: i64, k: u64) -> Result<Sample, String> {
     };
     let secs = k as f64;
     let link = LinkSample {
+        byte_counter: aterm_vitals::net_counter::ByteCounter::Cumulative64,
         name: "en0".into(),
         kind: LinkKind::Ethernet,
         up: true,

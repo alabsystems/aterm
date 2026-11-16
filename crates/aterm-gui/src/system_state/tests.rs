@@ -7365,7 +7365,8 @@ fn focus_on_a_card_item_that_leaves_the_card_moves_to_its_first_button() {
         .first()
         .cloned()
         .expect("the walk's page has its button");
-    let Some(AppViewState::SystemState(state)) = runtime.view_state_mut(view) else {
+    let mut route_native_guard = runtime.view_state_mut(view);
+    let Some(AppViewState::SystemState(state)) = route_native_guard.as_deref_mut() else {
         panic!("the page's view");
     };
     state.common.last_focus = Some(UiKey::new(open.clone()));
@@ -7381,6 +7382,7 @@ fn focus_on_a_card_item_that_leaves_the_card_moves_to_its_first_button() {
         page.access = Access::DeveloperTools;
         page.at = 2;
     }
+    drop(route_native_guard);
     assert!(runtime.publish_system_state(next));
     let Some(AppViewState::SystemState(state)) = runtime.view_state(view) else {
         panic!("the page's view");

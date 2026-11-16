@@ -4808,6 +4808,8 @@ fn a_read_with_room_outranks_a_full_rollout_reading_older_than_it() {
                 ..crate::harness::accounts::Sample::default()
             },
             walls: Vec::new(),
+            refusal: None,
+            limits: Default::default(),
         })
     };
     assert!(crate::harness::accounts_pool::lift_lone_wall(
@@ -4969,6 +4971,8 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
                 ..crate::harness::accounts::Sample::default()
             },
             walls: Vec::new(),
+            refusal: None,
+            limits: Default::default(),
         })
     };
     let run = |config: &str, cwd: &Path, asker: Asker, args: &[&str]| {
@@ -5083,6 +5087,8 @@ fn a_lone_default_row_launch_takes_no_row_and_the_facts_refuse_none() {
                             ..crate::harness::accounts::Sample::default()
                         },
                         walls: Vec::new(),
+                        refusal: None,
+                        limits: Default::default(),
                     })
                 };
                 assert!(

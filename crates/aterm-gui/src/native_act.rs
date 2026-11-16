@@ -192,14 +192,17 @@ pub(crate) fn renewal_pending(ctx: &crate::SessionCtx) -> bool {
     }
     renewal::pending(ctx)
 }
-pub(crate) fn retain_exec_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
+/// Whether a native operation keeps the claim of closed control connection `connection` on
+/// `ctx`, the session the window knows as `local`, which the EOF then does not hand back.
+pub(crate) fn retain_exec_claim(ctx: &crate::SessionCtx, local: u64, connection: u64) -> bool {
     #[cfg(unix)]
     {
-        source_exec::retain_claim(ctx, connection) || exec_handoff::retain_claim(ctx, connection)
+        source_exec::retain_claim(ctx, local, connection)
+            || exec_handoff::retain_claim(ctx, connection)
     }
     #[cfg(not(unix))]
     {
-        let _ = (ctx, connection);
+        let _ = (ctx, local, connection);
         false
     }
 }
@@ -320,10 +323,9 @@ pub(crate) struct Operations {
     runtime_data: Option<Arc<runtime_data::Slot>>,
     asked_binding: asked_upgrade::CurrentBinding,
     relaunch_pending: Option<Arc<relaunch_permit::Permit>>,
+    /// Each exec handoff's preparation and operation, one of each for each process that asks.
     #[cfg(unix)]
-    exec_prepare: Option<Arc<exec_handoff::Preparation>>,
-    #[cfg(unix)]
-    exec_operation: Option<Arc<Mutex<exec_handoff::Operation>>>,
+    exec: exec_handoff::Table,
     observations: Arc<Mutex<crate::native_observe::Store>>,
     renewal_seals: BTreeMap<String, renewal::Seal>,
     renewal_services: BTreeMap<String, Arc<renewal::Service>>,
@@ -1866,7 +1868,7 @@ fn capture_native_authority(
         {
             return Err(DENIED.into());
         }
-    } else if snapshot.contract() != Some(3)
+    } else if !matches!(snapshot.contract(), Some(3 | 4))
         || snapshot.holder() != Some(request.holder.as_str())
         || !snapshot.scopes().is_some_and(|s| s.contains(request.duty))
         || snapshot.connection() != caller.connection

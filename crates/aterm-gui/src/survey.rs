@@ -153,6 +153,18 @@ pub(crate) const REDACTED_LINE: &str = "[redacted: sensitive]";
 
 const FLEET_CODE: &str = "atf1-";
 
+/// Whether `line`, as [`redact`] left it, says nothing but that something was redacted: the
+/// whole-line notice, or only word notices (a join code's among them) and punctuation.
+pub(crate) fn only_redaction(line: &str) -> bool {
+    line == REDACTED_LINE
+        || (line.contains(REDACTED_WORD)
+            && !line
+                .replace(REDACTED_WORD, "")
+                .replace(FLEET_CODE, "")
+                .chars()
+                .any(char::is_alphanumeric))
+}
+
 /// Redact credential assignments, flags, URL userinfo, bearer headers, and high-entropy
 /// tokens in `text`.
 pub(crate) fn redact(text: &str) -> String {
@@ -517,6 +529,7 @@ impl Here {
         let node = node_id_opt();
         let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect(0, true, node);
         facts.update = Some(updater_fact());
+        facts.store_worst = crate::disk_stores::worst_now();
         Here {
             host: aterm_uds::process::lan_host_name(),
             instances: 1 + crate::sibling_scan::live_siblings(),
@@ -1182,6 +1195,7 @@ fn session_row(
         logged,
         tokens,
         upgrade,
+        opened,
     ) = {
         let mut timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let tools = timeline
@@ -1243,6 +1257,7 @@ fn session_row(
             tokens,
             // The harness upgrade word as `status` prints it, so a fleet read sees a held one.
             timeline.upgrade_column(now_unix_ms / 1000, awake_s),
+            timeline.slog().opened_ms(),
         )
     };
     let (user_title, role, supervisor, attention, pinned) = {
@@ -1362,7 +1377,7 @@ fn session_row(
          token={token} upgrade={} detail={} \
          doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
-         held_from={} typed_by={} typed_ms={} {request} {} {} pinned={pinned}",
+         held_from={} typed_by={} typed_ms={} {request} {} {} pinned={pinned} opened_ms={}",
         h.local_id,
         h.sid.as_str(),
         h.state.as_str(),
@@ -1407,6 +1422,7 @@ fn session_row(
         number_token(typed.map(|t| now_unix_ms.saturating_sub(t.at_unix_ms))),
         h.ctx.bells.wire(now_unix_ms),
         progress.fields(),
+        number_token(opened),
     );
     if level == SurveyLevel::Content {
         let cwd = footer

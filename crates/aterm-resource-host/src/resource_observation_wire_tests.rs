@@ -3,7 +3,9 @@
 
 use super::*;
 
-fn observed() -> Observation {
+const SESSION: &str = "t000000000a";
+
+fn observed(session: &str) -> Observation {
     Observation {
         host: ProcessKey {
             pid: 10,
@@ -16,7 +18,7 @@ fn observed() -> Observation {
         unproven_active: 0,
         lost_origins: 0,
         originals: vec![Original {
-            session: "ta000000000".into(),
+            session: session.into(),
             process: ProcessKey {
                 pid: 30,
                 start: 300,
@@ -28,15 +30,15 @@ fn observed() -> Observation {
             peak_footprint: Some(2048),
         }],
         sessions: vec![SessionUsage {
-            session: "ta000000000".into(),
+            session: session.into(),
             reaped_cpu_ns: 400,
             unread: 0,
         }],
-        outstanding_sessions: vec!["ta000000000".into()],
+        outstanding_sessions: vec![session.into()],
         terminals: (1..=35)
             .map(|seq| Terminal {
                 seq,
-                session: "ta000000000".into(),
+                session: session.into(),
                 process: ProcessKey {
                     pid: seq as u32 + 100,
                     start: seq * 100,
@@ -66,14 +68,24 @@ fn decode(frames: Vec<aterm_json::Value>) -> std::io::Result<Observation> {
 
 #[test]
 fn private_observations_preserve_every_generation_across_multiple_frames() {
-    let source = observed();
-    assert!(source.frames().len() > 3);
-    assert_eq!(decode(source.frames()).unwrap(), source);
+    for session in [SESSION, "s-0000000000000000000a"] {
+        let source = observed(session);
+        assert!(source.frames().len() > 3);
+        assert_eq!(decode(source.frames()).unwrap(), source);
+    }
+    for session in [
+        "s-a",
+        "s-0000000000000000000A",
+        "t000000000u",
+        "../../session",
+    ] {
+        assert!(decode(observed(session).frames()).is_err(), "{session}");
+    }
 }
 
 #[test]
 fn an_early_done_or_a_missing_middle_terminal_cannot_advance_the_cursor() {
-    let source = observed();
+    let source = observed(SESSION);
     let frames = source.frames();
     assert!(decode(vec![frames[0].clone(), aterm_json::json!({"done":true})]).is_err());
     let mut missing = source;
@@ -86,10 +98,10 @@ fn an_early_done_or_a_missing_middle_terminal_cannot_advance_the_cursor() {
 
 #[test]
 fn duplicate_originals_sessions_and_unknown_counters_do_not_become_ownership() {
-    let mut duplicate = observed();
+    let mut duplicate = observed(SESSION);
     duplicate.originals.push(duplicate.originals[0].clone());
     assert!(decode(duplicate.frames()).is_err());
-    let mut reused = observed();
+    let mut reused = observed(SESSION);
     let mut newer = reused.originals[0].clone();
     newer.process.start += 1;
     reused.originals.push(newer);
@@ -97,13 +109,13 @@ fn duplicate_originals_sessions_and_unknown_counters_do_not_become_ownership() {
         decode(reused.frames()).is_err(),
         "two active generations cannot share one PID"
     );
-    let mut duplicate = observed();
+    let mut duplicate = observed(SESSION);
     duplicate.sessions.push(duplicate.sessions[0].clone());
     assert!(decode(duplicate.frames()).is_err());
-    let mut duplicate = observed();
-    duplicate.outstanding_sessions.push("ta000000000".into());
+    let mut duplicate = observed(SESSION);
+    duplicate.outstanding_sessions.push(SESSION.into());
     assert!(decode(duplicate.frames()).is_err());
-    let mut unread = observed();
+    let mut unread = observed(SESSION);
     unread.terminals[0].cpu_ns = None;
     unread.terminals[0].child_cpu_ns = None;
     let decoded = decode(unread.frames()).unwrap();

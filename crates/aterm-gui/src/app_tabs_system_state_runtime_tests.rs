@@ -66,9 +66,10 @@ fn system_state_failed_window_close_preflight_keeps_the_shared_review() {
     use aterm_types::macos_setup::Plan;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    let window = app.windows.get_mut(&wid).unwrap();
+    let mut window = app.windows.get_mut(&wid).unwrap();
     window.rows = 90;
     window.cols = 160;
+    drop(window);
     assert!(app.open_system_state_tab());
     let (_, review) = app.active_native_view(wid).unwrap();
     let (send, receive) = std::sync::mpsc::channel();
@@ -110,9 +111,10 @@ fn system_state_second_window_close_keeps_the_offer_until_its_final_view_lets_it
     for window_close in [false, true] {
         let mut app = App::headless_for_test();
         let first_window = WindowId(0);
-        let window = app.windows.get_mut(&first_window).unwrap();
+        let mut window = app.windows.get_mut(&first_window).unwrap();
         window.rows = 90;
         window.cols = 160;
+        drop(window);
         assert!(app.open_system_state_tab());
         let (instance, first) = app.active_native_view(first_window).unwrap();
         let (send, receive) = std::sync::mpsc::channel();
@@ -296,14 +298,16 @@ fn system_state_restore_mints_a_view_and_shares_the_existing_controller() {
         let (instance, view) = cold.active_native_view(wid).expect("opened System State");
         // Prepare this fixture's disclosure before any frame, so the first actual
         // native presentation must contain this seed's value, not a generic stale label.
+        let mut route_native_guard = cold.native_runtime.view_state_mut(view);
         let Some(crate::native_app::AppViewState::SystemState(state)) =
-            cold.native_runtime.view_state_mut(view)
+            route_native_guard.as_deref_mut()
         else {
             panic!("the opened view is System State")
         };
         **state = crate::system_state::SystemStateViewState::with_line_open(Some(
             crate::system_state::lines::Line::Mac,
         ));
+        drop(route_native_guard);
         assert!(cold.commit_glassless_native_frame(wid));
         let ui = &cold.windows[&wid].leaf_render_cache[&view]
             .native

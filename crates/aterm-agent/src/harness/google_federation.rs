@@ -946,6 +946,7 @@ fn run(
                 }
             }
             Step::Refuse(why) => return Approval::Refused(why.clone()),
+            Step::Blocked(why) => return Approval::BotCheck(why.clone()),
             Step::Stop(_) | Step::Mailbox => {
                 return quiet("Vendor federation requires an unimplemented verification step");
             }

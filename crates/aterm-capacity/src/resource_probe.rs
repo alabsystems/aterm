@@ -22,6 +22,34 @@ pub enum ProbeRejection {
     Waiting(Shortfall),
     /// The requested envelope cannot fit the observed machine.
     Unreachable(String),
+    /// No observation: another admission held the ledger's lock when one was to be taken
+    /// ([`Capture::Turn`]), its pid where it wrote one. It decides nothing about the envelope;
+    /// a fresh admission would have met the same lock and read nothing either.
+    Turn(Option<u32>),
+}
+
+/// What one try at a shared observation found ([`ResourceProbe::capture_at`]).
+pub enum Capture {
+    /// The observation, which may reject envelopes until it expires.
+    Observed(ResourceProbe),
+    /// Another admission held the ledger's lock at that instant, its pid where it wrote one:
+    /// nothing was read, no claim was laid, and a later try may observe.
+    Turn(Option<u32>),
+    /// The ledger or the machine answered nothing a probe judges by (a release run, a cohort's
+    /// ledger, an unread or inconsistent reading, a claim of another accounting, a process whose
+    /// resources cannot be observed): every envelope takes fresh admission.
+    Unsupported,
+}
+
+impl Capture {
+    /// The observation, where one was taken.
+    #[must_use]
+    pub fn observed(self) -> Option<ResourceProbe> {
+        match self {
+            Capture::Observed(probe) => Some(probe),
+            Capture::Turn(_) | Capture::Unsupported => None,
+        }
+    }
 }
 
 /// Maximum age of an observation reused within one dispatcher generation.
@@ -36,6 +64,8 @@ pub struct ResourceProbe {
     captured: Instant,
     now: u64,
     pid: u32,
+    /// The ledger it read: a [`Place`] is one of this ledger's or none.
+    dir: PathBuf,
     reading: Reading,
     records: Vec<Record>,
     used: ProcessUse,
@@ -45,12 +75,12 @@ pub struct ResourceProbe {
 }
 
 impl ResourceProbe {
-    /// Observe ordinary holder admission without entering a waiter or writing a claim.
-    /// `None` means the caller must use the original admission path.
+    /// Observe ordinary holder admission without entering a waiter or writing a claim
+    /// ([`Self::capture_at`] now).
     ///
     /// # Errors
     /// A ledger read or admission-turn check failed. No claim was created.
-    pub fn capture(ledger: &Ledger, machine: &dyn Machine) -> io::Result<Option<Self>> {
+    pub fn capture(ledger: &Ledger, machine: &dyn Machine) -> io::Result<Capture> {
         Self::capture_at(ledger, machine, Instant::now())
     }
 
@@ -58,18 +88,20 @@ impl ResourceProbe {
     /// clock. Production callers must use the actual current instant; the result still grants
     /// no authority. Check against a fresh instant after any slow observation completes.
     ///
+    /// THREE ANSWERS: the observation ([`Capture::Observed`]); the ledger's lock held by
+    /// another admission at that instant ([`Capture::Turn`], its holder named), which costs one
+    /// try of the lock and reads nothing else; or nothing a probe judges by
+    /// ([`Capture::Unsupported`]), where the caller must use the original admission path.
+    ///
     /// # Errors
     /// A ledger read or admission-turn check failed. No claim was created.
-    pub fn capture_at(
-        ledger: &Ledger,
-        machine: &dyn Machine,
-        at: Instant,
-    ) -> io::Result<Option<Self>> {
+    pub fn capture_at(ledger: &Ledger, machine: &dyn Machine, at: Instant) -> io::Result<Capture> {
         if machine.release_run() || ledger.cohort_aware()? {
-            return Ok(None);
+            return Ok(Capture::Unsupported);
         }
-        let Ok(_turn) = ledger.try_turn()? else {
-            return Ok(None);
+        let _turn = match ledger.try_turn()? {
+            Ok(turn) => turn,
+            Err(holder) => return Ok(Capture::Turn(holder)),
         };
         let captured = at;
         let now = now_ms();
@@ -88,20 +120,20 @@ impl ResourceProbe {
                 .flatten()
                 .any(|load| !load.is_finite() || load < 0.0)
         {
-            return Ok(None);
+            return Ok(Capture::Unsupported);
         }
         let records = ledger.scan(false)?;
         if records
             .iter()
             .any(|record| record.accounting != crate::Accounting::Holder)
         {
-            return Ok(None);
+            return Ok(Capture::Unsupported);
         }
         let procs = if records.is_empty() {
             None
         } else {
             let Some(procs) = machine.procs() else {
-                return Ok(None);
+                return Ok(Capture::Unsupported);
             };
             if !std::iter::once(std::process::id())
                 .chain(records.iter().flat_map(|record| {
@@ -109,7 +141,7 @@ impl ResourceProbe {
                 }))
                 .all(|pid| procs.observes_resources(pid))
             {
-                return Ok(None);
+                return Ok(Capture::Unsupported);
             }
             Some(procs)
         };
@@ -125,6 +157,7 @@ impl ResourceProbe {
             accounting: crate::Accounting::Holder,
             pid,
             start_ms: now,
+            laid_at: None,
             seq: u64::MAX,
             checkout: String::new(),
             need: Need::new("probe"),
@@ -148,10 +181,11 @@ impl ResourceProbe {
             &reading,
         );
         let records: Vec<_> = records.into_iter().cloned().collect();
-        Ok(Some(Self {
+        Ok(Capture::Observed(Self {
             captured,
             now,
             pid,
+            dir: ledger.dir().to_path_buf(),
             reading,
             records,
             used,
@@ -191,6 +225,21 @@ impl ResourceProbe {
     /// `None` requires fresh admission, including for unsupported or expired observations.
     #[must_use]
     pub fn rejection_at(&self, need: &Need, at: Instant) -> Option<ProbeRejection> {
+        self.rejection_placed(need, at, None)
+    }
+
+    /// [`Self::rejection_at`] for a need its caller would enter at `place`
+    /// ([`Waiter::enter_at`]): judged behind the claims ahead of that place where a record of
+    /// this process still stands at it in the ledger this probe read, else as one laid now. A
+    /// need judged as laid now would be rejected behind every large waiter laid since the
+    /// place, which an entry at the place is ahead of.
+    #[must_use]
+    pub fn rejection_placed(
+        &self,
+        need: &Need,
+        at: Instant,
+        place: Option<&Place>,
+    ) -> Option<ProbeRejection> {
         // An exact default envelope check makes future Need fields opt out automatically.
         let mut supported = Need::new(need.what.clone()).mem(need.mem).cores(need.cores);
         supported.alone = need.alone;
@@ -212,7 +261,11 @@ impl ResourceProbe {
             &self.used.lines,
             &self.wide,
         );
-        let mine = (self.now, self.pid, u64::MAX);
+        let placed = place
+            .and_then(|place| place.standing_in(&self.dir))
+            .filter(|stood| stood.pid == self.pid)
+            .map_or(self.now, |stood| stood.ms.min(self.now));
+        let mine = (placed, self.pid, u64::MAX);
         decide(need, mine, &self.reading, &others, self.now)
             .err()
             .map(ProbeRejection::Waiting)

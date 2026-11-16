@@ -236,3 +236,75 @@ fn settled_lifted_add_deco_with_dirt_on_its_row_stays_byte_stable() {
         );
     }
 }
+
+/// `text` in `fg` on a page of `bg` (every cell of it, by an erase in the page's colour), its
+/// frame's pixels and width.
+fn on_page(rend: &mut Renderer, text: &str, fg: u32, bg: u32) -> (Vec<u32>, usize) {
+    let (rows, cols) = (3u16, 12u16);
+    let mut term = Terminal::new(rows, cols);
+    let sgr = |c: u32| format!("{};{};{}", (c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+    term.process(
+        format!(
+            "\x1b[48;2;{}m\x1b[2J\x1b[2;3H\x1b[38;2;{}m{text}",
+            sgr(bg),
+            sgr(fg)
+        )
+        .as_bytes(),
+    );
+    let f = rend.render_input(&term.cell_frame(usize::from(rows), usize::from(cols)));
+    (f.pixels.clone(), f.width)
+}
+
+/// A WORD'S GLOW KEEPS ITS LETTERS' READING (CT-51 Rule C;
+/// `aterm_effects::cursor_glow::word_glow_floor`): Feline's self-glow on paper at its whole
+/// amplitude lays `fox` in `#8a8f99` (3.3:1 on white) at no less than 97% of each letter's own
+/// reading, and in `#727272` (4.8:1), `#757575` (4.61:1) and `#767676` (4.54:1) at 4.5 or more
+/// or, where its raster reads its own colour under that, 97% of it, each letter read by its raster as
+/// `trail-contrast` reads it. NEGATIVE CONTROL
+/// (`aterm_effects::word_decorations::with_paper_glow_floor_old`): held to nine tenths of its
+/// own colour's contrast, as before, the glow lowers a letter of each under that bar.
+#[test]
+fn a_word_s_glow_keeps_its_letters_reading() {
+    use crate::trail_letters_read::Pair;
+    use aterm_effects::word_decorations::{paper_glow_peak, with_paper_glow_floor_old};
+    let mut rend = renderer();
+    let (cw, ch) = rend.cell_size();
+    let bg = 0x00FF_FFFF;
+    let mut worst = |fg: u32| {
+        let peak = paper_glow_peak(fg, bg);
+        let (clean, w) = on_page(&mut rend, "fox", fg, bg);
+        let (frame, _) = on_page(&mut rend, "fox", peak, bg);
+        let pair = Pair {
+            frame: &frame,
+            clean: &clean,
+            w,
+            cw,
+            ch,
+        };
+        let mut lows = Vec::new();
+        for (i, c) in "fox".chars().enumerate() {
+            let own = pair.own(1, 2 + i, 1).expect("a letter");
+            let local = pair.letter(1, 2 + i, 1, c).map_or(own, |l| l.local);
+            lows.push((c, local, own));
+        }
+        (peak, lows)
+    };
+    // Not lowered, as `trail-contrast` judges it: at the bar, or under it where its own reading
+    // is and it keeps 97% of that.
+    let keeps = |lows: &[(char, f64, f64)]| {
+        lows.iter()
+            .all(|&(_, local, own)| local >= 4.5 || (own < 4.5 && local >= 0.97 * own))
+    };
+    // The inks about the bar's edge (4.54 and 4.61 on white) too, whose raster reads just over
+    // or under the bar.
+    for fg in [0x008A_8F99, 0x0072_7272, 0x0076_7676, 0x0075_7575] {
+        let (peak, lows) = worst(fg);
+        assert_ne!(peak, fg, "{fg:06x}: the glow lights the word");
+        assert!(keeps(&lows), "{fg:06x} glowing {peak:06x}: {lows:?}");
+        let (peak, lows) = with_paper_glow_floor_old(|| worst(fg));
+        assert!(
+            !keeps(&lows),
+            "control: {fg:06x} glowing {peak:06x} at nine tenths keeps every letter: {lows:?}"
+        );
+    }
+}

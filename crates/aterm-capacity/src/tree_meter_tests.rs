@@ -768,3 +768,39 @@ fn a_child_born_to_a_leftover_after_its_root_ended_stays_left() {
     drop(sibling.0.stdin.take());
     assert!(sibling.0.wait().expect("the sibling's end").success());
 }
+
+/// Stopping periodic sampling must not join an in-flight native read or consume its tally.
+#[test]
+fn stop_request_finishes_after_the_current_read_without_consuming_the_meter() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reading_calls = Arc::clone(&calls);
+    let meter = TreeMeter::start_with(41, move |root, tally| {
+        let call = reading_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call == 1 {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+        }
+        tally
+            .lock()
+            .unwrap()
+            .book(&[member(root, 3, 5)], &mut |_| Some(true));
+    });
+    entered_rx
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap();
+    meter.request_stop();
+    release_tx.send(()).unwrap();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the requested meter reader's end",
+        || meter.reader.as_ref().unwrap().is_finished().then_some(()),
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(meter.peak(), 5 * MIB);
+    assert_eq!(meter.members().len(), 1);
+    assert_eq!(meter.stop(0), 5 * MIB);
+}

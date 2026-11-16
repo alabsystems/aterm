@@ -289,7 +289,7 @@ fn an_exited_workers_end_is_seen_by_a_look_and_by_going_to_it() {
     let (second, second_ctx) = second_tab(&mut app, wid);
     let tabs = app.windows[&wid].tab_set.tabs().len();
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.occluded = true;
     }
@@ -346,7 +346,7 @@ fn a_task_done_where_nobody_looks_keeps_its_dot() {
         metadata[tabs - 1].attention
     };
     {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.window_on_screen_for_test = true;
         ws.occluded = true;
     }
@@ -368,7 +368,7 @@ fn a_split_panes_task_done_in_front_is_seen() {
         let other = app.split_active_stub_tab(wid);
         assert_eq!(app.focused_session_id(wid), Some(other), "the new pane");
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.window_on_screen_for_test = true;
             ws.occluded = occluded;
         }
@@ -488,11 +488,8 @@ fn a_managers_team_chip_opens_the_overview_at_it() {
     app.press_claude_chip(wid, manager, Chip::Team, std::time::Instant::now());
     assert_eq!(crate::app_tabs::take_raised_windows(), vec![wid]);
     assert_eq!(app.focused_session_id(wid), Some(stray), "no tab moved");
-    let card = app
-        .windows
-        .get_mut(&wid)
-        .and_then(|ws| ws.overview_mut())
-        .expect("the card is open");
+    let mut window_guard = app.windows.get_mut(&wid).unwrap();
+    let card = window_guard.overview_mut().expect("the card is open");
     assert!(matches!(
         card.selected_item(),
         Some(OverviewItem::Manages { .. })

@@ -134,7 +134,7 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
     let hello_at = Instant::now();
     {
         let look = aterm_effects::kitty_registry::KittyLook::for_launch(App::TEST_LAUNCH_SEED);
-        let ws = off_app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = off_app.windows.get_mut(&wid).expect("window 0");
         ws.fx.companions_mut().cursor_cat.on_collect(hello_at, look);
         ws.fx
             .companions_mut()
@@ -142,7 +142,7 @@ fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
             .set_collection_presentable(hello_at, true);
     }
     let hello_visible = {
-        let ws = off_app.windows.get_mut(&wid).expect("window 0");
+        let mut ws = off_app.windows.get_mut(&wid).expect("window 0");
         let f = ws
             .fx
             .companions_mut()
@@ -357,7 +357,7 @@ fn a_session_fence_clears_only_the_licence_in_every_window_presenting_it() {
     let mut glow_out = Vec::new();
     let mut trail_out = Vec::new();
     for candidate in [wid, second] {
-        let ws = app.windows.get_mut(&candidate).unwrap();
+        let mut ws = app.windows.get_mut(&candidate).unwrap();
         ws.fx
             .cursor_mut()
             .glow
@@ -372,7 +372,7 @@ fn a_session_fence_clears_only_the_licence_in_every_window_presenting_it() {
         assert!(ws.fx.cursor_mut().trail.move_licensed(now));
     }
     let (cadence_before, rain_deadline_before, input_hot_before) = {
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         ws.fx.cursor_mut().cadence.on_keystroke(now);
         (
             ws.fx.cursor_mut().cadence.sample(now),
@@ -448,7 +448,7 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
         let mut glow = Vec::new();
         let mut trail = Vec::new();
         {
-            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut ws = app.windows.get_mut(&wid).unwrap();
             ws.fx
                 .cursor_mut()
                 .glow
@@ -462,7 +462,7 @@ fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() 
         }
 
         boundary(&mut app, wid);
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut ws = app.windows.get_mut(&wid).unwrap();
         assert!(!ws.fx.cursor_mut().glow.move_licensed(now));
         assert!(!ws.fx.cursor_mut().trail.move_licensed(now));
         let moved = now + Duration::from_millis(1);
@@ -773,7 +773,8 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
     let mut out = Vec::new();
     let t0 = Instant::now();
     {
-        let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+        let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+        let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
         glow.tick(Some((2, 2)), t0, &glow_cfg, geom, &mut out);
         glow.tick(
             Some((2, 4)),
@@ -801,7 +802,8 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
         assert_eq!(glow.insert_tally().lit, 0);
         assert_eq!(glow.insert_tally().delivered, 1, "the licence is armed");
     }
-    let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+    let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     glow.tick(
         Some((2, 12)),
         t0 + Duration::from_millis(60),
@@ -817,6 +819,7 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
         "the real completion is the insert's"
     );
     assert_eq!(glow.insert_tally().lit, 1);
+    drop(payload_guard_glow);
     drop(app);
     drop(sink);
     unsafe {
@@ -1260,7 +1263,8 @@ fn erase_credits(app: &mut App, wid: WindowId) -> usize {
         win_h: 384,
         head: 0,
     };
-    let glow = &mut app.windows.get_mut(&wid).unwrap().fx.cursor_mut().glow;
+    let mut payload_guard_glow = app.windows.get_mut(&wid).unwrap();
+    let glow = &mut payload_guard_glow.fx.cursor_mut().glow;
     glow.tick(
         Some((0, 0)),
         Instant::now(),

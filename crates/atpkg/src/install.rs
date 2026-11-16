@@ -85,6 +85,9 @@ pub struct StageHooks<'a> {
     pub pre_swap: Option<PreSwapHook<'a>>,
     /// Asked once the tree is verified.
     pub sidecars: Option<SidecarHook<'a>>,
+    /// `(suffix, bytes)` records written beside the build with the sidecars, ahead of its ready
+    /// marker (a signed manifest's kept records).
+    pub records: &'a [(&'static str, Vec<u8>)],
     /// `(name, target)` tool names laid in the verified `.incoming` tree before
     /// [`Self::pre_swap`] sees it.
     pub aliases: &'a [(&'a str, &'a str)],
@@ -97,6 +100,7 @@ impl StageHooks<'_> {
     pub const NONE: StageHooks<'static> = StageHooks {
         pre_swap: None,
         sidecars: None,
+        records: &[],
         aliases: &[],
         npm_package: None,
     };
@@ -228,7 +232,7 @@ pub fn verify_for_publication(
     build_dir: &Path,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
-    if hooks.sidecars.is_some() {
+    if hooks.sidecars.is_some() || !hooks.records.is_empty() {
         return Err(StageError::Payload(
             "publication inspection writes no install sidecars".into(),
         ));
@@ -728,7 +732,11 @@ fn finish_stage(
         }
     };
     let sidecars = match hooks.sidecars.map(|render| render(&root)).transpose() {
-        Ok(sidecars) => sidecars.unwrap_or_default(),
+        Ok(sidecars) => {
+            let mut sidecars = sidecars.unwrap_or_default();
+            sidecars.extend(hooks.records.iter().cloned());
+            sidecars
+        }
         Err(e) => {
             let _ = crate::store::remove_tree(incoming);
             return Err(e);

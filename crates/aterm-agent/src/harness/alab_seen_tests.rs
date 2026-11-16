@@ -493,6 +493,7 @@ fn a_forgotten_row_keeps_its_history_under_its_account_key() {
             by: "aa".into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     state.accounts.insert(
@@ -564,6 +565,7 @@ fn a_row_edited_to_another_account_leaves_its_observations_with_the_old_one() {
             by: "aa".into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     state.accounts.insert(

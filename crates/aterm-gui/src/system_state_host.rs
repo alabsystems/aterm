@@ -1253,7 +1253,7 @@ impl App {
             })
             .collect();
         for view in views {
-            if let Some(state) = self.native_runtime.view_state_mut(view) {
+            if let Some(mut state) = self.native_runtime.view_state_mut(view) {
                 state.common_mut().last_focus = None;
                 state.common_mut().focus_visible = false;
             }

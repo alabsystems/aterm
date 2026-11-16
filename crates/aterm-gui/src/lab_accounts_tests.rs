@@ -262,6 +262,7 @@ fn auth_without_a_recorded_human_task_only_points_to_recovery_inspection() {
                     routes: "past successful route".into(),
                     since: 120,
                     tried_at: 120,
+                    stop: None,
                 }),
                 ..Default::default()
             }),
@@ -550,6 +551,7 @@ fn a_successful_past_attempt_is_not_a_current_login_or_quota_reading() {
                 routes: "old route metadata".into(),
                 since: 100,
                 tried_at: 100,
+                stop: None,
             }),
             ..Default::default()
         },

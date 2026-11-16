@@ -18,6 +18,10 @@
 //!   the sweep's own state `D` covers every user, held once seen for [`KERNEL_WAIT_MS`], and
 //!   `/proc/stat`'s `procs_blocked` counts the machine's tasks waiting on I/O now (the kernel's
 //!   `nr_iowait()`, which leaves out a task in `D` on a lock or a mount outside I/O wait).
+//! - **What blocks at one reading** is one rule, [`Blocked::judge`], over those two and the jobs
+//!   engine's stuck work ([`StuckWork`]): the worst [`Blockage`] that holds, which the strip's
+//!   blockage ring keeps as each box's share and worst kind ([`BlockageBox`], A4 §6.2's cap).
+//!   It judges a reading, with no hold: the episodes with their holds are the event detector's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -34,13 +38,26 @@ pub const CENSUS_PERIOD_MS: u64 = 30_000;
 /// count.
 pub const CENSUS_STALE_MS: u64 = 3 * CENSUS_PERIOD_MS;
 
-/// Every zombie the sweeps have seen: when each was first seen and under which parent, and when
-/// each parent's pile began. The Processes row reads the model's, noted at every whole reading;
+/// How old a zombie sweep, a census pass or a jobs pass may be and still say what blocks now
+/// ([`Blocked::judge`]): the census's own bound.
+pub const BLOCKAGE_STALE_MS: u64 = CENSUS_STALE_MS;
+
+/// How long a pile has stood, and within how long it gained a zombie, while it reads as growing:
+/// a minute (A4 §6.4: "≥ 1/min for a minute").
+pub const PILE_GROWS_MS: u64 = 60_000;
+
+/// Every zombie the sweeps have seen: when each was first seen and under which parent, when
+/// each parent's pile began, and which left a standing pile while one first seen as it left
+/// would still count as new. The Processes row reads the model's, noted at every whole reading;
 /// the jobs engine's findings read their own, noted at each of its passes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ZombieBook {
     seen: HashMap<u32, (u64, u32)>,
     parents: HashMap<u32, u64>,
+    /// Zombies a sweep within [`ZOMBIE_AGE_MS`] + [`PILE_GROWS_MS`] found gone (reaped, or
+    /// under another parent) from a pile that still stands: `(parent, first seen, found gone)`,
+    /// in order.
+    gone: Vec<(u32, u64, u64)>,
 }
 
 impl ZombieBook {
@@ -48,14 +65,23 @@ impl ZombieBook {
     /// parent is forgotten, and a parent with none left loses its pile's start.
     pub fn note(&mut self, at_ms: u64, zombies: impl IntoIterator<Item = (u32, u32)>) {
         let live: HashMap<u32, u32> = zombies.into_iter().collect();
-        self.seen
-            .retain(|pid, (_, ppid)| live.get(pid).is_some_and(|pp| pp == ppid));
+        let gone = &mut self.gone;
+        gone.retain(|&(_, _, left)| at_ms.saturating_sub(left) < ZOMBIE_AGE_MS + PILE_GROWS_MS);
+        self.seen.retain(|pid, (first, ppid)| {
+            let stays = live.get(pid).is_some_and(|pp| pp == ppid);
+            if !stays {
+                gone.push((*ppid, *first, at_ms));
+            }
+            stays
+        });
         for (&pid, &ppid) in &live {
             self.seen.entry(pid).or_insert((at_ms, ppid));
             self.parents.entry(ppid).or_insert(at_ms);
         }
         let parents: HashSet<u32> = live.values().copied().collect();
         self.parents.retain(|p, _| parents.contains(p));
+        self.gone.retain(|(p, ..)| parents.contains(p));
+        self.gone.sort_unstable();
     }
 
     /// When `pid` was first seen a zombie, and its parent.
@@ -80,6 +106,41 @@ impl ZombieBook {
             }
         }
         by_parent
+    }
+
+    /// Whether `ppid`'s pile grows at `at_ms`: its first zombie came to count at least
+    /// [`PILE_GROWS_MS`] ago (each counts once seen [`ZOMBIE_AGE_MS`]), and the zombies that
+    /// came to count within that time outnumber those it counted before it that have gone. One
+    /// that went weighs against the pile for as long as a zombie first seen as it left would be
+    /// among the new ([`ZOMBIE_AGE_MS`] + [`PILE_GROWS_MS`]): a zombie counts late and leaves at
+    /// once, so without that a pile whose parent reaps one child as the next exits would dip
+    /// and read as grown a minute on. A pile found whole and never added to stands steady,
+    /// whatever its size, and so does one its parent reaps as fast as it fills, or faster; one
+    /// whose parent left it empty at a sweep starts again.
+    #[must_use]
+    pub fn grows(&self, ppid: u32, at_ms: u64) -> bool {
+        let counted_for = |first: u64| at_ms.saturating_sub(first).checked_sub(ZOMBIE_AGE_MS);
+        let stood = self
+            .pile_since(ppid)
+            .and_then(counted_for)
+            .is_some_and(|stood| stood >= PILE_GROWS_MS);
+        let came = self
+            .seen
+            .values()
+            .filter(|&&(_, parent)| parent == ppid)
+            .filter_map(|&(first, _)| counted_for(first))
+            .filter(|&counted| counted < PILE_GROWS_MS)
+            .count();
+        let went = self
+            .gone
+            .iter()
+            .filter(|&&(parent, first, left)| {
+                parent == ppid
+                    && at_ms.saturating_sub(left) < ZOMBIE_AGE_MS + PILE_GROWS_MS
+                    && counted_for(first).is_some_and(|counted| counted >= PILE_GROWS_MS)
+            })
+            .count();
+        stood && came > went
     }
 }
 
@@ -133,6 +194,11 @@ pub struct ZombiesView {
     pub count: u32,
     /// Their parents, the largest pile first (lower pid first among equals).
     pub piles: Vec<ZombieParent>,
+    /// Whether any pile grows ([`ZombieBook::grows`]): the pile column's critical ink (A4 §6.3).
+    /// Never from a sweep stopped at its cap, nor until a whole sweep after one has stood
+    /// [`ZOMBIE_AGE_MS`] + [`PILE_GROWS_MS`]: the book forgets a zombie a cut sweep did not
+    /// reach and dates it anew when the next sees it, which is no growth.
+    pub growing: bool,
     /// Whether the sweep read the whole process table: one stopped at its cap counts at least
     /// these.
     pub whole: bool,
@@ -170,6 +236,10 @@ pub struct CensusPass {
     pub read: u32,
     /// Processes whose threads it could not read.
     pub refused: u32,
+    /// Processes whose thread list was cut at the probe's cap with none of the threads read
+    /// uninterruptible: any may hold one past the cut, so [`Self::marked`] names at least the
+    /// processes so.
+    pub cut_unmarked: u32,
     /// Whether it ended a cover: every listed process read since the cover began.
     pub cover_done: bool,
     /// Passes the cover it ended took, where it ended one.
@@ -189,6 +259,9 @@ pub struct CensusMark {
     pub name: String,
     /// Its threads so.
     pub uninterruptible: u32,
+    /// Its thread list was cut at the probe's cap: [`Self::uninterruptible`] counts at least
+    /// those.
+    pub cut: bool,
     /// The pass before found the same process so too: held for two passes running (≥ 30 s).
     pub held: bool,
 }
@@ -223,6 +296,8 @@ pub struct DStuck {
     /// Its threads so, where its threads were read (the census); `None` where the sweep read the
     /// process's state alone.
     pub threads: Option<u32>,
+    /// The process has more threads than were read: [`Self::threads`] counts at least those.
+    pub threads_cut: bool,
     /// Held: two census passes running, or the sweep's state for at least [`KERNEL_WAIT_MS`].
     pub held: bool,
 }
@@ -238,6 +313,12 @@ pub struct DStateView {
     pub blocked: Option<u64>,
     /// How long before this reading the pass or sweep behind [`Self::procs`] ran, ms.
     pub age_ms: u64,
+    /// Whether no read behind [`Self::procs`] was cut at a cap: `false` where the sweep stopped
+    /// at its process cap, or a census pass cut a thread list and found none uninterruptible in
+    /// what it read ([`CensusPass::cut_unmarked`]). [`Self::procs`] then names at least the
+    /// processes so. A census cover that took more than one pass is told by [`Self::pass`], not
+    /// here.
+    pub whole: bool,
     /// The census pass behind it, with its cost; `None` off macOS.
     pub pass: Option<Arc<CensusPass>>,
 }
@@ -265,18 +346,199 @@ impl Default for DState {
     }
 }
 
+/// What the jobs engine's newest pass found stuck, as the host hands it in on a reading
+/// ([`Sample::stuck_work`]): the model reads no job itself (A4 §6.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StuckWork {
+    /// Jobs judged stuck (φ ≥ 8, [`crate::jobs::Verdict::Stuck`]).
+    pub jobs: u32,
+    /// Orphans burning a core with no writes ([`crate::jobs::Findings::busy_orphans`]).
+    pub busy_orphans: u32,
+    /// How long before the reading the pass ran, ms.
+    pub age_ms: u64,
+}
+
+impl StuckWork {
+    /// What `view`, a pass `age_ms` old, found stuck.
+    #[must_use]
+    pub fn of(view: &crate::jobs::JobsView, age_ms: u64) -> Self {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            jobs: count(
+                view.rows
+                    .iter()
+                    .filter(|r| r.verdict == crate::jobs::Verdict::Stuck)
+                    .count(),
+            ),
+            busy_orphans: count(view.findings.busy_orphans.len()),
+            age_ms,
+        }
+    }
+
+    /// The stuck jobs and busy orphans together.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.jobs.saturating_add(self.busy_orphans)
+    }
+}
+
+/// What blocks the processes' flow, least to worst (A4 §6.2's cap): the warn kinds in the
+/// well's order (⧖ under ☠ under ⊘, §6.4), and the growing pile, the one kind in critical
+/// ink, over them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Blockage {
+    /// A process held in an uninterruptible wait ([`DStateView::held`]).
+    Uninterruptible = 1,
+    /// Unreaped zombies in piles that do not grow.
+    SteadyPile = 2,
+    /// A stuck job or a busy orphan ([`StuckWork`]).
+    Stuck = 3,
+    /// A zombie pile that grows ([`ZombieBook::grows`]).
+    GrowingPile = 4,
+}
+
+impl Blockage {
+    /// Every kind, least first.
+    pub const ALL: [Self; 4] = [
+        Self::Uninterruptible,
+        Self::SteadyPile,
+        Self::Stuck,
+        Self::GrowingPile,
+    ];
+
+    /// The kind's rank, 1 to 4: what the blockage ring takes as a reading's value (0 is clear).
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        self as u8
+    }
+
+    /// The kind of `rank`; `None` for 0 or any other number.
+    #[must_use]
+    pub fn of_rank(rank: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.rank() == rank)
+    }
+
+    /// The kind's word: `d_state`, `steady_pile`, `stuck`, `growing_pile`. No `sys` view says
+    /// it yet.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Uninterruptible => "d_state",
+            Self::SteadyPile => "steady_pile",
+            Self::Stuck => "stuck",
+            Self::GrowingPile => "growing_pile",
+        }
+    }
+
+    /// Whether the cap draws it in critical ink: the growing pile alone (A4 §6.2).
+    #[must_use]
+    pub const fn critical(self) -> bool {
+        matches!(self, Self::GrowingPile)
+    }
+}
+
+/// What blocks at one reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Blocked {
+    /// None of the three readers answered for now: no time of the reading is judged.
+    #[default]
+    Unread,
+    /// At least one answered, and nothing it read blocks.
+    Clear,
+    /// The worst kind that holds.
+    By(Blockage),
+}
+
+impl Blocked {
+    /// The per-reading rule (A4 §6.2, §6.5): the worst of a zombie pile (growing or steady), stuck
+    /// work and a held uninterruptible wait, each from a reading no older than
+    /// [`BLOCKAGE_STALE_MS`]. A reader that did not answer, or answered too long ago, says
+    /// nothing either way; with none answering the reading is [`Self::Unread`], never clear.
+    #[must_use]
+    pub fn judge(zombies: &Zombies, dstate: &DState, stuck: Option<&StuckWork>) -> Self {
+        let fresh = |age_ms: u64| age_ms <= BLOCKAGE_STALE_MS;
+        let pile = match zombies {
+            Zombies::Read(v) if fresh(v.age_ms) => Some(v),
+            _ => None,
+        };
+        let waits = match dstate {
+            DState::Read(v) if fresh(v.age_ms) => Some(v),
+            _ => None,
+        };
+        let stuck = stuck.filter(|s| fresh(s.age_ms));
+        if pile.is_none() && waits.is_none() && stuck.is_none() {
+            return Self::Unread;
+        }
+        let pile = pile.filter(|v| v.count > 0).map(|v| {
+            if v.growing {
+                Blockage::GrowingPile
+            } else {
+                Blockage::SteadyPile
+            }
+        });
+        let stuck = stuck.filter(|s| s.count() > 0).map(|_| Blockage::Stuck);
+        let waits = waits
+            .filter(|v| v.held() > 0)
+            .map(|_| Blockage::Uninterruptible);
+        pile.max(stuck).max(waits).map_or(Self::Clear, Self::By)
+    }
+
+    /// What the blockage ring takes of this reading: the kind's rank (0 where clear) and whether
+    /// it counts toward the box's blocked share; `None` where unread.
+    #[must_use]
+    pub fn reading(self) -> Option<(f64, bool)> {
+        match self {
+            Self::Unread => None,
+            Self::Clear => Some((0.0, false)),
+            Self::By(kind) => Some((f64::from(kind.rank()), true)),
+        }
+    }
+}
+
+/// What one strip box of the blockage ring says (A4 §6.2's cap): the ring takes each reading's
+/// [`Blocked::reading`], so a box's over time is the share a blockage held and its largest
+/// reading the worst kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockageBox {
+    /// The share of the box's read time a blockage held, 0 to 1: the cap's length.
+    pub share: f64,
+    /// The worst kind read in the box; `None` where it read clear throughout.
+    pub worst: Option<Blockage>,
+}
+
+impl BlockageBox {
+    /// What `agg`, a bucket of the blockage ring, says: its worst kind is the worst whose rank
+    /// its largest reading reaches. `None` for a bucket that read nothing.
+    #[must_use]
+    pub fn of(agg: &crate::ring::Agg) -> Option<Self> {
+        agg.is_sound().then(|| Self {
+            share: agg.cell().over_share(),
+            worst: Blockage::ALL
+                .into_iter()
+                .rev()
+                .find(|k| agg.max >= f64::from(k.rank())),
+        })
+    }
+}
+
 /// The model's blockage state between readings.
 #[derive(Debug, Default)]
 pub(crate) struct Book {
     zombies: ZombieBook,
     /// The newest sweep's zombies and when it ran (ms on [`Sample::mono_ms`]'s clock).
     zombies_view: Option<(u64, ZombiesView)>,
+    /// Whether the newest sweep stopped at its cap.
+    zombies_cut: bool,
+    /// From when the zombie book tells growth again after a cut sweep
+    /// ([`ZombiesView::growing`]), ms on the same clock.
+    zombies_grow_from: u64,
     /// The newest census pass.
     census: Option<Arc<CensusPass>>,
     /// Linux's sweep: when each process (pid and start) was first seen in `D`.
     d_since: HashMap<(u32, Option<u64>), u64>,
-    /// Linux's newest sweep's processes in `D`, and when it ran.
-    d_view: Option<(u64, Vec<DStuck>)>,
+    /// Linux's newest sweep's processes in `D`, when it ran, and whether it read the whole
+    /// process table.
+    d_view: Option<(u64, Vec<DStuck>, bool)>,
 }
 
 impl Book {
@@ -314,11 +576,12 @@ impl Book {
             }
             // Until a sweep ran, no process is known either way: unread, `procs_blocked` or not.
             DStateRead::Sweep { blocked } => match &self.d_view {
-                Some((then, procs)) => DState::Read(DStateView {
+                Some((then, procs, whole)) => DState::Read(DStateView {
                     scope: DScope::Machine,
                     procs: procs.clone(),
                     blocked: *blocked,
                     age_ms: at.saturating_sub(*then),
+                    whole: *whole,
                     pass: None,
                 }),
                 None => DState::Unread(Unread::NotSampled),
@@ -347,11 +610,13 @@ impl Book {
                     pid: m.pid,
                     name: m.name.clone(),
                     threads: Some(m.uninterruptible),
+                    threads_cut: m.cut,
                     held: m.held,
                 })
                 .collect(),
             blocked: None,
             age_ms,
+            whole: pass.cut_unmarked == 0,
             pass: Some(Arc::clone(pass)),
         })
     }
@@ -371,6 +636,12 @@ impl Book {
                 .filter(|p| p.state == ProcState::Zombie)
                 .map(|p| (p.pid, p.ppid)),
         );
+        if !whole {
+            self.zombies_cut = true;
+        } else if std::mem::take(&mut self.zombies_cut) {
+            self.zombies_grow_from = at.saturating_add(ZOMBIE_AGE_MS + PILE_GROWS_MS);
+        }
+        let judged = whole && at >= self.zombies_grow_from;
         let piles = self.zombies.piles(at);
         let mut named: HashMap<u32, (&str, Option<u64>)> = HashMap::with_capacity(piles.len());
         if !piles.is_empty() {
@@ -404,6 +675,7 @@ impl Book {
             at,
             ZombiesView {
                 count: list.iter().map(|z| z.count).sum(),
+                growing: judged && list.iter().any(|z| self.zombies.grows(z.ppid, at)),
                 piles: list,
                 whole,
                 age_ms: 0,
@@ -423,12 +695,13 @@ impl Book {
                 pid: p.pid,
                 name: p.name.clone(),
                 threads: None,
+                threads_cut: false,
                 held: at.saturating_sub(since) >= KERNEL_WAIT_MS,
             });
         }
         stuck.sort_by_key(|d| d.pid);
         self.d_since = d_since;
-        self.d_view = Some((at, stuck));
+        self.d_view = Some((at, stuck, whole));
     }
 }
 

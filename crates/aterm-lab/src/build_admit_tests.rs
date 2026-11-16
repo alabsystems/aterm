@@ -157,6 +157,7 @@ fn claim(pid: u32) -> Record {
         timing: aterm_capacity::TimingEvidence::default(),
         pid,
         start_ms: 1,
+        laid_at: None,
         seq: 0,
         checkout: format!("checkout-{pid}"),
         need: Need::new("targo build").mem(1 << 30).covers(),

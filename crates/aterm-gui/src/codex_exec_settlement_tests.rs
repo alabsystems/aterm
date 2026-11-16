@@ -43,6 +43,7 @@ impl Fixture {
                 thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
                 wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
                 identity: renewal::Identity::from_native("source", "user"),
+                limit: None,
             },
             destination: Some(renewal::Identity::from_native("destination", "user")),
             sid: "s-fixture".into(),

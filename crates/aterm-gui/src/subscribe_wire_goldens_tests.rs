@@ -58,7 +58,7 @@ fn events_text(plant: bool) -> String {
             stamp,
         );
     let line = format!(
-        "{} off=44 from=s-a kind=ask trust=agent text=SENTINEL",
+        "{} off=44 from=t0000000001 kind=ask trust=agent text=SENTINEL",
         b.ctx.self_id.as_str()
     );
     let reply = crate::fabric::cmd_deliver_waking(&store, &line, &|_| {});
@@ -83,9 +83,9 @@ const EVENTS_GOLDEN: &str = concat!(
     "EVENT 5 act approve rev=13\n",
     "EVENT 5 program state=- rev=14\n",
     "EVENT 5 harness-policy gen=2\n",
-    "EVENT 5 inbox 1 from=s-a kind=ask off=40\n",
-    "EVENT 5 inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=s-a\n",
-    "EVENT 5 post 1 to=@s-b kind=answer re=1\n",
+    "EVENT 5 inbox 1 from=t0000000001 kind=ask off=40\n",
+    "EVENT 5 inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=t0000000001\n",
+    "EVENT 5 post 1 to=@t0000000002 kind=answer re=1\n",
     "EVENT 5 post-landed 1 off=41\n",
     "EVENT 5 hold 1 reason=owner origin=local hold_origin=local\n",
     "EVENT 5 fetch off=40\n",
@@ -98,9 +98,9 @@ const EVENTS_GOLDEN: &str = concat!(
     "EVENT 5 act approve rev=13\n",
     "EVENT 5 program state=- rev=14\n",
     "EVENT 5 harness-policy gen=2\n",
-    "EVENT 5 inbox 1 from=s-a kind=ask off=40\n",
-    "EVENT 5 inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=s-a\n",
-    "EVENT 5 post 1 to=@s-b kind=answer re=1\n",
+    "EVENT 5 inbox 1 from=t0000000001 kind=ask off=40\n",
+    "EVENT 5 inbox-seen 1 off=40 floor=41 seen=1 verdict=handled kind=ask from=t0000000001\n",
+    "EVENT 5 post 1 to=@t0000000002 kind=answer re=1\n",
     "EVENT 5 post-landed 1 off=41\n",
     "EVENT 5 hold 1 reason=owner origin=local hold_origin=local\n",
     "EVENT 5 fetch off=40\n",
@@ -110,7 +110,7 @@ const EVENTS_GOLDEN: &str = concat!(
     "GAP 6 events-dropped=257\n",
     "EVENT 6 meta field=attention value=vim%20build\n",
     "EVENT 6 agent idle rev=1 gen=0.2 fp=00000000000000bb\n",
-    "EVENT 6 inbox 1 from=s-a kind=ask off=44\n",
+    "EVENT 6 inbox 1 from=t0000000001 kind=ask off=44\n",
 );
 
 #[test]

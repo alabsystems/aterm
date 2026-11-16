@@ -15,7 +15,7 @@ fn fill_scratch(app: &mut App, wid: WindowId) {
         .expect("front terminal")
         .term
         .clone();
-    let ws = app.windows.get_mut(&wid).expect("window");
+    let mut ws = app.windows.get_mut(&wid).expect("window");
     let mut term = term_lock(&terminal);
     term.cell_frame_into(&mut ws.input_scratch, rows, cols);
 }
@@ -25,8 +25,8 @@ fn find(app: &mut App, wid: WindowId, query: &str) {
     app.windows
         .get_mut(&wid)
         .expect("window")
-        .search
-        .as_mut()
+        .routing
+        .search_mut()
         .expect("find is open")
         .set_query(query.to_string());
     app.search_recompute();

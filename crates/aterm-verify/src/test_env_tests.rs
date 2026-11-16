@@ -2,11 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::{EnvSnapshot, Scope, exec};
+#[cfg(unix)]
+use crate::exec;
+use crate::{EnvSnapshot, Scope};
 
 #[cfg(unix)]
 #[test]
-fn background_test_children_cannot_become_release_preemptors() {
+fn test_children_cannot_become_release_preemptors() {
     use aterm_capacity::Machine as _;
     const PROBE: &str = "ATERM_TEST_CAPACITY_ROLE_PROBE";
     if let Some(expected) = std::env::var_os(PROBE) {
@@ -14,21 +16,20 @@ fn background_test_children_cannot_become_release_preemptors() {
         return;
     }
     let dir = aterm_tempfile::tempdir().unwrap();
-    let mut ctx = context(dir.path(), true).with_release(true);
-    ctx.background = true;
+    let ctx = context(dir.path(), true).with_release(true);
     std::fs::create_dir_all(&ctx.scratch).unwrap();
     prepare(&ctx).unwrap();
     let probe = Cmd::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "test_env::tests::background_test_children_cannot_become_release_preemptors",
+            "test_env::tests::test_children_cannot_become_release_preemptors",
         ])
         .env(PROBE, "ordinary");
     let child = command(&ctx, probe);
     let out = exec::run(&child, ctx.exec_env());
     assert!(
         out.ok,
-        "test policy elevated a Background descendant: {}",
+        "test policy elevated an ordinary descendant: {}",
         out.output
     );
     // A real release marker must still select Release capacity. Only the fixture creates

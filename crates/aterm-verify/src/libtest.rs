@@ -319,7 +319,24 @@ pub fn refusal_reason(who: &str, names: &[String], log: &str) -> String {
     let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
     let more = names.len().saturating_sub(shown.len());
     let sentinel = COULD_NOT_RUN_SENTINEL;
-    let why = match refusal_reasons(log).as_slice() {
+    // The transcript can include a passing test's nested verifier events. Attribute the
+    // diagnostic only to the named failed blocks, and ignore quoted panic-message echoes.
+    // This does not decide whether any failure was an environmental refusal.
+    let mut refusal_lines = String::new();
+    if let Some(failures) = failed_tests(log) {
+        for failure in failures {
+            if !names.contains(&failure.name) {
+                continue;
+            }
+            for line in failure.block.lines() {
+                if line.trim_start().starts_with(sentinel) {
+                    refusal_lines.push_str(line);
+                    refusal_lines.push('\n');
+                }
+            }
+        }
+    }
+    let why = match refusal_reasons(&refusal_lines).as_slice() {
         [] => format!("see `{sentinel}` in their output"),
         [one] => one.clone(),
         [first, rest @ ..] => format!(

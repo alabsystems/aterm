@@ -439,11 +439,8 @@ fn pending_proof_records_changed_gates_and_preserves_reader_ownership() {
 fn a_failed_capture_barrier_does_not_withdraw_handoff_readiness() {
     use super::handoff_paint_proven as proven;
     let mut app = App::headless_for_test();
-    let ws = app
-        .windows
-        .get_mut(&WindowId(0))
-        .map(Box::as_mut)
-        .expect("test window");
+    let mut window_guard = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let ws = &mut **window_guard;
     assert!(
         !proven(false, true, std::iter::once(&*ws)),
         "control: a window that never presented has proven nothing"
@@ -563,7 +560,7 @@ fn a_deferred_settings_close_behind_the_front_tab_leaves_the_front() {
 fn a_deferred_split_settings_close_replays_behind_the_front_tab() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.os_window_for_test = true;
         ws.focused = true;
     }
@@ -643,7 +640,7 @@ fn a_deferred_split_settings_close_replays_behind_the_front_tab() {
 
 /// Focus every window and give `session` a failed command nobody has looked at.
 fn fail_unseen(app: &mut App, session: u64) {
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.os_window_for_test = true;
         ws.focused = true;
     }
@@ -1622,7 +1619,7 @@ fn a_live_consent_warm_up_holds_the_automatic_apply_but_only_to_its_cap() {
         "an explicit apply is never held"
     );
 
-    for ws in app.windows.values_mut() {
+    for mut ws in app.windows.values_mut() {
         ws.focused = false;
     }
     assert!(

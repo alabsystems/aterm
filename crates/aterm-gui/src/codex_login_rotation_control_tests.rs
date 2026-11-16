@@ -16,6 +16,7 @@ fn job(proof: &crate::self_claim::Proven, human_seq: u64) -> Preparation {
             thread: "00000000-0000-0000-0000-000000000001".into(),
             wall: "00000000-0000-0000-0000-000000000002".into(),
             identity: renewal::Identity::from_native("source", "user"),
+            limit: None,
         },
         process: Process {
             pid: proof.pid,

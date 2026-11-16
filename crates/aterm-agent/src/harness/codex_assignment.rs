@@ -191,7 +191,7 @@ fn hex(value: &str, len: usize) -> bool {
 fn key(caller: &Caller) -> Result<String, String> {
     if caller.pid <= 1
         || caller.birth == 0
-        || !aterm_types::control_verbs::is_minted_sid(&caller.sid)
+        || aterm_types::control_request::Sid::parse(&caller.sid).is_none()
     {
         return Err("invalid assignment caller".into());
     }

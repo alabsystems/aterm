@@ -158,8 +158,17 @@ impl SessionHost for GuiHost<'_> {
         if !self.serves(sid) {
             return None;
         }
-        let mut t = term_lock_whole(self.term);
-        still_wanted(&t).then(|| f(&mut t))
+        let out = {
+            let mut t = term_lock_whole(self.term);
+            still_wanted(&t).then(|| f(&mut t))
+        };
+        // A verb's change to the engine (`mainscreen` leaves the alternate screen) may move what
+        // a keeper META's fingerprint reads, with no output for the reader to see.
+        #[cfg(unix)]
+        if out.is_some() {
+            crate::keeper_link::ring_meta();
+        }
+        out
     }
 
     fn with_terminal_as_it_stands<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {

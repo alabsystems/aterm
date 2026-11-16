@@ -152,13 +152,20 @@ fn changed_or_unreadable_birth_cannot_label_a_reused_pid_with_package_metadata()
 
 #[test]
 fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
+    // Each executable is named as the store names it, where the readers look for it
+    // ([`atpkg::store::ToolName::exe_file`]: `<tool>.exe` on Windows).
+    let exe = |tool: &str| {
+        atpkg::store::ToolName::new(tool)
+            .expect("a tool name")
+            .exe_file()
+    };
     let scratch = aterm_tempfile::tempdir().unwrap();
     let layout = atpkg::store::Layout {
         prefix: scratch.path().join("pkg"),
     };
     let store_dir = layout.build_dir("grok-alab", 17);
     std::fs::create_dir_all(store_dir.join("bin")).unwrap();
-    let store_exe = store_dir.join("bin/grok-alab");
+    let store_exe = store_dir.join("bin").join(exe("grok-alab"));
     std::fs::write(&store_exe, b"plain fixture; never executed").unwrap();
     atpkg::store::mark_build_ready(&store_dir).unwrap();
     std::fs::write(store_dir.with_extension("version"), b"version v1\n0.3.0\n").unwrap();
@@ -181,7 +188,11 @@ fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
         (&local_b, "0.3.0+g222222222"),
     ] {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join("bin/grok-alab"), b"plain fixture; never executed").unwrap();
+        std::fs::write(
+            dir.join("bin").join(exe("grok-alab")),
+            b"plain fixture; never executed",
+        )
+        .unwrap();
         std::fs::write(
             dir.join(atpkg::harness::LOCAL_BUILD_JSON),
             format!(
@@ -196,7 +207,8 @@ fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
     std::fs::write(
         marker,
         format!(
-            "schema = 1\nprogram = \"grok-alab\"\ncheckout = {checkout}\nbins = [\"bin/grok-alab\"]\nlinked_at = \"\"\n"
+            "schema = 1\nprogram = \"grok-alab\"\ncheckout = {checkout}\nbins = [\"bin/{}\"]\nlinked_at = \"\"\n",
+            exe("grok-alab")
         ),
     )
     .unwrap();
@@ -206,7 +218,7 @@ fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
             "grok-alab",
             42,
             |_| Some(Birth(100)),
-            |_| Some(local_a.join("bin/grok-alab")),
+            |_| Some(local_a.join("bin").join(exe("grok-alab"))),
         )
         .as_deref(),
         Some("0.3.0+g111111111")
@@ -255,8 +267,8 @@ fn a_harness_store_build_and_retained_local_artifact_resolve_independently() {
 
     let cc_store = layout.build_dir("claude-code-alab", 5);
     std::fs::create_dir_all(cc_store.join("bin")).unwrap();
-    let cc_store_exe = cc_store.join("bin/claude-alab");
-    let cc_wrong_exe = cc_store.join("bin/claude-code-alab");
+    let cc_store_exe = cc_store.join("bin").join(exe("claude-alab"));
+    let cc_wrong_exe = cc_store.join("bin").join(exe("claude-code-alab"));
     std::fs::write(&cc_store_exe, b"plain fixture; never executed").unwrap();
     std::fs::write(&cc_wrong_exe, b"plain fixture; never executed").unwrap();
     atpkg::store::mark_build_ready(&cc_store).unwrap();

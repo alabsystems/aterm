@@ -11,11 +11,14 @@ use super::{
 };
 use crate::Result;
 use astream_wire::sync::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One read of a typed table, the quota applied.
 #[derive(Clone, Debug)]
 pub struct View {
+    /// The table generation read, whose own declaration of each collection a projection takes
+    /// ([`Self::collection`]); `None` for a fixture built without one.
+    pub(crate) table: Option<&'static Table>,
     /// The authenticated ancestry used to distinguish an observed claim from a concurrent one.
     pub(crate) causal: astream_wire::sync::Index,
     /// Every eligible operation, past-quota ones included (the schema reader and history read
@@ -32,6 +35,9 @@ pub struct View {
     /// causal parent that has not arrived, and this Mac's own writer has nothing withheld), so
     /// a comparison against these cells misses nothing a later projection would add.
     pub complete: bool,
+    /// What the operations still waiting may yet add, and where: a write of rows none of them
+    /// writes need not wait for them ([`Self::holds_back`]).
+    pub awaiting: Awaiting,
     /// Retained operations this build never projects and that cannot become visible: refused
     /// payloads (a newer build's encoding, a reused request id), cut-off or forked writers'
     /// records and quarantined payloads. They never hold a grid save or an import back;
@@ -39,23 +45,98 @@ pub struct View {
     pub refused: Vec<Digest>,
 }
 
+/// What retained operations still waiting on a causal parent (`Log::awaited`) may add to a
+/// read once their parents arrive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Awaiting {
+    /// The waiting records, each record that descends from one included.
+    pub records: usize,
+    /// The rows they write, as (collection, primary key); `None` where one of them cannot be
+    /// read here (this Mac's own record with no payload), so any row may be its.
+    pub rows: Option<BTreeSet<(String, String)>>,
+    /// A later generation's restated history is all here: its roll cover row has arrived.
+    pub restated: bool,
+}
+
+impl Awaiting {
+    /// Nothing waits.
+    pub const NONE: Self = Self {
+        records: 0,
+        rows: Some(BTreeSet::new()),
+        restated: true,
+    };
+}
+
+/// The primary key of a stored cell key `<pk>.<col>[.<elem>]`.
+fn row_of(key: &str) -> &str {
+    key.split_once('.').map_or(key, |(pk, _)| pk)
+}
+
 impl View {
     /// A complete empty read for test fixtures, without opening storage or enrollment.
     #[cfg(any(test, debug_assertions))]
     pub fn empty_for_test() -> Self {
         Self {
+            table: None,
             causal: astream_wire::sync::Index::new(crate::database::MAX_RECORDS),
             ops: Vec::new(),
             quota: Quota::default(),
             cells: Cells::new(),
             owned: BTreeMap::new(),
             complete: true,
+            awaiting: Awaiting::NONE,
             refused: Vec::new(),
         }
     }
 
-    /// One cells collection's rows.
+    /// Why a write of `rows` must wait for history still arriving on this Mac, or `None` when
+    /// nothing it writes can still change under it.
+    ///
+    /// A record that waits on a causal parent is not yet in the cells, so a comparison against
+    /// them cannot see its candidates. Only the rows it writes are in doubt: a write elsewhere
+    /// compares against cells no arriving record touches, and when the record lands it is
+    /// concurrent with that write, never hidden by it. So a write waits only where it writes a
+    /// row (collection and primary key) a waiting record writes, where a waiting record cannot
+    /// be read here (its rows are unknown), or while a later generation's restated history is
+    /// still arriving. The answer names how many records are withheld.
+    #[must_use]
+    pub fn holds_back(&self, rows: &[Vec<crate::database::Change>]) -> Option<String> {
+        if self.complete {
+            return None;
+        }
+        let withheld = format!("history incomplete ({} withheld)", self.awaiting.records);
+        if !self.awaiting.restated {
+            return Some(format!(
+                "{withheld}: this generation's restated history is still arriving"
+            ));
+        }
+        let Some(waiting) = &self.awaiting.rows else {
+            return Some(format!(
+                "{withheld}: a withheld record cannot be read here, so any row may be its"
+            ));
+        };
+        rows.iter().flatten().find_map(|change| {
+            let pk = row_of(&change.key);
+            waiting
+                .contains(&(change.collection.clone(), pk.to_owned()))
+                .then(|| format!("{withheld}: one writes {} row {pk}", change.collection))
+        })
+    }
+
+    /// `collection` as the generation this view read declares it: a generation keeps the shape
+    /// the builds that read it know (a column a later generation retypes, such as a list it
+    /// holds as a text set), while a build names each collection by its newest definition. A
+    /// collection the generation does not hold, or a view with no table, is `collection` itself.
+    pub fn collection<'c>(&self, collection: &'c Collection) -> &'c Collection {
+        self.table
+            .and_then(|table| table.collection(collection.name))
+            .unwrap_or(collection)
+    }
+
+    /// One cells collection's rows, as the generation this view read declares it
+    /// ([`Self::collection`]).
     pub fn project(&self, collection: &Collection) -> Projection {
+        let collection = self.collection(collection);
         if collection
             .columns
             .iter()
@@ -84,6 +165,8 @@ impl View {
         collection: &'static Collection,
         filters: &[grid::Where],
     ) -> Result<grid::Export> {
+        // Laid out as the generation this view read declares the collection, as it is projected.
+        let collection = self.collection(collection);
         grid::export_projected(
             table,
             collection,

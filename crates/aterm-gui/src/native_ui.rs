@@ -409,6 +409,27 @@ pub(crate) enum StyleRef {
     /// washed in it with a mark down its leading edge, words are set in its ink, a button is a
     /// Primary one in it.
     Unwritten,
+    /// A sheet's cell: a group square at its corners, ruled along its right and bottom edges in
+    /// the separator; its words are set as Plain ones.
+    Cell,
+    /// A sheet's header cell (a column's name, a row's number): a [`Self::Cell`] on the raised
+    /// ground a sheet's frozen lines stand on, on which the note's ink and the primary one read
+    /// at the words' floor on every theme (the tertiary ink does not).
+    CellHead,
+    /// The selected cell of a sheet: a square ring in the primary text ink, drawn over the cell.
+    /// Neutral, never the accent or the "not written" blue.
+    CellSelected,
+    /// The wash on a sheet's cells that a range holds beside its selected one: neutral ink,
+    /// inside the cell's rules.
+    CellRange,
+    /// The mark on a sheet's header whose column orders the rows from its least value up: a
+    /// drawn triangle, point up, in the primary ink. A shape, not a glyph of the text face.
+    SortUp,
+    /// [`Self::SortUp`]'s twin for a column ordered from its greatest value down: point down.
+    SortDown,
+    /// A bar on a sheet, in the readable secondary ink: the thumb that says where its columns
+    /// stand across, and the edge of its frozen column while columns lie under it.
+    SheetBar,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -420,6 +441,10 @@ pub(crate) struct Control<T> {
     pub(crate) style: StyleRef,
     pub(crate) role: Option<SemanticRole>,
     pub(crate) look_first: bool,
+    /// A pointer held on this control drags it: the page hears how far across the pointer has
+    /// moved since the press while it moves and once more at the release
+    /// ([`crate::native_app::SemanticInput::Drag`]), wherever the release lands.
+    pub(crate) drags: bool,
 }
 
 impl<T> Control<T> {
@@ -432,7 +457,14 @@ impl<T> Control<T> {
             style: StyleRef::default(),
             role: None,
             look_first: false,
+            drags: false,
         }
+    }
+
+    /// Hear the pointer's travel while it is held on this control ([`Self::drags`]).
+    pub(crate) const fn drags(mut self) -> Self {
+        self.drags = true;
+        self
     }
 
     /// Ask for a look before a pointer press ([`Self::look_first`]).
@@ -500,7 +532,10 @@ impl GroupSpec {
     /// The backdrop the group paints, as its audit line names it (`surface=`): `page` (an
     /// application's ground), `navigation` (a sidebar), `hero` and `card` (an elevated card, the
     /// hero tinted with the accent), `code` (a code block), `unwritten` (a change not yet
-    /// written), or `none`.
+    /// written), `cell`, `cell-head`, `cell-selected` and `cell-range` (a sheet's ruled cell, its
+    /// header cell, the ring on its selected one and the wash on the rest of a range), `sort-up`
+    /// and `sort-down` (a sorted header's mark), `sheet-bar` (a sheet's scroll thumb and frozen
+    /// edge), or `none`.
     pub(crate) const fn backdrop(&self) -> &'static str {
         match (self.role, self.style) {
             (SemanticRole::Application, _) => "page",
@@ -509,6 +544,13 @@ impl GroupSpec {
             (_, StyleRef::Secondary) => "card",
             (_, StyleRef::Code) => "code",
             (_, StyleRef::Unwritten) => "unwritten",
+            (_, StyleRef::Cell) => "cell",
+            (_, StyleRef::CellHead) => "cell-head",
+            (_, StyleRef::CellSelected) => "cell-selected",
+            (_, StyleRef::CellRange) => "cell-range",
+            (_, StyleRef::SortUp) => "sort-up",
+            (_, StyleRef::SortDown) => "sort-down",
+            (_, StyleRef::SheetBar) => "sheet-bar",
             _ => "none",
         }
     }
@@ -2716,6 +2758,13 @@ impl UiContent {
         }
     }
 
+    const fn drags(&self) -> bool {
+        match self {
+            Self::Button(control) => control.drags,
+            _ => false,
+        }
+    }
+
     /// The words this control's value reads as, where they are not its bare value.
     pub(crate) fn value_text(&self) -> Option<String> {
         match self {
@@ -3729,6 +3778,8 @@ pub(crate) struct HitRegion {
     pub(crate) rect: LogicalRect,
     pub(crate) action: ActionId,
     pub(crate) look_first: bool,
+    /// The control is dragged ([`Control::drags`]).
+    pub(crate) drags: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6171,6 +6222,87 @@ fn paint_compiled_node_at(
                     h: rect.height,
                     radius: 1.5,
                     fill: rgba(roles.unwritten, 255),
+                });
+            } else if matches!(spec.style, StyleRef::Cell | StyleRef::CellHead) {
+                // A sheet's cell: square, ruled right and bottom; a header cell on raised ground.
+                if spec.style == StyleRef::CellHead {
+                    prims.push(DrawPrim::Panel {
+                        x: rect.x,
+                        y: rect.y,
+                        w: rect.width,
+                        h: rect.height,
+                        radius: 0.0,
+                        fill: rgba(
+                            sheet_ground(&roles, crate::native_appearance::SHEET_HEAD_LIFT),
+                            255,
+                        ),
+                    });
+                }
+                let rule = rgba(roles.separator, 255);
+                prims.push(DrawPrim::Panel {
+                    x: (rect.right() - 1.0).max(rect.x),
+                    y: rect.y,
+                    w: 1.0_f32.min(rect.width),
+                    h: rect.height,
+                    radius: 0.0,
+                    fill: rule,
+                });
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: (rect.bottom() - 1.0).max(rect.y),
+                    w: rect.width,
+                    h: 1.0_f32.min(rect.height),
+                    radius: 0.0,
+                    fill: rule,
+                });
+            } else if spec.style == StyleRef::CellRange {
+                // A range's wash: inside the cell's rules, so the grid still shows through it.
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y,
+                    w: (rect.width - 1.0).max(0.0),
+                    h: (rect.height - 1.0).max(0.0),
+                    radius: 0.0,
+                    fill: rgba(
+                        sheet_ground(&roles, crate::native_appearance::SHEET_RANGE_WASH),
+                        255,
+                    ),
+                });
+            } else if matches!(spec.style, StyleRef::SortUp | StyleRef::SortDown) {
+                // A sorted header's mark: three bars that narrow to the point, at the middle of
+                // the mark's seat.
+                let up = spec.style == StyleRef::SortUp;
+                let (cx, top) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0 - 3.0);
+                for (step, half) in [1.0_f32, 3.0, 5.0].into_iter().enumerate() {
+                    let step = if up { step } else { 2 - step };
+                    prims.push(DrawPrim::Panel {
+                        x: cx - half,
+                        y: top + step as f32 * 2.0,
+                        w: half * 2.0,
+                        h: 2.0,
+                        radius: 0.0,
+                        fill: rgba(roles.text_primary, 255),
+                    });
+                }
+            } else if spec.style == StyleRef::SheetBar {
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
+                    radius: rect.width.min(rect.height) / 2.0,
+                    fill: rgba(readable_secondary(&roles), 255),
+                });
+            } else if spec.style == StyleRef::CellSelected {
+                // The selected cell's ring: two points of the primary ink, inside the cell.
+                prims.push(DrawPrim::Stroke {
+                    x: rect.x + 1.0,
+                    y: rect.y + 1.0,
+                    w: (rect.width - 2.0).max(0.0),
+                    h: (rect.height - 2.0).max(0.0),
+                    radius: 0.0,
+                    width: 2.0,
+                    color: rgba(roles.text_primary, 255),
                 });
             } else if spec.style == StyleRef::Code {
                 let (rect, joined) = open_box(prims, rect, node.joins, 10.0);
@@ -9617,6 +9749,19 @@ pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
     mix_rgb(roles.text_secondary, roles.text_primary, 0.55)
 }
 
+/// A sheet's header ground or its range's wash: the elevated ground lifted at most `most`
+/// toward the primary ink, and no further than leaves the sheet's words (the readable secondary
+/// ink and the primary one) reading at their floor on it
+/// ([`crate::native_appearance::sheet_ground`]).
+fn sheet_ground(roles: &crate::settings::Roles, most: f32) -> [u8; 3] {
+    crate::native_appearance::sheet_ground(
+        roles.elevated,
+        roles.text_primary,
+        &[readable_secondary(roles), roles.text_primary],
+        most,
+    )
+}
+
 fn quiet_text(roles: &crate::settings::Roles) -> [u8; 3] {
     readable_secondary(roles)
 }
@@ -9635,8 +9780,15 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         | StyleRef::Navigation
         | StyleRef::Setting
         | StyleRef::Chip
+        | StyleRef::Cell
+        | StyleRef::CellHead
         | StyleRef::Note => readable_secondary(roles),
-        StyleRef::Code => roles.text_primary,
+        StyleRef::SheetBar => readable_secondary(roles),
+        StyleRef::Code
+        | StyleRef::CellSelected
+        | StyleRef::CellRange
+        | StyleRef::SortUp
+        | StyleRef::SortDown => roles.text_primary,
     }
 }
 
@@ -9859,6 +10011,7 @@ impl Compiler {
         let projection = content.semantic();
         let description = content.description();
         let look_first = content.look_first();
+        let drags = content.drags();
         let value_text = content.value_text();
         if paint_only && (projection.action.is_some() || projection.focusable) {
             return Err(CompileError::PaintOnlyAction(key));
@@ -10014,6 +10167,7 @@ impl Compiler {
                     rect: visible,
                     action,
                     look_first,
+                    drags,
                 });
             }
         }
@@ -10060,6 +10214,7 @@ impl Compiler {
                     rect: shown,
                     action,
                     look_first,
+                    drags,
                 });
             }
         }

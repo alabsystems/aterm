@@ -2820,6 +2820,7 @@ fn default_urls_and_browse_pick_the_highest_verified_seq_and_ignore_a_forged_hig
             seq,
             head: [0xab; 32],
             label: None,
+            rec: None,
         })
     };
     let defaults = ["http://127.0.0.1:9/v1/alab", stuck.url.as_str()];

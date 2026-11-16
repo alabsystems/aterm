@@ -921,8 +921,16 @@ fn walk_claim(
                 return false;
             }
             let rel = rel.join(entry.file_name());
-            // The entry's own metadata: a link is read as a link.
-            let Ok(meta) = entry.metadata() else {
+            // The entry's own metadata: a link is read as a link. Off Windows that is the
+            // listing's `DirEntry::metadata`. Windows lists the folder's copy of an entry's times
+            // and size, which NTFS can leave behind the entry's own until something opens it, so
+            // a walk just after a write read a shape the next walk did not: there it is read by
+            // the entry's path.
+            #[cfg(not(windows))]
+            let meta = entry.metadata();
+            #[cfg(windows)]
+            let meta = std::fs::symlink_metadata(path.join(&rel));
+            let Ok(meta) = meta else {
                 return false;
             };
             let kind = meta.file_type();

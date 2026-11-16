@@ -144,7 +144,9 @@ USAGE
                  [--release-credentials <profile.toml>] [--engine DIRECTORY] [--verbose]
       Keep this clone releasing: a loop over the verbs above and below. Each cycle
       reads origin/main, this clone's release journal and its repair record, then
-      runs one verb or waits:
+      runs one verb or waits. A failing source gate or build opens an independent
+      repair worker that persists after the cutter exits; the unattended pump waits
+      for its FIX/NO-FIX report. This applies inside or outside an aterm session:
         main declares a cut version whose fixtures its tip holds  → --open-next
         an open version with no fleet line                         → --prepare --commit
                                                                      <the commit that opened it>
@@ -210,11 +212,13 @@ USAGE
       line: RELEASED …, or REFUSED at <step>: <why> — <what is public>. <remedy>.
       A refusal at a failing gate or build (the preflight's gates of R's source, the
       release input, `verify release`, qualify's build, tree or export; never a COULD
-      NOT RUN or a dry run) first opens one Claude Code worker under Land on it
-      (`aterm ctl @self spawn agent=claude -`, its task the log and the cut's inputs),
-      once per failing input hash (the version, R and the prover), its sid kept in
-      .git/aterm-release/repairs.toml; outside an aterm session it prints that
-      command instead.
+      NOT RUN or a dry run) returns a repair briefing with the log and cut's inputs
+      to the caller. Handle it through native subagents or directly, using your own
+      shell tools for commands. It opens no worker and prints no spawn recipe.
+      Only --pump opens a persistent Claude Code repair worker under Land, once per
+      failing input hash (the version, R and the prover), its sid kept in
+      .git/aterm-release/repairs.toml. A repair never waives a gate or changes the
+      run's refusal exit.
       Exit 0 released, prepared, qualified, or a dry run with nothing refused · 1 refused ·
       2 usage, or no checkout, HOME or log directory to run in · 3 a resumable
       stop (run it again) · 130 interrupted.
@@ -332,7 +336,8 @@ USAGE
                  [--min-build N] [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]... | --mac-only]
-                 [--windows-artifacts DIRECTORY [--windows-sha256 HEX]]
+                 [--windows-artifacts DIRECTORY
+                  [--windows-sha256 HEX | --windows-attested]]
       The cut step `ship release` runs; release with `ship release`. Gates, the
       claim of the release's reserved build, a byte copy of the verified bundle
       signed, notarized and packaged (the cut never builds), the tag, and one
@@ -386,7 +391,14 @@ USAGE
                            Windows host, read there and not off the carried
                            files: the pair comes by hand, and its receipt binds
                            nothing a writer of the carry cannot set, so no pair
-                           is admitted without it or with another digest
+                           is admitted without it, --windows-attested, or with
+                           another digest
+        --windows-attested the pair came through the pull lane (`ship release`
+                           puts it there from origin's handoff ref): it is bound
+                           by the attestation beside its receipt, signed by a
+                           builder the release commit's
+                           apps/aterm-win/release-builders.toml pins and not
+                           expired, in place of --windows-sha256
         --release-credentials <profile.toml>
                            an operator's signing profile file: a rostered,
                            unrevoked machine key and its notary credential
@@ -1401,12 +1413,15 @@ fn parse_release<'a>(
             || opts.prepare
             || opts.qualify
             || opts.forget
-            || opts.abandon.is_some())
+            || opts.abandon.is_some()
+            || opts.windows.is_some()
+            || opts.windows_sha256.is_some())
     {
         return Err(
             "--pump runs the release's verbs itself: it takes only the Linux declaration of \
              the lines it starts, --adopt, --once, --dry-run, --verbose, --engine and \
-             --release-credentials"
+             --release-credentials (a Windows zip comes to it through the pull lane, \
+             publish/config.sh's WINDOWS_PULL_DEFAULT, never by hand)"
                 .into(),
         );
     }
@@ -1643,6 +1658,12 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             }
             "--windows-artifacts" => take_windows(&mut opts.windows_artifacts, it)?,
             "--windows-sha256" => take_windows_sha256(&mut opts.windows_sha256, it)?,
+            "--windows-attested" => {
+                if opts.windows_attested {
+                    return Err("--windows-attested given twice".to_string());
+                }
+                opts.windows_attested = true;
+            }
             "--release-credentials" => {
                 if opts.release_credentials.is_some() {
                     return Err("--release-credentials given twice".to_string());
@@ -1677,6 +1698,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.mac_only
             || opts.windows_artifacts.is_some()
             || opts.windows_sha256.is_some()
+            || opts.windows_attested
             || opts.min_build.is_some())
     {
         return Err("--abandon combines with no other cut flag".to_string());
@@ -1688,6 +1710,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.mac_only
             || opts.windows_artifacts.is_some()
             || opts.windows_sha256.is_some()
+            || opts.windows_attested
             || opts.min_build.is_some())
     {
         return Err(
@@ -1707,6 +1730,19 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         opts.windows_sha256.as_deref(),
         opts.windows_artifacts.as_deref(),
     )?;
+    if opts.windows_attested && opts.windows_artifacts.is_none() {
+        return Err(
+            "--windows-attested names the pair of a --windows-artifacts directory; give both"
+                .to_string(),
+        );
+    }
+    if opts.windows_attested && opts.windows_sha256.is_some() {
+        return Err(
+            "--windows-attested and --windows-sha256 both anchor the Windows pair: a pulled \
+             pair is bound by its attestation, a carried one by the digest typed; give one"
+                .to_string(),
+        );
+    }
     if abandon.is_none()
         && !opts.sign
         && !opts.resume

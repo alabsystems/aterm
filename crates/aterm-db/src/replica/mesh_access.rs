@@ -62,11 +62,18 @@ impl MeshAccess {
         self.replica()?.mesh_takes(table)
     }
 
-    /// A table's current operation identities, where selected.
+    /// A table's current operation identities, where selected, as a reconciliation snapshot.
     /// # Errors
     /// Fresh admission or [`Replica::mesh_inventory`] refuses.
-    pub fn table_inventory(&self, table: Digest) -> Result<Option<BTreeSet<Digest>>> {
+    pub fn table_inventory(&self, table: Digest) -> Result<Option<super::Snapshot>> {
         self.replica()?.mesh_inventory(table)
+    }
+
+    /// `ids` of a table in causal order.
+    /// # Errors
+    /// Fresh admission or [`Replica::mesh_order`] refuses.
+    pub fn table_order(&self, table: Digest, ids: &[Digest]) -> Result<Vec<Digest>> {
+        self.replica()?.mesh_order(table, ids)
     }
 
     /// Read outgoing operations under current custody, history and key eligibility.

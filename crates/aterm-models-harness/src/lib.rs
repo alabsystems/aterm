@@ -458,7 +458,8 @@ pub use models_cold_resume_capability::cold_resume_capability_model;
 pub use models_cold_resume_environment::cold_resume_environment_model;
 pub use models_custody::line_custody_model;
 pub use models_disk::{
-    disk_await_liveness, disk_await_model, disk_free_ask_model, disk_reclaim_pass_model,
+    disk_await_liveness, disk_await_model, disk_budget_pass_model, disk_free_ask_model,
+    disk_reclaim_pass_model,
 };
 pub use models_disk_discovery_cycle::disk_discovery_cycle_model;
 pub use models_disk_projected::disk_projected_hold_model;

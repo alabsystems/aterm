@@ -57,13 +57,50 @@ fn alab_pack_gate(program: &str, exposes: &[String]) -> Option<Box<StageGate>> {
 
 type StageGate = dyn Fn(&Path) -> Result<(), StageError>;
 
-fn stage_hooks(gate: Option<&StageGate>) -> crate::install::StageHooks<'_> {
+/// The stage's hooks: the pack gate, and the records the signed manifest keeps beside the build
+/// ([`crate::manifest::PkgManifest::kept`]).
+fn stage_hooks<'a>(
+    gate: Option<&'a StageGate>,
+    pkg: &'a crate::manifest::PkgManifest,
+) -> crate::install::StageHooks<'a> {
     crate::install::StageHooks {
         pre_swap: gate,
         sidecars: None,
+        records: &pkg.kept,
         aliases: &[],
         npm_package: None,
     }
+}
+
+/// Verify a package manifest's raw bytes under `index`, parse them, and fill what an install
+/// keeps of them ([`crate::harness_record::kept_sidecars`]).
+fn signed_parse(
+    index: &TrustedIndex,
+    raw: Vec<u8>,
+    sig: &[u8],
+) -> Result<crate::manifest::PkgManifest, FlowError> {
+    let verified = index
+        .verify_pkg(raw, sig)
+        .map_err(|_| FlowError::PkgVerify)?;
+    let mut pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
+    pkg.kept =
+        crate::harness_record::kept_sidecars(&pkg, (verified.as_slice(), sig), index.roster_pair());
+    Ok(pkg)
+}
+
+/// One leading harness per word: a build whose signed `[harness]` leads a word another
+/// harness already leads is not installed ([`crate::harness_record::admit_install`]).
+fn admit_harness(
+    layout: &Layout,
+    program: &str,
+    pkg: &crate::manifest::PkgManifest,
+) -> Result<(), FlowError> {
+    let Some(table) = &pkg.harness else {
+        return Ok(());
+    };
+    let trust = crate::harness_record::Trust::of_layout(layout);
+    crate::harness_record::admit_install(layout, program, table, &trust)
+        .map_err(FlowError::HarnessLead)
 }
 
 /// What [`Fetcher::vendor_get`] came back with (mirrors `aterm_update_core::VendorResponse`).
@@ -337,6 +374,8 @@ pub enum FlowError {
     InsufficientDisk { required: u64, available: u64 },
     /// The program is dev-linked (linkmode).
     Linked(String),
+    /// A harness build leads a word another installed harness leads.
+    HarnessLead(String),
     /// The vendor-direct lane did not install a vendor program.
     Vendor(String),
     /// The vendor's release channel was not reached.
@@ -410,6 +449,7 @@ impl std::fmt::Display for FlowError {
                 f,
                 "{p} is dev-linked; run `aterm pkg unlink {p}` to release it"
             ),
+            FlowError::HarnessLead(line) => f.write_str(line),
             FlowError::Vendor(line)
             | FlowError::VendorUnreachable(line)
             | FlowError::VendorUnavailable(line) => f.write_str(line),
@@ -444,6 +484,49 @@ fn reassert_witness(layout: &Layout, program: &str, build: u64) -> Result<(), Fl
         return Ok(());
     }
     activate_build(layout, &build_dir).map_err(|e| FlowError::Activate(e.to_string()))
+}
+
+/// KEEP THE RECORDS OF A LIVE HARNESS BUILD AN OLDER ATPKG INSTALLED: an up-to-date harness
+/// program whose build keeps no signed manifest (an atpkg that predates records staged it) has
+/// its manifest fetched and verified once ([`verified_package`]) and, when the store's tree is
+/// the signed one, its records kept beside it now
+/// ([`crate::harness_record::keep_beside`]), so its `[harness]` makes a row without waiting for
+/// its next build. Best-effort: a fetch or write that fails is tried again on the next pass.
+fn keep_live_harness_records(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    (index, repo): (&TrustedIndex, &str),
+    program: &str,
+    build: u64,
+    prepared: Option<&crate::manifest::PkgManifest>,
+) {
+    let build_dir = layout.build_dir(program, build);
+    if !crate::harness::is_harness(program)
+        || crate::harness_record::keeps_manifest(&build_dir)
+        || !crate::store::build_is_complete(&build_dir)
+    {
+        return;
+    }
+    let fetched;
+    let pkg = match prepared {
+        Some(pkg) => pkg,
+        None => {
+            let Ok(pair) = fetcher.pkg_manifest(repo, program, build) else {
+                return;
+            };
+            let Ok(pkg) = verified_package(index, pair, program, build) else {
+                return;
+            };
+            fetched = pkg;
+            &fetched
+        }
+    };
+    let signed = pkg
+        .artifact_for(crate::cli::current_triple())
+        .map(|a| a.tree_root.as_str());
+    if signed.is_some() && held_root(&build_dir).as_deref() == signed {
+        let _ = crate::harness_record::keep_beside(&build_dir, pkg);
+    }
 }
 
 /// Lay the shim of each command the up-to-date `build` exposes whose shim is gone or runs another
@@ -545,10 +628,7 @@ fn verified_package(
     program: &str,
     build: u64,
 ) -> Result<crate::manifest::PkgManifest, FlowError> {
-    let verified = index
-        .verify_pkg(raw.clone(), &sig)
-        .map_err(|_| FlowError::PkgVerify)?;
-    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
+    let pkg = signed_parse(index, raw, &sig)?;
     if !pkg.is_for(program) || pkg.build_number != build {
         return Err(FlowError::Mismatch);
     }
@@ -767,6 +847,14 @@ fn install_inner(
     ) {
         ApplyDecision::UpToDate => {
             reassert_witness(layout, program, pinned)?;
+            keep_live_harness_records(
+                fetcher,
+                layout,
+                (&index, repo.as_str()),
+                program,
+                pinned,
+                prepared.as_ref(),
+            );
             let shimmed = lay_commands_off_path(
                 fetcher,
                 layout,
@@ -909,9 +997,10 @@ fn install_inner(
         }
     }
 
+    admit_harness(layout, program, &pkg)?;
     let shim_env = pkg.shim_env();
     let alab_gate = alab_pack_gate(program, &pkg.exposes);
-    let hooks = stage_hooks(alab_gate.as_deref());
+    let hooks = stage_hooks(alab_gate.as_deref(), &pkg);
     let landed = land_artifact(
         layout,
         &Landing {
@@ -1418,10 +1507,7 @@ pub fn signed_pkg(
         note_fetch_fault();
         FlowError::PkgFetch(e)
     })?;
-    let verified = index
-        .verify_pkg(raw.clone(), &sig)
-        .map_err(|_| FlowError::PkgVerify)?;
-    let pkg = parse_pkg(&verified).map_err(pkg_parse_error)?;
+    let pkg = signed_parse(&index, raw, &sig)?;
     if !pkg.is_for(program) || pkg.build_number != build {
         return Err(FlowError::Mismatch);
     }
@@ -1481,6 +1567,19 @@ pub fn install_build(
     req: &InstallRequest<'_>,
     ask: NamedAsk<'_>,
 ) -> Result<NamedBuild, FlowError> {
+    install_signed_build(fetcher, layout, anchor, floor, now_unix, req, ask).map(|(named, _)| named)
+}
+
+/// [`install_build`], with the signed manifest it installed from.
+fn install_signed_build(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    now_unix: i64,
+    req: &InstallRequest<'_>,
+    ask: NamedAsk<'_>,
+) -> Result<(NamedBuild, crate::manifest::PkgManifest), FlowError> {
     let (program, triple) = (req.program, req.triple);
     let (build, expect_root) = (ask.build, ask.expect_root);
     let (repo, pkg) = signed_pkg(fetcher, layout, anchor, floor, now_unix, req, build)?;
@@ -1510,9 +1609,8 @@ pub fn install_build(
     if held_root(&build_dir).as_deref() == Some(artifact.tree_root.as_str()) {
         crate::trust_lock::mark_used(&build_dir)
             .map_err(|e| FlowError::Activate(format!("named build retention: {e}")))?;
-        return Ok(NamedBuild::Present {
-            tree_root: artifact.tree_root.clone(),
-        });
+        let tree_root = artifact.tree_root.clone();
+        return Ok((NamedBuild::Present { tree_root }, pkg));
     }
     if ask.retry {
         crate::store::clear_stage_refusal(&build_dir);
@@ -1554,12 +1652,16 @@ pub fn install_build(
         let _ = std::fs::remove_file(&dl);
         return Err(FlowError::Activate(format!("shim_env sidecar: {e}")));
     }
+    if let Err(e) = admit_harness(layout, program, &pkg) {
+        let _ = std::fs::remove_file(&dl);
+        return Err(e);
+    }
     let alab_gate = alab_pack_gate(program, &pkg.exposes);
     let staged = verify_and_stage(
         artifact,
         &dl,
         &build_dir,
-        &stage_hooks(alab_gate.as_deref()),
+        &stage_hooks(alab_gate.as_deref(), &pkg),
     );
     let tree_root = match staged {
         Ok(root) => root,
@@ -1581,7 +1683,7 @@ pub fn install_build(
     let _ = crate::store::write_version(&build_dir, &pkg.version);
     crate::trust_lock::mark_used(&build_dir)
         .map_err(|e| FlowError::Activate(format!("named build retention: {e}")))?;
-    Ok(NamedBuild::Staged { tree_root })
+    Ok((NamedBuild::Staged { tree_root }, pkg))
 }
 
 /// A NAMED BUILD STAGED ([`install_build`]) IS SETTLED BY ITS RESOLVE CHECK: one the check accepts
@@ -1649,6 +1751,58 @@ fn held_root(build_dir: &Path) -> Option<String> {
     }
     crate::trust_lock::recorded_root_at(build_dir)
         .or_else(|| crate::trust_lock::fold_and_record(build_dir).ok().flatten())
+}
+
+/// THE WAY BACK FOR A HARNESS: a harness build named by number ([`install_build`], verified and
+/// staged with its kept records), then made the live one and held there: `current` and its shims
+/// move to it, and a local pin ([`crate::pin`]) keeps every update pass, atpkg's and the
+/// harness's own, from moving them until the person names it to `aterm pkg update <id>`, which
+/// releases the hold. The hold is recorded as this install's ([`crate::pin::set_held`]), so a
+/// named update releases it and never a pin the person set; a harness the person had pinned
+/// already stays theirs. A build the store already holds is admitted as a staged one is: its
+/// signed `[harness]` may not lead a word another harness leads ([`admit_harness`]), and the
+/// records an older atpkg did not keep beside it are kept now
+/// ([`crate::harness_record::keep_beside`]). A dev-linked harness is refused, as an ordinary
+/// install refuses it.
+///
+/// # Errors
+/// As [`install_build`], a linked program, a word another harness leads, and a record,
+/// activation or pin that cannot be written.
+pub fn install_harness_build(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    floor: BuildFloor,
+    now_unix: i64,
+    req: &InstallRequest<'_>,
+    ask: NamedAsk<'_>,
+) -> Result<NamedBuild, FlowError> {
+    let program = req.program;
+    if crate::linkmode::is_linked(layout, program) {
+        return Err(FlowError::Linked(program.to_string()));
+    }
+    let (named, pkg) = install_signed_build(fetcher, layout, anchor, floor, now_unix, req, ask)?;
+    let build_dir = layout.build_dir(program, ask.build);
+    if matches!(named, NamedBuild::Present { .. }) {
+        admit_harness(layout, program, &pkg)?;
+        crate::harness_record::keep_beside(&build_dir, &pkg)
+            .map_err(|e| FlowError::Activate(format!("{program} {}'s records: {e}", ask.build)))?;
+    }
+    let tools = crate::store::recorded_exposes(&build_dir).ok_or_else(|| {
+        FlowError::Activate(format!("{program} {} records no exposed tools", ask.build))
+    })?;
+    activate_build(layout, &build_dir).map_err(|e| FlowError::Activate(e.to_string()))?;
+    let env = crate::shim_env::read_sidecar(&build_dir);
+    install_tools_env(layout, &build_dir, &tools, Aliases::Off, &env)
+        .map_err(|e| FlowError::Activate(e.to_string()))?;
+    let persons = crate::pin::is_pinned(layout, program).unwrap_or(false)
+        && !crate::pin::is_held(layout, program).unwrap_or(false);
+    if !persons {
+        crate::pin::set_pinned(layout, program, true)
+            .and_then(|_| crate::pin::set_held(layout, program, true))
+            .map_err(|e| FlowError::Activate(format!("pin {program}: {e}")))?;
+    }
+    Ok(named)
 }
 
 /// Re-point `program` at its retained build `to` (the vendor lane's signed-yank rollback).
@@ -3720,8 +3874,7 @@ fn verified_pkg_or_miss(
     let (raw, sig) = fetcher
         .pkg_manifest(&repo, program, pinned)
         .map_err(|_| false)?;
-    let verified = index.verify_pkg(raw.clone(), &sig).map_err(|_| true)?;
-    let pkg = parse_pkg(&verified).map_err(|_| true)?;
+    let pkg = signed_parse(index, raw, &sig).map_err(|_| true)?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
         return Err(true);
     }
@@ -3999,9 +4152,15 @@ fn stage_fetched(
         *why = note;
         return None;
     }
+    if let Err(e) = admit_harness(layout, program, &pkg) {
+        let _ = std::fs::remove_file(&dl);
+        eprintln!("{}", stage_failure_note(program, pinned, &e.to_string()));
+        *why = e.to_string();
+        return None;
+    }
     let extract_scope = crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let alab_gate = alab_pack_gate(program, &pkg.exposes);
-    let hooks = stage_hooks(alab_gate.as_deref());
+    let hooks = stage_hooks(alab_gate.as_deref(), &pkg);
     let staged = match streamed {
         Some(streamed) => finished_or_sidecar_gone(
             &build_dir,

@@ -14,9 +14,8 @@ pub(crate) enum Point {
     /// current.
     BeforeCurrent,
     /// The gate of a held read is asked and has read nothing yet. Asked by a read
-    /// (`catalog::Directory::observe_displaced`), the ordinary observation of the table has
-    /// refused and no recovery replica has answered, neither of them busy, and the held open
-    /// has not begun.
+    /// (`catalog::Directory::observe_held`), the ordinary observation of the table has refused,
+    /// not busy, and neither the held open nor the table's recovery replica has been asked.
     HeldGate,
 }
 

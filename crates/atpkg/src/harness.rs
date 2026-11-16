@@ -14,8 +14,8 @@
 //! ([`crate::manifest::Index::installable`]): the passes install it unasked and keep it current,
 //! and only `[packages].exclude` or a person's uninstall keeps it out (docs/OWNER_RULINGS.md,
 //! 2026-10-27; that page's §11 D45). The name still decides
-//! two things: no `alab-<tool>` alias is laid for a harness (D13), and only the harness
-//! [`twin_harness`] names runs a vendor's sessions.
+//! two things: no `alab-<tool>` alias is laid for a harness (D13), and only the harness the
+//! registry says leads a word ([`twin_harness`]) runs that vendor's sessions.
 
 /// The suffix the one-word rule gives every harness program.
 pub const SUFFIX: &str = "-alab";
@@ -40,17 +40,14 @@ pub const fn is_harness(program: &str) -> bool {
 }
 
 /// The harness a vendor program's `agents/` twin hands its session to once that harness is
-/// installed, as `(program, tool)` (`docs/DESIGN-harness-repos-2026-10-24.md` §11 D32). A
-/// claiming harness also joins `crates/aterm-agent/src/harness/contract.rs`'s `ROSTER` in the
-/// same change. kimi-alab claims `relaunch,upgrade`; its process handoff also needs the Kimi
-/// program mapping in `aterm-agent-names`.
+/// installed, as `(id, tool)`: the registry row that leads `vendor`
+/// ([`crate::harness_record::Composition::leader_of`], `docs/HARNESS-CONTRACT.md` §2).
 #[must_use]
-pub const fn twin_harness(vendor: &str) -> Option<(&'static str, &'static str)> {
-    match vendor.as_bytes() {
-        b"grok" => Some(("grok-alab", "grok-alab")),
-        b"kimi" => Some(("kimi-alab", "kimi-alab")),
-        _ => None,
-    }
+pub fn twin_harness(layout: &crate::store::Layout, vendor: &str) -> Option<(String, String)> {
+    let trust = crate::harness_record::Trust::of_layout(layout);
+    crate::harness_record::compose(layout, &crate::config::load_harness(), &trust)
+        .leader_of(vendor)
+        .map(|row| (row.declaration.id.clone(), row.declaration.tool.clone()))
 }
 
 /// The receipt a local harness artifact directory carries (`atpkg-publish build-local`).
@@ -280,14 +277,17 @@ pub fn store_build_version_of_exe(
     if parts.next()?.as_os_str() != "bin" {
         return None;
     }
-    let tool = crate::store::ToolName::new(parts.next()?.as_os_str().to_str()?)?;
+    // The file is the store's own spelling of the tool's executable
+    // ([`crate::store::ToolName::exe_file`]: `<tool>.exe` on Windows, the tool itself elsewhere).
+    let file = parts.next()?.as_os_str().to_str()?;
+    let tool = crate::store::ToolName::new(file.strip_suffix(crate::platform::EXE_SUFFIX)?)?;
     if parts.next().is_some() || tool.as_str() != default_harness_tool(program) {
         return None;
     }
     let dir = layout.build_dir(program, build);
     let dir_meta = std::fs::symlink_metadata(&dir).ok()?;
     let bin_meta = std::fs::symlink_metadata(dir.join("bin")).ok()?;
-    let exe_meta = std::fs::symlink_metadata(dir.join("bin").join(tool.as_str())).ok()?;
+    let exe_meta = std::fs::symlink_metadata(dir.join("bin").join(file)).ok()?;
     if !dir_meta.file_type().is_dir()
         || crate::platform::is_reparse(&dir_meta)
         || !bin_meta.file_type().is_dir()

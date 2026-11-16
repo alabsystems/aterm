@@ -431,7 +431,11 @@ pub(crate) fn recipient_label(log: &Log, recipient: &Recipient) -> String {
 }
 
 /// A Mac's label as this log shows it: its member label, else its seat's.
-fn label_of(log: &Log, membership: &crate::membership_log::Membership, actor: &MemberId) -> String {
+pub(super) fn label_of(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    actor: &MemberId,
+) -> String {
     membership
         .label(actor)
         .map(str::to_owned)
@@ -851,7 +855,9 @@ pub fn on_table_cuts(cut: TableCuts) {
 /// cutoff of its own, read from a replica that may be behind, would cut honest operations the
 /// first remover kept; the share only replaces a cutoff an earlier attempt of its left
 /// ([`CutPass::Share`]). A table this pass could not cut is one [`cut_own_removals`] signs at the
-/// node service's next start.
+/// node service's next start. A person's removal whose writer successors include this Mac's own
+/// seat cuts nothing: [`draft_removal`] refuses it (a Mac does not remove itself), so no `Remove`
+/// follows that its cuts would precede.
 fn cut_tables_first(paths: &Paths, target: Target<'_>) {
     let Some(cut) = TABLE_CUTS.get() else {
         return;
@@ -869,7 +875,11 @@ fn cut_tables_first(paths: &Paths, target: Target<'_>) {
             let Ok((target, recipient, _)) = named_target(&log, target, &me) else {
                 return;
             };
-            (target, heirs_of(&log, &membership, &target, &recipient))
+            let heirs = heirs_of(&log, &membership, &target, &recipient);
+            if heirs.contains(&me) {
+                return;
+            }
+            (target, heirs)
         }
     };
     let pass = if membership.removal(&target).is_none() {
@@ -888,7 +898,10 @@ fn cut_tables_first(paths: &Paths, target: Target<'_>) {
 }
 
 /// [`cut_tables_first`] for a vault revocation or retirement, which names its targets by
-/// recipient: each current seat bound to one of `recipients`.
+/// recipient: each current seat bound to one of `recipients` or to one of their writer
+/// successors' ([`with_successors`]), which the removal takes out with them. Where those seats
+/// include this Mac's own, it cuts nothing: the removal is refused (a member does not remove
+/// itself), so no `Remove` follows that its cuts would precede.
 pub(super) fn cut_tables_for_recipients(paths: &Paths, recipients: &[Recipient]) {
     if TABLE_CUTS.get().is_none() {
         return;
@@ -896,13 +909,19 @@ pub(super) fn cut_tables_for_recipients(paths: &Paths, recipients: &[Recipient])
     let Ok(Some(log)) = trusted_store(paths).map(|s| s.and_then(|s| s.log().cloned())) else {
         return;
     };
+    let gone = with_successors(&log, &recipients.iter().copied().collect());
     let targets: Vec<MemberId> = log
         .membership()
         .members()
         .iter()
-        .filter(|(_, member)| recipients.contains(&member.binding.recipient()))
+        .filter(|(_, member)| gone.contains(&member.binding.recipient()))
         .map(|(actor, _)| *actor)
         .collect();
+    if let Ok(Some((me, _, _))) = log_entries::open_local_member_signer(paths, &log)
+        && targets.contains(&me)
+    {
+        return;
+    }
     for target in targets {
         cut_tables_first(paths, Target::Actor(target));
     }
@@ -942,34 +961,80 @@ pub fn cut_own_removals(paths: &Paths) -> usize {
 }
 
 /// The writer successors a person's removal of the Mac whose seat is `target` (its age recipient
-/// `recipient`) takes out with it: every seat below the Mac's own seats, the one named and each
-/// other seat of its recipient, in or out, in a succession the log holds
-/// (`super::successor::Lineages`). A successor is the same Mac's writer under an age identity of
-/// its own, on the same disk: left in, it would be wrapped every epoch minted after the removal.
+/// `recipient`) takes out with it: [`successors_of`] that recipient, with `target` among the
+/// Mac's seats.
 fn heirs_of(
     log: &Log,
     membership: &crate::membership_log::Membership,
     target: &MemberId,
     recipient: &Recipient,
 ) -> BTreeSet<MemberId> {
-    let mut seats = BTreeSet::from([*target]);
+    successors_below(
+        log,
+        membership,
+        BTreeSet::from([*target]),
+        &BTreeSet::from([*recipient]),
+    )
+}
+
+/// The writer successors a removal of the Macs whose age recipients are `recipients` takes out
+/// with them: every seat below one of the Macs' seats (each seat of one of `recipients`, in or
+/// out) in a succession the log holds (`super::successor::Lineages`), other than those seats. A
+/// successor is the same Mac's writer under an age identity of its own, on the same disk: left
+/// in, it would be wrapped every epoch minted after the removal. Every removal takes them out
+/// with the Mac: a person's by a word or a seat ([`heirs_of`]), and those that name the Mac by
+/// its age recipient alone, the admin's `aterm secrets revoke` and `retire` (through
+/// [`with_successors`]) and an edit of the vault that puts the Mac's key on a `code-only` line.
+pub(super) fn successors_of(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    recipients: &BTreeSet<Recipient>,
+) -> BTreeSet<MemberId> {
+    successors_below(log, membership, BTreeSet::new(), recipients)
+}
+
+/// [`successors_of`] `recipients`, with `seats` among the Macs' seats.
+fn successors_below(
+    log: &Log,
+    membership: &crate::membership_log::Membership,
+    mut seats: BTreeSet<MemberId>,
+    recipients: &BTreeSet<Recipient>,
+) -> BTreeSet<MemberId> {
     seats.extend(
         membership
             .members()
             .iter()
-            .filter(|(_, member)| member.binding.recipient() == *recipient)
+            .filter(|(_, member)| recipients.contains(&member.binding.recipient()))
             .map(|(actor, _)| *actor),
     );
     seats.extend(
         membership
             .removed()
             .keys()
-            .filter(|actor| seat_of(log, actor).is_some_and(|(seat, _, _)| seat == *recipient))
+            .filter(|actor| {
+                seat_of(log, actor).is_some_and(|(seat, _, _)| recipients.contains(&seat))
+            })
             .copied(),
     );
+    if seats.is_empty() {
+        return BTreeSet::new();
+    }
     let mut heirs = super::successor::Lineages::of(log).under(&seats);
     heirs.retain(|heir| !seats.contains(heir));
     heirs
+}
+
+/// Every age recipient a removal of the Macs whose age recipients are `recipients` takes out of
+/// `log`: `recipients`, and that of each of their writer successors ([`successors_of`]), in or
+/// out. No epoch the removal mints is wrapped to one of them.
+pub(super) fn with_successors(log: &Log, recipients: &BTreeSet<Recipient>) -> BTreeSet<Recipient> {
+    let mut gone = recipients.clone();
+    gone.extend(
+        successors_of(log, &log.membership(), recipients)
+            .iter()
+            .filter_map(|heir| seat_of(log, heir).map(|(recipient, _, _)| recipient)),
+    );
+    gone
 }
 
 /// What a draft signed, beside what it reports to the person (its refusal, where it refused).
@@ -1069,7 +1134,7 @@ fn draft_removal(
         let heirs = heirs_of(&log, &membership, &target, &recipient);
         if heirs.contains(&actor) {
             return refuse(Error::new(format!(
-                "this Mac's seat is a writer successor of {label}, and a person's removal takes                  a Mac's successors out with it: a Mac does not remove itself"
+                "this Mac's seat is a writer successor of {label}, and a person's removal takes a Mac's successors out with it: a Mac does not remove itself"
             )));
         }
         heirs
@@ -2279,7 +2344,7 @@ impl NodePass {
     fn materialize(&mut self, paths: &Paths, deadline: Instant) -> crate::Result<Option<u64>> {
         let config = configured(paths)?;
         let before = load_state(paths)?;
-        let kept = self.repaired.clone();
+        let kept = self.repaired;
         let unfinished = before.membership == Stored::In && before.failed;
         let repair = !unfinished && self.repair_due(paths, &before);
         let moved = log_entries::current_records_digest(paths, &config, &before)
@@ -2966,7 +3031,13 @@ fn stop_holds_removals() -> bool {
 ///   records and in wire bytes, what the re-keys a held `Remove` made due still owe
 ///   ([`log_entries::owed_rekeys`]; one-mesh proofs P6, F2 and F6: the stop alone left a large
 ///   lab's reserve to an automatic batch, and bytes no room at all). One that would pass either
-///   stays due and waits for checkpoints or for the owed re-keys, nothing signed.
+///   stays due and waits for checkpoints or for the owed re-keys, nothing signed;
+/// - of those, one no Mac waits on ([`crate::membership_log::RekeyDue::waited_on`]: a reseal of
+///   an audience every seat already opens whole) also stays within the stop of an automatic
+///   write, seven eighths of the byte bound ([`crate::membership_log::budgets::author_stop`]).
+///   A coalesce is never held to it: every member's `[everyone]` write waits on one
+///   (`log_entries::member`'s `KeysUnsettled`), so a class stop there would refuse, without a
+///   word, a person's write the log still has room for. Nor is a reseal a reader waits on.
 fn within_automatic_stop(
     log: &Log,
     opened: &OpenedAudienceEntries,
@@ -2978,10 +3049,18 @@ fn within_automatic_stop(
     // kernel), and every one under the `STOP_HOLDS_REMOVALS` mutant.
     let judged =
         |rotation: bool| stop_holds_removals() || aterm_mesh_core::capacity::stop_judges(rotation);
-    let made_by_removal: BTreeSet<EpochAudience> = log
-        .rekey_dues()
-        .into_iter()
+    let dues = log.rekey_dues();
+    let made_by_removal: BTreeSet<EpochAudience> = dues
+        .iter()
         .filter(|due| !judged(due.rotation))
+        .map(|due| due.audience.clone())
+        .collect();
+    // The re-keys no Mac waits on, which alone the automatic byte stop holds; every one under
+    // the `AUTOMATIC_STOP_HOLDS_WAITED` mutant.
+    let membership = log.membership_ref();
+    let unwaited: BTreeSet<EpochAudience> = dues
+        .into_iter()
+        .filter(|due| automatic_stop_holds_waited() || !due.waited_on(membership))
         .map(|due| due.audience)
         .collect();
     let removed = log.removed_recipients();
@@ -3019,9 +3098,13 @@ fn within_automatic_stop(
         log.budgets().keyed,
         crate::membership_log::budgets::held_bytes_bound(),
     );
+    let byte_stop =
+        crate::membership_log::budgets::author_stop(crate::membership_log::Class::Automatic);
     for audience in rest {
         let more = cost(&audience);
         if keeps_room(wide(planned.keyed), wide(more.keyed), 0, wide(stop))
+            && (!unwaited.contains(&audience)
+                || keeps_room(wide(planned.bytes), wide(more.bytes), 0, wide(byte_stop)))
             && keeps_room(
                 wide(planned.keyed),
                 wide(more.keyed),
@@ -3050,6 +3133,25 @@ thread_local! {
     /// re-key needs.
     pub(super) static AUTOMATIC_IGNORES_OWED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`within_automatic_stop`], on for one test thread: the automatic byte stop
+    /// holds every re-key no removal made due, a coalesce every member's write waits on too, as
+    /// FL-145 first had it.
+    pub(super) static AUTOMATIC_STOP_HOLDS_WAITED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn automatic_stop_holds_waited() -> bool {
+    AUTOMATIC_STOP_HOLDS_WAITED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn automatic_stop_holds_waited() -> bool {
+    false
 }
 
 #[cfg(test)]

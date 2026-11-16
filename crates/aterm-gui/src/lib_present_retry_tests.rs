@@ -74,7 +74,8 @@ fn a_dropped_echo_frame_reaches_glass_on_the_retry_for_every_drop_reason() {
             "{case:?}: gated before the retry"
         );
 
-        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut field_guard_ws = app.windows.get_mut(&wid).unwrap();
+        let ws = &mut **field_guard_ws;
         let fired = match ws.present_retry.deadline {
             Some(deadline) => service_due_presentation_clocks(
                 false,
@@ -93,6 +94,7 @@ fn a_dropped_echo_frame_reaches_glass_on_the_retry_for_every_drop_reason() {
             }
         };
         assert!(fired, "{case:?}: the retry fires");
+        drop(field_guard_ws);
         app.redraw_window(wid);
         assert_eq!(
             surface(&mut app).commits(),
@@ -670,7 +672,7 @@ fn successful_present_permanently_closes_bootstrap_retry() {
 
     assert!(model.fire("Present", &mut model_state));
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.on_present_succeeded();
         assert!(!window.bootstrap_present_retry_available);
         assert_matches(&model_state, &window.present_retry, Instant::now(), false);
@@ -679,7 +681,7 @@ fn successful_present_permanently_closes_bootstrap_retry() {
     assert!(model.fire("ForcedStimulus", &mut model_state));
     let mut requests = 0;
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         assert!(rearm_present_and_request(
             &mut window.present_retry,
             true,
@@ -715,7 +717,7 @@ fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
 
     assert!(model.fire("SynchronousStimulus", &mut model_state));
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         assert!(window.present_retry.on_external_stimulus());
         assert!(window.bootstrap_present_retry_available);
         assert_matches(&model_state, &window.present_retry, Instant::now(), true);
@@ -746,7 +748,7 @@ fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
     );
     assert!(model.fire("SynchronousStimulus", &mut model_state));
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         assert!(window.present_retry.on_external_stimulus());
         assert!(window.present_retry.recovery_redraw_outstanding);
         assert!(!window.bootstrap_present_retry_available);
@@ -764,7 +766,7 @@ fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
 
     assert!(model.fire("SynchronousStimulus", &mut model_state));
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         assert!(window.present_retry.on_external_stimulus());
         assert!(!window.bootstrap_present_retry_available);
         assert_matches(&model_state, &window.present_retry, deadline, false);

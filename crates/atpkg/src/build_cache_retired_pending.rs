@@ -78,8 +78,12 @@ impl Identity {
     }
 }
 
+/// Where `path` lies: its folder resolved and spelled as git spells it ([`super::git_path`]: no
+/// Windows verbatim drive prefix, so it is the path git lists and a caller holds), then its own
+/// name, which may be gone. `None` where its folder cannot be resolved.
 pub(super) fn location(path: &Path) -> Option<PathBuf> {
-    Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
+    let folder = path.parent()?.canonicalize().ok()?;
+    Some(super::git_path(&folder).join(path.file_name()?))
 }
 
 /// The folder of `checkout`'s linked worktrees' receipts.

@@ -903,6 +903,8 @@ pub fn calm_1510() -> Scene {
             wired: 4 << 30,
             compressed: Some(0),
             available: 108 << 30,
+            swap_used: Some(0),
+            swap_total: Some(0),
             pressure: Pressure::Normal,
             counters: Some(MemCounters::default()),
             ..MemSample::default()

@@ -933,6 +933,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
             by: "0a0b".into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         },
     );
     main.sample = Some(Sample {
@@ -1460,6 +1461,7 @@ fn a_wall_stands_until_its_instant_and_not_a_second_longer() {
         by: String::new(),
         attempts,
         cleared: false,
+        seen: None,
     };
     let reset = NOW + HOUR;
     let cases = [
@@ -1901,6 +1903,7 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
             (
                 "pool-a".to_string(),
                 Ok(Rank {
+                    borrowed: false,
                     low: false,
                     class: Class::Pool,
                     week_reset: None
@@ -4444,6 +4447,7 @@ fn a_stamp_ahead_of_the_clock_is_not_recent_and_shadows_nothing() {
             by: "0a0b".into(),
             attempts: 0,
             cleared: false,
+            seen: None,
         }
     );
     let mut s = state();
@@ -6416,6 +6420,7 @@ fn the_recorder_records_this_process_wall_for_its_account_once() {
             by: state.machine.clone(),
             attempts: 0,
             cleared: false,
+            seen: None,
         }
     );
     assert_eq!(
@@ -8505,6 +8510,222 @@ fn a_refill_inside_a_window_lifts_the_wall_it_replaced_and_wakes_the_wait() {
     );
 }
 
+/// The week was raised (a plan change) while no session on the row was served: the held figure
+/// says 99% and a Claude Code that began after it was read says 69% of the same week. That
+/// process was served only after the held figure, so the drop is a refill: the figure opens the
+/// window's epoch, journaled at the figure's instant for that window alone, lifts the wall of the
+/// old allowance, and the row is no longer `low`. A later figure of that process (its first held
+/// back or without the window) and a drop of exactly [`REFILL_UNSEEN_MIN_X10`] show it as well.
+/// CONTROLS: a process that began before or at the instant the held figure was read, a process of
+/// unknown age, a drop under the bound, and a held figure another machine dated each leave the
+/// held figure.
+#[test]
+fn a_new_process_reading_clearly_less_of_the_same_week_opens_its_epoch() {
+    let reset = NOW + 3 * DAY;
+    let week = |pct_x10: u32| {
+        Some(WindowRead {
+            pct_x10,
+            reset,
+            refilled: None,
+        })
+    };
+    let run_with = |pct_x10: u32,
+                    born: Option<i64>,
+                    seen_before: bool,
+                    read_at: i64,
+                    read_reset: i64,
+                    edit: &dyn Fn(&mut WindowFig)| {
+        let mut s = state();
+        let held = TapRead {
+            seven_day: week(990),
+            at: NOW - HOUR,
+            seen_before: true,
+            ..TapRead::default()
+        };
+        note_reading(&mut s, "main", &held, NOW - HOUR);
+        note_wall(
+            &mut s,
+            "main",
+            WEEK_LIMIT,
+            Some(reset),
+            NOW - HOUR,
+            NOW - HOUR,
+        );
+        if let Some(fig) = s
+            .accounts
+            .get_mut("main")
+            .and_then(|a| a.windows.get_mut(WEEK_LIMIT))
+        {
+            edit(fig);
+        }
+        let first = TapRead {
+            seven_day: Some(WindowRead {
+                pct_x10,
+                reset: read_reset,
+                refilled: None,
+            }),
+            at: read_at,
+            seen_before,
+            born,
+            ..TapRead::default()
+        };
+        let events = note_reading(&mut s, "main", &first, NOW);
+        (s, events)
+    };
+    let run = |pct_x10: u32, born: Option<i64>, seen_before: bool, held_by: &str| {
+        let held_by = held_by.to_owned();
+        run_with(
+            pct_x10,
+            born,
+            seen_before,
+            NOW,
+            reset,
+            &move |fig: &mut WindowFig| {
+                fig.by.clone_from(&held_by);
+            },
+        )
+    };
+    let here = state().machine;
+
+    for (why, pct_x10, seen_before) in [
+        ("its first figure", 690, false),
+        ("a later figure of the same process", 690, true),
+        (
+            "a drop of exactly the bound",
+            990 - REFILL_UNSEEN_MIN_X10,
+            false,
+        ),
+    ] {
+        let (s, events) = run(pct_x10, Some(NOW - MIN), seen_before, &here);
+        let kinds: Vec<Kind> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [Kind::Reset, Kind::Wall, Kind::Sample],
+            "{why}: {events:?}"
+        );
+        assert_eq!(events[0].t, NOW, "{why}: the refill is dated by its figure");
+        assert_eq!(events[0].refilled, [WEEK_LIMIT], "{why}");
+        assert!(
+            events[0].why.contains("refilled or raised"),
+            "{why}: {}",
+            events[0].why
+        );
+        let a = &s.accounts["main"];
+        let fig = &a.windows[WEEK_LIMIT];
+        assert_eq!((fig.pct_x10, fig.epoch_at), (pct_x10, Some(NOW)), "{why}");
+        assert_eq!(
+            a.sample.as_ref().and_then(|x| x.week_pct),
+            Some(pct_x10 / 10),
+            "{why}"
+        );
+        assert_eq!(
+            a.limited_until(NOW),
+            None,
+            "{why}: the old allowance's wall is lifted"
+        );
+        assert_eq!(a.low_until(NOW), None, "{why}");
+    }
+
+    for (why, (s, events)) in [
+        (
+            "a process older than the held figure",
+            run(690, Some(NOW - 2 * HOUR), false, &here),
+        ),
+        (
+            "a process begun the instant the held figure was read",
+            run(690, Some(NOW - HOUR), false, &here),
+        ),
+        ("a process of unknown age", run(690, None, false, &here)),
+        (
+            "a drop under the bound",
+            run(
+                990 - REFILL_UNSEEN_MIN_X10 + 1,
+                Some(NOW - MIN),
+                false,
+                &here,
+            ),
+        ),
+        (
+            "a held figure another machine dated",
+            run(690, Some(NOW - MIN), false, "ffff"),
+        ),
+    ] {
+        assert!(
+            events.iter().all(|e| e.kind == Kind::Sample),
+            "NEGATIVE CONTROL: {why}: {events:?}"
+        );
+        let a = &s.accounts["main"];
+        assert_eq!(
+            (
+                a.windows[WEEK_LIMIT].pct_x10,
+                a.windows[WEEK_LIMIT].epoch_at
+            ),
+            (990, None),
+            "NEGATIVE CONTROL: {why}"
+        );
+        assert!(a.limited_until(NOW).is_some(), "NEGATIVE CONTROL: {why}");
+    }
+
+    // CONTROLS on the guards no case above reaches: a held figure a limit reset spent after it
+    // has cut (its epoch stands; only the same-process rule may move it), a figure of a later
+    // reset (a new window, which begins empty and needs no epoch), and a figure dated at the held
+    // figure's own instant (a carried `at`).
+    let spent = NOW - HOUR + 1;
+    for (why, (s, events), epoch) in [
+        (
+            "a held figure a spent reset cut",
+            run_with(
+                690,
+                Some(NOW - MIN),
+                true,
+                NOW,
+                reset,
+                &|f: &mut WindowFig| {
+                    f.epoch_at = Some(spent);
+                },
+            ),
+            Some(spent),
+        ),
+        (
+            "a figure of a later reset than the held one",
+            run_with(
+                690,
+                Some(NOW - MIN),
+                false,
+                NOW,
+                reset + DAY,
+                &|_: &mut WindowFig| {},
+            ),
+            None,
+        ),
+        (
+            "a figure dated at the held figure's instant",
+            run_with(
+                690,
+                Some(NOW - MIN),
+                false,
+                NOW - HOUR,
+                reset,
+                &|_: &mut WindowFig| {},
+            ),
+            None,
+        ),
+    ] {
+        assert!(
+            !events.iter().any(|e| e.kind == Kind::Reset),
+            "NEGATIVE CONTROL: {why}: {events:?}"
+        );
+        assert_eq!(
+            s.accounts["main"]
+                .windows
+                .get(WEEK_LIMIT)
+                .and_then(|f| f.epoch_at),
+            epoch,
+            "NEGATIVE CONTROL: {why}"
+        );
+    }
+}
+
 #[test]
 fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
     let reset = NOW + 3 * HOUR;
@@ -9486,6 +9707,153 @@ fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the
     );
     assert_eq!(cond(&r, &refilled, "main", NOW), Condition::Usable);
     assert!(!refilled.accounts["main"].leave_early(NOW));
+}
+
+/// A row seen on m2 on 2026-11-15: Claude Code warned that 99% of the week was used, and a day
+/// later the same week (one reset) read 69% used, the plan having grown between. The warning's
+/// figure is from before that change, so it marks the row neither `low` nor warned, rotates
+/// nothing off it and says no full week; so too where the window's refill barrier falls after the
+/// warning, with no reading at all. CONTROLS: a reading before the warning, of its instant, less
+/// than [`WARNING_END_DROP_PCT`] lower, as much or more, or of a window that had reset by the
+/// warning's time, leaves the warning standing.
+#[test]
+fn a_reading_after_a_warning_that_finds_less_used_ends_the_warning_and_no_other_reading_does() {
+    let r = three();
+    let (week_end, session_end) = (NOW + 3 * DAY, NOW + 3 * HOUR);
+    let (week_said, session_said) = (NOW - DAY, NOW - HOUR);
+    let with = |sample: Option<Sample>, windows: BTreeMap<String, WindowFig>| {
+        let mut s = on_main();
+        s.accounts.insert(
+            "main".into(),
+            Account {
+                credits: Some(org_off()),
+                warned_week: Some(WindowSaid {
+                    pct: Some(99),
+                    reset: Some(week_end),
+                    at: week_said,
+                }),
+                warned_session: Some(WindowSaid {
+                    pct: Some(95),
+                    reset: Some(session_end),
+                    at: session_said,
+                }),
+                sample,
+                windows,
+                ..Account::default()
+            },
+        );
+        s
+    };
+    let state = |week: (u32, i64), session: (u32, i64)| {
+        with(
+            Some(Sample {
+                week_pct: Some(week.0),
+                week_reset: Some(week_end),
+                week_read_at: Some(week.1),
+                session_pct: Some(session.0),
+                session_reset: Some(session_end),
+                session_read_at: Some(session.1),
+                at: week.1.max(session.1),
+                ..Sample::default()
+            }),
+            BTreeMap::new(),
+        )
+    };
+    let full = |s: &State| {
+        windows_full(&r, s, NOW)
+            .into_iter()
+            .map(|full| full.label)
+            .collect::<Vec<_>>()
+    };
+    let ended = |why: &str, s: &State| {
+        let a = &s.accounts["main"];
+        assert_eq!(
+            (a.week_warning(), a.session_warning()),
+            (None, None),
+            "{why}"
+        );
+        assert_eq!(a.low_until(NOW), None, "{why}");
+        assert!(!a.warned(NOW) && !a.leave_early(NOW), "{why}");
+        assert_eq!(cond(&r, s, "main", NOW), Condition::Usable, "{why}");
+        assert!(full(s).is_empty(), "{why}");
+    };
+    let stands = |why: &str, s: &State| {
+        let a = &s.accounts["main"];
+        assert!(
+            a.week_warning().is_some() && a.session_warning().is_some(),
+            "NEGATIVE CONTROL: {why}"
+        );
+        assert_eq!(a.low_until(NOW), Some(week_end), "{why}");
+        assert!(a.warned(NOW) && a.leave_early(NOW), "{why}");
+        assert_eq!(cond(&r, s, "main", NOW), Condition::Low, "{why}");
+        assert_eq!(full(s), ["main"], "{why}");
+    };
+
+    ended(
+        "a later reading clearly lower",
+        &state((69, NOW), (40, NOW)),
+    );
+    let drop = WARNING_END_DROP_PCT;
+    ended(
+        "a later reading of the week lower by the drop",
+        &state((99 - drop, NOW), (40, NOW)),
+    );
+    let refilled = |at: i64, reset: i64| WindowFig {
+        pct_x10: 30,
+        reset,
+        at,
+        by: String::new(),
+        source: SOURCE_TAP.to_owned(),
+        epoch_at: Some(at),
+    };
+    ended(
+        "a refill barrier after the warning",
+        &with(
+            None,
+            BTreeMap::from([
+                (WEEK_LIMIT.to_owned(), refilled(NOW - MIN, week_end)),
+                (SESSION_LIMIT.to_owned(), refilled(NOW - MIN, session_end)),
+            ]),
+        ),
+    );
+
+    stands(
+        "a reading before the warning",
+        &state((69, week_said - DAY), (40, session_said - HOUR)),
+    );
+    stands(
+        "a later reading of the warning's instant",
+        &state((69, week_said), (40, session_said)),
+    );
+    stands(
+        "a later reading less than the drop lower",
+        &state((99 - drop + 1, NOW), (95 - drop + 1, NOW)),
+    );
+    stands(
+        "a later reading as much or more",
+        &state((99, NOW), (97, NOW)),
+    );
+    let mut closed = state((10, NOW), (5, NOW));
+    let sample = closed
+        .accounts
+        .get_mut("main")
+        .and_then(|a| a.sample.as_mut())
+        .expect("its sample");
+    (sample.week_reset, sample.session_reset) = (Some(week_said), Some(session_said));
+    stands("a reading of a window reset by the warning's time", &closed);
+    stands(
+        "a refill barrier before the warning",
+        &with(
+            None,
+            BTreeMap::from([
+                (WEEK_LIMIT.to_owned(), refilled(week_said - MIN, week_end)),
+                (
+                    SESSION_LIMIT.to_owned(),
+                    refilled(session_said - MIN, session_end),
+                ),
+            ]),
+        ),
+    );
 }
 
 /// Two rows: `main` with no dir and `work` at `/logins/work`, absolute on this host ([`at`]).
@@ -11342,6 +11710,409 @@ fn weeks_said_loads_only_the_weeks_a_screen_names() {
     );
 }
 
+/// A LIMIT WALL WALLS ITS LIMIT'S HANDOFFS ALONE: a wall of the Codex limit `codex_other`
+/// ([`limit_wall`]) is recorded under its id in [`Account::limit_walls`], with its reset, and
+/// nowhere in [`Account::walls`], so the row is no less fresh for every other decision: it is not
+/// [`Account::limited_until`] anything, its condition stays fresh, it is not walled at any time
+/// ([`Account::walled_at`]) and the wall alone is no observation ([`Account::observed`]). Only
+/// [`Account::limit_wall_until`] of that limit holds it, to the reset and its grace. A window name
+/// whose limit is no id (`limit:codex`, `limit:Codex-Other`) is an ordinary window's. CONTROL: the
+/// five-hour wall at the same reset makes the row Limited.
+#[test]
+fn a_limit_wall_walls_its_limits_handoffs_alone() {
+    let roster = three();
+    let until = NOW + 2 * HOUR;
+    let mut s = on_main();
+    fresh(&mut s, "work-2");
+    let events = note_wall(
+        &mut s,
+        "work-2",
+        &limit_wall("codex_other"),
+        Some(until),
+        NOW - MIN,
+        NOW,
+    );
+    assert_eq!(events.first().map(|e| e.kind), Some(Kind::Wall));
+    let account = s.account("work-2");
+    assert!(account.walls.is_empty(), "{:?}", account.walls);
+    assert_eq!(
+        account.limit_walls.keys().collect::<Vec<_>>(),
+        ["codex_other"]
+    );
+    assert_eq!(account.limit_walls["codex_other"].until, Some(until));
+    assert_eq!(account.limited_until(NOW), None);
+    assert_eq!(account.walled_at(), None);
+    assert!(cond(&roster, &s, "work-2", NOW).fresh());
+    assert_eq!(
+        account.limit_wall_until("codex_other", NOW),
+        Some(until + RESET_GRACE_S)
+    );
+    assert_eq!(account.limit_wall_until("codex_another", NOW), None);
+    assert_eq!(
+        account.limit_wall_until("codex_other", until + RESET_GRACE_S),
+        None,
+        "it ends with its reset's grace"
+    );
+    let mut bare = state();
+    note_wall(
+        &mut bare,
+        "pool-a",
+        &limit_wall("codex_other"),
+        Some(until),
+        NOW - MIN,
+        NOW,
+    );
+    assert!(
+        !bare.account("pool-a").observed(),
+        "a limit wall alone is no observation"
+    );
+    for ordinary in ["limit:codex", "limit:Codex-Other"] {
+        let mut s = on_main();
+        note_wall(&mut s, "work-2", ordinary, Some(until), NOW - MIN, NOW);
+        assert!(s.account("work-2").limit_walls.is_empty(), "{ordinary}");
+        assert!(
+            s.account("work-2").walls.contains_key(ordinary),
+            "{ordinary}"
+        );
+    }
+    let mut control = on_main();
+    fresh(&mut control, "work-2");
+    note_wall(
+        &mut control,
+        "work-2",
+        SESSION_LIMIT,
+        Some(until),
+        NOW - MIN,
+        NOW,
+    );
+    assert!(matches!(
+        cond(&roster, &control, "work-2", NOW),
+        Condition::Limited { .. }
+    ));
+}
+
+/// A LIMIT WALL IS KEPT IN `state.json` UNDER ITS OWN KEY, ONLY WHERE THERE IS ONE: a state with
+/// one writes `limit_walls` beside `walls` and reads it back whole; one with none writes no such
+/// key, as before limits were recorded, and a file without it reads none. A key that names no
+/// limit is dropped as it is read, and at most [`MAX_WALLS`] are kept, the newest.
+#[test]
+fn limit_walls_round_trip_under_their_own_key_only_where_there_are_some() {
+    let mut s = on_main();
+    fresh(&mut s, "work-2");
+    let plain = s.to_json();
+    assert!(!plain.contains("limit_walls"), "{plain}");
+    note_wall(
+        &mut s,
+        "work-2",
+        &limit_wall("codex_other"),
+        Some(NOW + HOUR),
+        NOW - MIN,
+        NOW,
+    );
+    let text = s.to_json();
+    let doc: Value = aterm_json::from_str(&text).expect("JSON");
+    assert!(doc["accounts"]["work-2"]["limit_walls"]["codex_other"].is_object());
+    assert_eq!(
+        doc["accounts"]["work-2"]["walls"],
+        aterm_json::json!({}),
+        "the ordinary walls hold none of it"
+    );
+    assert_eq!(State::from_json(&text, NOW), Ok(s.clone()));
+    let mut doc = doc;
+    let walls = doc
+        .as_object_mut()
+        .and_then(|top| top.get_mut("accounts"))
+        .and_then(Value::as_object_mut)
+        .and_then(|accounts| accounts.get_mut("work-2"))
+        .and_then(Value::as_object_mut)
+        .and_then(|account| account.get_mut("limit_walls"))
+        .and_then(Value::as_object_mut)
+        .expect("limit walls");
+    let wall = walls["codex_other"].clone();
+    walls.insert("codex".into(), wall.clone());
+    walls.insert("Codex-Other".into(), wall.clone());
+    for i in 0..MAX_WALLS {
+        let mut newer = wall.clone();
+        newer.as_object_mut().expect("a wall").insert(
+            "at".into(),
+            Value::from(NOW - MIN + 1 + i64::try_from(i).unwrap()),
+        );
+        walls.insert(format!("limit_{i}"), newer);
+    }
+    let back = State::from_json(&aterm_json::to_string(&doc).unwrap(), NOW).expect("loads");
+    let kept: Vec<_> = back.account("work-2").limit_walls.keys().cloned().collect();
+    assert_eq!(kept.len(), MAX_WALLS);
+    assert!(kept.iter().all(|id| id.starts_with("limit_")), "{kept:?}");
+}
+
+/// A LIMIT WALL IS NO WALL THE JOURNAL TELLS: the lab journal, which carries a row's walls to
+/// every other Mac ([`super::super::journal::observe`]), is told nothing of a wall of the Codex
+/// limit `codex_other`, so no other Mac (an older aterm included) folds it into its own walls.
+/// CONTROL: the five-hour wall at the same reset is told.
+#[test]
+fn a_limit_wall_is_no_wall_the_journal_tells() {
+    let told = |window: &str| {
+        let mut before = State {
+            machine: "ab12".into(),
+            ..State::default()
+        };
+        before.accounts.insert(
+            "ann".into(),
+            Account {
+                pk: Some("ac-0123456789abcdef".into()),
+                ..Account::default()
+            },
+        );
+        let mut after = before.clone();
+        let mut events = note_wall(&mut after, "ann", window, Some(5_000), 30, 40);
+        super::super::journal::observe(Cli::Codex, &before, &mut after, &mut events, 40)
+            .iter()
+            .filter(|note| note.kind == "wall")
+            .count()
+    };
+    assert_eq!(told(&limit_wall("codex_other")), 0);
+    assert_eq!(told(SESSION_LIMIT), 1, "CONTROL");
+}
+
+/// One window of a limit other than the codex bucket: its kind, share and reset.
+fn limit_window(
+    bucket: crate::ai::codex_limits::Bucket,
+    used: u32,
+    reset: Option<i64>,
+) -> crate::harness::codex_app_login::LimitWindow {
+    crate::harness::codex_app_login::LimitWindow {
+        bucket,
+        used,
+        reset,
+    }
+}
+
+/// A read's entry of a limit other than the codex bucket with these windows and nothing refusing
+/// it.
+fn limit_entry(
+    windows: Vec<crate::harness::codex_app_login::LimitWindow>,
+) -> crate::harness::codex_app_login::LimitUsage {
+    crate::harness::codex_app_login::LimitUsage {
+        windows,
+        refusal: None,
+    }
+}
+
+/// A LIMIT WALL ENDS NO PIN: the owner pinned `main`, the `active` row, and a read of it records
+/// `codex_other` spent ([`note_limits`], as every recorded handoff read does, the lost-login path's
+/// included). The limit's wall stands in `main`'s limit walls and the pin stands with no `Unpin`:
+/// the row still serves every session of every other limit, and the pin is the owner's ordinary
+/// decision, which only an ordinary wall retires. So for a wall recorded under the limit's window
+/// directly ([`note_wall`]). CONTROL: a five-hour wall of the same row ends the pin.
+#[test]
+fn a_limit_wall_ends_no_pin() {
+    use crate::ai::codex_limits::Bucket;
+    let spent = BTreeMap::from([(
+        "codex_other".to_owned(),
+        limit_entry(vec![limit_window(
+            Bucket::FiveHour,
+            100,
+            Some(NOW + 2 * HOUR),
+        )]),
+    )]);
+    let pinned = || {
+        let mut s = on_main();
+        s.pinned = true;
+        fresh(&mut s, "main");
+        s
+    };
+    let mut s = pinned();
+    let events = note_limits(&mut s, "main", &spent, None, NOW, NOW);
+    assert_eq!(
+        events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+        [Kind::Wall]
+    );
+    assert!(s.pinned, "the owner's pin stands");
+    assert!(s.account("main").limit_walls.contains_key("codex_other"));
+    let mut s = pinned();
+    let events = note_wall(
+        &mut s,
+        "main",
+        &limit_wall("codex_other"),
+        Some(NOW + 2 * HOUR),
+        NOW,
+        NOW,
+    );
+    assert!(events.iter().all(|e| e.kind != Kind::Unpin), "{events:?}");
+    assert!(s.pinned);
+    let mut control = pinned();
+    let events = note_wall(
+        &mut control,
+        "main",
+        SESSION_LIMIT,
+        Some(NOW + 2 * HOUR),
+        NOW,
+        NOW,
+    );
+    assert!(!control.pinned, "CONTROL: an ordinary wall ends the pin");
+    assert!(events.iter().any(|e| e.kind == Kind::Unpin), "CONTROL");
+}
+
+/// A READ THAT SHOWS NO ROOM ON A LIMIT HOLDS ITS ROW OFF THAT LIMIT'S HANDOFFS: [`note_limits`]
+/// walls, in the row's limit walls alone, each limit the read lists without room
+/// ([`crate::harness::codex_app_login::LimitUsage::no_room_until`]): one spent to its reset, one
+/// low on a window of any length (a day's at 95%) to the latest such reset, and one with no
+/// figure by rungs; and the limit the handoff asked about, where the read does not list it, by
+/// rungs. A limit with room records nothing, and another the read does not list keeps what it had.
+/// None of it is an ordinary wall: the row stays fresh. A later read showing each with room lifts
+/// its wall. CONTROL: the same reads asked about no limit record no wall of the one unlisted.
+#[test]
+fn a_read_with_no_room_on_a_limit_holds_its_row_off_that_limit() {
+    use crate::ai::codex_limits::Bucket;
+    let roster = three();
+    let reset = NOW + 20 * HOUR;
+    let reads = BTreeMap::from([
+        (
+            "spent".to_owned(),
+            limit_entry(vec![limit_window(Bucket::FiveHour, 100, Some(NOW + HOUR))]),
+        ),
+        (
+            "low".to_owned(),
+            limit_entry(vec![
+                limit_window(Bucket::FiveHour, 10, Some(NOW + HOUR)),
+                limit_window(Bucket::Day, 95, Some(reset)),
+            ]),
+        ),
+        ("unfigured".to_owned(), limit_entry(Vec::new())),
+        (
+            "roomy".to_owned(),
+            limit_entry(vec![limit_window(Bucket::Day, 50, Some(reset))]),
+        ),
+    ]);
+    let mut s = on_main();
+    fresh(&mut s, "work-2");
+    note_limits(&mut s, "work-2", &reads, Some("asked"), NOW, NOW);
+    let account = s.account("work-2");
+    assert_eq!(
+        account.limit_walls.keys().collect::<Vec<_>>(),
+        ["asked", "low", "spent", "unfigured"]
+    );
+    let until = |id: &str| account.limit_walls[id].until;
+    assert_eq!(
+        (
+            until("spent"),
+            until("low"),
+            until("unfigured"),
+            until("asked")
+        ),
+        (Some(NOW + HOUR), Some(reset), None, None)
+    );
+    for id in ["asked", "low", "spent", "unfigured"] {
+        assert!(account.limit_wall_until(id, NOW).is_some(), "{id}");
+    }
+    assert_eq!(account.limit_wall_until("roomy", NOW), None);
+    assert!(account.walls.is_empty());
+    assert!(cond(&roster, &s, "work-2", NOW).fresh());
+
+    let roomy = || limit_entry(vec![limit_window(Bucket::FiveHour, 10, Some(NOW + HOUR))]);
+    let later =
+        BTreeMap::from(["asked", "low", "spent", "unfigured"].map(|id| (id.to_owned(), roomy())));
+    note_limits(&mut s, "work-2", &later, None, NOW + MIN, NOW + MIN);
+    for id in ["asked", "low", "spent", "unfigured"] {
+        assert_eq!(
+            s.account("work-2").limit_wall_until(id, NOW + MIN),
+            None,
+            "{id} lifted"
+        );
+    }
+
+    let mut control = on_main();
+    note_limits(&mut control, "work-2", &reads, None, NOW, NOW);
+    assert!(
+        !control.account("work-2").limit_walls.contains_key("asked"),
+        "CONTROL"
+    );
+}
+
+/// A ROTATION OFF A WALL OF ANOTHER LIMIT PASSES AN `active` THE RECORDS HOLD OFF IT: a session on
+/// `main` rotates no pool whose `active` (`work-2`, proven and fresh) it could follow
+/// ([`begin_rotation`]: held). Leaving a wall of `codex_other` ([`begin_rotation_for`]), where
+/// `work-2`'s records hold it off that limit, it rotates the pool to `pool-a`, as it would past a
+/// low `active`. The pin and an unanswered canary still hold it, and a limit wall the `active` does
+/// not have, or one of another limit, passes nothing. CONTROL: with no limit, the same records
+/// hold it.
+#[test]
+fn a_rotation_off_a_limits_wall_passes_an_active_the_records_hold_off_it() {
+    let roster = three();
+    let enrolled = all(&roster);
+    let mover = Mover {
+        sid: "s-limit",
+        account: "main",
+    };
+    let records = |walled: Option<&str>| {
+        let mut s = State {
+            active: Some("work-2".into()),
+            proven: true,
+            ..state()
+        };
+        for label in ["main", "work-2", "pool-a"] {
+            fresh(&mut s, label);
+        }
+        if let Some(id) = walled {
+            note_wall(
+                &mut s,
+                "work-2",
+                &limit_wall(id),
+                Some(NOW + HOUR),
+                NOW,
+                NOW,
+            );
+        }
+        s
+    };
+    let rotate = |s: &mut State, limit: Option<&str>| {
+        begin_rotation_for(
+            s,
+            &roster,
+            &enrolled,
+            Some("work-2"),
+            mover,
+            "pool-a",
+            limit,
+            NOW,
+        )
+    };
+    let held = Err(Lost::Held {
+        active: "work-2".into(),
+    });
+    let mut s = records(Some("codex_other"));
+    assert!(rotate(&mut s, Some("codex_other")).is_ok());
+    assert_eq!(
+        (s.active.as_deref(), s.rotations.as_slice()),
+        (Some("pool-a"), [NOW].as_slice())
+    );
+    let mut s = records(None);
+    assert_eq!(rotate(&mut s, Some("codex_other")), held, "no wall of it");
+    let mut s = records(Some("codex_another"));
+    assert_eq!(rotate(&mut s, Some("codex_other")), held, "another's");
+    let mut s = records(Some("codex_other"));
+    s.pinned = true;
+    assert_eq!(rotate(&mut s, Some("codex_other")), held, "the pin");
+    let mut s = records(Some("codex_other"));
+    s.proven = false;
+    assert_eq!(rotate(&mut s, Some("codex_other")), held, "the canary");
+    let mut s = records(Some("codex_other"));
+    assert_eq!(rotate(&mut s, None), held, "CONTROL");
+    assert_eq!(
+        begin_rotation(
+            &mut s,
+            &roster,
+            &enrolled,
+            Some("work-2"),
+            mover,
+            "pool-a",
+            NOW
+        ),
+        held,
+        "CONTROL"
+    );
+}
+
 /// The upkeep's reading of the vault at `read_at`, naming `label`'s token as in use on this Mac
 /// until `end` ([`TokensHere`]).
 fn token_read(state: &mut State, label: &str, read_at: i64, end: i64) {
@@ -11876,4 +12647,532 @@ fn an_unknown_vault_read_keeps_the_previous_reading_of_the_rows_on_their_token()
             .unwrap()
     );
     assert_eq!(store.read_tokens_here(), None);
+}
+
+/// [`three`], this Mac's own rows, and `lent`: another Mac's account (a pool row this Mac does
+/// not prefer and is no home of), naming its login email, whose login was never made here; with
+/// the rows enrolled here (the own ones).
+fn with_lent() -> (Roster, BTreeSet<String>) {
+    let mut r = three();
+    r.rows.push(Row {
+        label: "lent".to_owned(),
+        class: Class::Pool,
+        dir: Some(at!("/logins/lent").to_owned()),
+        email: Some("lent@example.com".to_owned()),
+        ..Row::default()
+    });
+    (r, all(&three()))
+}
+
+/// [`with_lent`] with `lent` in another Mac's warm set (`m7`, [`Row::held_by`]).
+fn held_lent(r: &Roster) -> Roster {
+    let mut held = r.clone();
+    held.rows[3].held_by = Some("m7".to_owned());
+    held
+}
+
+/// The labels `candidates` admits for a session on `main` at a wall, in their order.
+fn admitted(roster: &Roster, state: &State, enrolled: &BTreeSet<String>) -> Vec<String> {
+    candidates(roster, state, enrolled, Some("main"), &wall(), NOW)
+        .into_iter()
+        .filter(|(_, verdict)| verdict.is_ok())
+        .map(|(label, _)| label)
+        .collect()
+}
+
+/// THE FLEET TOKEN RUNS A ROW WITH NO LOGIN HERE (FL-135): another Mac's account, whose login was
+/// never made on this Mac, runs here once the upkeep reads its vault token in use here
+/// ([`LoginHere::OnToken`]): rotation picks it after every row of this Mac's own ([`borrowed`],
+/// [`Rank::borrowed`]), a wall rotates a session onto it ([`advise`], [`begin_rotation`]), its
+/// launch starts on the token, and it is owed no sign-in or renewal here, so nothing makes a login
+/// for it. The claims ring still decides: another Mac's lease on the account refuses it, and this
+/// Mac's own admits it. NEGATIVE CONTROLS: with no reading the row is not made here, so no launch
+/// picks it, and it is owed a sign-in; the same row in another Mac's warm set is `HeldElsewhere` on
+/// its token as on a stored login, whether its login is made here or not, and no rotation lands on
+/// it; the same row as one this Mac prefers or is the home of ranks by its class among this Mac's
+/// own.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_row_with_no_login_here_runs_on_its_fleet_token_and_a_lease_elsewhere_still_wins() {
+    use crate::harness::token_route::{Decision, TokenFact};
+    let (r, enrolled) = with_lent();
+    let held = held_lent(&r);
+    let lent = r.row("lent").expect("lent");
+    let logins = Logins::default();
+    let mut s = on_main();
+    for label in ["work-2", "pool-a", "lent"] {
+        fresh(&mut s, label);
+    }
+    limited(&mut s, "main", NOW + HOUR);
+    let mut on_token = s.clone();
+    token_read(&mut on_token, "lent", NOW - MIN, NOW + 365 * DAY);
+    // Every row of this Mac's own walled too.
+    let walled = |state: &State| {
+        let mut state = state.clone();
+        limited(&mut state, "work-2", NOW + HOUR);
+        limited(&mut state, "pool-a", NOW + HOUR);
+        state
+    };
+
+    // CONTROL: with no reading, the row has no login here: no launch picks it, and it is owed a
+    // sign-in until its token runs it.
+    assert_eq!(login_here(lent, &s, false, NOW), LoginHere::NotMade);
+    assert_eq!(
+        why_not(&r, &s, &enrolled, &wall(), "lent"),
+        WhyNot::NotEnrolled
+    );
+    assert_eq!(launch_row(&r, &walled(&s), &enrolled, NOW), None);
+    assert!(needs_sign_in(lent, &s, &logins, false, NOW));
+    assert_eq!(
+        sign_in_next(&r, &s, &enrolled, Some("main"), NOW),
+        Some(("lent".to_owned(), true))
+    );
+    assert_eq!(
+        renew_next(&r, &s, &enrolled, Some("main"), NOW),
+        Some("lent".to_owned())
+    );
+
+    // Its fleet token runs it here, with no login made.
+    assert_eq!(login_here(lent, &on_token, false, NOW), LoginHere::OnToken);
+    assert!(token_only(lent, &on_token, &enrolled, NOW));
+    assert!(!token_only(lent, &s, &enrolled, NOW), "CONTROL: no reading");
+    assert_eq!(condition(lent, &on_token, false, NOW), Condition::Usable);
+    assert_eq!(
+        stored_login_condition(lent, &on_token, false, NOW),
+        Condition::NotEnrolled,
+        "its stored login is still not made here"
+    );
+    assert!(login_here(lent, &on_token, false, NOW).signed_in());
+    // Rotation picks it after every row of this Mac's own, the pool row too.
+    assert!(borrowed(lent, &on_token, &enrolled));
+    assert_eq!(
+        admitted(&r, &on_token, &enrolled),
+        ["work-2", "pool-a", "lent"]
+    );
+    assert!(
+        candidates(&r, &on_token, &enrolled, Some("main"), &wall(), NOW)
+            .iter()
+            .any(|(label, verdict)| label == "lent"
+                && matches!(verdict, Ok(Rank { borrowed: true, .. }))),
+        "ranked as borrowed"
+    );
+    // CONTROL: a row this Mac prefers (the lab names this Mac its home) or is the pool file's home
+    // of is this Mac's own, and ranks by its class, ahead of the pool row.
+    let mut preferred = r.clone();
+    preferred.rows[3].class = Class::Preferred;
+    assert_eq!(
+        admitted(&preferred, &on_token, &enrolled),
+        ["lent", "work-2", "pool-a"]
+    );
+    let mut home = on_token.clone();
+    home.home_accounts.insert("lent".to_owned());
+    assert!(!borrowed(lent, &home, &enrolled));
+    assert_eq!(
+        launch_row(&r, &on_token, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("work-2"),
+        "an own row first"
+    );
+    let all_walled = walled(&on_token);
+    assert_eq!(
+        launch_row(&r, &all_walled, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("lent")
+    );
+    // The launch-time guard's one judgment starts it on its token.
+    let started = token_guarded(
+        &r,
+        &all_walled,
+        &enrolled,
+        NOW,
+        &mut |row| matches!(launch_judged(row, TokenFact::InUse), Decision::Token { .. }),
+        None,
+        |state| launch_row(&r, state, &enrolled, NOW),
+    )
+    .expect("a row starts");
+    assert_eq!(started.label, "lent");
+    // A session at its wall rotates onto it, and the rotation commits.
+    let at_wall = advise(
+        &r,
+        &all_walled,
+        &enrolled,
+        &me("main"),
+        &wall(),
+        Mode::Early,
+        NOW,
+    );
+    assert!(
+        matches!(&at_wall, Advice::Move { to, rotates: true, .. } if to == "lent"),
+        "{at_wall:?}"
+    );
+    let mut rotated = all_walled.clone();
+    assert!(
+        begin_rotation(
+            &mut rotated,
+            &r,
+            &enrolled,
+            Some("main"),
+            mover("main"),
+            "lent",
+            NOW
+        )
+        .is_ok()
+    );
+    assert_eq!(rotated.active.as_deref(), Some("lent"));
+    // No sign-in or renewal is owed here: nothing makes it a login.
+    assert!(!needs_sign_in(lent, &on_token, &logins, false, NOW));
+    assert_eq!(
+        sign_in_next(&r, &on_token, &enrolled, Some("main"), NOW),
+        None
+    );
+    assert_eq!(
+        renew_next(&r, &on_token, &enrolled, Some("main"), NOW),
+        None
+    );
+
+    // CONTROL: another Mac's warm set holds every route off it: its token as its stored login,
+    // whether or not a login of it was made here; no launch or rotation lands on it.
+    let mut made = enrolled.clone();
+    made.insert("lent".to_owned());
+    for enrolled in [&enrolled, &made] {
+        assert_eq!(
+            why_not(&held, &on_token, enrolled, &wall(), "lent"),
+            WhyNot::HeldElsewhere
+        );
+        assert_eq!(launch_row(&held, &all_walled, enrolled, NOW), None);
+    }
+    assert!(!matches!(
+        advise(
+            &held,
+            &all_walled,
+            &enrolled,
+            &me("main"),
+            &wall(),
+            Mode::Early,
+            NOW
+        ),
+        Advice::Move { .. }
+    ));
+    let mut refused = all_walled.clone();
+    assert_eq!(
+        begin_rotation(
+            &mut refused,
+            &held,
+            &enrolled,
+            Some("main"),
+            mover("main"),
+            "lent",
+            NOW
+        ),
+        Err(Lost::NotACandidate)
+    );
+
+    // The claims ring still decides: another Mac's lease refuses it, this Mac's own admits it.
+    let mut leased = all_walled.clone();
+    leased.note_lease("lent", "m7", NOW + HOUR, NOW - MIN);
+    assert_eq!(
+        why_not(&r, &leased, &enrolled, &wall(), "lent"),
+        WhyNot::LeasedElsewhere { until: NOW + HOUR }
+    );
+    assert_eq!(launch_row(&r, &leased, &enrolled, NOW), None);
+    let mut mine = all_walled.clone();
+    mine.note_lease("lent", "0a0b", NOW + HOUR, NOW - MIN);
+    assert_eq!(
+        launch_row(&r, &mine, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("lent"),
+        "CONTROL: this Mac's own claim admits it"
+    );
+}
+
+/// A BORROWED ROW RANKS AFTER EVERY OWN ROW, A LOW ONE TOO (FL-135, [`borrowed`]): on a Mac whose
+/// lab clears every hold (no `ai-pool.toml`), a row with no login made here that runs on another
+/// Mac's fleet token is borrowed by its login and its class alone, so an own low row is taken at a
+/// wall before it; and its opening within 15 minutes makes no own low row wait for it
+/// ([`WhyNot::LowWhileOneIsNear`]). NEGATIVE CONTROLS: an own row opening as near still holds the
+/// low row back; and the borrowed row is ranked last, not refused.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_borrowed_row_ranks_after_every_own_row_and_its_opening_holds_no_own_low_row() {
+    let (r, enrolled) = with_lent();
+    assert!(r.rows.iter().all(|row| row.held_by.is_none()), "no holds");
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + HOUR);
+    low(&mut s, "work-2");
+    limited(&mut s, "pool-a", NOW + HOUR);
+    fresh(&mut s, "lent");
+    token_read(&mut s, "lent", NOW - MIN, NOW + 365 * DAY);
+    // A fresh borrowed row and an own low one: the own row first.
+    assert_eq!(admitted(&r, &s, &enrolled), ["work-2", "lent"]);
+
+    // The borrowed row's wall opens in ten minutes: the own low row is still taken now.
+    let mut near = s.clone();
+    limited(&mut near, "lent", NOW + 10 * MIN);
+    assert_eq!(admitted(&r, &near, &enrolled), ["work-2"]);
+    // CONTROL: an own row opening as near holds the low row back.
+    let mut own_near = near.clone();
+    limited(&mut own_near, "pool-a", NOW + 10 * MIN);
+    assert!(matches!(
+        why_not(&r, &own_near, &enrolled, &wall(), "work-2"),
+        WhyNot::LowWhileOneIsNear { .. }
+    ));
+}
+
+/// A BORROWED `ACTIVE` HOLDS NO SESSION OR LAUNCH WHILE AN OWN ROW IS FRESH (FL-135): once a
+/// rotation made a borrowed row `active`, a launch starts on a fresh row of this Mac's own, a
+/// session on an own row does not follow the borrowed `active`, and a session at its wall rotates
+/// off it onto a fresh own row. NEGATIVE CONTROLS: with no own row fresh, a launch takes the
+/// borrowed `active` and a session follows it; and an own fresh `active` still holds a rotation
+/// ([`Lost::Held`]).
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_borrowed_active_holds_no_session_or_launch_while_an_own_row_is_fresh() {
+    let (r, enrolled) = with_lent();
+    let mut s = State {
+        active: Some("lent".to_owned()),
+        proven: true,
+        ..state()
+    };
+    for label in ["main", "work-2", "lent"] {
+        fresh(&mut s, label);
+    }
+    limited(&mut s, "pool-a", NOW + HOUR);
+    token_read(&mut s, "lent", NOW - MIN, NOW + 365 * DAY);
+
+    assert_eq!(
+        launch_row(&r, &s, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("main"),
+        "an own fresh row, not the borrowed active"
+    );
+    let turn_end = advise(
+        &r,
+        &s,
+        &enrolled,
+        &me("main"),
+        &Point::TurnEnd,
+        Mode::Early,
+        NOW,
+    );
+    assert!(
+        !matches!(&turn_end, Advice::Move { to, .. } if to == "lent"),
+        "{turn_end:?}"
+    );
+    // At main's wall the session rotates onto work-2, off the borrowed active.
+    let mut at_wall = s.clone();
+    limited(&mut at_wall, "main", NOW + HOUR);
+    let moved = advise(
+        &r,
+        &at_wall,
+        &enrolled,
+        &me("main"),
+        &wall(),
+        Mode::Early,
+        NOW,
+    );
+    assert!(
+        matches!(&moved, Advice::Move { to, rotates: true, .. } if to == "work-2"),
+        "{moved:?}"
+    );
+    let mut rotated = at_wall.clone();
+    assert!(
+        begin_rotation(
+            &mut rotated,
+            &r,
+            &enrolled,
+            Some("lent"),
+            mover("main"),
+            "work-2",
+            NOW
+        )
+        .is_ok()
+    );
+
+    // CONTROL: with no own row fresh, the borrowed active is taken and followed.
+    let mut none_fresh = State {
+        active: Some("lent".to_owned()),
+        proven: true,
+        ..state()
+    };
+    fresh(&mut none_fresh, "lent");
+    low(&mut none_fresh, "main");
+    limited(&mut none_fresh, "work-2", NOW + HOUR);
+    limited(&mut none_fresh, "pool-a", NOW + HOUR);
+    token_read(&mut none_fresh, "lent", NOW - MIN, NOW + 365 * DAY);
+    assert_eq!(
+        launch_row(&r, &none_fresh, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("lent")
+    );
+    assert!(matches!(
+        advise(
+            &r,
+            &none_fresh,
+            &enrolled,
+            &me("main"),
+            &Point::TurnEnd,
+            Mode::Early,
+            NOW
+        ),
+        Advice::Move { to, .. } if to == "lent"
+    ));
+    // CONTROL: an own fresh active holds a rotation, as before.
+    let mut own_active = at_wall.clone();
+    own_active.active = Some("work-2".to_owned());
+    fresh(&mut own_active, "pool-a");
+    assert!(matches!(
+        begin_rotation(
+            &mut own_active,
+            &r,
+            &enrolled,
+            Some("work-2"),
+            mover("main"),
+            "pool-a",
+            NOW
+        ),
+        Err(Lost::Held { .. })
+    ));
+}
+
+/// THE HOME TAKES ITS ACCOUNT BACK (FL-135): a session here on a borrowed row's fleet token
+/// (another Mac's account, whose login was never made here) keeps it while this Mac's claim is the
+/// senior one, and moves onto a row of this Mac's own at its next turn end once the account's home
+/// claims it, though this Mac claimed first: the claims ring ranks a home's claim before a
+/// borrower's ([`super::super::claims::Book::homes_first`]). NEGATIVE CONTROLS: read with no
+/// homes, the claims rank first-come and this Mac keeps the account, which no Mac's warm set holds;
+/// and the same row in another Mac's warm set is never this Mac's to borrow, whatever the claims
+/// read: the hold names the account's Mac where no lab ranks homes ([`Row::held_by`]).
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a session runs on a vault token only on macOS"
+)]
+fn the_home_mac_takes_its_account_back_from_a_borrower_at_the_next_turn_end() {
+    use crate::harness::claims;
+    let (r, enrolled) = with_lent();
+    let held = held_lent(&r);
+    let entry = token_entry("aterm-claude-token-ac-00000000000000c3");
+    let borrower = Me {
+        route: AuthRoute::VaultToken { entry },
+        ..me("lent")
+    };
+    let mut s = State {
+        active: Some("lent".to_owned()),
+        proven: true,
+        ..state()
+    };
+    for label in ["main", "work-2", "pool-a", "lent"] {
+        fresh(&mut s, label);
+    }
+    token_read(&mut s, "lent", NOW - MIN, NOW + 365 * DAY);
+    let key = claims::LeaseKey::new("claude", "lent@example.com").expect("a key");
+    let keys = [("lent".to_owned(), key.clone())];
+    let claim = |machine: &str, label: &str, since: i64| claims::Row {
+        machine: machine.to_owned(),
+        label: label.to_owned(),
+        counter: 1,
+        until: NOW + DAY,
+        claims: vec![claims::Claim {
+            key: key.clone(),
+            kind: claims::Kind::Lease,
+            since,
+        }],
+        ranks_homes: true,
+    };
+    // This Mac ("0a0b") claimed the account an hour ago; its home ("0c07", m7) claims it now.
+    let borrowed = claims::Book::of([claim("0a0b", "", NOW - HOUR)]);
+    let taken_back = claims::Book::of([
+        claim("0a0b", "", NOW - HOUR),
+        claim("0c07", "m7", NOW - MIN),
+    ]);
+    let homes = claims::View {
+        me: "0a0b".to_owned(),
+        homes: Some(claims::Homes::of_machines([(
+            key.clone(),
+            "0c07".to_owned(),
+        )])),
+        ..claims::View::default()
+    };
+    let unread = claims::View {
+        me: "0a0b".to_owned(),
+        ..claims::View::default()
+    };
+    let settled = |book: &claims::Book, view: &claims::View| {
+        let mut state = s.clone();
+        claims::settle(&mut state, &keys, book, view, NOW);
+        state
+    };
+    let turn_end = |roster: &Roster, state: &State, me: &Me<'_>| {
+        advise(
+            roster,
+            state,
+            &enrolled,
+            me,
+            &Point::TurnEnd,
+            Mode::Early,
+            NOW,
+        )
+    };
+
+    // While this Mac's claim is the senior one, the token session keeps the account.
+    let before = settled(&borrowed, &homes);
+    assert_eq!(before.lease_verdict("lent", NOW), Ok(()));
+    assert_eq!(
+        turn_end(&r, &before, &borrower),
+        Advice::Stay(StayWhy::NothingDue)
+    );
+
+    // The home claims it: this Mac's earlier claim no longer holds it here, and at its next turn
+    // end the session moves onto a row of this Mac's own.
+    let after = settled(&taken_back, &homes);
+    assert_eq!(
+        after.lease_verdict("lent", NOW),
+        Err(WhyNot::LeasedElsewhere { until: NOW + DAY })
+    );
+    match turn_end(&r, &after, &borrower) {
+        Advice::Move {
+            to,
+            yields: Some(_),
+            ..
+        } => assert_eq!(to, "main"),
+        advice => panic!("the borrower yields, not {advice:?}"),
+    }
+    assert_eq!(
+        launch_row(&r, &after, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("main"),
+        "no launch here takes it back"
+    );
+
+    // CONTROL: read with no homes, the claims rank first-come, and this Mac's earlier one holds
+    // an account no Mac's warm set holds.
+    let first_come = settled(&taken_back, &unread);
+    assert_eq!(first_come.lease_verdict("lent", NOW), Ok(()));
+    assert_eq!(
+        turn_end(&r, &first_come, &borrower),
+        Advice::Stay(StayWhy::NothingDue)
+    );
+    // CONTROL: in m7's warm set, the row is never borrowed here, homes read or not: no launch
+    // takes it and the session on it yields.
+    for view in [&unread, &homes] {
+        let state = settled(&borrowed, view);
+        assert_eq!(
+            why_not(&held, &state, &enrolled, &wall(), "lent"),
+            WhyNot::HeldElsewhere
+        );
+        assert_eq!(
+            launch_row(&held, &state, &enrolled, NOW).map(|row| row.label.as_str()),
+            Some("main")
+        );
+        assert!(matches!(
+            turn_end(&held, &state, &borrower),
+            Advice::Move {
+                yields: Some(_),
+                ..
+            }
+        ));
+    }
 }

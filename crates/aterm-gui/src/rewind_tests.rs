@@ -2864,7 +2864,7 @@ fn a_tab_menu_rewind_owner_binds_each_shared_view_and_refuses_a_closed_original(
         crate::app_search::SearchEdit::Insert("mirror draft".into())
     ));
     let now = std::time::Instant::now();
-    for window in app.windows.values_mut() {
+    for mut window in app.windows.values_mut() {
         window.fx.cursor_mut().glow.note_typed_cells(now, 1);
         window.fx.cursor_mut().trail.note_typed(now);
     }
@@ -3721,7 +3721,7 @@ fn a_rewound_pane_draws_no_sparkle_words_in_a_present_or_a_capture() {
         let mut app = App::headless_for_test();
         app.config.motion = Some("full".into());
         {
-            let ws = app.windows.get_mut(&WID).expect("window");
+            let mut ws = app.windows.get_mut(&WID).expect("window");
             ws.focused = true;
             ws.present = Some(crate::PresentTarget::Cpu {
                 surface: crate::present::CpuSurface::Scripted(Default::default()),

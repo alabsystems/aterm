@@ -26,7 +26,7 @@ use std::{
 const CONTENTS: &str = "contents";
 
 mod materialization;
-pub use materialization::MaterializationAttempt;
+pub use materialization::{CompletedMaterialization, MaterializationAttempt, MaterializedInput};
 mod workspace;
 pub use workspace::MaterializationWorkspace;
 mod preparation_inputs;

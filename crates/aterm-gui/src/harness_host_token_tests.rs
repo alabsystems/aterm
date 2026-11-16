@@ -21,7 +21,7 @@ use super::*;
 use aterm_agent::harness::accounts_tokens::{self, Verdict, Windows};
 use aterm_agent::harness::token_route::{self, DESCRIPTOR_ENV, MARKER_ENV, MINTED_ENV, TokenFact};
 use aterm_agent::harness::{claims, journal};
-use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Lookup, Meta};
+use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Lookup, Meta, MintedBy};
 use aterm_secrets::client::{MemberWritten, OnBusy, Paths};
 
 /// The lab key every fixture account is keyed by.
@@ -60,6 +60,10 @@ pub(super) struct Vault {
     paths: Paths,
     /// The account the token is made for.
     email: String,
+    /// The vault's source, pinned to its signer, as a Mac it admits configures it.
+    pinned: String,
+    /// The route its mints name ([`Meta::minted_by`]).
+    minted_by: Option<MintedBy>,
 }
 
 impl Vault {
@@ -70,6 +74,11 @@ impl Vault {
 
     /// The vault, its token for `email` made at `minted_at`.
     pub(super) fn minted_for(home: &Path, minted_at: u64, email: &str) -> Self {
+        Self::made(home, minted_at, email, None)
+    }
+
+    /// The vault, its token for `email` made at `minted_at` by the route `minted_by`.
+    fn made(home: &Path, minted_at: u64, email: &str, minted_by: Option<MintedBy>) -> Self {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let server = aterm_secrets::server::start(
             socket,
@@ -85,7 +94,8 @@ impl Vault {
         .expect("the server");
         let url = format!("http://{}/v1/test", server.addr);
         let paths = Paths::for_home(home);
-        aterm_secrets::client::create(&paths, &url, None, Some("m22")).expect("create");
+        let created =
+            aterm_secrets::client::create(&paths, &url, None, Some("m22")).expect("create");
         aterm_secrets::client::admin_seed_swarm_roster(&paths, &[]).expect("roster");
         aterm_secrets::client::seed_vault_genesis(&paths, &home.with_extension("genesis"))
             .expect("genesis");
@@ -94,15 +104,16 @@ impl Vault {
             _server: server,
             paths,
             email: email.to_owned(),
+            pinned: format!("{url}#{}", created.signer),
+            minted_by,
         };
         vault.mint(minted_at);
         vault
     }
 
-    /// Writes the account's token as one made here at `minted_at` and not verified: the first
-    /// mint, or a `--replace`.
-    fn mint(&self, minted_at: u64) {
-        let meta = Meta {
+    /// The meta of the account's token made here at `minted_at`, not verified.
+    fn meta(&self, minted_at: u64) -> Meta {
+        Meta {
             email: self.email.clone(),
             account_id: "c-0123456789ab".to_owned(),
             minted_at,
@@ -110,19 +121,53 @@ impl Vault {
             expiry_from: ExpiryFrom::Printed,
             minted_on: "m22".to_owned(),
             cli: "2.1.318".to_owned(),
-            minted_by: None,
+            minted_by: self.minted_by,
             verified: None,
-        };
-        let token = concat!("sk-ant-", "oat01-inert_fixture-token-0123456789");
+        }
+    }
+
+    /// Writes the account's token as one made here at `minted_at` and not verified: the first
+    /// mint, or a `--replace`.
+    fn mint(&self, minted_at: u64) {
         let written = claude_token::write(
             &self.paths,
             &Key::parse(KEY).unwrap(),
-            &aterm_secrets::SecretBytes::from(token.as_bytes()),
-            &meta,
+            &aterm_secrets::SecretBytes::from(FIXTURE_TOKEN.as_bytes()),
+            &self.meta(minted_at),
             OnBusy::Refuse(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
         )
         .expect("the write");
         assert_eq!(written, MemberWritten::Posted);
+    }
+
+    /// Lets in the Mac at `home` as `label`: its seat bound by the vault's log, its vault
+    /// configured from the same source, and the records synced there. Returns its vault's paths.
+    fn admit(&self, home: &Path, label: &str) -> Paths {
+        let paths = Paths::for_home(home);
+        aterm_secrets::client::configure_log_member(&paths, &self.pinned, label)
+            .expect("configured");
+        let _ = aterm_secrets::client::machine_identity(&paths).expect("an identity");
+        let device = aterm_secrets::commons::bootstrap::Device::open(&paths)
+            .expect("the device")
+            .expect("a device key");
+        let store = aterm_secrets::client::load_records(&self.paths).expect("the records");
+        let log = store.log().expect("a log");
+        let aterm_secrets::membership_log::Body::Genesis { root, .. } = log.genesis().body() else {
+            panic!("a genesis");
+        };
+        let request = device
+            .request(root.network, root.authority)
+            .expect("a request");
+        let admitted =
+            aterm_secrets::client::admit_by_phrase(&self.paths, &request, [0x12; 32], label, 1_000)
+                .expect("the admission");
+        assert!(matches!(
+            admitted,
+            aterm_secrets::client::ByLog::Admitted(_)
+        ));
+        aterm_secrets::client::post_records_to_servers(&self.paths).expect("posted");
+        aterm_secrets::client::sync(&paths, None).expect("the admitted Mac syncs");
+        paths
     }
 
     fn verified(&self) -> bool {
@@ -132,6 +177,9 @@ impl Vault {
         )
     }
 }
+
+/// The fixture token: inert, in the setup-token grammar.
+const FIXTURE_TOKEN: &str = concat!("sk-ant-", "oat01-inert_fixture-token-0123456789");
 
 /// How long before the world's session was born its vault's first token was made: the session
 /// started on it.
@@ -199,12 +247,17 @@ fn stored_login_here(w: &TapWorld) {
 /// ([`token_route::standing_judged`]): this Mac's table and accounts state, the roster and the
 /// seat's home.
 fn judged(w: &TapWorld, vault: &Vault) -> TokenFact {
+    judged_at(w, &vault.paths)
+}
+
+/// [`judged`] by the vault at `paths`.
+fn judged_at(w: &TapWorld, paths: &Paths) -> TokenFact {
     let key = Key::parse(KEY).unwrap();
     let roster = accounts::Roster::load(&w.roster_path()).expect("the roster");
-    let found = claude_token::standing(&vault.paths, &key).expect("a standing");
+    let found = claude_token::standing(paths, &key).expect("a standing");
     token_route::standing_judged(
         &found,
-        &vault.paths,
+        paths,
         &accounts::Store::at(&w.state()),
         Some(&roster),
         &key,
@@ -1214,5 +1267,506 @@ fn a_reading_of_a_session_on_no_token_the_vault_holds_is_folded_nowhere() {
                 "{served}: no served fact of the vault's token"
             );
         }
+    }
+}
+
+/// The account's token as the vault at `paths` reads it.
+fn standing_at(paths: &Paths) -> claude_token::Standing {
+    match claude_token::standing(paths, &Key::parse(KEY).unwrap()).expect("a standing") {
+        Lookup::Found(standing) => standing,
+        Lookup::Absent | Lookup::Unknown => panic!("the vault holds the token"),
+    }
+}
+
+/// Whether the vault at `paths` returns exactly the fixture token.
+fn returns_fixture(paths: &Paths) -> bool {
+    match claude_token::read(paths, &Key::parse(KEY).unwrap(), Duration::from_secs(60)) {
+        Ok(Lookup::Found(read)) => read
+            .token()
+            .is_some_and(|token| token.as_slice() == FIXTURE_TOKEN.as_bytes()),
+        _ => false,
+    }
+}
+
+/// A status line of the row's account whose five-hour window resets at `session` and seven-day
+/// window at `week`.
+fn line(api_ms: u64, pct: u32, session: i64, week: i64) -> String {
+    format!(
+        r#"{{"cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{session}}},"seven_day":{{"used_percentage":30,"resets_at":{week}}}}}}}"#
+    )
+}
+
+/// Whether a file under `dir` holds a run of sixteen bytes of the fixture token.
+fn holds_fixture(dir: &Path) -> bool {
+    let run = &FIXTURE_TOKEN.as_bytes()[FIXTURE_TOKEN.len() - 16..];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            holds_fixture(&path)
+        } else {
+            std::fs::read(&path).is_ok_and(|bytes| bytes.windows(run.len()).any(|w| w == run))
+        }
+    })
+}
+
+/// Two seats of one scratch vault: m22, at `m22-home`, which minted the account's token in
+/// aterm's window [`MINTED_BEFORE_BIRTH`] before the world's session was born, and this Mac, the
+/// seat's home, which m22 let in as `m12`: the token reached it through the vault alone, so this
+/// Mac's token table holds no row of it.
+struct Peer {
+    m22: Vault,
+    here: Paths,
+}
+
+fn peer_world() -> (Arc<TapWorld>, Peer) {
+    let w = TapWorld::new();
+    std::fs::write(w.roster_path(), ROSTER).expect("roster");
+    let home = w.tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".secrets")).expect("home");
+    let m22_home = w.tmp.path().join("m22-home");
+    std::fs::create_dir_all(m22_home.join(".secrets")).expect("m22's home");
+    let m22 = Vault::made(&m22_home, first(&w), EMAIL, Some(MintedBy::Window));
+    let here = m22.admit(&home, "m12");
+    (w, Peer { m22, here })
+}
+
+/// A MAC HOLDING THE ACCOUNT'S STORED LOGIN VERIFIES A TOKEN ANOTHER MAC MINTED, AND REFUTES ONE
+/// OF ANOTHER ACCOUNT (§5.6): m22 minted the account's token in aterm's window, so it is in use on
+/// every Mac from mint, and this Mac, m12, holds no row of it. A session on the row's stored login
+/// here reports the row's windows: the tap looks for the account's vault token though no row of
+/// this Mac's table awaits one, and records the reading as its basis. A session on the token then
+/// reads the same windows: they are equal, and this Mac writes `verified`, naming m12, which m22
+/// reads, the token `active` there. A token of another account (its sessions read another
+/// account's windows) is refuted here alone: `differ` stops it on this Mac (`token-differ`
+/// journaled once, nothing written to the vault), and m22, which compared nothing, still uses it.
+/// Nothing of the token's value reaches the journal or this Mac's state. NEGATIVE CONTROL
+/// (2026-11-14, by hand, then restored with cp from a copy): with `basis_standing`'s look cut
+/// where no row awaits, the stored-login reading makes no row of the token and records no basis.
+#[cfg(unix)]
+#[test]
+fn a_mac_holding_the_accounts_stored_login_verifies_a_token_another_mac_minted_and_refutes_one_of_another_account()
+ {
+    for of_another in [false, true] {
+        let (w, peer) = peer_world();
+        let minted = standing_at(&peer.here);
+        assert!(
+            !minted.minted_here
+                && minted.signer.as_deref() == Some("m22")
+                && minted.serves_here()
+                && !minted.verified(),
+            "PRECONDITION: m22's window-made token, unverified, in use here: {minted:?}"
+        );
+        assert!(table(&w).rows.is_empty(), "PRECONDITION: no row of it here");
+        stored_login_here(&w);
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+        let ((), notes) = journal::capture(|| {
+            w.tap(10, 42, None);
+            assert_eq!(
+                step(),
+                Some("reading recorded"),
+                "the stored login's reading"
+            );
+            let row = table(&w)
+                .rows
+                .remove(KEY)
+                .expect("the reading made the token's row");
+            assert_eq!(row.minted_at, Some(first(&w)));
+            assert_eq!(
+                row.verification.basis,
+                Some((u64::try_from(w.clock()).unwrap(), rows_windows(&w))),
+                "the stored login's reading is the basis of m22's token"
+            );
+
+            on_token(&w, &idle, first(&w));
+            w.later(30);
+            if of_another {
+                w.tap_text(&theirs(&w, 20, 8), None, None);
+            } else {
+                w.tap(20, 43, None);
+            }
+            let said = step();
+            let now = u64::try_from(w.clock()).unwrap();
+            let row = table(&w).rows.remove(KEY).expect("the token's row");
+            aterm_secrets::client::sync(&peer.m22.paths, None).expect("m22 syncs");
+            let theirs = standing_at(&peer.m22.paths);
+            if of_another {
+                assert_eq!(said, Some(TAP_APART), "another account's windows");
+                assert_eq!(row.verification.verdict, Some(Verdict::Differ));
+                assert_eq!(
+                    judged_at(&w, &peer.here),
+                    TokenFact::Differ,
+                    "not in use here"
+                );
+                assert!(!standing_at(&peer.here).verified(), "nothing written");
+                assert!(!theirs.verified(), "nor read on m22");
+                assert!(
+                    accounts_tokens::TokenState::of(&Lookup::Found(theirs), None, now).in_use(),
+                    "m22 still uses it"
+                );
+            } else {
+                assert_eq!(said, Some("reading recorded"));
+                assert_eq!(row.verification.verdict, Some(Verdict::Equal));
+                assert!(row.verified.is_some(), "this Mac wrote it");
+                let on = |standing: &claude_token::Standing| {
+                    standing
+                        .meta
+                        .as_ref()
+                        .and_then(Meta::verification)
+                        .map(|verified| verified.on.clone())
+                };
+                assert_eq!(on(&standing_at(&peer.here)).as_deref(), Some("m12"));
+                assert_eq!(on(&theirs).as_deref(), Some("m12"), "m22 reads it");
+                assert_eq!(
+                    accounts_tokens::TokenState::of(&Lookup::Found(theirs), None, now),
+                    accounts_tokens::TokenState::Active,
+                    "active on m22"
+                );
+                assert_eq!(judged_at(&w, &peer.here), TokenFact::InUse);
+            }
+        });
+        let differs = notes.iter().filter(|n| n.kind == "token-differ").count();
+        assert_eq!(differs, usize::from(of_another), "token-differ: {notes:?}");
+        assert!(
+            !format!("{notes:?}").contains("inert_fixture"),
+            "nothing of the value is journaled"
+        );
+        assert!(!holds_fixture(&w.state()), "nor in this Mac's state");
+    }
+}
+
+/// A PEER MAC COMPARES NOTHING WITHOUT A CURRENT READING OF THE ACCOUNT'S STORED LOGIN (§5.6): on
+/// m12, which holds no row of m22's token, a session on the token reads the row's own windows
+/// twice. With no stored login of the account here, no reading is ever a basis, so neither
+/// compares anything and nothing is written to the vault. With a stored-login reading whose week
+/// ends before the token's reading, that basis compares nothing either. CONTROL: the exit test
+/// above, with a current basis.
+#[cfg(unix)]
+#[test]
+fn a_peer_mac_compares_nothing_without_a_current_stored_login_reading() {
+    for case in ["no stored login", "an ended week"] {
+        let (w, peer) = peer_world();
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+        if case == "an ended week" {
+            stored_login_here(&w);
+            let now = w.clock();
+            w.tap_text(&line(10, 42, now + 30, now + 60), None, None);
+            assert_eq!(step(), Some("reading recorded"), "{case}");
+            assert!(
+                table(&w).rows[KEY].verification.basis.is_some(),
+                "{case}: PRECONDITION: a basis"
+            );
+            w.later(120);
+        }
+        on_token(&w, &idle, first(&w));
+        for api_ms in [20, 30] {
+            let now = w.clock();
+            w.tap_text(&line(api_ms, 43, now + 3_600, now + 5 * 86_400), None, None);
+            assert!(step().is_some(), "{case}: the token's reading");
+            w.later(30);
+        }
+        let row = table(&w).rows.remove(KEY).expect("the token's row");
+        assert_eq!(
+            row.verification.verdict,
+            Some(Verdict::NoBasis),
+            "{case}: compared with nothing"
+        );
+        if case == "no stored login" {
+            assert_eq!(
+                row.verification.basis, None,
+                "a token's reading is no basis"
+            );
+        }
+        assert!(
+            !standing_at(&peer.here).verified(),
+            "{case}: nothing written"
+        );
+        assert!(row.verified.is_none(), "{case}");
+    }
+}
+
+/// m22's meta of its token made at [`first`], refuted, as a later build writes a refutation: of a
+/// later schema (2), which no build of schema 1 parses, so every Mac of this build reads a pair
+/// beside it `mismatched (value)`.
+fn refuted_meta(w: &TapWorld, peer: &Peer) -> String {
+    let json = peer.m22.meta(first(w)).to_json();
+    assert!(json.contains(r#""schema":1"#), "PRECONDITION: {json}");
+    let at = u64::try_from(w.clock()).unwrap();
+    json.replacen(r#""schema":1"#, r#""schema":2"#, 1).replacen(
+        '{',
+        &format!(
+            r#"{{"refuted":{{"on":"m22","at":{at},"seven_day_resets_at":{},"five_hour_resets_at":null}},"#,
+            born(w) + 4 * 3600 + 2 * 86_400
+        ),
+        1,
+    )
+}
+
+/// Moves the world's clock, where it must, into this Mac's turn to settle a pair that it and m22
+/// split just now: the turns go to the pair's writers in seat order, each
+/// [`claude_token::SETTLE_TURN_SECS`] long from the split ([`claude_token::settle`]), so where m22's
+/// seat comes first this Mac's turn is the second, and the clock moves half a turn into it.
+fn into_this_macs_turn(w: &TapWorld, peer: &Peer) {
+    let records = aterm_secrets::client::load_records(&peer.here).expect("the records");
+    let seats = aterm_secrets::client::seats_ever(records.log().expect("a log"));
+    let seat = |label: &str| {
+        seats
+            .iter()
+            .find(|(_, _, named)| named == label)
+            .map(|(seat, _, _)| *seat)
+            .expect("a seat")
+    };
+    if seat("m22") < seat("m12") {
+        w.later(i64::try_from(claude_token::SETTLE_TURN_SECS * 3 / 2).unwrap());
+    }
+}
+
+/// TWO MACS' CONCURRENT VERIFY AND REFUTE ARE SETTLED AT ONE TICK, WITH NO NEW MINT (§5.6): this
+/// Mac, m12, verifies m22's token by its stored login's windows while m22, before reading that
+/// verification, writes the pair again refuted, as a later build's refutation is ([`refuted_meta`]).
+/// Once each Mac holds both, the pair reads `mismatched (draft)` on both, whatever schema its meta
+/// is of. In this Mac's turn to settle it ([`into_this_macs_turn`]), m22's settle writes nothing,
+/// and this Mac's next token reading settles it in that tick: one draft, the token m22 minted
+/// beside the refutation, which both Macs read `mismatched (value)`, so neither serves it, and
+/// this Mac's verification is not written over the refutation (`aterm-secrets`' settle tests pin
+/// the bytes kept).
+#[cfg(unix)]
+#[test]
+fn a_concurrent_verify_and_refute_are_settled_at_one_tick_with_no_new_mint() {
+    use aterm_secrets::claude_token::{Check, Mismatch, Settled};
+    let (w, peer) = peer_world();
+    stored_login_here(&w);
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    w.tap(10, 42, None);
+    assert_eq!(step(), Some("reading recorded"), "the basis");
+
+    let key = Key::parse(KEY).unwrap();
+    let refuted = refuted_meta(&w, &peer);
+    aterm_secrets::client::test_put_everyone_draft(
+        &peer.m22.paths,
+        &[
+            (&key.entry(), FIXTURE_TOKEN.as_bytes()),
+            (&key.meta_entry(), refuted.as_bytes()),
+        ],
+    )
+    .expect("m22's refutation");
+    on_token(&w, &idle, first(&w));
+    w.later(30);
+    w.tap(20, 43, None);
+    assert_eq!(step(), Some("reading recorded"));
+    assert!(
+        standing_at(&peer.here).verified(),
+        "PRECONDITION: this Mac verified it, not yet holding m22's refutation"
+    );
+    for paths in [&peer.here, &peer.m22.paths] {
+        aterm_secrets::client::sync(paths, None).expect("syncs");
+        assert_eq!(
+            standing_at(paths).check,
+            Check::Mismatched(Mismatch::Draft),
+            "the two drafts split the pair"
+        );
+    }
+    w.later(30);
+    into_this_macs_turn(&w, &peer);
+    assert_eq!(
+        claude_token::settle(
+            &peer.m22.paths,
+            &key,
+            u64::try_from(w.clock()).unwrap(),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .expect("m22's settle"),
+        Settled::Theirs("m12".to_owned()),
+        "m22's turn it is not"
+    );
+
+    w.tap(30, 44, None);
+    assert!(step().is_some(), "the next token reading");
+    for paths in [&peer.here, &peer.m22.paths] {
+        aterm_secrets::client::sync(paths, None).expect("syncs");
+        let settled = standing_at(paths);
+        assert_eq!(
+            settled.check,
+            Check::Mismatched(Mismatch::Value),
+            "one tick settles it, to the refutation"
+        );
+        assert!(!settled.verified(), "the refutation stands: unverified");
+        assert!(!returns_fixture(paths), "served nowhere");
+    }
+}
+
+/// A SPLIT PAIR WHOSE WINNING META THIS BUILD DOES NOT READ IS SETTLED AT A READING ON ITS TOKEN
+/// (§5.6): m22 and this Mac, m12, each write the pair again at once, refuted as a later build
+/// refutes it ([`refuted_meta`], of schema 2), neither having read the other's. Once each Mac holds
+/// both, the pair reads `mismatched (draft)`, and its meta, the register's winner, does not parse
+/// here, so the standing names no token, and a session on the token reads as one on another token.
+/// In this Mac's turn ([`into_this_macs_turn`]), the next reading of that session settles the pair
+/// anyway: the settle goes before the reading is judged for its token. Both Macs then read one
+/// draft, `mismatched (value)`, served nowhere. In the test above, the pair's winning meta is m22's
+/// refutation or this Mac's verification, whichever op the log orders first. Before this fix, the
+/// tap judged the token first, and about two runs in five that test failed: the reading was taken
+/// as one of another token and settled nothing. Here neither meta parses, so that order fails
+/// every run, as this test did before the fix.
+#[cfg(unix)]
+#[test]
+fn a_split_pair_whose_winning_meta_does_not_parse_is_settled_at_a_reading_on_its_token() {
+    use aterm_secrets::claude_token::{Check, Mismatch, Settled};
+    let (w, peer) = peer_world();
+    stored_login_here(&w);
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    w.tap(10, 42, None);
+    assert_eq!(step(), Some("reading recorded"), "the basis");
+
+    let key = Key::parse(KEY).unwrap();
+    let theirs = refuted_meta(&w, &peer);
+    w.later(1);
+    let ours = refuted_meta(&w, &peer).replacen(r#""on":"m22""#, r#""on":"m12""#, 1);
+    assert_ne!(theirs, ours, "PRECONDITION: two values of the meta");
+    for (paths, meta) in [(&peer.m22.paths, &theirs), (&peer.here, &ours)] {
+        aterm_secrets::client::test_put_everyone_draft(
+            paths,
+            &[
+                (&key.entry(), FIXTURE_TOKEN.as_bytes()),
+                (&key.meta_entry(), meta.as_bytes()),
+            ],
+        )
+        .expect("a refutation");
+    }
+    for paths in [&peer.here, &peer.m22.paths] {
+        aterm_secrets::client::sync(paths, None).expect("syncs");
+        let split = standing_at(paths);
+        assert_eq!(
+            split.check,
+            Check::Mismatched(Mismatch::Draft),
+            "the two drafts split the pair"
+        );
+        assert!(
+            split.meta.is_none(),
+            "PRECONDITION: its winning meta does not parse here"
+        );
+    }
+    w.later(30);
+    into_this_macs_turn(&w, &peer);
+    assert_eq!(
+        claude_token::settle(
+            &peer.m22.paths,
+            &key,
+            u64::try_from(w.clock()).unwrap(),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .expect("m22's settle"),
+        Settled::Theirs("m12".to_owned()),
+        "m22's turn it is not"
+    );
+
+    on_token(&w, &idle, first(&w));
+    w.tap(30, 44, None);
+    assert_eq!(
+        step(),
+        Some(TAP_OTHER_TOKEN),
+        "the reading, read before its settle, names no token of the vault's"
+    );
+    for paths in [&peer.here, &peer.m22.paths] {
+        aterm_secrets::client::sync(paths, None).expect("syncs");
+        let settled = standing_at(paths);
+        assert_eq!(
+            settled.check,
+            Check::Mismatched(Mismatch::Value),
+            "the reading settles it, to one draft"
+        );
+        assert!(!returns_fixture(paths), "served nowhere");
+    }
+}
+
+/// A SPLIT PAIR IS SETTLED AT THE ACCOUNTS UPKEEP'S PASS, WITH NO SESSION OF ITS ACCOUNT ON ANY
+/// MAC (§5.6): this Mac, m12, and m22 verify m22's token at once, neither having read the other's
+/// verification, so once each holds both the pair reads `mismatched (draft)` on both and no Mac
+/// serves it. No session of the account runs anywhere, so no reading's tap settles it. In this
+/// Mac's turn ([`into_this_macs_turn`]), m22's pass writes nothing, and this Mac's pass
+/// ([`accounts_tokens::rows_on_token_settled`]) settles it and lists the vault again, so the row
+/// reads as on its token at that same pass; both Macs then read one verified draft and return the
+/// token. CONTROL: a read that settles nothing ([`accounts_tokens::rows_on_token_read`]) leaves
+/// the pair split and the row off its token.
+#[cfg(unix)]
+#[test]
+fn a_split_pair_is_settled_at_the_accounts_upkeep_with_no_session_anywhere() {
+    use aterm_secrets::claude_token::{BY_WINDOWS, Check, Mismatch, Verified};
+    let (w, peer) = peer_world();
+    let key = Key::parse(KEY).unwrap();
+    let now = u64::try_from(w.clock()).unwrap();
+    for (paths, on) in [(&peer.here, "m12"), (&peer.m22.paths, "m22")] {
+        let evidence = Verified {
+            on: on.to_owned(),
+            at: now,
+            by: BY_WINDOWS.to_owned(),
+            seven_day_resets_at: Some(born(&w) + 4 * 3600 + 86_400),
+            five_hour_resets_at: Some(born(&w) + 4 * 3600),
+        };
+        assert_eq!(
+            claude_token::verify(
+                paths,
+                &key,
+                first(&w),
+                evidence,
+                OnBusy::Refuse(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            )
+            .expect("a verification"),
+            MemberWritten::Posted,
+            "{on}'s verification"
+        );
+    }
+    let split = || {
+        for paths in [&peer.here, &peer.m22.paths] {
+            aterm_secrets::client::sync(paths, None).expect("syncs");
+            assert_eq!(
+                standing_at(paths).check,
+                Check::Mismatched(Mismatch::Draft),
+                "the two verifications split the pair"
+            );
+        }
+    };
+    split();
+    into_this_macs_turn(&w, &peer);
+    let at = w.clock();
+    let roster = accounts::Roster::load(&w.roster_path()).expect("the roster");
+    let store = accounts::Store::at(&w.state());
+    assert_eq!(
+        journal::with_keyer(keyer, || {
+            accounts_tokens::rows_on_token_read(&peer.here, &store, &roster, at)
+        }),
+        Some(std::collections::BTreeMap::new()),
+        "CONTROL: a read that settles nothing: the row is off its token"
+    );
+    split();
+    let m22_listed = claude_token::listed(&peer.m22.paths).expect("m22's listing");
+    assert!(
+        !accounts_tokens::settle_splits(
+            &accounts_tokens::Vault(peer.m22.paths.clone()),
+            &m22_listed,
+            u64::try_from(at).unwrap()
+        ),
+        "m22's pass: not its turn"
+    );
+    let on_token = journal::with_keyer(keyer, || {
+        accounts_tokens::rows_on_token_settled(&peer.here, &store, &roster, at)
+    })
+    .expect("the listing was read");
+    assert_eq!(
+        on_token.get("main"),
+        Some(&(first(&w) + 365 * 86_400)),
+        "the pass that settled the pair reads the row on its token"
+    );
+    for paths in [&peer.here, &peer.m22.paths] {
+        aterm_secrets::client::sync(paths, None).expect("syncs");
+        let settled = standing_at(paths);
+        assert_eq!(settled.check, Check::Readable, "settled: {settled:?}");
+        assert!(settled.verified(), "a verification stands");
+        assert!(returns_fixture(paths), "the same token, served");
     }
 }

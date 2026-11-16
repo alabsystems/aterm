@@ -10,8 +10,9 @@ use super::*;
 /// that directory where `left`, spelled apart from it, since a location is what it names.
 #[test]
 fn each_occupant_of_a_displaced_rows_directory_answers_for_itself() {
-    let world = World::new("displaced-occupant-");
-    let dir = world.store().login_dir("a").unwrap();
+    // This directory-only judgment needs no native vault or account-source fixture.
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("login");
     let spelled = dir.display().to_string();
     let verdict = |left: bool| {
         fs::create_dir_all(&dir).unwrap();
@@ -102,7 +103,6 @@ fn a_sync_that_published_rows_and_refused_the_move_says_no_row_moved() {
 #[test]
 fn the_setup_resync_counts_a_move_it_made_with_nothing_to_read() {
     let world = World::new("setup-resync-");
-    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     world.login(B);
     let claude = world.config.with_file_name(accounts::ACCOUNTS_FILE);
     let fetch =
@@ -147,7 +147,6 @@ fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool(
     assert!(synced.is_err(), "{synced:?}");
 
     let world = World::new("upkeep-moved-");
-    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     let wake = world.store().wake_path();
     let _ = fs::remove_file(&wake);
     world.login(B);
@@ -168,11 +167,23 @@ fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool(
 /// `--json` names the row that took the login, with a source to read and with nothing to read.
 #[test]
 fn a_move_leaves_the_row_what_it_left_and_the_receipt_names_it() {
-    for source in [true, false] {
-        let world = World::new("bound-was-");
-        if !source {
-            crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
-        }
+    for source in [
+        #[cfg(unix)]
+        true,
+        false,
+    ] {
+        let world = if source {
+            #[cfg(unix)]
+            {
+                World::with_source("bound-was-")
+            }
+            #[cfg(not(unix))]
+            {
+                panic!("the real vault fixture requires Unix")
+            }
+        } else {
+            World::new("bound-was-")
+        };
         let store = world.store();
         let dir_b = store.login_dir("b").unwrap();
         write_login(&dir_b, B);
@@ -206,7 +217,6 @@ fn a_move_leaves_the_row_what_it_left_and_the_receipt_names_it() {
 #[test]
 fn a_broken_roster_is_the_syncs_error_with_nothing_to_read() {
     let world = World::new("broken-roster-");
-    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     world.login(B);
     fs::write(&world.roster, "[[account\nlabel=").unwrap();
     let synced = world.sync();

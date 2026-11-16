@@ -10,16 +10,16 @@
 //! (`s-1a2b3c4d5e6f70819203`), which [`TabId::parse`] refuses: a cold restore gives such a tab a
 //! minted ID and records the `s-` one as the ID it had. A shell still running in such a tab holds
 //! the `s-` text in its environment, which nothing can rewrite, so the readers of a request from
-//! this Mac's own shells (a requester's `sid=`, a `@<sid>` selector, a keeper's link) also take
-//! it ([`is_legacy`]), and only as the ID of a session this Mac holds. No fleet reader takes it
-//! and nothing mints it.
+//! a still-running shell (a requester's `sid=`, a local `@<sid>` selector, a keeper's link) also
+//! take it ([`is_legacy`]). Requester metadata can carry that exact legacy ID over the fleet;
+//! it does not become a canonical tab ID, and nothing mints it.
 //!
-//! This module is THE parser of a tab ID: every crate that reads one (a `@<id>` selector, a
-//! `sid=` field, a file named by one, a fabric principal) asks [`TabId::parse`] or [`is_tab_id`],
-//! so one grammar is accepted everywhere. The grammar of the `t` form's text (the alphabet, the
-//! lengths and [`is_tab_id`]) is alab-policy's (`alab_policy::tab_id`), which the reply readers
-//! read a session's name by; this module builds the ID on it. It is strict: lower case only, none of Crockford's
-//! aliases (`i`, `l`, `o`, `u`) in the `t` form, exact lengths. One spelling per ID also keeps two
+//! [`TabId::parse`] reads the canonical form. Its text grammar (the alphabet, lengths and
+//! [`is_tab_id`]) is [`alab_policy::tab_id`]'s, shared with the reply readers; this module builds
+//! the ID on it. Local request and requester-metadata readers use
+//! [`crate::control_request::Sid`] or [`crate::control_verbs::is_minted_sid`] to also accept the
+//! exact legacy form. Both grammars are strict: lower case only, exact lengths, and none of
+//! Crockford's aliases (`i`, `l`, `o`, `u`) in the `t` form. One spelling per ID also keeps two
 //! IDs from folding onto one file name on a case-insensitive volume.
 
 use core::fmt;

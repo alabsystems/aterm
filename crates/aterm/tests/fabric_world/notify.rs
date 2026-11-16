@@ -202,7 +202,7 @@ fn offset_of(line: &str) -> u64 {
 fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
     let fleet = Fleet::boot("notify-once");
     let w = Watch::attention(&fleet, "once");
-    let first = raise_attention(&fleet, "s-one", 1, "needs a key");
+    let first = raise_attention(&fleet, "t000043q5e2", 1, "needs a key");
 
     let run = w.once("attention", &[]);
     assert!(run.status.success(), "{}", run.stderr);
@@ -241,7 +241,7 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
         rescan.stdout
     );
 
-    let second = raise_attention(&fleet, "s-one", 2, "still needs a key");
+    let second = raise_attention(&fleet, "t000043q5e2", 2, "still needs a key");
     assert_ne!(second, first);
     let third = w.once("attention", &[]);
     assert!(third.status.success(), "{}", third.stderr);
@@ -260,16 +260,21 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
     let fleet = Fleet::boot("notify-standing");
     let w = Watch::attention(&fleet, "standing");
     let key = format!("attention={}", aterm_link::pct::encode("needs a key"));
-    let first = presence_row(&fleet, "s-one", 1, &format!("state=live inc=1 {key}"));
-    presence_row(&fleet, "s-one", 2, &format!("state=live inc=2 {key}"));
+    let first = presence_row(&fleet, "t000043q5e2", 1, &format!("state=live inc=1 {key}"));
+    presence_row(&fleet, "t000043q5e2", 2, &format!("state=live inc=2 {key}"));
     presence_row(
         &fleet,
-        "s-one",
+        "t000043q5e2",
         3,
         &format!("state=live inc=2 phase=busy {key}"),
     );
-    presence_row(&fleet, "s-one", 4, &format!("state=exited inc=2 {key}"));
-    let other = presence_row(&fleet, "s-two", 5, &format!("state=live inc=1 {key}"));
+    presence_row(
+        &fleet,
+        "t000043q5e2",
+        4,
+        &format!("state=exited inc=2 {key}"),
+    );
+    let other = presence_row(&fleet, "t000043qb1t", 5, &format!("state=live inc=1 {key}"));
     let run = w.once("attention", &[]);
     assert!(run.status.success(), "{}", run.stderr);
     assert_eq!(
@@ -287,9 +292,9 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
         run.stdout
     );
 
-    presence_row(&fleet, "s-one", 6, "state=live inc=3 attention=-");
-    let again = presence_row(&fleet, "s-one", 7, &format!("state=live inc=3 {key}"));
-    presence_row(&fleet, "s-one", 8, &format!("state=live inc=4 {key}"));
+    presence_row(&fleet, "t000043q5e2", 6, "state=live inc=3 attention=-");
+    let again = presence_row(&fleet, "t000043q5e2", 7, &format!("state=live inc=3 {key}"));
+    presence_row(&fleet, "t000043q5e2", 8, &format!("state=live inc=4 {key}"));
     let run = w.once("attention", &[]);
     assert!(run.status.success(), "{}", run.stderr);
     assert_eq!(
@@ -302,7 +307,7 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
         "a clear re-arms the subject"
     );
 
-    presence_row(&fleet, "s-one", 9, &format!("state=live inc=5 {key}"));
+    presence_row(&fleet, "t000043q5e2", 9, &format!("state=live inc=5 {key}"));
     let run = w.once("attention", &[]);
     assert!(run.status.success(), "{}", run.stderr);
     assert_eq!(w.fired().len(), 3, "a restart remembers what stands");
@@ -317,7 +322,7 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
 fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     let fleet = Fleet::boot("notify-doubt");
     let w = Watch::attention(&fleet, "doubt");
-    let off = raise_attention(&fleet, "s-one", 1, "the disk is full");
+    let off = raise_attention(&fleet, "t000043q5e2", 1, "the disk is full");
 
     let crashed = w.once_with(
         "attention",
@@ -362,7 +367,7 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
     let fleet = Fleet::boot("notify-rate");
     let w = Watch::attention(&fleet, "rate");
     let offs: Vec<u64> = (1..=3)
-        .map(|n| raise_attention(&fleet, "s-one", n, &format!("escalation {n}")))
+        .map(|n| raise_attention(&fleet, "t000043q5e2", n, &format!("escalation {n}")))
         .collect();
 
     let run = w.once("attention", &["--rate", "1/1h"]);
@@ -389,7 +394,7 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
         );
     }
 
-    let fourth = raise_attention(&fleet, "s-one", 4, "escalation 4");
+    let fourth = raise_attention(&fleet, "t000043q5e2", 4, "escalation 4");
     let after = w.once("attention", &["--rate", "3/1h"]);
     assert!(after.status.success(), "{}", after.stderr);
     assert_eq!(
@@ -413,7 +418,7 @@ fn an_attention_string_cannot_become_a_shell_word() {
     let w = Watch::attention(&fleet, "inject");
     let pwned = fleet.tmp.join("pwned");
     let payload = format!("; touch {}; echo owned", pwned.display());
-    raise_attention(&fleet, "s-one", 1, &payload);
+    raise_attention(&fleet, "t000043q5e2", 1, &payload);
 
     let exec = format!(
         "printf '%s\\n' \"$ATERM_NOTIFY_TEXT\" >> {}",
@@ -438,7 +443,7 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
     let w = Watch::attention(&fleet, "follow");
     let mut daemon = w.follow("attention");
 
-    let first = raise_attention(&fleet, "s-one", 1, "one");
+    let first = raise_attention(&fleet, "t000043q5e2", 1, "one");
     until("the follower to record a completed notification", || {
         w.journal()
             .iter()
@@ -449,7 +454,7 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
 
     daemon.kill();
 
-    let second = raise_attention(&fleet, "s-one", 2, "two");
+    let second = raise_attention(&fleet, "t000043q5e2", 2, "two");
     let back = w.once("attention", &[]);
     assert!(back.status.success(), "{}", back.stderr);
     let fired = w.fired();
@@ -477,7 +482,14 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
         ],
     );
     let attention: Vec<u64> = (1..=16)
-        .map(|seq| raise_attention(&fleet, "s-one", seq, &format!("needs a response {seq}")))
+        .map(|seq| {
+            raise_attention(
+                &fleet,
+                "t000043q5e2",
+                seq,
+                &format!("needs a response {seq}"),
+            )
+        })
         .collect();
     let halt = fleet
         .god()
@@ -517,7 +529,7 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
         aterm_link::notify::cursor_of(&w.state, "attention").map(|_| ())
     });
     daemon.kill();
-    let off = raise_attention(&fleet, "s-one", 1, "arrived while offline");
+    let off = raise_attention(&fleet, "t000043q5e2", 1, "arrived while offline");
     let _restarted = w.follow_with("attention", &w.appender(), &["--since", "head"]);
     until("the previously unwatched attention to fire", || {
         w.fired()
@@ -531,8 +543,8 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
 fn a_page_checkpoint_waits_for_the_last_notification_command() {
     let fleet = Fleet::boot("notify-page-checkpoint");
     let w = Watch::attention(&fleet, "page-checkpoint");
-    let first = raise_attention(&fleet, "s-one", 1, "first");
-    let second = raise_attention(&fleet, "s-one", 2, "second");
+    let first = raise_attention(&fleet, "t000043q5e2", 1, "first");
+    let second = raise_attention(&fleet, "t000043q5e2", 2, "second");
     let after_page = fleet
         .god()
         .publish(
@@ -625,23 +637,23 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     };
     publish(
         1,
-        &format!("/f/{FLEET}/in/n-a/s-b/h-andrew/ask"),
+        &format!("/f/{FLEET}/in/n-a/t0000003vv2/h-andrew/ask"),
         "v=1 t=1 text=no",
     );
     publish(
         2,
         &format!("/f/{FLEET}/in/p/h-andrew/n-a/note"),
-        "v=1 t=1 from=s-b text=no",
+        "v=1 t=1 from=t0000003vv2 text=no",
     );
     publish(
         3,
         &format!("/f/{FLEET}/in/p/h-other/n-a/ask"),
-        "v=1 t=1 from=s-b text=no",
+        "v=1 t=1 from=t0000003vv2 text=no",
     );
     let ask = publish(
         4,
         &format!("/f/{FLEET}/in/p/h-andrew/n-a/ask"),
-        "v=1 t=1 from=s-b text=is%20this%20ok",
+        "v=1 t=1 from=t0000003vv2 text=is%20this%20ok",
     );
     publish(
         5,
@@ -686,7 +698,7 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
     let fleet = Fleet::boot("notify-sup");
     let w = Watch::attention(&fleet, "sup");
     let offs: Vec<u64> = (1..=3)
-        .map(|n| raise_attention(&fleet, "s-one", n, &format!("escalation {n}")))
+        .map(|n| raise_attention(&fleet, "t000043q5e2", n, &format!("escalation {n}")))
         .collect();
 
     let run = w.once("attention", &["--rate", "1/1h"]);
@@ -694,7 +706,7 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
     assert_eq!(w.fired(), vec![format!("{} dup=0 sup=0", offs[0])]);
     assert_eq!(w.suppressed(), 2, "two drops are on disk: {}", run.stdout);
 
-    let fourth = raise_attention(&fleet, "s-one", 4, "escalation 4");
+    let fourth = raise_attention(&fleet, "t000043q5e2", 4, "escalation 4");
     let broken = w.once_with(
         "attention",
         "aterm-link-no-such-notifier-9f3c",
@@ -720,7 +732,7 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
         broken.stdout
     );
 
-    let fifth = raise_attention(&fleet, "s-one", 5, "escalation 5");
+    let fifth = raise_attention(&fleet, "t000043q5e2", 5, "escalation 5");
     let ok = w.once("attention", &["--rate", "9/1h"]);
     assert!(ok.status.success(), "{}", ok.stderr);
     assert_eq!(
@@ -746,7 +758,7 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     }
     let w = Watch::attention(&fleet, "ordered");
     let _daemon = w.follow("attention");
-    let held = raise_attention(&fleet, "s-one", 1, "one");
+    let held = raise_attention(&fleet, "t000043q5e2", 1, "one");
     // The follower says its durable wait once for the log, at the first record it holds
     // (fix unit E5, E2E-15), in the words the notifier exports.
     const SAID: &str = aterm_link::notify::DURABLE_WAIT_WORDS;
@@ -764,7 +776,7 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
             .then_some(())
     });
     assert_eq!(w.fired(), vec![format!("{held} dup=0 sup=0")]);
-    let again = raise_attention(&fleet, "s-three", 3, "three");
+    let again = raise_attention(&fleet, "t004c2wz0sr", 3, "three");
     assert!(broker.flush_durable().expect("a full flush") > again);
     until("the durable mark to page the second row", || {
         w.journal()
@@ -786,7 +798,7 @@ fn an_ordered_brokers_attention_pages_once_it_is_durable() {
         &[],
         &[("ATERM_LINK_NOTIFY_PAGE_EARLY", "1")],
     );
-    let raised = raise_attention(&fleet, "s-two", 2, "two");
+    let raised = raise_attention(&fleet, "t000043qb1t", 2, "two");
     until("the control to page the row", || {
         early
             .journal()
@@ -974,7 +986,7 @@ impl Sess {
 fn a_need_whose_raise_the_bus_lost_pages_once_where_a_snapshot_names_it() {
     let fleet = Fleet::boot("notify-need-hole");
     let w = Watch::attention(&fleet, "need-hole");
-    let face = format!("/f/{FLEET}/pub/n-alpha/s-hole/ev");
+    let face = format!("/f/{FLEET}/pub/n-alpha/t00047tmz78/ev");
     let mut god = fleet.god();
     let mut seq = 0;
     let mut publish = |bodies: &[String]| -> Vec<u64> {

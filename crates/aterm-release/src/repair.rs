@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The repair worker a failed release cut opens.
+//! Repair ownership when a release cut fails.
 //!
 //! When `targo --unverified ship release` refuses at a failing gate or build, a red it decided
 //! about R's code, its failure exit hands [`open`] the failure and the cut's inputs
 //! ([`Failure`]); a COULD NOT RUN, a dry run and an operational stop (a dirty clone, another
-//! run's claim, a flag) open nothing. `open` starts one Claude Code worker under Autopilot Land
-//! on it, `aterm ctl @self spawn agent=claude cwd=<the release clone> -` with [`task`] on stdin,
+//! run's claim, a flag) open nothing. A caller-invoked cut returns its repair briefing for the
+//! caller to handle through native subagents or directly, without opening another session. A
+//! release pump needs an independent repair that persists after the cutter exits, so [`open`]
+//! starts one Claude Code worker under Autopilot Land with [`task`] on stdin,
 //! once per failing input hash ([`input_hash`]: the version, R and the prover), and keeps the
 //! worker's sid in the clone's repair record ([`RECORD_FILE`], beside the release journal). The
 //! record outlives the run, so a cut that fails again on the same inputs names the worker
 //! already on them and opens none, while a new hop, version or prover is a new hash and opens
 //! one. A red of `--open-next` judges main's tip, which is another commit at every try, so its
 //! hash is of the version it opens after alone ([`opening_hash`]): one worker per opened
-//! version. Outside an aterm session `open` starts nothing and gives the command to run instead
-//! ([`command`]). A spawn that fails, or a record that cannot be read or kept, is said
+//! version. A pump in an aterm session starts it there; a pump outside one reaches the newest
+//! local aterm. A spawn that fails, or a record that cannot be read or kept, is said
 //! ([`Opened::lines`]) and changes nothing else: the cut still ends with its own refusal.
 //!
 //! The spawn is injected ([`Spawner`]): [`Ctl`] is the real one, and a test's records its tasks.
-//! A cut the release pump runs has no session of its own, so its worker starts in the newest
-//! local aterm instead ([`Unattended`], chosen by [`spawner`]). The worker's report ends with one
+//! [`spawner`] chooses a route only for a pump; caller-owned repair needs no spawner or record.
+//! The worker's report ends with one
 //! line the pump reads ([`verdict`]): `FIX <commit>`, or `NO-FIX <why>`.
 
 use std::fmt::Write as _;
@@ -44,10 +46,6 @@ const MAX_RECORD_BYTES: u64 = 1024 * 1024;
 /// Each socket read and write of the real spawn, in seconds (`aterm ctl --timeout`), so the cut's
 /// failure exit ends even when no aterm answers.
 const SPAWN_TIMEOUT_SECS: &str = "60";
-
-/// The word that ends the task in [`command`]'s here-document. No task line is this word: every
-/// field the failure supplies is one line after a label, and every excerpt line is indented.
-const TASK_END: &str = "ATERM_REPAIR_TASK";
 
 const HASH_DOMAIN: &[u8] = b"aterm-release-repair-v1";
 const OPENING_DOMAIN: &[u8] = b"aterm-release-repair-open-next-v1";
@@ -194,8 +192,6 @@ impl Record {
 
 /// Where a repair worker starts.
 pub trait Spawner {
-    /// Whether this cut runs in an aterm session, where `@self` names it.
-    fn in_session(&self) -> bool;
     /// Start one worker in `cwd` on `task`: its sid.
     /// # Errors
     /// Why no worker started.
@@ -210,11 +206,15 @@ pub const PUMP_ENV: &str = "ATERM_RELEASE_PUMP";
 /// ([`spawn_args`]) with the task on stdin, each socket read and write bounded by a minute.
 pub struct Ctl;
 
-impl Spawner for Ctl {
-    fn in_session(&self) -> bool {
+impl Ctl {
+    /// Whether `@self` can route a pump's repair through this cut's aterm session.
+    #[must_use]
+    pub fn in_session() -> bool {
         std::env::var_os(aterm_types::domain::ENV_SESSION_ID).is_some_and(|sid| !sid.is_empty())
     }
+}
 
+impl Spawner for Ctl {
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
         ctl_spawn(&spawn_args(cwd), task)
     }
@@ -228,24 +228,30 @@ impl Spawner for Ctl {
 pub struct Unattended;
 
 impl Spawner for Unattended {
-    fn in_session(&self) -> bool {
-        true
-    }
-
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
         ctl_spawn(&unattended_args(cwd), task)
     }
 }
 
-/// The spawner of this cut: [`Ctl`] in a session or for a cut a person runs (which prints the
-/// command outside one), [`Unattended`] for a pump's cut outside a session.
+/// The route for a pump's repair: [`Ctl`] in a session, [`Unattended`] outside one. A caller's
+/// cut returns no spawner regardless of its terminal: its own harness handles the failure.
 #[must_use]
-pub fn spawner(in_session: bool, pump: bool) -> Box<dyn Spawner> {
-    if unattended(in_session, pump) {
-        Box::new(Unattended)
+pub fn spawner(in_session: bool, pump: bool) -> Option<Box<dyn Spawner>> {
+    if !pump {
+        None
+    } else if unattended(in_session, pump) {
+        Some(Box::new(Unattended))
     } else {
-        Box::new(Ctl)
+        Some(Box::new(Ctl))
     }
+}
+
+/// Who handles this cut's failure. Only a pump has an independently supervised repair process.
+pub enum RepairMode<'a> {
+    /// Return the failure briefing to the caller, with no independent session.
+    Caller,
+    /// The persistent release pump owns the repair and its worker's eventual report.
+    Pump(&'a mut dyn Spawner),
 }
 
 /// Whether a cut's worker starts with no session: only a pump's cut outside one.
@@ -256,6 +262,9 @@ pub const fn unattended(in_session: bool, pump: bool) -> bool {
 
 fn ctl_spawn(words: &[String], task: &str) -> Result<String, String> {
     use aterm_uds::spawnfd::Stdio;
+    eprintln!(
+        "repair: the release pump needs an independent repair session that persists after this cut exits"
+    );
     let mut child = aterm_uds::spawnfd::command("aterm")
         .args(["ctl", "--timeout", SPAWN_TIMEOUT_SECS])
         .args(words)
@@ -460,31 +469,6 @@ pub fn spawn_args(cwd: &Path) -> Vec<String> {
     ]
 }
 
-/// The command that starts the worker from an aterm tab: [`spawn_args`], the task in a
-/// here-document.
-#[must_use]
-pub fn command(cwd: &Path, task: &str) -> String {
-    let words: Vec<String> = spawn_args(cwd).iter().map(|w| shell_word(w)).collect();
-    format!(
-        "aterm ctl {} <<'{TASK_END}'\n{task}{TASK_END}",
-        words.join(" ")
-    )
-}
-
-/// `word` as a POSIX shell reads it back: itself when it holds nothing the shell reads, else
-/// single-quoted.
-fn shell_word(word: &str) -> String {
-    let plain = !word.is_empty()
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"@%+=:,./_-".contains(&b));
-    if plain {
-        word.to_string()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
-}
-
 /// `text` on one line: each NUL, carriage return and newline a space.
 fn one_line(text: &str) -> String {
     text.replace(['\n', '\r', '\0'], " ")
@@ -526,12 +510,28 @@ fn excerpt(text: &str, lines: usize, width: usize, lead: &str, budget: usize) ->
 /// over the cap (no path, gate or commit makes them so) would its end be cut.
 #[must_use]
 pub fn task(clone: &Path, failure: &Failure, hash: &str) -> String {
+    briefing(clone, failure, hash, true)
+}
+
+/// The failure context shared by a caller's handoff and an independent pump worker's task.
+fn briefing(clone: &Path, failure: &Failure, hash: &str, worker: bool) -> String {
     let mut head = String::new();
-    let _ = writeln!(
-        head,
-        "A release cut of aterm stopped at a failing gate or build, and you are its repair \
-         worker: a failed cut opens one per failing input hash."
-    );
+    if worker {
+        let _ = writeln!(
+            head,
+            "A release cut of aterm stopped at a failing gate or build, and you are its repair \
+             worker: a failed cut opens one per failing input hash."
+        );
+    } else {
+        head.push_str(
+            "A release cut of aterm stopped at a failing gate or build. The caller handles its \
+             repair; no new aterm session was opened. Use your harness's native subagents for \
+             same-machine delegation and your own shell/background tools for commands. Work \
+             directly when native subagents are unavailable. A separate session needs an \
+             explicit request or a concrete need native tools cannot meet; state that reason \
+             before spawning.\n",
+        );
+    }
     let _ = writeln!(
         head,
         "\nWhat failed: {}, at step {} of `targo --unverified ship release`.",
@@ -576,15 +576,26 @@ pub fn task(clone: &Path, failure: &Failure, hash: &str) -> String {
          in it is yours to edit, commit, reset or switch.\n\
          3. Fix the cause forward on main in a worktree of your own outside the release clone \
          (AGENTS.md, Shared checkout), land it with `targo --unverified verify land`, and remove \
-         that worktree once it has landed.\n\
-         4. Do not run `ship release`, publish, or read the release credentials. The cut carries \
-         your fix with `targo --unverified ship release --fix <the fix's own non-merge commit>`, \
-         so end your report with one line that names that commit in full: `FIX <its 40 hex \
-         digits>`.\n\
-         5. If the cause is not in the source (this machine, a service, a credential), or you \
-         could not finish, change nothing and end your report with one line: `NO-FIX <what it \
-         is>`.\n",
+         that worktree when its overall goal is done.\n",
     );
+    if worker {
+        tail.push_str(
+            "4. Do not run `ship release`, publish, or read the release credentials. The cut \
+             carries your fix with `targo --unverified ship release --fix <the fix's own \
+             non-merge commit>`, so end your report with one line that names that commit in \
+             full: `FIX <its 40 hex digits>`.\n\
+             5. If the cause is not in the source (this machine, a service, a credential), or \
+             you could not finish, change nothing and end your report with one line: \
+             `NO-FIX <what it is>`.\n",
+        );
+    } else {
+        tail.push_str(
+            "4. After landing a source fix, the cut can carry it with `targo --unverified ship \
+             release --fix <the fix's own non-merge commit>`.\n\
+             5. If a machine, service or credential prevents the operation, record that \
+             limitation and continue useful work elsewhere.\n",
+        );
+    }
     // The why, the detail and the remedy share what is left, a third each.
     let share = MAX_TASK_BYTES.saturating_sub(head.len() + tail.len()) / 3;
     let detail = failure.detail.join("\n");
@@ -625,9 +636,8 @@ pub enum Opened {
     Spawned { hash: String, sid: String },
     /// A worker was already opened for this input hash: its sid. It started none.
     Already { hash: String, sid: String },
-    /// This cut runs in no aterm session: the command that starts the worker from one. It started
-    /// none.
-    Command { hash: String, command: String },
+    /// The caller owns the repair; its failure context, with no worker started or recorded.
+    Caller { hash: String, briefing: String },
     /// It started a worker, and the record could not keep its sid: why. A cut that fails again on
     /// these inputs opens another.
     Unrecorded {
@@ -657,13 +667,12 @@ impl Opened {
                 short(hash),
                 record.display()
             )],
-            Self::Command { hash, command } => {
+            Self::Caller { hash, briefing } => {
                 let mut lines = vec![format!(
-                    "repair: not in an aterm session, so no worker opened (input hash {}); in an \
-                     aterm tab this opens it:",
+                    "repair: caller-owned repair (input hash {}); no worker opened",
                     short(hash)
                 )];
-                lines.extend(command.lines().map(str::to_string));
+                lines.extend(briefing.lines().map(str::to_string));
                 lines
             }
             Self::Unrecorded { hash, sid, why } => vec![format!(
@@ -682,11 +691,18 @@ impl Opened {
 
 /// Open the repair worker of `failure`, a red of the cut in the release clone `clone` whose
 /// repair record is `record`, once per [`input_hash`]: a worker the record holds for the hash is
-/// named and none started; outside an aterm session ([`Spawner::in_session`]) the command is
-/// given and none started; else one starts in `clone` on [`task`] and the record keeps its sid. A
-/// record that cannot be read starts none, as it cannot say whether one was opened.
-pub fn open(record: &Path, clone: &Path, failure: &Failure, spawner: &mut dyn Spawner) -> Opened {
+/// named and none started. [`RepairMode::Caller`] instead returns the repair briefing without
+/// reading or writing a worker record. Only a pump starts a worker in `clone` on [`task`] and
+/// keeps its sid. A pump's unreadable record starts none, as it cannot say whether one opened.
+pub fn open(record: &Path, clone: &Path, failure: &Failure, mode: RepairMode<'_>) -> Opened {
     let hash = input_hash(failure);
+    let spawner = match mode {
+        RepairMode::Caller => {
+            let briefing = briefing(clone, failure, &hash, false);
+            return Opened::Caller { hash, briefing };
+        }
+        RepairMode::Pump(spawner) => spawner,
+    };
     let mut kept = match Record::load(record) {
         Ok(kept) => kept,
         Err(why) => return Opened::Failed { hash, why },
@@ -696,10 +712,6 @@ pub fn open(record: &Path, clone: &Path, failure: &Failure, spawner: &mut dyn Sp
         return Opened::Already { hash, sid };
     }
     let task = task(clone, failure, &hash);
-    if !spawner.in_session() {
-        let command = command(clone, &task);
-        return Opened::Command { hash, command };
-    }
     let sid = match spawner.spawn(clone, &task) {
         Ok(sid) => sid,
         Err(why) => return Opened::Failed { hash, why },

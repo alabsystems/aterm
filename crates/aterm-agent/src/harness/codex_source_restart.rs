@@ -297,7 +297,7 @@ impl Registry {
     ) -> Result<Option<RestartReservation>, Error> {
         use crate::harness::codex_app_login::legacy_file_reader_allowed;
         if Process::observe(child.pid).as_ref() != Some(child)
-            || !aterm_types::control_verbs::is_minted_sid(sid)
+            || aterm_types::control_request::Sid::parse(sid).is_none()
             || command.env.iter().any(|(name, _)| name == LAUNCH_ENV)
             || command
                 .unset

@@ -46,8 +46,8 @@ fn account_targets_wait_for_a_writer_instead_of_admitting_a_denied_peer() {
 }
 
 pub(crate) use super::fixture::{
-    Lab, NETWORK, repair_commons, repair_commons_among_first, repair_commons_at,
-    repair_commons_first, repair_commons_reports,
+    Lab, NETWORK, repair_commons, repair_commons_among, repair_commons_among_first,
+    repair_commons_at, repair_commons_first, repair_commons_reports,
 };
 
 /// One Commons round between Macs `a` (initiator) and `b` (responder), each with its ring windows

@@ -1400,7 +1400,7 @@ fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
     );
 }
 
-/// THE TAB MARK (the Workers as subagents design (2026-11-04) §7): appended last, local,
+/// THE TAB MARK (the Workers as subagents design (2026-11-04) §7): appended after the mail gap, local,
 /// its keys appended at the tiers their values are: a window's number, the parked bit, the
 /// worker's task end and the close's samples are wire facts, the account a host fact. A sample
 /// holds a count or `unavailable`, never anything else, and an older reader skips the kind and
@@ -1408,7 +1408,6 @@ fn a9_mail_gap_is_appended_local_at_its_keys_tiers() {
 /// a sample key refuses a word; a count key refuses `unavailable`.
 #[test]
 fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
-    assert_eq!(Kind::ALL.last(), Some(&Kind::Tab), "the last kind");
     let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
     assert_eq!(kind_at(Kind::Tab), kind_at(Kind::MailGap).map(|i| i + 1));
     assert_eq!(Kind::Tab.word(), "tab");
@@ -1530,6 +1529,127 @@ fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
     );
 }
 
+/// THE DESC MARK (a description claim) is the last kind, appended after `tab`, local, and names no
+/// key of its own: the slot, `upto` and `ttl` are wire facts, the claim's text, its author's
+/// declared name and what it is about are host facts, so the journal holds them and the wire tier
+/// and the bus never do. A program's own title rides in `title=` instead and stays content tier.
+/// An older reader reads an unknown kind and keeps every key, all of them older than the kind.
+/// CONTROL: the longest realistic claim fits a record, and one with every field at its bound is
+/// refused whole, never cut.
+#[test]
+fn the_desc_mark_is_appended_local_and_its_text_is_a_host_fact() {
+    assert_eq!(Kind::ALL.last(), Some(&Kind::Desc), "the last kind");
+    let kind_at = |k: Kind| Kind::ALL.iter().position(|x| *x == k);
+    assert_eq!(kind_at(Kind::Desc), kind_at(Kind::Tab).map(|i| i + 1));
+    assert_eq!(Kind::Desc.word(), "desc");
+    assert!(Kind::Desc.is_mark() && Kind::Desc.node_level().is_none());
+    assert_eq!(Kind::from_word("desc"), Kind::Desc);
+    let claim = |by: Actor, f: Fields| Rec {
+        seq: 77,
+        t: 1_760_545_012_345,
+        op: Op::Mark,
+        node: Node::SESSION,
+        par: None,
+        k: Kind::Desc,
+        f,
+        src: Src::Mark,
+        conf: Conf::Claim,
+        by,
+    };
+    let r = claim(
+        Actor::Ctl,
+        Fields::new()
+            .tok(Key::Field, "title")
+            .and_then(|f| f.text(Key::Value, "fix the parser"))
+            .and_then(|f| f.u(Key::Upto, 70))
+            .and_then(|f| f.u(Key::Ttl, 600))
+            .and_then(|f| f.text(Key::As, "planner"))
+            .and_then(|f| f.id(Key::Re, "41"))
+            .expect("a claim's fields"),
+    );
+    let host = encode(&r, Tier::Host).expect("fits");
+    assert_eq!(
+        host,
+        "77 mark - desc field=title value=fix%20the%20parser upto=70 ttl=600 as=planner re=41 \
+         by=ctl src=mark conf=claim t=1760545012345"
+    );
+    assert_eq!(decode(&host), Ok(r.clone()), "{host}");
+    let wire = encode(&r, Tier::Wire).expect("fits");
+    assert!(
+        wire.contains(" field=title upto=70 ttl=600 "),
+        "the wire facts: {wire}"
+    );
+    assert!(
+        !wire.contains("value=") && !wire.contains("as=") && !wire.contains(" re="),
+        "no host fact on the wire: {wire}"
+    );
+    assert!(!r.is_bus_class() && !r.is_turn_class(), "local");
+    assert_eq!(
+        aterm_slog::encode_mirror(&r, Tier::Wire, 1, None, &|_| None),
+        Err(EncodeError::NotBusClass)
+    );
+    let older = host.replace(" desc ", " zz-kind-of-phase-9 ");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Unknown, "{older}");
+    assert_eq!(
+        read.f.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        [
+            Key::Field,
+            Key::Value,
+            Key::Upto,
+            Key::Ttl,
+            Key::As,
+            Key::Re
+        ],
+        "every key it knew: {older}"
+    );
+    let inband = claim(
+        Actor::Nobody,
+        Fields::new()
+            .tok(Key::Field, "title")
+            .and_then(|f| f.text(Key::Title, "QZP7TITLE of a program"))
+            .expect("an in-band title"),
+    );
+    assert!(
+        !encode(&inband, Tier::Host)
+            .expect("fits")
+            .contains("QZP7TITLE"),
+        "a program's own title never reaches the host tier"
+    );
+    let sized = |value: usize, name: usize, re: &str, by: Actor, upto: u64| {
+        let mut r = claim(
+            by,
+            Fields::new()
+                .tok(Key::Field, &"s".repeat(24))
+                .and_then(|f| f.text(Key::Value, &"v".repeat(value)))
+                .and_then(|f| f.u(Key::Upto, upto))
+                .and_then(|f| f.u(Key::Ttl, 3600))
+                .and_then(|f| f.text(Key::As, &"n".repeat(name)))
+                .and_then(|f| f.id(Key::Re, re))
+                .expect("a claim's fields"),
+        );
+        r.seq = 4_294_967_296;
+        encode(&r, Tier::Content)
+    };
+    let sid = Actor::Sid(ShortId::new("s-0123456789abcdef0123").expect("a sid"));
+    let longest = sized(256, 32, "4294967295", sid, 4_294_967_295).expect("the longest fits");
+    assert!(longest.len() <= MAX_RECORD_BYTES, "{}", longest.len());
+    assert!(
+        longest.contains(&format!(" value={} ", "v".repeat(256))),
+        "whole"
+    );
+    let fleet = Actor::Fleet(
+        ShortId::new(&format!("fleet:01234567:{}", "s".repeat(25))).expect("a 40-byte actor"),
+    );
+    assert!(
+        matches!(
+            sized(256, 40, &"9".repeat(40), fleet, u64::MAX),
+            Err(EncodeError::TooLarge(n)) if n > MAX_RECORD_BYTES
+        ),
+        "CONTROL: every field at its bound is refused, not cut"
+    );
+}
+
 /// A REQUEST'S WHY (ATERM-KI-1109-3) is the last key, a host-tier text
 /// a tab's open carries, percent-encoded as every text value is, beside its `why=` word, and reads back whole. NEGATIVE CONTROL: the
 /// wire encode, which keeps no host text, drops it.
@@ -1581,37 +1701,66 @@ fn a_fleet_drives_actor_names_node_head_and_session() {
     assert_eq!(Actor::fleet_drive("  ", None), Actor::Nobody, "CONTROL");
 }
 
-/// A FLEET DRIVE KEEPS THE WHOLE MINTED SID: 6 + 8 + 1 + 22 = 37 bytes, within the 40 an actor
-/// takes, and it reads back as itself.
+/// A FLEET DRIVE KEEPS THE WHOLE MINTED SID: the longest is a legacy tab's `s-` ID, which the
+/// drive's requester line names for a tab opened before the `t` form (`Requester::parse`), so
+/// 6 + 8 + 1 + 22 = 37 bytes, within the 40 an actor takes, and it reads back as itself.
+/// NEGATIVE CONTROL: a second legacy tab of the same Mac is another actor, not the first one's.
 #[test]
 fn fleet_drive_keeps_whole_minted_sid() {
+    let node = "ab".repeat(16);
     let sid = "s-0123456789abcdef0123";
-    let drive = Actor::fleet_drive(&"ab".repeat(16), Some(sid));
+    let drive = Actor::fleet_drive(&node, Some(sid));
     assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
     assert_eq!(drive.word().len(), 37);
     assert!(drive.word().len() <= ShortId::MAX);
     assert_eq!(Actor::from_word(drive.word()), drive);
+    let other = Actor::fleet_drive(&node, Some("s-fedcba9876543210fedc"));
+    assert_eq!(other.word(), "fleet:abababab:s-fedcba9876543210fedc");
+    assert_ne!(other, drive, "CONTROL");
 }
 
-/// A FLEET DRIVE KEEPS A `t` TAB ID WHOLE TOO: a requester names its tab in either form, and
-/// a tab opened before the `t` form keeps its `s-` ID until it closes.
+/// A FLEET DRIVE KEEPS A `t` TAB ID WHOLE TOO: 6 + 8 + 1 + 11 = 26 bytes, and it reads back as
+/// itself, at either end of the alphabet as in its middle.
 /// NEGATIVE CONTROLS: a `t` ID one character short, upper case, or with a letter outside the
-/// Crockford alphabet records `-`.
+/// Crockford alphabet, and an `s-` ID one hex digit short or long, record `-`.
 #[test]
 fn fleet_drive_keeps_a_t_tab_id_whole() {
     let node = "ab".repeat(16);
-    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+    for sid in ["tqn5r6e0148", "t0000000000", "tzzzzzzzzzz"] {
         let drive = Actor::fleet_drive(&node, Some(sid));
         assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
+        assert_eq!(drive.word().len(), 26);
         assert_eq!(Actor::from_word(drive.word()), drive);
     }
-    for bad in ["tqn5r6e014", "TQN5R6E0148", "tqn5r6e014u"] {
+    for bad in [
+        "tqn5r6e014",
+        "TQN5R6E0148",
+        "tqn5r6e014u",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+    ] {
         assert_eq!(
             Actor::fleet_drive(&node, Some(bad)).word(),
             "fleet:abababab:-",
             "CONTROL: {bad:?}"
         );
     }
+}
+
+/// A STORED FLEET ACTOR THAT NAMES A LEGACY TAB READS BACK WHOLE: the longest actor token an
+/// earlier build's rows hold, 37 of the 40 bytes an actor takes.
+/// NEGATIVE CONTROL: the same token one byte past the 40 reads as nobody.
+#[test]
+fn a_stored_fleet_actor_naming_a_legacy_tab_reads_back() {
+    let stored = "fleet:abababab:s-0123456789abcdef0123";
+    assert_eq!(stored.len(), 37);
+    assert!(stored.len() <= ShortId::MAX);
+    let actor = Actor::from_word(stored);
+    assert!(matches!(actor, Actor::Fleet(_)), "{actor:?}");
+    assert_eq!(actor.word(), stored);
+    let over = format!("{stored}0123");
+    assert_eq!(over.len(), ShortId::MAX + 1);
+    assert_eq!(Actor::from_word(&over), Actor::Nobody, "CONTROL");
 }
 
 /// A FLEET DRIVE'S UNMINTED SID IS `-`: a requester names a session only in the shape aterm

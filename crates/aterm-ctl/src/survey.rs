@@ -76,7 +76,7 @@ pub(crate) struct Args {
 }
 
 const USAGE: &str = "ERR usage: survey [--fleet] [--budget <chars>] | survey [--json] \
-                     [--sid <s-…>] [--fleet | --host <h> [--holder <pid>.<boot>.<start>]] | \
+                     [--sid <sid>] [--fleet | --host <h> [--holder <pid>.<boot>.<start>]] | \
                      survey --brief [--budget <chars>] (--fleet and --host take --timeout \
                      <seconds, at most 10>)";
 
@@ -905,21 +905,33 @@ fn repo_said(row: &Fields, at_ms: Option<u64>) -> String {
 /// The most checkouts a block's text lists ([`home_lines`]); `--json` carries every one.
 const CHECKOUTS_SHOWN: usize = 16;
 
-/// The lines a block's header is followed by where its instance says where its home is: the
-/// home, the free space on its volume and when its checkouts were read (`  home /Users//a, 812 GiB
-/// free · checkouts read 3m ago`), then each checkout aterm's setup cloned into it as that read
-/// found it (`    trust main@0123456789ab 3 behind origin/main, fetched 2h ago, dirty`), at most
-/// [`CHECKOUTS_SHOWN`], each cut to [`LINE_CHARS`]; none where it says nothing of its home (an
-/// aterm before the field).
+/// The lines a block's header is followed by where its instance says its home or its home
+/// volume's figures. Where it says where its home is (at content): the home, the free space and
+/// the size of its volume ([`volume_said`]) and when its checkouts were read (`  home /Users//a,
+/// 812 GiB free of 1862 GiB · checkouts read 3m ago`), the build output that volume held when
+/// its Mac last sized it ([`build_line`]), then each checkout aterm's setup cloned into it as
+/// that read found it (`    trust main@0123456789ab 3 behind origin/main, fetched 2h ago,
+/// dirty`), at most [`CHECKOUTS_SHOWN`]. At facts, which says no location, the volume's figures
+/// alone (`  home volume 812 GiB free of 1862 GiB`) and the build output: sizes and a time, no
+/// path. The fullest of aterm's own stores that refuse writes at a bound follows the build
+/// output at either level ([`store_line`]). Each line is cut to [`LINE_CHARS`]; none where it says nothing of either (an aterm
+/// before the fields). A figure an older aterm does not say is left out, never shown as 0.
 fn home_lines(survey: &Survey) -> Vec<String> {
     let h = &survey.header;
-    let Some(home) = h.get("home") else {
-        return Vec::new();
-    };
     let at_ms = h.number("at_ms");
+    let build: Vec<String> = build_line(h, at_ms)
+        .into_iter()
+        .chain(store_line(h))
+        .collect();
+    let Some(home) = h.get("home") else {
+        let volume = volume_said(h, |total| format!("of {total}"))
+            .map(|said| fit(&format!("  home volume {said}"), LINE_CHARS));
+        return volume.into_iter().chain(build).collect();
+    };
     let mut head = format!("  home {}", shown(home, 64));
-    if let Some(mb) = h.number("home_free_mb") {
-        head.push_str(&format!(", {} free", size_shown(mb)));
+    if let Some(said) = volume_said(h, |total| format!("on a {total} volume")) {
+        head.push_str(", ");
+        head.push_str(&said);
     }
     head.push_str(" \u{b7} ");
     let Some(rows) = &survey.repos else {
@@ -929,7 +941,9 @@ fn home_lines(survey: &Survey) -> Vec<String> {
         } else {
             "checkouts not read yet"
         });
-        return vec![fit(&head, LINE_CHARS)];
+        return std::iter::once(fit(&head, LINE_CHARS))
+            .chain(build)
+            .collect();
     };
     match h.number("repos_at").zip(at_ms) {
         Some((read, at)) => head.push_str(&format!(
@@ -943,6 +957,7 @@ fn home_lines(survey: &Survey) -> Vec<String> {
         head.push_str(": none");
     }
     let mut lines = vec![fit(&head, LINE_CHARS)];
+    lines.extend(build);
     for row in rows.iter().take(CHECKOUTS_SHOWN) {
         lines.push(fit(&format!("    {}", repo_said(row, at_ms)), LINE_CHARS));
     }
@@ -956,6 +971,62 @@ fn home_lines(survey: &Survey) -> Vec<String> {
         lines.push(format!("    +{cut} past the most a read lists, not read"));
     }
     lines
+}
+
+/// The free space and the size of a home's volume as header `h` says them, for [`home_lines`]:
+/// `812 GiB free of 1862 GiB`, the free space alone (`812 GiB free`), or the size alone as
+/// `alone` words it (`on a 1862 GiB volume` after the home's place). `None` where it says
+/// neither (an aterm before both keys); a size of 0 is no size.
+fn volume_said(h: &Fields, alone: impl FnOnce(String) -> String) -> Option<String> {
+    let total = h.number("home_total_mb").filter(|&total| total > 0);
+    match (h.number("home_free_mb"), total) {
+        (Some(free), Some(total)) => Some(format!(
+            "{} free of {}",
+            size_shown(free),
+            size_shown(total)
+        )),
+        (Some(free), None) => Some(format!("{} free", size_shown(free))),
+        (None, Some(total)) => Some(alone(size_shown(total))),
+        (None, None) => None,
+    }
+}
+
+/// The build output on a home's volume as its Mac's disk watch last sized it, for
+/// [`home_lines`]: `  build output 84 GiB, sized 2h ago` (`at least 84 GiB` where that sizing
+/// was cut short and the figure is a floor), its age told on that Mac's one clock (the header's
+/// own `at_ms` less `home_build_at_ms`), cut to [`LINE_CHARS`]. `None` where the header says
+/// none: an aterm before the keys, no sizing recorded yet, or a key unreadable, since the three
+/// read together or not at all.
+fn build_line(h: &Fields, at_ms: Option<u64>) -> Option<String> {
+    let mb = h.number("home_build_mb")?;
+    let sized = h.number("home_build_at_ms").filter(|&sized| sized > 0)?;
+    let floor = match h.get("home_build_partial")? {
+        "1" => "at least ",
+        "0" => "",
+        _ => return None,
+    };
+    let ago = at_ms.map_or_else(String::new, |at| {
+        format!(", sized {} ago", age(at.saturating_sub(sized)))
+    });
+    Some(fit(
+        &format!("  build output {floor}{}{ago}", size_shown(mb)),
+        LINE_CHARS,
+    ))
+}
+
+/// The fullest of the stores aterm keeps on a Mac that refuse writes at a bound, as its header
+/// says it, for [`home_lines`]: `  fullest store vault-records, 83% of its bound`. `None`
+/// where the header says none (an aterm before the keys, or no such store sized), where the
+/// share does not read, or where the name is not a fixed word's shape (1 to 32 lowercase
+/// letters and hyphens): nothing else a peer sends is shown as a store.
+fn store_line(h: &Fields) -> Option<String> {
+    let name = h.get("store_worst").filter(|name| {
+        (1..=32).contains(&name.len())
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            && name.bytes().any(|b| b.is_ascii_lowercase())
+    })?;
+    let pct = h.number("store_worst_pct")?;
+    Some(format!("  fullest store {name}, {pct}% of its bound"))
 }
 
 fn header_line(reply: &HostReply, survey: &Survey) -> String {

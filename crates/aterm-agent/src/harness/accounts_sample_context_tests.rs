@@ -21,6 +21,8 @@ fn seed(world: &World, at: i64) {
                     ..near_wall()
                 },
                 walls: vec![(accounts::SESSION_LIMIT, Some(NOW + HOUR))],
+                refusal: None,
+                limits: Default::default(),
             })
         },
     )
@@ -60,6 +62,8 @@ fn only_an_accepted_current_sample_gets_the_new_login_context() {
                 (home == work).then(|| Usage {
                     sample: Sample { at, ..near_wall() },
                     walls: Vec::new(),
+                    refusal: None,
+                    limits: Default::default(),
                 })
             },
         )
@@ -107,6 +111,8 @@ fn a_declined_same_time_sample_does_not_certify_an_old_context() {
             (home == work).then(|| Usage {
                 sample: near_wall(),
                 walls: Vec::new(),
+                refusal: None,
+                limits: Default::default(),
             })
         },
     )

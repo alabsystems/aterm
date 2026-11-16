@@ -68,7 +68,7 @@ fn typed_on_paper(path: Path) -> Vec<(u32, u32)> {
         .clone();
     {
         // A lone pane presents onto a surface: the scripted CPU one a headless window draws on.
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
         });
@@ -90,7 +90,7 @@ fn typed_on_paper(path: Path) -> Vec<(u32, u32)> {
     for step in 1..=60u64 {
         let now = t0 + Duration::from_millis(16 * step);
         if step % 5 == 0 {
-            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut ws = app.windows.get_mut(&wid).expect("window");
             ws.fx.cursor_mut().glow.note_typed_cells(now, 1);
             ws.fx.cursor_mut().trail.note_typed(now);
             term_lock(&term).process(b"x");

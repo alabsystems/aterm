@@ -472,6 +472,8 @@ fn the_cold_codex_act_starts_a_relaunch_on_the_account_its_restart_asked_for() {
                     ..Sample::default()
                 },
                 walls: Vec::new(),
+                refusal: None,
+                limits: Default::default(),
             })
         };
         let used = ColdUse::asking(wanted);

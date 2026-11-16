@@ -4,20 +4,24 @@
 use super::*;
 
 #[test]
-fn persistent_controller_is_independent_of_the_deploying_terminal() {
+fn persistent_follower_is_independent_of_the_deploying_terminal() {
     let text = manifest(
         Path::new("/state/controllers/123/aterm-verify"),
         Path::new("/state/check & judge"),
+        Path::new("/Users//a/aterm"),
         Path::new("/Users//a"),
         "/bin:/custom",
         17,
     );
     // Negative controls: omitting restart or substituting the worker's cwd/executable
-    // would lose the lane when that worker exits and removes its worktree.
+    // would lose the follower when that worker exits and removes its worktree.
     assert!(text.contains("<key>KeepAlive</key><true/>"));
     assert!(text.contains("<key>RunAtLoad</key><true/>"));
-    assert!(text.contains("<string>/state/controllers/123/aterm-verify</string>"));
+    assert!(text.contains(
+        "<array><string>/state/controllers/123/aterm-verify</string><string>watch</string>"
+    ));
     assert!(text.contains("<key>WorkingDirectory</key><string>/state/check &amp; judge</string>"));
+    assert!(text.contains("<string>--repair-cwd</string><string>/Users//a/aterm</string>"));
     assert!(text.contains("<key>ProcessType</key><string>Interactive</string>"));
     assert!(text.contains("<key>ExitTimeOut</key><integer>60</integer>"));
     assert!(text.contains("<string>17</string>"));

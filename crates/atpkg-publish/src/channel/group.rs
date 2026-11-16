@@ -723,7 +723,7 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         if free < need {
             pf.problems.push(format!(
                 "{} has {} GiB free; the pack needs about {} GiB there (one staged copy of the \
-                 sysroot plus its tarball). Free space, or point --out at a volume that has it",
+                 sysroot plus its tarball). Point --out at a volume that has it",
                 ctx.shown(probe_at),
                 free >> 30,
                 need >> 30

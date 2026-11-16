@@ -39,6 +39,21 @@ fn the_page_lists_every_view_the_server_takes() {
     }
 }
 
+/// The disk section teaches each form of the disk view the parser takes (`sys disk <form>`),
+/// and each parses as that form: a form the parser gains cannot go untaught. NEGATIVE
+/// CONTROL: a word that is no form does not parse.
+#[test]
+fn the_disk_section_teaches_every_form_the_parser_takes() {
+    use aterm_vitals::sys::{DiskForm, SysQuery};
+    for form in DiskForm::ALL {
+        let usage = format!("sys disk {}", form.word());
+        assert!(DISK_BODY.contains(&usage), "{usage}: {DISK_BODY}");
+        let q = SysQuery::parse(&format!("disk {}", form.word())).expect("a form parses");
+        assert_eq!(q.form, Some(form));
+    }
+    assert!(SysQuery::parse("disk bogus").is_err(), "CONTROL");
+}
+
 /// Every section renders under its name, is in the page's MORE list, fits 100 columns and
 /// teaches only served `aterm ctl` verbs; the page's basics fit one screen; and a word that
 /// names no section is refused with the list.

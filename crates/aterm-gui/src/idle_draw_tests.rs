@@ -89,7 +89,7 @@ fn a_covered_window_draws_at_most_a_frame_a_period_and_owes_the_rest() {
     app.redraw_window_at(WID, soon);
     assert_eq!(commits(&mut app), paced, "the next one parks");
     let due = t0 + COVERED_FRAME_PERIOD;
-    let ws = app.windows.get_mut(&WID).expect("the window");
+    let mut ws = app.windows.get_mut(&WID).expect("the window");
     assert_eq!(
         ws.covered_frame_deadline(),
         Some(due),
@@ -98,6 +98,7 @@ fn a_covered_window_draws_at_most_a_frame_a_period_and_owes_the_rest() {
     assert!(!ws.covered_frame_due(soon));
     assert!(ws.covered_frame_due(due), "the owed frame comes due");
     assert_eq!(ws.covered_frame_deadline(), None, "once");
+    drop(ws);
     app.redraw_window_at(WID, due);
     assert!(commits(&mut app) > paced, "and draws the current state");
     // Minimised from there, it owes nothing more.

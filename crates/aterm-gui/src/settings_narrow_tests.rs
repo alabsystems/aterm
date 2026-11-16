@@ -1601,7 +1601,9 @@ fn the_fleet_fields_words_keep_it_a_field() {
                 let context = format!("{scale}\u{d7} {width}x{height}");
                 let (mut runtime, instance, view) = every_page_runtime();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.arm_config_file(None, None, ConfigFileArm::inert());
@@ -2013,7 +2015,8 @@ fn a_text_size_change_remeasures_a_scrolled_caption() {
             runtime
                 .dispatch(instance, view, AppEvent::ScrollLines(1))
                 .unwrap();
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.scroll_page_to(stop);
@@ -2630,7 +2633,8 @@ pub(super) fn every_page_runtime_over(
     replace_settings_source(&mut runtime, view, source.to_string());
     assert!(runtime.replace_settings_packages(super::live_packages_state(None), 2));
     {
-        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        let mut route_native_guard = runtime.view_state_mut(view);
+        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
             unreachable!()
         };
         state.arm_config_file(
@@ -3750,7 +3754,9 @@ fn a_path_field_keeps_its_file_name() {
                 let context = format!("{scale}\u{d7} {width} {folder}");
                 let (mut runtime, instance, view) = every_page_runtime();
                 {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!()
                     };
                     state.arm_config_file(
@@ -4049,7 +4055,8 @@ fn a_theme_not_in_use_gives_its_name_the_check_slot() {
         replace_settings_source(&mut runtime, view, source.to_string());
         go_to_route(&mut runtime, instance, view, SettingsRoute::Themes);
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.showcase.filter =
@@ -4649,7 +4656,8 @@ fn the_discard_question_leaves_messages_room() {
         let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
         let (mut runtime, instance, view) = super::setup_with_messages();
         {
-            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            let mut route_native_guard = runtime.view_state_mut(view);
+            let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut() else {
                 unreachable!()
             };
             state.field_inputs.insert(
@@ -5048,7 +5056,9 @@ fn every_page_is_named_once_on_screen() {
                 let (mut runtime, instance, view) = setup();
                 go_to_route(&mut runtime, instance, view, route);
                 if sheet {
-                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    let mut route_native_guard = runtime.view_state_mut(view);
+                    let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
+                    else {
                         unreachable!();
                     };
                     state.compact_navigation = true;
@@ -5174,7 +5184,8 @@ fn the_search_field_keeps_a_typed_query_readable() {
                     let cx = view_cx_at(width, 348.0);
                     let (mut runtime, instance, view, _) = compile_search(query, &cx);
                     {
-                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        let mut route_native_guard = runtime.view_state_mut(view);
+                        let Some(AppViewState::Settings(state)) = route_native_guard.as_deref_mut()
                         else {
                             unreachable!();
                         };

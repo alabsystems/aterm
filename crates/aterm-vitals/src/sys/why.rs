@@ -327,11 +327,7 @@ impl<'a> Reading<'a> {
                 if x.pressure.rank().is_some() {
                     clauses.push(format!("pressure {}", x.pressure.word()));
                 }
-                clauses.push(if x.swap_used == 0 {
-                    "swap 0".into()
-                } else {
-                    format!("swap {}", words::mem(x.swap_used))
-                });
+                clauses.push(words::swap_used(x.swap_used));
                 match x.compressed {
                     Some(0) => clauses.push("nothing compressed".into()),
                     Some(b) => clauses.push(format!("{} compressed", words::mem(b))),
@@ -926,6 +922,7 @@ pub fn why_text(
         let n = lines.len() + head.len() + body.len() + tail.len() + hw_notes.len() + events.len();
         let header = header_line(
             View::Why,
+            None,
             None,
             subject_word(q, Some(s)),
             n,

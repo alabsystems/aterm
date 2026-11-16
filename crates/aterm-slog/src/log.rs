@@ -226,6 +226,8 @@ pub enum Refused {
     AlreadyOpen,
     /// A closed node the log no longer places: no record of its subtree is live and its close is older than the last [`CLOSED_PARENTS`] closes, so where it hung is not known, and an amend of it could be classed and counted only by a guess ([`Log::amend`]).
     Forgotten(Node),
+    /// A `desc` mark whose `upto=` (held here) names a seq past the record it would become: a claim covers the log up to itself at most, never records that do not exist yet.
+    UptoAhead(u64),
 }
 
 impl From<FieldError> for Refused {
@@ -1420,6 +1422,14 @@ impl Log {
         self.fold.state()
     }
 
+    /// WHO THIS SESSION IS, for ranking its description claims ([`crate::fold::rank_of`]): its own sid and its creator's. No record carries it and no carry or journal does, so the host says it after every construction; the fold a fenced reader is shown learns it too, since it is a fact about the session and not a record past the fence. Every slot is settled again under it ([`crate::fold::Fold::set_desc_ident`]).
+    pub fn set_desc_ident(&mut self, own: Option<ShortId>, creator: Option<ShortId>) {
+        self.fold.set_desc_ident(own, creator);
+        if let Some(fence) = self.fence.as_mut() {
+            fence.1.set_desc_ident(own, creator);
+        }
+    }
+
     /// Whether `node` is open (the session until it closes).
     #[must_use]
     pub fn is_open(&self, node: Node) -> bool {
@@ -1730,8 +1740,10 @@ impl Log {
     /// [`Kind::Act`] with no open `at` is the act of deciding the open approval or question step
     /// when one is open ([`Log::open_decision_step`]), even with a tool open beside it (fix E3,
     /// finding E2E-3): the harness's escalate act lands on the box it escalated.
+    /// A `desc` mark's `upto=` may name any seq up to the record itself (`last_seq + 1`, which is
+    /// what leaving it out means for the authors whose claim covers the log as they wrote it).
     /// # Errors
-    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`], or an encoding refusal.
+    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`], [`Refused::UptoAhead`] for a `desc` whose `upto=` is past the record it would become, or an encoding refusal.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
         if self.session_closed {
             return Err(Refused::SessionClosed);
@@ -1740,6 +1752,12 @@ impl Log {
             return Err(Refused::KindDoesNotFit(m.kind));
         }
         refuse_owned(Op::Mark, &m.f)?;
+        if m.kind == Kind::Desc
+            && let Some(upto) = m.f.get_u(Key::Upto)
+            && upto > self.last_seq.saturating_add(1)
+        {
+            return Err(Refused::UptoAhead(upto));
+        }
         let node = match m.at {
             Some(n) if self.is_open(n) => n,
             _ if m.kind == Kind::Act => self

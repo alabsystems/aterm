@@ -27,7 +27,14 @@ impl PreparedExec {
     /// default SIGPIPE; a returned failure restores the previous action. The same signal
     /// disposition serialization requirement as [`TransparentCommand::exec`] applies.
     /// An elapsed deadline returns `TimedOut`; a failed clock read refuses dispatch.
+    /// On Darwin an unsettled process-table read returns `WouldBlock` before dispatch;
+    /// the original deadline is checked after the read settles and the spawn lock is held.
     pub fn exec_until(self, deadline_us: u64) -> io::Error {
+        #[cfg(target_vendor = "apple")]
+        let _closed = match super::close_exec_gate() {
+            Ok(closed) => closed,
+            Err(error) => return error,
+        };
         self.0.exec_until(deadline_us)
     }
 
@@ -188,7 +195,13 @@ impl TransparentCommand {
     ///
     /// Callers must serialize signal-disposition changes around an exec. This does not
     /// serialize another thread that independently changes SIGPIPE's process-wide action.
+    /// On Darwin an unsettled process-table read returns `WouldBlock` without dispatch.
     pub fn exec(&mut self) -> io::Error {
+        #[cfg(target_vendor = "apple")]
+        let _closed = match super::close_exec_gate() {
+            Ok(closed) => closed,
+            Err(error) => return error,
+        };
         let image = match self.image() {
             Ok(image) => image,
             Err(error) => return error,

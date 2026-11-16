@@ -828,6 +828,22 @@ impl Store {
         self.log.as_ref()
     }
 
+    /// Its log's [`Log::heads_digest`]: `None` before a genesis roots it, when no held record
+    /// has a head to name.
+    #[must_use]
+    pub fn heads_digest(&self) -> Option<[u8; 32]> {
+        self.log.as_ref().map(Log::heads_digest)
+    }
+
+    /// [`Self::heads_digest`], or the empty log's ([`super::empty_heads_digest`]) where it holds
+    /// no genesis: what a vault server's TXT `rec=` and its records answers state, so a server
+    /// holding no records says so, where saying nothing is an older build's silence.
+    #[must_use]
+    pub fn records_digest(&self) -> [u8; 32] {
+        self.heads_digest()
+            .unwrap_or_else(super::empty_heads_digest)
+    }
+
     /// Whether `id` is already held (complete or waiting).
     #[must_use]
     pub fn contains(&self, id: &RecordId) -> bool {

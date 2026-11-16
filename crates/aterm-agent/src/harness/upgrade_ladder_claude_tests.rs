@@ -78,6 +78,7 @@ fn read(rows: Vec<String>, seq: u64, human: HumanInput) -> Screen {
         generation: None,
         human,
         title: None,
+        program_report: None,
         human_seq: None,
     }
 }
@@ -406,6 +407,7 @@ fn rest_look(rows: &[String], behind: u64) -> Facts {
         generation: None,
         human: HumanInput::Ago(600_000),
         title: None,
+        program_report: None,
         human_seq: None,
     };
     let mut st = St {

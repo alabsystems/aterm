@@ -866,7 +866,7 @@ impl Sim {
             .stdout
             .split_whitespace()
             .nth(1)
-            .filter(|sid| spawn.code == 0 && aterm_types::tab_id::is_tab_id(sid))
+            .filter(|sid| spawn.code == 0 && aterm_types::control_verbs::is_minted_sid(sid))
             .map(|sid| format!("@{sid}"));
         let line = worker
             .as_deref()
@@ -1660,7 +1660,7 @@ fn give_sessions(world: &mut World) -> Result<(), Fail> {
                 let inst = &world.insts[idx];
                 let body = world.ctl_ok(inst, &["spawn"]).map_err(Fail::die)?;
                 body.split_whitespace()
-                    .find(|w| aterm_types::tab_id::is_tab_id(w))
+                    .find(|w| aterm_types::control_verbs::is_minted_sid(w))
                     .ok_or_else(|| Fail::die(format!("m{idx:02}: spawn: {body}")))?
                     .to_owned()
             };

@@ -123,8 +123,8 @@ fn measure(cache: &Journals) {
         .mesh_inventory(scope.digest())
         .unwrap()
         .unwrap();
-    assert_eq!(inventory.len(), RECORDS);
-    let ids: Vec<_> = inventory.into_iter().take(offered).collect();
+    assert_eq!(inventory.ids().count(), RECORDS);
+    let ids: Vec<_> = inventory.ids().copied().take(offered).collect();
     let validated = replica(&lab, 0).mesh_wires(scope.digest(), &ids).unwrap();
     assert_eq!(validated.len(), ids.len());
     for (id, wire) in ids.iter().zip(&validated) {

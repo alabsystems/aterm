@@ -171,17 +171,22 @@ impl Stores for Changing {
         Ok(table == TABLE && self.unit != Unit::Members)
     }
 
-    fn table_inventory(&self, table: Digest) -> io::Result<Option<BTreeSet<Digest>>> {
+    fn table_inventory(&self, table: Digest) -> io::Result<Option<aterm_db::replica::Snapshot>> {
         Ok((table == TABLE).then(|| {
-            if matches!(self.unit, Unit::Table(_)) {
+            aterm_db::replica::Snapshot::new(if matches!(self.unit, Unit::Table(_)) {
                 self.records()
                     .iter()
                     .map(|wire| crate::stores::digest(wire))
                     .collect()
             } else {
                 BTreeSet::new()
-            }
+            })
         }))
+    }
+
+    fn table_order(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Digest>> {
+        assert_eq!(table, TABLE);
+        Ok(ids.to_vec())
     }
 
     fn table_wires(&self, table: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
@@ -395,6 +400,244 @@ fn every_inventory_unit_fetches_current_wires_after_the_receive_turn() {
             assert!(
                 b.records().contains(&b.outgoing),
                 "only eligibility changed, not custody"
+            );
+        }
+    }
+}
+
+/// A store holding one large table, its operations in the order they arrived (causal, for this
+/// stand-in), counting each wire it is asked for.
+struct Large {
+    records: Mutex<Vec<Vec<u8>>>,
+    /// With `false`, `table_order` hands `ids` back as given (the negative control).
+    orders: bool,
+}
+
+impl Large {
+    fn new(records: Vec<Vec<u8>>, orders: bool) -> Arc<Self> {
+        Arc::new(Self {
+            records: Mutex::new(records),
+            orders,
+        })
+    }
+
+    fn digests(&self) -> Vec<Digest> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|wire| crate::stores::digest(wire))
+            .collect()
+    }
+}
+
+impl Stores for Large {
+    fn ingest_table(&self, table: Digest, kind: Kind, wires: &[Vec<u8>]) -> Vec<Verdict> {
+        assert_eq!((table, kind), (TABLE, Kind::Operation));
+        self.records.lock().unwrap().extend_from_slice(wires);
+        vec![Verdict::Applied; wires.len()]
+    }
+
+    fn ingest_members(&self, wires: &[Vec<u8>]) -> Vec<Verdict> {
+        vec![Verdict::Applied; wires.len()]
+    }
+
+    fn table_lengths(&self) -> io::Result<Vec<(TableKey, u64)>> {
+        Ok(vec![(
+            TableKey {
+                table: TABLE,
+                recovery: false,
+            },
+            self.records.lock().unwrap().len() as u64,
+        )])
+    }
+
+    fn table_held(&self, _: TableKey, _: u64, _: u64) -> io::Result<Vec<Held>> {
+        Ok(Vec::new())
+    }
+
+    fn members_held(&self, _: usize) -> io::Result<(Vec<Vec<u8>>, usize)> {
+        Ok((Vec::new(), 0))
+    }
+
+    fn tables(&self) -> io::Result<BTreeSet<Digest>> {
+        Ok(BTreeSet::from([TABLE]))
+    }
+
+    fn takes(&self, table: Digest) -> io::Result<bool> {
+        Ok(table == TABLE)
+    }
+
+    fn table_inventory(&self, table: Digest) -> io::Result<Option<aterm_db::replica::Snapshot>> {
+        assert_eq!(table, TABLE);
+        Ok(Some(aterm_db::replica::Snapshot::new(
+            self.digests().into_iter().collect(),
+        )))
+    }
+
+    fn table_order(&self, _: Digest, ids: &[Digest]) -> io::Result<Vec<Digest>> {
+        if !self.orders {
+            return Ok(ids.to_vec());
+        }
+        let at: BTreeMap<Digest, usize> = self
+            .digests()
+            .into_iter()
+            .enumerate()
+            .map(|(n, id)| (id, n))
+            .collect();
+        let mut ordered = ids.to_vec();
+        ordered.sort_by_key(|id| at.get(id).copied().unwrap_or(usize::MAX));
+        Ok(ordered)
+    }
+
+    fn table_wires(&self, _: Digest, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
+        let records = self.records.lock().unwrap();
+        let by: BTreeMap<Digest, &Vec<u8>> = records
+            .iter()
+            .map(|wire| (crate::stores::digest(wire), wire))
+            .collect();
+        Ok(ids
+            .iter()
+            .filter_map(|id| by.get(id).map(|wire| (*wire).clone()))
+            .collect())
+    }
+
+    fn table_proofs(&self, _: Digest) -> io::Result<Option<BTreeSet<ProofKey>>> {
+        Ok(Some(BTreeSet::new()))
+    }
+
+    fn table_proof_wires(&self, _: Digest, _: &[ProofKey]) -> io::Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+
+    fn members_inventory(&self) -> io::Result<BTreeSet<Digest>> {
+        Ok(BTreeSet::new())
+    }
+
+    fn members_wires(&self, _: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A stream that counts the bytes each way.
+struct Counted<S> {
+    inner: S,
+    read: usize,
+    written: usize,
+}
+
+impl<S: Read> Read for Counted<S> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(bytes)?;
+        self.read += n;
+        Ok(n)
+    }
+}
+
+impl<S: Write> Write for Counted<S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// One `Inventory` exchange between two stores of `a` and `b`; the records `b` received in
+/// order, and the bytes on the wire both ways.
+fn exchange_large(a: &Arc<Large>, b: &Arc<Large>) -> (Vec<Vec<u8>>, usize) {
+    let before = b.records.lock().unwrap().len();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (left_dir, right_dir) = (root.path().join("left"), root.path().join("right"));
+    std::fs::create_dir_all(&left_dir).unwrap();
+    std::fs::create_dir_all(&right_dir).unwrap();
+    let left_egress = Egress::new(Arc::clone(a) as Arc<dyn Stores>, &left_dir);
+    let right_egress = Egress::new(Arc::clone(b) as Arc<dyn Stores>, &right_dir);
+    let (left_summary, right_summary) =
+        (summary(a.as_ref()).unwrap(), summary(b.as_ref()).unwrap());
+    let (left, right) = UnixStream::pair().unwrap();
+    for stream in [&left, &right] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+    }
+    let mut left = Counted {
+        inner: Buffered::new(left),
+        read: 0,
+        written: 0,
+    };
+    let mut right = Buffered::new(right);
+    std::thread::scope(|scope| {
+        let responder = scope.spawn(|| {
+            exchange_stream(
+                b.as_ref(),
+                &right_egress,
+                &mut right,
+                right_summary,
+                false,
+                false,
+            )
+            .unwrap()
+        });
+        exchange_stream(
+            a.as_ref(),
+            &left_egress,
+            &mut left,
+            left_summary,
+            true,
+            false,
+        )
+        .unwrap();
+        responder.join().unwrap();
+    });
+    let received = b.records.lock().unwrap()[before..].to_vec();
+    (received, left.read + left.written)
+}
+
+/// Two tables of 8192 operations that differ by 16 (LT-B5M): one exchange moves all 16, the
+/// inventory traded for it is a few kilobytes where `atm-inv 2`'s whole lists were 256 KiB, and
+/// the 16, a chain each naming the one before, arrive parents first.
+/// NEGATIVE CONTROLS: the stand-in whose `table_order` hands its ids back in digest order runs
+/// in the loop and must deliver the chain out of order; and with `exchange_stream` not calling
+/// `Stores::table_order` at all, the ordering store's chain arrives out of order too: `a child
+/// arrived before its parent`.
+#[test]
+fn two_tables_of_8192_operations_differing_by_16_move_every_record_parents_first() {
+    for orders in [true, false] {
+        let shared: Vec<Vec<u8>> = (0..8176_u32)
+            .map(|n| format!("operation {n}").into_bytes())
+            .collect();
+        // Each record of the chain names the one before it, so its digest order is not its
+        // causal order.
+        let chain: Vec<Vec<u8>> = (0..16_u32)
+            .map(|n| format!("chain {n} after {}", n.wrapping_sub(1)).into_bytes())
+            .collect();
+        let a = Large::new(shared.iter().chain(&chain).cloned().collect(), orders);
+        let b = Large::new(shared.clone(), true);
+        let (received, bytes) = exchange_large(&a, &b);
+        let mut wanted = chain.clone();
+        wanted.sort();
+        let mut got = received.clone();
+        got.sort();
+        assert_eq!(got, wanted, "every one of the 16 moves");
+        let payload: usize = chain.iter().map(|wire| wire.len() + 4).sum();
+        assert!(
+            bytes < payload + 8 * 1024,
+            "{bytes} bytes on the wire for {payload} of records"
+        );
+        let in_order = received == chain;
+        if orders {
+            assert!(in_order, "a child arrived before its parent");
+        } else {
+            assert!(
+                !in_order,
+                "the control's digest order happened to be causal"
             );
         }
     }

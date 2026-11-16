@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use super::vendor_tests::mailbox_paths;
 use super::*;
 use crate::harness::alab_roster::test_machine;
 use aterm_spec::interp::State;
@@ -43,13 +44,13 @@ fn configuration(label: &str, tier: i64, exact: Option<i64>) -> String {
     text
 }
 
-fn fixture(source: i64, case: i64, spelling: &str) -> MailboxConfig {
+fn fixture(source: i64, case: i64, spelling: &str, lower_path: &str) -> MailboxConfig {
     let home = aterm_tempfile::tempdir().unwrap();
     let low = configuration("m27-2", 2, (case == 2).then_some(4));
     let high = configuration(spelling, 1, (case == 1).then_some(3));
     let roster = "[[account]]\nlabel='m27-2'\nclass='dedicated'\nemail='mailbox@example.org'\n";
     let files = [
-        (".secrets/ai-mailbox.toml", low.as_str()),
+        (lower_path, low.as_str()),
         ("store/mailbox.toml", high.as_str()),
         (".config/aterm/accounts.toml", roster),
     ];
@@ -89,22 +90,24 @@ pub(crate) fn precedence_transition(state: &State, action: &str) -> State {
         }
         "Resolve" => {
             let mut selected = None;
-            for spelling in ["m27-2", "m27_2", "m27.2"] {
-                let cfg = fixture(state["source"], state["case"], spelling);
-                let values = [
-                    cfg.password_for(Some("mailbox@example.org")),
-                    cfg.mailbox_password_for(Some("mailbox@example.org")),
-                    cfg.totp_secret_for(Some("mailbox@example.org")),
-                ];
-                for (kind, value) in values.into_iter().enumerate() {
-                    let value = value.expect("fixture has a credential");
-                    let tier = (1..=4)
-                        .find(|tier| credential(kind, *tier) == value)
-                        .unwrap();
-                    if let Some(prior) = selected {
-                        assert_eq!(tier, prior, "credential kinds and label spellings agree");
+            for &lower_path in mailbox_paths() {
+                for spelling in ["m27-2", "m27_2", "m27.2"] {
+                    let cfg = fixture(state["source"], state["case"], spelling, lower_path);
+                    let values = [
+                        cfg.password_for(Some("mailbox@example.org")),
+                        cfg.mailbox_password_for(Some("mailbox@example.org")),
+                        cfg.totp_secret_for(Some("mailbox@example.org")),
+                    ];
+                    for (kind, value) in values.into_iter().enumerate() {
+                        let value = value.expect("fixture has a credential");
+                        let tier = (1..=4)
+                            .find(|tier| credential(kind, *tier) == value)
+                            .unwrap();
+                        if let Some(prior) = selected {
+                            assert_eq!(tier, prior, "credential kinds and label spellings agree");
+                        }
+                        selected = Some(tier);
                     }
-                    selected = Some(tier);
                 }
             }
             next.insert("phase", 1);
@@ -146,39 +149,39 @@ fn mailbox_source_precedence_conforms_with_negative_controls() {
 
 #[test]
 fn mailbox_superseded_totp_uri_does_not_retain_its_old_email_alias() {
-    let home = aterm_tempfile::tempdir().unwrap();
-    let old = configuration("m27", 2, None).replace("mailbox%40", "old-inbox%40");
-    let new_uri = OLD_TOTP.replace("mailbox%40", "new-inbox%40");
-    let new = configuration("m27", 1, None).replace("KRSXG5A", &new_uri);
-    plant(
-        home.path(),
-        &[
-            (".secrets/ai-mailbox.toml", old),
-            ("store/mailbox.toml", new),
-        ],
-    );
-    let cfg = discover_mailbox_config_files_raw(
-        Some(home.path()),
-        Some(&home.path().join("store")),
-        None,
-    );
-    assert!(cfg.password_for(Some("old-inbox@example.org")).is_none());
-    assert!(
-        cfg.mailbox_password_for(Some("old-inbox@example.org"))
-            .is_none()
-    );
-    assert!(cfg.totp_secret_for(Some("old-inbox@example.org")).is_none());
-    assert_eq!(
-        cfg.password_for(Some("new-inbox@example.org")).as_deref(),
-        Some("password-1")
-    );
-    assert_eq!(
-        cfg.totp_secret_for(Some("new-inbox@example.org"))
-            .as_deref(),
-        Some(new_uri.as_str())
-    );
+    for &mailbox_path in mailbox_paths() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let old = configuration("m27", 2, None).replace("mailbox%40", "old-inbox%40");
+        let new_uri = OLD_TOTP.replace("mailbox%40", "new-inbox%40");
+        let new = configuration("m27", 1, None).replace("KRSXG5A", &new_uri);
+        plant(
+            home.path(),
+            &[(mailbox_path, old), ("store/mailbox.toml", new)],
+        );
+        let cfg = discover_mailbox_config_files_raw(
+            Some(home.path()),
+            Some(&home.path().join("store")),
+            None,
+        );
+        assert!(cfg.password_for(Some("old-inbox@example.org")).is_none());
+        assert!(
+            cfg.mailbox_password_for(Some("old-inbox@example.org"))
+                .is_none()
+        );
+        assert!(cfg.totp_secret_for(Some("old-inbox@example.org")).is_none());
+        assert_eq!(
+            cfg.password_for(Some("new-inbox@example.org")).as_deref(),
+            Some("password-1")
+        );
+        assert_eq!(
+            cfg.totp_secret_for(Some("new-inbox@example.org"))
+                .as_deref(),
+            Some(new_uri.as_str())
+        );
+    }
 }
 
+#[cfg(unix)]
 #[test]
 fn mailbox_raw_named_secrets_obey_contested_label_isolation() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -206,6 +209,7 @@ fn mailbox_raw_named_secrets_obey_contested_label_isolation() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn mailbox_named_files_cannot_override_equivalent_store_keys() {
     for raw in [false, true] {
@@ -259,8 +263,15 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
     let owner = "owner_m27@example.org";
     let home = aterm_tempfile::tempdir().unwrap();
     let secrets = home.path().join(".secrets");
-    let put =
-        |name: &str, text: &str| crate::vault_entry::seed(home.path(), &[(name, text.as_bytes())]);
+    let put = |name: &str, text: &str| {
+        #[cfg(unix)]
+        crate::vault_entry::seed(home.path(), &[(name, text.as_bytes())]);
+        #[cfg(not(unix))]
+        {
+            let _ = (name, text);
+            panic!("this fixture source requires the Unix vault");
+        }
+    };
     let values = [credential(0, 1), credential(1, 1), credential(2, 1)];
     let fields = ["password", "mailbox_password", "totp_secret"];
     let body: String = fields
@@ -268,8 +279,8 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
         .zip(&values)
         .map(|(key, value)| format!("{key} = '{value}'\n"))
         .collect();
-    // No store entry is named by an email (an entry's name is `[A-Za-z0-9._-]`), so the first
-    // two sources are the local mailbox file and the store's `mailbox.toml`.
+    // No store entry is named by an email (an entry's name is `[A-Za-z0-9._-]`). Source zero
+    // is a portable local file; every other source is an actual vault entry.
     match source {
         0 => plant(
             home.path(),
@@ -378,6 +389,12 @@ fn explicit_email_secrets_do_not_create_credentials_for_other_mailboxes() {
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
+                // The model still checks every source. Its real fixture can read only the
+                // local-file source on targets without a vault backend.
+                #[cfg(not(unix))]
+                if action.name == "Resolve" && state["source"] != 0 {
+                    continue;
+                }
                 let next = scope_transition(&state, action.name);
                 assert!(model.successors(action.name, &state).contains(&next));
                 if action.name == "Resolve" {
@@ -406,45 +423,44 @@ fn explicit_email_secrets_do_not_create_credentials_for_other_mailboxes() {
 /// password is not found under the lab (`left: None right: Some("fixture-pw")`).
 #[test]
 fn a_renamed_rows_old_label_still_names_its_secrets() {
-    use super::super::accounts::{Cli, Vendor};
-    use super::super::alab_roster::{Lab, LabAccount, with_lab};
-    let home = aterm_tempfile::tempdir().unwrap();
-    plant(
-        home.path(),
-        &[
-            (
-                ".secrets/ai-mailbox.toml",
-                "[passwords]\nm22-2 = \"fixture-pw\"\n",
-            ),
-            (
-                ".config/aterm/accounts.toml",
-                "[[account]]\nlabel = \"claude-bbbbbb\"\nclass = \"dedicated\"\n\
+    for &mailbox_path in mailbox_paths() {
+        use super::super::accounts::{Cli, Vendor};
+        use super::super::alab_roster::{Lab, LabAccount, with_lab};
+        let home = aterm_tempfile::tempdir().unwrap();
+        plant(
+            home.path(),
+            &[
+                (mailbox_path, "[passwords]\nm22-2 = \"fixture-pw\"\n"),
+                (
+                    ".config/aterm/accounts.toml",
+                    "[[account]]\nlabel = \"claude-bbbbbb\"\nclass = \"dedicated\"\n\
                  email = \"bob@example.test\"\n",
-            ),
-        ],
-    );
-    let read = || {
-        discover_mailbox_config_files_raw(Some(home.path()), None, None)
-            .password_for(Some("bob@example.test"))
-    };
-    assert_eq!(read(), None);
-    let lab = Lab {
-        me: Some(test_machine("m22")),
-        accounts: vec![LabAccount {
-            pk: "ac-0000000000000001".into(),
-            cli: Cli::Claude,
-            vendor: Vendor::default(),
-            label: "claude-bbbbbb".into(),
-            legacy_label: Some("m22-2".into()),
-            email: "bob@example.test".into(),
-            identity: None,
-            browser: None,
-            joinable: true,
-            preferred: vec![(test_machine("m22"), Some(1))],
-        }],
-        ..Lab::default()
-    };
-    assert_eq!(with_lab(lab, read).as_deref(), Some("fixture-pw"));
+                ),
+            ],
+        );
+        let read = || {
+            discover_mailbox_config_files_raw(Some(home.path()), None, None)
+                .password_for(Some("bob@example.test"))
+        };
+        assert_eq!(read(), None);
+        let lab = Lab {
+            me: Some(test_machine("m22")),
+            accounts: vec![LabAccount {
+                pk: "ac-0000000000000001".into(),
+                cli: Cli::Claude,
+                vendor: Vendor::default(),
+                label: "claude-bbbbbb".into(),
+                legacy_label: Some("m22-2".into()),
+                email: "bob@example.test".into(),
+                identity: None,
+                browser: None,
+                joinable: true,
+                preferred: vec![(test_machine("m22"), Some(1))],
+            }],
+            ..Lab::default()
+        };
+        assert_eq!(with_lab(lab, read).as_deref(), Some("fixture-pw"));
+    }
 }
 
 /// Where the lab names this Mac, the mailbox labels come from the lab and the sheet is not read:
@@ -452,6 +468,7 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
 /// nothing under a lab that names this Mac and does not know that label.
 /// NEGATIVE CONTROL: with `mailbox_aliases`' `names_this_mac` return removed, the sheet's label
 /// still maps under the lab (`left: Some("sheet-pw") right: None`).
+#[cfg(unix)]
 #[test]
 fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
     use super::super::alab_roster::{Lab, with_lab};
@@ -490,6 +507,7 @@ fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
 /// with no lab held and nothing pending.
 /// NEGATIVE CONTROL: with `mailbox_aliases` gated on `names_this_mac` alone, the sheet's label
 /// maps while pending (`left: Some("sheet-pw") right: None`).
+#[cfg(unix)]
 #[test]
 fn a_pending_lab_reads_no_sheet_for_its_mailbox_labels() {
     use super::super::alab_roster::while_pending;
@@ -533,6 +551,9 @@ fn plant<T: AsRef<str>>(home: &Path, files: &[(&str, T)]) {
         std::fs::write(at, text.as_ref()).unwrap();
     }
     if !entries.is_empty() {
+        #[cfg(unix)]
         crate::vault_entry::seed(home, &entries);
+        #[cfg(not(unix))]
+        panic!("this fixture source requires the Unix vault");
     }
 }

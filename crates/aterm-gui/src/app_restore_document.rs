@@ -17,7 +17,7 @@ std::thread_local! {
 }
 
 /// Exercise the production reader/preparation pipeline in a headless cursor test.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn with_headless_restore_admission_for_test<R>(body: impl FnOnce() -> R) -> R {
     struct Reset(bool);
     impl Drop for Reset {

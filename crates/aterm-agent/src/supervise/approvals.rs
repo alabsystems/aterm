@@ -490,6 +490,40 @@ pub fn book_self_claim(
     Ledger::open(Some(path), sid, warn).write_self_claim(t_ms, row, warn)
 }
 
+/// BOOK A FOLDER TRUST CLAUDE CODE RECORDED BEFORE A LAUNCH (`crate::harness::launch_trust`) in
+/// session `sid`'s ledger at `path`, stamped `t_ms`: the approved row the folder-trust dialog's
+/// answer would have left, under the rule that would have answered it (`rule_id`), the folder as
+/// its subject and who recorded it (`by`, `Claude Code <version>`) in its reason. No box was
+/// read, so its `box_seq` is 0. Appended under the lock the ledger's cut holds
+/// ([`ledger_stripe`]), as [`book_self_claim`] is. The line, or `None` where nothing was written
+/// (why in `warn`).
+pub fn book_launch_trust(
+    path: &Path,
+    sid: Option<&str>,
+    t_ms: i64,
+    rule_id: &str,
+    folder: &str,
+    by: &str,
+    warn: &mut dyn Write,
+) -> Option<String> {
+    let ledger_cut = ledger_stripe(path);
+    let _held = ledger_cut
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reason = format!("{LAUNCH_TRUST_REASON} {by}");
+    let row = Row {
+        rule_id,
+        outcome: Outcome::Approved,
+        command: folder,
+        reason: &reason,
+        box_seq: 0,
+    };
+    Ledger::open(Some(path), sid, warn).write(t_ms, &row, warn)
+}
+
+/// How the reason of a [`book_launch_trust`] row begins; who recorded the trust follows.
+pub const LAUNCH_TRUST_REASON: &str = "recorded before launch by";
+
 /// BOOK A FACT A PROVEN SELF-CLAIM'S ACT CARRIED ([`SelfClaimFactRow`]) in session `sid`'s
 /// ledger at `path`, stamped `t_ms`, as [`book_self_claim`] books its act: through
 /// [`Ledger::write_self_claim_fact`] under the lock the ledger's cut holds ([`ledger_stripe`]).

@@ -1364,7 +1364,8 @@ fn only_a_device_notice_or_a_wake_starts_a_round_before_the_pace() {
 }
 
 /// K3, the wait a round's facts choose: the backstop for a settled round with every hint source
-/// armed, and the two-second timer for each thing a round can owe.
+/// armed and no notice to confirm, and the two-second timer for each thing a round can owe and
+/// while a notice is confirmed.
 /// NEGATIVE CONTROL: without the `attempted` test, the unfinished attachment's row waits 300 s.
 #[test]
 fn a_settled_round_waits_for_the_backstop_and_an_owed_round_keeps_the_timer() {
@@ -1373,20 +1374,13 @@ fn a_settled_round_waits_for_the_backstop_and_an_owed_round_keeps_the_timer() {
     let none = Causes::default();
     let secs = Duration::from_secs;
     assert_eq!(BACKSTOP, secs(300));
-    let waits = |facts: RoundFacts| next_wait(&facts, WHOLE, PACE);
+    let waits = |facts: RoundFacts| next_wait(&facts, false, WHOLE, PACE);
     let rows = [
         ("settled", settled(none), secs(300)),
         ("a records hint", settled(Causes::RECORDS), secs(300)),
         ("a focus hint", settled(Causes::FOCUS), secs(300)),
         ("a request hint", settled(Causes::REQUEST), secs(300)),
         ("a wake", settled(Causes::WAKE), secs(300)),
-        ("a device notice", settled(Causes::DEVICE), PACE),
-        ("a console notice", settled(Causes::CONSOLE), PACE),
-        (
-            "a device notice among others",
-            settled(Causes::DEVICE.union(Causes::FOCUS)),
-            PACE,
-        ),
         (
             "moved",
             RoundFacts {
@@ -1488,6 +1482,11 @@ fn a_settled_round_waits_for_the_backstop_and_an_owed_round_keeps_the_timer() {
     for (name, facts, wait) in rows {
         assert_eq!(waits(facts), wait, "{name}");
     }
+    assert_eq!(
+        next_wait(&settled(none), true, WHOLE, PACE),
+        PACE,
+        "a notice still confirmed"
+    );
     for (name, coverage) in [
         (
             "no device notices",
@@ -1511,19 +1510,25 @@ fn a_settled_round_waits_for_the_backstop_and_an_owed_round_keeps_the_timer() {
             },
         ),
     ] {
-        assert_eq!(next_wait(&settled(none), coverage, PACE), PACE, "{name}");
+        assert_eq!(
+            next_wait(&settled(none), false, coverage, PACE),
+            PACE,
+            "{name}"
+        );
     }
 }
 
 /// K3, round counts on a scripted clock: a settled keeper with every source armed runs a round
-/// for each hint, one more after a keyboard or console notice, one at each backstop, and none
-/// else.
-/// NEGATIVE CONTROL: with the wait after every round the pace, the hour with no hint runs 1800
-/// rounds.
+/// for each hint, five more at the pace after a keyboard or console notice ([`CONFIRMING`]), one
+/// at each backstop, and none else.
+/// NEGATIVE CONTROLS: with the wait after every round the pace, the hour with no hint runs 1800
+/// rounds; with [`CONFIRMING`] 1, each notice runs one confirming round, and its count reads 12.
 #[test]
 fn a_settled_keeper_runs_a_round_for_a_hint_or_the_backstop_and_none_else() {
     use watch::Causes;
     let none = Causes::default();
+    // The five rounds that confirm a notice whose round started at `from`, each at the pace.
+    let confirming = |from: u128| (1..=5).map(move |nth| (from + nth * 2_000, none));
 
     // An hour with no hint: the first round, the one its new sample owes, and the backstop's.
     let (rounds, armed) = scripted_rounds(&[], 3_599_999, fresh_then_settled);
@@ -1538,22 +1543,22 @@ fn a_settled_keeper_runs_a_round_for_a_hint_or_the_backstop_and_none_else() {
     );
     assert_eq!(armed, 13, "one wait a round");
 
-    // Five hints of each kind, ten seconds apart, in a hundred seconds: no backstop falls in
-    // them.
+    // Five hints of each kind, fifteen seconds apart, in a hundred seconds: no backstop falls in
+    // them, and a notice's confirming rounds end before the next hint.
     let count = |cause| {
-        let hints: Vec<_> = (1..=5).map(|nth| (nth * 10_000, cause)).collect();
+        let hints: Vec<_> = (1..=5).map(|nth| (nth * 15_000, cause)).collect();
         scripted_rounds(&hints, 100_000, fresh_then_settled).0.len()
     };
     assert_eq!(scripted_rounds(&[], 100_000, fresh_then_settled).0.len(), 2);
     assert_eq!(
         count(Causes::DEVICE),
-        2 + 2 * 5,
-        "a round and its confirming round"
+        2 + 6 * 5,
+        "a round and its five confirming rounds"
     );
     assert_eq!(
         count(Causes::CONSOLE),
-        2 + 2 * 5,
-        "a round and its confirming round"
+        2 + 6 * 5,
+        "a round and its five confirming rounds"
     );
     assert_eq!(count(Causes::RECORDS), 2 + 5);
     assert_eq!(count(Causes::FOCUS), 2 + 5);
@@ -1561,40 +1566,37 @@ fn a_settled_keeper_runs_a_round_for_a_hint_or_the_backstop_and_none_else() {
     assert_eq!(count(Causes::WAKE), 2 + 5);
 
     // When each round starts: at the hint, but no sooner than the pace after the round before,
-    // a keyboard notice and a wake apart.
+    // a keyboard notice and a wake apart; and a notice's confirming rounds at the pace after it.
     let (rounds, _) = scripted_rounds(
         &[
             (10_000, Causes::DEVICE),
-            (20_000, Causes::RECORDS),
-            (20_500, Causes::FOCUS),
-            (21_000, Causes::REQUEST),
-            (21_500, Causes::RECORDS),
-            (30_000, Causes::CONSOLE),
-            (40_000, Causes::WAKE),
-            (40_100, Causes::DEVICE),
+            (30_000, Causes::RECORDS),
+            (30_500, Causes::FOCUS),
+            (31_000, Causes::REQUEST),
+            (31_500, Causes::RECORDS),
+            (40_000, Causes::CONSOLE),
+            (60_000, Causes::WAKE),
+            (60_100, Causes::DEVICE),
         ],
-        60_000,
+        80_000,
         fresh_then_settled,
     );
-    assert_eq!(
-        rounds,
-        [
-            (0, none),
-            (2_000, none),
-            (10_000, Causes::DEVICE),
-            (12_000, none),
-            (20_000, Causes::RECORDS),
+    let expected: Vec<_> = [(0, none), (2_000, none), (10_000, Causes::DEVICE)]
+        .into_iter()
+        .chain(confirming(10_000))
+        .chain([
+            (30_000, Causes::RECORDS),
             (
-                22_000,
-                Causes::FOCUS.union(Causes::REQUEST).union(Causes::RECORDS)
+                32_000,
+                Causes::FOCUS.union(Causes::REQUEST).union(Causes::RECORDS),
             ),
-            (30_000, Causes::CONSOLE),
-            (32_000, none),
-            (40_000, Causes::WAKE),
-            (40_100, Causes::DEVICE),
-            (42_100, none),
-        ]
-    );
+            (40_000, Causes::CONSOLE),
+        ])
+        .chain(confirming(40_000))
+        .chain([(60_000, Causes::WAKE), (60_100, Causes::DEVICE)])
+        .chain(confirming(60_100))
+        .collect();
+    assert_eq!(rounds, expected);
 }
 
 /// What a keeper's worker tells its test: each round's causes and the wait chosen after it, and
@@ -1799,9 +1801,9 @@ fn a_worker_hears_each_hint_and_runs_no_round_for_it_before_the_pace() {
 /// K3, on the function the keeper's thread runs, with no pace so that only a settled wait
 /// blocks: a fresh worker runs its first round, the one its new sample owes, and one for its
 /// records watch's first look, then blocks. Each hint then runs one round, and a keyboard or
-/// console notice one more, and nothing else runs: 25 rounds, 3 of them the fresh worker's, 10
-/// for five keyboard notices, 9 for three focus, three request and three records hints, and 3
-/// for a focus hint and a console notice.
+/// console notice five more that confirm it, and nothing else runs: 49 rounds, 3 of them the
+/// fresh worker's, 30 for five keyboard notices, 9 for three focus, three request and three
+/// records hints, and 7 for a focus hint and a console notice.
 /// NEGATIVE CONTROL: with the wait after every round the pace, the second round's wait returns
 /// `Deadline` where the settled wait blocks for `Hint(records)`, and rounds follow with no
 /// hint.
@@ -1842,6 +1844,16 @@ fn a_settled_worker_blocks_until_a_hint_and_runs_one_round_for_it() {
             Kept::Round(none, BACKSTOP),
         ],
     );
+    // The five rounds that confirm a notice: each at the pace (none here), and the fifth
+    // settles again.
+    let confirming: Vec<_> = (1..=5)
+        .flat_map(|nth| {
+            [
+                Kept::Waited(Woke::Deadline),
+                Kept::Round(none, if nth < 5 { now } else { BACKSTOP }),
+            ]
+        })
+        .collect();
     // The records watch's first look.
     expect(&mut told, &one_round(Causes::RECORDS));
     for _ in 0..5 {
@@ -1851,10 +1863,9 @@ fn a_settled_worker_blocks_until_a_hint_and_runs_one_round_for_it() {
             &[
                 Kept::Waited(Woke::Hint(Causes::DEVICE)),
                 Kept::Round(Causes::DEVICE, now),
-                Kept::Waited(Woke::Deadline),
-                Kept::Round(none, BACKSTOP),
             ],
         );
+        expect(&mut told, &confirming);
     }
     for nth in 0..3 {
         worker.control.hint(Causes::FOCUS);
@@ -1876,17 +1887,16 @@ fn a_settled_worker_blocks_until_a_hint_and_runs_one_round_for_it() {
             Kept::Waited(Woke::Hint(Causes::CONSOLE)),
             Kept::Waited(Woke::Deadline),
             Kept::Round(Causes::CONSOLE, now),
-            Kept::Waited(Woke::Deadline),
-            Kept::Round(none, BACKSTOP),
         ],
     );
+    expect(&mut told, &confirming);
     let after = worker.end();
     assert_eq!(told, expected);
     let rounds = told
         .iter()
         .filter(|event| matches!(event, Ok(Kept::Round(..))))
         .count();
-    assert_eq!(rounds, 3 + 2 * 5 + 3 * 3 + 1 + 2);
+    assert_eq!(rounds, 3 + 6 * 5 + 3 * 3 + 1 + 6);
     assert_eq!(after, [Kept::Waited(Woke::Stopped)], "nothing but the stop");
 }
 
@@ -1924,7 +1934,7 @@ fn a_worker_whose_hint_sources_did_not_arm_keeps_its_timer() {
 /// and the two-second pace), over a system that reads no hardware: every round finds all
 /// three hint sources armed, the first round's wait is the pace, and a round after it settles
 /// on the backstop. A wake starts each later round, so the law waits out no pace; a keyboard
-/// this Mac attaches meanwhile only adds a paced round.
+/// this Mac attaches meanwhile only adds the paced rounds that confirm its notice.
 /// NEGATIVE CONTROLS: with the console registration deleted from the live watch's setup the
 /// first round's coverage says `console: false`; with `live_worker` handing its worker no
 /// records folder it says `records: false`.
@@ -1968,9 +1978,10 @@ fn the_keepers_thread_arms_every_hint_source_and_settles_on_the_backstop() {
         records: true,
     };
     // Each round's coverage and wait, to the first that settled or found a source unarmed, and
-    // no more than eight: each is a wait for something that must happen.
+    // no more than twenty, room for three keyboard notices' confirming rounds: each is a wait for
+    // something that must happen.
     let mut rounds = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..20 {
         let Ok(round) = told.recv_timeout(Duration::from_secs(60)) else {
             break;
         };

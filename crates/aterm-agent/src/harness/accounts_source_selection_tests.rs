@@ -47,19 +47,23 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
         )
         .unwrap();
     }
-    // Unusable content still selects its entry; selection must not fall through.
+    // The policy consumes one observed vault snapshot; the conformance fixture supplies that
+    // input directly, so the selection law is judged even where the vault client is absent.
     let entries = [
         ("pool", super::super::super::ai_pool::AI_POOL_FILE),
         ("vault", FLEET_ROSTER_FILE),
         ("sheet", ACCOUNTS_CSV_FILE),
     ]
-    .into_iter()
-    .filter(|(key, _)| state[*key] == 1)
-    .map(|(_, name)| (name, b"unusable source".as_slice()))
-    .collect::<Vec<_>>();
-    if !entries.is_empty() {
-        crate::vault_entry::seed(home, &entries);
-    }
+    .map(|(key, name)| {
+        Some(VaultSource {
+            name: name.to_owned(),
+            read: if state[key] == 1 {
+                crate::vault_entry::Read::Present("unusable source".to_owned())
+            } else {
+                crate::vault_entry::Read::Absent
+            },
+        })
+    });
     let scope = if state["init"] == 1 || promote {
         Scope::Init
     } else {
@@ -70,7 +74,13 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
         let held = store.acquire().unwrap();
         store.retire_source_held(&held, 1).unwrap();
     }
-    let selected = select_for(&store, Some(home), Some(&config), Some(&roster), scope).unwrap();
+    let selected = select_inner(
+        || entries,
+        Some(&config),
+        Some(&roster),
+        scope,
+        store.source_policy().unwrap().retired(),
+    );
     let slot = match selected {
         Selection::Absent => 0,
         Selection::Key(_) => 1,
@@ -89,9 +99,14 @@ pub(crate) fn resolve(state: &State, action: &str) -> State {
 }
 
 #[test]
-fn source_selection_conforms_and_rejects_promoted_manual_scope() {
+fn source_selection_model_holds_on_every_target() {
     let model = aterm_models_harness::account_source_selection_model();
     aterm_spec::interp::prove_and_catch(&model);
+}
+
+#[test]
+fn source_selection_conforms_and_rejects_promoted_manual_scope() {
+    let model = aterm_models_harness::account_source_selection_model();
     let mut selections = 0;
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
@@ -107,13 +122,16 @@ fn source_selection_conforms_and_rejects_promoted_manual_scope() {
         }
     }
     assert_eq!(selections, 256);
-    let mut manual = model.init_state();
-    manual.insert("vault", 1);
-    let promoted = resolve_scope(&manual, "Select", true);
-    assert!(!model.successors("Select", &manual).contains(&promoted));
-    assert!(!model.check_invariant("SelectionMatchesPolicy", &promoted));
+    for source in ["beside", "vault"] {
+        let mut manual = model.init_state();
+        manual.insert(source, 1);
+        let promoted = resolve_scope(&manual, "Select", true);
+        assert!(!model.successors("Select", &manual).contains(&promoted));
+        assert!(!model.check_invariant("SelectionMatchesPolicy", &promoted));
+    }
 }
 
+#[cfg(unix)]
 #[test]
 fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() {
     use super::super::login_tests::{Desk, NOW, upkeep_effects};

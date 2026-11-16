@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use aterm_types::land_trailer::{Checked, Row};
+use aterm_land_trailer::{Checked, Row};
 
 /// Replay immutable release history without entering publication or touching its host.
 #[test]
@@ -452,7 +452,10 @@ fn a_shared_path_merge_cannot_borrow_its_parents_judgment() {
 }
 
 /// A composed landing carries only the checked branch's delta. Main that arrived while
-/// it ran remains owed, and an extra resolution edit invalidates the composition claim.
+/// it ran remains owed, and an extra resolution edit invalidates the composition claim. Held on
+/// unix, where alone `verify land`'s composition rule builds: off unix a composed receipt grants
+/// no coverage.
+#[cfg(unix)]
 #[test]
 fn composition_excludes_new_main_and_checks_its_actual_tree() {
     let r = Repo::new();
@@ -499,7 +502,9 @@ fn composition_excludes_new_main_and_checks_its_actual_tree() {
 }
 
 /// A re-judge names the prior checked branch as its base, not the main ancestor
-/// from which the later composition's disjoint files must be computed.
+/// from which the later composition's disjoint files must be computed. Held on unix, where alone
+/// `verify land`'s composition rule builds: off unix a composed receipt grants no coverage.
+#[cfg(unix)]
 #[test]
 fn composed_rejudgment_uses_the_parents_common_main() {
     let r = Repo::new();
@@ -637,22 +642,20 @@ fn a_recheck_binds_its_landing_and_leaves_mains_own_commits_owed() {
     r.git(&["merge", "--no-ff", "-qm", "merge main", &main]);
     let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
     let without = receipt.clone();
-    receipt
-        .rechecked
-        .push(aterm_types::land_trailer::Rechecked {
-            tree: tree.clone(),
-            rows: NAMES
-                .into_iter()
-                .map(|name| Row {
-                    check: name.into(),
-                    word: "ok".into(),
-                })
-                .collect(),
-            base: main.clone(),
-            onto: main.clone(),
-            secs: 1,
-            after: 1,
-        });
+    receipt.rechecked.push(aterm_land_trailer::Rechecked {
+        tree: tree.clone(),
+        rows: NAMES
+            .into_iter()
+            .map(|name| Row {
+                check: name.into(),
+                word: "ok".into(),
+            })
+            .collect(),
+        base: main.clone(),
+        onto: main.clone(),
+        secs: 1,
+        after: 1,
+    });
     r.landing(&tree, &topic, &main, &receipt);
     let input = r.input(&base);
     assert_eq!(input.commits.as_slice(), std::slice::from_ref(&main));
@@ -716,7 +719,9 @@ fn a_second_discovery_asks_only_about_commits_no_call_has_read() {
 
 /// R12: a kept composition answer is the answer of the rule text that gave it. The same rule
 /// asks nothing again; a changed rule judges the composition again, and nothing else: what a
-/// commit changed does not depend on that rule.
+/// commit changed does not depend on that rule. Held on unix, where alone `verify land`'s
+/// composition rule builds: off unix a composed receipt grants no coverage.
+#[cfg(unix)]
 #[test]
 fn a_changed_composition_rule_judges_the_composition_again() {
     let r = Repo::new();

@@ -200,8 +200,8 @@ fn full_look() -> Look {
             file_backed: 5 * GIB,
             app: 18 * GIB,
             shared: Some(GIB),
-            swap_used: GIB / 2,
-            swap_total: 2 * GIB,
+            swap_used: Some(GIB / 2),
+            swap_total: Some(2 * GIB),
             pressure: Some(aterm_sysprobe::MemoryLevel::Warn),
             exact: true,
             ..aterm_sysprobe::MemoryDetail::default()

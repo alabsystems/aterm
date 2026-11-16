@@ -5,28 +5,23 @@
 //! DISK-ADMIT). verify, `ship trust run` and the lab's VM boots each claim, in the capacity
 //! ledger (`aterm_capacity`), what their last runs of that kind wrote ([`aterm_capacity::Footprints`]),
 //! or, where none was measured here, the kind's cold budget less what its directories hold. A
-//! volume short of it is relieved first: the build cache's pass under pressure
-//! ([`crate::build_cache::ReclaimAfter::by_floor`]) and, inside aterm, the window's disk
-//! watch asked for the room (`await sys free>=`). Then the run waits, saying once a minute what
-//! it needs, what is free and what holds the most, instead of failing at `ENOSPC` hours in,
-//! having said first why it needs that ([`aterm_capacity::Estimate`]). A
-//! run needing more than the volume has free above its floor once its relief ran waits while
-//! other runs hold scratch claims there ([`Run::scratch`]) whose writes, if returned by their
-//! end, would bring it within the room. It rechecks and is relieved again once one has ended;
-//! with none such held it is refused at once (UNMET, [`Error::Unmet`]), naming what holds
-//! the most and how much to free, its caller adding how to start it at once where it has a way
-//! (verify's `--admit now`): what other runs wrote stays once they end, so no wait could admit
-//! it. While it is beyond the room it reserves nothing against the runs behind it, and the watch is
-//! asked for no room on its behalf by them ([`aterm_capacity::Short::unservable`]). A run its
-//! relief brought within the room waits for what the runs ahead reserve; where runs admitted
-//! around it hold the rest, it is relieved again, sized for them, where one of them reserves
-//! disk that its last relief was not sized for ([`aterm_capacity::Relief::relieve`]). The
-//! cache's pass keeps the run's own directories, which the run is about to write into
-//! ([`recorder`]), trading the room a bloated one would free for a warm build. A relief whose pass removed anything, or that asked the
+//! volume short of it is relieved once: the build cache's pass under pressure
+//! ([`crate::build_cache::ReclaimAfter::by_floor`]) and, inside aterm, the window's disk watch
+//! asked for the room (`await sys free>=`) for one pass of it ([`ASK_FOR`]). Then the run starts
+//! where its need fits what the volume has free above its floor less what the runs held there
+//! have still to write, or ends at once (UNMET, [`Error::Unmet`], with one admission record)
+//! instead of failing at `ENOSPC` hours in, having said first why it needs that
+//! ([`aterm_capacity::Estimate`]). The refusal names what the run was short of and what holds
+//! the most on the volume, its caller adding how to start it at once where it has a way
+//! (verify's `--admit now`). No run waits for disk, neither for what the runs beside it reserve
+//! or wrote nor for anyone to free space, and nothing it says asks anyone to
+//! (`docs/DESIGN-disk-custody-2026-11-12.md`, DC-06). The cache's pass keeps the run's own
+//! directories, which the run is about to write into ([`recorder`]), trading the room a bloated
+//! one would free for a warm build. A relief whose pass removed anything, or that asked the
 //! window's watch (whose own passes know no run's directories), is followed by a new measure of
 //! them, and so is the look that admits a claim that waited (another run's pass or the watch's
-//! own may have emptied them meanwhile): the claim is sized again from it, re-entering the wait
-//! when it grew, and the run's writes are measured from it ([`Sizing`]).
+//! own may have emptied them meanwhile): the claim is sized again from it, judged again by the
+//! room when it grew, and the run's writes are measured from it ([`Sizing`]).
 //! SIGINT, SIGTERM or SIGHUP ends the claim, its measuring and its relief within a second
 //! ([`aterm_toolchain::interrupt`]), with [`Error::Stopped`] and nothing left in the ledger.
 //! Under `--admit now`, which relieves nothing and measures before any wait, only the claim's
@@ -82,8 +77,8 @@ pub struct Run {
     /// `None`: it waits as long as they hold.
     pub stuck_ends: Option<Duration>,
     /// Its writes are scratch ([`aterm_capacity::Need::scratch`]): its claim's end may return up
-    /// to what it writes, so a run beyond the room can wait for it and then recheck. A durable
-    /// run, including a Trust run whose held slots survive, is not scratch.
+    /// to what it writes. No run waits for that: one beyond the room once its relief ran ends at
+    /// once. A durable run, including a Trust run whose held slots survive, is not scratch.
     pub scratch: bool,
     /// Where a kind whose directories are each checkout's own keeps its runs of every checkout on
     /// this machine, and what this run builds; `None` for a kind whose directories are the
@@ -141,8 +136,8 @@ impl Admitted {
 
     /// [`Self::finish`], running `empty` once what it took is measured and before its claim goes
     /// ([`aterm_capacity::Meter::finish_emptying`]). A scratch run can use this to return its
-    /// ephemeral writes while the claim is still visible; a waiter rechecks actual space after
-    /// the claim ends.
+    /// ephemeral writes while the claim is still visible, so a look after it ends reads that
+    /// space free.
     pub fn finish_emptying(self, empty: impl FnOnce()) -> Footprint {
         self.finish_here_emptying(empty).run
     }
@@ -185,14 +180,14 @@ impl Admitted {
     }
 }
 
-/// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume
-/// ([`Reclaim::live`]) before it waits and saying through `say` what it does and waits for.
+/// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume once
+/// ([`Reclaim::live`]) and saying through `say` what it does.
 ///
 /// # Errors
 /// [`Error::Never`]: the need is more than the volume holds above its floor; [`Error::Unmet`]:
-/// more than the volume has free above its floor once the relief ran, with no scratch claim
-/// held there that could meet it, which no wait admits (the caller runs nothing: COULD NOT RUN, or NOT RUN in the lab,
-/// naming what to free and the way it has to start at once, if it has one); [`Error::Ledger`]:
+/// more than the volume has free above its floor once its one relief ran, so it ends at once
+/// rather than wait for disk (the caller runs nothing: COULD NOT RUN, or NOT RUN in the lab,
+/// naming what it was short of and the way it has to start at once, if it has one); [`Error::Ledger`]:
 /// no home, or the ledger could not be written (the caller runs without a claim, and says so);
 /// [`Error::Stopped`]: an interrupt ended the wait (the caller ends as NOT RUN);
 /// [`Error::Stuck`]: the wait gave up behind holders that made no progress
@@ -216,7 +211,7 @@ pub fn admit(run: Run, mode: Admit, say: &mut dyn FnMut(&str)) -> Result<Admitte
 /// from, the cold budget, or the budget capping a peak), since a wait line names the figure
 /// alone; one admitted at once says nothing. After a relief that may have removed what the
 /// directories held, and at the look that admits a claim that waited ([`Sizing`]), they are
-/// measured again: a claim that grew says so and re-enters the wait with it, one refused then is
+/// measured again: a claim that grew says so and is judged again with it, one refused then is
 /// refused for that figure, and the run's writes are measured from what they held at the last
 /// measure.
 ///
@@ -368,10 +363,10 @@ impl Whole {
     }
 }
 
-/// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume
-/// ([`Reclaim::live`], keeping [`SizedClaim::keep`]) before it waits and saying through `say` what it
-/// does and waits for. Nothing is walked to size it; only a wait short of room sizes the
-/// largest holders its lines name, as every wait does ([`Reclaim::live`]).
+/// Claim `run`'s disk in this user's ledger on the live machine, relieving a short volume once
+/// ([`Reclaim::live`], keeping [`SizedClaim::keep`]) and saying through `say` what it does.
+/// Nothing is walked to size it; only a refusal short of room sizes the largest holders it
+/// names, as every refusal does ([`Reclaim::live`]).
 ///
 /// # Errors
 /// As [`admit`]: [`Error::Never`], [`Error::Unmet`], [`Error::Ledger`], [`Error::Stopped`],
@@ -540,10 +535,6 @@ impl Relief for Sizing<'_> {
         self.relief.holders(short, stopped)
     }
 
-    fn renewed(&mut self, stopped: Stopped<'_>) -> bool {
-        self.relief.renewed(stopped)
-    }
-
     fn resized(&mut self, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) -> Option<u64> {
         let touched = std::mem::take(&mut self.relief.touched);
         if std::mem::take(&mut self.relieved) && !touched {
@@ -647,8 +638,8 @@ pub type Ask = Box<dyn FnMut(u64, &Path, Stopped<'_>) -> Option<String>>;
 /// The largest holders of the volume mounted at a path, with their sizes, largest first.
 pub type Largest = Box<dyn FnMut(&Path, Stopped<'_>) -> Vec<(PathBuf, u64)>>;
 
-/// WHAT A SHORT VOLUME IS RELIEVED BY before a run waits on it, and who a wait line names as
-/// holding the rest.
+/// WHAT A SHORT VOLUME IS RELIEVED BY, once, before a run short of it is judged by its room,
+/// and who a refusal names as holding the rest.
 pub struct Reclaim {
     /// The build cache's pass under pressure, given the short volume.
     pass: Pass,
@@ -657,26 +648,13 @@ pub struct Reclaim {
     ask: Ask,
     /// The largest holders of the volume mounted at the path, largest first.
     largest: Largest,
-    /// The holders' words, read once a wait begins.
+    /// The holders' words, read once, at the first look that names them.
     named: Option<String>,
     /// Whether a relief since the claim was last sized ([`Sizing`]) may have removed what the
     /// run's directories held: its pass removed something, or the window's disk watch answered
     /// (its own passes, run for the room asked, know no run's directories).
     touched: bool,
-    /// The build directories of gone workspaces now ([`crate::build_cache::gone_leaves`]), read
-    /// at each waiting look; `None` reads none, and the relief is never renewed.
-    gone: Option<Gone>,
-    /// What `gone` listed as the last relief's pass began: a directory it did not list then (its
-    /// workspace removed since) renews the relief ([`Relief::renewed`]). One the pass kept (a
-    /// build holds it) is listed, so it renews nothing.
-    gone_after: std::collections::BTreeSet<PathBuf>,
-    /// Whether the last relief was asked for disk: only a disk shortfall is renewed, so a wait
-    /// short of memory or load alone never relieves again at every look.
-    short_of_disk: bool,
 }
-
-/// The build directories of gone workspaces now, cheaply ([`crate::build_cache::gone_leaves`]).
-pub type Gone = Box<dyn FnMut() -> std::collections::BTreeSet<PathBuf>>;
 
 impl Reclaim {
     /// The relief made of these parts.
@@ -688,18 +666,7 @@ impl Reclaim {
             largest,
             named: None,
             touched: false,
-            gone: None,
-            gone_after: std::collections::BTreeSet::new(),
-            short_of_disk: false,
         }
-    }
-
-    /// This relief, renewed at a waiting look short of disk where `gone` lists a build directory
-    /// it did not list as the last pass began ([`Relief::renewed`]).
-    #[must_use]
-    pub fn watching(mut self, gone: Gone) -> Reclaim {
-        self.gone = Some(gone);
-        self
     }
 
     /// The live relief: [`crate::build_cache::reclaim_home_watched`] where the build cache is on
@@ -735,17 +702,6 @@ impl Reclaim {
             Box::new(ask_watch),
             Box::new(move |mount, stopped| largest_on(mount, &own, stopped)),
         )
-        .watching(Box::new(|| {
-            aterm_types::dirs::home_dir()
-                .filter(|_| cfg!(target_os = "macos"))
-                .map(|home| {
-                    crate::build_cache::gone_leaves(
-                        &crate::build_cache::cache_root(&home),
-                        Some(&home),
-                    )
-                })
-                .unwrap_or_default()
-        }))
     }
 }
 
@@ -761,12 +717,11 @@ impl Reclaim {
 /// room where the directory holds more than the run writes from empty (`Footprints::need` caps a
 /// rewrite at the kind's cold budget), which the keep trades for the warm build: the pass is not
 /// sized to the run's shortfall, so it would take that build whenever it ran, even when the rest
-/// it freed was room enough, and where it was not, the run's wait line names that directory
-/// among the largest holders. It takes all it may, since a look still short after it asks it again
-/// only where its need grew or, for a need that could not fit, where a claim its last call did not
-/// count now reserves that disk ([`aterm_capacity::Relief`]). A stale part of a directory the run
-/// uses (`Unused::Stale`, staged beside it) goes: below the floor, where stale means an hour
-/// unwritten, that can cost the run a cold compile.
+/// it freed was room enough, and where it was not, the run's refusal names that directory among
+/// the largest holders. It takes all it may, since it is the run's one relief: a look still short
+/// of the room after it ends the run ([`aterm_capacity::Relief::relieve`]). A stale part of a
+/// directory the run uses (`Unused::Stale`, staged beside it) goes: below the floor, where stale
+/// means an hour unwritten, that can cost the run a cold compile.
 fn recorder<'a>(
     own: &'a [PathBuf],
     halt: &'a AtomicBool,
@@ -795,22 +750,17 @@ fn recorder<'a>(
 
 impl Relief for Reclaim {
     fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) {
-        self.short_of_disk = disk_short(short).is_some();
-        let Some((need, mount, floor, reserved, above_floor)) = disk_short(short) else {
+        let Some((need, mount, floor, above_floor, writing)) = disk_short(short) else {
             return;
         };
         let room = Room {
             mount: &mount,
             after: crate::build_cache::ReclaimAfter::by_floor(above_floor == 0),
         };
-        if let Some(gone) = self.gone.as_mut() {
-            // Before the pass: one removed while it runs renews the next look.
-            self.gone_after = gone();
-        }
         let (freed, removed, stayed) = (self.pass)(room, stopped);
         self.touched |= !removed.is_empty();
         if !removed.is_empty() {
-            // What held the volume changed: the next wait line reads its holders again.
+            // What held the volume changed: a refusal reads its holders again.
             self.named = None;
         }
         if stopped() {
@@ -840,7 +790,10 @@ impl Relief for Reclaim {
             }
             line
         });
-        let want = floor.saturating_add(reserved).saturating_add(need);
+        // The room its admission judges it by next: the need above the floor and what the
+        // claims held there have still to write beside it, not what waiters reserve, since no
+        // run waits for disk.
+        let want = floor.saturating_add(writing).saturating_add(need);
         if let Some(answer) = (self.ask)(want, &mount, stopped) {
             self.touched = true;
             say(&format!(
@@ -866,33 +819,32 @@ impl Relief for Reclaim {
         });
         (!named.is_empty()).then(|| named.clone())
     }
-
-    fn renewed(&mut self, stopped: Stopped<'_>) -> bool {
-        let Some(gone) = self.gone.as_mut().filter(|_| self.short_of_disk) else {
-            return false;
-        };
-        !stopped() && gone().iter().any(|leaf| !self.gone_after.contains(leaf))
-    }
 }
 
-/// The disk a shortfall is short of: `(need, mount, floor, reserved, above_floor)`.
+/// The disk a shortfall is short of: `(need, mount, floor, above_floor, writing)`.
 fn disk_short(short: &Shortfall) -> Option<(u64, PathBuf, u64, u64, u64)> {
     short.shorts.iter().find_map(|s| match s {
         Short::Disk {
             need,
             mount,
             floor,
-            reserved,
             above_floor,
+            writing,
             ..
-        } => Some((*need, mount.clone(), *floor, *reserved, *above_floor)),
+        } => Some((*need, mount.clone(), *floor, *above_floor, *writing)),
         _ => None,
     })
 }
 
-/// How long the window's disk watch is waited for when asked for room: one pass of it. The run
-/// waits on in its own admission after, with no deadline.
+/// How long the window's disk watch is waited for when asked for room: one pass of it, bounded
+/// in [`ask_watch`] and by the emergency hold's own deadline
+/// ([`crate::build_admit`]'s `DiskHold`). The run then starts or ends: its admission judges it
+/// by the room that pass left and waits for no more disk.
 pub const ASK_FOR: Duration = Duration::from_secs(60);
+
+/// How much sooner than [`ASK_FOR`] the window is asked to answer (`timeout=`): its own answer
+/// at its timeout reaches [`ask_watch`] before ask_watch's deadline ends the ask unanswered.
+const ASK_GRACE: Duration = Duration::from_secs(2);
 
 /// The volume mounted at `mount`'s free bytes now; 0 where unread.
 fn free_on(mount: &Path) -> u64 {
@@ -947,13 +899,16 @@ fn cache_on(mount: &Path) -> bool {
 
 /// Inside aterm (`ATERM_SESSION_ID` names this session), ask the window's disk watch for `bytes`
 /// free on the volume mounted at `mount` (`aterm ctl @self await sys free>=<bytes>B vol=<mount>`),
-/// waiting for it up to [`ASK_FOR`], or until `stopped` says an interrupt came, which ends the
-/// ask (this process's own child) at once: its answer, or `None` outside aterm, with no `aterm`
-/// on `PATH`, or once stopped.
-fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
+/// waiting for it up to [`ASK_FOR`] (the window is asked to answer [`ASK_GRACE`] sooner), or
+/// until `stopped` says so ([`answer_of`]): either ends the ask (this process's own child, killed
+/// and reaped before this returns), so no window that never answers (an older `aterm`, a hung
+/// one) holds it longer, and none outlives the wait that asked it. Its answer, or `None` outside
+/// aterm, with no `aterm` on `PATH`, once stopped, or at its deadline.
+pub(crate) fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
     std::env::var_os("ATERM_SESSION_ID").filter(|v| !v.is_empty())?;
     let path = std::env::var_os("PATH")?;
     let aterm = crate::vendor::first_on_path("aterm", Some(&path))?;
+    let deadline = std::time::Instant::now() + ASK_FOR;
     let mut child = aterm_uds::spawnfd::command(&aterm)
         .args([
             "ctl".to_owned(),
@@ -962,15 +917,29 @@ fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
             "sys".to_owned(),
             format!("free>={bytes}B"),
             format!("vol={}", pct_encode(&mount.to_string_lossy())),
-            format!("timeout={}", ASK_FOR.as_millis()),
+            format!("timeout={}", ASK_FOR.saturating_sub(ASK_GRACE).as_millis()),
         ])
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::piped())
         .stderr(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .ok()?;
+    answer_of(&mut child, deadline, stopped)
+}
+
+/// THE ANSWER OF AN ASK'S CHILD (its stdout and stderr piped), WAITED FOR UNTIL IT EXITS,
+/// `deadline` PASSES OR `stopped` SAYS SO: the first line it said (stdout's, else stderr's), or
+/// `no answer (<status>)` where it exited saying nothing. At the deadline, once stopped, or where
+/// its exit cannot be read, the child is killed and reaped before this returns `None`: an ask
+/// that ended unanswered leaves no process behind, whatever the caller does next (the emergency
+/// hold lets its build start beside it, `DiskHold::once` in [`crate::build_admit`]).
+pub(crate) fn answer_of(
+    child: &mut aterm_uds::spawnfd::Child,
+    deadline: std::time::Instant,
+    stopped: Stopped<'_>,
+) -> Option<String> {
     // Each pipe is read on a thread of its own while the ask lasts, so no answer, however long,
-    // stalls it; an ask ended by an interrupt leaves them, which end with its pipes.
+    // stalls it; an ask that ends unanswered leaves them, and they end with its pipes.
     let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         std::thread::spawn(move || {
             use std::io::Read as _;
@@ -993,17 +962,20 @@ fn ask_watch(bytes: u64, mount: &Path, stopped: Stopped<'_>) -> Option<String> {
             .take()
             .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
     );
-    let status = loop {
-        if stopped() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
+    let exited = loop {
+        if stopped() || std::time::Instant::now() >= deadline {
+            break None;
         }
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => std::thread::sleep(aterm_toolchain::interrupt::NAP),
-            Err(_) => return None,
+            Err(_) => break None,
         }
+    };
+    let Some(status) = exited else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     };
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();

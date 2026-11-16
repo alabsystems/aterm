@@ -34,3 +34,7 @@ aterm-slog = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "installer"
+harness = false

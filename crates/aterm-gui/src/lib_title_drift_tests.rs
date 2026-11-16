@@ -227,7 +227,7 @@ fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
     app.title_drift.pending.insert(0);
     app.session_chrome_expiry.session = Some(0);
     app.session_chrome_expiry.after_window = Some(WindowId(0));
-    let window = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut window = app.windows.get_mut(&WindowId(0)).expect("test window");
     window.tab_title_epochs.insert(0, 7);
     window.tab_title_cache.insert(
         0,
@@ -245,6 +245,7 @@ fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
         .insert(tab_id, (Some(0), "private title".to_string()));
 
     app.pool.attach(0);
+    drop(window);
     assert!(
         !app.detach_session_view(0),
         "the first of two views keeps the shared session alive"

@@ -75,7 +75,11 @@
 //!   code or the email.
 //! - **Never a loop**: one invocation runs one sign-in at most. After one that ended without a
 //!   login, the next starts only for a person's own launch (a terminal, [`Gate::ack`]); a
-//!   background caller waits [`PERSON_BACKOFF_SECS`] ([`Ended::Backoff`]).
+//!   background caller waits [`PERSON_BACKOFF_SECS`] ([`Ended::Backoff`]), and after one a bot
+//!   protection stopped (`bot-check`) starts none on any clock: only a person's launch at this
+//!   terminal ([`Gate::person`]: no agent's tab, no other Mac's drive), or a login made some
+//!   other way since, goes on from it, and an end that is no login leaves the check standing
+//!   ([`Record::checked`]) (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3).
 
 use std::ffi::OsString;
 use std::io;
@@ -112,8 +116,9 @@ pub const EXIT_SIGNED_OUT: u8 = 69;
 /// `EX_TEMPFAIL`: another sign-in runs, and the caller did not ask to wait for it.
 pub const EXIT_BUSY: u8 = 75;
 
-/// How long a background caller leaves the sign-in alone after one ended without a login (the
-/// accounts upkeep's `PERSON_BACKOFF`): each try starts a live device sign-in.
+/// How long a background caller leaves the sign-in alone after one ended without a login where no
+/// bot protection stopped it (the accounts upkeep's `PERSON_BACKOFF`): each try starts a live
+/// device sign-in. One a bot protection stopped holds on no clock ([`Record::bot_protected`]).
 pub const PERSON_BACKOFF_SECS: i64 = 6 * 60 * 60;
 
 /// How long the automatic rung ([`Auto::approve`]) may hold the device page before the person
@@ -312,8 +317,9 @@ pub fn target(
         .ok_or_else(|| "no home directory is known".to_owned())
 }
 
-/// The last sign-in's end, as [`RECORD_FILE`] keeps it: `gen=<n> t=<unix> outcome=<word>`, and
-/// `by=headless` where the automatic rung's refusal ended it.
+/// The last sign-in's end, as [`RECORD_FILE`] keeps it: `gen=<n> t=<unix> outcome=<word>`,
+/// `by=headless` where the automatic rung's refusal ended it, and `checked=<unix>` where a bot
+/// protection's stop stands from an earlier one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Record {
     /// How many sign-ins have ended on this machine.
@@ -325,6 +331,11 @@ pub struct Record {
     /// The automatic rung refused it (another code, another account): a person's own launch
     /// after it skips that rung once and asks them ([`run`]).
     pub by: bool,
+    /// When a bot protection stopped an earlier sign-in that no login has ended since: a later
+    /// end that is no login (a person's launch that stopped, hung or ran out) leaves it
+    /// standing, as the account's check stands for every other pool
+    /// ([`super::accounts::CheckStop`]).
+    pub checked: Option<i64>,
 }
 
 impl Record {
@@ -334,13 +345,37 @@ impl Record {
         self.generation > 0 && !matches!(self.outcome.as_str(), "signed-in" | "signed-in-elsewhere")
     }
 
+    /// Whether a bot protection stopped it (its outcome `bot-check`,
+    /// [`login_drive::Outcome::BotCheck`]) or an earlier one no login has ended since
+    /// ([`Record::checked`]): no background caller starts another, on any clock.
+    #[must_use]
+    pub fn bot_protected(&self) -> bool {
+        self.checked_at().is_some()
+    }
+
+    /// When the bot protection's stop that stands was met ([`Record::bot_protected`]).
+    #[must_use]
+    pub fn checked_at(&self) -> Option<i64> {
+        if self.generation == 0 {
+            return None;
+        }
+        if self.outcome == "bot-check" {
+            return Some(self.t);
+        }
+        self.checked
+            .filter(|_| !matches!(self.outcome.as_str(), "signed-in" | "signed-in-elsewhere"))
+    }
+
     fn line(&self) -> String {
         format!(
-            "gen={} t={} outcome={}{}\n",
+            "gen={} t={} outcome={}{}{}\n",
             self.generation,
             self.t,
             self.outcome,
-            if self.by { " by=headless" } else { "" }
+            if self.by { " by=headless" } else { "" },
+            self.checked
+                .map(|at| format!(" checked={at}"))
+                .unwrap_or_default()
         )
     }
 
@@ -359,6 +394,8 @@ impl Record {
                     .collect();
             } else if word == "by=headless" {
                 record.by = true;
+            } else if let Some(v) = word.strip_prefix("checked=") {
+                record.checked = crate::parse_int(v);
             }
         }
         record
@@ -1028,6 +1065,11 @@ pub(super) struct Gate<'a> {
     /// A person's own launch (a terminal): it may start a sign-in after one that ended without
     /// a login.
     pub ack: bool,
+    /// A person at this terminal ([`super::cli::person_at_terminal`]: a terminal, no agent's
+    /// marker, not driven from another Mac): only it may start a sign-in after one a bot
+    /// protection stopped ([`Record::bot_protected`]). A tab an agent or another Mac started has
+    /// a terminal too, and nobody at it.
+    pub person: bool,
     /// Whether this caller was asked to stop (Ctrl-C, a hangup, a stop).
     pub stopped: &'a dyn Fn() -> bool,
     /// Unix seconds now.
@@ -1058,12 +1100,14 @@ pub enum Ended {
     /// The sign-in this caller waited on ended without a login, how ([`Record::outcome`]).
     Waited(String),
     /// The last sign-in ended without a login at the time, and a background caller leaves it
-    /// alone until `until`.
+    /// alone until `until`, or, where a bot protection stopped it, on no clock.
     Backoff {
         /// How it ended.
         outcome: String,
-        /// When a background caller may start one again (unix seconds).
-        until: i64,
+        /// When a background caller may start one again (unix seconds); `None` where a bot
+        /// protection stopped it ([`Record::bot_protected`]), which only a person's own launch
+        /// goes on from.
+        until: Option<i64>,
     },
     /// Nothing ran, why.
     NotRun(String),
@@ -1136,10 +1180,21 @@ impl Ended {
                 "the Grok Build sign-in this waited on ended without a login ({outcome}); \
                  nothing more was started"
             ),
-            Ended::Backoff { outcome, until } => format!(
+            Ended::Backoff {
+                outcome,
+                until: Some(until),
+            } => format!(
                 "the last Grok Build sign-in ended without a login ({outcome}); a launch from a \
                  terminal starts a new one, and a background one waits until {}",
                 aterm_types::rfc3339::format_rfc3339(u64::try_from(*until).unwrap_or(0))
+            ),
+            Ended::Backoff {
+                outcome,
+                until: None,
+            } => format!(
+                "the last Grok Build sign-in met a bot protection ({outcome}), which aterm never \
+                 tries to pass; a launch from a terminal starts a new one, and a background one \
+                 starts none"
             ),
             Ended::NotRun(why) => format!("Grok Build was not signed in: {why}"),
             Ended::Unsigned { why, .. } => format!("Grok Build was not signed in: {why}"),
@@ -1309,9 +1364,25 @@ pub(super) fn run(
     }
     let last = read_record(gate.state);
     let now = (gate.now)();
+    // A login made since the check (its file written after it) answers it, as one made for an
+    // account's row ends that account's check.
+    let login_since = |at: i64| {
+        std::fs::metadata(&target)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|t| i64::try_from(t.as_secs()).unwrap_or(i64::MAX) > at)
+    };
+    let checked = last.checked_at().filter(|at| !login_since(*at));
+    if !gate.person && checked.is_some() {
+        return Ended::Backoff {
+            until: None,
+            outcome: "bot-check".to_owned(),
+        };
+    }
     if !gate.ack && last.unsigned() && now.saturating_sub(last.t) < PERSON_BACKOFF_SECS {
         return Ended::Backoff {
-            until: last.t.saturating_add(PERSON_BACKOFF_SECS),
+            until: Some(last.t.saturating_add(PERSON_BACKOFF_SECS)),
             outcome: last.outcome,
         };
     }
@@ -1349,11 +1420,17 @@ pub(super) fn run(
         Lead::Stopped(host) => ("stopped".to_owned(), host.clone()),
         Lead::Elsewhere(host, _) => ("signed-in-elsewhere".to_owned(), host.clone()),
     };
+    let t = (gate.now)();
     let _ = write_record(
         gate.state,
         &Record {
             generation: last.generation.max(before.generation).saturating_add(1),
-            t: (gate.now)(),
+            t,
+            checked: match word.as_str() {
+                "signed-in" | "signed-in-elsewhere" => None,
+                "bot-check" => Some(t),
+                _ => checked,
+            },
             outcome: word.clone(),
             by: led.refused_by_rung,
         },

@@ -14,6 +14,10 @@
 //! forged, is not in it. `aterm fleet`, `aterm status` and the window's Fleet glance
 //! read it; each read is one connection and one answer, and it starts nothing.
 //!
+//! **Quota rows, for the node alone.** The same judgement reads every seat's quota rows
+//! ([`quota_rows`]) for the node service's reader of its peers' lifts (`aterm`'s
+//! `quota_lifts`), which runs in the node and asks no socket; the view itself holds none.
+//!
 //! **Why the node serves it.** "Up" is the board's judgement of rows that advanced while presence
 //! ran (90 seconds, [`crate::presence::UP_FOR`]); a reader that opened its own tail would read
 //! every seat silent until a period passed, and would need the metrics log's guard secret, which
@@ -31,8 +35,8 @@
 
 use crate::logs::{Mesh, MeshLog};
 use crate::presence::{self, Behind, PresenceRow, Seat, Standing};
-use aterm_metrics::row::{ActivityRow, NeedsRow, RowError};
-use aterm_metrics::subject::{Node, Now, Subject};
+use aterm_metrics::row::{ActivityRow, NeedsRow, QuotaRow, Row, RowError};
+use aterm_metrics::subject::{AccountKey, Cli, Node, Now, Subject};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
@@ -61,6 +65,13 @@ pub const NEEDS_FILTER: &str = "/m/*/shared/now/needs";
 /// Every Mac's activity row.
 pub const ACTIVITY_FILTER: &str = "/m/*/shared/now/activity";
 
+/// Every Mac's quota rows: each account's and each agy home's ([`quota_rows`] reads the
+/// accounts').
+pub const QUOTA_FILTER: &str = aterm_metrics::rules::QUOTA_FILTER;
+
+/// The most quota rows one read holds: 64 Macs of 256 accounts each.
+pub const QUOTA_ROWS_MAX: usize = 1 << 14;
+
 /// The bound on a reader's connect and ask, and on each read and write of its answer: the node
 /// answers one reader at a time, each within [`ASK_WITHIN`] for its ask and [`ROWS_WITHIN`] for
 /// its two row reads together (one store operation of at most [`ROWS_WITHIN`] past it), so one
@@ -82,6 +93,9 @@ const ROWS_PAGE: u32 = 256;
 
 /// The pages a row read walks, at most: [`SEATS_MAX`] rows.
 const ROWS_PAGES_MAX: usize = SEATS_MAX / ROWS_PAGE as usize + 1;
+
+/// The pages a quota row read walks, at most: [`QUOTA_ROWS_MAX`] rows and every agy home's.
+const QUOTA_PAGES_MAX: usize = 2 * QUOTA_ROWS_MAX / ROWS_PAGE as usize + 1;
 
 /// What the node service holds of every current seat, as it answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,6 +651,37 @@ pub(crate) fn activity_rows(
     )
 }
 
+/// Every current seat's newest quota row of each account on this Mac's `metrics.log`, by Mac,
+/// CLI and account, judged as a `now` row is ([`signed_rows`]): its origin stamp carries its
+/// owner's producer id and its envelope verifies under its owner's node key, so a removed Mac's
+/// row, or one a relaying Mac forged, is not in it. An agy home's row, a body that names
+/// another CLI or account than its subject, and a row an older build wrote (a version-1 quota
+/// row, which holds no lift) are left out. This Mac's own rows are in it. It gives up once
+/// `within` has passed, each store operation bounded by the time left.
+///
+/// # Errors
+/// Where the log cannot be read, its broker stamps no origins, `within` passed, or the rows did
+/// not end within their bound.
+pub fn quota_rows(
+    mesh: &Mesh,
+    within: Duration,
+) -> io::Result<BTreeMap<(Node, Cli, AccountKey), QuotaRow>> {
+    signed_rows(
+        mesh,
+        QUOTA_FILTER,
+        |subject| match *subject {
+            Subject::Quota { node, cli, account } => Some((node, cli, account)),
+            _ => None,
+        },
+        |subject, body| match Row::decode_at(subject, body)? {
+            Row::Quota(row) => Ok(row),
+            _ => Err(RowError::NoCodec),
+        },
+        (Instant::now() + within, within),
+        (QUOTA_ROWS_MAX, QUOTA_PAGES_MAX),
+    )
+}
+
 /// Every current seat's newest row under `filter` on this Mac's `metrics.log` whose subject is
 /// `want` and whose body `decode` takes, judged as presence judges a row
 /// ([`presence::signed_by`]); a row that fails, or a subject this build names otherwise or not
@@ -650,12 +695,37 @@ pub(crate) fn signed_now_rows<T>(
     decode: fn(&[u8]) -> Result<T, RowError>,
     deadline: Instant,
 ) -> io::Result<BTreeMap<String, T>> {
+    signed_rows(
+        mesh,
+        filter,
+        |subject| match *subject {
+            Subject::Now { node, now } if now == want => Some(node.to_string()),
+            _ => None,
+        },
+        |_, body| decode(body),
+        (deadline, ROWS_WITHIN),
+        (SEATS_MAX, ROWS_PAGES_MAX),
+    )
+}
+
+/// The rows under `filter` on this Mac's `metrics.log` whose subject `key` names and whose
+/// body `decode` takes at it, each judged by its origin ([`presence::signed_by`]), the newest of
+/// each key. It gives up once `deadline` (`within` from its start) has passed, before it starts
+/// or before a page; and stops at `max` rows, or fails past `pages` pages.
+fn signed_rows<K: Ord, T>(
+    mesh: &Mesh,
+    filter: &str,
+    key: impl Fn(&Subject) -> Option<K>,
+    decode: impl Fn(&Subject, &[u8]) -> Result<T, RowError>,
+    (deadline, within): (Instant, Duration),
+    (max, pages): (usize, usize),
+) -> io::Result<BTreeMap<K, T>> {
     let late = || {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
                 "the rows of {filter} took longer than {} s",
-                ROWS_WITHIN.as_secs()
+                within.as_secs()
             ),
         )
     };
@@ -673,36 +743,36 @@ pub(crate) fn signed_now_rows<T>(
     }
     let mut rows = BTreeMap::new();
     let mut cursor = String::new();
-    for _ in 0..ROWS_PAGES_MAX {
+    for _ in 0..pages {
         if Instant::now() >= deadline {
             return Err(late());
         }
         let (page, _, resume) = client.last_page(filter, &cursor, ROWS_PAGE)?;
         let origins = client.page_origins().to_vec();
         for (at, (_, subject, body)) in page.into_iter().enumerate() {
-            let Ok(Subject::Now { node, now }) = Subject::parse(&subject) else {
+            let Ok(parsed) = Subject::parse(&subject) else {
                 continue;
             };
-            if now != want {
+            let Some(k) = key(&parsed) else {
                 continue;
-            }
-            let principal = node.to_string();
+            };
+            let principal = parsed.node().to_string();
             let origin = origins.get(at).copied().flatten();
             let Ok((_, payload)) = presence::signed_by(mesh, &principal, &subject, origin, &body)
             else {
                 continue;
             };
-            if let Ok(row) = decode(payload) {
-                rows.insert(principal, row);
+            if let Ok(row) = decode(&parsed, payload) {
+                rows.insert(k, row);
             }
         }
-        if resume.is_empty() || rows.len() >= SEATS_MAX {
+        if resume.is_empty() || rows.len() >= max {
             return Ok(rows);
         }
         cursor = resume;
     }
     Err(io::Error::other(format!(
-        "the rows of {filter} did not end within {ROWS_PAGES_MAX} pages"
+        "the rows of {filter} did not end within {pages} pages"
     )))
 }
 

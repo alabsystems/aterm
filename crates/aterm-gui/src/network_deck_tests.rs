@@ -1758,3 +1758,57 @@ fn explicit_network_closeup_keeps_hidden_deck_and_terminal_geometry() {
         before
     );
 }
+
+/// The Network State band is part of the System Resources band, so it is drawn only where a
+/// window carries that band: with the band's window out of view and a Sill window in view
+/// nothing draws it and its feed is not asked; the band's window in view draws it. The Sill's
+/// frame is given no network, lab or fleet rows. View ▸ Network State still opens the card in
+/// a window without the band, and the open card asks the feed.
+#[test]
+fn the_network_band_is_drawn_only_where_a_window_carries_the_band() {
+    use crate::stats_band::tests::{TwoWindows, two_windows};
+    use crate::stats_deck::StatsBars;
+    let TwoWindows {
+        mut app,
+        first,
+        second,
+        attached: _attached,
+    } = two_windows();
+    let due = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    app.network_next_poll = Some(due);
+    let snapshot = inactive_snapshot();
+    app.network_source = Some(std::sync::Arc::new(move |_| Some(snapshot.clone())));
+
+    app.windows.get_mut(&first).expect("window").occluded = true;
+    assert!(!app.network_band_drawn(), "only the Sill window is in view");
+    assert_eq!(app.network_state_deadline(), None, "the feed is not asked");
+    app.windows.get_mut(&first).expect("window").occluded = false;
+    assert!(app.network_band_drawn(), "the band's window shows");
+    assert_eq!(app.network_state_deadline(), Some(due));
+
+    {
+        use crate::network_deck::field::tests::{field_of, fleet};
+        let now = 1_800_000_000_000;
+        app.fleet_field = Some(std::sync::Arc::new(field_of(fleet(5), now)));
+    }
+    let deck = app.deck_frame(first).expect("the band's frame");
+    assert_eq!(deck.form, StatsBars::Deck, "PRECONDITION");
+    let input = app.deck_input(&deck);
+    assert!(
+        input.network.is_some() && input.lab.is_some() && input.fleet.is_some(),
+        "CONTROL: the Deck's frame is given all three"
+    );
+    let sill = app.deck_frame(second).expect("the Sill's frame");
+    assert_eq!(sill.form, StatsBars::Sill, "PRECONDITION");
+    let input = app.deck_input(&sill);
+    assert!(input.network.is_none(), "no network rows");
+    assert!(input.lab.is_none(), "no lab rows");
+    assert!(input.fleet.is_none(), "no fleet rows");
+
+    // The card opens in the window without the band, and counts while that window is in view.
+    app.windows.get_mut(&first).expect("window").occluded = true;
+    assert!(app.open_network_lens_in(second), "View ▸ Network State");
+    assert!(app.network_band_drawn(), "its open card");
+    app.close_stats_lens(second);
+    assert!(!app.network_band_drawn());
+}

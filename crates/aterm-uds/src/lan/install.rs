@@ -598,15 +598,29 @@ impl Reading {
         self.image.owed() || self.plist.owed()
     }
 
-    /// Whether setup owes a file repair or a known-stopped service. A running older signed
-    /// image adopts its update itself. An unreadable file or job never creates service debt.
-    /// `running` is read only when both files can already serve this build or adopt it.
+    /// Whether setup owes a file repair or a known-stopped service, and the job is not one a
+    /// person switched off. A running older signed image adopts its update itself. An unreadable
+    /// file or job never creates service debt. `running` is read only when both files can
+    /// already serve this build or adopt it.
+    ///
+    /// `switched_off` is read only when something would be owed: a job launchd lists switched off
+    /// (`Some(true)`: its background item turned off in Login Items, or `launchctl disable`)
+    /// stays the person's, so it owes nothing, files current or not, and no password is asked to
+    /// undo their choice; putting it back is theirs, as it is for the node job
+    /// (`aterm_agent::node_service::read_for_sync_with`). Unlike the node job, one still running
+    /// owes nothing either: a repair boots it out, and launchd refuses to start again a job it
+    /// lists switched off. Where launchd cannot say (`None`), the debt stands as it reads.
     #[must_use]
-    pub fn owed_with_running(&self, running: impl FnOnce() -> Option<bool>) -> bool {
-        self.owed()
+    pub fn owed_with_job(
+        &self,
+        running: impl FnOnce() -> Option<bool>,
+        switched_off: impl FnOnce() -> Option<bool>,
+    ) -> bool {
+        let owed = self.owed()
             || (matches!(self.image, Part::Current | Part::Adopting(_))
                 && self.plist == Part::Current
-                && running() == Some(false))
+                && running() == Some(false));
+        owed && switched_off() != Some(true)
     }
 
     /// Whether both parts are as this build installs them.
@@ -675,12 +689,16 @@ pub fn read_here() -> Option<(PathBuf, Result<Reading, String>)> {
 }
 
 /// Whether setup's one elevation owes this Mac the broker, using this process's file reading
-/// and the injected service reading ([`Reading::owed_with_running`]). `false` with no source
+/// and the injected service readings ([`Reading::owed_with_job`]). `false` with no source
 /// and for a file reading that failed, so no password is asked for want of a reading.
 #[must_use]
-pub fn owed_here(running: impl FnOnce() -> Option<bool>) -> bool {
-    read_here()
-        .is_some_and(|(_, reading)| reading.is_ok_and(|reading| reading.owed_with_running(running)))
+pub fn owed_here(
+    running: impl FnOnce() -> Option<bool>,
+    switched_off: impl FnOnce() -> Option<bool>,
+) -> bool {
+    read_here().is_some_and(|(_, reading)| {
+        reading.is_ok_and(|reading| reading.owed_with_job(running, switched_off))
+    })
 }
 
 /// A test's thin 64-bit Mach-O of CPU type `cpu` whose embedded signature carries `directories`

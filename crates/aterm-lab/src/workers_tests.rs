@@ -220,9 +220,8 @@ fn a_spawn_result_naming_its_request_still_names_its_sid() {
     let text = [
         result("t1", "OK t0000000f0a req=r-20261109-1411-local-01"),
         result("t2", r"OK t0000000f0b\n"),
-        // A peer on an earlier build answers with its tab's earlier `s-` ID.
-        result("t2e", "OK s-0123456789abcdef0f0c"),
-        // NEGATIVE CONTROLS: a refusal, a sid that is not one, and nothing after `OK`.
+        result("t2r", "OK t0000000f0c req=r-20261109-1411-local-02"),
+        // NEGATIVE CONTROLS: a refusal, invalid or legacy IDs, and nothing after `OK`.
         result(
             "t3",
             "ERR spawn req=r-20261109-1411-local-01: the request has concluded",
@@ -230,6 +229,7 @@ fn a_spawn_result_naming_its_request_still_names_its_sid() {
         result("t4", "OK t0000000f0u req=r-20261109-1411-local-02"),
         result("t5", "OK "),
         result("t6", "OK s-0123456789abcdef0f0"),
+        result("t7", "OK s-0123456789abcdef0f0c"),
     ]
     .join("\n");
     assert_eq!(
@@ -237,7 +237,7 @@ fn a_spawn_result_naming_its_request_still_names_its_sid() {
         vec![
             "t0000000f0a".to_string(),
             "t0000000f0b".to_string(),
-            "s-0123456789abcdef0f0c".to_string()
+            "t0000000f0c".to_string()
         ]
     );
 }
@@ -263,11 +263,11 @@ fn spawn_timings_use_the_same_receipts_as_worker_identity() {
         .dump(crate::pyjson::COMPACT)
     };
     let current = "OK t0000000f0a req=r-20261109-1411-local-01";
-    let earlier = "OK s-0123456789abcdef0f0c req=r-20261109-1411-local-02";
+    let requested = "OK t0000000f0f req=r-20261109-1411-local-02";
     let text = [
         result("user", "t1", current, Some("2026-10-16T10:24:42.010Z")),
         result("user", "t1", current, Some("2026-10-16T10:24:42.020Z")),
-        result("user", "t2", earlier, Some("2026-10-16T10:24:42.030Z")),
+        result("user", "t2", requested, Some("2026-10-16T10:24:42.030Z")),
         result(
             "assistant",
             "t3",
@@ -319,6 +319,12 @@ fn spawn_timings_use_the_same_receipts_as_worker_identity() {
             "OK t0000000f0a-other",
             Some("2026-10-16T10:24:42.130Z"),
         ),
+        result(
+            "user",
+            "t14",
+            "OK s-0123456789abcdef0f0c req=r-20261109-1411-local-03",
+            Some("2026-10-16T10:24:42.140Z"),
+        ),
     ]
     .join("\n");
     let rows = rows(&text);
@@ -326,7 +332,7 @@ fn spawn_timings_use_the_same_receipts_as_worker_identity() {
         spawned(&rows),
         [
             "t0000000f0a",
-            "s-0123456789abcdef0f0c",
+            "t0000000f0f",
             "t0000000f0b",
             "t0000000f0b",
             "t0000000f0c",
@@ -337,10 +343,8 @@ fn spawn_timings_use_the_same_receipts_as_worker_identity() {
     );
     let second = 1_792_146_282_000;
     assert_eq!(spawn_time(&rows, "t0000000f0a"), Some(second + 10));
-    assert_eq!(
-        spawn_time(&rows, "s-0123456789abcdef0f0c"),
-        Some(second + 30)
-    );
+    assert_eq!(spawn_time(&rows, "t0000000f0f"), Some(second + 30));
+    assert_eq!(spawn_time(&rows, "s-0123456789abcdef0f0c"), None);
     assert_eq!(spawn_time(&rows, "t0000000f0b"), Some(second + 50));
     assert_eq!(spawn_time(&rows, "t0000000f0c"), None);
     assert_eq!(spawn_time(&rows, "t0000000f0d"), Some(second + 110));

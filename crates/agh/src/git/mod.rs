@@ -55,7 +55,7 @@ pub fn advertised_refs(
             .split_once('\t')
             .ok_or_else(|| crate::Error::protocol("Git ref advertisement is malformed"))?;
         let full = name.strip_suffix("^{}").unwrap_or(name);
-        if !aterm_types::land_trailer::object_id(oid)
+        if !aterm_land_trailer::object_id(oid)
             || !(full == "HEAD" || (full.starts_with("refs/") && crate::path::ref_name_ok(full)))
         {
             return Err(crate::Error::protocol(

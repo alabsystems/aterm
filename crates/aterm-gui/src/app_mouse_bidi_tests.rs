@@ -34,7 +34,7 @@ fn sweep(app: &mut App, wid: WindowId, from: u16, to: u16, side: SelectionSide) 
 /// [`sweep`] on viewport row `row`.
 fn sweep_on(app: &mut App, wid: WindowId, row: u16, from: u16, to: u16, side: SelectionSide) {
     {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.last_mouse_cell = (row, from);
         ws.last_mouse_side = SelectionSide::Left;
     }

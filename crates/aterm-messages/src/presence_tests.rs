@@ -946,7 +946,7 @@ fn the_programs_own_report_is_named_only_where_the_reader_names_no_phase() {
             composer: ComposerState::Unknown,
         }),
         shell: Some(("running", now)),
-        program: Some(("codex working", now)),
+        program: Some(("codex working".into(), now)),
         ..TFacts::default()
     };
     for phase in [None, Some(AgentPhase::Unknown)] {
@@ -995,7 +995,7 @@ fn a_programs_own_context_figure_follows_its_report() {
             composer: ComposerState::Unknown,
         }),
         shell: Some(("running", now)),
-        program: Some(("codex working", now)),
+        program: Some(("codex working".into(), now)),
         program_ctx_left: ctx,
         ..TFacts::default()
     };

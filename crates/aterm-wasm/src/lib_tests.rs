@@ -1719,3 +1719,373 @@ fn web_translucency_floors_the_rendered_glyphs() {
         "control: the unfloored glyph is sub-AA ({opaque}:1)"
     );
 }
+
+#[test]
+fn same_font_size_preserves_settled_and_pending_frames() {
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"same px");
+    t.render().unwrap();
+    t.render().unwrap();
+    assert!(!t.needs_frame());
+    t.set_px(14.0).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "an unchanged size must not invalidate a settled frame"
+    );
+    t.render().unwrap();
+    assert!(t.last_render_skipped());
+    t.process(b"!");
+    assert!(t.needs_frame());
+    t.set_px(14.0).unwrap();
+    assert!(
+        t.needs_frame(),
+        "a no-op must preserve pending output damage"
+    );
+    t.render().unwrap();
+    assert!(!t.last_render_skipped());
+    t.set_px(15.0).unwrap();
+    assert!(t.needs_frame(), "a real size change must still invalidate");
+    t.render().unwrap();
+    t.render().unwrap();
+    assert!(!t.needs_frame());
+    assert!(t.set_px(1_000_000.0).is_err());
+    assert!(!t.needs_frame(), "refusal preserves the settled frame");
+}
+
+#[test]
+#[ignore = "manual finite unchanged-font instruction comparison"]
+fn font_size_update_cost() {
+    let case = std::env::var("ATERM_FONT_UPDATE_CASE").unwrap();
+    assert!(matches!(case.as_str(), "noop" | "change"));
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"same px");
+    t.render().unwrap();
+    t.render().unwrap();
+    let expected = t.rgba();
+    let geometry = (t.width(), t.height());
+    let mut skipped = 0;
+    for i in 0..256 {
+        let px = if case == "change" && i % 2 == 0 {
+            15.0
+        } else {
+            14.0
+        };
+        t.set_px(std::hint::black_box(px)).unwrap();
+        t.render().unwrap();
+        skipped += usize::from(t.last_render_skipped());
+    }
+    assert_eq!((t.width(), t.height()), geometry);
+    assert_eq!(t.rgba(), expected, "the final 14px frame is unchanged");
+    eprintln!("FONT_PROFILE case={case} iterations=256 skipped={skipped}");
+}
+
+#[test]
+fn repeating_focus_style_preserves_settled_and_pending_frames() {
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"focus style");
+    t.selection_start(0, 0);
+    t.selection_extend(0, 4);
+    t.render().unwrap();
+    t.render().unwrap();
+    assert!(!t.needs_frame());
+    t.set_selection_inactive(false);
+    assert!(
+        !t.needs_frame(),
+        "an identical focus style must not invalidate"
+    );
+    t.set_selection_inactive_bg(None);
+    assert!(
+        !t.needs_frame(),
+        "an identical absent override must not invalidate"
+    );
+    t.set_selection_inactive(true);
+    assert!(t.needs_frame());
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    t.render().unwrap();
+    t.render().unwrap();
+    assert!(!t.needs_frame());
+    t.set_selection_inactive(true);
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    assert!(!t.needs_frame(), "identical inactive values must gate too");
+    t.process(b"!");
+    t.set_selection_inactive(true);
+    t.set_selection_inactive_bg(Some(0x0012_3456));
+    assert!(
+        t.needs_frame(),
+        "a no-op must preserve pending output damage"
+    );
+    t.render().unwrap();
+    assert!(!t.last_render_skipped());
+    t.set_selection_inactive_bg(None);
+    assert!(t.needs_frame(), "clearing an override is a real change");
+    t.render().unwrap();
+    t.render().unwrap();
+    t.set_selection_inactive(false);
+    assert!(t.needs_frame(), "returning to focused is a real change");
+}
+
+#[test]
+#[ignore = "manual finite focus-style instruction comparison"]
+fn focus_style_update_cost() {
+    let case = std::env::var("ATERM_FOCUS_UPDATE_CASE").unwrap();
+    assert!(matches!(case.as_str(), "noop" | "change"));
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"focus style");
+    t.selection_start(0, 0);
+    t.selection_extend(0, 4);
+    t.render().unwrap();
+    t.render().unwrap();
+    let expected = t.rgba();
+    let geometry = (t.width(), t.height());
+    let mut skipped = 0;
+    for i in 0..256 {
+        let inactive = case == "change" && i % 2 == 0;
+        t.set_selection_inactive(std::hint::black_box(inactive));
+        t.set_selection_inactive_bg(std::hint::black_box(inactive.then_some(0x0012_3456)));
+        t.render().unwrap();
+        skipped += usize::from(t.last_render_skipped());
+    }
+    assert_eq!((t.width(), t.height()), geometry);
+    assert_eq!(t.rgba(), expected, "the final focused frame is unchanged");
+    eprintln!("FOCUS_PROFILE case={case} iterations=256 skipped={skipped}");
+}
+
+#[test]
+fn repeating_render_settings_preserves_frame_and_normalization() {
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"render settings");
+    t.render().unwrap();
+    t.render().unwrap();
+    t.set_minimum_contrast(0.0);
+    assert!(!t.needs_frame(), "identical contrast must not invalidate");
+    t.set_background_opacity(1.0);
+    assert!(
+        !t.needs_frame(),
+        "identical background opacity must not invalidate"
+    );
+    t.set_cursor_opacity(1.0);
+    assert!(
+        !t.needs_frame(),
+        "identical cursor opacity must not invalidate"
+    );
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(t.needs_frame());
+    t.render().unwrap();
+    t.render().unwrap();
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(!t.needs_frame());
+    t.process(b"!");
+    t.set_minimum_contrast(4.5);
+    t.set_background_opacity(0.5);
+    t.set_cursor_opacity(0.5);
+    assert!(
+        t.needs_frame(),
+        "identical settings preserve pending output"
+    );
+    t.render().unwrap();
+    assert!(!t.last_render_skipped());
+    for (input, expected) in [
+        (f32::NAN, 1.0_f32),
+        (f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 1.0),
+        (2.0, 1.0),
+        (-1.0, 0.0),
+        (-0.0, -0.0),
+        (0.0, 0.0),
+        (0.25, 0.25),
+    ] {
+        t.set_background_opacity(input);
+        t.set_cursor_opacity(input);
+        assert_eq!(
+            t.renderer.background_opacity().to_bits(),
+            expected.to_bits()
+        );
+        assert_eq!(t.renderer.cursor_opacity().to_bits(), expected.to_bits());
+    }
+    t.set_minimum_contrast(f32::NAN);
+    assert!(t.renderer.minimum_contrast().is_nan());
+    t.render().unwrap();
+    t.render().unwrap();
+    t.set_minimum_contrast(f32::NAN);
+    assert!(
+        t.needs_frame(),
+        "nonfinite requests keep the existing forwarding path"
+    );
+}
+
+#[test]
+#[ignore = "manual finite render-settings instruction comparison"]
+fn render_settings_update_cost() {
+    let case = std::env::var("ATERM_RENDER_UPDATE_CASE").unwrap();
+    assert!(matches!(case.as_str(), "noop" | "change"));
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.process(b"render settings");
+    t.render().unwrap();
+    t.render().unwrap();
+    let expected = t.rgba();
+    let geometry = (t.width(), t.height());
+    let mut skipped = 0;
+    for i in 0..256 {
+        let changed = case == "change" && i % 2 == 0;
+        t.set_minimum_contrast(std::hint::black_box(if changed { 4.5 } else { 0.0 }));
+        t.set_background_opacity(std::hint::black_box(if changed { 0.5 } else { 1.0 }));
+        t.set_cursor_opacity(std::hint::black_box(if changed { 0.5 } else { 1.0 }));
+        t.render().unwrap();
+        skipped += usize::from(t.last_render_skipped());
+    }
+    assert_eq!((t.width(), t.height()), geometry);
+    assert_eq!(t.rgba(), expected, "the final default frame is unchanged");
+    eprintln!("RENDER_PROFILE case={case} iterations=256 skipped={skipped}");
+}
+
+#[test]
+fn same_chrome_geometry_preserves_frames_and_refusals() {
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.set_chrome(0, 0).unwrap();
+    t.process(b"chrome geometry");
+    t.render().unwrap();
+    t.render().unwrap();
+    let plain = (t.width(), t.height());
+    t.set_chrome(0, 0).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "identical exact-fit chrome must not invalidate"
+    );
+    t.set_chrome(4, 6).unwrap();
+    assert!(t.needs_frame());
+    t.render().unwrap();
+    t.render().unwrap();
+    assert_eq!((t.width(), t.height()), (plain.0 + 8, plain.1 + 14));
+    assert_eq!((t.chrome_pad(), t.chrome_head()), (4, 6));
+    t.set_chrome(4, 6).unwrap();
+    assert!(
+        !t.needs_frame(),
+        "identical installed chrome must not invalidate"
+    );
+    t.process(b"!");
+    t.set_chrome(4, 6).unwrap();
+    assert!(t.needs_frame(), "same geometry preserves pending output");
+    t.render().unwrap();
+    assert!(!t.last_render_skipped());
+    t.render().unwrap();
+    assert!(t.set_chrome(u16::MAX, u16::MAX).is_err());
+    assert_eq!((t.chrome_pad(), t.chrome_head()), (4, 6));
+    assert!(!t.needs_frame(), "refusal must preserve the settled frame");
+    t.set_chrome(0, 0).unwrap();
+    assert!(t.needs_frame());
+    t.render().unwrap();
+    assert_eq!((t.width(), t.height()), plain);
+}
+
+#[test]
+#[ignore = "manual finite chrome instruction comparison"]
+fn chrome_update_cost() {
+    let case = std::env::var("ATERM_CHROME_UPDATE_CASE").unwrap();
+    assert!(matches!(case.as_str(), "noop" | "change"));
+    let mut t = AtermTerminal::new(
+        8,
+        40,
+        BUNDLED_FACE,
+        14.0,
+        0x00d8_d8d8,
+        0x0018_1818,
+        0x00a0_c0ff,
+        0x0040_4050,
+    )
+    .unwrap();
+    t.set_chrome(0, 0).unwrap();
+    t.process(b"chrome geometry");
+    t.render().unwrap();
+    t.render().unwrap();
+    let expected = t.rgba();
+    let geometry = (t.width(), t.height());
+    let mut skipped = 0;
+    for i in 0..256 {
+        let (pad, head) = if case == "change" && i % 2 == 0 {
+            (4, 6)
+        } else {
+            (0, 0)
+        };
+        t.set_chrome(std::hint::black_box(pad), std::hint::black_box(head))
+            .unwrap();
+        t.render().unwrap();
+        skipped += usize::from(t.last_render_skipped());
+    }
+    assert_eq!((t.width(), t.height()), geometry);
+    assert_eq!(t.rgba(), expected, "the final exact-fit frame is unchanged");
+    eprintln!("CHROME_PROFILE case={case} iterations=256 skipped={skipped}");
+}

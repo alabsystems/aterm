@@ -19,9 +19,11 @@
 //! per session across key rotations), and the machine-number negotiation
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §6.6: who holds a number, the older builds' implied
 //! records and migration, a machine's primary, succession, stripped and opaque entries, and the
-//! automatic pick), and the fleet access lock
+//! automatic pick), the fleet access lock
 //! (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §8 `FleetAccessLock`: a per-machine ceiling
-//! over the drive grants that fails closed and keeps the reads).
+//! over the drive grants that fails closed and keeps the reads), and a vault server's gated peer
+//! pulls (`VaultPeerGate`: a peer whose TXT names a newer version or records this server neither
+//! holds nor proved is pulled, and nothing a TXT shows held).
 
 mod models_access_lock;
 mod models_cached_log;
@@ -42,6 +44,7 @@ mod models_ledger_publish;
 mod models_machine_number;
 mod models_membership;
 mod models_mesh_relay;
+mod models_peer_gate;
 mod models_peer_replacement;
 mod models_peer_selection;
 mod models_records_capacity;
@@ -81,6 +84,7 @@ pub use models_mesh_relay::{
     PRESENCE_FAIR, SETTLES, TABLES_FAIR, every_up_mac_gets_every_table_record_liveness,
     mesh_relay_model, restarted_mac_reads_up_liveness,
 };
+pub use models_peer_gate::peer_gate_model;
 pub use models_peer_replacement::peer_replacement_model;
 pub use models_peer_selection::peer_selection_model;
 pub use models_records_capacity::records_capacity_model;

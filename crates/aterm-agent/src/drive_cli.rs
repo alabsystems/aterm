@@ -304,7 +304,10 @@ fn gone_to(verb: &str) -> Option<&'static str> {
         }
         "supervise" | "watch" => "the window's host (`aterm help harness`)",
         "task" => {
-            "`aterm ctl @self spawn agent=claude -` then `aterm ctl await task @<sid> since=0`"
+            "your harness's native subagents for same-machine tasks and your own shell/background \
+             tools for commands; work directly when native subagents are unavailable; \
+             `aterm help workers` covers explicitly requested sessions or needs native tools \
+             cannot meet"
         }
         "report" => "`aterm ctl @<sid> result` (or `offscreen` / `text`)",
         _ => return None,
@@ -395,7 +398,8 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
         Some(sid) => sid,
         None => {
             return Err(
-                "ledger needs the worker: `aterm drive ledger @s-…` (or a single-session --journal)"
+                "ledger needs the worker: `aterm drive ledger @<sid>` (or a single-session \
+                 --journal)"
                     .to_string(),
             );
         }

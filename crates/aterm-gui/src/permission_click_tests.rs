@@ -285,3 +285,14 @@ fn the_window_answers_the_default_from_the_resolvers_read() {
     );
     crate::harness_host::publish_snapshot_for_test(tab, None);
 }
+
+/// LS-72: a click refused because the tab's agent is another user's process (`sudo claude`),
+/// whose arguments the kernel never answers to aterm, says so in the light's title: a lasting
+/// refusal of its own, never a wait or the free word's "its command line can't be rewritten".
+#[test]
+fn a_click_on_another_users_agent_is_refused_in_its_own_words() {
+    let why = ClickRefusal::of(&harness::Refusal::ArgvWithheld);
+    assert_eq!(why, ClickRefusal::ArgvWithheld);
+    assert_eq!(why.says(), "it runs as another user");
+    assert_ne!(why.says(), ClickRefusal::Line.says());
+}

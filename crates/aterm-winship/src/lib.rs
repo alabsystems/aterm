@@ -6,7 +6,9 @@
 //! origin/main without stopping a running window (`update`), run that daily
 //! (`schedule`), say what is installed and staged (`status`), and build a
 //! claimed release commit's Windows zip and the receipt the release cutter
-//! admits (`release-build`, `handoff`).
+//! admits (`release-build`, `handoff`), and serve the release pump's requests
+//! for one through the dev repository, signed by this host's pinned builder key
+//! (`release-serve`, `release-key`, `pull`, `attest`).
 //!
 //! A dev tool: nothing here is linked into the shipped `aterm`. It runs the
 //! dist's own images and the tree's own `apps\aterm-win\build.ps1` and
@@ -19,14 +21,17 @@
 //! No path of the checkout that built it is compiled in: the repository is
 //! decided when it runs (`repo`).
 
+pub mod attest;
 pub mod env;
 pub mod handoff;
 pub mod plan;
 pub mod pointer;
 pub mod proc;
+pub mod pull;
 pub mod release;
 pub mod repo;
 pub mod schedule;
+pub mod serve;
 pub mod smoke;
 pub mod update;
 
@@ -54,7 +59,9 @@ USAGE:
     aterm-winship schedule [--daily HH:MM] [--repo <dir>] [--remove] [--dry-run]
     aterm-winship status [--repo <dir>]
     aterm-winship release-build --version <v> --build-number <n> --commit <sha> --out <dir>
-                                [--repo <dir>]
+                                [--repo <dir>] [--sign-with <key> [--builder <id>]]
+    aterm-winship release-key init|show [--key <path>] [--builder <id>]
+    aterm-winship release-serve [--once] [--repo <dir>] [--key <path>] [--builder <id>] [--log]
 
 smoke     Start <dist>\\aterm-gui.exe --headless in an isolated environment
           (a scratch root; TMP, TEMP, LOCALAPPDATA, APPDATA and USERPROFILE
@@ -68,8 +75,11 @@ smoke     Start <dist>\\aterm-gui.exe --headless in an isolated environment
 update    Fetch origin, check origin/main out in the build tree
           %LOCALAPPDATA%\\aterm\\build\\src (a worktree of the repository), run
           its apps\\aterm-win\\build.ps1 into
-          %LOCALAPPDATA%\\aterm\\dist\\<commit12>.building, give the finished
-          folder the name <commit12>, smoke it, write
+          %LOCALAPPDATA%\\aterm\\dist\\<commit12>.building (with -Tool, so the
+          tree's own aterm-winship.exe is built beside it), give the finished
+          folder the name <commit12>, smoke it with the tree's own tool (which,
+          once it passed or failed the build, replaces the copy the scheduled
+          task runs), write
           %LOCALAPPDATA%\\aterm\\dist\\latest.json, keep the staged, the
           previous and the installed dist and delete older ones, then run the
           dist's install.ps1 -Staged (-Staged -Restart with --restart; -Update
@@ -78,13 +88,16 @@ update    Fetch origin, check origin/main out in the build tree
           nothing when the pointer already names origin/main, and installs
           nothing over a newer installed build (--force does both). --log
           appends the run to %LOCALAPPDATA%\\aterm\\dist\\update.log.
-schedule  Register the per-user Scheduled Task aterm-winship-update that runs
-          `update --log --repo <the repository>` daily at HH:MM (04:30), from
-          a copy of this tool at %LOCALAPPDATA%\\aterm\\build\\aterm-winship.exe
-          and with no window. The task runs on battery, is not stopped when
-          the PC goes on battery, and a start missed while the PC slept or was
-          off runs once it is back. --remove removes it; --dry-run prints the
-          schtasks line and the task's XML and changes nothing.
+schedule  Register two per-user Scheduled Tasks, from a copy of this tool at
+          %LOCALAPPDATA%\\aterm\\build\\aterm-winship.exe and with no window:
+          aterm-winship-update runs `update --log --repo <the repository>`
+          daily at HH:MM (04:30), and aterm-winship-release-serve runs
+          `release-serve --once --log --repo <the repository>` every 10
+          minutes. Each runs on battery, is not stopped when the PC goes on
+          battery, runs a start missed while the PC slept or was off once it
+          is back, and passes over a start while it is still running.
+          --remove removes both; --dry-run prints the schtasks lines and the
+          tasks' XML and changes nothing.
 status    The installed build, the staged pointer, the repository, origin/main
           and the build tree. Reads only.
 release-build
@@ -102,8 +115,43 @@ release-build
           the clean commit and the compiler unchanged, and admits the pair as
           the cutter will. Its last line prints the zip's SHA-256, which the
           Mac's `ship release --windows-sha256` must name: the carry is not
-          trusted. Exit 0 made, 1 the build or a check failed, 3 nothing was
-          built.
+          trusted. --sign-with <key> also writes <zip>.handoff.sig, the
+          receipt signed by that builder key as --builder (this computer's
+          name), which the cut admits in place of the typed digest when
+          apps\\aterm-win\\release-builders.toml pins the builder. Exit 0
+          made, 1 the build or a check failed, 3 nothing was built.
+release-key
+          init makes this host's builder key, a PKCS#8 Ed25519 key at --key
+          (%USERPROFILE%\\.aterm\\windows-builder\\ed25519.pk8), when there is
+          none (one that is there is kept, never overwritten); init and show
+          print the builder id (--builder, else this computer's name) and the
+          public key, as the [[builder]] table to pin in
+          apps\\aterm-win\\release-builders.toml, admitted for 90 days. The
+          private key is never printed. Whoever can read the key file can
+          have a pump release ship a Windows zip of their own until its
+          not_after: keep it in the profile of a Windows account that runs
+          release-serve and nothing else (no agent, no branch build), and pin
+          a new key before the old one's not_after.
+release-serve
+          Serve the release pump's requests for a Windows zip through origin.
+          A poll fetches origin/main and refs/aterm-release/windows/request;
+          serves only when origin/main's apps\\aterm-win\\release-builders.toml
+          pins this builder with this key, unexpired; checks the request (its
+          one parent the release commit, whose one parent is on origin/main
+          and which changes only RELEASES.ledger, CHANGELOG.md and entry files
+          under changes/, pinning this builder, built fewer than twice);
+          pushes the heartbeat refs/aterm-release/windows/alive, which names
+          the request and, when it passes the request over, why; and when
+          origin has no handoff for it yet, checks the release commit out in
+          %LOCALAPPDATA%\\aterm\\release\\src (a worktree of the repository),
+          builds it with this tool's release-build (holding update's lock),
+          signs the receipt, and pushes the zip in parts with its receipt and
+          signature as refs/aterm-release/windows/handoff/<v>-<n>-<commit12>,
+          deleting the handoff refs of older requests. git never prompts for
+          a credential. --once polls once, else every 10 minutes; --log
+          appends to %LOCALAPPDATA%\\aterm\\release\\serve.log. Exit 0 the poll
+          did its part, 1 a request was refused or a build or push failed, 3
+          it could not run.
 
 The repository is --repo <dir>; else the one recorded in
 %LOCALAPPDATA%\\aterm\\build\\repo.txt (written when the build tree is made and
@@ -143,6 +191,22 @@ pub enum Verb {
     },
     /// `release-build`.
     ReleaseBuild(release::Options),
+    /// `release-key`.
+    ReleaseKey {
+        /// `init` makes the key when there is none; `show` only reads it.
+        init: bool,
+        /// The key file; [`attest::default_key`] when `None`.
+        key: Option<PathBuf>,
+        /// The builder id; this computer's name when `None`.
+        builder: Option<String>,
+    },
+    /// `release-serve`; `log` appends the polls to the serve log.
+    ReleaseServe {
+        /// What to serve with.
+        opts: serve::Options,
+        /// Append the polls to the serve log.
+        log: bool,
+    },
 }
 
 type Words<'a> = std::slice::Iter<'a, String>;
@@ -242,6 +306,7 @@ pub fn parse(args: &[String]) -> Result<Verb, String> {
         "release-build" => {
             let (mut version, mut build, mut commit, mut out, mut repo) =
                 (None, None, None, None, None);
+            let (mut sign_with, mut builder) = (None, None);
             while let Some(word) = words.next() {
                 match word.as_str() {
                     "--version" => version = Some(value(word, &mut words)?),
@@ -254,19 +319,73 @@ pub fn parse(args: &[String]) -> Result<Verb, String> {
                     "--commit" => commit = Some(value(word, &mut words)?),
                     "--out" => out = Some(PathBuf::from(value(word, &mut words)?)),
                     "--repo" => repo = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--sign-with" => sign_with = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--builder" => builder = Some(value(word, &mut words)?),
                     other => return Err(unknown(other)),
                 }
             }
             let need = |flag: &str| format!("{verb}: {flag} is required (aterm-winship help)");
+            let sign = match (sign_with, builder) {
+                (Some(key), builder) => Some(release::Sign { key, builder }),
+                (None, Some(_)) => {
+                    return Err(format!(
+                        "{verb}: --builder names who signs, and --sign-with names no key"
+                    ));
+                }
+                (None, None) => None,
+            };
             let opts = release::Options {
                 version: version.ok_or_else(|| need("--version"))?,
                 build: build.ok_or_else(|| need("--build-number"))?,
                 commit: commit.ok_or_else(|| need("--commit"))?,
                 out: out.ok_or_else(|| need("--out"))?,
                 repo,
+                sign,
             };
             opts.check()?;
             Ok(Verb::ReleaseBuild(opts))
+        }
+        "release-key" => {
+            let init = match words.next().map(String::as_str) {
+                Some("init") => true,
+                Some("show") => false,
+                _ => return Err(format!("{verb}: say init or show (aterm-winship help)")),
+            };
+            let (mut key, mut builder) = (None, None);
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--key" => key = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--builder" => builder = Some(value(word, &mut words)?),
+                    other => return Err(unknown(other)),
+                }
+            }
+            if let Some(id) = &builder {
+                attest::check_id(id).map_err(|e| format!("{verb}: {e}"))?;
+            }
+            Ok(Verb::ReleaseKey { init, key, builder })
+        }
+        "release-serve" => {
+            let mut opts = serve::Options {
+                once: false,
+                repo: None,
+                key: None,
+                builder: None,
+            };
+            let mut log = false;
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--once" => opts.once = true,
+                    "--repo" => opts.repo = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--key" => opts.key = Some(PathBuf::from(value(word, &mut words)?)),
+                    "--builder" => opts.builder = Some(value(word, &mut words)?),
+                    "--log" => log = true,
+                    other => return Err(unknown(other)),
+                }
+            }
+            if let Some(id) = &opts.builder {
+                attest::check_id(id).map_err(|e| format!("{verb}: {e}"))?;
+            }
+            Ok(Verb::ReleaseServe { opts, log })
         }
         other => Err(format!("unknown verb '{other}' (aterm-winship help)")),
     }
@@ -341,17 +460,49 @@ fn run_schtasks(args: &[String], env: &[(String, String)], out: &mut Out) -> i32
     }
 }
 
+/// The first code of `codes` that is not [`PASS`], else [`PASS`].
+fn first_failure(codes: &[i32]) -> i32 {
+    codes.iter().copied().find(|&c| c != PASS).unwrap_or(PASS)
+}
+
 fn unschedule(dry_run: bool, layout: &Layout, env: &[(String, String)], out: &mut Out) -> i32 {
-    let args = schedule::delete_args();
-    if dry_run {
-        out.say(&schedule::shown(&args));
-        return PASS;
+    let mut codes = Vec::new();
+    for task in schedule::Task::ALL {
+        let args = schedule::delete_args(task);
+        if dry_run {
+            out.say(&schedule::shown(&args));
+            continue;
+        }
+        // A task that is not registered (one scheduled before this tool had it) is no
+        // failure of its removal.
+        match proc::run(
+            &system32(env, "schtasks.exe"),
+            &schedule::query_args(task),
+            Place::default(),
+            smoke::HANG,
+        ) {
+            Ok(ran) if !ran.ok() => {
+                out.say(&format!("schedule: {} is not registered", task.name()));
+                let _ = std::fs::remove_file(layout.task_xml(task));
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                out.say(&format!("schedule: {e}"));
+                codes.push(NOT_RUN);
+                continue;
+            }
+        }
+        let code = run_schtasks(&args, env, out);
+        if code == PASS {
+            let _ = std::fs::remove_file(layout.task_xml(task));
+        }
+        codes.push(code);
     }
-    let code = run_schtasks(&args, env, out);
-    if code == PASS {
+    let code = first_failure(&codes);
+    if !dry_run && code == PASS {
         // The record of the repository stays: `update` by hand still reads it.
         let _ = std::fs::remove_file(layout.tool());
-        let _ = std::fs::remove_file(layout.task_xml());
     }
     code
 }
@@ -364,39 +515,58 @@ fn run_schedule(
     env: &[(String, String)],
     out: &mut Out,
 ) -> i32 {
-    // The task is given the repository by its absolute path, checked now: it
-    // starts in the system directory, long after this checkout may be gone.
+    // The tasks are given the repository by its absolute path, checked now: they
+    // start in the system directory, long after this checkout may be gone.
+    let now = local_now();
     let made = std::env::current_dir()
         .map_err(|e| format!("the working directory: {e}"))
         .and_then(|cwd| repo::resolve(repo, layout, &cwd))
         .and_then(|repo| {
-            let start = schedule::start_boundary(local_now(), at)?;
-            let xml = schedule::task_xml(
-                &system32(env, "conhost.exe"),
-                &layout.tool(),
-                &repo.dir,
-                &start,
-                caller(env).as_deref(),
-            )?;
-            Ok((repo, start, xml))
+            let mut tasks = Vec::new();
+            for task in schedule::Task::ALL {
+                let start = match task {
+                    schedule::Task::Update => schedule::start_boundary(now, at)?,
+                    schedule::Task::Serve => schedule::soon_boundary(now),
+                };
+                let xml = schedule::task_xml(
+                    task,
+                    &system32(env, "conhost.exe"),
+                    &layout.tool(),
+                    &repo.dir,
+                    &start,
+                    caller(env).as_deref(),
+                )?;
+                tasks.push((task, start, xml));
+            }
+            Ok((repo, tasks))
         });
-    let (repo, start, xml) = match made {
+    let (repo, tasks) = match made {
         Ok(made) => made,
         Err(e) => {
             out.say(&format!("schedule: not run: {e}"));
             return NOT_RUN;
         }
     };
-    let file = layout.task_xml();
-    let args = schedule::create_args(&file);
     if dry_run {
-        out.say(&schedule::shown(&args));
-        out.say(&format!("{}:", file.display()));
-        for line in xml.lines() {
-            out.say(line);
+        for (task, _, xml) in &tasks {
+            let file = layout.task_xml(*task);
+            out.say(&schedule::shown(&schedule::create_args(*task, &file)));
+            out.say(&format!("{}:", file.display()));
+            for line in xml.lines() {
+                out.say(line);
+            }
+        }
+        for (task, start, _) in &tasks {
+            out.say(&format!(
+                "schedule: dry run; {} would run `{} --repo {}` {}, first on {start}",
+                task.name(),
+                task.verb(),
+                repo.dir.display(),
+                task.when()
+            ));
         }
         out.say(&format!(
-            "schedule: dry run; would copy this tool to {}, record the repository {} ({}) and register the task, first start {start}: it {}; nothing changed",
+            "schedule: dry run; would copy this tool to {}, record the repository {} ({}) and register both tasks: each {}; nothing changed",
             layout.tool().display(),
             repo.dir.display(),
             repo.from.word(),
@@ -407,23 +577,85 @@ fn run_schedule(
     let written = keep_tool(layout)
         .and_then(|_| repo::record(layout, &repo.dir))
         .and_then(|()| {
-            aterm_uds::atomic_file::write(&file, &schedule::utf16(&xml), 0o644)
-                .map_err(|e| format!("{}: {e}", file.display()))
+            tasks.iter().try_for_each(|(task, _, xml)| {
+                let file = layout.task_xml(*task);
+                aterm_uds::atomic_file::write(&file, &schedule::utf16(xml), 0o644)
+                    .map_err(|e| format!("{}: {e}", file.display()))
+            })
         });
     if let Err(e) = written {
         out.say(&format!("schedule: not run: {e}"));
         return NOT_RUN;
     }
-    let code = run_schtasks(&args, env, out);
-    if code == PASS {
-        out.say(&format!(
-            "schedule: {} runs `update --log --repo {}` daily at {at}, first on {start}: it {}",
-            schedule::TASK,
-            repo.dir.display(),
-            schedule::CONDITIONS
-        ));
+    let mut codes = Vec::new();
+    for (task, start, _) in &tasks {
+        let code = run_schtasks(
+            &schedule::create_args(*task, &layout.task_xml(*task)),
+            env,
+            out,
+        );
+        if code == PASS {
+            out.say(&format!(
+                "schedule: {} runs `{} --repo {}` {}, first on {start}: it {}",
+                task.name(),
+                task.verb(),
+                repo.dir.display(),
+                task.when(),
+                schedule::CONDITIONS
+            ));
+        }
+        codes.push(code);
     }
-    code
+    first_failure(&codes)
+}
+
+/// What `release-key` says of the key at `path` for `builder`, `today_secs` being now: makes it
+/// first with `init` ([`attest::init_key`]). Its lines go to `say`; the exit code.
+fn release_key(
+    init: bool,
+    path: &Path,
+    builder: &str,
+    today_secs: u64,
+    say: &mut dyn FnMut(&str),
+) -> i32 {
+    if init {
+        match attest::init_key(path) {
+            Ok(true) => say(&format!("release-key: made {}", path.display())),
+            Ok(false) => say(&format!(
+                "release-key: {} holds a key already; it is kept",
+                path.display()
+            )),
+            Err(e) => {
+                say(&format!("release-key: {e}"));
+                return FAILED;
+            }
+        }
+    }
+    let public = match attest::read_key(path).and_then(|key| attest::public_key(&key)) {
+        Ok(public) => public,
+        Err(e) => {
+            say(&format!(
+                "release-key: not run: {e} (make one with `aterm-winship release-key init`)"
+            ));
+            return NOT_RUN;
+        }
+    };
+    say(&format!("builder:    {builder}"));
+    say(&format!("public key: {public}"));
+    say(&format!(
+        "pin it in {} (not_after is the last day its attestations are admitted: whoever can \
+         read the key file until then can attest a zip, so keep it in an account that runs \
+         release-serve alone, and pin a new key before then):",
+        pull::BUILDERS_FILE
+    ));
+    say("[[builder]]");
+    say(&format!("id = \"{builder}\""));
+    say(&format!("public_key = \"{public}\""));
+    say(&format!(
+        "not_after = \"{}\"",
+        pull::date_of(today_secs + attest::PIN_DAYS * 86_400)
+    ));
+    PASS
 }
 
 /// Runs the tool on `args` (those after the program name); the exit code.
@@ -461,6 +693,12 @@ pub fn run(args: &[String]) -> i32 {
     if let Verb::ReleaseBuild(opts) = &verb {
         return match release::release_build(opts, &env) {
             Ok(made) => {
+                if let Some(attestation) = &made.attestation {
+                    println!(
+                        "release-build: signed the receipt in {}",
+                        attestation.display()
+                    );
+                }
                 println!(
                     "release-build: wrote {} ({} bytes, sha256 {}) and {}, built in the {} lane; \
                      carry the folder to the Mac's --windows-artifacts directory, and give \
@@ -477,6 +715,32 @@ pub fn run(args: &[String]) -> i32 {
             Err((code, why)) => {
                 eprintln!("aterm-winship: {why}");
                 code
+            }
+        };
+    }
+    if let Verb::ReleaseKey { init, key, builder } = &verb {
+        let resolved = key
+            .clone()
+            .or_else(|| attest::default_key(&env))
+            .ok_or_else(|| {
+                "the environment has no USERPROFILE: name the key with --key <path>".to_string()
+            })
+            .and_then(|path| {
+                let builder = match builder {
+                    Some(builder) => builder.clone(),
+                    None => attest::default_builder(&env)?,
+                };
+                Ok((path, builder))
+            });
+        return match resolved {
+            Ok((path, builder)) => {
+                release_key(*init, &path, &builder, pull::now_secs(), &mut |line| {
+                    println!("{line}")
+                })
+            }
+            Err(e) => {
+                eprintln!("aterm-winship: not run: {e}");
+                NOT_RUN
             }
         };
     }
@@ -518,7 +782,22 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
         Verb::Status { repo } => update::status(repo.as_deref(), &layout, &mut Out::terminal()),
-        Verb::Help | Verb::Smoke(_) | Verb::ReleaseBuild(_) => PASS,
+        Verb::ReleaseServe { opts, log } => {
+            let mut out = if log {
+                serve::rotate(&layout.serve_log());
+                match Out::logged(&layout.serve_log()) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        eprintln!("aterm-winship: not run: {e}");
+                        return NOT_RUN;
+                    }
+                }
+            } else {
+                Out::terminal()
+            };
+            serve::serve(&opts, &layout, &env, &mut out)
+        }
+        Verb::Help | Verb::Smoke(_) | Verb::ReleaseBuild(_) | Verb::ReleaseKey { .. } => PASS,
     }
 }
 

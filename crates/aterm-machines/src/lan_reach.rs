@@ -110,7 +110,8 @@ enum Answer {
         direct: bool,
     },
     /// Not answered, in a way only a change the watch hears ends: no socket and no allowance, a
-    /// broker of another protocol, or one that refused this process's code or is not the broker
+    /// job the person switched off, a broker of another protocol, or one that refused this
+    /// process's code or is not the broker
     /// (a broker that starts makes its socket again). A broker that predates
     /// `Unavailable::Unchecked` also refuses while it could not check: it adopts the update that
     /// brings that, its socket made again.
@@ -128,10 +129,18 @@ impl Answer {
     fn of_failure(error: &aterm_uds::lan::LanError, socket_there: bool) -> Self {
         use aterm_uds::lan::{LanError, Unavailable};
         match error {
-            LanError::Unavailable(Unavailable::NotInstalled) if socket_there => Self::Transient,
+            LanError::Unavailable(Unavailable::NotInstalled | Unavailable::NotRunning)
+                if socket_there =>
+            {
+                Self::Transient
+            }
             LanError::Unavailable(Unavailable::Unchecked(_)) | LanError::Io(_) => Self::Transient,
             LanError::Unavailable(
-                Unavailable::NotInstalled | Unavailable::Outdated { .. } | Unavailable::Refused(_),
+                Unavailable::NotInstalled
+                | Unavailable::NotRunning
+                | Unavailable::SwitchedOff
+                | Unavailable::Outdated { .. }
+                | Unavailable::Refused(_),
             ) => Self::Settled,
         }
     }

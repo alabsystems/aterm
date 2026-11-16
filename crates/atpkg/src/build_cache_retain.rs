@@ -111,7 +111,7 @@ pub fn retain(home: &Path, root: &Path) -> Result<PathBuf, String> {
     let path = index.join(format!("{key}.json"));
     let gate = super::open_gate(&super::gate_path(&path).ok_or("cache gate is unavailable")?)
         .ok_or("cache gate is unavailable")?;
-    let _held = crate::lock::Flock::try_lock(gate).map_err(|_| "cache root is busy")?;
+    let _held = super::gate::try_exclusive(gate).map_err(|_| "cache root is busy")?;
     // Serialize marker CAS with a deep walk's provisional keep, on the actual directory
     // inode. No pathname lock or replaceable marker inode can stand in for this lock.
     let _publication = publication_lock(&pinned).ok_or("cache custody publication is busy")?;

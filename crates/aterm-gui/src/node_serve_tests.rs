@@ -198,7 +198,8 @@ impl WindowLauncher for MockWindowLauncher {
                                 let mut task = [0u8; 11];
                                 stream.read_exact(&mut task).expect("read 11 task bytes");
                                 assert_eq!(&task, b"hello world");
-                                let reply = format!("OK 1\nsid=s-woken driver={}\n", driver.node);
+                                let reply =
+                                    format!("OK 1\nsid=t0000000e01 driver={}\n", driver.node);
                                 let _ = stream.write_all(reply.as_bytes());
                                 let _ = stream.flush();
                             }
@@ -266,20 +267,21 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         RelayHeader::parse(&drive_no_key.encode()).expect("parse drive without key"),
         drive_no_key
     );
-    // A drive naming sessions carries them, so the window that hosts them takes it.
+    // A drive naming sessions carries them, a legacy tab's ID beside a tab ID, so the window that
+    // hosts them takes it.
     let naming = RelayHeader::Drive {
         driver,
         key: Some(aterm_net::fleet::NodeKey::from_bytes([0xcd; 32])),
         peer: Some(peer),
         sids: vec![
             SessionId::new("s-4c56f539e92639ba37ae"),
-            SessionId::new("s-b"),
+            SessionId::new("tqn5r6e0148"),
         ],
         requester: Requester::default(),
     };
     assert!(
         naming.encode().ends_with(&format!(
-            " sids=s-4c56f539e92639ba37ae,s-b{REQUESTER_NOBODY}\n"
+            " sids=s-4c56f539e92639ba37ae,tqn5r6e0148{REQUESTER_NOBODY}\n"
         )),
         "{}",
         naming.encode()
@@ -298,7 +300,7 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         peer: None,
         sids: Vec::new(),
         requester: Requester::of(
-            Some("s-0123456789abcdef0123"),
+            Some("tqn5r6e0148"),
             Some("claude"),
             Some("Opus 5.5"),
             Some("team acct %"),
@@ -356,10 +358,14 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
         nobody("DRIVE node=abcd host=x%00y peer=-\n"),
         nobody("DRIVE node=abcd host=x peer=- sids=\n"),
         nobody("DRIVE node=abcd host=x peer=- sids=-\n"),
-        nobody("DRIVE node=abcd host=x peer=- sids=s-a,,s-b\n"),
-        nobody("DRIVE node=abcd host=x peer=- sids=s-a,x-b\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=t000000000a,,t000000000b\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=t000000000a,x-b\n"),
         nobody("DRIVE node=abcd host=x peer=- sids=s-\n"),
-        nobody("DRIVE node=abcd host=x peer=- sids=s-a sids=s-b\n"),
+        // The loose `s-` forms an earlier build carried name no session.
+        nobody("DRIVE node=abcd host=x peer=- sids=t000000000a,s-b\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-4C56F539E92639BA37AE\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=s-4c56f539e92639ba37a\n"),
+        nobody("DRIVE node=abcd host=x peer=- sids=t000000000a sids=t000000000b\n"),
         "ASK peer=-\n".to_owned(),
         "ASK\n".to_owned(),
         "ASK peer=127.0.0.1:1 more=1\n".to_owned(),
@@ -369,6 +375,11 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
             "malformed relay header must be rejected: {bad:?}"
         );
     }
+    let two = nobody("DRIVE node=abcd host=x peer=- sids=t000000000a,t000000000b\n");
+    assert!(
+        RelayHeader::parse(&two).is_ok(),
+        "CONTROL: the same header naming two tabs parses"
+    );
     assert_eq!(super::parse_relay_filename("wf-42.sock"), Some(42));
     assert_eq!(super::parse_relay_filename("wf-042.sock"), None);
     assert_eq!(super::parse_relay_filename("wf-0.sock"), None);
@@ -424,6 +435,9 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         home: None,
         home_dir: None,
         home_free_mb: Some(900),
+        home_total_mb: None,
+        home_build: None,
+        store_worst: None,
         machine: None,
         repos: None,
         update: None,
@@ -546,7 +560,7 @@ fn the_node_jobs_own_survey_reads_ask_the_windows_for_no_look() {
                         let _ = s.write_all(
                             format!(
                                 "OK 2\ninstance pid={pid} at_ms=1793160000000 sessions=1 cut=0 \
-                                 instances=1 instances_read=1\nsession sid=s-1 pid=901 \
+                                 instances=1 instances_read=1\nsession sid=t0000000001 pid=901 \
                                  program=zsh\n"
                             )
                             .as_bytes(),
@@ -697,7 +711,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     assert_eq!(parsed_facts.label.as_deref(), Some("m7"));
     //    A survey a session asked for names it (`by=`) and answers as the plain one does; the
     //    plain `version` after it is answered once this job has handed the read's row over.
-    let asked_by = "s-00000000000000000abc";
+    let asked_by = "t0000000abc";
     dialed
         .transport
         .stream()
@@ -756,13 +770,13 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         "update retry\n",
         "update status apply\n",
         "update holds retry\n",
-        "@s-1 update status\n",
+        "@t0000000001 update status\n",
     ] {
         let reply = drive_line(line);
         assert!(reply.starts_with("ERR "), "{line:?}: {reply}");
         assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
     }
-    let asker = "s-0123456789abcdef0123";
+    let asker = "tqn5r6e0148";
     let session = Requester::of(Some(asker), Some("claude"), None, None);
     launcher.logged_in.store(true, Ordering::Release);
     for (line, needs) in [
@@ -770,8 +784,11 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         ("spawn\n", FleetAccess::Full),
         ("spawn cwd=/nowhere\n", FleetAccess::Full),
         ("spawn \"open\n", FleetAccess::Full),
-        ("@s-1 turn hello\n", FleetAccess::ReadWrite),
-        ("@s-1 post kind=note -- hi\n", FleetAccess::ReadWrite),
+        ("@t0000000001 turn hello\n", FleetAccess::ReadWrite),
+        (
+            "@t0000000001 post kind=note -- hi\n",
+            FleetAccess::ReadWrite,
+        ),
     ] {
         let reply = drive_line(line);
         assert_eq!(
@@ -789,7 +806,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         "board\n",
         "vault status\n",
         "service-repair status\n",
-        "@s-1 status\n",
+        "@t0000000001 status\n",
     ] {
         let reply = drive_line(line);
         assert!(
@@ -799,7 +816,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     }
     //     A session of the driving Mac asks: its refused turn names it, and the board it reads
     //     is a read of its own (the board keeper's, which names no session, is a poll).
-    let reply = drive_as(&session, "@s-1 turn hello\n");
+    let reply = drive_as(&session, "@t0000000001 turn hello\n");
     assert_eq!(
         FleetAccess::refused_at(&reply),
         Some((FleetAccess::ReadOnly, FleetAccess::ReadWrite))
@@ -889,7 +906,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     drive_non_spawn
         .transport
         .stream()
-        .write_all(drive_bytes("@s-1 turn hello\n").as_bytes())
+        .write_all(drive_bytes("@t0000000001 turn hello\n").as_bytes())
         .unwrap();
     drive_non_spawn.transport.stream().flush().unwrap();
     let non_spawn_reply = read_line_raw(drive_non_spawn.transport.stream(), 4096)
@@ -954,7 +971,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     drop(drive_logged_out);
 
     // 4. Positive (§7.4, C20): logged-in windowless Mac wakes a window on `spawn`, streams
-    //    `GO 11\n` + task payload + `OK 1\nsid=s-woken...`, and subsequent `survey` routes to
+    //    `GO 11\n` + task payload + `OK 1\nsid=t0000000e01...`, and subsequent `survey` routes to
     //    that live window (`window=1`).
     launcher.logged_in.store(true, Ordering::Release);
     let tcp = TcpStream::connect(addr).expect("connect drive spawn");
@@ -985,7 +1002,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         .expect("read spawned body")
         .expect("spawned body");
     assert!(
-        spawned_body.contains("sid=s-woken") && spawned_body.contains(driver_id.node()),
+        spawned_body.contains("sid=t0000000e01") && spawned_body.contains(driver_id.node()),
         "{spawned_body}"
     );
     assert_eq!(launcher.launches.load(Ordering::Acquire), 1);
@@ -1547,6 +1564,9 @@ fn custody_move_rejects_an_old_secrets_open_facts_push() {
             home: None,
             home_dir: None,
             home_free_mb: None,
+            home_total_mb: None,
+            home_build: None,
+            store_worst: None,
             machine: None,
             repos: None,
             update: None,
@@ -2484,7 +2504,7 @@ fn a_running_window_that_takes_no_hand_over_is_answered_busy() {
     driver_at.dialed();
     for (op, line) in [
         (FleetOp::Survey, "survey\n"),
-        (FleetOp::Drive, "@s-1 turn hello\n"),
+        (FleetOp::Drive, "@t0000000001 turn hello\n"),
         (FleetOp::Drive, "spawn agent=claude len=11\n"),
     ] {
         let tcp = TcpStream::connect(addr).expect("connect");

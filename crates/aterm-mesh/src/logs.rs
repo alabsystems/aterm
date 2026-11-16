@@ -1506,6 +1506,14 @@ impl Mesh {
         }
     }
 
+    /// Forget every seat's advance on presence's board, where presence runs on this mesh
+    /// ([`crate::presence::Board::forget_advances`]).
+    pub(crate) fn forget_advances(&self) {
+        if let Some(presence) = self.presence.lock_or_recover().upgrade() {
+            presence.forget_advances();
+        }
+    }
+
     /// Report `event` to the observer.
     pub(crate) fn report(&self, event: &Event) {
         if let Event::Settled { log, .. } = event

@@ -28,6 +28,22 @@ fn recipient() -> String {
 /// the same value, states none, as does a value that is not a bound's or no header at all.
 ///
 /// CONTROL (in the test): the same value sent once is the bound it states.
+/// A records reply's [`RECORDS_HEADS_HEADER`] states a digest only as exactly 64 lowercase hex
+/// digits; uppercase, one digit short or over, a digit that is no hex, and no header state none.
+///
+/// NEGATIVE CONTROL (2026-11-15): with `records_heads` taking any case (`is_lower` read as any
+/// hex), the uppercase value states a digest (`left: Some([171, ..])`, `right: None`).
+#[test]
+fn a_records_heads_header_states_a_digest_only_as_64_lowercase_hex_digits() {
+    assert_eq!(records_heads(Some(&"ab".repeat(32))), Some([0xab; 32]));
+    assert_eq!(records_heads(Some(&"AB".repeat(32))), None, "uppercase");
+    assert_eq!(records_heads(Some(&"a".repeat(63))), None, "63 digits");
+    assert_eq!(records_heads(Some(&"a".repeat(65))), None, "65 digits");
+    let not_hex = format!("{}g", "a".repeat(63));
+    assert_eq!(records_heads(Some(&not_hex)), None, "not hex");
+    assert_eq!(records_heads(None), None, "no header");
+}
+
 #[test]
 fn a_reply_states_a_records_bound_only_in_one_header_that_parses() {
     let bound = crate::crossing::RecordsBound::of(4_096, true);

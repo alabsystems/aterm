@@ -52,9 +52,10 @@ pub(crate) enum Cause {
     /// A tab a drag deferred, sized as it is drawn (`redraw_window`).
     Redraw,
     /// The Deck's head moved: a config reload changed its size setting, or the stats bars into or
-    /// out of it (`App::apply_prepared_config_generation_unfenced`), or a restored frame the Deck
-    /// sized in the form it no longer takes re-gridded its tabs at attach
-    /// (`App::regrid_to_attach_frame`).
+    /// out of it, in a window that carries the System Resources band
+    /// (`App::apply_prepared_config_generation_unfenced`), a person gave one window that band or
+    /// took it away (`App::toggle_window_band`), or a restored frame the Deck sized in the form
+    /// it no longer takes re-gridded its tabs at attach (`App::regrid_to_attach_frame`).
     Deck,
     /// A session restore placed every tab, and each pane took its window's grid
     /// (`App::regrid_restored_windows`): a handed-off shell keeps the grid its engine was parked at.

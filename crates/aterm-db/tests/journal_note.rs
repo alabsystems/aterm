@@ -82,6 +82,9 @@ fn widest(t: u64) -> Event {
         to: None,
         tab: None,
         harness: None,
+        op: None,
+        via: None,
+        program: None,
     }
 }
 

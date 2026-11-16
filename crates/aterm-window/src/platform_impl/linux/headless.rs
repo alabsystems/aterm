@@ -101,6 +101,8 @@ pub struct EventLoop<T: 'static> {
     queue: Arc<Mutex<VecDeque<T>>>,
     waker: Waker,
     loop_running: bool,
+    /// The failure of the platform's own backend this loop stands in for ([`Self::fell_back`]).
+    fell_back_from: Option<String>,
     _marker: PhantomData<T>,
 }
 
@@ -119,8 +121,21 @@ impl<T: 'static> EventLoop<T> {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             waker,
             loop_running: false,
+            fell_back_from: None,
             _marker: PhantomData,
         })
+    }
+
+    /// This loop, standing in for the platform's own backend, which failed with `why`.
+    pub(crate) fn fell_back(mut self, why: String) -> Self {
+        self.fell_back_from = Some(why);
+        self
+    }
+
+    /// Why this loop stands in for the platform's own backend ([`Self::fell_back`]); `None` for
+    /// one asked for as headless.
+    pub(crate) fn fell_back_from(&self) -> Option<&str> {
+        self.fell_back_from.as_deref()
     }
 
     fn state(&self) -> &ActiveEventLoop {

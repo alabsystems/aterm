@@ -27,7 +27,7 @@ use crate::{
     Error, Result,
     database::Change,
     typed::{
-        LIFECYCLE,
+        Collection, LIFECYCLE,
         cell::{self, CellKey, CellValue, Cells, Projection, Row},
         guard, keys,
         owned::OwnedRead,
@@ -385,7 +385,11 @@ fn automatic(
 
 /// Only the enrollment adopting this row publishes its node. An owner's value or conflict
 /// stays authoritative; a later pass never overwrites it or spends another record on it.
-fn own_node(input: &Input<'_>, machines: &Projection, mac: &str) -> Result<Vec<Change>> {
+fn own_node(
+    input: &Input<'_>,
+    (machine, machines): (&Collection, &Projection),
+    mac: &str,
+) -> Result<Vec<Change>> {
     let Some(node) = input.probe.node.as_deref().filter(|node| {
         node.len() == 16
             && node
@@ -404,14 +408,14 @@ fn own_node(input: &Input<'_>, machines: &Projection, mac: &str) -> Result<Vec<C
     {
         return Ok(Vec::new());
     }
-    Ok(vec![automatic(&MACHINE, mac, "node", Value::from(node))?])
+    Ok(vec![automatic(machine, mac, "node", Value::from(node))?])
 }
 
 /// Follow a signed choice, or replace an automatic label that lost its claim. A nodeless
 /// sheet row may share a signed choice until `merge` folds it in.
 fn number_change(
     input: &Input<'_>,
-    machines: &Projection,
+    (machine, machines): (&Collection, &Projection),
     facts: &OwnedRead,
     mac: &str,
 ) -> Result<Vec<Change>> {
@@ -424,7 +428,7 @@ fn number_change(
             })
         }) {
             return Ok(vec![automatic(
-                &MACHINE,
+                machine,
                 mac,
                 "label",
                 Value::from(birth_label(input, machines)?),
@@ -477,7 +481,7 @@ fn number_change(
     {
         return Ok(Vec::new());
     }
-    Ok(vec![automatic(&MACHINE, mac, "label", Value::from(label))?])
+    Ok(vec![automatic(machine, mac, "label", Value::from(label))?])
 }
 
 /// The first Mac to report an unseen model writes its key and what it knows; the owner fills in
@@ -499,10 +503,11 @@ fn model_birth(cells: &Cells, probe: &Probe) -> Result<Vec<Change>> {
 /// Rule 4's row: keyed by this uuid, naming what this Mac reads of itself, except a fleet node or a
 /// host name a live row already names. A disk clone keeps its original's fleet files and names, and
 /// a second row naming them would hold the original at `node-ambiguous` for good; this Mac's facts
-/// row still states what it read.
+/// row still states what it read. `machine` is the `machine` collection as the generation written
+/// declares it, so its hosts go in the form that generation holds them ([`cell::texts_change`]).
 fn machine_birth(
     input: &Input<'_>,
-    machines: &Projection,
+    (machine, machines): (&Collection, &Projection),
     pk: &str,
     label: &str,
 ) -> Result<Vec<Change>> {
@@ -512,44 +517,39 @@ fn machine_birth(
         |node: &str| live_rows().any(|row| row.get("node").and_then(Value::as_str) == Some(node));
     let host_named = |host: &str| {
         live_rows().any(|row| {
-            row.get("hosts")
-                .and_then(Value::as_array)
-                .is_some_and(|hosts| {
-                    hosts
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|held| same_host(held, host))
-                })
+            cell::texts(row.fields.get("hosts"))
+                .iter()
+                .any(|held| same_host(held, host))
         })
     };
     let mut changes = vec![
-        automatic(&MACHINE, pk, "label", Value::from(label))?,
-        automatic(&MACHINE, pk, "status", Value::from("active"))?,
+        automatic(machine, pk, "label", Value::from(label))?,
+        automatic(machine, pk, "status", Value::from("active"))?,
         automatic(
-            &MACHINE,
+            machine,
             pk,
             "model",
             Value::from(model_key(&probe.hw_model)?),
         )?,
-        automatic(&MACHINE, pk, LIFECYCLE, Value::from("live"))?,
+        automatic(machine, pk, LIFECYCLE, Value::from("live"))?,
     ];
     if let Some(node) = probe
         .node
         .as_deref()
         .filter(|node| aterm_codec::hex::is_lower(node, 16) && !node_named(node))
     {
-        changes.push(automatic(&MACHINE, pk, "node", Value::from(node))?);
+        changes.push(automatic(machine, pk, "node", Value::from(node))?);
     }
     let mut hosts = hosts_cell(&probe.hosts);
     hosts.retain(|host| !host_named(host));
-    if !hosts.is_empty() {
-        changes.push(automatic(
-            &MACHINE,
-            pk,
-            "hosts",
-            Value::Array(hosts.iter().map(|h| Value::from(h.as_str())).collect()),
-        )?);
-    }
+    changes.extend(cell::texts_change(
+        machine,
+        pk,
+        "hosts",
+        &[],
+        &hosts,
+        |x| CellValue::automatic(machine.version, x),
+    )?);
     Ok(changes)
 }
 
@@ -1095,7 +1095,7 @@ fn automatic_only(row: &Row) -> bool {
 fn close(
     input: &Input<'_>,
     cells: &Cells,
-    machines: &Projection,
+    (collection, machines): (&Collection, &Projection),
     facts: &OwnedRead,
     row: &BTreeMap<&'static str, Value>,
     into: &str,
@@ -1187,9 +1187,19 @@ fn close(
         }
         let mut changes = Vec::new();
         if machine.get("merged_into").and_then(Value::as_str) != Some(into) {
-            changes.push(automatic(&MACHINE, &mac, "merged_into", Value::from(into))?);
+            changes.push(automatic(
+                collection,
+                &mac,
+                "merged_into",
+                Value::from(into),
+            )?);
         }
-        changes.push(automatic(&MACHINE, &mac, LIFECYCLE, Value::from("merged"))?);
+        changes.push(automatic(
+            collection,
+            &mac,
+            LIFECYCLE,
+            Value::from("merged"),
+        )?);
         return Ok(Some(Closing {
             mac,
             into: into.to_owned(),
@@ -1283,15 +1293,9 @@ fn pick(
         .filter(|(pk, row)| {
             !bound.contains(pk.as_str())
                 && no_other_node(row)
-                && row
-                    .get("hosts")
-                    .and_then(Value::as_array)
-                    .is_some_and(|hosts| {
-                        hosts
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .any(|host| probe.hosts.iter().any(|mine| same_host(mine, host)))
-                    })
+                && cell::texts(row.fields.get("hosts"))
+                    .iter()
+                    .any(|host| probe.hosts.iter().any(|mine| same_host(mine, host)))
         })
         .map(|(pk, _)| pk)
         .collect();
@@ -1344,7 +1348,13 @@ pub fn plan(input: &Input<'_>, view: &crate::typed::View) -> Result<Plan> {
     let empty = OwnedRead::default();
     let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
     let saw = birth_saw(view, facts);
-    plan_projected(input, &view.cells, facts, &view.project(&MACHINE), &saw)
+    plan_projected(
+        input,
+        &view.cells,
+        facts,
+        (view.collection(&MACHINE), &view.project(&MACHINE)),
+        &saw,
+    )
 }
 
 /// [`plan`] over projected rows; `saw` is [`birth_saw`].
@@ -1352,7 +1362,7 @@ fn plan_projected(
     input: &Input<'_>,
     cells: &Cells,
     facts: &OwnedRead,
-    machines: &Projection,
+    (machine, machines): (&Collection, &Projection),
     saw: &dyn Fn(&str, &str) -> bool,
 ) -> Result<Plan> {
     let (me, mut findings) = resolved(input.me, facts);
@@ -1395,8 +1405,8 @@ fn plan_projected(
             ));
         }
         let seen = own.value.get("seen").and_then(Value::as_u64).unwrap_or(0);
-        let mut node = own_node(input, machines, bound)?;
-        let renamed = number_change(input, machines, facts, bound)?;
+        let mut node = own_node(input, (machine, machines), bound)?;
+        let renamed = number_change(input, (machine, machines), facts, bound)?;
         let moves = !renamed.is_empty();
         let moved_label = renamed
             .iter()
@@ -1435,8 +1445,15 @@ fn plan_projected(
         // A birth of this Mac's chain that its facts fold into `bound` is closed into it, in the
         // record that states the fold or alone in a later one.
         let mut held = Vec::new();
-        let (outcome, closes) = match close(input, cells, machines, facts, &row, bound, &mut held)?
-        {
+        let (outcome, closes) = match close(
+            input,
+            cells,
+            (machine, machines),
+            facts,
+            &row,
+            bound,
+            &mut held,
+        )? {
             Some(Closing { mac, into, changes }) => (Outcome::Closed { mac, into }, changes),
             None => (
                 Outcome::Refreshed {
@@ -1543,7 +1560,7 @@ fn plan_projected(
                     },
                     own_pk.clone(),
                     None,
-                    machine_birth(input, machines, &own_pk, &label)?,
+                    machine_birth(input, (machine, machines), &own_pk, &label)?,
                 )
             }
         },
@@ -1574,15 +1591,15 @@ fn plan_projected(
     let row = stated(input, None, &mac, predecessor.as_deref(), Some(label))?;
     let mut changes = model_birth(cells, input.probe)?;
     if births.is_empty() {
-        changes.extend(own_node(input, machines, &mac)?);
-        changes.extend(number_change(input, machines, facts, &mac)?);
+        changes.extend(own_node(input, (machine, machines), &mac)?);
+        changes.extend(number_change(input, (machine, machines), facts, &mac)?);
         if input.me.chosen.is_none()
             && machines
                 .rows
                 .get(&mac)
                 .is_some_and(|row| !row.fields.contains_key("label"))
         {
-            changes.push(automatic(&MACHINE, &mac, "label", Value::from(label))?);
+            changes.push(automatic(machine, &mac, "label", Value::from(label))?);
         }
     }
     changes.extend(births);

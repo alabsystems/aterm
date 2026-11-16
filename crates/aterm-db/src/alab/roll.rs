@@ -33,18 +33,22 @@
 //!    old table's scope, so its signer and operation digest are its own: a reader authenticates
 //!    it and applies the owned rule exactly as before (`att::archived_ops`). A Mac's own row in
 //!    the new generation outranks its archived one.
-//! 3. **Cover.** One `roll` row per (generation, Mac) says which records of each writer this
+//! 3. **History.** Each entry of the old generation's history this Mac holds and the new one
+//!    does not carry yet goes in as a `history` row, a secret's value withheld, newest first
+//!    within a bound (`alab::history`): without it every cell's history would begin at the
+//!    roll once step 5 deletes the old storage.
+//! 4. **Cover.** One `roll` row per (generation, Mac) says which records of each writer this
 //!    restatement carried: for each writer, its last record before the first one this build
 //!    cannot read. A record that only projects nothing (a merge, a past-quota record, a cut-off
 //!    writer's) counts as carried.
 //!    A cover counts only as the Mac its key names wrote it (`covers`).
-//! 4. **Seal** the old generation (`catalog::Directory::seal`): readers move to the new one. The
+//! 5. **Seal** the old generation (`catalog::Directory::seal`): readers move to the new one. The
 //!    seal waits until every current Writer has declared the new generation in its own name
 //!    (`endorse`, `catalog::Directory::undeclared`), which only a build that compiles it does,
 //!    since an older build cannot read the registry once the old generation is sealed; the
 //!    roll reports the Macs it waits for, and running it again once they have seals.
-//! 5. **Release** this Mac's storage of the old generation where the covers carry everything
-//!    it holds there (`catalog::release`).
+//! 6. **Release** this Mac's storage of the old generation where the covers carry everything
+//!    it holds there and the history rows every entry of it (`catalog::release`).
 //!
 //! Every restated register change has a request id derived from its content and the target's
 //! observed eligible business history. An unchanged re-run writes nothing; an exact retry
@@ -59,7 +63,8 @@
 //! stays.
 
 use super::{
-    registry::{APPLICATION, ARCHIVED, ROLL},
+    history,
+    registry::{APPLICATION, ARCHIVED, HISTORY, ROLL},
     store::Registry,
 };
 use crate::{
@@ -86,8 +91,9 @@ use aterm_secrets::commons::bootstrap::Bootstrap;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The collections a roll does not restate as registers: the schema rows (the new generation
-/// takes the compiled ones) and the old generation's own cover rows.
-const NOT_RESTATED: [&str; 2] = [typed::SCHEMA, ROLL.name];
+/// takes the compiled ones), the old generation's own cover rows, and its history rows, which a
+/// roll writes again as history (`alab::history`).
+const NOT_RESTATED: [&str; 3] = [typed::SCHEMA, ROLL.name, HISTORY.name];
 
 /// The origins carried at each collection and key, including ones a later edit replaced.
 pub(crate) type Carried = BTreeMap<(String, String), BTreeSet<Digest>>;
@@ -148,7 +154,7 @@ pub(crate) type Secrets<'a> = (&'a dyn Sealer, Option<Reseal<'a>>, &'a dyn secre
 /// [`restate_with_claims`] with no claim provenance to carry.
 #[cfg(test)]
 pub(crate) fn restate(
-    table: &typed::Table,
+    (from, table): (&typed::Table, &typed::Table),
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
@@ -156,7 +162,7 @@ pub(crate) fn restate(
     secrets: Secrets<'_>,
 ) -> Result<Restated> {
     restate_with_claims(
-        table,
+        (from, table),
         source,
         held,
         target,
@@ -168,7 +174,9 @@ pub(crate) fn restate(
 
 /// The registers to write into the new generation (`target`, whose rolls already carried
 /// `carried`) from the old one's `source` cells, `held` being every operation this Mac holds of
-/// the old one, and `table` the compiled declaration both generations share. A register carries
+/// the old one, `from` the old generation's declaration and `table` the new one's. A list
+/// column the new generation holds as a text set is restated as its members ([`as_members`]),
+/// each element a register of its own; every other register keeps its key. A register carries
 /// candidates not carried before, retains ones the new generation still holds, and drops ones
 /// this Mac's old history shows superseded. A previously carried candidate absent from the new
 /// generation stays absent: a later edit replaced it. An unchanged result writes nothing; an
@@ -190,7 +198,7 @@ pub(crate) fn restate(
 /// sealed token does not open, sits in a column that is neither `SecretRef` nor `Phone`, or opens
 /// to a value its column cannot hold. Each names coordinates, never a value.
 fn restate_with_claims(
-    table: &typed::Table,
+    (from, table): (&typed::Table, &typed::Table),
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
@@ -201,6 +209,7 @@ fn restate_with_claims(
     let target_claims = typed::claim::carried_claims(target)?;
     let reseal = secrets.1;
     let mut out = Restated::default();
+    let mut registers: Vec<Register> = Vec::new();
     for (coord @ (collection, key), cell) in source {
         if NOT_RESTATED.contains(&collection.as_str())
             || cell.stopped
@@ -210,6 +219,26 @@ fn restate_with_claims(
         {
             continue;
         }
+        let candidates = cell::origins_refs(cell);
+        match list_to_set((from, table), collection, key) {
+            Some(form) => registers.extend(as_members(
+                form,
+                coord,
+                &candidates,
+                (target, held, carried),
+            )?),
+            None => registers.push((
+                coord.clone(),
+                candidates
+                    .into_iter()
+                    .map(|(origin, value)| (origin, value.clone()))
+                    .collect(),
+            )),
+        }
+    }
+    for (coord, candidates) in registers {
+        let (collection, key) = &coord;
+        let coord = &coord;
         let now: BTreeMap<Digest, &Value> = target
             .get(coord)
             .map(cell::origins_refs)
@@ -217,13 +246,12 @@ fn restate_with_claims(
             .into_iter()
             .collect();
         let carried_here = carried.get(coord);
-        let mut old: BTreeMap<Digest, Value> = cell::origins_refs(cell)
+        let mut old: BTreeMap<Digest, Value> = candidates
             .into_iter()
             .filter(|(origin, _)| {
                 carried_here.is_none_or(|origins| !origins.contains(origin))
                     || now.contains_key(origin)
             })
-            .map(|(origin, value)| (origin, value.clone()))
             .collect();
         // Each moved value's entry is named by its origin ([`secret::moved_entry`]), so every Mac
         // that rolls this register names the same entries; equal values share the first one, in
@@ -335,6 +363,135 @@ fn restate_with_claims(
             key: key.clone(),
             value,
         }]);
+    }
+    Ok(out)
+}
+
+/// One register a roll restates: its coordinates, and the old generation's candidates of it,
+/// each by the operation that wrote it.
+type Register = ((String, String), Vec<(Digest, Value)>);
+
+/// How the list cell `key` of `collection` changes form from the generation `from` to `to`
+/// (LT-15B): where `from` holds its column as a list of at most `.2` texts and `to` as a text
+/// set whose members are of type `.1`, the cell's key, the member type and that bound; else
+/// `None`.
+fn list_to_set<'k>(
+    (from, to): (&typed::Table, &typed::Table),
+    collection: &str,
+    key: &'k str,
+) -> Option<(CellKey<'k>, &'static typed::Ty, usize)> {
+    let parsed = CellKey::parse(key)
+        .ok()
+        .filter(|parsed| parsed.elem.is_none())?;
+    let typed::Ty::List(_, longest) = from.collection(collection)?.column(parsed.col)?.ty else {
+        return None;
+    };
+    let member = to
+        .collection(collection)?
+        .column(parsed.col)?
+        .ty
+        .text_set()?;
+    Some((parsed, member, longest))
+}
+
+/// The element registers that restate a list register (`coord`, its old `candidates`) in a
+/// generation that holds its column as a text set (`form`, from [`list_to_set`]): one register
+/// for each member any candidate lists, and for each element `target` holds there that an
+/// operation this Mac holds of the old generation (`held`), or one a roll carried, wrote. At each
+/// element every list candidate is one candidate, its origin, schema version, source and
+/// automatic mark kept: the member's text where the list holds it, `false` where it does not, a
+/// revert's bare `null` as it is. A member every candidate lists so reads as one value; any
+/// other is a conflict of an add and a removal, as concurrent lists were, so no union settles a
+/// concurrent removal. Members compare in their normal form ([`keys::normal_text`]); an item that
+/// is only space lists nothing.
+///
+/// # Errors
+/// A candidate is no typed list the old generation reads (not a list, longer than its column
+/// allows, an item no text, or one no set member can be); the error names the coordinates,
+/// never a value.
+fn as_members(
+    (parsed, member, longest): (CellKey<'_>, &typed::Ty, usize),
+    (collection, key): &(String, String),
+    candidates: &[(Digest, &Value)],
+    (target, held, carried): (&Cells, &BTreeSet<Digest>, &Carried),
+) -> Result<Vec<Register>> {
+    let refused = || {
+        Error::new(&format!(
+            "{collection} {key}: a list the old generation reads raw cannot become set members; \
+             resolve it first"
+        ))
+    };
+    // Each candidate's list, by origin: its typed value's fields and the members it holds, by
+    // element key; `None` for a revert's bare `null`.
+    let mut lists: Vec<(Digest, Option<(CellValue, BTreeMap<String, String>)>)> = Vec::new();
+    let mut universe: BTreeSet<String> = BTreeSet::new();
+    for (origin, value) in candidates {
+        if value.is_null() {
+            lists.push((*origin, None));
+            continue;
+        }
+        let typed = CellValue::decode(value).map_err(|_| refused())?;
+        let items: &[Value] = match &typed.x {
+            Value::Null => &[],
+            Value::Array(items) if items.len() <= longest => items,
+            _ => return Err(refused()),
+        };
+        let mut members = BTreeMap::new();
+        for item in items {
+            let raw = item.as_str().ok_or_else(refused)?;
+            if keys::normal_text(raw).is_empty() {
+                continue;
+            }
+            let text = cell::text_member(member, raw).map_err(|_| refused())?;
+            members.insert(keys::text_elem(&text), text);
+        }
+        universe.extend(members.keys().cloned());
+        lists.push((*origin, Some((typed, members))));
+    }
+    // An element the new generation holds from this generation's history, which no candidate
+    // lists any more (a later list dropped it), is restated too, so the drop reaches it.
+    for ((there, element), cell) in target {
+        let Ok(at) = CellKey::parse(element) else {
+            continue;
+        };
+        if there == collection
+            && at.pk == parsed.pk
+            && at.col == parsed.col
+            && let Some(elem) = at.elem
+            && cell::origins_refs(cell).iter().any(|(origin, _)| {
+                held.contains(origin)
+                    || carried
+                        .get(&(there.clone(), element.clone()))
+                        .is_some_and(|origins| origins.contains(origin))
+            })
+        {
+            universe.insert(elem.to_owned());
+        }
+    }
+    let mut out = Vec::new();
+    for elem in universe {
+        let element = CellKey {
+            pk: parsed.pk,
+            col: parsed.col,
+            elem: Some(&elem),
+        }
+        .encode()?;
+        let candidates = lists
+            .iter()
+            .map(|(origin, list)| {
+                let value = list.as_ref().map_or(Value::Null, |(typed, members)| {
+                    CellValue {
+                        x: members
+                            .get(&elem)
+                            .map_or(Value::Bool(false), |text| Value::String(text.clone())),
+                        ..typed.clone()
+                    }
+                    .encode()
+                });
+                (*origin, value)
+            })
+            .collect();
+        out.push(((collection.clone(), element), candidates));
     }
     Ok(out)
 }
@@ -613,6 +770,51 @@ pub(crate) fn covers(
     out
 }
 
+/// Each writer of `view` that wrote its own cover row, for any generation: the Macs whose word a
+/// carried history stands on (`alab::history::carried`), as a release stands on their covers.
+/// A cover counts only as the Mac its key names wrote it, as in [`covers`].
+pub(crate) fn rollers(
+    view: &View,
+    resolve: impl Fn(&Digest, &Actor) -> Option<[u8; 16]>,
+) -> BTreeSet<Actor> {
+    let mut out = BTreeSet::new();
+    for op in view
+        .ops
+        .iter()
+        .filter(|op| !op.revert && !view.quota.over.contains(&op.id))
+    {
+        if out.contains(&op.actor) {
+            continue;
+        }
+        let Some(machine) = resolve(&op.roster, &op.actor) else {
+            continue;
+        };
+        let uuid = keys::uuid32(&machine);
+        let own = op
+            .changes
+            .iter()
+            .filter(|change| change.collection == ROLL.name)
+            .any(|change| {
+                let Ok(key) = CellKey::parse(&change.key) else {
+                    return false;
+                };
+                key.col == "from"
+                    && key.elem.is_none()
+                    && change
+                        .value
+                        .as_ref()
+                        .and_then(|value| CellValue::decode(value).ok())
+                        .and_then(|value| value.x.as_u64())
+                        .and_then(|from| u32::try_from(from).ok())
+                        .is_some_and(|from| key.pk == keys::roll_pk(from, &uuid))
+            });
+        if own {
+            out.insert(op.actor);
+        }
+    }
+    out
+}
+
 /// Whether every record `held` names is within `covered`.
 pub(crate) fn within(held: &BTreeMap<String, u64>, covered: &BTreeMap<String, u64>) -> bool {
     held.iter()
@@ -712,6 +914,9 @@ pub struct Rolled {
     pub registers: usize,
     pub archived: usize,
     pub cover: bool,
+    /// History entries carried (`alab::history`), and those left behind its bound.
+    pub history: usize,
+    pub history_left: usize,
     /// Records appended (none for a plan).
     pub records: usize,
     /// Whether this roll sealed the old generation (an earlier one, or another Mac, may have).
@@ -728,7 +933,9 @@ pub struct Rolled {
 
 /// The storage release's `covered` answer for a restated registry generation: whether the next
 /// generation's cover rows carry every record this Mac holds of `retired`, in its primary and
-/// its recovery storage alike, since the release deletes both. Holding none, it is carried;
+/// its recovery storage alike, since the release deletes both, and its history rows every entry
+/// of that history (`alab::history::uncarried`), so a roll by a build that carried none keeps
+/// the storage until a roll here carries it; a history this Mac cannot read answers not carried. Holding none, it is carried;
 /// holding some with no next generation here, it is not. A region whose storage directory is
 /// there but cannot be observed (an unfinished enrollment) answers not carried: what it holds
 /// is unknown, so it is never released unread.
@@ -753,15 +960,22 @@ pub(crate) fn covered(
     };
     let scope = retired.descriptor.scope;
     let mut held: BTreeMap<String, u64> = BTreeMap::new();
+    let mut owed = Vec::new();
     for region in [directory.primary(), directory.recovery()] {
         match region.observe_store_if_exists(session, scope)? {
             Some(old) => {
-                for (actor, last) in
-                    holdings(&held_of(&Log::read_with(session, &old, scope, decode)?))
-                {
+                let log = Log::read_with(session, &old, scope, decode)?;
+                for (actor, last) in holdings(&held_of(&log)) {
                     let entry = held.entry(actor).or_default();
                     *entry = (*entry).max(last);
                 }
+                let view = View::read(from.table, session, &log);
+                let Ok((entries, _)) =
+                    history::owed(session, from.table, from.generation, log, &view)
+                else {
+                    return Ok(false);
+                };
+                owed.extend(entries);
             }
             None if region.path(scope)?.try_exists()? => return Ok(false),
             None => {}
@@ -779,10 +993,9 @@ pub(crate) fn covered(
         session,
         &Log::read_with(session, &new, next, decode)?,
     );
-    Ok(within(
-        &held,
-        &covers(&view, owned::commons::historical(session), from.generation),
-    ))
+    let resolve = owned::commons::historical(session);
+    Ok(within(&held, &covers(&view, &resolve, from.generation))
+        && history::uncarried(&owed, &history::carried(&view, &resolve, None)).is_empty())
 }
 
 /// Each register of `cells` holding a candidate whose sealed token (an earlier build's `sec1:`)
@@ -1048,6 +1261,13 @@ impl Registry {
             .map(|op| op.header.id)
             .collect();
         let frontier = frontier(&held_ops);
+        let (owed, stated) = history::owed(
+            &session,
+            from.table,
+            from.generation,
+            Log::read_with(&session, &old, old_scope, decode)?,
+            &old_view,
+        )?;
         let to_descriptor = to.descriptor(trust)?;
         let observed = directory.observe_store_if_exists(&session, to_descriptor.scope)?;
         let uuid = session
@@ -1057,95 +1277,132 @@ impl Registry {
             .map(|binding| keys::uuid32(binding.machine()))
             .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
 
-        let plan = |new: Option<&Store>| -> Result<(Restated, usize, usize, bool)> {
-            let (target, carried, done_archive, rolls, target_claims) = match new {
-                Some(store) => {
-                    let log = Log::read_with(&session, store, to_descriptor.scope, decode)?;
-                    if !log.awaited(session.actor()).is_empty() {
-                        return Err(Error::new(
-                            "this Mac's history of the new registry generation is incomplete; a \
+        let plan =
+            |new: Option<&Store>| -> Result<(Restated, usize, usize, bool, history::Planned)> {
+                let (target, carried, done_archive, rolls, target_claims, target_history, used) =
+                    match new {
+                        Some(store) => {
+                            let log = Log::read_with(&session, store, to_descriptor.scope, decode)?;
+                            if !log.awaited(session.actor()).is_empty() {
+                                return Err(Error::new(
+                                    "this Mac's history of the new registry generation is incomplete; a \
                              roll waits for a complete scan",
-                        ));
-                    }
-                    let view = View::read(to.table, &session, &log);
-                    let carried = carried_origins(log.eligible_iter().map(|(_, command)| command));
-                    // What is carried already is each record that authenticates, wherever
-                    // it was written: a cell some other writer put at a record's key first
-                    // must not keep that record from being carried.
-                    let archived: BTreeSet<Digest> =
-                        att::archived_ops(to.table, &session, &view.ops)
-                            .into_iter()
-                            .map(|op| op.id)
-                            .collect();
-                    let rolls = view.project(&ROLL);
-                    let claims = view.claim_provenance(to.table)?;
-                    (view.cells, carried, archived, rolls, claims)
-                }
-                None => Default::default(),
-            };
-            let from_name = from.name();
-            let opener = att::sealer(&from_name, &session, old_scope)?;
-            // A generation builds up to 0.199.0 still read takes a token resealed for it, never
-            // a store reference ([`typed::Ty::Secret`]); only the third generation takes those.
-            let to_name = to.name();
-            let reseal = if to.table.collections.iter().any(|c| {
-                c.columns
-                    .iter()
-                    .any(|column| column.ty == typed::Ty::Secret)
-            }) {
-                Some(att::sealer(&to_name, &session, to_descriptor.scope)?)
-            } else {
-                None
-            };
-            let mut claims = target_claims;
-            typed::claim::merge_claims(&mut claims, old_claims.clone())?;
-            let mut restated = restate_with_claims(
-                to.table,
-                &old_view.cells,
-                &held,
-                &target,
-                &carried,
-                (&opener, reseal.as_ref().map(|s| s as &dyn Sealer), secrets),
-                &claims,
-            )?;
-            let rows = &mut restated.rows;
-            let registers = rows.len();
-            let mut archived = 0;
-            let mut operations: BTreeSet<Digest> = BTreeSet::new();
-            for read in old_view.owned.values() {
-                operations.extend(read.rows.values().map(|row| row.operation));
-            }
-            for operation in operations {
-                if done_archive.contains(&operation) {
-                    continue;
-                }
-                // A row the old generation itself read from an archived record is carried with
-                // that record's archived row, a register like any other.
-                let Some(wire) = old.wire_unchecked(&operation) else {
-                    continue;
+                                ));
+                            }
+                            let view = View::read(to.table, &session, &log);
+                            let carried =
+                                carried_origins(log.eligible_iter().map(|(_, command)| command));
+                            // What is carried already is each record that authenticates, wherever
+                            // it was written: a cell some other writer put at a record's key first
+                            // must not keep that record from being carried.
+                            let archived: BTreeSet<Digest> =
+                                att::archived_ops(to.table, &session, &view.ops)
+                                    .into_iter()
+                                    .map(|op| op.id)
+                                    .collect();
+                            let rolls = view.project(&ROLL);
+                            let claims = view.claim_provenance(to.table)?;
+                            // This Mac's own rows count too: a roll cut short after its history and
+                            // before its cover does not write that history again.
+                            let history = history::carried(
+                                &view,
+                                owned::commons::historical(&session),
+                                Some(session.actor()),
+                            );
+                            let used = store.retained_use(&session, session.actor())?;
+                            (view.cells, carried, archived, rolls, claims, history, used)
+                        }
+                        None => Default::default(),
+                    };
+                let from_name = from.name();
+                let opener = att::sealer(&from_name, &session, old_scope)?;
+                // A generation builds up to 0.199.0 still read takes a token resealed for it, never
+                // a store reference ([`typed::Ty::Secret`]); only the third generation takes those.
+                let to_name = to.name();
+                let reseal = if to.table.collections.iter().any(|c| {
+                    c.columns
+                        .iter()
+                        .any(|column| column.ty == typed::Ty::Secret)
+                }) {
+                    Some(att::sealer(&to_name, &session, to_descriptor.scope)?)
+                } else {
+                    None
                 };
-                rows.push(archive_row(&operation, from.generation, wire)?);
-                archived += 1;
-            }
-            let cover = cover_row(
-                &rolls,
-                from.generation,
-                &uuid,
-                &frontier,
-                held.len(),
-                now_ms,
-            )?;
-            let changed = !cover.is_empty();
-            if changed {
-                rows.push(cover);
-            }
-            Ok((restated, registers, archived, changed))
-        };
+                let mut claims = target_claims;
+                typed::claim::merge_claims(&mut claims, old_claims.clone())?;
+                let mut restated = restate_with_claims(
+                    (from.table, to.table),
+                    &old_view.cells,
+                    &held,
+                    &target,
+                    &carried,
+                    (&opener, reseal.as_ref().map(|s| s as &dyn Sealer), secrets),
+                    &claims,
+                )?;
+                let rows = &mut restated.rows;
+                let registers = rows.len();
+                let mut archived = 0;
+                let mut operations: BTreeSet<Digest> = BTreeSet::new();
+                for read in old_view.owned.values() {
+                    operations.extend(read.rows.values().map(|row| row.operation));
+                }
+                for operation in operations {
+                    if done_archive.contains(&operation) {
+                        continue;
+                    }
+                    // A row the old generation itself read from an archived record is carried with
+                    // that record's archived row, a register like any other.
+                    let Some(wire) = old.wire_unchecked(&operation) else {
+                        continue;
+                    };
+                    rows.push(archive_row(&operation, from.generation, wire)?);
+                    archived += 1;
+                }
+                let cover = cover_row(
+                    &rolls,
+                    from.generation,
+                    &uuid,
+                    &frontier,
+                    held.len(),
+                    now_ms,
+                )?;
+                let changed = !cover.is_empty();
+                if changed {
+                    rows.push(cover);
+                }
+                // The history goes in with the restatement, before the cover that says it is there,
+                // within what this Mac's writer has room for once the rest of the roll is in: a
+                // roll whose restatement alone passes that is refused before anything is declared.
+                let (records, bytes) = history::appended(&rows[..])?;
+                let budget = history::Budget::room(
+                    used.writer_records.saturating_add(records),
+                    used.writer_bytes.saturating_add(bytes),
+                )
+                .ok_or_else(|| {
+                    Error::new(
+                        "this roll passes what this Mac may write into the new registry generation",
+                    )
+                })?;
+                let mut planned = history::plan(
+                    from.table,
+                    owed.iter().cloned(),
+                    &stated,
+                    &target_history,
+                    from.generation,
+                    &uuid,
+                    budget,
+                )?;
+                // The cover stays last, as the apply path appends it.
+                let cover = if changed { rows.pop() } else { None };
+                rows.append(&mut planned.rows);
+                rows.extend(cover);
+                Ok((restated, registers, archived, changed, planned))
+            };
 
         // The plan runs on what this Mac holds before anything is declared, so a roll it
         // refuses (a register past the candidates a carried value holds, a cover past its
         // writers, a record too large to archive) leaves no declaration of the next generation.
-        let (planned, registers, archived, cover) = plan(observed.as_ref())?;
+        let (planned, registers, archived, cover, carried) = plan(observed.as_ref())?;
         let unread = held_ops.iter().filter(|op| op.unread).count();
         let mut rolled = Rolled {
             from: from.generation,
@@ -1153,6 +1410,8 @@ impl Registry {
             registers,
             archived,
             cover,
+            history: carried.carried,
+            history_left: carried.not_carried,
             unread,
             ..Rolled::default()
         };
@@ -1207,8 +1466,10 @@ impl Registry {
             registers,
             archived,
             cover,
+            carried,
         ) = plan(Some(&store))?;
         (rolled.registers, rolled.archived, rolled.cover) = (registers, archived, cover);
+        (rolled.history, rolled.history_left) = (carried.carried, carried.not_carried);
         // Every record as the new generation holds it ([`att::conform`]), before any value
         // goes into the store: a generation older builds read takes no store reference.
         for row in &mut rows {

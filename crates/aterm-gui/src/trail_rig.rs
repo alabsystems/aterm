@@ -129,7 +129,7 @@ impl TrailRig {
         // windowed App installs it only after its first present: without this a process's first
         // rig titles frame 0's panes on a cold store and every later rig on a warm one.
         app.sync_chrome_fonts();
-        if let Some(ws) = app.windows.get_mut(&WindowId(0)) {
+        if let Some(mut ws) = app.windows.get_mut(&WindowId(0)) {
             ws.present = Some(crate::PresentTarget::Cpu {
                 surface: crate::present::CpuSurface::Scripted(Default::default()),
             });
@@ -284,18 +284,19 @@ impl TrailRig {
     pub fn scale(&mut self, scale: f64, at: Instant) {
         self.at(at, |app, wid| {
             let font_px = font_px_for_scale(app.font_size, scale);
-            let Some(ws) = app.windows.get_mut(&wid) else {
+            let Some(mut ws) = app.windows.get_mut(&wid) else {
                 return;
             };
             ws.scale = scale;
             ws.metrics.font_px = font_px;
+            drop(ws);
             app.apply_window_scale(wid);
         });
     }
 
     /// The panel's refresh rate, as the window's monitor would report it.
     pub fn panel_hz(&mut self, hz: u32) {
-        if let Some(ws) = self.app.windows.get_mut(&self.wid) {
+        if let Some(mut ws) = self.app.windows.get_mut(&self.wid) {
             ws.frame_interval = Some(Duration::from_nanos(1_000_000_000 / u64::from(hz.max(1))));
         }
     }
@@ -309,7 +310,7 @@ impl TrailRig {
     /// The glow's ramp cost: `None` the shipped one (aterm-render's `RAMP_COST`), `Some(true)`
     /// every run a ramp, `Some(false)` every ramp row laid as its quad.
     pub fn ramp_cost(&mut self, always: Option<bool>) {
-        let Some(ws) = self.app.windows.get_mut(&self.wid) else {
+        let Some(mut ws) = self.app.windows.get_mut(&self.wid) else {
             return;
         };
         let glow = &mut ws.fx.cursor_mut().glow;
@@ -324,7 +325,7 @@ impl TrailRig {
     /// admits from now on, or restore `LIVE` with `None` (a script's `live <level>`): a frame the
     /// latch refuses stays off whatever the level.
     pub fn live(&mut self, live: Option<aterm_effects::cursor_glow::Live>) {
-        if let Some(ws) = self.app.windows.get_mut(&self.wid) {
+        if let Some(mut ws) = self.app.windows.get_mut(&self.wid) {
             ws.trail_ground.force_live(live);
         }
     }

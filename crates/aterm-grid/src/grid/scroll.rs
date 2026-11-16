@@ -483,11 +483,18 @@ impl Grid {
 
     pub(crate) const DETACHED_LAZY_CAP: usize = 50_000;
 
+    /// Drop the oldest staged rows past [`Self::DETACHED_LAZY_CAP`] while a reflow has the store
+    /// detached. Past the cap at least `CAP` rows are staged, so the drop takes at least one and
+    /// opens or widens the cut: the marker moves onto the absolute row the newest dropped row held
+    /// and names a new count. That row's key now names other text, so the drop bumps
+    /// `history_renumber_epoch`, as a flood's cut does ([`Self::drop_flood_overflow`]).
     fn bound_detached_lazy_buffer(&mut self) {
         let len = self.storage.lazy_buffer.len();
         if len > Self::DETACHED_LAZY_CAP {
             let drop_n = len - Self::DETACHED_LAZY_CAP;
             self.storage.flood_truncated_lines += self.storage.lazy_buffer.drop_oldest(drop_n);
+            self.storage.history_renumber_epoch =
+                self.storage.history_renumber_epoch.saturating_add(1);
             let before = self.storage.reflow_window_cap_dropped;
             self.storage.reflow_window_cap_dropped =
                 before.saturating_add(u64::try_from(drop_n).unwrap_or(u64::MAX));

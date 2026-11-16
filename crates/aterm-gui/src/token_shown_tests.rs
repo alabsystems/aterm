@@ -10,6 +10,7 @@ use crate::claude_lights::Fact;
 use crate::fact_menu::FactAct;
 use aterm_agent::harness::accounts::AuthRoute;
 use aterm_agent::harness::footer::FooterFacts;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 
 const KEY: &str = "ac-fedcba9876543210";
@@ -371,6 +372,55 @@ fn a_fact_keeps_the_views_typed_fields() {
     assert_eq!(shown.vault_words, account.vault_words());
     assert_eq!(shown.peers, ["m22"]);
     assert_eq!(shown.peers_read_at, Some(2_000));
+    assert_eq!(
+        shown.verified_on, None,
+        "the vault not read: the row's own time, naming no Mac"
+    );
+
+    // The vault read: its meta's stamp, when and on which Mac, whatever this Mac's row holds
+    // (FL-134: the Mac that compared the token wrote it, here m12, not this Mac).
+    use aterm_secrets::claude_token::{Check, ExpiryFrom, Key, Meta, Standing, Verified};
+    let verified_elsewhere = AccountToken {
+        standing: Some(Standing {
+            key: Key::parse(KEY).expect("a key"),
+            meta: Some(Meta {
+                email: "person@example.com".into(),
+                account_id: "c-0123456789ab".into(),
+                minted_at: 1_000,
+                expires_at: 9_000,
+                expiry_from: ExpiryFrom::Printed,
+                minted_on: "m15".into(),
+                cli: "2.1.318".into(),
+                minted_by: None,
+                verified: Some(Verified {
+                    on: "m12".into(),
+                    at: 1_700,
+                    by: aterm_secrets::claude_token::BY_WINDOWS.into(),
+                    seven_day_resets_at: None,
+                    five_hour_resets_at: None,
+                }),
+            }),
+            check: Check::Readable,
+            signer: Some("m15".into()),
+            minted_here: true,
+            exposed: Vec::new(),
+            refused_at: None,
+        }),
+        ..account
+    };
+    let read = facts_of_view(
+        dir.path(),
+        (Some(vec![verified_elsewhere]), &BTreeMap::new()),
+        100,
+    );
+    let [shown] = read.facts.as_slice() else {
+        panic!("one account: {read:?}");
+    };
+    assert_eq!(
+        (shown.verified_at, shown.verified_on.as_deref()),
+        (Some(1_700), Some("m12")),
+        "the vault's stamp, not this Mac's row"
+    );
 }
 
 #[test]

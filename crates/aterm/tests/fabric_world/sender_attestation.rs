@@ -22,7 +22,7 @@ fn a_node_cannot_attest_a_human_in_from() {
         6_401,
         2,
         &subject,
-        b"v=1 t=1 from=s-realsession text=r1honest",
+        b"v=1 t=1 from=th1beaktyb8 text=r1honest",
     )
     .expect("publish the honest attestation");
 
@@ -44,7 +44,7 @@ fn a_node_cannot_attest_a_human_in_from() {
         .find(|r| r.contains("text=r1honest"))
         .expect("the honest row landed");
     assert!(
-        honest.contains("from=s-realsession@n-rogue"),
+        honest.contains("from=th1beaktyb8@n-rogue"),
         "a node speaking for its own session is still attested: {honest}"
     );
 }
@@ -80,14 +80,14 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
     let (a, _b) = w.two_sessions();
 
     let nowhere = w.verb(&format!(
-        "@{a} post to=@s-victim@n-nowhere kind=note --wait=60000 r1nowhere"
+        "@{a} post to=@t04gf278prc@n-nowhere kind=note --wait=60000 r1nowhere"
     ));
     assert!(
         nowhere.header().starts_with("ERR unroutable"),
         "a node the fleet never showed is no route: {}",
         nowhere.header()
     );
-    let unminted = format!("/f/{FLEET}/in/n-nowhere/s-victim/{}/note", w.node);
+    let unminted = format!("/f/{FLEET}/in/n-nowhere/t04gf278prc/{}/note", w.node);
     assert!(w.row(&unminted).is_none(), "no lane was minted for it");
 
     w.god()
@@ -99,7 +99,7 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
         )
         .expect("show n-attacker to the fleet");
     let shown = w.verb(&format!(
-        "@{a} post to=@s-victim@n-attacker kind=note --wait=60000 r1unadvertised"
+        "@{a} post to=@t04gf278prc@n-attacker kind=note --wait=60000 r1unadvertised"
     ));
     assert!(
         shown.header().starts_with("ERR unroutable"),
@@ -110,24 +110,24 @@ fn an_explicit_node_address_never_writes_the_pin_table() {
         .publish(
             9_400,
             2,
-            &format!("/f/{FLEET}/pub/n-attacker/s-victim/presence"),
+            &format!("/f/{FLEET}/pub/n-attacker/t04gf278prc/presence"),
             b"v=1 t=1 state=live inc=1",
         )
-        .expect("n-attacker advertises s-victim");
+        .expect("n-attacker advertises t04gf278prc");
 
     let posted = w.verb(&format!(
-        "@{a} post to=@s-victim@n-attacker kind=note r1poison"
+        "@{a} post to=@t04gf278prc@n-attacker kind=note r1poison"
     ));
     assert!(posted.ok(), "{}", posted.header());
 
-    let lane = format!("/f/{FLEET}/in/n-attacker/s-victim/{}/note", w.node);
+    let lane = format!("/f/{FLEET}/in/n-attacker/t04gf278prc/{}/note", w.node);
     until("the post to reach the address it named", || {
         w.row(&lane).map(|_| ())
     });
 
     let pins = std::fs::read_to_string(w.state.join("pins")).unwrap_or_default();
     assert!(
-        !pins.contains("s-victim"),
+        !pins.contains("t04gf278prc"),
         "an address a sender typed is not an observation, and must not be \
          pinned: {pins:?}"
     );
@@ -188,7 +188,7 @@ fn a_sessions_ev_records_are_attributable_to_that_session() {
             b"v=1 t=1 via=NOT-A-PRINCIPAL text=r1refused",
         )
         .expect("publish a record the bridge refuses");
-    let ghost = "s-r1ghost00000000";
+    let ghost = "tsrd2bqs008";
     let subject = format!("/f/{FLEET}/in/{}/{ghost}/h-x/note", w.node);
     let (off, _) = god
         .publish(6_800, 2, &subject, b"v=1 t=1 text=r1ghosted")
@@ -238,10 +238,10 @@ fn a_refusal_reaches_the_senders_own_lane_and_raises_no_false_alarm() {
         6_700,
         1,
         &from_peer,
-        format!("v=1 t=1 from=s-peerside text={huge}").as_bytes(),
+        format!("v=1 t=1 from=tsm97x0xxgh text={huge}").as_bytes(),
     )
     .expect("publish the peer's oversized note");
-    let peer_lane = format!("/f/{FLEET}/in/n-peer/s-peerside/{}/undeliverable", w.node);
+    let peer_lane = format!("/f/{FLEET}/in/n-peer/tsm97x0xxgh/{}/undeliverable", w.node);
     until("the peer's own lane to carry the verdict", || {
         w.row(&peer_lane)
             .filter(|x| x.contains("not%20delivered"))

@@ -341,10 +341,12 @@ pub fn announce() {
 /// Whether session `sid` is a worker another fleet Mac started here: the driven window's record
 /// of it under `<state>/`[`aterm_types::fleet_access::DRIVE_WORKERS`]. A plain shell another Mac
 /// opened has no record, nor has a worker such a worker spawned locally.
+/// `sid` comes from this Mac's shell environment, which can retain an exact legacy ID while
+/// that shell runs; this lookup is not a reader of IDs supplied by the fleet.
 #[cfg(unix)]
 #[must_use]
 pub fn fleet_started(state: &Path, sid: &str) -> bool {
-    aterm_types::control_verbs::is_minted_sid(sid)
+    aterm_types::control_request::Sid::parse(sid).is_some()
         && std::fs::symlink_metadata(
             state
                 .join(aterm_types::fleet_access::DRIVE_WORKERS)

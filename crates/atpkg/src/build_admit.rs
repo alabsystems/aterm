@@ -32,17 +32,28 @@
 //! so. An unavailable or unreadable ledger refuses the build. An interrupt ends a wait
 //! before the build starts.
 //!
-//! How the hidden verb runs it ([`front_exec`], BUILD-ADMIT's shim hop): the front, which is the
-//! shell's job, claims, hands its claim to a holder that keeps it for the build's life ([`hold`]),
-//! and becomes the build in its own pid with its granted job width (its signal state put back as
-//! it was started with it: `build_admit_exec.rs`), so every reader of that pid, its parent, its
-//! job and its signals finds the build itself. On macOS the front becomes the build only with
-//! its exec gate closed (`aterm_sysprobe::exec_gate`); where one of its own process-table reads
-//! is still in the kernel the build runs as its child, under its claim where it holds one
-//! ([`front_exec`]). A build started under a cargo that holds its
-//! build lock (a build script's) runs under its verified covering claim; without one, an
-//! ambiguous active lock bounds a wait to one admission look ([`possible_build_lock`]). Where
-//! no holder arms, it runs as [`supervise`] runs it.
+//! When it is held for disk (`DiskHold`, `docs/DESIGN-disk-custody-2026-11-12.md` §2): a build
+//! the shim's front runs in an aterm tab while the volume of its build directory reads below its
+//! emergency line ([`aterm_capacity::floor::Lines::emergency`], or fewer inodes free than
+//! [`aterm_capacity::floor::Lines::files_emergency`]) asks the window's disk watch for one pass
+//! and waits for its answer at most a minute, then claims and starts whatever the pass freed,
+//! having said one line. The hold comes after the checks that claim nothing and before its
+//! claim is entered, and never under a possible build lock, so it holds no claim, no place in
+//! the ledger's queue and no lock another build waits on; the watch's answer ends it, and where
+//! none comes its own deadline does (its ask's `aterm ctl` killed and reaped before the build
+//! starts), or an interrupt. No plain build is refused for disk.
+//!
+//! How the hidden verb runs it ([`front_exec_bounded`], BUILD-ADMIT's shim hop): the front, which
+//! is the shell's job, claims, hands its claim to a holder that keeps it for the build's life
+//! ([`hold`]), and becomes the build in its own pid with its granted job width (its signal state
+//! put back as it was started with it: `build_admit_exec.rs`), so every reader of that pid, its
+//! parent, its job and its signals finds the build itself. On macOS the front becomes the build
+//! only with its exec gate closed (`aterm_sysprobe::exec_gate`); where one of its own
+//! process-table reads is still in the kernel the build runs as its child, under its claim where
+//! it holds one. A build started under a cargo that holds
+//! its build lock (a build script's) runs under its verified covering claim; without one, an
+//! ambiguous active lock bounds a wait to one admission look ([`possible_build_lock`]). Where no
+//! holder arms, it runs as [`supervise`] runs it.
 //!
 //! How it runs under its front ([`supervise`], and the in-process callers'
 //! [`run_if_claimed_at`]): the build is spawned as a pass-through, every descriptor this
@@ -822,6 +833,148 @@ fn refuse(say: &mut dyn FnMut(&str), why: &str) -> Admission {
     Admission::Refused(line)
 }
 
+/// The window's disk watch asked once for a number of bytes free on the volume mounted at a path
+/// ([`crate::admit_disk::ask_watch`]), until its `stopped` says the hold is over: its answer, or
+/// `None` where it could not be asked or was stopped first.
+pub(crate) type AskOnce =
+    Box<dyn FnOnce(u64, &Path, crate::admit_disk::Stopped<'_>) -> Option<String> + Send>;
+
+/// The volume holding a path, read beside its emergency line
+/// ([`aterm_capacity::reading::read_lined`]).
+pub(crate) type ReadLined = Box<dyn FnMut(&Path) -> Option<aterm_capacity::reading::Lined>>;
+
+/// THE ONE HOLD A PLAIN BUILD SHORT OF DISK GETS (`docs/DESIGN-disk-custody-2026-11-12.md` §2,
+/// the one exception to "no wait for disk"): a build the shim's front runs in an aterm tab while
+/// the volume of its build directory reads below its emergency line
+/// ([`aterm_capacity::floor::Lines::emergency`], or fewer inodes free than
+/// [`aterm_capacity::floor::Lines::files_emergency`]) asks the window's disk watch for one pass
+/// and waits for its answer at most [`Self::bound`], then starts whatever the pass freed, having
+/// said one line naming the volume, what was free and how long it was held ([`Self::once`]). It
+/// is held in the front before its claim is entered, so it holds no claim and no place in the
+/// ledger's queue (`HoldHoldsNothing` in `aterm_models_atpkg::atpkg_build_admit_model`), and never
+/// under a possible build lock ([`admit_for`]), so no build waits for a lock on a hold
+/// (`NoWaitOnAHold`); it can close no wait cycle. Its bound is this process's own deadline, never
+/// anyone's answer (`HoldBounded`). An interrupt ends it as one ends a claim's wait.
+pub(crate) struct DiskHold {
+    /// Whether the build runs in an aterm tab (`ATERM_SESSION_ID` set): only there is a window's
+    /// watch to ask, and outside it nothing is read.
+    pub(crate) in_aterm: bool,
+    /// The build's build directory, where the shim's placement names it; `None`: the volume of
+    /// the directory the build runs in is read.
+    pub(crate) at: Option<PathBuf>,
+    /// Reads a volume beside its emergency line.
+    pub(crate) reader: ReadLined,
+    /// The watch's one ask, taken by the hold that makes it.
+    pub(crate) ask: Option<AskOnce>,
+    /// The longest the hold waits for the watch's answer ([`crate::admit_disk::ASK_FOR`]).
+    pub(crate) bound: std::time::Duration,
+}
+
+impl DiskHold {
+    /// The live hold for a build whose build directory is `at` (`None`: unnamed): in an aterm tab
+    /// where `ATERM_SESSION_ID` is set, reading the live volume
+    /// ([`aterm_capacity::reading::read_lined`]) and asking the window's watch
+    /// ([`crate::admit_disk::ask_watch`]) for up to [`crate::admit_disk::ASK_FOR`].
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn live(at: Option<PathBuf>) -> DiskHold {
+        DiskHold {
+            in_aterm: std::env::var_os("ATERM_SESSION_ID").is_some_and(|v| !v.is_empty()),
+            at,
+            reader: Box::new(aterm_capacity::reading::read_lined),
+            ask: Some(Box::new(crate::admit_disk::ask_watch)),
+            bound: crate::admit_disk::ASK_FOR,
+        }
+    }
+
+    /// HOLD ONCE WHERE THE BUILD'S VOLUME IS BELOW ITS EMERGENCY LINE: outside aterm nothing is
+    /// read; else the volume of [`Self::at`] (or `cwd`) is read once, and where it has fewer bytes
+    /// free than its emergency line, or fewer inodes free than its files' line, the window's
+    /// watch is asked for one pass (for the emergency line; for one byte more than is free where
+    /// only inodes are short, so the watch makes a pass rather than answer at once), its answer
+    /// waited for at most [`Self::bound`], and one line said through `say`. The ask runs on this
+    /// thread and its `stopped` says so once the bound passes or an interrupt comes: the live ask
+    /// then kills and reaps its `aterm ctl` before it returns
+    /// ([`crate::admit_disk::answer_of`]), so a hold that ended leaves no ask behind beside the
+    /// build it lets start. A hold asks at most once, whatever calls it again. At or above both
+    /// lines nothing more is read or said.
+    ///
+    /// # Errors
+    /// [`Error::Stopped`] with the signal, where an interrupt ended the hold (said in one line):
+    /// the build does not start.
+    pub(crate) fn once(&mut self, cwd: &Path, say: &mut dyn FnMut(&str)) -> Result<(), Error> {
+        if !self.in_aterm {
+            return Ok(());
+        }
+        let Some(ask) = self.ask.take() else {
+            return Ok(());
+        };
+        let at = self.at.clone().unwrap_or_else(|| cwd.to_path_buf());
+        let Some(before) = (self.reader)(&at) else {
+            return Ok(());
+        };
+        let Some(lines) = before.lines else {
+            return Ok(());
+        };
+        let bytes_short = before.free < lines.emergency;
+        let files_short = before.files_free.filter(|f| *f < lines.files_emergency);
+        if !bytes_short && files_short.is_none() {
+            return Ok(());
+        }
+        let bytes = if bytes_short {
+            lines.emergency
+        } else {
+            before.free.saturating_add(1).max(lines.emergency)
+        };
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        let started = Instant::now();
+        let deadline = started + self.bound;
+        let got = ask(bytes, before.mount.as_path(), &|| {
+            watch.caught().is_some() || Instant::now() >= deadline
+        });
+        let unanswered = got.is_none() && Instant::now() >= deadline;
+        if let Some(signal) = watch.take() {
+            say(&format!(
+                "{SAYS}: an interrupt ({}) ended its hold for disk on {}; the build did not start",
+                aterm_toolchain::interrupt::name(signal),
+                before.mount.display()
+            ));
+            return Err(Error::Stopped {
+                signal: Some(signal),
+                short: None,
+            });
+        }
+        let answer = match got {
+            Some(answer) => answer.trim().to_owned(),
+            None if unanswered => format!("no answer within {}", aterm_capacity::span(self.bound)),
+            None => "the watch could not be asked".to_owned(),
+        };
+        let was = match files_short {
+            Some(files) if !bytes_short => format!(
+                "{files} files free, below its {} files' emergency line",
+                lines.files_emergency
+            ),
+            _ => format!(
+                "{} free, below its {} emergency line",
+                aterm_capacity::gib(before.free),
+                aterm_capacity::gib(lines.emergency)
+            ),
+        };
+        let now = (self.reader)(&at).map_or_else(
+            || "its free space unread now".to_owned(),
+            |after| format!("{} free now", aterm_capacity::gib(after.free)),
+        );
+        say(&format!(
+            "{SAYS}: {} had {was}; held {} for one pass of the window's disk watch ({answer}); \
+             {now}; the build starts",
+            before.mount.display(),
+            aterm_capacity::span(started.elapsed()),
+        ));
+        drop(watch);
+        Ok(())
+    }
+}
+
 /// CLAIM `build`'s memory, run in `cwd`, at `seat`, saying through `say` what it waits for
 /// ([`aterm_capacity::admit_with`]), what refuses it and why it claims nothing.
 pub fn admit(build: &Build, cwd: &Path, seat: &Seat<'_>, say: &mut dyn FnMut(&str)) -> Admission {
@@ -835,7 +988,15 @@ fn admit_bounded(
     probe_lock: &dyn Fn() -> Option<PathBuf>,
     say: &mut dyn FnMut(&str),
 ) -> Admission {
-    admit_for(build, cwd, seat, probe_lock, say, AdmissionKind::Holder)
+    admit_for(
+        build,
+        cwd,
+        seat,
+        probe_lock,
+        say,
+        AdmissionKind::Holder,
+        None,
+    )
 }
 
 /// Admit one explicitly managed cohort build for [`supervise`]. This uses a prepared
@@ -850,7 +1011,7 @@ pub fn admit_cohort(
     seat: &Seat<'_>,
     say: &mut dyn FnMut(&str),
 ) -> Admission {
-    admit_for(build, cwd, seat, &|| None, say, AdmissionKind::Cohort)
+    admit_for(build, cwd, seat, &|| None, say, AdmissionKind::Cohort, None)
 }
 
 /// Reserve one independent job in an explicit cohort host. This always requests
@@ -873,7 +1034,15 @@ pub fn admit_cohort_job(
             "host job admission requires resource guards and its actual owner process",
         );
     }
-    admit_for(build, cwd, seat, &|| None, say, AdmissionKind::HostJob)
+    admit_for(
+        build,
+        cwd,
+        seat,
+        &|| None,
+        say,
+        AdmissionKind::HostJob,
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -885,6 +1054,34 @@ enum AdmissionKind {
     HostJob,
 }
 
+/// THE PLAIN FRONT'S ADMISSION, the one [`front_exec_bounded`] makes: `build` claimed as a
+/// holder's ([`admit_for`]), held once for disk by `hold` first ([`DiskHold::once`]), with
+/// `probe_lock` its possible build lock.
+#[cfg(any(unix, test))]
+fn front_admit(
+    build: &Build,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    probe_lock: &dyn Fn() -> Option<PathBuf>,
+    say: &mut dyn FnMut(&str),
+    hold: &mut DiskHold,
+) -> Admission {
+    admit_for(
+        build,
+        cwd,
+        seat,
+        probe_lock,
+        say,
+        AdmissionKind::Holder,
+        Some(hold),
+    )
+}
+
+/// CLAIM `build`'s memory as `kind` claims ([`admit`]), first held once for disk by `hold`
+/// where one is given ([`DiskHold::once`]): only where the build would wait for its claim
+/// (`--admit wait`), after the checks that claim nothing (a covering claim, its own) and before
+/// its claim is entered, and never under a possible build lock (`probe_lock`), so the hold holds
+/// no claim, no place in the queue and no lock another build waits on.
 fn admit_for(
     build: &Build,
     cwd: &Path,
@@ -892,6 +1089,7 @@ fn admit_for(
     probe_lock: &dyn Fn() -> Option<PathBuf>,
     say: &mut dyn FnMut(&str),
     kind: AdmissionKind,
+    hold: Option<&mut DiskHold>,
 ) -> Admission {
     let cohort = !matches!(kind, AdmissionKind::Holder);
     #[cfg(unix)]
@@ -953,6 +1151,15 @@ fn admit_for(
     }
     // Hints never precede verified authority, and an explicit mode choice needs no hint.
     let possible_lock = (seat.mode == Admit::Wait).then(probe_lock).flatten();
+    // The one hold for disk, before anything is entered. Under a possible build lock it is
+    // skipped: an ancestor build may hold the lock other builds wait on, and no hold keeps it.
+    if seat.mode == Admit::Wait
+        && possible_lock.is_none()
+        && let Some(hold) = hold
+        && let Err(e) = hold.once(cwd, say)
+    {
+        return Admission::Stopped(e);
+    }
     let key = key(build, cwd);
     let own = seat.own.as_deref().map(Records::load).unwrap_or_default();
     let verify = seat
@@ -1565,13 +1772,19 @@ fn supervise_launch(
             } else {
                 front.aim(child.id(), meter.as_ref().map(TreeMeter::watch));
             }
-            let status = wait_supervised(&mut owned, Some(&front), terminal.as_mut(), say);
+            let status = wait_supervised(
+                &mut owned,
+                Some(&front),
+                terminal.as_mut(),
+                meter.as_ref(),
+                say,
+            );
             let passed = front.passed();
             front.disarm();
             (status, passed)
         }
         None => (
-            wait_supervised(&mut owned, None, terminal.as_mut(), say),
+            wait_supervised(&mut owned, None, terminal.as_mut(), meter.as_ref(), say),
             None,
         ),
     };
@@ -1706,6 +1919,7 @@ fn wait_supervised(
     owned: &mut SupervisedChild,
     front: Option<&front::Front>,
     terminal: Option<&mut JobRun<'_>>,
+    meter: Option<&TreeMeter>,
     say: &mut dyn FnMut(&str),
 ) -> std::io::Result<std::process::ExitStatus> {
     let result = wait_supervised_events(owned, front, terminal);
@@ -1741,6 +1955,11 @@ fn wait_supervised(
             if !child.is_reaped() && !child.owns_unreaped() {
                 // Lost custody is permanent for this handle. No timer can restore it;
                 // spurious unparks recheck the same state without granting authority.
+                if let Some(meter) = meter {
+                    // Stop periodic work without joining a possibly blocked native read.
+                    // The meter and reservation stay owned; this is no retirement receipt.
+                    meter.request_stop();
+                }
                 std::thread::park();
                 continue;
             }
@@ -2360,9 +2579,9 @@ pub fn run_if_claimed(
 /// whether or not the call claims and before any claim is asked for, so a refused or
 /// interrupted call leaves one too; a line that cannot be written is dropped unsaid and changes
 /// nothing that follows.
-/// Then a call that claims runs `target` under its claim in this pid ([`front_exec`]); other calls
-/// become `target` by exec, their words handed on unchanged. A shim refuses non-UTF-8 words
-/// because its cache placement cannot be established; a non-shim front still passes them on.
+/// Then a call that claims runs `target` under its claim in this pid ([`front_exec_bounded`]);
+/// other calls become `target` by exec, their words handed on unchanged. A shim refuses non-UTF-8
+/// words because its cache placement cannot be established; a non-shim front still passes them on.
 #[must_use = "return or inspect the admitted build command's exit status"]
 pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     if let [only] = argv
@@ -2484,7 +2703,8 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
         if let (Some(tab), Some(built)) = (&tab, &built) {
             crate::build_start::note(tab, &built.workspace, built.build_dir.as_deref());
         }
-        return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock);
+        let hold = DiskHold::live(built.as_ref().and_then(|b| b.build_dir.clone()));
+        return front_exec_bounded(target, &args, tool, &cwd, &seat, &possible_lock, hold);
     }
     exec(target, rest)
 }
@@ -2562,8 +2782,11 @@ fn usage() -> std::process::ExitCode {
 /// hands its claim to a holder ([`hand_over`]) and becomes `target` with its granted job width, so
 /// every reader of this pid, its parent, its job and its signals finds the build itself; where
 /// no holder arms, the build runs under the claim here as [`supervise`] runs it, and only where
-/// that cannot start does it run unclaimed, said. An interrupt that ended the wait ends this
-/// process as it would have ended the build ([`stopped_by`]).
+/// that cannot start does it run unclaimed, said. Before it claims, a build whose build
+/// directory's volume reads below its emergency line in an aterm tab is held once for disk
+/// (`hold`, [`front_admit`]), never under a possible build lock (`probe_lock`). An interrupt that
+/// ended the hold or the wait ends this process as it would have ended the build
+/// ([`stopped_by`]).
 ///
 /// On macOS this process becomes `target` only with its exec gate closed
 /// (`aterm_sysprobe::exec_gate`): an exec made while a thread of this process is in a
@@ -2574,17 +2797,6 @@ fn usage() -> std::process::ExitCode {
 /// as this process's child there (`run_as_child`), so in both cases the build's pid is then not
 /// this one.
 #[cfg(unix)]
-pub fn front_exec(
-    target: &Path,
-    args: &[String],
-    tool: Tool,
-    cwd: &Path,
-    seat: &Seat<'_>,
-) -> std::process::ExitCode {
-    front_exec_bounded(target, args, tool, cwd, seat, &|| None)
-}
-
-#[cfg(unix)]
 fn front_exec_bounded(
     target: &Path,
     args: &[String],
@@ -2592,12 +2804,13 @@ fn front_exec_bounded(
     cwd: &Path,
     seat: &Seat<'_>,
     probe_lock: &dyn Fn() -> Option<PathBuf>,
+    mut hold: DiskHold,
 ) -> std::process::ExitCode {
     let Some(build) = classify(args, tool) else {
         return exec(target, args);
     };
     let mut say = |line: &str| eprintln!("{line}");
-    let held = match admit_bounded(&build, cwd, seat, probe_lock, &mut say) {
+    let held = match front_admit(&build, cwd, seat, probe_lock, &mut say, &mut hold) {
         Admission::Claimed(held) => *held,
         Admission::Stopped(Error::Stopped {
             signal: Some(sig), ..

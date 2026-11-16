@@ -75,6 +75,88 @@ pub(super) fn stamp(seq: u64) -> AgentStamp {
     }
 }
 
+/// A program's engine beside a test's log: each OSC 7501 report parsed in its own batch at the
+/// log's wall clock, then read as the status sweep reads it, under one hold of the timeline: the
+/// engine's turn edges past the log's cursor (`SessionTimeline::feed_program_turns`), then the
+/// shown move's mark (`SessionTimeline::note_program_state`). A codex's claimed turns move by
+/// those edges alone.
+pub(super) struct Engine(aterm_core::terminal::Terminal);
+
+impl Engine {
+    pub(super) fn new() -> Self {
+        Self(aterm_core::terminal::Terminal::new(24, 80))
+    }
+
+    /// The engine `term` is (a successor's, restored from its predecessor's carry).
+    pub(super) const fn of(term: aterm_core::terminal::Terminal) -> Self {
+        Self(term)
+    }
+
+    /// `shown` written (`None`: `state=clear`), then swept with its mark.
+    pub(super) fn says(
+        &mut self,
+        g: &mut SessionTimeline,
+        shown: Option<aterm_core::terminal::program_state::ProgramState>,
+    ) {
+        self.writes(g, shown);
+        let r = self.0.program_state();
+        g.note_program_state(r.state, r.began);
+    }
+
+    /// `shown` written and its edges swept, with no mark: a move the sweep's gate never shows.
+    pub(super) fn writes(
+        &mut self,
+        g: &mut SessionTimeline,
+        shown: Option<aterm_core::terminal::program_state::ProgramState>,
+    ) {
+        self.parse(g, shown);
+        self.feed(g);
+    }
+
+    /// `shown` parsed in one batch at the log's wall clock, unswept.
+    pub(super) fn parse(
+        &mut self,
+        g: &SessionTimeline,
+        shown: Option<aterm_core::terminal::program_state::ProgramState>,
+    ) {
+        let body = shown.map_or_else(
+            || "state=clear".to_string(),
+            |s| match s.kind {
+                Some(k) => format!(
+                    "state={}:app={}:kind={}",
+                    s.state.as_str(),
+                    s.app.as_str(),
+                    k.as_str()
+                ),
+                None => format!("state={}:app={}", s.state.as_str(), s.app.as_str()),
+            },
+        );
+        self.bytes(g, format!("\x1b]7501;{body}\x1b\\").as_bytes());
+    }
+
+    /// `bytes` parsed in one batch at the log's wall clock, unswept.
+    pub(super) fn bytes(&mut self, g: &SessionTimeline, bytes: &[u8]) {
+        self.0.process_at(
+            bytes,
+            aterm_core::terminal::ClockReading {
+                wall_ms: Some(g.slog().now().wall_ms),
+                ..aterm_core::terminal::ClockReading::now()
+            },
+        );
+    }
+
+    /// The sweep's read of the edges past the log's cursor, fed under the program in front.
+    pub(super) fn feed(&mut self, g: &mut SessionTimeline) {
+        let mut read = ProgramRead::of(&self.0, g.slog().program_cursor());
+        g.feed_program_turns(&mut read);
+    }
+
+    /// The engine.
+    pub(super) const fn term(&self) -> &aterm_core::terminal::Terminal {
+        &self.0
+    }
+}
+
 /// A timeline whose session is open (spawned), its clock on the hand.
 pub(super) fn opened() -> (Mutex<SessionTimeline>, Hand) {
     let tl = Mutex::new(SessionTimeline::for_test());
@@ -106,7 +188,7 @@ fn swept_with(g: &mut SessionTimeline, read: &BlockRead) {
     let _ = g.sweep_slog(read, false, 100, pgid);
 }
 
-fn swept(g: &mut SessionTimeline) {
+pub(super) fn swept(g: &mut SessionTimeline) {
     swept_with(g, &BlockRead::default());
 }
 
@@ -1841,7 +1923,7 @@ fn the_meta_and_fabric_producers_take_only_their_order() {
         st::seed_carried_claims(&ctx.meta, &ctx.timeline, None, &["a=b".to_string()], now);
         let none = || {};
         let _ = crate::fabric::cmd_inbox_seen(&*ctx, "1 handled");
-        let _ = crate::fabric::cmd_post(&*ctx, "to=@s-peer kind=ask --wait=0 x", None);
+        let _ = crate::fabric::cmd_post(&*ctx, "to=@tpeer000001 kind=ask --wait=0 x", None);
         let hold = crate::fabric::Hold {
             reason: "demo".into(),
             origin: "local".into(),
@@ -3562,7 +3644,7 @@ fn a_failure_the_person_sees_is_seen_in_the_log() {
     for looking in [true, false] {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.os_window_for_test = true;
             ws.focused = looking;
         }
@@ -3593,7 +3675,7 @@ fn a_failure_the_person_sees_is_seen_in_the_log() {
             (Some("failure"), 0),
             "NEGATIVE CONTROL: nobody looked"
         );
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.focused = true;
         }
         app.note_session_seen(wid, session);
@@ -3620,7 +3702,7 @@ fn a_carried_exit_the_person_saw_is_seen_in_the_log() {
     for seen in [true, false] {
         let mut app = crate::App::headless_for_test();
         let wid = crate::WindowId(0);
-        for ws in app.windows.values_mut() {
+        for mut ws in app.windows.values_mut() {
             ws.os_window_for_test = true;
             ws.focused = false;
         }
@@ -5008,6 +5090,38 @@ pub(super) fn producer() -> (crate::session_store::SessionHandle, SessionStore, 
     store.register(h.clone());
     h.ctx.timeline.lock().unwrap().note_root_group(100);
     (h, store, hand)
+}
+
+/// CX-05 across a seamless update: a carried log is already open, so the successor's
+/// registration stamps no first open, and the predecessor's log open stands for the lineage's
+/// (`adopt_carried`), never `-` or the successor's own time. CONTROL: a log the update did not
+/// carry starts over, and the successor's registration opens it.
+#[test]
+fn a_carried_log_reports_its_predecessors_open() {
+    for carry in [true, false] {
+        let (p, store, _hand) = producer();
+        let first = p.ctx.timeline.lock().unwrap().slog().opened_ms();
+        assert_eq!(
+            first,
+            Some(WALL0),
+            "PRECONDITION: the producer opened at its hand's 0"
+        );
+        let (s, _next, _hand2) = hand_over(&p, &store, 2_000, carry);
+        let got = s.ctx.timeline.lock().unwrap().slog().opened_ms();
+        if carry {
+            assert_eq!(
+                got,
+                Some(WALL0),
+                "the carried log's open, not the successor's"
+            );
+        } else {
+            assert_eq!(
+                got,
+                Some(WALL0 + 2_000),
+                "CONTROL: uncarried, the successor's own open"
+            );
+        }
+    }
 }
 
 fn publish(g: &mut SessionTimeline, word: &'static str, seq: u64) {
@@ -7078,8 +7192,9 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
 /// tab, as a drive's spawn has none) names a whole requesting sid in `by=` and the requester's
 /// program, model and account at their caps beside a short `why_text=`, within
 /// [`aterm_slog::MAX_RECORD_BYTES`]. With the longest `why_text=` a request admits it gives up the
-/// account and keeps the rest; with every field at its longest (a parent, the widest window) it
-/// gives up the model too. Each time the mark, its `why_text=` and its `by=` are kept.
+/// account and keeps the rest; with every field at its longest (a legacy tab's ID as the parent,
+/// the widest window) it gives up the model too. Each time the mark, its `why_text=` and its
+/// `by=` are kept. A fleet drive names its requester's session by the `t` form alone.
 #[test]
 fn open_mark_fits_at_max_sizes() {
     use aterm_types::control_verbs::{
@@ -7090,7 +7205,7 @@ fn open_mark_fits_at_max_sizes() {
         aterm_codec::pct::encoded_len(&longest_why),
         REQUEST_WHY_BYTES
     );
-    let sid = "s-0123456789abcdef0123";
+    let sid = "tqn5r6e0148";
     let requester = Arc::new(Requester::of(
         Some(sid),
         Some(&"p".repeat(REQUESTER_TOKEN_MAX)),
@@ -7158,7 +7273,7 @@ fn open_mark_fits_at_max_sizes() {
     assert_eq!(
         named(&opened(
             &longest_why,
-            aterm_slog::ShortId::new(sid),
+            aterm_slog::ShortId::new("s-0123456789abcdef0123"),
             u64::MAX
         )),
         ["agent"],

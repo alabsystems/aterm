@@ -1904,3 +1904,268 @@ fn a_write_may_name_a_seed_row_no_pass_has_written_here() {
         "a seed pass writes every named row"
     );
 }
+
+/// Seal, on Mac `from`, a typed write whose causal parent never arrives anywhere, and give it to
+/// Mac `to`: the record a slow or partitioned peer leaves waiting (`Log::awaited`).
+fn withhold_on(lab: &Lab, from: usize, to: usize, changes: Vec<crate::database::Change>) {
+    let command = Command::Write {
+        request: crate::crypto::random().unwrap(),
+        changes,
+    };
+    let missing = [91; 32];
+    let wire = application::with_store(
+        &lab.paths[from],
+        false,
+        Handle::at(lab.paths[from].clone(), &REGISTRY).descriptor(),
+        |session, _, scope| {
+            crate::table::tests::seal(
+                session,
+                scope,
+                crate::crypto::Causal {
+                    sequence: 1_000,
+                    previous: Some(missing),
+                    parents: &[missing],
+                },
+                &command.encode()?,
+            )
+        },
+    )
+    .unwrap();
+    application::with_store(
+        &lab.paths[to],
+        false,
+        Handle::at(lab.paths[to].clone(), &REGISTRY).descriptor(),
+        |session, store, _| store.ingest(session, &wire),
+    )
+    .unwrap();
+}
+
+/// A record still waiting on a causal parent holds back only a write of a row it writes (TK-08):
+/// Mac 0 holds Mac 1's withheld edit of one machine row, so a grid save of that row waits and
+/// says how many records are withheld, while a save of another row is written at once and the
+/// withheld record, when its parent arrives, is concurrent with it rather than hidden by it.
+/// NEGATIVE CONTROL: with `apply` refusing on `!view.complete` (as before), the save of the other
+/// row fails too: `` called `Result::unwrap()` on an `Err` value: Error("this table's history
+/// here is incomplete; a grid save waits for a complete scan") ``.
+#[test]
+fn a_withheld_record_holds_back_only_the_rows_it_touches() {
+    const OTHER: &str = "mc-000000000000000a";
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    let mut other = machine(OTHER);
+    other[0] = put(&MACHINE, OTHER, "label", json!("m10"));
+    owner.write(vec![machine(MC), other]).unwrap();
+    repair_new_registry(&lab);
+    withhold_on(
+        &lab,
+        1,
+        0,
+        vec![put(&MACHINE, MC, "location", json!("rack w"))],
+    );
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let view = handle.view().unwrap();
+    assert!(!view.complete);
+    assert_eq!(view.awaiting.records, 1);
+    assert_eq!(
+        view.awaiting.rows,
+        Some(BTreeSet::from([(MACHINE.name.to_owned(), MC.to_owned())]))
+    );
+
+    // Another row: written now.
+    let exported = export_machines(&lab.paths[0]);
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, OTHER),
+        "location",
+        "rack b",
+    );
+    let plan = sheet::plan(
+        &registry::REGISTRY,
+        &MACHINE,
+        &exported.base,
+        &saved,
+        &no_birth,
+    )
+    .unwrap();
+    let applied = handle.apply(&MACHINE, &plan).unwrap();
+    assert_eq!((applied.records, applied.cells), (1, 1));
+    let after = handle.view().unwrap();
+    assert_eq!(
+        after.awaiting.records, 1,
+        "the save names only records it read as parents, so it waits on nothing"
+    );
+    let rows = after.project(&MACHINE).rows;
+    assert_eq!(rows[OTHER].get("location"), Some(&json!("rack b")));
+
+    // The withheld record's row: waits, naming the count and the row, and writes nothing.
+    let exported = export_machines(&lab.paths[0]);
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, MC),
+        "location",
+        "rack c",
+    );
+    let plan = sheet::plan(
+        &registry::REGISTRY,
+        &MACHINE,
+        &exported.base,
+        &saved,
+        &no_birth,
+    )
+    .unwrap();
+    let error = handle.apply(&MACHINE, &plan).unwrap_err().to_string();
+    assert!(error.contains("history incomplete (1 withheld)"), "{error}");
+    assert!(error.contains(&format!("machine row {MC}")), "{error}");
+    let rows = handle.view().unwrap().project(&MACHINE).rows;
+    assert_eq!(rows[MC].get("location"), Some(&json!("rack a")));
+}
+
+/// A withheld record this Mac cannot read (no command: its rows are unknown) holds back every
+/// write, and a later generation's restated history still arriving holds back every write too;
+/// with nothing withheld, nothing is held back.
+#[test]
+fn an_unreadable_or_unrestated_wait_holds_back_every_row() {
+    let rows = vec![vec![put(&MACHINE, MC, "location", json!("rack b"))]];
+    let mut view = View::empty_for_test();
+    assert_eq!(view.holds_back(&rows), None);
+    view.complete = false;
+    view.awaiting = crate::typed::Awaiting {
+        records: 2,
+        rows: None,
+        restated: true,
+    };
+    let why = view.holds_back(&rows).unwrap();
+    assert!(why.starts_with("history incomplete (2 withheld)"), "{why}");
+    view.awaiting = crate::typed::Awaiting {
+        records: 0,
+        rows: Some(BTreeSet::new()),
+        restated: false,
+    };
+    let why = view.holds_back(&rows).unwrap();
+    assert!(why.contains("restated history is still arriving"), "{why}");
+    view.awaiting = crate::typed::Awaiting {
+        records: 1,
+        rows: Some(BTreeSet::from([(
+            MACHINE.name.to_owned(),
+            "mc-000000000000000b".to_owned(),
+        )])),
+        restated: true,
+    };
+    assert_eq!(view.holds_back(&rows), None);
+}
+
+/// A typed table's checkpoint pass (tracker LT-B10B): fenced while a member reports a build that
+/// cannot read `ATCKP1`; past the fence, Mac 0 proposes a checkpoint of the records at least 14
+/// days old and Mac 1, which recomputes the same body from its own replica, seconds it, so both
+/// seats sign one body and it is final; a pass with nothing new signs nothing; and the table
+/// reads exactly as before, with the checkpoint records neither projected nor refused.
+/// NEGATIVE CONTROL: with `MetadataEvidence::is_table_control` recognizing only cutoffs, the
+/// document log decodes each checkpoint as a command and refuses it: `a checkpoint is never
+/// refused` with two record ids on the left.
+#[test]
+fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
+    use super::checkpoint::{AGE_MS, Signed};
+    use aterm_secrets::commons::{
+        finality,
+        hearing::{self, Ledger, Said},
+    };
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    // Records written 20 days ago: old enough to go below a cut, recent enough that their
+    // writers are current.
+    let now = aterm_time::unix_millis().unwrap();
+    let then = now - 20 * DAY;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    append_history_at(
+        &here,
+        Command::Write {
+            request: [91; 16],
+            changes: machine(MC),
+        },
+        then + 1_000,
+    );
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    append_history_at(
+        &there,
+        Command::Write {
+            request: [92; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        then + 2_000,
+    );
+    repair_registry(&lab, 2);
+    append_history_at(
+        &here,
+        Command::Write {
+            request: [93; 16],
+            changes: vec![put(&MACHINE, MC, "nickname", json!("spare"))],
+        },
+        then + 3_000,
+    );
+    repair_registry(&lab, 2);
+    let before = here.view().unwrap();
+
+    assert!(then + 3_000 + AGE_MS < now);
+    let bootstrap = lab.bootstrap(0);
+    let access = bootstrap.access().unwrap().unwrap();
+    let seats: std::collections::BTreeSet<Actor> = access
+        .members()
+        .iter()
+        .map(|member| member.binding().actor())
+        .collect();
+    let heard_at = |version| {
+        let mut ledger = Ledger::new(bootstrap.trust());
+        for seat in &seats {
+            ledger.record(*seat, now, Said::Version(version));
+        }
+        ledger
+    };
+    let older = heard_at(hearing::Version(0, 202, 0));
+    assert_eq!(
+        here.checkpoint_every(&older, now, 1).unwrap(),
+        Signed::Fenced
+    );
+    let ready = heard_at(hearing::READS_CHECKPOINTS);
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Proposed
+    );
+    assert_eq!(
+        here.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Nothing
+    );
+    repair_registry(&lab, 2);
+    assert_eq!(
+        there.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Seconded
+    );
+    assert_eq!(
+        there.checkpoint_every(&ready, now, 1).unwrap(),
+        Signed::Nothing
+    );
+    repair_registry(&lab, 2);
+
+    let shares = application::observe_store(&lab.paths[0], here.descriptor(), |_, store, _| {
+        Ok(store
+            .checkpoints()
+            .map(|(signer, body)| (signer, body.clone()))
+            .collect::<Vec<_>>())
+    })
+    .unwrap();
+    assert_eq!(shares.len(), 2, "one share from each seat");
+    assert_eq!(shares[0].1, shares[1].1, "one body");
+    assert!(shares[0].1.below > 0);
+    let signed = shares.iter().map(|(signer, _)| *signer).collect();
+    assert!(finality::is_final(&seats, &signed));
+
+    let after = here.view().unwrap();
+    assert_eq!(after.cells, before.cells);
+    assert_eq!(after.owned, before.owned);
+    assert_eq!(
+        after.refused, before.refused,
+        "a checkpoint is never refused"
+    );
+}

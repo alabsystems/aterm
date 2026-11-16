@@ -161,7 +161,10 @@ fn reused_mesh_access_history(competing: bool) {
     assert_eq!(control(), before);
     // Exercise production access before the independent control opens any new
     // session, so it cannot refresh shared observations on the adapter's behalf.
-    let physical = access.table_inventory(scope.digest()).unwrap();
+    let physical = access
+        .table_inventory(scope.digest())
+        .unwrap()
+        .map(|held| held.ids().copied().collect::<BTreeSet<_>>());
     let outgoing = access.table_wires(scope.digest(), &ids).unwrap();
     {
         let session = Session::observe(&b).unwrap();
@@ -319,7 +322,9 @@ fn a_delivered_operation_applies_once_and_bad_or_unselected_records_are_refused(
     );
     assert!(seen.is_empty(), "and appends nothing: {seen:?}");
     assert_eq!(
-        b.mesh_inventory(catalog.digest()).unwrap(),
+        b.mesh_inventory(catalog.digest())
+            .unwrap()
+            .map(|held| held.ids().copied().collect::<BTreeSet<_>>()),
         Some(BTreeSet::from([*id]))
     );
     assert_eq!(
@@ -349,7 +354,7 @@ fn a_delivered_operation_applies_once_and_bad_or_unselected_records_are_refused(
             .as_slice(),
         [Verdict::Refused(_)]
     ));
-    assert_eq!(b.mesh_inventory([7; 32]).unwrap(), None);
+    assert!(b.mesh_inventory([7; 32]).unwrap().is_none());
     assert!(
         b.mesh_ingest(
             catalog.digest(),
@@ -584,7 +589,9 @@ fn a_mesh_read_checks_its_store_once_as_it_opens() {
     let reads: [(&str, &dyn Fn()); 5] = [
         ("operation inventory", &|| {
             assert_eq!(
-                b.mesh_inventory(table).unwrap(),
+                b.mesh_inventory(table)
+                    .unwrap()
+                    .map(|held| held.ids().copied().collect::<BTreeSet<_>>()),
                 Some(BTreeSet::from([*id]))
             );
         }),

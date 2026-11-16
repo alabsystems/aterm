@@ -371,7 +371,7 @@ fn a_fresh_vault_member_joins_the_default_fleet_and_can_be_driven() {
     assert_eq!(read_line_raw(&mut driven, 4096).unwrap().unwrap(), "OK 1\n");
     let result = read_line_raw(&mut driven, 4096).unwrap().unwrap();
     assert!(
-        result.contains("sid=s-woken") && result.contains(issuer_id.node()),
+        result.contains("sid=t0000000e01") && result.contains(issuer_id.node()),
         "{result}"
     );
     drop(driven);

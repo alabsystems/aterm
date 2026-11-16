@@ -82,13 +82,13 @@ fn an_ended_restored_source_releases_its_lane_and_reads_a_successors_first_recei
             first_seq: 1,
             next_seq: 1,
             sessions: vec![SessionUsage {
-                session: "tacde112200".into(),
+                session: "s-000000000000acde1122".into(),
                 reaped_cpu_ns: 10,
                 unread: 0,
             }],
             terminals: vec![Terminal {
                 seq: 1,
-                session: "tacde112200".into(),
+                session: "s-000000000000acde1122".into(),
                 process: ProcessKey { pid: 200, start: 2 },
                 uid: Some(501),
                 coalition: None,
@@ -140,7 +140,9 @@ fn an_ended_restored_source_releases_its_lane_and_reads_a_successors_first_recei
             |since| forwarder.resource_observation(since),
         );
         assert!(read.source_ended && retired.get());
-        assert_eq!(read.result.unwrap().terminals[0].seq, 1);
+        let observed = read.result.unwrap();
+        assert_eq!(observed.terminals[0].seq, 1);
+        assert_eq!(observed.terminals[0].session, "s-000000000000acde1122");
         worker.join().unwrap();
     }
 }

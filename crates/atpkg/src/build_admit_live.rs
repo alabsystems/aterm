@@ -59,6 +59,9 @@ enum Phase {
 #[derive(Debug)]
 pub struct Cancellation {
     inbox: UnixDatagram,
+    // Intent handles do not own job lifetime. Keep the SAME native peer until
+    // the actual supervisor retires; dropping external handles is no cancellation.
+    _peer: Arc<UnixDatagram>,
     wake: Arc<aterm_uds::childwake::ChildWake>,
     owner: u32,
     grace: Duration,
@@ -88,10 +91,12 @@ impl Cancellation {
         let (sender, inbox) = aterm_uds::kept_out(UnixDatagram::pair)?;
         sender.set_nonblocking(true)?;
         inbox.set_nonblocking(true)?;
+        let sender = Arc::new(sender);
         Ok((
-            CancelHandle(Arc::new(sender)),
+            CancelHandle(Arc::clone(&sender)),
             Self {
                 inbox,
+                _peer: sender,
                 wake,
                 owner: std::process::id(),
                 grace,
@@ -258,3 +263,7 @@ impl Cancellation {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "build_admit_cancellation_tests.rs"]
+pub(super) mod tests;

@@ -421,6 +421,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         pinned: false,
         sid: None,
         lineage: None,
+        opened_ms: None,
         log_ep: None,
         cwd: None,
         title: String::new(),

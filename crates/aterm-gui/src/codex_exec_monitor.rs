@@ -80,15 +80,7 @@ fn run(mut job: Job) {
             policy: ctx.native_policy.quota_rotation_enabled(),
         });
         let pid = i32::try_from(job.source.pid).unwrap_or(-1);
-        if !gone {
-            gone = aterm_uds::process::read_birth(pid)
-                .is_some_and(|birth| birth.0 != job.source.birth)
-                || matches!(
-                    aterm_uds::process::process_presence(pid),
-                    aterm_uds::process::ProcessPresence::Absent
-                        | aterm_uds::process::ProcessPresence::Exited
-                );
-        }
+        gone = gone || super::super::ProcessKey::of(&job.source).gone();
         let expired = remaining(job.settlement.deadline()).is_none();
         let poll = job.settlement.poll(
             observation,

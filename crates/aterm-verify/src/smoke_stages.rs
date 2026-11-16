@@ -233,7 +233,12 @@ enum Ready {
     Stopped,
 }
 
-fn bring_up(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, bundle: &crate::MeasureArtifact) -> Ready {
+fn bring_up(
+    ctx: &Ctx,
+    r: &mut Report,
+    sb: &mut Sandbox,
+    bundle: &crate::AdmittedArtifact<'_>,
+) -> Ready {
     let tag = "gui smoke";
     let (gui, ctl) = (bundle.bin("aterm-gui"), bundle.bin("aterm-ctl"));
     if !crate::is_executable_file(&gui) || !crate::is_executable_file(&ctl) {
@@ -353,6 +358,15 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         r.skip(format!("gui smoke {}", crate::stages::NO_APP));
         return;
     };
+    if let Err(why) =
+        bundle.with_admission(ctx, |admitted| gui_typing_smoke_admitted(ctx, r, admitted))
+    {
+        r.cannot_run(format!("gui smoke: {why}"));
+    }
+}
+
+fn gui_typing_smoke_admitted(ctx: &Ctx, r: &mut Report, bundle: &crate::AdmittedArtifact<'_>) {
+    r.raw(format!("GUI smoke subject: {}", bundle.describe()));
     let Some(mut sb) = Sandbox::with_config("atl", SMOKE_CONFIG) else {
         r.cannot_run("gui smoke: mktemp");
         return;
@@ -366,8 +380,8 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
             typing_burst(ctx, r, &mut sb, &ctl_bin);
         });
         if !ctx.cursor_pacing {
-            crate::stages::native_row(ctx, r, "release AOS", |r| {
-                aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
+            crate::stages::native_row(ctx, r, &format!("{} AOS", bundle.profile().name()), |r| {
+                aos_step(ctx, r, &mut sb, &ctl_bin, &subject, bundle.profile());
             });
             crate::stages::native_row(ctx, r, "Settings hardware keys", |r| {
                 settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
@@ -400,14 +414,15 @@ pub const AOS_BUNDLE_REFUSAL: &str = "ERR aos bundle needs a debug build";
 const CTL_STDERR: &str = "aterm-ctl: ";
 
 /// The bundle's `aos` verb attaches and detaches the front window's glow, and refuses only the debug forms (design §14.5 R0 exit item 8).
-fn aos_release_step(
+fn aos_step(
     ctx: &Ctx,
     r: &mut Report,
     sb: &mut Sandbox,
     ctl_bin: &Path,
     subject: &crate::stages::Subject,
+    profile: crate::artifact::Profile,
 ) {
-    let tag = "gui smoke: release aos";
+    let tag = format!("gui smoke: {} aos", profile.name());
     let Some(pid) = sb.child.as_ref().map(SmokeChild::id) else {
         r.cannot_run(format!("{tag}: no child to drive"));
         return;
@@ -426,7 +441,7 @@ fn aos_release_step(
             subject.unanswered(
                 r,
                 None,
-                tag,
+                &tag,
                 &[format!("aos status ({})", status.trim_end())],
             );
             return;
@@ -444,7 +459,11 @@ fn aos_release_step(
     let attach = ctl(ctx, sb, ctl_bin, &["aos", "attach"]);
     let detach = ctl(ctx, sb, ctl_bin, &["aos", "detach"]);
     let bundle = ctl(ctx, sb, ctl_bin, &["aos", "bundle"]);
-    match aos_release_verdict(&attach, &detach, &bundle) {
+    let verdict = match profile {
+        crate::artifact::Profile::Release => aos_release_verdict(&attach, &detach, &bundle),
+        crate::artifact::Profile::Debug => aos_debug_verdict(&attach, &detach, &bundle),
+    };
+    match verdict {
         Ok(line) => r.pass(line),
         Err(bad) => r.fail(bad),
     }
@@ -468,6 +487,26 @@ pub fn aos_release_verdict(attach: &str, detach: &str, bundle: &str) -> Result<S
         ));
     }
     Ok("the release aos verb attached and detached the glow and refused bundle by name".into())
+}
+
+/// The explicit debug contract: attach/detach still drive shipped glow code; the debug-only
+/// bundle form is available but this fresh window has published no plan. This proves no release
+/// refusal and can never qualify a release gate.
+fn aos_debug_verdict(attach: &str, detach: &str, bundle: &str) -> Result<String, String> {
+    if !(ok_reply(attach) && attach.contains(" attached=true code=shipped ")) {
+        return Err(format!("gui smoke: aos attach -> {}", or_no_reply(attach)));
+    }
+    if !ok_reply(detach) {
+        return Err(format!("gui smoke: aos detach -> {}", or_no_reply(detach)));
+    }
+    const NO_PUBLICATION: &str = "ERR no published plan is live in the front window (a repair, an attach or a detach since its publication drops its bundle)";
+    if server_reply(bundle) != NO_PUBLICATION {
+        return Err(format!(
+            "gui smoke: debug aos bundle -> {} (the fresh debug window has no published plan)",
+            or_no_reply(bundle)
+        ));
+    }
+    Ok("the debug aos verb attached and detached the glow and answered bundle with no published plan; debug validation does not qualify a release".into())
 }
 
 fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {

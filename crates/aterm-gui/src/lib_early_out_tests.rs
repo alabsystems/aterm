@@ -123,9 +123,10 @@ fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
         let Backend::Cpu(renderer) = backend.ready_mut() else {
             panic!("headless test backend is CPU")
         };
-        let ws = windows
+        let mut route_guard_ws = windows
             .get_mut(&WindowId(0))
             .expect("headless fixture window");
+        let ws = &mut **route_guard_ws;
         let _ = renderer.render_input_cached(&mut ws.cpu_cache, input);
         ws.cpu_cache.frame_pixels().to_vec()
     }
@@ -269,7 +270,7 @@ fn run_asymmetric_pad_layout_conformance() {
         "the GUI backend delegate must not snap a same-value pad to symmetry"
     );
     let cached = {
-        let ws = app
+        let mut ws = app
             .windows
             .get_mut(&WindowId(0))
             .expect("headless fixture window");
@@ -309,7 +310,7 @@ fn dropped_surface_attempt_unstamps_same_key_for_retry() {
     let wid = WindowId(0);
     let mut app = App::headless_for_test();
     {
-        let ws = app.windows.get_mut(&wid).expect("fixture window");
+        let mut ws = app.windows.get_mut(&wid).expect("fixture window");
         ws.stamp_present_decision(key);
         assert!(
             !should_repaint(ws.last_present, key),

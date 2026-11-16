@@ -919,12 +919,14 @@ fn the_permission_clicks_ends_conform_to_its_model() {
         "the plain reason: {text:?}"
     );
     drive_click_action("Rest", || {
-        let s = app
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
+        let mut window_guard = app.windows.get_mut(&wid).unwrap();
+        let s = window_guard
+            .claude_lights
+            .sessions
+            .get_mut(&session)
             .expect("the session's lights");
         s.refused.as_mut().expect("the refusal said").2 = Instant::now();
+        drop(window_guard);
         app.drain_claude_lights();
     });
     check_click_transition(&app, at, "Rest", &mut state, None);

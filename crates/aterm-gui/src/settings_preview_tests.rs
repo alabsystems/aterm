@@ -6437,6 +6437,73 @@ fn the_flying_cat_rides_beside_the_caret_on_its_row() {
     }
 }
 
+/// THE PREVIEW'S FLIER FLIES THE TAB COMPLETION, AS THE TERMINAL'S DOES. The scene's Tab
+/// completes eight cells at once; drawn at its rest past them on that frame, the glide moved there
+/// at full alpha in one frame, the pop the terminal's flier no longer makes
+/// (`WordDecorations::fly_kitty_glide`). Played in turn a motion step apart over the Tab, no frame
+/// moves the full-alpha glide more than its stride unless a frame beside it moves it on by half
+/// as much, a flight's steps. Control: the glide drawn at its rest (`GLIDE_JUMPS`) pops there.
+#[test]
+fn the_flying_cat_flies_the_tab_completion() {
+    use aterm_effects::word_decorations::{GLIDE_JUMPS, GLIDE_STRIDE};
+    let stride = i32::from(GLIDE_STRIDE) * 8;
+    let read = || {
+        let middles: Vec<Option<(i32, i32)>> = (1_200..=2_600)
+            .step_by(usize::try_from(MOTION_STEP_MS).unwrap_or(1))
+            .map(|phase| {
+                let input = played(
+                    &SettingsPreviewSpec::cursor(flying_cat()).with_phase(phase),
+                    Theme::default(),
+                );
+                sprites(&input)
+                    .into_iter()
+                    .filter(|sprite| sprite.alpha == u8::MAX)
+                    .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                    .map(|sprite| {
+                        (
+                            2 * sprite.x + i32::from(sprite.w),
+                            2 * sprite.y + i32::from(sprite.h),
+                        )
+                    })
+            })
+            .collect();
+        let steps: Vec<i32> = middles
+            .windows(2)
+            .map(|pair| match (pair[0], pair[1]) {
+                (Some(a), Some(b)) => ((b.0 - a.0).abs().max((b.1 - a.1).abs()) + 1) / 2,
+                _ => 0,
+            })
+            .collect();
+        let pops: Vec<(usize, i32)> = steps
+            .iter()
+            .enumerate()
+            .filter(|&(i, &step)| {
+                let before = i.checked_sub(1).map_or(0, |b| steps[b]);
+                let after = steps.get(i + 1).copied().unwrap_or(0);
+                step > stride && before * 2 < step && after * 2 < step
+            })
+            .map(|(i, &step)| (i, step))
+            .collect();
+        // How far it went over the read, px: its middle's reach along the row.
+        let xs = middles.iter().flatten().map(|m| m.0 / 2);
+        let went = xs.clone().max().unwrap_or(0) - xs.min().unwrap_or(0);
+        (pops, went)
+    };
+    let (pops, went) = read();
+    assert!(
+        went >= 8 * 8,
+        "the glide goes past the Tab's eight cells over the read: {went} px"
+    );
+    assert!(pops.is_empty(), "the flier pops at the Tab: {pops:?}");
+    GLIDE_JUMPS.with(|c| c.set(true));
+    let (jumped, _) = read();
+    GLIDE_JUMPS.with(|c| c.set(false));
+    assert!(
+        !jumped.is_empty(),
+        "control: the glide drawn at its rest pops at the Tab"
+    );
+}
+
 #[test]
 fn reduced_motion_preview_suppresses_the_flying_cat_s_flight() {
     let reduced = played(

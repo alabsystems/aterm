@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use super::*;
 
-const SID: &str = "s-ab";
+const SID: &str = "tabxxxxxxxx";
 const URI: &str = "file:///tmp/x%20y/COMMIT_EDITMSG";
 
 /// How long the mock window may take to accept and answer the connect phase.
@@ -116,16 +116,16 @@ fn redial_by_uri_after_replaced() {
         " ",
         "s-",
         "s-g",
-        "@s-ab",
+        "@tabxxxxxxxx",
         ".",
         "1",
         "../s-ab",
-        "s-ab,s-cd",
-        "s-ab close",
-        "s-ab\n",
-        "s-ab\r",
-        "s-ab\tedit",
-        "s-ab close\n@s-ab",
+        "tabxxxxxxxx,tcdxxxxxxxx",
+        "tabxxxxxxxx close",
+        "tabxxxxxxxx\n",
+        "tabxxxxxxxx\r",
+        "tabxxxxxxxx\tedit",
+        "tabxxxxxxxx close\n@tabxxxxxxxx",
     ] {
         let mut wire =
             Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::PermissionDenied.into())]);
@@ -235,16 +235,16 @@ fn err_reply_selects_terminal_face() {
         " ",
         "s-",
         "s-g",
-        "@s-ab",
+        "@tabxxxxxxxx",
         ".",
         "1",
         "../s-ab",
-        "s-ab,s-cd",
-        "s-ab close",
-        "s-ab\n",
-        "s-ab\r",
-        "s-ab\tedit",
-        "s-ab close\n@s-ab",
+        "tabxxxxxxxx,tcdxxxxxxxx",
+        "tabxxxxxxxx close",
+        "tabxxxxxxxx\n",
+        "tabxxxxxxxx\r",
+        "tabxxxxxxxx\tedit",
+        "tabxxxxxxxx close\n@tabxxxxxxxx",
     ] {
         let mut wire =
             Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::PermissionDenied.into())]);
@@ -433,9 +433,15 @@ fn edit_and_await_edit_over_a_real_socket() {
     assert_eq!(heard[..2], probe);
     assert_eq!(heard[2], format!("@{SID} edit {URI}\n"));
     assert_eq!(heard[3..5], probe);
-    assert_eq!(heard[5], "@s-ab await edit ticket=9 timeout=600000\n");
+    assert_eq!(
+        heard[5],
+        "@tabxxxxxxxx await edit ticket=9 timeout=600000\n"
+    );
     assert_eq!(heard[6..8], probe);
-    assert_eq!(heard[8], "@s-ab await edit ticket=9 timeout=600000\n");
+    assert_eq!(
+        heard[8],
+        "@tabxxxxxxxx await edit ticket=9 timeout=600000\n"
+    );
 }
 
 /// NEGATIVE CONTROL: `await_over` must reject unsendable keys or fallback URIs before dialing and

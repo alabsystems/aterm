@@ -23,6 +23,7 @@ fn record(pid: u32, start_ms: u64, need: Need, held: bool) -> Record {
         timing: crate::TimingEvidence::default(),
         pid,
         start_ms,
+        laid_at: None,
         seq: 0,
         checkout: "/ck".to_owned(),
         need,

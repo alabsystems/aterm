@@ -139,8 +139,8 @@ fn relay<'b>(
 
 #[test]
 fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
-    let mut t = FrameTracker::new("subscribe @s-a,@s-b screen,events\n");
-    t.feed(b"sub 1 s-a\nsub 2 s-b\nEVENT 1 exited\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx,@tbxxxxxxxxx screen,events\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nsub 2 tbxxxxxxxxx\nEVENT 1 exited\n");
     assert!(!t.session_over(), "one of two targets exited");
     t.feed(b"EVENT 2 exi");
     assert!(
@@ -150,12 +150,12 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     t.feed(b"ted\n");
     assert!(t.session_over());
 
-    let mut t = FrameTracker::new("subscribe @s-a screen,bytes,events\n");
-    t.feed(b"sub 1 s-a\nDELTA 1 seq=4 screen 2\nEVENT 1 exited\nsub 9 s-row\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx screen,bytes,events\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nDELTA 1 seq=4 screen 2\nEVENT 1 exited\nsub 9 s-row\n");
     assert!(!t.session_over(), "screen rows are rows, not frames");
     assert_eq!(
         t.sids(),
-        [("1".to_string(), "s-a".to_string())],
+        [("1".to_string(), "taxxxxxxxxx".to_string())],
         "a body that reads like a `sub` line is no target"
     );
     t.feed(b"BYTES 1 15\nEVENT 1 exit");
@@ -165,12 +165,12 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     assert!(t.session_over(), "the real frame after the bodies");
 
     let mut t = FrameTracker::new("subscribe @* events\n");
-    t.feed(b"sub 1 s-a\nEVENT 1 exited\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nEVENT 1 exited\n");
     assert!(!t.session_over());
 
-    let mut t = FrameTracker::new("subscribe @s-a events\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx events\n");
     t.feed(
-        b"sub 1 s-a\nEVENT 1 block-complete 12 exit=0\n\
+        b"sub 1 taxxxxxxxxx\nEVENT 1 block-complete 12 exit=0\n\
           EVENT 1 turn 7 submitted=1 status=settled dur_ms=5\nEVENT 1 exited\n",
     );
     t.start_leg(LegSession::Same);
@@ -183,14 +183,14 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
             ..EventAnchors::default()
         }
     );
-    let mut t = FrameTracker::new("subscribe @s-a events\n");
-    t.feed(b"sub 1 s-a\nEVENT 1 exited\nDELTA 1 seq=1 screen x\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx events\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nEVENT 1 exited\nDELTA 1 seq=1 screen x\n");
     assert!(!t.session_over());
-    let mut t = FrameTracker::new("subscribe @s-a events\n");
-    t.feed(b"sub 1 s-a\nEVENT 1 exited\nDELTA 1 seq=1 screen +2\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx events\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nEVENT 1 exited\nDELTA 1 seq=1 screen +2\n");
     assert!(!t.session_over());
-    let mut t = FrameTracker::new("subscribe @s-a events\n");
-    t.feed(b"sub 1 s-a\nEVENT 1 exited\nBYTES 1 +2\n");
+    let mut t = FrameTracker::new("subscribe @taxxxxxxxxx events\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nEVENT 1 exited\nBYTES 1 +2\n");
     assert!(!t.session_over());
 }
 
@@ -202,17 +202,17 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
         turn: Some(7),
         ..EventAnchors::default()
     };
-    let tied = [("1".to_string(), "s-aaaa".to_string())];
+    let tied = [("1".to_string(), "taaaaxxxxxx".to_string())];
     let local = [
-        ("3".to_string(), "s-aaaa".to_string()),
-        ("5".to_string(), "s-bbbb".to_string()),
+        ("3".to_string(), "taaaaxxxxxx".to_string()),
+        ("5".to_string(), "tbbbbxxxxxx".to_string()),
     ];
     for (request, sids, anchors, resumed) in [
         (
-            "@s-a subscribe screen,events since=41 since-turn=7 since-block=3 every-frame\n",
+            "@taxxxxxxxxx subscribe screen,events since=41 since-turn=7 since-block=3 every-frame\n",
             &[][..],
             none,
-            Some("@s-a subscribe screen,events every-frame since-block=3 since-turn=7\n"),
+            Some("@taxxxxxxxxx subscribe screen,events every-frame since-block=3 since-turn=7\n"),
         ),
         (
             "subscribe @* sessions\n",
@@ -221,57 +221,57 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
             Some("subscribe @* sessions\n"),
         ),
         (
-            "subscribe @s-a events since-block=20\n",
+            "subscribe @taxxxxxxxxx events since-block=20\n",
             &[][..],
             EventAnchors {
                 block: Some(12),
                 turn: None,
                 ..EventAnchors::default()
             },
-            Some("subscribe @s-a events since-block=20\n"),
+            Some("subscribe @taxxxxxxxxx events since-block=20\n"),
         ),
         (
-            "subscribe @s-a,@s-b events\n",
+            "subscribe @taxxxxxxxxx,@tbxxxxxxxxx events\n",
             &[][..],
             seen,
-            Some("subscribe @s-a,@s-b events\n"),
+            Some("subscribe @taxxxxxxxxx,@tbxxxxxxxxx events\n"),
         ),
         (
-            "subscribe @s-bbbb events\n",
+            "subscribe @tbbbbxxxxxx events\n",
             &[][..],
             seen,
-            Some("subscribe @s-bbbb events since-block=12 since-turn=7\n"),
+            Some("subscribe @tbbbbxxxxxx events since-block=12 since-turn=7\n"),
         ),
         (
             "subscribe @3 screen,events since=9\n",
             &local[..],
             none,
-            Some("subscribe @s-aaaa screen,events\n"),
+            Some("subscribe @taaaaxxxxxx screen,events\n"),
         ),
         (
-            "subscribe @3,@s-cccc,@.,@5 events\n",
+            "subscribe @3,@tccccxxxxxx,@.,@5 events\n",
             &local[..],
             none,
-            Some("subscribe @s-aaaa,@s-cccc,@.,@s-bbbb events\n"),
+            Some("subscribe @taaaaxxxxxx,@tccccxxxxxx,@.,@tbbbbxxxxxx events\n"),
         ),
         ("subscribe @4 events\n", &local[..], none, None),
         (
             "subscribe @. events\n",
             &tied[..],
             seen,
-            Some("subscribe @s-aaaa events since-block=12 since-turn=7\n"),
+            Some("subscribe @taaaaxxxxxx events since-block=12 since-turn=7\n"),
         ),
         (
             "subscribe events\n",
             &tied[..],
             seen,
-            Some("subscribe @s-aaaa events since-block=12 since-turn=7\n"),
+            Some("subscribe @taaaaxxxxxx events since-block=12 since-turn=7\n"),
         ),
         (
             "@. subscribe screen,events since=4\n",
             &tied[..],
             seen,
-            Some("@s-aaaa subscribe screen,events since-block=12 since-turn=7\n"),
+            Some("@taaaaxxxxxx subscribe screen,events since-block=12 since-turn=7\n"),
         ),
         (
             "subscribe @. events since-block=3\n",
@@ -304,10 +304,10 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
             &tied[..],
             Some("@. subscribe screen,events\n"),
         ),
-        ("subscribe @s-bbbb events\n", &tied[..], None),
+        ("subscribe @tbbbbxxxxxx events\n", &tied[..], None),
         ("subscribe @. events\n", &[][..], None),
-        ("subscribe @.,@s-cccc events\n", &tied[..], None),
-        ("@. subscribe @s-cccc events\n", &tied[..], None),
+        ("subscribe @.,@tccccxxxxxx events\n", &tied[..], None),
+        ("@. subscribe @tccccxxxxxx events\n", &tied[..], None),
         ("subscribe @1 events\n", &tied[..], None),
         ("subscribe @* sessions\n", &tied[..], None),
     ] {
@@ -321,45 +321,45 @@ fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
 
 #[test]
 fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
-    let request = "subscribe @s-a log since-log=5 log-ep=1\n";
+    let request = "subscribe @taxxxxxxxxx log since-log=5 log-ep=1\n";
     let mut t = FrameTracker::new(request);
     t.feed(
-        b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1\n\
+        b"OK subscribe 1\nsub 1 taxxxxxxxxx log_seq=5 log_ep=1\n\
           LOG 1 6 open r1 cmd src=shell conf=strong t=1\n\
           LOG 1 9 close r1 cmd out=ok src=shell conf=strong t=2\n",
     );
     let resumed = resume_request(request, &t.sids(), &t.anchors()).expect("resumes");
-    assert_eq!(resumed, "subscribe @s-a log since-log=9 log-ep=1\n");
+    assert_eq!(resumed, "subscribe @taxxxxxxxxx log since-log=9 log-ep=1\n");
     assert!(
         !resumed.contains("since-log=5"),
         "NEGATIVE CONTROL: the request's own anchor would replay 6..9"
     );
-    let live = "subscribe @s-a log\n";
+    let live = "subscribe @taxxxxxxxxx log\n";
     let mut t = FrameTracker::new(live);
-    t.feed(b"OK subscribe 1\nsub 1 s-a log_seq=12 log_ep=3\n");
+    t.feed(b"OK subscribe 1\nsub 1 taxxxxxxxxx log_seq=12 log_ep=3\n");
     assert_eq!(
         resume_request(live, &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-a log since-log=12 log-ep=3\n"),
+        Some("subscribe @taxxxxxxxxx log since-log=12 log-ep=3\n"),
         "nothing relayed yet: from where it started"
     );
     t.start_leg(LegSession::Same);
     t.feed(
-        b"OK subscribe 1\nsub 1 s-a log_seq=12 log_ep=3\n\
+        b"OK subscribe 1\nsub 1 taxxxxxxxxx log_seq=12 log_ep=3\n\
           GAP 1 log-lost=0 why=handoff resync_to=1012 ep=4\n\
           LOG 1 1013 mark - handoff src=aterm conf=exact t=3\n",
     );
     assert_eq!(
         resume_request(live, &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-a log since-log=1013 log-ep=4\n"),
+        Some("subscribe @taxxxxxxxxx log since-log=1013 log-ep=4\n"),
         "a gap's epoch, then the record after it"
     );
     let mut t = FrameTracker::new(live);
-    t.feed(b"OK subscribe 1\nsub 1 s-a\nLOG 1 4 mark - bell src=engine conf=strong t=1\n");
+    t.feed(b"OK subscribe 1\nsub 1 taxxxxxxxxx\nLOG 1 4 mark - bell src=engine conf=strong t=1\n");
     assert_eq!(
         resume_request(live, &t.sids(), &t.anchors()).as_deref(),
         Some(live)
     );
-    let tied = [("1".to_string(), "s-a".to_string())];
+    let tied = [("1".to_string(), "taxxxxxxxxx".to_string())];
     let seen = EventAnchors {
         log_seq: Some(9),
         log_ep: Some(1),
@@ -368,18 +368,18 @@ fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
     let own = "subscribe @. log since-log=5 log-ep=1\n";
     assert_eq!(
         resume_request(own, &tied, &seen).as_deref(),
-        Some("subscribe @s-a log since-log=9 log-ep=1\n")
+        Some("subscribe @taxxxxxxxxx log since-log=9 log-ep=1\n")
     );
     assert_eq!(
         unpinned_resume_request(own, &tied, &seen).as_deref(),
         Some("subscribe @. log\n")
     );
     assert_eq!(
-        resume_request("subscribe @s-a,@s-b log\n", &[], &seen).as_deref(),
-        Some("subscribe @s-a,@s-b log\n")
+        resume_request("subscribe @taxxxxxxxxx,@tbxxxxxxxxx log\n", &[], &seen).as_deref(),
+        Some("subscribe @taxxxxxxxxx,@tbxxxxxxxxx log\n")
     );
     let mut t = FrameTracker::new(live);
-    t.feed(b"sub 1 s-a log_seq=7 log_ep=2\n");
+    t.feed(b"sub 1 taxxxxxxxxx log_seq=7 log_ep=2\n");
     t.start_leg(LegSession::Other);
     assert_eq!(t.anchors(), EventAnchors::default());
 }
@@ -389,15 +389,15 @@ fn a_resumed_log_stream_continues_after_the_last_record_relayed() {
 /// after a reset is not reset again by the request's stale base.
 #[test]
 fn a_resumed_log_stream_names_the_log_only_where_its_request_did() {
-    let request = "subscribe @s-a log since-log=5 log-ep=1 log-base=1\n";
+    let request = "subscribe @taxxxxxxxxx log since-log=5 log-ep=1 log-base=1\n";
     let mut t = FrameTracker::new(request);
     t.feed(
-        b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1 log_base=1\n\
+        b"OK subscribe 1\nsub 1 taxxxxxxxxx log_seq=5 log_ep=1 log_base=1\n\
           LOG 1 9 close r1 cmd out=ok src=shell conf=strong t=2\n",
     );
     assert_eq!(
         resume_request(request, &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-a log since-log=9 log-ep=1 log-base=1\n")
+        Some("subscribe @taxxxxxxxxx log since-log=9 log-ep=1 log-base=1\n")
     );
     t.feed(
         b"GAP 1 log-lost=0 why=reset resync_to=0 ep=7 base=6\n\
@@ -405,18 +405,18 @@ fn a_resumed_log_stream_names_the_log_only_where_its_request_did() {
     );
     assert_eq!(
         resume_request(request, &t.sids(), &t.anchors()).as_deref(),
-        Some("subscribe @s-a log since-log=1 log-ep=7 log-base=6\n"),
+        Some("subscribe @taxxxxxxxxx log since-log=1 log-ep=7 log-base=6\n"),
         "the reset's base, never the request's stale one"
     );
-    let plain = "subscribe @s-a log since-log=5 log-ep=1\n";
+    let plain = "subscribe @taxxxxxxxxx log since-log=5 log-ep=1\n";
     let mut t = FrameTracker::new(plain);
-    t.feed(b"OK subscribe 1\nsub 1 s-a log_seq=5 log_ep=1 log_base=1\n");
+    t.feed(b"OK subscribe 1\nsub 1 taxxxxxxxxx log_seq=5 log_ep=1 log_base=1\n");
     assert_eq!(
         resume_request(plain, &t.sids(), &t.anchors()).as_deref(),
         Some(plain),
         "a request that named no log resumes naming none"
     );
-    let tied = [("1".to_string(), "s-a".to_string())];
+    let tied = [("1".to_string(), "taxxxxxxxxx".to_string())];
     let own = "subscribe @. log since-log=5 log-ep=1 log-base=1\n";
     assert_eq!(
         unpinned_resume_request(own, &tied, &EventAnchors::default()).as_deref(),
@@ -432,9 +432,9 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
         turn: None,
         ..EventAnchors::default()
     };
-    let tied = [("1".to_string(), "s-a".to_string())];
+    let tied = [("1".to_string(), "taxxxxxxxxx".to_string())];
     let original = "subscribe @. cursor,events\n";
-    let after_update = "subscribe @s-a cursor,events since-block=5\n";
+    let after_update = "subscribe @taxxxxxxxxx cursor,events since-block=5\n";
     assert_eq!(
         resume_lines(original, after_update, &tied, &seen),
         Some((after_update.to_string(), Some(original.to_string())))
@@ -448,7 +448,7 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
         resume_lines(original, original, &tied, &seen),
         Some((after_update.to_string(), Some(original.to_string())))
     );
-    let by_sid = "subscribe @s-a cursor,events\n";
+    let by_sid = "subscribe @taxxxxxxxxx cursor,events\n";
     assert_eq!(
         resume_lines(by_sid, by_sid, &tied, &seen),
         Some((after_update.to_string(), None))
@@ -935,7 +935,7 @@ fn conn_after(
 #[cfg(unix)]
 #[test]
 fn a_write_that_fails_reads_the_refusal_the_successor_left() {
-    let big = format!("subscribe @s-a cursor {}\n", "x".repeat(4 << 20));
+    let big = format!("subscribe @taxxxxxxxxx cursor {}\n", "x".repeat(4 << 20));
     let ask = |client: &CtlStream| {
         let mut reader = super::super::reply_on(client);
         ask_once(client, &mut reader, None, &big)
@@ -967,7 +967,7 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
     });
     let mut reader = super::super::reply_on(&client);
     assert!(
-        matches!(ask_once(&client, &mut reader, None, "subscribe @s-a cursor\n"), Answer::Line(l) if l.is_empty())
+        matches!(ask_once(&client, &mut reader, None, "subscribe @taxxxxxxxxx cursor\n"), Answer::Line(l) if l.is_empty())
     );
     server.join().unwrap();
 }
@@ -978,7 +978,7 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
 #[test]
 fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_0() {
     let filler = "x".repeat(4 << 20);
-    let request = format!("subscribe @s-a cursor,events {filler}\n");
+    let request = format!("subscribe @taxxxxxxxxx cursor,events {filler}\n");
     for (shape, closes, saturated) in [
         ("silent", 1, 0),
         ("saturated", 1, 3),
@@ -990,7 +990,7 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
         let old = fake_server(
             aterm_uds::CtlListener::bind(&sock).unwrap(),
             sock.clone(),
-            "OK subscribe 1\nsub 1 s-a\n",
+            "OK subscribe 1\nsub 1 taxxxxxxxxx\n",
             true,
             seen_tx,
         );
@@ -1035,7 +1035,8 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
                     let _ = conn.set_read_timeout(None);
                     let mut rest = String::new();
                     let _ = std::io::BufReader::new(&conn).read_line(&mut rest);
-                    let _ = (&conn).write_all(b"OK subscribe 1\nsub 1 s-a\nEVENT 1 exited\n");
+                    let _ =
+                        (&conn).write_all(b"OK subscribe 1\nsub 1 taxxxxxxxxx\nEVENT 1 exited\n");
                 }
             }
         });
@@ -1072,7 +1073,7 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
                 "{shape}: the stream resumed: {out}"
             );
             assert!(
-                out.ends_with("sub 1 s-a\nEVENT 1 exited\n"),
+                out.ends_with("sub 1 taxxxxxxxxx\nEVENT 1 exited\n"),
                 "{shape}: the successor's leg was relayed: {out}"
             );
             assert_eq!(
@@ -1089,14 +1090,14 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
 #[cfg(unix)]
 #[test]
 fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
-    let request = "subscribe @s-a cursor,events\n";
+    let request = "subscribe @taxxxxxxxxx cursor,events\n";
     let (_dir, sock) = scratch_sock("rd-busy-again");
     let path = sock.to_str().unwrap().to_string();
     let (seen_tx, _seen) = std::sync::mpsc::channel();
     let old = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\n",
+        "OK subscribe 1\nsub 1 taxxxxxxxxx\n",
         true,
         seen_tx,
     );
@@ -1131,7 +1132,7 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
             } else if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 let _ = (&conn).write_all(b"ERR control server busy; retry\n");
             } else {
-                let _ = (&conn).write_all(b"OK subscribe 1\nsub 1 s-a\nEVENT 1 exited\n");
+                let _ = (&conn).write_all(b"OK subscribe 1\nsub 1 taxxxxxxxxx\nEVENT 1 exited\n");
             }
         }
     });
@@ -1150,7 +1151,7 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
     assert_eq!(code, ExitCode::SUCCESS, "the stream resumed: {out}");
     assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert!(
-        out.ends_with("sub 1 s-a\nEVENT 1 exited\n"),
+        out.ends_with("sub 1 taxxxxxxxxx\nEVENT 1 exited\n"),
         "the successor's leg was relayed: {out}"
     );
 }
@@ -1174,14 +1175,14 @@ fn publish_entry(dir: &std::path::Path, sid: &str, sock: &std::path::Path) {
     .unwrap();
 }
 
-/// A relay (A) forwarding `subscribe @s-abc …` to a host (B) that went away
+/// A relay (A) forwarding `subscribe @tabcxxxxxxx …` to a host (B) that went away
 /// stays up and says so on the stream: the relay follows B's successor where it
 /// republishes `graph/<sid>`, never passing the marker on; with none there
 /// within the wait, exit 75, never 0.
 #[cfg(unix)]
 #[test]
 fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
-    let request = "subscribe @s-abc events\n";
+    let request = "subscribe @tabcxxxxxxx events\n";
     for successor_up in [true, false] {
         let (dir, relay_sock) = scratch_sock("rd-fwd");
         let relay_path = relay_sock.to_str().unwrap().to_string();
@@ -1189,7 +1190,7 @@ fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
         let gone = gone_pid();
         let reply: &'static str = Box::leak(
             format!(
-                "OK subscribe 1\nsub 1 s-abc\nEVENT 1 block-complete 3 exit=0\n{}",
+                "OK subscribe 1\nsub 1 tabcxxxxxxx\nEVENT 1 block-complete 3 exit=0\n{}",
                 host_gone_marker(gone, &host)
             )
             .into_boxed_str(),
@@ -1208,11 +1209,11 @@ fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
             let server = fake_server(
                 aterm_uds::CtlListener::bind(&successor_sock).unwrap(),
                 successor_sock.clone(),
-                "OK subscribe 1\nsub 1 s-abc\nEVENT 1 exited\n",
+                "OK subscribe 1\nsub 1 tabcxxxxxxx\nEVENT 1 exited\n",
                 false,
                 asked_tx,
             );
-            publish_entry(dir.path(), "s-abc", &successor_sock);
+            publish_entry(dir.path(), "tabcxxxxxxx", &successor_sock);
             server
         });
         let stream = CtlStream::connect(&relay_sock).expect("connect");
@@ -1251,12 +1252,12 @@ fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
         if successor_up {
             assert_eq!(
                 asked.try_recv().as_deref(),
-                Ok("subscribe @s-abc events since-block=3\n"),
+                Ok("subscribe @tabcxxxxxxx events since-block=3\n"),
                 "B's successor was asked, from the last block relayed"
             );
             assert_eq!(code, ExitCode::SUCCESS, "{out}");
             assert!(
-                out.ends_with("sub 1 s-abc\nEVENT 1 exited\n"),
+                out.ends_with("sub 1 tabcxxxxxxx\nEVENT 1 exited\n"),
                 "the successor's leg was relayed: {out}"
             );
         } else {
@@ -1427,7 +1428,7 @@ fn a_self_stream_moves_only_on_the_fixed_socket_the_call_named() {
         ("alias-follow", flagless(None), &alias, Arrival::Shared),
         (
             "graph-entry",
-            flagless(Some("s-00ab")),
+            flagless(Some("t00abxxxxxx")),
             &fixed,
             Arrival::Shared,
         ),
@@ -1999,7 +2000,7 @@ fn only_anchorless_blocking_reads_are_asked_again() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     for yes in [
         "text",
-        "@s-a text",
+        "@taxxxxxxxxx text",
         "wait",
         "ready",
         "inbox",
@@ -2008,16 +2009,16 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await idle 500",
         "await match prompt",
         "await inbox",
-        "@s-a await agent idle,prompt timeout=60000",
-        "@s-a await agent idle,prompt timeout 20000 autopilot=cruise",
-        "@s-a await gone interrupt rows 3 4 timeout 20000 autopilot=-",
+        "@taxxxxxxxxx await agent idle,prompt timeout=60000",
+        "@taxxxxxxxxx await agent idle,prompt timeout 20000 autopilot=cruise",
+        "@taxxxxxxxxx await gone interrupt rows 3 4 timeout 20000 autopilot=-",
         "await idle 500 autopilot=land",
         "await log need",
-        "@s-a await log need timeout=600000",
+        "@taxxxxxxxxx await log need timeout=600000",
         "await log close=turn since=4 ep=1 timeout=600000",
         "await log need,need",
-        "@s-a await log need,close=turn since=4 ep=1 timeout=600000",
-        "@s-a await edit uri=file:///tmp/x timeout=600000",
+        "@taxxxxxxxxx await log need,close=turn since=4 ep=1 timeout=600000",
+        "@taxxxxxxxxx await edit uri=file:///tmp/x timeout=600000",
     ] {
         assert!(retries_across_replacement(&parts(yes)), "{yes}");
         assert!(is_blocking_read(&parts(yes)), "{yes}");
@@ -2026,26 +2027,26 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "await seq",
         "await seq timeout=0",
         "await block",
-        "@s-a await block timeout=600000",
+        "@taxxxxxxxxx await block timeout=600000",
         "await consent",
         "await seq 40",
         "await inbox since=12",
-        "@s-a await agent idle,prompt since=7",
+        "@taxxxxxxxxx await agent idle,prompt since=7",
         "inbox get 4",
         "inbox since=7",
         "inbox 16 since=7",
-        "@s-a await seq 3 timeout=500",
-        "@s-a await seq 3 timeout 20000 autopilot=land",
+        "@taxxxxxxxxx await seq 3 timeout=500",
+        "@taxxxxxxxxx await seq 3 timeout 20000 autopilot=land",
         "await seq timeout 20000 autopilot=off",
-        "@s-a await agent busy since=7 timeout 20000 autopilot=cruise",
+        "@taxxxxxxxxx await agent busy since=7 timeout 20000 autopilot=cruise",
         "await log close=turn",
-        "@s-a await log kind=verdict timeout=5000",
+        "@taxxxxxxxxx await log kind=verdict timeout=5000",
         "await log open=step timeout=1000",
         "await log close=turn,kind=note",
         "await log need,close=turn",
-        "@s-a await log close=turn,need timeout=600000",
+        "@taxxxxxxxxx await log close=turn,need timeout=600000",
         "await log need,kind=note timeout=5000",
-        "@s-a await edit ticket=7 timeout=600000",
+        "@taxxxxxxxxx await edit ticket=7 timeout=600000",
         "@3 text",
         "@3 await match DONE",
         "@12 wait",
@@ -2057,8 +2058,8 @@ fn only_anchorless_blocking_reads_are_asked_again() {
         "send hi",
         "key enter",
         "inbox seen 4",
-        "post to=@s-b hi",
-        "subscribe @s-a events",
+        "post to=@tbxxxxxxxxx hi",
+        "subscribe @taxxxxxxxxx events",
     ] {
         assert!(!retries_across_replacement(&parts(never)), "{never}");
     }
@@ -2069,8 +2070,8 @@ fn only_anchorless_blocking_reads_are_asked_again() {
 fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
     for request in [
-        "@s-a await log close=turn timeout=600000",
-        "@s-a await log need,close=turn timeout=600000",
+        "@taxxxxxxxxx await log close=turn timeout=600000",
+        "@taxxxxxxxxx await log need,close=turn timeout=600000",
     ] {
         let cut = parts(request);
         assert!(reports_replacement(&cut), "{request}");
@@ -2086,7 +2087,7 @@ fn a_cut_since_less_await_log_says_to_wait_again_from_status() {
 #[test]
 fn a_cut_edit_wait_by_ticket_says_to_wait_by_the_file() {
     let parts = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
-    let cut = parts("@s-a await edit ticket=7 timeout=600000");
+    let cut = parts("@taxxxxxxxxx await edit ticket=7 timeout=600000");
     assert!(reports_replacement(&cut));
     assert!(!retries_across_replacement(&cut));
     let note = not_asked_again_note(&cut);
@@ -2102,10 +2103,13 @@ fn a_cut_turn_or_post_is_reported_as_a_replacement_and_never_asked_again() {
         .expect("a gone note ends in its exit");
     for (write, reported) in [
         ("turn hi", true),
-        ("@s-a turn timeout=1800000 implement X", true),
+        ("@taxxxxxxxxx turn timeout=1800000 implement X", true),
         ("@3 turn go", true),
-        ("post to=@s-b hi", true),
-        ("@s-a post to=@s-b kind=task --wait-ack=60000 go", true),
+        ("post to=@tbxxxxxxxxx hi", true),
+        (
+            "@taxxxxxxxxx post to=@tbxxxxxxxxx kind=task --wait-ack=60000 go",
+            true,
+        ),
         ("send hi", false),
         ("key enter", false),
     ] {
@@ -2243,7 +2247,7 @@ fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
         let retired = fake_server(
             aterm_uds::CtlListener::bind(&sock).unwrap(),
             sock.clone(),
-            "OK subscribe 0\nsub 1 s-a\n",
+            "OK subscribe 0\nsub 1 taxxxxxxxxx\n",
             false,
             seen_tx.clone(),
         );
@@ -2259,7 +2263,7 @@ fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
         let successor = fake_server(
             listener,
             sock.clone(),
-            "OK subscribe 0\nsub 1 s-b\n",
+            "OK subscribe 0\nsub 1 tbxxxxxxxxx\n",
             false,
             seen_tx,
         );
@@ -2284,7 +2288,10 @@ fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
         let text = String::from_utf8(out).unwrap();
         let requests: Vec<String> = seen.try_iter().collect();
         assert_eq!(requests, [request, request], "{flag}: {text}");
-        assert_eq!(text, "sub 1 s-a\nGAP 1 replaced\nsub 1 s-b\n", "{flag}");
+        assert_eq!(
+            text, "sub 1 taxxxxxxxxx\nGAP 1 replaced\nsub 1 tbxxxxxxxxx\n",
+            "{flag}"
+        );
         assert_eq!(code, ExitCode::SUCCESS, "{flag}: {text}");
     }
 }
@@ -2364,7 +2371,7 @@ fn a_subscription_by_an_untied_local_number_is_not_followed() {
     let successor = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-aaaa\nEVENT 1 exited\n",
+        "OK subscribe 1\nsub 1 taaaaxxxxxx\nEVENT 1 exited\n",
         false,
         seen_tx,
     );
@@ -2435,7 +2442,7 @@ fn serve_by(
 #[test]
 fn a_stream_whose_instance_said_bye_quit_ends_at_once_with_75() {
     let mut t = FrameTracker::new("subscribe @* events,sessions\n");
-    t.feed(b"sub 1 s-a\nEVENT * bye handoff\nDELTA 1 seq=2 screen 1\nEVENT * bye quit\n");
+    t.feed(b"sub 1 taxxxxxxxxx\nEVENT * bye handoff\nDELTA 1 seq=2 screen 1\nEVENT * bye quit\n");
     assert!(!t.said_quit(), "a handoff, and a screen row");
     t.feed(b"EVENT * bye quit\n");
     assert!(t.said_quit());
@@ -2449,7 +2456,7 @@ fn a_stream_whose_instance_said_bye_quit_ends_at_once_with_75() {
     let old = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nEVENT * bye quit\n",
+        "OK subscribe 1\nsub 1 taxxxxxxxxx\nEVENT * bye quit\n",
         true,
         tx,
     );
@@ -2489,12 +2496,12 @@ fn a_stream_whose_instance_said_bye_quit_ends_at_once_with_75() {
 fn a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate() {
     let (_dir, sock) = scratch_sock("rd-live");
     let path = sock.to_str().unwrap().to_string();
-    let request = "subscribe @s-a screen\n";
+    let request = "subscribe @taxxxxxxxxx screen\n";
     let (tx, _rx) = std::sync::mpsc::channel();
     let server = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\n",
+        "OK subscribe 1\nsub 1 taxxxxxxxxx\n",
         false,
         tx,
     );
@@ -2562,7 +2569,7 @@ fn a_blocking_read_is_asked_again_only_where_that_means_the_same_question() {
         &path,
         Some(gone),
         None,
-        &parts("@s-a await idle 500"),
+        &parts("@taxxxxxxxxx await idle 500"),
         &served,
         None,
         |next| {
@@ -2681,12 +2688,12 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     );
     within_the_deadline(started);
 
-    let request = "subscribe @s-a screen\n";
+    let request = "subscribe @taxxxxxxxxx screen\n";
     let (tx, _rx) = std::sync::mpsc::channel();
     let old = fake_server(
         aterm_uds::CtlListener::bind(&sock).unwrap(),
         sock.clone(),
-        "OK subscribe 1\nsub 1 s-a\nDELTA 1 seq=2 screen 1\nhello\n",
+        "OK subscribe 1\nsub 1 taxxxxxxxxx\nDELTA 1 seq=2 screen 1\nhello\n",
         true,
         tx,
     );
@@ -2719,7 +2726,7 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
         &path,
         Some(gone),
         None,
-        &parts("@s-a await match prompt"),
+        &parts("@taxxxxxxxxx await match prompt"),
         &redial,
         Some(started + short),
         |_| panic!("no successor to ask"),
@@ -2764,7 +2771,7 @@ fn a_flagless_call_follows_its_session_to_the_successors_own_socket() {
     let old_sock = dir.join(format!("aterm-{gone}.sock"));
     let old = old_sock.to_str().unwrap();
     let new_sock = dir.join(format!("aterm-{own}.sock"));
-    let sid = "s-0123abcd";
+    let sid = "t0123abcdxx";
     let (tx, _rx) = std::sync::mpsc::channel();
     let successor = fake_server(
         aterm_uds::CtlListener::bind(&new_sock).unwrap(),
@@ -2823,7 +2830,7 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
     let old_sock = dir.join(format!("aterm-{gone}.sock"));
     let old = old_sock.to_str().unwrap();
     let stranger_sock = dir.join(format!("aterm-{own}.sock"));
-    let sid = "s-4567cdef";
+    let sid = "t4567cdefxx";
     let (tx, _rx) = std::sync::mpsc::channel();
     let stranger = fake_server(
         aterm_uds::CtlListener::bind(&stranger_sock).unwrap(),
@@ -2869,11 +2876,11 @@ fn a_flagless_call_never_takes_an_unrelated_instance_for_a_successor() {
 fn the_session_a_request_names_is_read_by_the_wire_grammar() {
     let named = |line: &str| target_sid(line).map(|sid| sid.as_str().to_string());
     for (line, sid) in [
-        ("@s-ab focus in\n", "s-ab"),
-        ("@s-ab\tfocus in", "s-ab"),
-        ("subscribe @s-ab screen\n", "s-ab"),
-        ("subscribe\t@s-ab screen", "s-ab"),
-        ("@s-ab subscribe @s-cd screen", "s-ab"),
+        ("@tabxxxxxxxx focus in\n", "tabxxxxxxxx"),
+        ("@tabxxxxxxxx\tfocus in", "tabxxxxxxxx"),
+        ("subscribe @tabxxxxxxxx screen\n", "tabxxxxxxxx"),
+        ("subscribe\t@tabxxxxxxxx screen", "tabxxxxxxxx"),
+        ("@tabxxxxxxxx subscribe @tcdxxxxxxxx screen", "tabxxxxxxxx"),
     ] {
         assert_eq!(named(line).as_deref(), Some(sid), "{line:?}");
     }
@@ -2882,7 +2889,7 @@ fn the_session_a_request_names_is_read_by_the_wire_grammar() {
         "@ focus in",
         "@1 focus in",
         "@S-AB focus in",
-        "subscribe @s-ab,@s-cd screen",
+        "subscribe @tabxxxxxxxx,@tcdxxxxxxxx screen",
         "subscribe @* screen",
         "subscribe screen",
         "focus in",
@@ -2906,7 +2913,7 @@ fn a_call_to_a_peer_follows_the_peers_host_not_its_own() {
     let old = old_sock.to_str().unwrap();
     let own_sock = dir.join("aterm-1.sock");
     let new_sock = dir.join("aterm-2.sock");
-    let (peer, me) = ("s-0a1b", "s-2c3d");
+    let (peer, me) = ("t0a1bxxxxxx", "t2c3dxxxxxx");
     let (tx, _rx) = std::sync::mpsc::channel();
     let mine = fake_server(
         aterm_uds::CtlListener::bind(&own_sock).unwrap(),
@@ -2970,7 +2977,7 @@ fn a_call_to_a_peer_follows_the_peers_host_not_its_own() {
 fn a_redial_follows_what_the_call_resolved_through() {
     use super::super::targets_in;
     let dir = PathBuf::from("/r");
-    let sid = Some("s-ab".to_string());
+    let sid = Some("tabxxxxxxxx".to_string());
     let follow = |sock: Option<&str>, pid: Option<u32>, sid: Option<String>| {
         targets_in(Some(dir.clone()), sock.map(String::from), pid, sid, None)
             .expect("targets")

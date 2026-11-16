@@ -393,7 +393,7 @@ fn a_press_over_a_frame_drawn_before_a_newer_read_writes_nothing() {
     let seeded = named(Class::Seeded, 7, "Heron");
     let mut app = crate::App::headless_for_test();
     // Tall enough that the page's actions stay on screen under a notice.
-    if let Some(window) = app.windows.get_mut(&wid) {
+    if let Some(mut window) = app.windows.get_mut(&wid) {
         window.cols = 160;
         window.rows = 120;
     }

@@ -1521,7 +1521,7 @@ fn a_delivered_mail_alone_reaches_the_next_take_as_its_count() {
         let (none, _) = slots(&cmd_log_take(&store, "", Some(generation)));
         assert!(none.is_empty(), "PRECONDITION: everything landed: {none:?}");
         let line = format!(
-            "{} off=7 from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+            "{} off=7 from=tpeer000001@n-lab kind=note trust=agent text=QZP6WORD",
             a.sid.as_str()
         );
         assert_eq!(crate::fabric::cmd_deliver(&store, &line), "OK 1\n");
@@ -1532,7 +1532,7 @@ fn a_delivered_mail_alone_reaches_the_next_take_as_its_count() {
         let snap = decode_bus(body).expect("decodes").rec;
         assert_eq!(snap.op, aterm_slog::Op::Snap, "{body}");
         assert_eq!(snap.f.get_u(Key::MailIn), Some(1), "{body}");
-        for word in ["QZP6WORD", "s-peer", "n-lab", "note", " off="] {
+        for word in ["QZP6WORD", "tpeer000001", "n-lab", "note", " off="] {
             assert!(!body.contains(word), "{word} crossed: {body}");
         }
     });
@@ -1582,7 +1582,7 @@ fn a_mail_count_the_rate_holds_back_says_when_it_is_due() {
         );
         let deliver = |off: u64| {
             let line = format!(
-                "{} off={off} from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+                "{} off={off} from=tpeer000001@n-lab kind=note trust=agent text=QZP6WORD",
                 a.sid.as_str()
             );
             assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK "));
@@ -1926,7 +1926,7 @@ fn the_rate_hold_is_each_sessions_own_and_the_take_names_it() {
         };
         let deliver = |to: &crate::session_store::SessionHandle, off: u64| {
             let line = format!(
-                "{} off={off} from=s-peer@n-lab kind=note trust=agent text=QZP6WORD",
+                "{} off={off} from=tpeer000001@n-lab kind=note trust=agent text=QZP6WORD",
                 to.sid.as_str()
             );
             assert!(crate::fabric::cmd_deliver(&store, &line).starts_with("OK "));

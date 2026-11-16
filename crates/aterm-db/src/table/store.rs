@@ -103,7 +103,8 @@ pub(crate) fn with_replay_observer<T>(
 #[cfg(test)]
 thread_local! {
     /// While set, this thread's appends fail after the handle is poisoned and before the log is
-    /// written: an append whose outcome is uncertain.
+    /// written (a checkpoint group's once its permit is durable): an append whose outcome is
+    /// uncertain.
     pub(crate) static APPEND_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -286,6 +287,15 @@ impl Capacity {
 fn charge(subject: &str, wire: usize) -> usize {
     wire.saturating_add(8 + subject.len() + aterm_journal::APPEND_OVERHEAD)
 }
+/// The most wire bytes of operations one table holds ([`MAX_BYTES`]): past it the store refuses
+/// a write (`table operation capacity exhausted`), as it does past [`MAX_RECORDS`] operations
+/// and a writer's own quota. For a reader that names the bound a table enforces (`sys disk`'s
+/// store lines). It bounds what the table holds, not its files: the journal on disk also keeps
+/// each discarded operation and the conflict reserve, so a file's size is no share of it.
+#[must_use]
+pub const fn operation_bytes_bound() -> u64 {
+    MAX_BYTES as u64
+}
 pub(crate) const WRITER_RECORDS: usize = 4096;
 pub(crate) const WRITER_BYTES: usize = 8 * 1024 * 1024;
 const SUBJECT: &str = "commons/table/1";
@@ -382,9 +392,15 @@ pub enum AppendKind {
 }
 
 /// One durable append to a table store, handed to the process's sink after the journal append
-/// and the witness publish succeeded (the end of the store's one append path, or a writing open
-/// that adopts the unwitnessed append a cut-off writer left). Fired exactly once per new record;
-/// never for a duplicate, which an ingest answers with its stored receipt.
+/// and the witness publish succeeded (the end of a scalar append, a checkpoint group's commit
+/// before the check that guards its receipts, or a writing open that adopts the unwitnessed tail
+/// a cut-off writer left). The path that witnessed a new record fires it once, and no path fires
+/// for a duplicate, which an ingest answers with its stored receipt. A crash can break that once
+/// either way: a stop between the witness and the sink announces none, and where the witness took
+/// the log's ordered flush (an Ordered log on its device) a power loss that takes the witness
+/// while its record stays announces that record again from the writing open that adopts it. A
+/// sink must therefore take a repeated `offset` as one record and read what it missed from the
+/// store.
 #[derive(Debug)]
 pub struct Appended<'a> {
     /// The table's identifier ([`Scope::digest`]).
@@ -454,6 +470,31 @@ struct Stored {
     /// The member-signed removal cutoff this operation is ([`cutoff`]), read once as it is
     /// admitted.
     cut: Option<cutoff::Cut>,
+    /// The table checkpoint this operation signs ([`crate::checkpoint`]), read once as it is
+    /// admitted.
+    checkpoint: Option<crate::checkpoint::Body>,
+}
+
+/// What a table operation is to the table itself (a removal cutoff, a checkpoint) rather than to
+/// an application, read once from its plaintext as it is admitted or replayed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Control {
+    pub(crate) cut: Option<cutoff::Cut>,
+    pub(crate) checkpoint: Option<crate::checkpoint::Body>,
+}
+
+impl Control {
+    pub(crate) fn of(payload: &[u8]) -> Self {
+        Self {
+            cut: cutoff::decode(payload),
+            checkpoint: crate::checkpoint::decode(payload),
+        }
+    }
+
+    /// Whether the operation is an application's: neither a cutoff nor a checkpoint.
+    pub(crate) const fn is_none(&self) -> bool {
+        self.cut.is_none() && self.checkpoint.is_none()
+    }
 }
 
 /// A signature and custody witness retain bytes; only a fresh historical grant opens payloads.
@@ -548,6 +589,17 @@ pub struct MetadataEvidence {
     /// A member-signed removal cutoff ([`cutoff`]): a causal parent like any operation, whose
     /// payload no application decodes and no reader counts as a refusal.
     pub cutoff: bool,
+    /// The table checkpoint this operation signs ([`crate::checkpoint`]): like a cutoff, a causal
+    /// parent no application decodes and no reader counts as a refusal.
+    pub(crate) checkpoint: Option<crate::checkpoint::Body>,
+}
+
+impl MetadataEvidence {
+    /// Whether this operation is the table's own (a removal cutoff or a checkpoint), which no
+    /// application decodes and no reader counts as a refusal.
+    pub fn is_table_control(&self) -> bool {
+        self.cutoff || self.checkpoint.is_some()
+    }
 }
 
 /// A local handle for authenticated table data. Writers are exclusive;
@@ -1414,7 +1466,9 @@ impl Store {
         // from pending to ready. No record can be authored in the pending state.
         claim[4] = b'1';
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
-        let (log, replay) = if read_only {
+        // A writing open's pending group permit: whether one stood past the acknowledged witness
+        // when replay read the log. An observer never acts on one.
+        let (log, replay, permitted) = if read_only {
             // Read physical facts before their group permission: a newly observed checkpoint
             // must not be judged under a permit snapshot taken before that group began.
             let journal = journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?;
@@ -1423,7 +1477,7 @@ impl Store {
             } else {
                 group::read(&claim_dir, &claim_name, &claim)?
             };
-            (None, journal.witnessed(boundary)?)
+            (None, journal.witnessed(boundary)?, false)
         } else {
             let mut log = Log::open(
                 dir,
@@ -1445,7 +1499,7 @@ impl Store {
                 group::read(&claim_dir, &claim_name, &claim)?
             };
             let replay = replay::read(&mut log, boundary, pending)?;
-            (Some(log), replay)
+            (Some(log), replay, boundary.end().is_some())
         };
         // The scope is fixed for the open: whether it is the catalog is judged once, here, for the
         // writer quota and every record replay admits (`operation_policy_in`).
@@ -1593,8 +1647,16 @@ impl Store {
                         wire: wire.wire(),
                     });
                 }
+            } else if permitted {
+                // Replay stopped at the acknowledged witness a pending group permit starts at:
+                // the writer stopped before any of that group reached the log (a group that
+                // did is adopted above, its permit then complete). Retire the permit before
+                // anything appends: the next append moves custody past its start without
+                // reaching its end, and a permit left behind would refuse every later open.
+                group::retire(&store.claim_dir, &store.claim_name)?;
             }
-            // Complete a possible earlier rename whose directory barrier failed.
+            // Complete a possible earlier rename whose directory barrier failed, and make a
+            // retirement above durable before any append moves the custody witness.
             aterm_durable::durable_dir(&store.claim_dir)?;
             directory::remember(dir, &store.claim_dir, &store.claim_name, &store.claim)?;
         }
@@ -1830,6 +1892,7 @@ impl Store {
             .insert(record.header().clone())
             .map_err(|_| Error::new("table index refused witnessed header"))?;
         self.operation_bytes += wire.len();
+        let control = Control::of(record.payload());
         self.hold(
             id,
             Stored {
@@ -1837,7 +1900,8 @@ impl Store {
                 header: record.header().clone(),
                 receipt,
                 payload: PayloadState::Ready,
-                cut: cutoff::decode(record.payload()),
+                cut: control.cut,
+                checkpoint: control.checkpoint,
             },
         );
         self.poisoned = false;
@@ -2934,6 +2998,41 @@ impl Store {
         Ok(true)
     }
 
+    /// Each checkpoint this table holds, with its signer.
+    pub(crate) fn checkpoints(&self) -> impl Iterator<Item = (Actor, &crate::checkpoint::Body)> {
+        self.records
+            .values()
+            .filter_map(|stored| Some((stored.header.actor, stored.checkpoint.as_ref()?)))
+    }
+
+    /// Sign `checkpoint` into this table (docs/DESIGN-table-checkpoint-2026-11-15.md §3, tracker
+    /// LT-B10B): a body this Mac computed itself ([`crate::checkpoint::Computed`]), of this table,
+    /// once no current member holds the version fence back (`held`, from
+    /// [`aterm_secrets::commons::hearing::Ledger::holding_below`] at
+    /// [`aterm_secrets::commons::hearing::CHECKPOINTS`]).
+    ///
+    /// # Errors
+    /// A member holds the fence, the body is another table's, or as [`Self::commit_own`].
+    pub(crate) fn sign_checkpoint(
+        &mut self,
+        session: &Session<'_>,
+        checkpoint: &crate::checkpoint::Computed,
+        held: &[(Actor, aterm_secrets::commons::hearing::Hold)],
+    ) -> Result<Receipt> {
+        if !held.is_empty() {
+            return Err(Error::new(&format!(
+                "a table checkpoint waits until every member heard in the last 7 days runs aterm {} or later: {} do not yet",
+                aterm_secrets::commons::hearing::READS_CHECKPOINTS,
+                held.len()
+            )));
+        }
+        let body = checkpoint.body();
+        if body.scope != self.scope.digest() || body.generation != self.scope.generation() {
+            return Err(Error::new("a checkpoint of another table"));
+        }
+        self.commit_own(session, &crate::checkpoint::encode(body))
+    }
+
     fn catalog_projection(&self, session: &Session<'_>) -> Result<Projection> {
         self.check(session)?;
         self.projected(session)
@@ -3051,7 +3150,9 @@ impl Store {
                 .catalog_projection(session)?
                 .ordered
                 .iter()
-                .filter(|id| self.records[*id].cut.is_none())
+                .filter(|id| {
+                    self.records[*id].cut.is_none() && self.records[*id].checkpoint.is_none()
+                })
                 .map(|id| batch.authenticate(&self.records[id].wire))
                 .collect::<Result<Vec<_>>>()?;
             self.check(session)?;
@@ -3110,7 +3211,9 @@ impl Store {
             let positive = &mut evidence[..self.records.len()];
             let records = ordered
                 .iter()
-                .filter(|id| self.records[*id].cut.is_none())
+                .filter(|id| {
+                    self.records[*id].cut.is_none() && self.records[*id].checkpoint.is_none()
+                })
                 .map(|id| {
                     let idx = positive
                         .binary_search_by_key(id, |e| e.header.id)
@@ -3220,6 +3323,7 @@ impl Store {
                     record,
                     catalog_eligible: eligible.contains(&stored.header.id),
                     cutoff: stored.cut.is_some(),
+                    checkpoint: stored.checkpoint.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3254,6 +3358,7 @@ impl Store {
                 record,
                 catalog_eligible: false,
                 cutoff: false,
+                checkpoint: None,
             });
         }
         Ok(evidence)
@@ -3309,6 +3414,28 @@ impl Store {
             .filter(|id| !excluded.contains(*id))
             .filter_map(|id| self.wire_unchecked(id).map(ToOwned::to_owned))
             .collect()
+    }
+    /// A reconciliation snapshot of `ids` over this store's causal index: each writer's dense,
+    /// unforked prefix among them can be agreed by its frontier alone
+    /// (`astream_wire::sync::rbsr::Snapshot::from_inventory`).
+    ///
+    /// # Errors
+    /// The retained headers no longer form an index.
+    pub(crate) fn snapshot_of(
+        &self,
+        ids: &BTreeSet<Digest>,
+    ) -> Result<astream_wire::sync::rbsr::Snapshot> {
+        Ok(astream_wire::sync::rbsr::Snapshot::from_inventory(
+            ids.clone(),
+            self.index()?,
+        ))
+    }
+
+    /// `ids` in causal order ([`causal_order`]): a record follows every parent of it among `ids`,
+    /// so a peer sent them in this order never receives a child before a parent it is also being
+    /// sent.
+    pub(crate) fn causal_order_of(&self, ids: &[Digest]) -> Vec<Digest> {
+        causal_order(ids, |id| self.records.get(id).map(|stored| &stored.header))
     }
     /// IDs withheld from replication by unavailable membership, quarantine and their causal closure. As with
     /// `inventory_unchecked`, the caller stands on the store's check in its admitted session.
@@ -3764,4 +3891,47 @@ pub(crate) fn rebind_claim(claim: &mut [u8], dir: &Path) -> Result<(Digest, Dige
     let before = custody_of(claim);
     claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(dir)?);
     Ok((before, custody_of(claim)))
+}
+
+/// `ids` in causal order under `header`: Kahn's algorithm over the parent links (`parents` and
+/// `previous`) that stay inside `ids`, taking the ready record least by (actor, sequence, digest)
+/// each step. An id with no header keeps its place among the ready ones as a root.
+pub(crate) fn causal_order<'h>(
+    ids: &[Digest],
+    header: impl Fn(&Digest) -> Option<&'h Header>,
+) -> Vec<Digest> {
+    let set: BTreeSet<Digest> = ids.iter().copied().collect();
+    let key = |id: &Digest| -> (Actor, u64, Digest) {
+        header(id).map_or(([0; 48], 0, *id), |h| (h.actor, h.sequence, *id))
+    };
+    let mut waiting = BTreeMap::<Digest, usize>::new();
+    let mut children = BTreeMap::<Digest, Vec<Digest>>::new();
+    for id in &set {
+        let parents: BTreeSet<Digest> = header(id)
+            .map(|h| h.parents.iter().chain(h.previous.iter()).copied().collect())
+            .unwrap_or_default();
+        let inside: Vec<Digest> = parents.into_iter().filter(|p| set.contains(p)).collect();
+        waiting.insert(*id, inside.len());
+        for parent in inside {
+            children.entry(parent).or_default().push(*id);
+        }
+    }
+    let mut ready: BTreeSet<(Actor, u64, Digest)> = waiting
+        .iter()
+        .filter(|&(_, &n)| n == 0)
+        .map(|(id, _)| key(id))
+        .collect();
+    let mut ordered = Vec::with_capacity(set.len());
+    while let Some(next) = ready.pop_first() {
+        let id = next.2;
+        ordered.push(id);
+        for child in children.get(&id).into_iter().flatten() {
+            let n = waiting.get_mut(child).expect("every child is waiting");
+            *n -= 1;
+            if *n == 0 {
+                ready.insert(key(child));
+            }
+        }
+    }
+    ordered
 }

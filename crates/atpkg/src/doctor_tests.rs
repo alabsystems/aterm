@@ -434,17 +434,32 @@ fn check_rejected_version_reply(
     reply: &[u8],
     expected: &str,
 ) {
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let cat = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/cat"));
+    let script = format!(
+        "#!{}\necho query >> \"$0.asked\"\n{} \"$0.stdout\"\n",
+        shell.display(),
+        crate::platform::sh_shim_quote(&cat),
+    );
     for legacy in [false, true] {
         let root = synthetic_home("complete-version-output");
         let bin = root.join("program");
         let output = root.join("program.stdout");
         let asked = root.join("program.asked");
-        std::fs::write(
-            &bin,
-            b"#!/bin/sh\necho query >> \"$0.asked\"\n/bin/cat \"$0.stdout\"\n",
-        )
-        .unwrap();
+        std::fs::write(&bin, &script).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ready = b"version-fixture-ready\n";
+        std::fs::write(&output, ready).unwrap();
+        let started = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+            &mut aterm_uds::spawnfd::command(&bin),
+            aterm_spec::wait::MUST_HAPPEN,
+            format!("version fixture {} readiness", bin.display()),
+        )
+        .unwrap_or_else(|error| panic!("version fixture {} did not start: {error}", bin.display()));
+        assert!(started.status.success(), "{started:?}");
+        assert_eq!(started.stdout, ready);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), "query\n");
+        std::fs::remove_file(&asked).unwrap();
         let identity = crate::probe_cache::identity(&bin).unwrap();
         std::fs::write(&output, rejected).unwrap();
         let cache = root.join("state").join(VERSIONS);

@@ -553,10 +553,14 @@ fn real_builds(world: &Path, seat: &Seat<'_>, driver: &mut Driver) {
         assert!(driver.result(&ticket.id).as_ref().unwrap().succeeded());
         let mut command = spawnfd::command(path.join("target.noindex/debug/headless_probe"));
         assert!(
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap()
-                .status
-                .success()
+            aterm_uds::deadline::output_while_process_progressing(
+                &mut command,
+                aterm_spec::wait::MUST_HAPPEN,
+                "host table compiled probe",
+            )
+            .unwrap()
+            .status
+            .success()
         );
     }
     assert!(seat.ledger.as_ref().unwrap().list().unwrap().is_empty());
@@ -576,13 +580,17 @@ fn run_actor(real: bool) {
     if real {
         command.env(REAL, "1");
     }
-    let output = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-        .unwrap_or_else(|error| {
-            panic!(
-                "actor {error:?}; last phase: {}",
-                std::fs::read_to_string(world.path().join("phase")).unwrap_or_default()
-            )
-        });
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_spec::wait::MUST_HAPPEN,
+        "host table actor",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "actor {error:?}; last phase: {}",
+            std::fs::read_to_string(world.path().join("phase")).unwrap_or_default()
+        )
+    });
     assert!(
         output.status.success(),
         "{}",

@@ -27,7 +27,7 @@ fn synchronized_hold_preserves_license_and_anchors_until_glass_release() {
 
     let key_at = t0 + Duration::from_millis(1);
     let (spawns, tally, anchors) = {
-        let ws = app.windows.get_mut(&wid).expect("window");
+        let mut ws = app.windows.get_mut(&wid).expect("window");
         ws.fx.cursor_mut().glow.note_typed_cells(key_at, 1);
         ws.fx.cursor_mut().trail.note_typed(key_at);
         (
@@ -105,7 +105,7 @@ fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
 
         let key_at = t0 + Duration::from_millis(16);
         {
-            let ws = app.windows.get_mut(&wid).expect("window");
+            let mut ws = app.windows.get_mut(&wid).expect("window");
             ws.fx.cursor_mut().glow.note_typed_cells(key_at, 1);
             ws.fx.cursor_mut().trail.note_typed(key_at);
         }
@@ -210,7 +210,7 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
 
     let candidate_at = t0 + Duration::from_millis(16);
     {
-        let window = app.windows.get_mut(&wid).expect("window");
+        let mut window = app.windows.get_mut(&wid).expect("window");
         window
             .fx
             .cursor_mut()
@@ -233,7 +233,7 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         "the preflight deliberately samples sync false"
     );
     assert!(!update_sync_frame_hold(
-        app.windows.get_mut(&wid).expect("window"),
+        &mut app.windows.get_mut(&wid).expect("window"),
         preflight,
         candidate_at,
         SYNC_HOLD_CAP,
@@ -270,7 +270,7 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
     };
     assert!(current.active && current.open_dirty);
     let late_hold = recheck_sync_frame_hold(
-        app.windows.get_mut(&wid).expect("window"),
+        &mut app.windows.get_mut(&wid).expect("window"),
         preflight,
         current,
         candidate_at,
@@ -327,7 +327,7 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         }
     };
     assert!(!recheck_sync_frame_hold(
-        app.windows.get_mut(&wid).expect("window"),
+        &mut app.windows.get_mut(&wid).expect("window"),
         current,
         released,
         candidate_at,

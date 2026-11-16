@@ -35,7 +35,7 @@ fn stated(endpoint: &Endpoint, wire: Wire) -> usize {
     let metadata = 4 + HELLO_FIXED + 6;
     match wire {
         Wire::Whole => metadata,
-        Wire::Delta | Wire::Duplex => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
             metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len()
         }
     }
@@ -2662,6 +2662,7 @@ const fn alpn(protocol: Protocol) -> &'static str {
         Protocol::Frontier(Wire::Whole) => "atdb/4",
         Protocol::Frontier(Wire::Delta) => "atdb/5",
         Protocol::Frontier(Wire::Duplex) => "atdb/6",
+        Protocol::Frontier(Wire::Reconcile) => "atdb/7",
     }
 }
 

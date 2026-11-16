@@ -290,6 +290,46 @@ fn runs_split_at_reset_refill_epoch() {
     assert_eq!(units, (50 + 60 + 20 + 70) * 20);
 }
 
+/// AN EPOCH DATED BY ITS OWN FIRST FIGURE (a refill or a raised allowance read on that figure)
+/// names no instant the window was empty, so its run's rise starts at that figure: a week held at
+/// 99%, then read at 69% on a raised allowance and at 70% after, is a point of use, not 70 points
+/// in a day. Negative control: starting that run from 0 at the epoch charges the whole first
+/// figure to the lookback.
+#[test]
+fn an_epoch_dated_by_its_own_figure_begins_at_that_figure() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    let reset = NOW + 3 * D;
+    fx.fig("me", NOW - 2 * H, None, Some((990, reset)));
+    let epoch = NOW - 30 * MIN;
+    for (t, pct) in [(epoch, 690), (NOW, 700)] {
+        let rows = fx.series.get_mut("me").unwrap();
+        rows.push(SeriesRow {
+            t,
+            by: MACHINE.into(),
+            said: Said::Fig {
+                five_hour: None,
+                seven_day: Some(Fig {
+                    pct_x10: pct,
+                    reset,
+                    at: t,
+                    src: "tap".into(),
+                    epoch: Some(epoch),
+                }),
+                ac: None,
+                key: None,
+            },
+        });
+    }
+    let shape: Vec<Began> = runs(&fx.series["me"], Window::Week, NOW)
+        .iter()
+        .map(|run| run.began)
+        .collect();
+    assert_eq!(shape, [Began::Window, Began::Epoch(epoch)]);
+    let (units, earliest, _) = rise_of(&fx, Window::Week, WEEK_LOOKBACK_S);
+    assert_eq!(earliest, Some(NOW - 2 * H));
+    assert_eq!(units, (700 - 690) * 20, "a point of a 20x week, not 70");
+}
+
 /// T5: A WINDOW THAT BEGAN INSIDE THE LOOKBACK BEGINS EMPTY, at `reset − W`. Negative control:
 /// starting at the window's first row under-counts its rise.
 #[test]

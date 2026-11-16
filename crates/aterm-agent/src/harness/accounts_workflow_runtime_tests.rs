@@ -53,12 +53,10 @@ impl Fixture {
                         },
                     );
                 }
-                let events = if matches!(case, 1 | 2 | 7) {
-                    vec![
-                        accounts::Event::new(NOW, accounts::Kind::SignIn, "work")
-                            .because("provider browser bot-check"),
-                    ]
-                } else if matches!(case, 5 | 6) {
+                if matches!(case, 1 | 2 | 7) {
+                    accounts::note_check_stop(logins, &raw, NOW);
+                }
+                let events = if matches!(case, 5 | 6) {
                     vec![
                         accounts::Event::new(NOW, accounts::Kind::SignIn, "work")
                             .because("provider window done session-kept"),
@@ -201,9 +199,7 @@ fn runtime_case(cli: Cli, case: i64) -> (i64, i64) {
     let records = fixture.records();
     let before = fixture.images();
     let held = match case {
-        1 | 2 | 7 => {
-            bot_check_on_record_at(&fixture.store, &fixture.raw, &records.logins).is_some()
-        }
+        1 | 2 | 7 => check_standing_at(&fixture.store, &fixture.raw, &records.logins).is_some(),
         3 | 4 => {
             reconcile_workflow_retries(
                 &guard,
@@ -308,7 +304,9 @@ fn runtime_case(cli: Cli, case: i64) -> (i64, i64) {
                     state.activity_owners.insert(key.clone(), owner.clone());
                 }
                 if case == 10 {
-                    state.bot_checked.insert(key.clone(), clock);
+                    state
+                        .unrecorded_checks
+                        .insert(key.clone(), super::login_activity_tests::a_check_met(&key));
                 }
                 if case == 11 {
                     state.last_attempt.insert(key.clone(), clock);
@@ -380,7 +378,7 @@ fn runtime_case(cli: Cli, case: i64) -> (i64, i64) {
                     assert_eq!(state.parked.get(&key), Some(&clock));
                 }
                 if case == 10 {
-                    assert_eq!(state.bot_checked.get(&key), Some(&clock));
+                    assert!(state.unrecorded_checks.contains_key(&key));
                 }
                 if case == 11 {
                     assert_eq!(state.last_attempt.get(&key), Some(&clock));
@@ -470,8 +468,15 @@ fn workflow_retry_and_completion_consumers_conform_across_restarts_and_replaceme
 fn a_page_row_is_promised_a_sign_in_only_on_a_ledger_that_can_be_read() {
     let fixture = Fixture::new(Cli::Codex, 3);
     let records = fixture.records();
-    let promised =
-        |cli| page_row_signs_in_unattended(cli, &fixture.store, &fixture.raw, &records.logins);
+    let promised = |cli| {
+        page_row_signs_in_unattended(
+            cli,
+            &fixture.store,
+            &records.raw_roster,
+            &fixture.raw,
+            &records.logins,
+        )
+    };
     assert!(
         promised(Cli::Codex),
         "CONTROL: nothing on record against it"
@@ -520,12 +525,15 @@ fn unadmitted_prose_cannot_complete_or_block_an_admitted_task() {
             workflow_browser_window_token(&fixture.store, &fixture.raw, &records.logins, task.at)
                 .is_none()
         );
-        assert!(bot_check_on_record_at(&fixture.store, &fixture.raw, &records.logins).is_none());
+        assert!(check_standing_at(&fixture.store, &fixture.raw, &records.logins).is_none());
         assert_eq!(
             unaddressed_sign_in_task_at(&fixture.store, &records.logins, &fixture.raw),
             Some(task.at)
         );
     }
+    // Under the row's admitted workflow, a renewal's `bot-check` line is the record an earlier
+    // build wrote of a bot protection's stop, and holds as its account's
+    // [`accounts::CheckStop`] does ([`ledger_check_at`]).
     fixture
         .store
         .transact_pool_logins_within(&[], &fixture.path, NOW, &mut None, |_, _, logins| {
@@ -538,24 +546,8 @@ fn unadmitted_prose_cannot_complete_or_block_an_admitted_task() {
         .unwrap();
     let records = fixture.records();
     assert_eq!(
-        bot_check_on_record_at(&fixture.store, &fixture.raw, &records.logins),
+        check_standing_at(&fixture.store, &fixture.raw, &records.logins),
         Some(NOW)
-    );
-    fixture
-        .store
-        .append(&[accounts::Event::new(
-            NOW,
-            accounts::Kind::WrongAccount,
-            "work",
-        )])
-        .unwrap();
-    assert_eq!(
-        accounts::current_workflow(&fixture.raw, &fixture.records().logins),
-        Some(token)
-    );
-    assert!(
-        bot_check_on_record_at(&fixture.store, &fixture.raw, &records.logins).is_none(),
-        "a committed independent terminal veto does not need positive workflow authority"
     );
 }
 
@@ -607,7 +599,9 @@ fn a_cleanup_read_cannot_erase_a_newer_workflows_claim_or_pending_task() {
                 state.ladder_owners.insert(key.clone(), owner);
                 state.last_attempt.insert(key.clone(), clock);
                 state.parked.insert(key.clone(), clock);
-                state.bot_checked.insert(key.clone(), clock);
+                state
+                    .unrecorded_checks
+                    .insert(key.clone(), super::login_activity_tests::a_check_met(&key));
                 state.ladder.failed(&key, "current C inputs", clock);
                 token
             };
@@ -658,7 +652,7 @@ fn a_cleanup_read_cannot_erase_a_newer_workflows_claim_or_pending_task() {
             ));
             assert_eq!(state.last_attempt.get(&key), Some(&clock));
             assert_eq!(state.parked.get(&key), Some(&clock));
-            assert_eq!(state.bot_checked.get(&key), Some(&clock));
+            assert!(state.unrecorded_checks.contains_key(&key));
             assert!(state.ladder.has_backoff(&key));
             assert!(!state.browser_unparked.contains_key(&key));
             drop(state);

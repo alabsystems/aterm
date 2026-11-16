@@ -71,6 +71,9 @@ fn problem(why: impl ToString) -> Refusal {
 /// The file a verb names, and what this Mac holds of it.
 struct Target {
     file: &'static Type,
+    /// The collection the file projects: a catalog table's, the only kind an owner's verb
+    /// writes.
+    collection: &'static Collection,
     held: File,
     name: Name,
 }
@@ -81,9 +84,20 @@ impl Target {
         let Some(file) = super::find(&name) else {
             return Err(usage(format!("{name}: no such shared file in this build")));
         };
+        // Each Mac states its own rows of a Mac file through its journal, and nobody writes a
+        // view: no verb of a person's writes either.
+        let Some((_, collection)) = file.table() else {
+            return Err(usage(match file.class {
+                super::Class::Derived => format!("{name} is a view: nothing writes it"),
+                super::Class::Owner | super::Class::Mac => {
+                    format!("{name} is written by each Mac's harness, never by a verb")
+                }
+            }));
+        };
         let root = super::root(&generation::original(paths));
         Ok(Self {
             file,
+            collection,
             held: File::at(&root, &name),
             name,
         })
@@ -104,7 +118,7 @@ impl Target {
         let collection = att::find(&base.table)
             .and_then(|compiled| compiled.collection(&base.collection))
             .map_err(|_| stale())?;
-        if collection.name != self.file.collection.name {
+        if collection.name != self.collection.name {
             return Err(stale());
         }
         Ok((base, collection))
@@ -280,7 +294,7 @@ fn add(target: &Target, assigns: &[String]) -> Result<Vec<Edit>, Refusal> {
     // nothing is materialized yet: a birth is compared with nothing.
     let collection = target
         .baseline()
-        .map_or(target.file.collection, |(_, collection)| collection);
+        .map_or(target.collection, |(_, collection)| collection);
     let mut edits = Vec::new();
     let mut given: Vec<&str> = Vec::new();
     for word in assigns {

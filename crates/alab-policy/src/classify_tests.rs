@@ -1089,7 +1089,8 @@ fn the_added_reads_are_reads_and_their_neighbours_are_not() {
 }
 
 /// `aterm ctl` is read-only by verb and form: `meta` reads and `meta set` writes the owner's
-/// badge; `inbox` reads and `inbox seen` writes.
+/// badge; `inbox` reads and `inbox seen` writes; `described` reads a session's description
+/// claims and the `mark` that writes one writes.
 #[test]
 fn aterm_forms_are_judged_by_their_full_subform() {
     for read in [
@@ -1103,6 +1104,8 @@ fn aterm_forms_are_judged_by_their_full_subform() {
         "aterm ctl @s-1 inbox",
         "aterm ctl @s-1 inbox get 3",
         "aterm ctl @s-1 resizes 20 since=4",
+        "aterm ctl @s-1 described",
+        "aterm ctl @s-1 described --json",
         "aterm ctl turn --help",
         "aterm-ctl status",
         "aterm --version",
@@ -1119,6 +1122,7 @@ fn aterm_forms_are_judged_by_their_full_subform() {
         "aterm ctl @s-1 meta set attention hi",
         "aterm ctl @s-1 meta unset attention",
         "aterm ctl @s-1 inbox seen 3 handled",
+        "aterm ctl @s-1 mark - desc field=title value=Fold%20laws",
         "aterm ctl @s-1 key 1",
         "aterm ctl @s-1 send x",
         "aterm ctl @s-1 turn 'go'",

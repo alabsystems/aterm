@@ -177,6 +177,7 @@ fn runtime_tools_keeps_only_what_exists() {
 /// The real tool is the selected developer directory's, else the Command Line Tools' own,
 /// read by path; never Apple's `/usr/bin` stub (which would find the shim on PATH again),
 /// never a relative directory, and never a name with a path in it.
+#[cfg(unix)]
 #[test]
 fn the_real_tool_is_a_developer_directorys_never_a_usr_bin_stub() {
     let xcode = std::path::Path::new("/Applications/Xcode.app/Contents/Developer");
@@ -241,6 +242,7 @@ fn the_real_tool_is_a_developer_directorys_never_a_usr_bin_stub() {
 /// `make` and `xcodebuild`. With Xcode selected and the Command Line Tools absent,
 /// `/usr/bin/cc` runs Xcode's toolchain `cc`, so the shim hands the call to that binary
 /// rather than say the tools carry no `cc`.
+#[cfg(unix)]
 #[test]
 fn with_xcode_selected_the_shim_finds_xcodes_own_cc() {
     let xcode = std::path::Path::new(XCODE_DEVELOPER);
@@ -273,6 +275,7 @@ fn with_xcode_selected_the_shim_finds_xcodes_own_cc() {
 /// names Xcode's own developer directory where Xcode is installed, ahead of the Command Line
 /// Tools, so `/usr/bin/git` runs Xcode's git there: the shim reads the same directories in
 /// the same order. `$DEVELOPER_DIR` and the link still come first.
+#[cfg(unix)]
 #[test]
 fn with_no_link_the_shim_reads_xcode_where_xcode_select_does() {
     let path = std::path::PathBuf::from;
@@ -387,6 +390,7 @@ fn a_process_names_the_shims_developer_dir_only_while_the_tools_are_missing() {
 
 /// Its developer directory never reads as the tools: `$DEVELOPER_DIR` comes first among the
 /// directories, and it holds `xcrun` alone.
+#[cfg(unix)]
 #[test]
 fn the_shims_developer_dir_never_reads_as_the_tools() {
     use std::path::Path;
@@ -426,6 +430,7 @@ fn the_called_tool_is_xcruns_first_word_when_that_names_one() {
     assert_eq!(called_tool("git", &words(&["status"])), "git");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_shim_leaves_the_path_it_hands_on() {
     let shim = std::path::Path::new("/state/clt-shim");

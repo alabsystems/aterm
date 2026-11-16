@@ -302,7 +302,7 @@ fn a_posts_idem_and_via_never_reach_a_bus_body() {
     let (h, _store) = fabric_rig(75);
     let reply = crate::fabric::cmd_post(
         &h.ctx,
-        "to=@s-peer kind=ask dl=5000 via=n-qzp6via1 key=QZP6IDEM1 --wait=0 SENTINEL",
+        "to=@tpeer000001 kind=ask dl=5000 via=n-qzp6via1 key=QZP6IDEM1 --wait=0 SENTINEL",
         None,
     );
     assert!(queued(&reply, 1), "{reply}");

@@ -86,6 +86,7 @@ pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
             thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
             wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
             identity: Identity::from_native("account", "user"),
+            limit: None,
         },
         sid: "t000fjxtvre".into(),
         old_pid: 10,

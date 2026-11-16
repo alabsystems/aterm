@@ -189,6 +189,9 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
         std::fs::read(sysroot.join("bin/trustc")).expect("t"),
         "the fixture pair differs inside its signatures"
     );
+    // Keep macOS's first assessment of the freshly linked image outside the pack's
+    // compiler-response hang detector. The pack still admits its actual version output.
+    aterm_spec::wait::first_exec(&sysroot.join("bin/trustc"), &["-vV"]);
     put_exe(
         &sysroot.join("bin/tippy"),
         b"#!/bin/sh\nd=$(dirname \"$0\"); cmp -s \"$d/rustc\" \"$d/trustc\" || { echo \"tippy: setup error: rustc is not trustc\" >&2; exit 1; }; exit 0\n",

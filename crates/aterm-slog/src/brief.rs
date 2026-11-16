@@ -287,7 +287,7 @@ pub fn count_line_forms() -> [String; 4] {
 /// The `out=` word a failed run closes with, which the runs count line counts.
 const RUN_FAIL: &str = Out::Run(RunOut::Fail).word();
 
-/// Whether a mark of kind `k` renders its own line in a brief.
+/// Whether a mark of kind `k` renders its own line in a brief. A `desc` claim never does: a brief is what an agent is given, and a description is a claim about the session, never an instruction to whoever reads it.
 const fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -329,6 +329,7 @@ const fn mark_worth_a_line(k: Kind) -> bool {
             | Kind::Row
             | Kind::MailGap
             | Kind::Tab
+            | Kind::Desc
     )
 }
 

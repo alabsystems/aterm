@@ -300,7 +300,10 @@ fn a_protected_address_never_resolves_a_mailbox() {
 
 /// A sign-in's mailbox from registry rows alone (step A9): the MAILBOX row names its login by
 /// the address row, and its patterns, webmail and held credentials, never a value; each value is
-/// read from the secret-store entry its `SecretRef` cell names.
+/// read from the secret-store entry its `SecretRef` cell names. Each reveal journals first, and
+/// the reveal journal is Unix's alone (`secret::Journal::record`; elsewhere every reveal is
+/// refused), as is the lab view that asks for a sign-in.
+#[cfg(unix)]
 mod sign_in {
     use super::*;
     use crate::{
@@ -374,12 +377,9 @@ mod sign_in {
                     stored(&store, "mailbox", &mailbox, "totp", TOTP),
                 ),
                 elem(&MAILBOX, &mailbox, "receives", &member),
-                put(
-                    &MAILBOX,
-                    &mailbox,
-                    "receives_domains",
-                    json!(["pm.example.test", "*"]),
-                ),
+                // The fourth generation's domains: one element each.
+                elem(&MAILBOX, &mailbox, "receives_domains", "pm.example.test"),
+                elem(&MAILBOX, &mailbox, "receives_domains", "*"),
             ],
         );
         Fixture {
@@ -493,6 +493,50 @@ mod sign_in {
                 "a cell names its entry, never holds the value"
             );
         }
+    }
+
+    /// Only a settled domain routes (LT-15B): a domain one writer added while another removed it
+    /// is no route, and the mailbox's other domains still route.
+    /// NEGATIVE CONTROL (run 2026-11-15): with [`mailboxes`] reading its domains through
+    /// `cell::texts` (each element's first candidate), the disputed domain routes: `` left:
+    /// ["ai1@example.test", "*@dispute.example.test", "*@pm.example.test", "*"] ``.
+    #[test]
+    fn a_disputed_domain_routes_nothing() {
+        let Fixture {
+            mut book, mailbox, ..
+        } = fixture();
+        let seen = book.all();
+        book.write(
+            2,
+            &seen,
+            vec![elem(
+                &MAILBOX,
+                &mailbox,
+                "receives_domains",
+                "dispute.example.test",
+            )],
+        );
+        book.write(
+            3,
+            &seen,
+            vec![
+                cell::member_change(
+                    &MAILBOX,
+                    &mailbox,
+                    "receives_domains",
+                    "dispute.example.test",
+                    false,
+                    |x| cell::CellValue::owner(MAILBOX.version, x),
+                )
+                .unwrap(),
+            ],
+        );
+        let (addresses, mailboxes_rows) = projections(&book);
+        let found = mailboxes(&addresses, &mailboxes_rows);
+        assert_eq!(
+            found[0].receives,
+            ["ai1@example.test", "*@pm.example.test", "*"]
+        );
     }
 
     /// Two entries holding one value are one value: Macs that rolled one value from different
@@ -738,7 +782,6 @@ mod sign_in {
     /// the opener; with `holds_credential` counting only references (before the fix), the
     /// listing holds none: `` left: [] right: [Password, Totp] ``.
     #[test]
-    #[cfg(unix)]
     fn a_sign_in_below_the_third_generation_opens_its_sealed_token() {
         use crate::{
             alab::registry::{REGISTRY_2, REGISTRY_3, SEALED_ADDRESS, SEALED_MAILBOX},

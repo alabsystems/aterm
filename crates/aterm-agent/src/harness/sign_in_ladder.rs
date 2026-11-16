@@ -516,6 +516,9 @@ struct Backoff {
     inputs: String,
     /// A page stopped this failure ([`Ladder::page_stopped`]).
     page_stopped: bool,
+    /// That page was a bot protection, which only a person goes on from: no clock and no new
+    /// input ends this wait, only the saved record ([`Ladder::page_ended`]).
+    for_a_person: bool,
 }
 
 /// The vault refresh's own clock: one `aterm secrets sync` at a time, and none sooner than its
@@ -566,9 +569,11 @@ pub(super) enum VaultTurn {
 
 impl Ladder {
     /// The existing retry clock, without probing routes or advancing the ladder.
+    /// A row that waits for a person has none ([`Self::page_stopped`]).
     pub(super) fn retry_at(&self, label: &str, now: Instant) -> Option<Instant> {
         self.backoff
             .get(label)
+            .filter(|backoff| !backoff.for_a_person)
             .map(|backoff| backoff.next)
             .filter(|next| *next > now)
     }
@@ -577,7 +582,8 @@ impl Ladder {
     /// last failure stands and the machine reads as it did then (`inputs`); a new mailbox, a
     /// browser installed, a vault delivery or a profile made ends the wait at once, though a row a
     /// page stopped is held on record before it gets here. Once a different input is observed,
-    /// returning to the previous input cannot restore its wait.
+    /// returning to the previous input cannot restore its wait. A row a bot protection stopped
+    /// waits for a person whatever it reads and however long it waits ([`Self::page_stopped`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -611,6 +617,9 @@ impl Ladder {
         )
     )]
     pub(super) fn held(&mut self, label: &str, inputs: &str, now: Instant) -> bool {
+        if self.backoff.get(label).is_some_and(|b| b.for_a_person) {
+            return true;
+        }
         if self.backoff.get(label).is_some_and(|b| b.inputs != inputs) {
             self.backoff.remove(label);
             return false;
@@ -652,18 +661,24 @@ impl Ladder {
                 step,
                 inputs: inputs.to_owned(),
                 page_stopped: false,
+                for_a_person: false,
             },
         );
         wait
     }
 
-    /// Notes that a page stopped `label`'s last failure, which it waits on until `until`: no move
-    /// ends this wait ([`Self::moved`]), and the saved record says when it is over
+    /// Notes that a page stopped `label`'s last failure, which it waits on until `until`, or, with
+    /// `None`, until a person goes on from it: a bot protection's check or block page, which
+    /// nothing here tries again on a clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md`
+    /// §3). No move ends either wait ([`Self::moved`]), and the saved record says when it is over
     /// ([`Self::page_ended`]).
-    pub(super) fn page_stopped(&mut self, label: &str, until: Instant) {
+    pub(super) fn page_stopped(&mut self, label: &str, until: Option<Instant>) {
         if let Some(backoff) = self.backoff.get_mut(label) {
             backoff.page_stopped = true;
-            backoff.next = backoff.next.max(until);
+            match until {
+                Some(until) => backoff.next = backoff.next.max(until),
+                None => backoff.for_a_person = true,
+            }
         }
     }
 
@@ -787,6 +802,16 @@ impl Ladder {
             seen: None,
         });
         VaultTurn::Due
+    }
+
+    /// What the vault's last refresh found, where it started no earlier than `since`, has
+    /// ended, and no observed change has made it stale since: a reading of the vault fresher
+    /// than `since` (plan package FL-138's token upkeep reads one before it makes a token).
+    pub(super) fn vault_seen_since(&self, since: Instant) -> Option<Vault> {
+        self.vault
+            .as_ref()
+            .filter(|run| !run.invalidated && run.at >= since)
+            .and_then(|run| run.seen.clone())
     }
 
     /// Read a completed result without reserving a refresh the caller will not start.
@@ -950,6 +975,49 @@ pub(super) fn spaced_until(
 ) -> Option<i64> {
     let last = last.filter(|last| last.cli != cli.id() || last.label != label)?;
     (now.abs_diff(last.at) < SPACING_S.unsigned_abs()).then(|| last.at.saturating_add(SPACING_S))
+}
+
+/// What [`space_token_capture`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TokenSpacing {
+    /// The capture may start now: its start is this Mac's last sign-in start.
+    Started,
+    /// Another account's sign-in started here within [`SPACING_S`]; not before this time (Unix
+    /// seconds).
+    Until(i64),
+    /// The sign-in lock is held (a sign-in runs here), or the record could not be read or
+    /// written: nothing starts on this pass.
+    Busy,
+}
+
+/// SPACES A TOKEN CAPTURE THIS MAC'S UPKEEP MAKES WITH NOBODY THERE (plan package FL-138) as an
+/// automatic sign-in of Claude Code's `label` at `now`: its page may sign the account's window
+/// store in, which the provider sees as a sign-in, so another account's start within
+/// [`SPACING_S`] holds it ([`spaced_until`]), and its own start is recorded as this Mac's last.
+/// Both are read and written under the sign-in lock, taken without waiting and let go before
+/// the capture runs: a token is made under its account's lock, never `signin.lock`.
+pub(super) fn space_token_capture(
+    store: &super::accounts::Store,
+    label: &str,
+    now: i64,
+) -> TokenSpacing {
+    let Ok(Some(_turn)) = store.signin_now() else {
+        return TokenSpacing::Busy;
+    };
+    let Ok(last) = last_started(store) else {
+        return TokenSpacing::Busy;
+    };
+    let cli = super::accounts::Cli::Claude;
+    if let Some(until) = spaced_until(last.as_ref(), cli, label, now) {
+        return TokenSpacing::Until(until);
+    }
+    match super::atomic_write::write_atomic(
+        &spacing_path(store),
+        &Started::new(cli, label, now).text(),
+    ) {
+        Ok(()) => TokenSpacing::Started,
+        Err(_) => TokenSpacing::Busy,
+    }
 }
 
 /// Where `store`'s Mac keeps its last sign-in start ([`SIGNIN_SPACING_FILE`]).

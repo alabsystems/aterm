@@ -358,3 +358,44 @@ fn recorder_keeps_unordered_raw_counters_and_selects_the_complete_envelope() {
     let huge = member(Some((u64::MAX, 1))).unwrap();
     assert!(peak_sum(&[huge.clone(), huge]).is_err());
 }
+
+#[test]
+fn multiwindow_cleanup_requires_every_original_cat_not_just_the_workload_pair() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    // Two workload terminals plus one unrelated 30-tab window. Inject identities
+    // into the same production recorder state; no real process or window is opened.
+    let originals: Vec<_> = (0..32)
+        .map(|i| {
+            let mut child = child_identity();
+            child.pid += i;
+            child.token()
+        })
+        .collect();
+    for missing in [None, Some(0), Some(31)] {
+        let path = dir.path().join(format!("retirement-{missing:?}.jsonl"));
+        let mut started = retired_sample(1);
+        started.originals = originals.clone();
+        started.retired.clear();
+        let mut finished = retired_sample(2);
+        finished.originals = originals.clone();
+        finished.retired = originals
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != missing)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let writer = Writer::new(
+            path.clone(),
+            "key".into(),
+            "generation".into(),
+            4096,
+            started,
+        )
+        .unwrap();
+        let result = CaptureState::default().complete(writer, &identity().token(), Ok(finished));
+        assert_eq!(result.is_ok(), missing.is_none());
+        let raw = std::fs::read_to_string(path).unwrap();
+        let footer: Value = aterm_json::from_str(raw.lines().last().unwrap()).unwrap();
+        assert_eq!(footer["cleanup_complete"], json!(missing.is_none()));
+    }
+}

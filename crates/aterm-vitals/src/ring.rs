@@ -68,8 +68,8 @@ impl Taken {
 }
 
 /// How a reading lands in a history of wall-clock buckets: A1 §1.4 item 9's one back-step rule,
-/// which [`BucketRing`], its ten-minute buckets, [`crate::history::FreeHistory`] and
-/// [`crate::writes::WriteHour`] share.
+/// which [`BucketRing`], its ten-minute buckets, [`crate::history::FreeSeries`] (the disk's 24
+/// hours and 3 weeks) and [`crate::writes::WriteHour`] share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lands {
     /// The history held nothing: the reading opens its first bucket, keyed as given.

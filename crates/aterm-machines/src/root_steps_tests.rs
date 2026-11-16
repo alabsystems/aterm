@@ -667,6 +667,53 @@ fn init_owes_a_stopped_broker_even_while_its_signed_update_is_adoptable() {
     }
 }
 
+/// A broker job launchd lists switched off (aterm's background item turned off in Login Items,
+/// or `launchctl disable`) owes no password, stopped with current files or with files to repair,
+/// in macOS 13's and earlier spellings. NEGATIVE CONTROL: listed enabled, or unread, a stopped job
+/// or a file repair stays owed. MUTANT: an `owed` that reads no switch owes every one.
+#[test]
+fn a_broker_the_person_switched_off_owes_no_password() {
+    use aterm_uds::lan::{IMAGE_EXECUTABLE, PLIST_PATH, install};
+    const PRINT_DISABLED: &str = "/bin/launchctl print-disabled system";
+    let ours = install::test_image(0x0100_000c, &[b"this build"]);
+    let list = |state: &str| {
+        Ran::ok(&format!(
+            "disabled services = {{\n\t\"systems.alab.aterm-lan\" => {state}\n}}\n"
+        ))
+    };
+    let owes = |installed: bool, switch: Option<Ran>| {
+        let mut sys = Fake::root();
+        let source = Path::new("/Applications/aterm.app");
+        sys.running_app = Some(source.into());
+        sys.on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+            .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+            .file("/Applications/aterm.app/Contents/MacOS/aterm", &ours)
+            .on(
+                "/bin/launchctl print system/systems.alab.aterm-lan",
+                Ran::exit(113, "Could not find service"),
+            );
+        if installed {
+            sys.file(IMAGE_EXECUTABLE, &ours)
+                .file(PLIST_PATH, install::plist_text(source).as_bytes());
+        }
+        if let Some(switch) = switch {
+            sys.on(PRINT_DISABLED, switch);
+        }
+        owed(&sys).contains(&Owed::LanBroker)
+    };
+    for installed in [true, false] {
+        assert!(!owes(installed, Some(list("disabled"))), "{installed}");
+        assert!(!owes(installed, Some(list("true"))), "{installed}");
+        assert!(owes(installed, Some(list("enabled"))), "{installed}");
+        assert!(owes(installed, Some(list("false"))), "{installed}");
+        assert!(
+            owes(installed, Some(Ran::exit(1, "Operation not permitted"))),
+            "{installed}"
+        );
+        assert!(owes(installed, None), "{installed}");
+    }
+}
+
 /// Account spelling cannot select the built-in ALL alias or an administrator's user alias.
 #[test]
 fn a_naming_account_cannot_be_a_sudoers_user_alias() {

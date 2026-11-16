@@ -263,7 +263,7 @@ fn app_with_a_running_page(t0: Instant) -> (App, WindowId, crate::tab_model::Vie
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     {
-        let window = app.windows.get_mut(&wid).unwrap();
+        let mut window = app.windows.get_mut(&wid).unwrap();
         window.rows = 90;
         window.cols = 160;
         window.os_window_for_test = true;

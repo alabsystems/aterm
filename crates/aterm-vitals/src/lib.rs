@@ -18,6 +18,7 @@ pub mod jobs;
 pub mod lanes;
 pub mod left;
 pub mod model;
+pub mod net_counter;
 pub mod peaks;
 pub mod program_check;
 pub mod ring;
@@ -39,7 +40,8 @@ pub use model::{
     AccountIx, AneCheck, AneSample, COMMIT_NEAR_PCT, CapBasis, ClusterSpec, ClusterView,
     CommitSample, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot,
     Hog, LinkKind, LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView,
-    NetState, NetView, NoFigure, PlaceKind, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample,
+    MemoryClass, MemoryClassKind, MemoryPartition, NetState, NetView, NoFigure,
+    PhysicalMemoryClasses, PlaceKind, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample,
     ProcState, ProcView, Resource, ResourceView, RowFacts, RowScope, STRIP_RINGS, Sample,
     SavedStrip, ScopeFig, ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind,
     StripLine, TabRoot, TabTokens, TabView, TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals,

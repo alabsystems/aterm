@@ -78,7 +78,7 @@ pub(super) struct Effects<'a> {
 fn needs_adoption(
     candidate: &Candidate,
     grant: &Grant,
-    records: &accounts::AccountRecords,
+    (store, records): (&accounts::Store, &accounts::AccountRecords),
     home: &Path,
     now: i64,
 ) -> bool {
@@ -93,10 +93,22 @@ fn needs_adoption(
             .chain(candidate.row.identity_email.iter())
             .any(|email| row.matches_email(email))
     });
+    // A row a bot protection stopped here, or one of its pool and realm, is a person's, the
+    // candidate's own label for one not yet appended ([`super::super::accounts_sync::person_hold`]).
+    let held = |row: &Row| {
+        super::super::accounts_sync::person_hold(
+            store,
+            &records.raw_roster,
+            records.raw_roster.row(&row.label).unwrap_or(row),
+            &records.logins,
+        )
+        .is_some()
+    };
     let Some(row) = matching.next() else {
-        return true;
+        return !held(&candidate.row);
     };
     if matching.next().is_some()
+        || held(row)
         || row.browser.is_some()
         || (candidate.ordinary_renewal
             && records.logins.shared.required(row) == Ok(Some(grant.source))
@@ -458,7 +470,7 @@ pub(super) fn prepare_shared_with_clock(
         let Ok(grant) = candidate.authority.prepare(&candidate.row) else {
             continue;
         };
-        if !needs_adoption(&candidate, &grant, &records, home, now) {
+        if !needs_adoption(&candidate, &grant, (&store, &records), home, now) {
             continue;
         }
         let pending = logins
@@ -908,11 +920,32 @@ pub(super) fn automatic(inner: CheckedAuthority, config: PathBuf) -> CheckedAuth
     Arc::new(Automatic { inner, config })
 }
 
+/// What a background sign-in reads of this machine's environment as `name`: the home it runs in,
+/// else the process's own variable; in a test, the account [`RUN_AS`] names on this thread is
+/// its `USER` and `LOGNAME`.
 fn environment(home: &Path, name: &str) -> Option<std::ffi::OsString> {
     if name == "HOME" {
         return Some(home.as_os_str().to_owned());
     }
+    #[cfg(test)]
+    {
+        if matches!(name, "USER" | "LOGNAME")
+            && let Some(person) = RUN_AS.with(|person| person.borrow().clone())
+        {
+            return Some(person);
+        }
+    }
     std::env::var_os(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The account a test on this thread runs its live background sign-ins as, in place of the
+    /// process's `USER` and `LOGNAME` ([`environment`]): verify's declared test environment
+    /// carries neither, and without one a sign-in starts no child
+    /// ([`super::super::cli::auth_check_env`]).
+    pub(in crate::harness) static RUN_AS: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub(in crate::harness) fn sign_in_with_inputs_scoped(

@@ -5,9 +5,13 @@
 //! Linux one (linux_release.rs, [`super::linux::Handoff`]): the directory is fixed before the
 //! claim, the pair in it is held to the cut when it signs, frozen into the journal, copied
 //! into `dist/`, stamped into the signed appcast and uploaded with the release. Unlike a
-//! Linux pair, which a `--linux-worker` can fetch itself, a Windows pair always comes by hand,
-//! so it is also held to the zip's SHA-256 the person read off the Windows host and named
-//! (`--windows-sha256`): the pair's own receipt binds nothing a writer of the carry cannot set.
+//! Linux pair, which a `--linux-worker` can fetch itself, a Windows pair has no worker the cut
+//! drives, so it is also held to an anchor the pair's own receipt cannot set: the zip's SHA-256
+//! the person read off the Windows host and named (`--windows-sha256`), for a pair that came by
+//! hand; or, for one the pull lane brought (`--windows-attested`,
+//! `crate::buildplan::windows_pull`), the attestation beside the receipt, by a builder the
+//! release commit itself pins (`aterm_winship::attest`, `apps/aterm-win/release-builders.toml`).
+//! A handoff has exactly one anchor.
 //!
 //! The pair is what `aterm-winship release-build` writes on a Windows host (the Mac
 //! cannot build the MSVC images, and this crate does not build on Windows): the portable
@@ -40,9 +44,14 @@ pub struct Handoff {
     pub directory: PathBuf,
     /// The zip's SHA-256 the person named (`--windows-sha256`), read off the Windows host
     /// where `release-build` printed it: what binds a pair that came by hand
-    /// ([`Receipt::check_carried`]). The sign step admits no pair without it.
+    /// ([`Receipt::check_carried`]). The sign step admits no pair without it or `attested`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// `--windows-attested`: the pair came through the pull lane, and what binds it is the
+    /// attestation beside its receipt (`<zip>.handoff.sig`) by a builder the release commit pins,
+    /// in place of a typed digest ([`Sources::builders`]). Never with `sha256`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attested: bool,
     /// The receipt the sign step admitted, frozen: a resume refuses a directory that says
     /// anything else.
     #[serde(default)]
@@ -50,6 +59,26 @@ pub struct Handoff {
     /// The verifier the sign step took out of the frozen zip, frozen with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verifier: Option<Verifier>,
+    /// For an `attested` handoff, the builder whose attestation admitted the frozen zip, frozen
+    /// with it: a resume refuses an attestation of another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attester: Option<Attester>,
+    /// For an `attested` handoff, the UTC day (`YYYY-MM-DD`) its attestation was first admitted
+    /// on: the pull lane's admission for a pair it brought (the release journal's
+    /// `windows_pull.admitted_on`), else the first import. The builder's `not_after` is judged
+    /// on this day at every import, so a resume after it neither refuses what was admitted
+    /// before it nor admits what was not. Frozen with the zip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_on: Option<String>,
+}
+
+/// The builder that attested a pulled pair, as the release commit pins it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attester {
+    /// Its id (`aterm_winship::attest::check_id`).
+    pub builder: String,
+    /// Its pinned Ed25519 public key, 64 lowercase hex digits.
+    pub public_key: String,
 }
 
 /// get-aterm.ps1's verifier as the cut took it out of the frozen zip: the digest and size
@@ -106,6 +135,10 @@ pub struct Sources {
     pub stock: String,
     /// The commit's `trust.lock` `compiler_commit`, when it carries a lock.
     pub trust_commit: Option<String>,
+    /// The text of the commit's `apps/aterm-win/release-builders.toml`
+    /// (`aterm_winship::pull::BUILDERS_FILE`), the builders whose attestation binds a pulled
+    /// pair; `None` when the commit holds no such file, which pins none.
+    pub builders: Option<String>,
 }
 
 impl Sources {
@@ -132,6 +165,29 @@ impl Sources {
             tree,
             stock,
             trust_commit,
+            builders: builders_at(git, commit)?,
+        })
+    }
+
+    /// The builders the commit pins (none without its builders file), for an attestation
+    /// checked on `today` (`YYYY-MM-DD`, UTC): the builder that attested the receipt beside the
+    /// zip `asset` in `directory`.
+    ///
+    /// # Errors
+    /// A builders file that does not read, or an attestation `aterm_winship::attest` refuses
+    /// (an unknown or expired builder, a bad signature), named as such.
+    pub fn attester(&self, directory: &Path, asset: &str, today: &str) -> Result<Attester, String> {
+        let builders = match &self.builders {
+            Some(text) => {
+                aterm_winship::attest::Builders::parse(text).map_err(|e| e.to_string())?
+            }
+            None => aterm_winship::attest::Builders::default(),
+        };
+        let attested = aterm_winship::attest::verify_beside(directory, asset, &builders, today)
+            .map_err(|refused| format!("the Windows pair's attestation is refused: {refused}"))?;
+        Ok(Attester {
+            builder: attested.builder,
+            public_key: attested.public_key,
         })
     }
 
@@ -143,6 +199,25 @@ impl Sources {
             trust_commit: self.trust_commit.as_deref(),
         }
     }
+}
+
+/// The text of `commit`'s `apps/aterm-win/release-builders.toml` (`aterm_winship::pull::BUILDERS_FILE`),
+/// read from this repository's objects; `None` when the commit holds no such file.
+///
+/// # Errors
+/// What git cannot answer for `commit`.
+pub fn builders_at(git: &dyn GitRunner, commit: &str) -> Result<Option<String>, String> {
+    let read = |args: &[&str]| {
+        git_ok(git, args)
+            .map(|out| out.stdout_utf8())
+            .map_err(|e| e.to_string())
+    };
+    let builders_file = aterm_winship::pull::BUILDERS_FILE;
+    let listed = read(&["ls-tree", "--name-only", commit, "--", builders_file])?;
+    if listed.trim().is_empty() {
+        return Ok(None);
+    }
+    read(&["show", &format!("{commit}:{builders_file}")]).map(Some)
 }
 
 /// The Windows assets `manifest` signs: the zip, then the verifier.
@@ -219,9 +294,67 @@ impl Handoff {
         Ok(Self {
             directory,
             sha256: sha256.map(handoff::carried_sha256).transpose()?,
+            attested: false,
             artifact: None,
             verifier: None,
+            attester: None,
+            attested_on: None,
         })
+    }
+
+    /// The handoff a cut declares: `--windows-artifacts directory` with its anchor, the digest
+    /// the person named (`--windows-sha256`, [`Handoff::new`]) or, `attested`, the attestation
+    /// the pull lane brought beside the receipt (`--windows-attested`).
+    ///
+    /// # Errors
+    /// What [`Handoff::new`] refuses, or both anchors at once.
+    pub fn declared(
+        directory: &Path,
+        sha256: Option<&str>,
+        attested: bool,
+    ) -> Result<Self, String> {
+        if attested && sha256.is_some() {
+            return Err(
+                "--windows-attested and --windows-sha256 both anchor the Windows pair: a pair \
+                 the pull lane brought is bound by its attestation, one carried by hand by the \
+                 digest typed; pass one"
+                    .into(),
+            );
+        }
+        let mut handoff = Self::new(directory, sha256)?;
+        handoff.attested = attested;
+        Ok(handoff)
+    }
+
+    /// The handoff, for an attested one, judged on `day` (`YYYY-MM-DD`): the day the pull lane
+    /// admitted its attestation ([`Handoff::attested_on`]). `None`, or a handoff bound by a
+    /// digest, changes nothing.
+    ///
+    /// # Errors
+    /// A day that is no date.
+    pub fn attested_on(mut self, day: Option<&str>) -> Result<Self, String> {
+        if let Some(day) = day.filter(|_| self.attested) {
+            if aterm_winship::pull::date_days(day).is_none() {
+                return Err(format!(
+                    "the Windows pair's admission day {day:?} is not a date (YYYY-MM-DD)"
+                ));
+            }
+            self.attested_on = Some(day.to_string());
+        }
+        Ok(self)
+    }
+
+    /// The anchor in words, for a refusal: the typed digest, the attestation, or none named.
+    #[must_use]
+    pub fn anchor_words(&self) -> String {
+        match (&self.sha256, self.attested) {
+            (Some(sha256), _) => format!("SHA-256 {sha256}"),
+            (None, true) => self.attester.as_ref().map_or_else(
+                || "attested by a pinned builder".to_string(),
+                |attester| format!("attested by builder {}", attester.builder),
+            ),
+            (None, false) => "no anchor named".to_string(),
+        }
     }
 
     /// The handoff is of release `version` build `build` at `commit`, from a safe directory;
@@ -252,14 +385,61 @@ impl Handoff {
         {
             return Err("Windows handoff names a carried digest that is no SHA-256".into());
         }
+        if self.attested && self.sha256.is_some() {
+            return Err(
+                "Windows handoff names both a carried digest and an attestation: one anchor \
+                 binds a pair"
+                    .into(),
+            );
+        }
+        if !self.attested && self.attester.is_some() {
+            return Err("Windows handoff names an attesting builder but no attestation".into());
+        }
+        if let Some(day) = &self.attested_on
+            && (!self.attested || aterm_winship::pull::date_days(day).is_none())
+        {
+            return Err(
+                "Windows handoff names an admission day that is no date, or no attestation it \
+                 was admitted by"
+                    .into(),
+            );
+        }
         match (&self.artifact, &self.verifier) {
             (Some(artifact), Some(verifier)) => {
                 artifact.check_identity(version, build, commit)?;
                 if !aterm_codec::hex::is_lower(&verifier.sha256, 64) {
                     return Err("Windows handoff froze a verifier digest that is no SHA-256".into());
                 }
-                // A frozen zip was bound to the digest the person named when it was admitted.
-                artifact.check_carried(self.sha256.as_deref())
+                if !self.attested {
+                    // A frozen zip was bound to the digest the person named when it was
+                    // admitted.
+                    return artifact.check_carried(self.sha256.as_deref());
+                }
+                // A frozen pulled zip was bound to a pinned builder's attestation when it was
+                // admitted: the builder and the day are frozen with it.
+                if self.attested_on.is_none() {
+                    return Err(
+                        "Windows handoff froze an attested zip but not the day it was admitted"
+                            .into(),
+                    );
+                }
+                match &self.attester {
+                    Some(attester)
+                        if aterm_winship::attest::check_id(&attester.builder).is_ok()
+                            && aterm_codec::hex::is_lower(&attester.public_key, 64) =>
+                    {
+                        Ok(())
+                    }
+                    Some(_) => Err(
+                        "Windows handoff froze an attesting builder that is no pinned builder"
+                            .into(),
+                    ),
+                    None => Err(
+                        "Windows handoff froze an attested zip but not the builder that attested \
+                         it"
+                        .into(),
+                    ),
+                }
             }
             (Some(_), None) => {
                 Err("Windows handoff froze its zip but not the verifier it carries".into())
@@ -299,6 +479,16 @@ impl Handoff {
             "Windows release stage",
         )?);
         let lacking = handoff::missing(&self.directory, version)?;
+        if !lacking.is_empty() && self.attested {
+            return Err(format!(
+                "the pulled Windows pair lacks {} in {}: the release put it there from origin's \
+                 handoff before it declared it, and something removed it since; `{} --forget` \
+                 withdraws this reservation, and the release reserves and asks again",
+                lacking.join(" and "),
+                self.directory.display(),
+                crate::release::RELEASE_COMMAND,
+            ));
+        }
         if !lacking.is_empty() {
             return Err(format!(
                 "Windows build output missing ({}) in {}. On a Windows host, in a clean \
@@ -332,8 +522,34 @@ impl Handoff {
             );
         }
         // Admission proves the pair agrees with itself and this cut; the digest the person read
-        // off the Windows host proves it is the pair that host built.
-        admitted.check_carried(self.sha256.as_deref())?;
+        // off the Windows host proves it is the pair that host built, or, for a pair the pull
+        // lane brought, the attestation of a builder this commit pins proves its receipt is the
+        // one that builder signed. Its expiry is judged on the day it was first admitted, never
+        // again on a later one: a resume past the builder's `not_after` signs what was admitted
+        // before it.
+        let attested_on = self.attested.then(|| {
+            self.attested_on
+                .clone()
+                .unwrap_or_else(aterm_winship::pull::today)
+        });
+        let attester = if let Some(day) = &attested_on {
+            let attester = sources.attester(&self.directory, &admitted.asset, day)?;
+            if self
+                .attester
+                .as_ref()
+                .is_some_and(|frozen| *frozen != attester)
+            {
+                return Err(
+                    "the Windows pair's attesting builder changed after this cut froze it; \
+                     resume refused"
+                        .into(),
+                );
+            }
+            Some(attester)
+        } else {
+            admitted.check_carried(self.sha256.as_deref())?;
+            None
+        };
         let staged = dist.join(&admitted.asset);
         super::linux::stage_copy(
             &self.directory.join(&admitted.asset),
@@ -356,6 +572,8 @@ impl Handoff {
         }
         self.artifact = Some(admitted);
         self.verifier = Some(verifier);
+        self.attester = attester;
+        self.attested_on = attested_on;
         Ok(())
     }
 

@@ -31,7 +31,7 @@ fn inked_row(from: usize, to: usize) -> Vec<Vec<RenderCell>> {
 fn the_router_lead_is_the_footprints_own_lead() {
     let mut app = App::headless_for_test();
     let now = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let look = ws
         .fx
         .companions_mut()
@@ -63,7 +63,7 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     cfg.style = crate::cursor_glow::GlowStyle::RainbowKitty;
     cfg.intensity = 1.0;
     let now = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let mut out = Vec::new();
     ws.fx
         .cursor_mut()
@@ -78,7 +78,7 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     let mut frame = before;
     ws.input_scratch.cells = inked_row(0, 0);
     route_v2_companion(
-        ws,
+        &mut ws,
         CompanionInk::Single,
         CompanionDuty::FlyingHead { cell: (4, 10) },
         now,
@@ -92,7 +92,7 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     let mut frame = before;
     ws.input_scratch.cells = inked_row(11, 30);
     route_v2_companion(
-        ws,
+        &mut ws,
         CompanionInk::Single,
         CompanionDuty::FlyingHead { cell: (4, 10) },
         now,
@@ -114,7 +114,7 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     let mut frame = before;
     ws.input_scratch.cells = inked_row(0, 80);
     route_v2_companion(
-        ws,
+        &mut ws,
         CompanionInk::Single,
         CompanionDuty::Pet,
         now,
@@ -132,7 +132,7 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
     app.config.cursor_trail = Some(true);
     let cfg = app.glow_config();
     let now = Instant::now();
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let mut out = Vec::new();
     ws.fx
         .cursor_mut()
@@ -154,7 +154,7 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
         .glow
         .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
     let pet_frame = crate::app_render::pet_tick_for_test(
-        ws,
+        &mut ws,
         aterm_effects::host::CaptureMode::Present,
         aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
@@ -177,7 +177,7 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
     );
     let mut cat = ws.fx.companions_mut().cursor_cat.static_frame(t1);
     route_v2_companion(
-        ws,
+        &mut ws,
         CompanionInk::Single,
         CompanionDuty::FlyingHead { cell: (3, 40) },
         t1,
@@ -200,7 +200,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
     cfg.intensity = 1.0;
     let now = Instant::now();
     let caret = (4u16, 10u16);
-    let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+    let mut ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let mut out = Vec::new();
     ws.fx
         .cursor_mut()
@@ -208,7 +208,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         .tick(Some(caret), now, &cfg, glow_geom(), &mut out);
     assert!(ws.fx.cursor_mut().glow.v2_status().is_some(), "fixture: v2");
     let resident = super::pet_owner_tick_for_test(
-        ws,
+        &mut ws,
         aterm_effects::host::CaptureMode::Present,
         aterm_effects::kitty_pet::PetSense {
             caret_drawn: true,
@@ -252,8 +252,16 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         rest.y,
         rest.y + i32::from(rest.h),
     );
-    let routed =
-        super::route_single_cursor_companion(ws, GEOM, Some(caret), &pet, head, true, 255, now);
+    let routed = super::route_single_cursor_companion(
+        &mut ws,
+        GEOM,
+        Some(caret),
+        &pet,
+        head,
+        true,
+        255,
+        now,
+    );
     let seat = routed.seat.px.expect("the head is seated");
     assert!(
         seat.1 <= rest.0 && seat.0 < i32::from(caret.1) * i32::from(GEOM.cell_w),
@@ -266,7 +274,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
     assert_eq!(yield_box, seat, "the word pass yields to the seat");
 
     let fp = super::emit_routed_cursor_companion(
-        ws,
+        &mut ws,
         GEOM,
         &pet,
         false,
@@ -307,10 +315,10 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
     ws.input_scratch.cells = inked_row(0, 0);
     let head = ws.fx.companions_mut().cursor_cat.static_frame(t0);
     let ahead =
-        super::route_single_cursor_companion(ws, GEOM, Some(caret), &pet, head, true, 255, t0);
+        super::route_single_cursor_companion(&mut ws, GEOM, Some(caret), &pet, head, true, 255, t0);
     assert_ne!(
         super::emit_routed_cursor_companion(
-            ws,
+            &mut ws,
             GEOM,
             &pet,
             false,
@@ -330,7 +338,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
     ws.input_scratch.cells = inked_row(11, 30);
     let head = ws.fx.companions_mut().cursor_cat.static_frame(t1);
     let gliding =
-        super::route_single_cursor_companion(ws, GEOM, Some(caret), &pet, head, true, 255, t1);
+        super::route_single_cursor_companion(&mut ws, GEOM, Some(caret), &pet, head, true, 255, t1);
     let target = gliding.seat.px.expect("the new mirror target");
     let reserved = gliding
         .on_glass(Some(caret), None)
@@ -338,7 +346,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         .expect("the prepared gliding body");
     assert_ne!(
         super::emit_routed_cursor_companion(
-            ws,
+            &mut ws,
             GEOM,
             &pet,
             false,
@@ -485,14 +493,14 @@ fn a_capture_shades_the_sky_where_the_pet_is_drawn() {
 
     let mut twin = pet_app();
     let cfg = twin.glow_config();
-    let tw = twin.windows.get_mut(&wid).expect("window");
+    let mut tw = twin.windows.get_mut(&wid).expect("window");
     tw.fx
         .cursor_mut()
         .glow
         .tick(Some((5, 10)), t0, &cfg, glow_geom(), &mut Vec::new());
     let on_glass = (0..100u64).any(|k| {
         crate::app_render::pet_tick_for_test(
-            tw,
+            &mut tw,
             aterm_effects::host::CaptureMode::Present,
             aterm_effects::kitty_pet::PetSense {
                 caret_drawn: true,

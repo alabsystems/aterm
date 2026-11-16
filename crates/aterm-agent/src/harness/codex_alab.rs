@@ -11,6 +11,7 @@ use super::accounts::Cli;
 use super::accounts_step::Step;
 use super::codex_rollout::is_thread_id;
 use super::upgrade::{ArgvRefusal, Version};
+use super::upgrade_drive::{self, NotRead, read_not_made};
 use super::worker::REFUSAL_ROOM;
 
 /// The manifest every Codex package carries at its root (layoutVersion 1).
@@ -23,7 +24,18 @@ pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 const MAX_PACKAGE_BYTES: u64 = atpkg::alab::MAX_PACKAGE_JSON_BYTES as u64;
 
 fn package_text(path: &Path) -> Option<String> {
+    package_file(path).ok().flatten()
+}
+
+/// The text of the package file at `path` as its read came to it: `Ok(None)` where it was read
+/// and is no package file (absent, a link, a directory or other non-file, past
+/// [`MAX_PACKAGE_BYTES`], an open refused for a lasting state such as a permission, or text not
+/// UTF-8 that has stood past [`upgrade_drive::WRITE_SETTLE`]), [`NotRead`] only where the read
+/// itself was not made ([`upgrade_drive::read_not_made`]) or its text is not UTF-8 within
+/// [`upgrade_drive::WRITE_SETTLE`] of its last write, as a file caught mid-write reads (LS-72).
+fn package_file(path: &Path) -> Result<Option<String>, NotRead> {
     use std::io::Read as _;
+    let absent = |e: &std::io::Error| is_absent(e) || is_link_refusal(e);
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -32,32 +44,78 @@ fn package_text(path: &Path) -> Option<String> {
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
     #[cfg(not(unix))]
-    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
-        return None;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if absent(&e) || !read_not_made(&e) => return Ok(None),
+        Err(_) => return Err(NotRead),
     }
-    let file = options.open(path).ok()?;
-    let meta = file.metadata().ok()?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if absent(&e) || !read_not_made(&e) => return Ok(None),
+        Err(_) => return Err(NotRead),
+    };
+    let meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) if read_not_made(&e) => return Err(NotRead),
+        Err(_) => return Ok(None),
+    };
     if !meta.is_file() || meta.len() > MAX_PACKAGE_BYTES {
-        return None;
+        return Ok(None);
     }
     let cap = usize::try_from(meta.len().saturating_add(1)).unwrap_or(0);
     let mut text = String::with_capacity(cap);
-    file.take(MAX_PACKAGE_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    (text.len() as u64 <= MAX_PACKAGE_BYTES).then_some(text)
+    match file.take(MAX_PACKAGE_BYTES + 1).read_to_string(&mut text) {
+        Ok(_) => Ok((text.len() as u64 <= MAX_PACKAGE_BYTES).then_some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => upgrade_drive::unfinished(path),
+        Err(e) if read_not_made(&e) => Err(NotRead),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether `e` says the path was read and names nothing (`ENOENT`, `ENOTDIR`).
+fn is_absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether `e` is `O_NOFOLLOW`'s refusal of a link (`ELOOP`): the path read, and a link.
+fn is_link_refusal(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
 }
 
 /// Whether the Codex `exe` runs ALAB BYTES (codex-alab).
 #[must_use]
 pub fn alab_bytes(exe: &Path) -> bool {
-    alab_marker(exe).is_some_and(|marker| marker.is_ok_and(|m| m.file_type().is_file()))
+    alab_package(exe) == Ok(true)
 }
 
-/// The [`ALAB_BUILD_JSON`] look of `exe`'s package root.
-pub(crate) fn alab_marker(exe: &Path) -> Option<std::io::Result<std::fs::Metadata>> {
-    let (root, _) = package_root(exe)?;
-    Some(std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)))
+/// Whether the Codex `exe` runs ALAB BYTES, as the reads of its package came to it: `Ok(true)` an
+/// ALab package ([`alab_bytes`]), `Ok(false)` where they were read and say it is none (`exe`
+/// names no file, no package root's manifest names it, or that root has no [`ALAB_BUILD_JSON`]
+/// file), and [`NotRead`] where a read failed (`exe` not resolved, a manifest or the marker not
+/// read, or a manifest that is not JSON, as one caught mid-replacement is): a failed read is never
+/// the answer that the program is OpenAI's Codex, which no lane relaunches (LS-15).
+pub(super) fn alab_package(exe: &Path) -> Result<bool, NotRead> {
+    let Some((root, _)) = package_root_read(exe)? else {
+        return Ok(false);
+    };
+    match std::fs::symlink_metadata(root.join(ALAB_BUILD_JSON)) {
+        Ok(marker) => Ok(marker.file_type().is_file()),
+        Err(e) if read_not_made(&e) => Err(NotRead),
+        // Absent, or a lasting state (a permission) every later read finds again: no marker.
+        Err(_) => Ok(false),
+    }
 }
 
 /// The BUILD an ALab package's `exe` runs, as its rollouts name it (`session_meta`'s
@@ -126,16 +184,52 @@ fn package_versions(exe: &Path) -> Option<(String, String)> {
 /// `exe`'s package root (its parent or grandparent) whose manifest names
 /// `exe` itself, and that manifest's text.
 fn package_root(exe: &Path) -> Option<(PathBuf, String)> {
-    let exe = std::fs::canonicalize(exe).ok()?;
-    exe.ancestors().skip(1).take(2).find_map(|root| {
-        let text = package_text(&root.join(PACKAGE_JSON))?;
-        let rel = package_entrypoint(&text)?;
+    package_root_read(exe).ok().flatten()
+}
+
+/// [`package_root`] as its reads came to it: `Ok(None)` where `exe` names no file now (or its
+/// resolution answers with a lasting state) or each root was read and none names it, [`NotRead`]
+/// where `exe`'s resolution was not made or a read failed at a root before one named it (its
+/// manifest not read, or not JSON within [`upgrade_drive::WRITE_SETTLE`] of its last write, or its
+/// entry, which is `exe`'s own path, not read). A manifest that has stood not JSON past that is
+/// that root's lasting content and names nothing, so the walk goes on to the next root (LS-72).
+fn package_root_read(exe: &Path) -> Result<Option<(PathBuf, String)>, NotRead> {
+    let exe = match std::fs::canonicalize(exe) {
+        Ok(exe) => exe,
+        Err(e) if is_absent(&e) || !read_not_made(&e) => return Ok(None),
+        Err(_) => return Err(NotRead),
+    };
+    for root in exe.ancestors().skip(1).take(2) {
+        let Some(text) = package_file(&root.join(PACKAGE_JSON))? else {
+            continue;
+        };
+        let Some(rel) = package_entrypoint(&text) else {
+            if aterm_json::from_str::<Value>(&text).is_err() {
+                // Not JSON: a manifest caught mid-write says nothing yet; one that has stood so
+                // names no entry, as a manifest with none does.
+                upgrade_drive::unfinished::<()>(&root.join(PACKAGE_JSON))?;
+            }
+            continue;
+        };
         if !atpkg::alab::regular_entry_under(root, &rel) {
-            return None;
+            // `exe` is canonical, so an entry that names its own path walks no link: refused, it
+            // was not read (or `exe` went since its resolution), never another program's.
+            if root.join(&rel) == exe {
+                return Err(NotRead);
+            }
+            continue;
         }
-        let entry = std::fs::canonicalize(root.join(rel)).ok()?;
-        (entry == exe).then(|| (root.to_path_buf(), text))
-    })
+        let entry = match std::fs::canonicalize(root.join(rel)) {
+            Ok(entry) => entry,
+            Err(e) if read_not_made(&e) => return Err(NotRead),
+            // A lasting state (gone, a permission): the entry names no file, so not `exe`.
+            Err(_) => continue,
+        };
+        if entry == exe {
+            return Ok(Some((root.to_path_buf(), text)));
+        }
+    }
+    Ok(None)
 }
 
 /// The version of the Codex `exe`, read from its package manifest, never by running it.

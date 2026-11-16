@@ -1321,6 +1321,7 @@ fn land(
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: Some(&sidecars),
+        records: &[],
         aliases: spec.aliases,
         npm_package: Some(&npm_package),
     };

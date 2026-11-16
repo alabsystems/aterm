@@ -23,18 +23,23 @@
 //! `Remove` of m7 ([`aterm_secrets::client::undo_removals`]), off the event loop. Both are a
 //! person's own press.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_messages::exceptions::{Entry, Family};
 use aterm_messages::need::{Ask, Reason, StandingWhy, Then};
 use aterm_messages::{Intent, Message, Severity, tags};
 use aterm_secrets::client::{Asking, Paths};
+use aterm_secrets::home_lan::HomeNet;
 use aterm_secrets::members::desk::{self, Desk, HomeFrom, Local, Row, RowState};
 use aterm_secrets::members::{self, Allowed, PhraseState};
 use aterm_types::MutexExt;
+use aterm_uds::stop::Stop;
 
 use crate::App;
 use crate::messages_host::wall_stamp_now;
@@ -42,12 +47,35 @@ use crate::messages_host::wall_stamp_now;
 /// The key every "Undo m7's removals?" row starts with, the remover's join code after it.
 pub(crate) const UNDO_PREFIX: &str = "members.undo.";
 
-/// How often the lane looks at the desk for a change the join entries or undo rows reflect.
+/// How long the lane rests after its wait itself failed, before it looks again: the period it
+/// looked at the desk on before it waited on events.
 const READ_EVERY: Duration = Duration::from_secs(2);
 
-/// How often the lane reads this Mac's membership again: a new log seat or roster binding lets it
-/// allow, and a Mac that left the vault drops its desk.
+/// How often the lane reads this Mac's membership again while its last read did not settle (a
+/// member a fault shaped, removals it could not read, a vault mid-apply or files it could not
+/// stamp: no event tells such a fault ended), or while its home is read with it (a debug build's
+/// lab vault, [`HomeFrom::Vault`], whose home turns on this Mac's route), and how often it looks
+/// at the files that membership is read from at all where no file watch hears them ([`Inputs`]):
+/// a new log seat or roster binding lets it allow, and a Mac that left the vault drops its desk.
+/// Also how often it reads which network this Mac is on again while the desk files rows
+/// ([`Lane::follow_rows`]): the process's network moves ([`crate::network_moved`]) hear the
+/// kernel's address and link events, not the routing table, so the default route moving between
+/// two networks this Mac holds at once (a service order change) can come with none, and nothing
+/// tells of ARP resolving a new network's gateway after the events of the move; either can change
+/// the network the rows were heard on. Each is the period the lane read on before it waited on
+/// events.
 const LOCAL_EVERY: Duration = Duration::from_secs(30);
+
+/// How finely the lane finds the instant the desk's rows next change by themselves
+/// ([`next_change`]): it wakes at most this long after a row lapsed.
+const CHANGE_GRAIN: Duration = Duration::from_millis(1);
+
+// [`next_change`] searches [`desk::STILL_ASKING`] past its instant: a phrase that kept a row
+// longer would lapse it after the span, at an instant the lane never wakes for.
+const _: () = assert!(
+    aterm_secrets::pake::ALLOW_LIFETIME.as_nanos() < desk::STILL_ASKING.as_nanos()
+        && aterm_secrets::pake::INVITE_LIFETIME.as_nanos() < desk::STILL_ASKING.as_nanos()
+);
 
 /// What `allow` and `invite` say in place of the phrase, `lasts` being how long the phrase shown
 /// works: an Allow's phrase and an invite's do not last as long.
@@ -86,6 +114,47 @@ static LIVE: Slot = Mutex::new(None);
 /// it.
 static CHANGED: AtomicBool = AtomicBool::new(false);
 
+/// What wakes the desk lane besides a network move: a change to a file this Mac's membership is
+/// read from ([`Inputs`]), or the desk changed off the lane ([`touched`]), which can move when
+/// its rows next lapse ([`next_change`]).
+static RUNG: Bell = Bell::new();
+
+/// A wake any thread rings, as often as it likes, for the desk lane, which waits on it beside
+/// this process's network moves ([`crate::network_moved::Watch::wait_until`]): a latched stop
+/// for each wait, which the lane renews before it looks ([`Bell::renew`]), so a ring during the
+/// look wakes the wait after it.
+struct Bell(Mutex<Option<Arc<Stop>>>);
+
+impl Bell {
+    /// A bell no lane waits on yet: a ring before the first [`Bell::renew`] is folded into the
+    /// lane's first look.
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Wake the lane's wait, or the next one where it is looking now.
+    fn ring(&self) {
+        if let Some(stop) = self.0.lock_or_recover().as_ref() {
+            stop.set();
+        }
+    }
+
+    /// The stop the lane's next wait waits on, unset, in place of the last: a ring from now on
+    /// sets it.
+    fn renew(&self) -> Arc<Stop> {
+        let stop = Arc::new(Stop::new());
+        *self.0.lock_or_recover() = Some(Arc::clone(&stop));
+        stop
+    }
+}
+
+/// The desk changed off the lane (an ask served, a phrase shown): the window's next park reads it,
+/// and the lane looks again, since the change can move when the desk's rows next lapse.
+fn touched() {
+    CHANGED.store(true, Ordering::Release);
+    RUNG.ring();
+}
+
 /// The "Undo m7's removals?" rows this Mac shows while a member's removal keeps it out, as the
 /// lane last read them ([`aterm_secrets::client::undo_offers`]).
 static UNDO: Mutex<Vec<aterm_secrets::client::UndoOffer>> = Mutex::new(Vec::new());
@@ -109,10 +178,24 @@ pub(crate) fn serve_ask(
     stream: &mut dyn aterm_net::fleet::Duplex,
     peer: SocketAddr,
 ) {
+    serve_ask_at_home(desk, stream, peer, &aterm_secrets::home_lan::home_net);
+}
+
+/// [`serve_ask`], the desk's home ALab LAN read by `home` as the exchange begins, with which
+/// network this Mac is on ([`follow_here`]): a Mac that proves itself from the home is let in with
+/// nobody's Allow, and a row the exchange hears is heard on that network, so the exchange judges
+/// by the network as it is now, whatever moved since the desk was last read.
+fn serve_ask_at_home(
+    desk: Option<&Shared>,
+    stream: &mut dyn aterm_net::fleet::Duplex,
+    peer: SocketAddr,
+    home: &dyn Fn() -> Option<HomeNet>,
+) {
     let Some(desk) = desk else {
         let _ = members::refuse(stream, "this Mac is not an ALab member yet");
         return;
     };
+    follow_here(desk, home);
     // A Mac that is ALab's already but whose vault key changed proves its fleet node key on this
     // connection and is let back in with nobody (`aterm_secrets::client::readmit`), as far as
     // this Mac's fleet book allows it (read here, on the connection's thread).
@@ -164,7 +247,7 @@ pub(crate) fn serve_ask(
             fleet: None,
         }),
     );
-    CHANGED.store(true, Ordering::Release);
+    touched();
     match served {
         Ok(Some(let_in)) => {
             let by_log = if let_in.logged {
@@ -209,10 +292,13 @@ pub(crate) fn serve_vault_join(
     let from = peer.map_or(std::net::Ipv4Addr::UNSPECIFIED.into(), |at| at.ip());
     let ended = judged.and_then(|(judged, paths)| {
         let desk = LIVE.lock_or_recover().clone();
+        if let Some(desk) = &desk {
+            follow_here(desk, &aterm_secrets::home_lan::home_net);
+        }
         aterm_agent::vault_join::serve(stream, from, &judged, desk.as_deref(), &paths)
             .map_err(|error| error.to_string())
     });
-    CHANGED.store(true, Ordering::Release);
+    touched();
     match ended {
         Ok(()) => {
             aterm_log::info!("members: let a Mac back in by its proof over the fleet from {from}")
@@ -296,10 +382,14 @@ fn post_allowed(allowed: Allowed, logged: bool) {
     }
 }
 
-/// Start the desk of a windowed macOS instance, off the event loop: read this Mac's membership
-/// every [`LOCAL_EVERY`] ([`Lane::look`]: the desk made once it is a member, dropped once it
-/// left, read again only once its vault moved), and mark each change the join entries or undo
-/// rows reflect ([`App::follow_member_requests`]). Whether the thread started.
+/// Start the desk of a windowed macOS instance, off the event loop ([`run`]): read this Mac's
+/// membership at launch and again once a file it is read from moved ([`Lane::look`], heard by
+/// [`Inputs`]: the desk made once it is a member, dropped once it left), follow this Mac's
+/// network moves ([`Lane::moved`]), and mark each change the join entries or undo rows reflect
+/// ([`App::follow_member_requests`]), those its rows make by lapsing at the instant they lapse
+/// ([`next_change`]). While the desk files rows, which network this Mac is on is read again every
+/// [`LOCAL_EVERY`] ([`Lane::follow_rows`]). Where no file watch starts, those files are looked at
+/// every [`LOCAL_EVERY`], as before the lane waited on events. Whether the thread started.
 pub(crate) fn spawn_lane(headless: bool) -> bool {
     if headless || !cfg!(target_os = "macos") {
         return false;
@@ -309,24 +399,24 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
             let Ok(paths) = aterm_secrets::client::Paths::live() else {
                 return;
             };
+            let mut inputs = Inputs::start(&RUNG)
+                .inspect_err(|error| {
+                    aterm_log::info!(
+                        "members: no file watch on this Mac's membership ({error}), so it is \
+                         looked at every {LOCAL_EVERY:?}"
+                    );
+                })
+                .ok();
             let mut lane = Lane::new(paths, std::time::Instant::now);
-            let mut before: Option<Snapshot> = None;
+            lane.watched = inputs.is_some();
             let mut moved = crate::network_moved::watch();
-            loop {
-                lane.look(&LIVE);
-                // A desk dropped reads as a change too: the window ends its rows.
-                let desk = LIVE.lock_or_recover().clone();
-                let now = desk
-                    .as_ref()
-                    .map(|desk| Snapshot::of(&desk.lock_or_recover(), aterm_time::Instant::now()));
-                if before != now {
-                    CHANGED.store(true, Ordering::Release);
-                    before = now;
-                }
-                if moved.wait(READ_EVERY) != crate::network_moved::Woke::Timer {
-                    lane.moved(&LIVE);
-                }
-            }
+            let _ = run(
+                &mut lane,
+                &LIVE,
+                inputs.as_mut(),
+                &RUNG,
+                &mut |stop, deadline| ControlFlow::Continue(heard(&mut moved, stop, deadline)),
+            );
         });
     match spawned {
         Ok(_) => true,
@@ -337,24 +427,269 @@ pub(crate) fn spawn_lane(headless: bool) -> bool {
     }
 }
 
-/// The desk lane's reads of this Mac's membership under its vault folder: when it last finished
-/// one, and what its files stood at when one last settled.
+/// What ended one wait of the desk lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heard {
+    /// This Mac's network moved ([`crate::network_moved`]).
+    Moved,
+    /// Its bell rang ([`RUNG`]): a file this Mac's membership is read from changed, or the desk
+    /// changed off the lane.
+    Rung,
+    /// The deadline it waited to came: a row lapses, or a read of the vault or of the network is
+    /// due again.
+    Due,
+}
+
+/// Wait on `moved` and `stop` until `deadline` (`None`: for one of them only). A wait that failed
+/// rests [`READ_EVERY`] and reads as due, so the lane looks again on the period it looked on
+/// before it waited on events.
+fn heard(moved: &mut crate::network_moved::Watch, stop: &Stop, deadline: Option<Instant>) -> Heard {
+    match moved.wait_until(&[stop], deadline) {
+        Ok(Some(crate::network_moved::Woke::Timer)) => Heard::Due,
+        Ok(Some(_)) => Heard::Moved,
+        Ok(None) => Heard::Rung,
+        Err(error) => {
+            aterm_log::info!("members: the desk lane's wait failed ({error})");
+            std::thread::sleep(READ_EVERY);
+            Heard::Due
+        }
+    }
+}
+
+/// How [`run`] waits: until the stop rings or the deadline passes, or it breaks to end the run.
+type Wait<'a> = dyn FnMut(&Stop, Option<Instant>) -> ControlFlow<(), Heard> + 'a;
+
+/// The desk lane: look at this Mac's membership into `slot` ([`Lane::look`]), read which network
+/// this Mac is on again where the desk's rows call for it ([`Lane::follow_rows`]), arm `inputs` on
+/// the files it is read from as they stand ([`Inputs::arm`]), mark a change the join entries or
+/// undo rows reflect (a desk made or dropped reads as one too, so the window ends its rows), then
+/// `wait` on `bell` until the desk's rows next lapse, a read of the vault falls due or one of the
+/// network does, whichever comes first ([`Lane::wake_at`]); with none, only for an event. Each
+/// round renews `bell` before it looks, so a ring during the look wakes the wait after it. Ends
+/// when `wait` breaks.
+fn run(
+    lane: &mut Lane,
+    slot: &Slot,
+    mut inputs: Option<&mut Inputs>,
+    bell: &Bell,
+    wait: &mut Wait<'_>,
+) -> ControlFlow<()> {
+    let mut before: Option<Snapshot> = None;
+    loop {
+        let stop = bell.renew();
+        lane.look(slot);
+        lane.follow_rows(slot);
+        if let Some(inputs) = inputs.as_deref_mut() {
+            inputs.arm(&lane.paths);
+        }
+        let desk = slot.lock_or_recover().clone();
+        let now = aterm_time::Instant::now();
+        let (snapshot, deadline) = match &desk {
+            Some(desk) => {
+                let desk = desk.lock_or_recover();
+                (
+                    Some(Snapshot::of(&desk, now)),
+                    lane.wake_at(Some(&desk), now),
+                )
+            }
+            None => (None, lane.wake_at(None, now)),
+        };
+        if before != snapshot {
+            CHANGED.store(true, Ordering::Release);
+            before = snapshot;
+        }
+        if wait(&stop, deadline)? == Heard::Moved {
+            lane.moved(slot);
+        }
+    }
+}
+
+/// The first instant after `now` at which the desk's rows, as the digest files them
+/// ([`Snapshot::of`]), change by themselves: a row lapses ([`desk::STILL_ASKING`] after its Mac
+/// last asked, or as the phrase that kept it ends), or the proof that lets a row move a seat
+/// lapses. Each such change is for good (a lapsed row never comes back, a lapsed proof never
+/// holds again), so once the rows differ from `now`'s they differ at every later instant; and
+/// each falls within [`desk::STILL_ASKING`] of `now`, since every ask, proof and phrase is from
+/// `now` or before and a phrase lasts less. The first is found by halving that span to
+/// [`CHANGE_GRAIN`]: `None` where the rows are the same at its end, else the instant at most
+/// [`CHANGE_GRAIN`] after the change.
+fn next_change(desk: &Desk, now: aterm_time::Instant) -> Option<aterm_time::Instant> {
+    let rows = Snapshot::of(desk, now);
+    let mut late = now.checked_add(desk::STILL_ASKING + CHANGE_GRAIN)?;
+    if Snapshot::of(desk, late) == rows {
+        return None;
+    }
+    let mut early = now;
+    while late.saturating_duration_since(early) > CHANGE_GRAIN {
+        let mid = early + late.saturating_duration_since(early) / 2;
+        if Snapshot::of(desk, mid) == rows {
+            early = mid;
+        } else {
+            late = mid;
+        }
+    }
+    Some(late)
+}
+
+/// One file or folder this Mac's membership is read from, as [`Inputs`] watches it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Input {
+    /// A file, heard written, replaced, removed or made, or its mode changed.
+    File(PathBuf),
+    /// A folder, heard by its entries made, removed or replaced.
+    Folder(PathBuf),
+}
+
+/// The files of the vault folder `aterm_secrets::client::desk_inputs` stamps that no public path
+/// of [`Paths`] names: the state lock (whose mode the deny list reads), the held envelope, the
+/// vault slot's creation claim, and the Commons custody that seats this Mac (its retained claim
+/// and its two locks).
+const VAULT_FILES: [&str; 6] = [
+    ".lock",
+    "vault",
+    "creation.claim",
+    "commons.claim",
+    "commons.lock",
+    "commons-device.lock",
+];
+
+/// The files of the vault's `commons` folder `aterm_secrets::client::desk_inputs` stamps: this
+/// Mac's device age identity, the claim it is held to, and the pinned anchor.
+const COMMONS_FILES: [&str; 3] = ["device.age", "device.claim", "default.pin"];
+
+/// The files this Mac's membership is read from under `paths`, as
+/// `aterm_secrets::client::desk_inputs` stamps them, each watched as a file, which a watch hears
+/// written in place, replaced by rename, removed, made or given another mode, and tells only
+/// where its stamp moved: so a change to any other file of the vault folder (its server's, its
+/// jobs' logs, its queues) wakes nothing. They are the standing files ([`Paths::standing_files`]:
+/// the source, the state, which the desk stamps by what it holds, the identity, and the
+/// membership records' entry, pin, intent, and a layout's header and data file, which a record
+/// arriving is appended to in place), the membership history this Mac acknowledged
+/// ([`Paths::acknowledged_history_files`]), [`VAULT_FILES`] and [`COMMONS_FILES`], in a debug
+/// build a lab vault's home LAN file, and the Commons control journal by each of its folders'
+/// entries and each of its files, which it appends in place. The standing files add the Allowed a
+/// member handed this Mac, which the desk does not read: its change wakes a look that finds the
+/// desk's stamps unmoved and reads nothing. The vault folder's own owner and mode, which the
+/// stamps hold too, are left out: a change to them alone moves no file, and the read it would
+/// wake is refused and leaves the desk as it was.
+fn inputs_of(paths: &Paths) -> BTreeSet<Input> {
+    let commons = paths.dir.join("commons");
+    #[cfg(any(test, debug_assertions))]
+    let lab = Some(paths.dir.join(aterm_secrets::members::lab_lan::FILE));
+    #[cfg(not(any(test, debug_assertions)))]
+    let lab = None;
+    let mut wanted: BTreeSet<Input> = paths
+        .standing_files()
+        .into_iter()
+        .chain(paths.acknowledged_history_files())
+        .chain(VAULT_FILES.map(|name| paths.dir.join(name)))
+        .chain(COMMONS_FILES.map(|name| commons.join(name)))
+        .chain(lab)
+        .map(Input::File)
+        .collect();
+    let mut folders = vec![commons.join("control")];
+    while let Some(folder) = folders.pop() {
+        if let Ok(entries) = std::fs::read_dir(&folder) {
+            for entry in entries.flatten() {
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => folders.push(entry.path()),
+                    Ok(_) => {
+                        wanted.insert(Input::File(entry.path()));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        wanted.insert(Input::Folder(folder));
+    }
+    wanted
+}
+
+/// The watch over the files this Mac's membership is read from ([`inputs_of`]), ringing the desk
+/// lane's bell at each change it hears.
+struct Inputs {
+    watch: aterm_uds::file_watch::FileWatch,
+    keys: BTreeMap<Input, u64>,
+    next: u64,
+}
+
+impl Inputs {
+    /// A watch over this platform's file events ringing `bell`, watching nothing yet.
+    ///
+    /// # Errors
+    /// The platform's file events, or the watch's thread, cannot start.
+    fn start(bell: &'static Bell) -> std::io::Result<Self> {
+        aterm_uds::file_watch::FileWatch::platform(
+            "aterm-members-desk-watch",
+            Box::new(move |_| bell.ring()),
+        )
+        .map(|watch| Self {
+            watch,
+            keys: BTreeMap::new(),
+            next: 0,
+        })
+    }
+
+    /// Watch exactly what the membership under `paths` is read from now ([`inputs_of`]): a file
+    /// or folder gone from it is let go, and one new to it is watched, its first look ringing
+    /// once, which folds in a change made before it armed. A folder still missing is watched
+    /// until it is made, and the look its making wakes arms what it holds.
+    fn arm(&mut self, paths: &Paths) {
+        let wanted = inputs_of(paths);
+        let Self { watch, keys, next } = self;
+        keys.retain(|input, key| {
+            let kept = wanted.contains(input);
+            if !kept {
+                watch.unwatch(*key);
+            }
+            kept
+        });
+        for input in wanted {
+            if keys.contains_key(&input) {
+                continue;
+            }
+            let key = *next;
+            *next += 1;
+            match &input {
+                Input::File(path) => watch.watch(key, path.clone()),
+                Input::Folder(path) => watch.watch_directory(key, path.clone()),
+            }
+            keys.insert(input, key);
+        }
+    }
+}
+
+/// The desk lane's reads of this Mac's membership under its vault folder and of the network it is
+/// on: when it last finished each, and what the vault's files stood at when a read last settled.
 struct Lane {
     paths: aterm_secrets::client::Paths,
     clock: fn() -> std::time::Instant,
     /// This Mac as a member: [`Local::of`], a test's own.
     of: Of,
-    /// When the last [`Lane::look`] finished: the next is [`LOCAL_EVERY`] after it.
+    /// Whether a file watch hears the files the membership is read from ([`Inputs`]); where none
+    /// does, they are looked at every [`LOCAL_EVERY`].
+    watched: bool,
+    /// When the last read finished, or the last look where no watch hears the files; `None`
+    /// before the first, and after a network move that the membership's home is read with
+    /// ([`Lane::moved`]).
     looked: Option<std::time::Instant>,
+    /// Whether the desk the last read left reads its home with the vault ([`HomeFrom::Vault`]: a
+    /// debug build's lab vault, that file under this Mac's route at the read). No event tells the
+    /// route moved where no address or link did, so such a vault is read again every
+    /// [`LOCAL_EVERY`] whether or not a file moved, as it was before the lane waited on events.
+    with_vault: bool,
+    /// When the lane last read which network this Mac is on ([`Lane::follow_network`]); `None`
+    /// before the first.
+    networked: Option<std::time::Instant>,
     /// The desk's inputs ([`aterm_secrets::client::desk_inputs`]) as they stood across the last
     /// read that settled: a whole member read ([`Local::whole`]), or a Mac that left, with its
-    /// removals read, while no file moved (taken before the read and equal after it), and no home
-    /// read with the vault ([`HomeFrom::Vault`]). While they stand so, a look reads nothing of the
-    /// vault again. Taken before the read alone they would not do: a write moves a file's stamp
-    /// for good (a new inode, a change time nothing sets back), but `state.toml` is stamped by a
-    /// digest of what it holds ([`aterm_secrets::client::state_standing`]), which can go from A
-    /// to B during the read and back to A after it, and a member read under B would then stand
-    /// under A's stamps until a file moved, which a vault round does not.
+    /// removals read, while no file moved (taken before the read and equal after it). While they
+    /// stand so, a look reads nothing of the vault again. Taken before the read alone they would
+    /// not do: a write moves a file's stamp for good (a new inode, a change time nothing sets
+    /// back), but `state.toml` is stamped by a digest of what it holds
+    /// ([`aterm_secrets::client::state_standing`]), which can go from A to B during the read and
+    /// back to A after it, and a member read under B would then stand under A's stamps until a
+    /// file moved, which a vault round does not.
     settled: Option<aterm_secrets::client::DeskInputs>,
     /// How many looks read the vault: the test's count.
     #[cfg(test)]
@@ -367,56 +702,133 @@ impl Lane {
             paths,
             clock,
             of: Local::of,
+            watched: true,
             looked: None,
+            with_vault: false,
+            networked: None,
             settled: None,
             #[cfg(test)]
             reads: 0,
         }
     }
 
-    /// Look at this Mac's membership into `slot` once [`LOCAL_EVERY`] passed since the last look
-    /// finished: read it again ([`follow_local`], [`follow_undo`]) where a file it is read from
-    /// moved since the last settled read, or its home LAN is read with it (a debug build's lab
-    /// vault, [`HomeFrom::Vault`]), its home ALab LAN alone ([`follow_home`]) where neither; then
-    /// which network this Mac is on ([`follow_network`]).
+    /// Whether [`LOCAL_EVERY`] passed since `at`; `None`, never, reads as passed.
+    fn passed(&self, at: Option<std::time::Instant>) -> bool {
+        at.is_none_or(|at| (self.clock)().saturating_duration_since(at) >= LOCAL_EVERY)
+    }
+
+    /// Whether [`LOCAL_EVERY`] passed since the last read (or look, unwatched) finished.
+    fn rested(&self) -> bool {
+        self.passed(self.looked)
+    }
+
+    /// Look at this Mac's membership into `slot`: read it again ([`follow_local`],
+    /// [`follow_undo`]) where a file it is read from moved since the last settled read, then tell
+    /// the desk which network this Mac is on ([`Lane::follow_network`]); nothing while those
+    /// files stand as that read left them. A read that did not settle is read again once
+    /// [`LOCAL_EVERY`] passed since it, as is a vault the desk reads its home with
+    /// ([`Lane::with_vault`]) and every look where no watch hears the files.
     fn look(&mut self, slot: &Slot) {
-        if self
-            .looked
-            .is_some_and(|at| (self.clock)().saturating_duration_since(at) < LOCAL_EVERY)
-        {
+        if !self.watched && !self.rested() {
             return;
         }
         let inputs = aterm_secrets::client::desk_inputs(&self.paths);
-        if inputs.is_some() && inputs == self.settled {
-            follow_home(slot);
-        } else {
-            #[cfg(test)]
-            {
-                self.reads += 1;
+        let home_due = self.with_vault && self.rested();
+        if inputs.is_some() && inputs == self.settled && !home_due {
+            if !self.watched {
+                self.looked = Some((self.clock)());
             }
-            let read = follow_local(slot, &self.paths, self.of);
-            let undo = follow_undo(&self.paths);
-            let with_vault = home_from(slot) == Some(HomeFrom::Vault);
-            self.settled = inputs.filter(|inputs| {
-                read && undo
-                    && !with_vault
-                    && aterm_secrets::client::desk_inputs(&self.paths).as_ref() == Some(inputs)
-            });
+            return;
         }
-        follow_network(slot);
+        if self.settled.is_none() && !self.rested() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        let read = follow_local(slot, &self.paths, self.of);
+        let undo = follow_undo(&self.paths);
+        self.with_vault = home_from(slot) == Some(HomeFrom::Vault);
+        self.settled = inputs.filter(|inputs| {
+            read && undo && aterm_secrets::client::desk_inputs(&self.paths).as_ref() == Some(inputs)
+        });
+        self.follow_network(slot);
         self.looked = Some((self.clock)());
     }
 
-    /// This Mac moved to another network: the rows heard on the last one go ([`follow_network`])
-    /// and its home ALab LAN is read again ([`follow_home`]). Its vault did not move with it, so
-    /// nothing of it is read again until the next [`Lane::look`] finds a file moved; a home read
-    /// with the vault ([`HomeFrom::Vault`]) is read with it at once, at the next look.
-    fn moved(&mut self, slot: &Slot) {
+    /// When the lane must look again with no event: [`LOCAL_EVERY`] after the last read where it
+    /// did not settle or the desk reads its home with the vault ([`Lane::with_vault`]), or after
+    /// the last look where no watch hears the files; `None` while a settled read stands under a
+    /// watch, which hears every file it was read from.
+    fn due(&self) -> Option<Instant> {
+        let looked = self.looked?;
+        (!self.watched || self.settled.is_none() || self.with_vault)
+            .then(|| looked.checked_add(LOCAL_EVERY))
+            .flatten()
+    }
+
+    /// Tell the desk in `slot` which network this Mac is on now ([`follow_network`]), and note
+    /// when.
+    fn follow_network(&mut self, slot: &Slot) {
         follow_network(slot);
-        if home_from(slot) == Some(HomeFrom::Vault) {
+        self.networked = Some((self.clock)());
+    }
+
+    /// Read which network this Mac is on again ([`Lane::follow_network`]) where the desk in `slot`
+    /// files rows ([`Snapshot::files_rows`]) and [`LOCAL_EVERY`] passed since the lane last read
+    /// it, so a move no event tells of ([`LOCAL_EVERY`]: the default route moving between two
+    /// networks this Mac holds, a gateway ARP resolved after the move) drops the rows heard on the
+    /// last network within that period, as the lane's every look did before it waited on events.
+    /// A desk that files no rows has nothing such a move drops: a row is heard on the network an
+    /// exchange reads as it begins ([`follow_here`]).
+    fn follow_rows(&mut self, slot: &Slot) {
+        let files = slot.lock_or_recover().clone().is_some_and(|desk| {
+            Snapshot::of(&desk.lock_or_recover(), aterm_time::Instant::now()).files_rows()
+        });
+        if files && self.passed(self.networked) {
+            self.follow_network(slot);
+        }
+    }
+
+    /// When the lane must read which network this Mac is on again with no event
+    /// ([`Lane::follow_rows`]): [`LOCAL_EVERY`] after its last read while the desk `files` rows
+    /// (at once before any read); `None` while it files none.
+    fn network_due(&self, files: bool) -> Option<Instant> {
+        if !files {
+            return None;
+        }
+        Some(
+            self.networked
+                .and_then(|at| at.checked_add(LOCAL_EVERY))
+                .unwrap_or_else(|| (self.clock)()),
+        )
+    }
+
+    /// When the lane must look again with no event, `desk` (the slot's, if any) as it stands at
+    /// `now`: the first of the instant its rows next change by themselves ([`next_change`]), a
+    /// read of the vault falling due ([`Lane::due`]) and one of the network falling due while it
+    /// files rows ([`Lane::network_due`]); `None`, only for an event, where none of them is.
+    fn wake_at(&self, desk: Option<&Desk>, now: aterm_time::Instant) -> Option<Instant> {
+        let (lapses, files) = desk.map_or((None, false), |desk| {
+            (next_change(desk, now), Snapshot::of(desk, now).files_rows())
+        });
+        [lapses, self.due(), self.network_due(files)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// This Mac moved to another network: the rows heard on the last one go
+    /// ([`Lane::follow_network`]). Its vault did not move with it, so nothing of it is read again
+    /// until a file moves; a home read with the vault ([`Lane::with_vault`]) is read with it at
+    /// once, at the next look. A home its place gives is read as each exchange begins
+    /// ([`follow_here`]).
+    fn moved(&mut self, slot: &Slot) {
+        self.follow_network(slot);
+        if self.with_vault {
+            self.settled = None;
             self.looked = None;
-        } else {
-            follow_home(slot);
         }
     }
 }
@@ -429,7 +841,7 @@ type Of = fn(&aterm_secrets::client::Paths) -> aterm_secrets::Result<Option<Loca
 /// what it heard; none once this Mac left the vault ([`left`]), so its rows end, an `ask` is
 /// refused and Allow finds no desk. A vault mid-apply and unreadable state leave `slot` as it
 /// was. Whether the read settled: a member every read of which answered ([`Local::whole`]; one a
-/// fault shaped is shown, and read again at the next look), or a Mac that left.
+/// fault shaped is shown, and read again [`LOCAL_EVERY`] later), or a Mac that left.
 fn follow_local(slot: &Slot, paths: &aterm_secrets::client::Paths, of: Of) -> bool {
     match of(paths) {
         Ok(Some(local)) => {
@@ -462,26 +874,41 @@ fn home_from(slot: &Slot) -> Option<HomeFrom> {
     Some(from)
 }
 
-/// Read the home ALab LAN of the member whose desk is in `slot` again, where its place gives it
-/// ([`HomeFrom::Place`]), outside the desk's lock: it reads the network.
-fn follow_home(slot: &Slot) {
-    let Some(desk) = slot.lock_or_recover().clone() else {
-        return;
-    };
+/// Read the home ALab LAN of the member whose desk is `desk` again (`home`,
+/// `aterm_secrets::home_lan::home_net`), where its place gives it ([`HomeFrom::Place`]), outside
+/// the desk's lock: it reads the network, so never on a window's main thread. An exchange on the
+/// desk does this as it begins, since only an exchange reads the home (a Mac that proves itself
+/// from it is let in with nobody's Allow), and the home moves with the network and with the
+/// members' answers there, each counted only while fresh, which nothing tells of.
+fn follow_home(desk: &Shared, home: &dyn Fn() -> Option<HomeNet>) {
     if desk.lock_or_recover().home_from() != HomeFrom::Place {
         return;
     }
-    let home = aterm_secrets::home_lan::home_net();
+    let home = home();
     desk.lock_or_recover().on_home(home);
 }
 
-/// Tell the desk in `slot` which network this Mac is on now
-/// ([`aterm_secrets::heard::network_key`], read before the desk's lock): the rows heard on
-/// another one go ([`Desk::on_network`]), and their entries end.
+/// Bring `desk` up to where this Mac is as an exchange on it begins: which network it is on
+/// ([`desk_network`]), so a row the exchange hears is heard on the network as it is now, and its
+/// home ALab LAN (`home`, [`follow_home`]). Both read the network, so never on a window's main
+/// thread.
+fn follow_here(desk: &Shared, home: &dyn Fn() -> Option<HomeNet>) {
+    desk_network(desk);
+    follow_home(desk, home);
+}
+
+/// Tell the desk in `slot` which network this Mac is on now ([`desk_network`]).
 fn follow_network(slot: &Slot) {
     let Some(desk) = slot.lock_or_recover().clone() else {
         return;
     };
+    desk_network(&desk);
+}
+
+/// Tell `desk` which network this Mac is on now ([`aterm_secrets::heard::network_key`], read
+/// before the desk's lock): the rows heard on another one go ([`Desk::on_network`]), and their
+/// entries end.
+fn desk_network(desk: &Shared) {
     let network = aterm_secrets::heard::network_key();
     let gone = desk.lock_or_recover().on_network(network);
     if gone > 0 {
@@ -599,6 +1026,11 @@ impl Snapshot {
                 .collect(),
             can_allow: desk.local().can_allow(),
         }
+    }
+
+    /// Whether the digest files any row of the desk: a request still asking, or allowed.
+    fn files_rows(&self) -> bool {
+        !self.rows.is_empty()
     }
 }
 
@@ -865,6 +1297,8 @@ impl App {
             return false;
         };
         let ignored = desk.lock_or_recover().ignore(request).is_ok();
+        // The row the digest just stopped filing no longer lapses later: the lane looks again.
+        RUNG.ring();
         self.refresh_member_rows();
         self.close_spent_phrase_sheet();
         ignored
@@ -971,7 +1405,7 @@ impl App {
             desk.lock_or_recover().withdraw(phrase);
             return Err(why);
         }
-        CHANGED.store(true, Ordering::Release);
+        touched();
         Ok(lasts)
     }
 

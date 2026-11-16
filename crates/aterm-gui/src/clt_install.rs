@@ -1130,12 +1130,13 @@ impl RootSteps {
 /// rule that names the Mac after admission ([`aterm_types::macos_setup::ADMITTED_NAME_RULE`]),
 /// reading no root-owned 0440 file while no refused rule stands
 /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`), or `broker`, the LAN
-/// broker's install owed as both read it ([`aterm_uds::lan::install::Reading::owed_with_running`]:
+/// broker's install owed as both read it ([`aterm_uds::lan::install::Reading::owed_with_job`]:
 /// its image or plist missing or not this build's, or its service stopped; a running image of
-/// the source's own signing team adopts with no password), or `spotlight`, a folder of this
-/// account's home besides Documents and Desktop that setup has never excluded from Spotlight
-/// nor failed to, which is `aterm init`'s own reading (`aterm_machines::init_spotlight::scope_owed`). A step that
-/// cannot be read is not owed: no password is asked for want of a reading. Only macOS reads it.
+/// the source's own signing team adopts with no password, and a job launchd lists switched off
+/// stays the person's, owing nothing), or `spotlight`, a folder of this account's home besides
+/// Documents and Desktop that setup has never excluded from Spotlight nor failed to, which is
+/// `aterm init`'s own reading (`aterm_machines::init_spotlight::scope_owed`). A step that cannot
+/// be read is not owed: no password is asked for want of a reading. Only macOS reads it.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
     mode: aterm_containment::consent::DebuggerMode,
@@ -1192,9 +1193,10 @@ pub(crate) fn read_root_steps() -> bool {
                 let refused =
                     std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
                         .is_ok();
-                let broker = aterm_uds::lan::install::owed_here(|| {
-                    aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL)
-                });
+                let broker = aterm_uds::lan::install::owed_here(
+                    || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
+                    || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
+                );
                 let spotlight = aterm_types::macos_setup::spotlight_scope::owed_here();
                 let owed =
                     root_steps_owed_by(debugger.mode, member, rule, refused, broker, spotlight);

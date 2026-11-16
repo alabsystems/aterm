@@ -156,6 +156,9 @@ USAGE:
     aterm harness signin --cli grok [--wait] [--json]
                                                  sign this machine in to Grok Build once: sandboxed, one
                                                  sign-in and one need however many sessions ask
+    aterm harness ls [--json]                    the harness registry: each row and where it
+                                                 came from, each refused record and why, and
+                                                 the strip list every shell gets
     aterm harness versions [--json]              each harness's version: built-in, installed
                                                  harness packages, and live claims
     aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
@@ -358,14 +361,21 @@ REBUILDABLE BUDGET (`budget` in `aterm ctl @self sys disk`):
     volume where that is smaller or the key is unwritten.
   - `kept`: the volume's used bytes less the rebuildable ones (aterm's registered build caches
     and the build directories a search finds); `target`: `cap` less `kept`, never below 0.
-  The window sizes the rebuildable bytes on a thread of its own, at most once an hour across
-  its processes and only while the volume is `ok`, and the record says how far over or under
-  `target` they are; a sizing cut short is a floor. It is a reading: it changes no volume
-  state, starts no pass, takes no build's lock and removes nothing. `disk.cap_used_gib = 0`,
-  or a value that is not a whole number, turns the budget off and leaves every removal as it
-  was; a negative one is unwritten.
+  The window and `disk watch` size the rebuildable bytes on a thread of their own, at most once
+  an hour across their processes and only while the volume is `ok`, and the record says how far
+  over or under `target` they are; a sizing cut short is a floor. The sizing changes no volume
+  state and takes no build's lock. Over the cap, between the other passes and at any volume
+  state, a budget pass takes tier 1-3 rows (and, once a run, the shared build cache's stale
+  parts unwritten an hour) of build dirs no live session works in, started a build in or used
+  in its recent runs, until the used bytes are back at the cap or what it removed covers the
+  shortfall; out of rows and still over, it writes one `cannot-meet` row to disk.jsonl a
+  volume and cap, and tries again a day later or once the sessions or the rebuildable bytes
+  change. A window runs it only as the one aterm instance, and a look a pressure pass is due
+  at stops it before its next removal. `disk.cap_used_gib = 0`, a value that is not a whole
+  number, or `disk.auto_free_gib = 0` turns the pass off; a negative cap is unwritten.
 
-AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before each item):
+AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before each item; tiers
+1-3 over the rebuildable budget as well, at any state, stopping at its cap):
   - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
     owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
   - tier 2 (`low`): idle Cargo profile `incremental/` dirs (idle past `disk.target_stale_days`,
@@ -476,6 +486,29 @@ no new relaunch line carries the tap and no reading times a wait; a session alre
 keeps writing readings until it is relaunched.
 ";
 
+const HELP_LS: &str = "\
+`ls` prints the harness registry (`docs/HARNESS-CONTRACT.md` \u{a7}2): the harnesses aterm
+proves a claim from, the words each one leads and where each row came from:
+  - `seed`: compiled into this aterm for a harness whose installed build carries no signed
+    record yet;
+  - `build <n>`: the signed record kept beside that store build, verified now against the
+    trusted keys, the index's yanks and the build's tree (a claimant's build is verified
+    again at each proof);
+  - `link <checkout>`: a development link, over a row that already exists (it keeps the
+    row's words and strip entries and takes `name` and `mark` from the checkout's
+    `alab-harness.toml`), or of an id aterm.toml's `[harness] dev` lists (`dev`: its data is
+    the checkout's `alab-harness.toml`).
+Then each record the registry refused and why (a record that does not verify, a link of an
+id with no row nor `dev` listing, a second harness leading a word another leads), each row
+it narrowed (`narrowed`: a word the person's `[harness] lead.<word>` gave a link, a listed
+checkout whose declaration does not read), and the strip list every shell aterm spawns
+gets: aterm.toml's `shell_env_strip` or the default list, plus what each row adds, and each
+entry refused and why.
+`--json` prints one object: `rows` (`id`, `origin`, `build`, `link`, `dev`, `tool`, `leads`,
+`name`, `env_strip`), `refused` and `notes` (`id`, `what`, `reason`), `env_strip` and
+`env_refused` (`origin`, `entry`, `reason`).
+";
+
 const HELP_VERSIONS: &str = "\
 `versions` (`version`) prints every harness version on this machine, in three sections
 (`docs/DESIGN-harness-repos-2026-10-24.md` \u{a7}5):
@@ -492,7 +525,8 @@ const HELP_VERSIONS: &str = "\
 `--json` prints one array of objects, each with `kind`: `built-in` (`id`, `slug`, `label`,
 `version`, `major`, `minor`), `package` (`harness`, `program`, `build`, `version`, `link`) or
 `claim` (`session`, `holder`, `harness`, `proven`, `version`, `agent`, `vendor`); a field
-nothing records is `null`.
+nothing records is `null`. Which installed harnesses aterm proves a claim from, and why
+any is refused: `aterm harness ls`.
 ";
 
 const HELP_LEDGER: &str = "\
@@ -575,8 +609,11 @@ VAULT TOKENS (Claude Code's pool, macOS):
   login here`, `none` in `--json`; an account this Mac only keeps a token record of says
   nothing of a login, `unread` in `--json`. Off macOS the block still says each
   token's state, and no `offer:` line comes, since the step makes a token only on macOS.
+  A `token step:` line says when a check stopped the account's token step and what tries it
+  again, and a `token upkeep:` line when this Mac's upkeep ran a capture for its token that made
+  none, which it does not run again until something changes.
   `--json` carries the same under `tokens`, each account's `offer{state, login, pair, since,
-  step}`, and each session's `route`.
+  step}`, `step{word, at}` and `tried{gap, minted_at, at}`, and each session's `route`.
 
 LIMIT RESET (`[harness] limit_reset = true`, default false):
   At Claude Code's usage-limit dialog on the machine's default login (no other account run
@@ -893,11 +930,15 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     still signs in by `accounts login` alone, since its renewals stop at the block page above.
     A renewal whose page waits on a person for 90 s stops `needs-sign-in` and names it. A
     Kimi row's email is never typed on Kimi's pages (its form signs a new account up as
-    readily as it signs one in). A background renewal that stopped for a person, or met
-    Cloudflare's bot check, leaves its row alone for 6 hours. A bot check records one
-    human login task in the account read and Messages; it sends no repeated agent prompt
-    and opens no browser automatically. Run the task's `accounts login` at the desk to
-    complete the provider's challenge; aterm still verifies the account before binding it.
+    readily as it signs one in). A background renewal that stopped for a person leaves its
+    row alone for 6 hours. One that met a bot protection (Cloudflare's check, a block page)
+    records the account's check and one human login task in the account read and Messages,
+    and nothing with nobody at this Mac signs the row in again, on any clock: not the upkeep,
+    a saved choice, an agent's or another Mac's `accounts renew --cli`, which name the task.
+    It sends no repeated agent prompt and opens no browser automatically. Run the task's
+    `accounts login` at the desk to complete the provider's challenge; a signed-in `accounts
+    browser` window since also ends the check's hold. aterm still verifies the account before
+    binding it.
   - On macOS Grok Build's sign-in runs under `sandbox-exec` with LaunchServices, Apple
     events and the pasteboard denied, so it opens no browser on the desk.
   - A Codex worker aterm starts takes the pool's pin, else its fresh active row, else the
@@ -1284,11 +1325,18 @@ pub fn harness_state_dir() -> Result<PathBuf, String> {
     match std::env::var_os("ATERM_HARNESS_STATE") {
         Some(dir) if Path::new(&dir).is_absolute() => Ok(PathBuf::from(dir)),
         Some(_) => Err("ATERM_HARNESS_STATE must be absolute".to_string()),
-        None => Ok(aterm_types::dirs::state_dir()
-            .ok_or_else(|| "the aterm state root is unknown".to_string())?
-            .join("harness")
-            .join(HARNESS)),
+        None => Ok(harness_state_in(
+            &aterm_types::dirs::state_dir()
+                .ok_or_else(|| "the aterm state root is unknown".to_string())?,
+        )),
     }
+}
+
+/// The harness state directory of the aterm state folder `state`:
+/// `<state>/harness/claude-harness`.
+#[must_use]
+pub fn harness_state_in(state: &Path) -> PathBuf {
+    state.join("harness").join(HARNESS)
 }
 
 impl Env {
@@ -1723,6 +1771,11 @@ pub enum Cmd {
         /// The JSON form.
         json: bool,
     },
+    /// The harness registry ([`super::registry`]).
+    Ls {
+        /// The JSON form.
+        json: bool,
+    },
     /// The incremental numeric harness version of each CLI harness.
     Versions {
         /// The JSON form.
@@ -1770,6 +1823,8 @@ pub enum HelpPage {
     Upgrade,
     /// `upgrade --status --help`: every field of a status line.
     UpgradeStatus,
+    /// `ls --help`: the harness registry.
+    Ls,
     /// `versions --help`: incremental numeric harness versions.
     Versions,
     /// `tap --help`: the usage tap.
@@ -1899,6 +1954,7 @@ pub fn help_page(page: HelpPage) -> String {
             ],
         ),
         HelpPage::UpgradeStatus => ("upgrade", true, &[HELP_UPGRADE_STATUS]),
+        HelpPage::Ls => ("ls", false, &[HELP_LS]),
         HelpPage::Versions => ("versions", false, &[HELP_VERSIONS]),
         HelpPage::Signin => ("signin", false, &[HELP_SIGNIN]),
         HelpPage::Tap => ("tap", false, &[HELP_TAP]),
@@ -2095,6 +2151,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             Some("accounts") => HelpPage::Accounts,
             Some("upgrade") if owner.contains(&OwnerAsk::Status) => HelpPage::UpgradeStatus,
             Some("upgrade") => HelpPage::Upgrade,
+            Some("ls") => HelpPage::Ls,
             Some("versions" | "version") => HelpPage::Versions,
             Some("tap") => HelpPage::Tap,
             Some("signin") => HelpPage::Signin,
@@ -2143,6 +2200,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             refresh,
             json,
         },
+        "ls" => {
+            if rest.len() > 1 {
+                return Err(format!("ls takes no operand, not {:?}", &rest[1..]));
+            }
+            Cmd::Ls { json }
+        }
         "versions" | "version" => {
             if rest.len() > 1 {
                 return Err(format!("{verb} takes no operand, not {:?}", &rest[1..]));
@@ -2257,7 +2320,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
         }
         "upgrade" => {
             let sid = rest.get(1).map_or(String::new(), |s| (*s).to_string());
-            if !sid.is_empty() && !aterm_types::control_verbs::is_minted_sid(&sid) {
+            if !sid.is_empty() && aterm_types::control_request::Sid::parse(&sid).is_none() {
                 return Err(format!(
                     "upgrade takes a tab's ID (`t` and 10 characters, such as `tqn5r6e0148`, or the `s-` \
                      and 20 hex digits of a tab opened before that form, as `aterm ctl sessions` \
@@ -5272,6 +5335,7 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
         session_cwds: vec![env.cwd.clone()],
         session_cwd_unknown: None,
         link_dirs: home.as_deref().map(default_link_dirs).unwrap_or_default(),
+        budget: None,
     }
 }
 
@@ -5703,7 +5767,7 @@ pub fn disk_tick(
     remove: &mut disk::Remove<'_>,
     measure: &mut disk::Measure<'_>,
 ) -> DiskTick {
-    disk_tick_with(look, config, remove, measure, None)
+    disk_tick_with(look, config, remove, measure, None, None).0
 }
 
 /// An automatic watch's pass, advancing its discovery selection across looks. Explicitly
@@ -5717,16 +5781,205 @@ pub fn disk_tick_paged(
     measure: &mut disk::Measure<'_>,
     cursor: &mut disk::discover::Cursor,
 ) -> DiskTick {
-    disk_tick_with(look, config, remove, measure, Some(cursor))
+    disk_tick_with(look, config, remove, measure, Some(cursor), None).0
 }
 
+/// One page of a budget pass ([`disk_tick_budget`]): the sizing it runs from, how far the
+/// volume is over its cap, the live sessions it keeps the builds of, and which page of its run
+/// this is ([`disk::budget::Run`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BudgetLook<'a> {
+    /// The sizing the run began from.
+    pub sizing: &'a disk::budget::Sizing,
+    /// The volume over its cap, as the look read it ([`disk::budget::over`]).
+    pub over: disk::budget::Over,
+    /// The live sessions ([`disk::budget::Live`]).
+    pub live: &'a disk::budget::Live,
+    /// The page of the run, from 1 ([`disk::budget::BUDGET_PAGES`]).
+    pub page: u32,
+}
+
+/// What a budget pass asks once its rows are planned, just before it journals or removes
+/// anything: the pass lock it runs under, still its (`Err`: why not, and the page stands down).
+pub type Take<'a> = dyn FnMut() -> Result<(), String> + 'a;
+
+/// How one page of a budget pass ended ([`disk_tick_budget`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetEnd {
+    /// Free space was measured at or above the target: the memo went.
+    Met,
+    /// It stood down (a stop, a yield, the lock, a measure not read): why. No row, memo untouched.
+    StoodDown(String),
+    /// Short of the target with pages of its search left, or a row refused that a later page
+    /// may take.
+    Unfinished,
+    /// Nothing it may take is left and the volume is still over: whether its `cannot-meet` row
+    /// was written now (`row`; `false`: one was for this volume and cap already, or the memo
+    /// could not be kept), and whether its figures were a floor.
+    CannotMeet { row: bool, partial: bool },
+}
+
+impl BudgetEnd {
+    /// How the page ended, as a watch's line says it.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Met => "the volume's used bytes are back under the cap".to_owned(),
+            Self::StoodDown(why) => format!("stood down: {why}"),
+            Self::Unfinished => "its search goes on at the next look".to_owned(),
+            Self::CannotMeet { row, partial } => format!(
+                "nothing it may take is left{}{}",
+                if *partial { " of what it reached" } else { "" },
+                if *row {
+                    "; its one cannot-meet row is in disk.jsonl"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+}
+
+/// What one page of a budget pass did, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetTick {
+    /// The page's tick: its report and every step journalled into `<state>/disk.jsonl`.
+    pub tick: DiskTick,
+    /// How the page ended.
+    pub end: BudgetEnd,
+}
+
+/// ONE PAGE OF THE BUDGET PASS: a look of [`disk_tick_paged`]'s kind, at any `disk=` level,
+/// whose plan is the budget's alone ([`disk::pass_plan`] over [`disk::budget::ask`]): tier 1, 2
+/// and 3 rows of build directories no live session keeps, each stopping at the volume's free
+/// target, `measure` read before each (`None`, a yield to a pressure look among them, stands it
+/// down). `take` is asked once the rows are planned, before anything is journalled or removed.
+/// The page ends by what was measured ([`disk::budget::end_of`]): met (the memo goes), or unable
+/// to meet the target, which writes one `cannot-meet` row into `<state>/disk.jsonl` a volume and
+/// cap ([`disk::budget::unmet`], the memo saved before the row). Nothing here refuses, holds or
+/// tells a build anything, and the row is a record.
+#[must_use]
+pub fn disk_tick_budget(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    budget: &BudgetLook<'_>,
+    take: &mut Take<'_>,
+    remove: &mut disk::Remove<'_>,
+    measure: &mut disk::Measure<'_>,
+    cursor: &mut disk::discover::Cursor,
+) -> BudgetTick {
+    let mut refused: Option<String> = None;
+    let mut asked = || {
+        let took = take();
+        if let Err(why) = &took {
+            refused = Some(why.clone());
+        }
+        took
+    };
+    let taking: &mut Take<'_> = &mut asked;
+    let (tick, ask) = disk_tick_with(
+        look,
+        config,
+        remove,
+        measure,
+        Some(cursor),
+        Some((budget, taking)),
+    );
+    let end = match (&tick, refused) {
+        (DiskTick::Reclaimed(done, _), None) => {
+            budget_end(look, budget, done, ask.as_ref(), measure)
+        }
+        (_, refused) => {
+            BudgetEnd::StoodDown(refused.unwrap_or_else(|| "the look admitted no pass".to_owned()))
+        }
+    };
+    BudgetTick { tick, end }
+}
+
+/// How a budget page that ran (`done`, the plan's `ask`) ended, free space measured once more
+/// ([`disk::budget::end_of`]): met removes the memo, and unable to meet the target writes its
+/// row once ([`disk_cannot_meet`]).
+fn budget_end(
+    look: &DiskLook<'_>,
+    budget: &BudgetLook<'_>,
+    done: &disk::Applied,
+    ask: Option<&disk::budget::Ask>,
+    measure: &mut disk::Measure<'_>,
+) -> BudgetEnd {
+    use disk::budget::End;
+    let after = measure();
+    let free_target = budget.over.free_target;
+    let partial = budget.sizing.sized.partial;
+    match disk::budget::end_of(done, after, free_target, budget.page, partial) {
+        End::Met => {
+            if let Err(e) = disk::budget::met(look.state) {
+                aterm_log::warn!("harness disk watch: the budget's memo was not removed: {e}");
+            }
+            BudgetEnd::Met
+        }
+        End::StoodDown(why) => BudgetEnd::StoodDown(why),
+        End::Unfinished => BudgetEnd::Unfinished,
+        End::CannotMeet { partial } => {
+            let row = disk::CannotMeetRow {
+                by: "budget",
+                volume: &budget.sizing.volume,
+                budget: &budget.over.budget,
+                partial,
+                free: after.unwrap_or(0),
+                free_target,
+                held: ask.map_or(0, |ask| ask.held.len()),
+            };
+            let inputs = disk::budget::Inputs::of(
+                budget.sizing,
+                &budget.over.budget,
+                budget.live.digest(),
+                partial,
+            );
+            BudgetEnd::CannotMeet {
+                row: disk_cannot_meet(look.state, look.now, &inputs, &row),
+                partial,
+            }
+        }
+    }
+}
+
+/// The memo, then the row: `<state>`'s memo says this volume and cap cannot meet the target
+/// ([`disk::budget::unmet`]), and where none said so before, `row` goes into `<state>/disk.jsonl`.
+/// Whether the row was written; a memo that cannot be kept writes none.
+fn disk_cannot_meet(
+    state: &Path,
+    now: i64,
+    inputs: &disk::budget::Inputs,
+    row: &disk::CannotMeetRow<'_>,
+) -> bool {
+    match disk::budget::unmet(state, inputs, now) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            aterm_log::warn!(
+                "harness disk watch: the budget's memo was not kept, so no cannot-meet row is \
+                 written: {e}"
+            );
+            return false;
+        }
+    }
+    let path = state.join(DISK_LEDGER);
+    let _ = bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS);
+    let mut sink = io::sink();
+    let mut journal = Journal::open(Some(&path), None, &mut sink);
+    journal.append_raw(&disk::cannot_meet_row(now, row), &mut sink)
+}
+
+/// [`disk_tick`] and its kin: with `budget`, one page of the budget pass ([`disk_tick_budget`]),
+/// whose ask comes back beside the tick.
 fn disk_tick_with(
     look: &DiskLook<'_>,
     config: disk::Config,
     remove: &mut disk::Remove<'_>,
     measure: &mut disk::Measure<'_>,
     mut cursor: Option<&mut disk::discover::Cursor>,
-) -> DiskTick {
+    budget: Option<(&BudgetLook<'_>, &mut Take<'_>)>,
+) -> (DiskTick, Option<disk::budget::Ask>) {
     let DiskLook {
         state,
         volume,
@@ -5743,14 +5996,22 @@ fn disk_tick_with(
         session_cwd_unknown,
         link_dirs,
     } = *look;
+    let (budget, take) = match budget {
+        Some((budget, take)) => (Some(budget), Some(take)),
+        None => (None, None),
+    };
+    let free_target = budget.map(|b| b.over.free_target);
     let admitted = config.auto_free_gib > 0
         && free.is_some()
-        && (config.below_warn(free) || demand.is_some() || projected.is_some());
+        && (config.below_warn(free)
+            || demand.is_some()
+            || projected.is_some()
+            || free_target.is_some());
     if !admitted {
         if let Some(cursor) = cursor {
             cursor.reset_cycle();
         }
-        return DiskTick::Plenty;
+        return (DiskTick::Plenty, None);
     }
     let paged = targets.is_empty() && discover.is_some() && cursor.is_some();
     if let Some(cursor) = cursor.as_deref_mut() {
@@ -5765,6 +6026,7 @@ fn disk_tick_with(
                 session_cwds,
                 session_cwd_unknown,
                 link_dirs,
+                free_target,
             ));
         } else {
             cursor.reset_cycle();
@@ -5808,20 +6070,36 @@ fn disk_tick_with(
         demand,
         projected,
         idle_whole: config.idle_whole_on()
-            && (config.pressed(free, projected.as_ref()) || demand.is_some()),
+            && (config.pressed(free, projected.as_ref())
+                || demand.is_some()
+                || free_target.is_some()),
         session_cwds: session_cwds.to_vec(),
         session_cwd_unknown: session_cwd_unknown.map(str::to_owned),
         link_dirs: link_dirs.to_vec(),
+        budget: free_target,
         ..disk::Roots::default()
     };
     let mut survey = disk::scan(&roots, now, disk::Trigger::Tick, config, free);
     survey.room = room;
-    let rep = disk::report(&survey, config);
+    let mut rep = disk::report(&survey, config);
+    rep.budget = budget.map(|b| disk::budget::ask(&survey, b.live, b.over.free_target, table, now));
     let unfinished = if rep.assessment_complete {
         unfinished
     } else {
         Some("the target assessment or recent-profile plan was cut short".to_owned())
     };
+    if let Some(take) = take
+        && let Err(why) = take()
+    {
+        if let Some(cursor) = cursor {
+            cursor.reset_cycle();
+        }
+        let done = disk::Applied {
+            unfinished: Some(why),
+            ..disk::Applied::default()
+        };
+        return (DiskTick::Reclaimed(done, Vec::new()), rep.budget);
+    }
     let path = state.join(DISK_LEDGER);
     let mut sink = io::sink();
     let mut journal = if std::fs::create_dir_all(state).is_ok() {
@@ -5879,14 +6157,16 @@ fn disk_tick_with(
         !std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     };
     let hogs = disk::hogs_left(&survey, &rep, &done, &there);
-    DiskTick::Reclaimed(done, hogs)
+    (DiskTick::Reclaimed(done, hogs), rep.budget)
 }
 
 /// The rebuildable bytes on `volume` now, for the budget `aterm ctl sys disk` prints
 /// ([`disk::budget::rebuildable`]): the registered build caches and the build directories an
 /// unpaged search from `discover` finds, those on `volume` (the volume ids a pass's search
-/// compares, `table`'s on Windows), each sized once before `deadline`. A reading: it takes no
-/// build's lock, journals nothing, removes nothing and holds no pass's discovery cursor.
+/// compares, `table`'s on Windows), each sized once before `deadline`. A volume whose id cannot
+/// be read places nothing: its figure is 0 bytes as a floor, never a complete 0. A reading: it
+/// takes no build's lock, journals nothing, removes nothing and holds no pass's discovery
+/// cursor.
 #[must_use]
 pub fn disk_rebuildable(
     volume: &Path,
@@ -5896,8 +6176,13 @@ pub fn disk_rebuildable(
 ) -> disk::Rebuildable {
     let fresh = (cfg!(windows) && table.is_none()).then(aterm_sysprobe::volumes::table);
     let ids = table.or(fresh.as_ref());
-    let measured = volume_id(volume, ids);
-    let same_volume = |path: &Path| measured.is_some() && volume_id(path, ids) == measured;
+    let Some(measured) = volume_id(volume, ids) else {
+        return disk::Rebuildable {
+            bytes: 0,
+            partial: true,
+        };
+    };
+    let same_volume = |path: &Path| volume_id(path, ids).as_ref() == Some(&measured);
     disk::budget::rebuildable(
         discover,
         disk::discover::Budget::SHIPPED,
@@ -6541,18 +6826,38 @@ pub fn disk_sweep_journalled(
         &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
     ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
 ) -> DiskSweep {
+    disk_sweep_journalled_counted(state, now, |record, _| sweep(record))
+}
+
+/// [`disk_sweep_journalled`], `sweep` also given what the entries it put on record so far were
+/// sized at before their removal (the second argument), so a gate can stop on that count where
+/// free space lags what was removed (a snapshot that still holds the blocks).
+#[must_use]
+pub fn disk_sweep_journalled_counted(
+    state: &Path,
+    now: i64,
+    sweep: impl FnOnce(
+        &mut dyn FnMut(&Path, atpkg::build_cache::Unused) -> bool,
+        &dyn Fn() -> u64,
+    ) -> Vec<(PathBuf, atpkg::build_cache::Unused)>,
+) -> DiskSweep {
     let mut sized = Vec::new();
     let mut unrecorded = false;
-    let swept = sweep(&mut |path, why| {
-        let (bytes, _) = disk::dir_bytes(path);
-        let admitted = disk_sweep_journal(state, path, bytes, why, false, now);
-        if admitted {
-            sized.push((path.to_path_buf(), why, bytes));
-        } else {
-            unrecorded = true;
-        }
-        admitted
-    });
+    let recorded = std::cell::Cell::new(0u64);
+    let swept = sweep(
+        &mut |path, why| {
+            let (bytes, _) = disk::dir_bytes(path);
+            let admitted = disk_sweep_journal(state, path, bytes, why, false, now);
+            if admitted {
+                sized.push((path.to_path_buf(), why, bytes));
+                recorded.set(recorded.get().saturating_add(bytes));
+            } else {
+                unrecorded = true;
+            }
+            admitted
+        },
+        &|| recorded.get(),
+    );
     for (path, why) in &swept {
         let bytes = disk_sweep_sized(&sized, path, *why);
         disk_sweep_journal(state, path, bytes, *why, true, now);
@@ -10023,6 +10328,9 @@ pub struct SurveyAccount {
     pub plan: Option<String>,
     /// The plan's tier, where the profile named one (`20x`).
     pub plan_tier: Option<String>,
+    /// The walls this Mac lifted on it, the newest of each window
+    /// ([`accounts::Account::newest_lifts`]), which its quota row tells the other Macs.
+    pub lifts: Vec<accounts::Lift>,
 }
 
 /// How old a row's figures may be for a survey to call it `usable` ([`survey_condition`]): as long
@@ -10319,11 +10627,34 @@ pub fn survey_accounts(
             // The owner's `accounts use` cleared the row: what was read before that no longer
             // speaks for it, as no older observer can raise its wall again ([`accounts::pin`]).
             let since_pin = |at: i64| account.cleared_at.is_none_or(|cleared| at > cleared);
-            let session = current_account_window(&windows, accounts::SESSION_LIMIT, now)
-                .filter(|f| since_pin(f.at));
+            // A lift of a window's wall (a read with room, a refill, a reset step, another Mac's
+            // word: [`accounts::note_peer_lift`]) says the window has room again: a full figure of
+            // it read at or before the lift was recorded no longer speaks for it, as the wall
+            // itself does not. A figure with room, or one read after, still does.
+            let since_lift = |window: &str, (pct, at): (u32, i64)| {
+                pct < 100
+                    || account
+                        .walls
+                        .get(window)
+                        .filter(|wall| wall.cleared)
+                        .is_none_or(|lifted| at > lifted.at)
+            };
+            let session =
+                current_account_window(&windows, accounts::SESSION_LIMIT, now).filter(|f| {
+                    since_pin(f.at) && since_lift(accounts::SESSION_LIMIT, (f.whole(), f.at))
+                });
             let week = current_account_window(&windows, accounts::WEEK_LIMIT, now)
-                .filter(|f| since_pin(f.at));
+                .filter(|f| since_pin(f.at) && since_lift(accounts::WEEK_LIMIT, (f.whole(), f.at)));
+            let sampled = account.sample.as_ref().map_or(i64::MIN, |sample| sample.at);
             let unnamed = account.unnamed_windows(now);
+            let unnamed = accounts::UnnamedWindows {
+                session: unnamed
+                    .session
+                    .filter(|&(pct, _)| since_lift(accounts::SESSION_LIMIT, (pct, sampled))),
+                week: unnamed
+                    .week
+                    .filter(|&(pct, _)| since_lift(accounts::WEEK_LIMIT, (pct, sampled))),
+            };
             // Whichever was read last speaks for a window: a sample that named no reset, or a
             // figure, which names one.
             let held_window = |unnamed: Option<(u32, i64)>, fig: Option<&accounts::WindowFig>| {
@@ -10390,6 +10721,7 @@ pub fn survey_accounts(
                 }),
                 plan: plan.and_then(|plan| plan.word.clone()),
                 plan_tier: plan.and_then(|plan| plan.tier.clone()),
+                lifts: account.newest_lifts(&state.machine),
             }
         })
         .collect();
@@ -11982,7 +12314,9 @@ fn rows_no_route_signs_in(
             let store = env.accounts_store_for(cli)?;
             Some(left_out(&|row| {
                 raw_roster.row(&row.label).is_some_and(|raw| {
-                    super::accounts_sync::page_row_signs_in_unattended(cli, &store, raw, logins)
+                    super::accounts_sync::page_row_signs_in_unattended(
+                        cli, &store, raw_roster, raw, logins,
+                    )
                 })
             }))
         }
@@ -12083,8 +12417,8 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
         }
         _ => {}
     }
-    let shown = |window: &str, said: &Option<accounts::WindowSaid>, window_s: i64| {
-        let said = said.as_ref()?;
+    let shown = |window: &str, said: Option<&accounts::WindowSaid>, window_s: i64| {
+        let said = said?;
         let (pct, _) = said.figure(window_s, now)?;
         Some(match said.reset {
             Some(at) => format!(
@@ -12096,10 +12430,10 @@ fn usage_words(account: &accounts::Account, now: i64) -> String {
         })
     };
     if let Some(said) =
-        shown("weekly", &account.warned_week, accounts::WEEK_WINDOW_S).or_else(|| {
+        shown("weekly", account.week_warning(), accounts::WEEK_WINDOW_S).or_else(|| {
             shown(
                 "session",
-                &account.warned_session,
+                account.session_warning(),
                 accounts::SESSION_WINDOW_S,
             )
         })
@@ -12360,7 +12694,8 @@ const SIGNING_IN_WORD: &str = "signing-in";
 /// ([`accounts::login_here`], over the rows whose login the report says is here,
 /// [`reported_enrolled`]): a row with no login to run on here, none made or one signed out, is
 /// [`accounts::LoginHere::SIGNED_OUT`], or [`SIGNING_IN_WORD`] while `signing_in` names it; a
-/// signed-out row that runs on its vault token here is [`accounts::LoginHere::ON_TOKEN`]; any
+/// row with no stored login to run on here that runs on its vault token here (none made, or one
+/// signed out) is [`accounts::LoginHere::ON_TOKEN`]; any
 /// other row is what its records say ([`accounts::login_state`]), the upkeep's renewal state, so
 /// a forecast end that passed is `due`. The words for a row with no login here are the glass's
 /// (`outlook::SIGNED_OUT`, `outlook::SIGNING_IN`) spelt as one token, a field a script matches.
@@ -12521,6 +12856,47 @@ pub(super) fn stopped_step(cli: Cli, label: &str) -> String {
         "a page stopped aterm's sign-in: run `{}` in a terminal on this Mac",
         Step::Renew(cli, label.to_owned())
     )
+}
+
+/// Why a run with nobody at this terminal (an agent's, another Mac's request, an unattended one,
+/// a worker's launch) starts nothing for `cli`'s row `label`, left to a person
+/// ([`super::accounts_sync::left_to_a_person`]), and the person's step ([`left_step`]), in text
+/// an agent reads: `w3: not run: …; a person runs `aterm harness accounts renew w3` in a
+/// terminal on this Mac`.
+pub(super) fn left_words(cli: Cli, label: &str) -> String {
+    format!(
+        "{label}: not run: its last sign-in stopped where only a person at this Mac can go on; a \
+         person runs `{}` in a terminal on this Mac",
+        left_step(cli, label)
+    )
+}
+
+/// [`left_words`] for what holds `cli`'s row `label` ([`super::accounts_sync::person_hold`]): its
+/// own record, or a bot protection's stop of another row of its pool here, whose page answers
+/// this Mac's browser the same.
+pub(super) fn held_words(cli: Cli, label: &str, hold: &super::accounts_sync::PersonHold) -> String {
+    match hold {
+        super::accounts_sync::PersonHold::Row => left_words(cli, label),
+        super::accounts_sync::PersonHold::Pool(other) => format!(
+            "{label}: not run: a bot protection stopped this Mac's last sign-in of `{other}`, and \
+             {}'s page answers this Mac's browser the same for every account; a person runs `{}` \
+             in a terminal on this Mac",
+            cli.connector().product,
+            left_step(cli, label)
+        ),
+    }
+}
+
+/// The step a person at this Mac takes for `cli`'s row `label` that a bot protection stopped:
+/// a Claude row's own renewal, which on macOS opens aterm's sign-in window, where they complete
+/// the check; another CLI's own sign-in, which they approve from a terminal
+/// ([`accounts::SignInAction::Login`]), since that CLI's renewal loads the headless page the
+/// check answered.
+pub(crate) fn left_step(cli: Cli, label: &str) -> Step {
+    match cli {
+        Cli::Claude => Step::Renew(cli, label.to_owned()),
+        Cli::Codex | Cli::Grok | Cli::Kimi | Cli::Agy => Step::Login(cli, label.to_owned()),
+    }
 }
 
 /// The row's current sign-in task, where one stands and asks a person for something: none for a
@@ -13076,7 +13452,8 @@ fn token_report(env: &Env, host: &dyn AccountsHost) -> super::accounts_token_vie
     let sessions = host
         .local_survey(env)
         .map(|lines| view::with_logins(view::sessions_of(&lines), &accounts, &logins));
-    let steps = view::held_steps(&store, &accounts, env.home.as_deref(), || {
+    let var = |name: &str| host.machine_var(name);
+    let steps = view::held_steps(&store, &accounts, (env.home.as_deref(), &var), || {
         host.setup_token_program().map(|(_, version)| version)
     });
     Report::Accounts {
@@ -15011,13 +15388,15 @@ pub(super) enum Renewal {
     /// Local admission, shared authority or captured state became unavailable; retain a
     /// saved selection for a fresh attempt rather than interpreting this as an authentication failure.
     Deferred,
-    /// Another CLI's sign-in stopped where only a person can go on (its page waits on one, or a
-    /// block page, or its time ran out), so a background renewal of the row waits for one
-    /// ([`super::accounts_sync`]'s backoff).
+    /// Another CLI's sign-in stopped where only a person can go on and no bot protection
+    /// stopped it (its page waits on one, or its time ran out), so a background renewal of the
+    /// row waits for one ([`super::accounts_sync`]'s `PERSON_BACKOFF`).
     NeedsPerson,
-    /// A sign-in met Cloudflare's bot check, which did not clear. Its account keeps a human
-    /// sign-in task, without an immediate prompt. Background renewal waits as long as after
-    /// another stop for a person; a human can start the native login explicitly.
+    /// A bot protection stopped the sign-in: Cloudflare's bot check, which did not clear, or a
+    /// block page. Its account keeps the check on record ([`accounts::CheckStop`]) and a human
+    /// sign-in task, without an immediate prompt, and nothing with nobody at this Mac signs it
+    /// in again, on any clock ([`super::accounts_sync::left_to_a_person`]); a person can start
+    /// the native login explicitly.
     BotCheck,
 }
 
@@ -15224,10 +15603,11 @@ fn renew_one(
 /// Records how a renewal a person or an agent ran by hand ended short of a login, as the
 /// upkeep's ladder records its own ([`accounts::note_hand_sign_in_attempt`]), in the one
 /// wording for a run's end ([`RenewalObservation::ended`]: the exit, what the opener met and the
-/// reason it gave), so the row's `sign-in:` line and
-/// one `sign-in` ledger row keep why it ended after the terminal's lines are gone. A page that stopped it records
-/// `blocked`, as the ladder does. It records a run that says why it ended: its provider exited
-/// with a failure of its own (1 to 127), or its opener wrote what it met. A run a signal ended
+/// reason it gave), so the row's `sign-in:` line and one `sign-in` ledger row keep why it ended
+/// after the terminal's lines are gone. A page that stopped it records `blocked` with the page it
+/// was ([`accounts::note_sign_in_stop`]), as the ladder does. It records a run that says why it
+/// ended: its provider exited with a failure of its own (1 to 127), or its opener wrote what it
+/// met. A run a signal ended
 /// (a person's Ctrl-C), one whose provider never started or exited 0 (what failed then has its
 /// own line and record), one put off, and one that signed in another account write nothing
 /// here. The records are read again under the writer: the run itself may have moved them.
@@ -15253,13 +15633,11 @@ fn note_hand_renewal(
     {
         return;
     }
-    let outcome = if renewal == Renewal::BotCheck
-        || observation.met().is_some_and(super::open_url::Met::stopped)
-    {
-        accounts::AttemptOutcome::Blocked
-    } else {
-        accounts::AttemptOutcome::Failed
-    };
+    let stop = observation
+        .met()
+        .filter(|met| met.stopped())
+        .map(|met| met.word)
+        .or((renewal == Renewal::BotCheck).then_some(super::open_url::MetWord::BotCheck));
     let routes = format!("by hand: {}", observation.ended(renewal));
     let recorded = store
         .read_account_records(Some(roster_path), now)
@@ -15283,9 +15661,18 @@ fn note_hand_renewal(
                 },
                 |_, logins| {
                     accounts::admit_workflow(logins, label)?;
-                    Ok(accounts::note_hand_sign_in_attempt(
-                        logins, label, outcome, &routes, now,
-                    ))
+                    Ok(match stop {
+                        Some(word) => {
+                            accounts::note_sign_in_stop(logins, row, true, word, &routes, now)
+                        }
+                        None => accounts::note_hand_sign_in_attempt(
+                            logins,
+                            label,
+                            accounts::AttemptOutcome::Failed,
+                            &routes,
+                            now,
+                        ),
+                    })
                 },
             )
         });
@@ -16203,6 +16590,30 @@ fn run_accounts_renew(
             let _ = writeln!(out, "{label}: {said}");
             continue;
         };
+        let person = person_at_terminal(host);
+        // A row a bot protection stopped, or whose renewal is a person's, is not signed in with
+        // nobody at the terminal: an agent's run, another Mac's request and an unattended one
+        // open nothing for it, wait for no other sign-in first and say the step that is the
+        // person's (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). Its token in use here
+        // lifts nothing: every route this runs loads a page.
+        let left_to_a_person = |logins: &accounts::Logins, err: &mut dyn Write| {
+            let left = !person
+                && file_roster
+                    .row(label)
+                    .is_some_and(|raw| super::accounts_sync::left_to_a_person(&store, raw, logins));
+            if left {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts renew: {}",
+                    left_words(Cli::Claude, label)
+                );
+            }
+            left
+        };
+        if left_to_a_person(&attempt_logins, err) {
+            ok &= !labels.contains(label);
+            continue;
+        }
         if let Some(words) = spaced_words(&sign_in, &store, now) {
             let _ = writeln!(out, "{label}: {words}");
             continue;
@@ -16271,6 +16682,11 @@ fn run_accounts_renew(
             };
             sign_in = current_sign_in;
             attempt_logins = current.logins;
+            // Another sign-in it waited for may have ended where only a person goes on.
+            if left_to_a_person(&attempt_logins, err) {
+                ok &= !labels.contains(label);
+                continue;
+            }
         }
         let attempt_rows = accounts::bound(&file_roster, &attempt_logins);
         let Some(row) = attempt_rows.row(label) else {
@@ -16300,7 +16716,6 @@ fn run_accounts_renew(
         // Elsewhere a person is here for a row whose page stopped its automatic sign-in: it is
         // theirs, in the row's own browser profile, or with none named their default browser,
         // where no opener of aterm's runs. An agent's terminal is nobody here.
-        let person = person_at_terminal(host);
         // Where the opener cannot be made, no window can open, and the row is signed in as
         // it is anywhere else.
         let window_opener = (host.opens_sign_in_window()
@@ -18247,7 +18662,8 @@ fn person_step(cli: Cli, outcome: &super::login_drive::Outcome) -> Option<accoun
 fn human_challenge_step(cli: Cli, label: &str, out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "{label}: human browser challenge recorded; {}",
+        "{label}: human browser challenge recorded; nothing signs this row in again with nobody \
+         at this Mac; {}",
         accounts::SignInAction::Login.next_step(cli, label)
     );
 }
@@ -18510,6 +18926,25 @@ fn renew_one_for_operation(
                 }
             }
         }
+        // THE PAGE STEP: whichever door reached it (the upkeep, a saved choice, a click, an
+        // agent's or another Mac's renew, a worker's launch, an enrollment, a Kimi Code CLI
+        // row's refresh that found no profile to refresh), a row a bot protection stopped, or
+        // one of its pool and realm here, loads no page with nobody at this terminal, on any
+        // clock (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). Nothing new is recorded:
+        // the check that holds it is.
+        if !person_at_terminal(host)
+            && let Some(hold) = records.raw_roster.row(label).and_then(|raw| {
+                super::accounts_sync::person_hold(store, &records.raw_roster, raw, &records.logins)
+            })
+        {
+            drop_staging(&plan.staging, err);
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {}",
+                held_words(cli, label, &hold)
+            );
+            return Renewal::Failed;
+        }
         let _ = writeln!(
             out,
             "renewing `{label}`: {}",
@@ -18551,8 +18986,34 @@ fn renew_one_for_operation(
             return Renewal::Deferred;
         }
         let now = host.now().max(floor);
+        // A bot protection's stop is a fact of this Mac and the row's account, whatever moved in
+        // the run's own fences meanwhile (the row's policy, its workflow, the publication):
+        // where the run's own record does not land, the check alone is written under the
+        // account's own fence, by every door that met it. A background run whose write found the
+        // records busy keeps it in its process until it is written ([`super::accounts_sync`]'s
+        // `hold_for_a_person`).
+        let check_alone = || {
+            if matches!(drove.outcome, Outcome::BotCheck(_)) {
+                let _ = super::accounts_sync::write_check_stop(
+                    store,
+                    &super::accounts_sync::PendingCheck {
+                        roster_path: roster_path.to_owned(),
+                        row: records
+                            .raw_roster
+                            .row(label)
+                            .cloned()
+                            .unwrap_or_else(|| row.clone()),
+                        generation: captured_logins
+                            .get(label)
+                            .map(|binding| binding.renewal_generation),
+                        at: now,
+                    },
+                );
+            }
+        };
         let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
         if let Err(why) = policy_unchanged() {
+            check_alone();
             if plan.publication.require_work_current().is_err() {
                 return Renewal::Deferred;
             }
@@ -18578,6 +19039,14 @@ fn renew_one_for_operation(
                 }
                 if let Some(action) = person_step(cli, &drove.outcome) {
                     accounts::note_sign_in_task(logins, label, action, now);
+                }
+                // A bot protection's stop is the account's, apart from the row's workflow: only
+                // a login made for the row, or a signed-in `accounts browser` window, ends it
+                // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3).
+                if matches!(drove.outcome, Outcome::BotCheck(_))
+                    && let Some(raw_row) = raw.row(label)
+                {
+                    accounts::note_check_stop(logins, raw_row, now);
                 }
                 plan.require_publication(host, store)?;
                 Ok(vec![event])
@@ -18641,6 +19110,9 @@ fn renew_one_for_operation(
                     return Renewal::Deferred;
                 }
                 let recorded = record(err, accounts::Kind::SignIn);
+                if !recorded {
+                    check_alone();
+                }
                 if plan.require_publication(host, store).is_err() {
                     return Renewal::Deferred;
                 }
@@ -18655,7 +19127,8 @@ fn renew_one_for_operation(
                     if recorded { "" } else { " (not even that)" }
                 );
                 if !recorded {
-                    // A bot check is held in the background on its end, on record or not.
+                    // A bot check the record missed holds on the check written above, or, where
+                    // that write found the records busy, in the background's process.
                     return if matches!(other, Outcome::BotCheck(_)) {
                         Renewal::BotCheck
                     } else {
@@ -18691,8 +19164,9 @@ fn renew_one_for_operation(
                     // A driven sign-in's step is never the Claude renewal's ([`person_step`]).
                     Some(accounts::SignInAction::Renew) | None => {}
                 }
-                // A bot check keeps its own outcome and backoff. Its human task is a quiet
-                // account record, not a prompt repeated into working agent sessions.
+                // A bot check keeps its own outcome and the account's check, which holds the
+                // row on no clock. Its human task is a quiet account record, not a prompt
+                // repeated into working agent sessions.
                 return match other {
                     Outcome::Exited(code) => Renewal::authentication_failed(*code),
                     Outcome::NeedsYou(_) | Outcome::NeedsSignIn(_) | Outcome::Hung => {
@@ -18949,6 +19423,32 @@ fn run_accounts_renew_for(
             let _ = writeln!(out, "{label}: {said}");
             continue;
         };
+        // A row a bot protection stopped, or one of its pool and realm here, is not signed in
+        // with nobody at the terminal: an agent's run, a tab another Mac drives and an
+        // unattended one load no page for it and say the step that is the person's, before any
+        // spacing is judged (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). A person
+        // here runs it. A Kimi Code CLI row's native refresh loads no page and goes on; its fall
+        // back to the page is held where it is chosen ([`pool_kimi`]).
+        #[cfg(unix)]
+        let native_profile = cli == Cli::Kimi
+            && pool_kimi::profile(&store, row, &attempt_logins)
+                .is_ok_and(|profile| profile.is_some());
+        #[cfg(not(unix))]
+        let native_profile = false;
+        if !person_at_terminal(host)
+            && !native_profile
+            && let Some(hold) = file_roster.row(label).and_then(|raw| {
+                super::accounts_sync::person_hold(&store, &file_roster, raw, &attempt_logins)
+            })
+        {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts renew: {}",
+                held_words(cli, label, &hold)
+            );
+            ok &= !labels.contains(label);
+            continue;
+        }
         if let Some(words) = spaced_words(&sign_in, &store, now) {
             let _ = writeln!(out, "{label}: {words}");
             continue;
@@ -20925,6 +21425,7 @@ pub fn run(cmd: &Cmd, env: &Env, out: &mut dyn Write, err: &mut dyn Write) -> Ex
         Cmd::AccountsSourceTable { cli, json } => {
             run_accounts_source_table(*cli, env, *json, out, err)
         }
+        Cmd::Ls { json } => run_ls(env, *json, out),
         Cmd::Versions { json } => run_versions(env, *json, out),
         Cmd::Signin { wait, json } => run_signin(env, *wait, *json, out, err),
         Cmd::MailboxesImport { csv, into, dry_run } => {
@@ -21009,6 +21510,7 @@ fn run_signin(
             hang: super::login_drive::HANG,
             wait,
             ack: io::stdin().is_terminal(),
+            person: person_at_terminal(&LiveAccounts::default()),
             stopped: &stopped,
             now: &now,
             begin: &begin,
@@ -21058,6 +21560,138 @@ fn run_versions(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `ls [--json]`: the harness registry of the store and aterm.toml `env` names ([`HELP_LS`]).
+fn run_ls(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
+    let config = env
+        .config
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map_or_else(atpkg::config::HarnessConfig::default, |t| {
+            atpkg::config::parse_harness(&t)
+        });
+    let registry = super::registry::Registry::load_from(versions_layout(env).as_ref(), &config);
+    write_ls(&registry, json, out);
+    ExitCode::SUCCESS
+}
+
+/// Render `registry` as `ls` prints it ([`HELP_LS`]).
+fn write_ls(registry: &super::registry::Registry, json: bool, out: &mut dyn Write) {
+    use super::registry::Origin;
+    use crate::supervise::journal::json_str;
+    let list = |items: &[String]| {
+        format!(
+            "[{}]",
+            items
+                .iter()
+                .map(|i| json_str(i))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    if json {
+        let rows: Vec<String> = registry
+            .entries()
+            .iter()
+            .map(|e| {
+                let (origin, build, link, dev) = match &e.origin {
+                    Origin::Seed => ("seed", "null".to_string(), "null".to_string(), false),
+                    Origin::Signed { build } => ("build", build.to_string(), "null".into(), false),
+                    Origin::Linked { checkout, listed } => (
+                        "link",
+                        "null".into(),
+                        json_str(&checkout.to_string_lossy()),
+                        *listed,
+                    ),
+                };
+                format!(
+                    r#"{{"id":{},"origin":"{origin}","build":{build},"link":{link},"dev":{dev},"tool":{},"leads":{},"name":{},"env_strip":{}}}"#,
+                    json_str(e.row.id),
+                    json_str(&e.tool),
+                    list(&e.leads),
+                    json_str(&e.name),
+                    list(&e.env_strip),
+                )
+            })
+            .collect();
+        let [refused, notes] = [registry.refused(), registry.notes()].map(|list| {
+            list.iter()
+                .map(|r| {
+                    format!(
+                        r#"{{"id":{},"what":{},"reason":{}}}"#,
+                        json_str(&r.id),
+                        json_str(&r.what),
+                        json_str(&r.reason)
+                    )
+                })
+                .collect::<Vec<String>>()
+        });
+        let env_refused: Vec<String> = registry
+            .env_refused()
+            .iter()
+            .map(|r| {
+                format!(
+                    r#"{{"origin":{},"entry":{},"reason":{}}}"#,
+                    json_str(&r.origin),
+                    json_str(&r.entry),
+                    json_str(r.reason)
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            r#"{{"rows":[{}],"refused":[{}],"notes":[{}],"env_strip":{},"env_refused":[{}]}}"#,
+            rows.join(","),
+            refused.join(","),
+            notes.join(","),
+            list(registry.env_strip().prefixes()),
+            env_refused.join(",")
+        );
+        return;
+    }
+    let _ = writeln!(out, "harnesses");
+    for e in registry.entries() {
+        let mut origin = e.origin.words();
+        if matches!(e.origin, Origin::Linked { listed: true, .. }) {
+            origin.push_str(" (dev)");
+        }
+        let leads = if e.leads.is_empty() {
+            "leads nothing".to_string()
+        } else {
+            format!("leads {}", e.leads.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "  {:<17} {:<16} {leads}; tool {}; {origin}",
+            e.row.id, e.name, e.tool
+        );
+    }
+    let _ = writeln!(out, "refused");
+    if registry.refused().is_empty() {
+        let _ = writeln!(out, "  (none)");
+    }
+    for r in registry.refused() {
+        let _ = writeln!(out, "  {} {}: {}", r.id, r.what, r.reason);
+    }
+    if !registry.notes().is_empty() {
+        let _ = writeln!(out, "narrowed");
+        for r in registry.notes() {
+            let _ = writeln!(out, "  {} {}: {}", r.id, r.what, r.reason);
+        }
+    }
+    let _ = writeln!(out, "shell strip list");
+    let _ = writeln!(out, "  {}", registry.env_strip().prefixes().join(" "));
+    for e in registry
+        .entries()
+        .iter()
+        .filter(|e| !e.env_strip.is_empty())
+    {
+        let _ = writeln!(out, "  {} adds {}", e.row.id, e.env_strip.join(" "));
+    }
+    for r in registry.env_refused() {
+        let _ = writeln!(out, "  refused {} from {}: {}", r.entry, r.origin, r.reason);
+    }
+}
+
 /// The atpkg store `versions` reads: the `[packages] prefix` of [`Env::config`] under
 /// [`Env::home`], vetted as atpkg vets it, else the default prefix there.
 fn versions_layout(env: &Env) -> Option<atpkg::store::Layout> {
@@ -21077,7 +21711,7 @@ fn versions_layout(env: &Env) -> Option<atpkg::store::Layout> {
 /// `supervisor_version=`, `supervisor_vendor=`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveClaim {
-    /// The session (its tab ID, `t…`).
+    /// A session held by a local instance, including a live legacy ID.
     sid: String,
     /// The holder, decoded (`grok-alab@4242`, `codex-alab@4242`).
     holder: String,
@@ -21106,14 +21740,15 @@ impl LiveClaim {
 }
 
 /// The harness claims of a `sessions` reply body, in row order: only rows whose holder names a
-/// harness ([`LiveClaim::harness`]).
+/// harness ([`LiveClaim::harness`]). The body is this Mac's own, so a tab still under its legacy
+/// `s-` ID is read as one ([`aterm_types::control_verbs::is_minted_sid`]).
 fn live_claims_of(body: &str) -> Vec<LiveClaim> {
     let mut out = Vec::new();
     for row in body.lines() {
         let mut words = row.split_whitespace();
         let Some(sid) = words
             .nth(1)
-            .filter(|s| aterm_types::control_verbs::is_minted_sid(s))
+            .filter(|s| aterm_types::control_request::Sid::parse(s).is_some())
         else {
             continue;
         };
@@ -21402,14 +22037,61 @@ pub const LAUNCH_FLAG: &str = "--launch";
 /// `aterm harness tap --launch -- <args>`: the `--settings` value a Claude Code launch of
 /// `<args>` in this process's directory and environment carries from its start
 /// ([`super::tap::launch_value`]), or `None`. atpkg's managed twin asks it inside an aterm tab and
-/// puts `--settings <value>` ahead of the launch's own arguments; the verb reads no stdin and
-/// always exits 0, so a launch never waits on it or fails for it. First, on Unix, it notes the
-/// Claude home the launch serves from (`note_launch_home`).
+/// puts `--settings <value>` ahead of the launch's own arguments; the verb reads no stdin, prints
+/// that value and nothing else, and always exits 0, so a launch never fails for it. First, on
+/// Unix, it notes the Claude home the launch serves from (`note_launch_home`) and settles the
+/// launch's folder trust ([`settle_launch_trust`]): the one step a launch may wait on, for a
+/// folder Claude Code holds no trust record for, and at most
+/// [`super::launch_trust::DEADLINE`] past the two reads of its window, each bounded by
+/// [`super::launch_trust::SESSION_WAIT`]. A launch the twin says has no terminal on its output
+/// (`atpkg::launch_tap::STDOUT_TTY_ENV` is `0`) is not settled: Claude Code prints and exits
+/// there and draws no dialog, and a tool shell inside a tab launches that way under the tab's
+/// policy. A twin laid before it said so is settled as a terminal's launch.
 fn launch_tap_value(args: &[String]) -> Option<String> {
     let env = Env::from_process().ok()?;
     #[cfg(unix)]
     note_launch_home(&env);
     let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
+    let argv: Vec<String> = std::iter::once("claude".to_owned())
+        .chain(args.iter().cloned())
+        .collect();
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    let sid = std::env::var("ATERM_PARENT_SESSION_ID").ok();
+    #[cfg(unix)]
+    let account_home = aterm_uds::account::home();
+    #[cfg(not(unix))]
+    let account_home: Option<PathBuf> = None;
+    let no_harness = std::env::var_os("ATERM_NO_HARNESS").is_some_and(|v| !v.is_empty());
+    #[cfg(unix)]
+    if let Some(sid) = sid.as_deref().filter(|sid| !sid.is_empty()) {
+        let build = super::launch_trust::twin_store_build();
+        let no_terminal =
+            std::env::var_os(atpkg::launch_tap::STDOUT_TTY_ENV).is_some_and(|said| said == "0");
+        let _ = settle_launch_trust(
+            &env,
+            &policy,
+            &super::launch_trust::Launch {
+                argv: &argv,
+                cwd: &env.cwd,
+                env: &vars,
+                account_home: account_home.as_deref(),
+                user_home: env.home.as_deref().or(account_home.as_deref())?,
+                no_harness,
+                no_terminal,
+                build: build.as_deref(),
+            },
+            sid,
+            &super::launch_trust::StoreVendor,
+            &|sid| {
+                super::launch_trust::session_seen(
+                    None,
+                    None,
+                    sid,
+                    super::launch_trust::SESSION_WAIT,
+                )
+            },
+        );
+    }
     let armed = super::tap::Armed::arm(
         policy.usage_tap_on(),
         super::tap::stable_exe,
@@ -21418,22 +22100,13 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
         Some(env.now),
     );
     let home = env.home.clone()?;
-    let argv: Vec<String> = std::iter::once("claude".to_owned())
-        .chain(args.iter().cloned())
-        .collect();
     let cwd = std::env::current_dir().ok()?;
     let settings = super::upgrade_drive::tap_settings_under(&home, &argv, &cwd.to_string_lossy());
     let user = super::upgrade_drive::tap_user_settings(&home);
-    let vars: Vec<(String, String)> = std::env::vars().collect();
-    let sid = std::env::var("ATERM_PARENT_SESSION_ID").ok();
-    #[cfg(unix)]
-    let account_home = aterm_uds::account::home();
-    #[cfg(not(unix))]
-    let account_home: Option<PathBuf> = None;
     super::tap::launch_value(&super::tap::LaunchFacts {
         armed: armed.as_ref(),
         sid: sid.as_deref(),
-        no_harness: std::env::var_os("ATERM_NO_HARNESS").is_some_and(|v| !v.is_empty()),
+        no_harness,
         env: &vars,
         home: Some(&home),
         account_home: account_home.as_deref(),
@@ -21442,6 +22115,41 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
         user_settings: Some(&user),
         profile_store: super::upgrade_drive::tap_profile_store_at(&home),
     })
+}
+
+/// SETTLE THE FOLDER TRUST OF A LAUNCH IN TAB `sid` ([`super::launch_trust::settle`]) under
+/// `policy` and what the session's window says of it (no hold, no other supervisor, its own
+/// Autopilot word and trusted folder), which `seen` reads only for a folder that holds no trust
+/// record. What it did, and a step it had to skip unread, is booked in the session's ledger and
+/// journal under the aterm state root; it prints nothing.
+#[cfg(unix)]
+fn settle_launch_trust(
+    env: &Env,
+    policy: &SupervisorConfig,
+    launch: &super::launch_trust::Launch<'_>,
+    sid: &str,
+    vendor: &dyn super::launch_trust::Vendor,
+    seen: &dyn Fn(&str) -> Option<super::launch_trust::Seen>,
+) -> super::launch_trust::Settled {
+    let mut book = super::launch_trust::DriveBook {
+        state: env.aterm_state.clone(),
+        sid: sid.to_string(),
+    };
+    super::launch_trust::settle(
+        launch,
+        &|cwd| {
+            super::launch_trust::session_gate(
+                policy,
+                seen(sid).as_ref(),
+                env.home.as_deref(),
+                disk::discover::own_uid(),
+                cwd,
+            )
+        },
+        vendor,
+        &mut book,
+        super::launch_trust::DEADLINE,
+    )
 }
 
 /// Note the Claude home this launch serves from ([`super::claude_homes`]), before it serves

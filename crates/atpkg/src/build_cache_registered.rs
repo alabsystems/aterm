@@ -6,7 +6,8 @@
 //! A name or a cache tag is not ownership. A fresh private stage and durable identity receipt
 //! precede atomic target publication. An existing unrecorded target that proves cargo made it
 //! as its build directory (cargo's own tag, which cargo writes into a build directory only as
-//! it makes it, and the rustc facts a build keeps there) is recorded where it stands, its
+//! it makes it, and the rustc facts beside a profile a compilation or `clean -p` laid there) is
+//! recorded where it stands, its
 //! contents and identity kept (the `adoption` module); every other one stays unmanaged and
 //! keeps its output paths, and a producer requiring managed output refuses it.
 //! The index avoids searching the person's folders.
@@ -30,6 +31,10 @@ pub use known::KnownCargoCache;
 pub(super) mod retention;
 pub use retention::CAPABILITY as RETAIN_CAPABILITY;
 pub use retention::retain;
+
+#[cfg(unix)]
+#[path = "build_cache_gate.rs"]
+mod gate;
 
 /// The internal front-door call a managed compiler shim makes before it execs Cargo.
 pub const REGISTER_VERB: &str = "__build_cache_register";
@@ -756,6 +761,10 @@ fn decode(bytes: &[u8]) -> Option<Receipt> {
     .then_some(receipt)
 }
 
+/// Whether `receipt` binds the folder at its root: a receipt no creation is still making, of a
+/// canonical folder in scope with the identity it recorded, no source and no cargo home's cache
+/// ([`adoption::home_cache`]: what came under custody before it was one, or under a rule that
+/// did not refuse it, binds nothing once it is), whose marker binds it ([`marker_binds`]).
 fn same(home: &Path, receipt: &Receipt) -> bool {
     receipt.creating.is_none()
         && scope(home, &receipt.root)
@@ -765,7 +774,19 @@ fn same(home: &Path, receipt: &Receipt) -> bool {
             std::fs::symlink_metadata(receipt.root.join(name))
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         })
+        && !home_cache(home, &receipt.root)
         && read(&receipt.root.join(MARKER)).is_some_and(|marker| marker_binds(&marker, receipt))
+}
+
+/// [`adoption::home_cache`] where adoption is built; elsewhere nothing is.
+#[cfg(unix)]
+fn home_cache(home: &Path, root: &Path) -> bool {
+    adoption::home_cache(home, root)
+}
+
+#[cfg(not(unix))]
+fn home_cache(_: &Path, _: &Path) -> bool {
+    false
 }
 
 /// The marker declares identity and package policy; producer rosters, Pending and evolving
@@ -858,10 +879,10 @@ fn witness_soon(home: &Path, root: &Path) {
     let Ok(_admission) = crate::lock::Flock::try_lock(admission) else {
         return;
     };
-    let Ok(gate) = crate::metadata_io::open_regular(&gate) else {
+    let Ok(gate) = gate::open(&gate) else {
         return;
     };
-    let Ok(_held) = crate::lock::Flock::try_lock(gate) else {
+    let Ok(_held) = gate::try_exclusive(gate) else {
         return;
     };
     if let Some(mut receipt) = read(&path)
@@ -950,7 +971,7 @@ fn pending_copy(index: &Path, root_key: &str, receipt: &Receipt) -> Option<()> {
     // A separate stage receipt survives publishing a replacement at the original target.
     // Its own gate exists before the receipt can become visible to a reclaimer.
     let file = open_gate(&gate_path(&path)?)?;
-    let _held = crate::lock::Flock::try_lock(file).ok()?;
+    let _held = gate::try_exclusive(file).ok()?;
     write(&path, receipt)
 }
 
@@ -990,10 +1011,10 @@ fn recorded_while(home: &Path, root: &Path, workspace: &Path, still: &dyn Fn() -
     let Some(gate) = gate_path(&path) else {
         return false;
     };
-    let Ok(file) = crate::metadata_io::open_regular(&gate) else {
+    let Ok(file) = gate::open(&gate) else {
         return false;
     };
-    let Ok(_held) = crate::lock::Flock::try_lock_shared(file) else {
+    let Ok(_held) = gate::try_shared(file) else {
         return false;
     };
     still() && read(&path).is_some_and(|receipt| producer_matches(home, root, workspace, &receipt))
@@ -1093,8 +1114,8 @@ fn prepare_owned_descendants(
     // new nested custody boundary cannot appear between the walk's checks and preparation.
     let admission = open_admission(record.parent().ok_or_else(stop)?).ok_or_else(stop)?;
     let _held_admission = crate::lock::Flock::try_lock_shared(admission).map_err(|_| stop())?;
-    let gate = crate::metadata_io::open_regular(&gate_path(&record).ok_or_else(stop)?)?;
-    let _held_gate = crate::lock::Flock::try_lock_shared(gate).map_err(|_| stop())?;
+    let gate = gate::open(&gate_path(&record).ok_or_else(stop)?)?;
+    let _held_gate = gate::try_shared(gate).map_err(|_| stop())?;
     let receipt = read(&record)
         .filter(|receipt| still() && producer_matches(home, root, workspace, receipt))
         .ok_or_else(stop)?;
@@ -1131,8 +1152,8 @@ fn prepare_owned_descendants(
                 Err(_) => return Err(stop()),
             };
             if marked || indexed {
-                let gate = crate::metadata_io::open_regular(&gate_path(&record).ok_or_else(stop)?)?;
-                let gate = crate::lock::Flock::try_lock_shared(gate).map_err(|_| stop())?;
+                let gate = gate::open(&gate_path(&record).ok_or_else(stop)?)?;
+                let gate = gate::try_shared(gate).map_err(|_| stop())?;
                 let on_record = read(&record).ok_or_else(stop)?;
                 let now = Identity::held(held).ok_or_else(stop)?;
                 if !marked && binds_nothing(path, &on_record, &now) {
@@ -1302,31 +1323,120 @@ pub fn prepare_default_target(root: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Take the producer's terminal exclusive root gate, preserving contention and other I/O kinds.
+/// A producer's hang detector for a gate a running holder on record holds ([`producer_gate`]):
+/// it waits while a holder on record does work ([`gate::Watch`]), however long that takes, and
+/// is refused once this long passes in which none does any it can read. A reclaim holds a root's
+/// gate across its inventories of the root and the removal of its stale parts
+/// ([`reclaim_selected_on`]), which a loaded Mac can stretch past any wall-clock bound while the
+/// reclaim keeps working. The advisory planner ([`plan_on`]) holds it only while it reads the
+/// receipt, and lets it go before its inventory.
 #[cfg(unix)]
-fn try_producer_gate(
-    file: std::fs::File,
+const GATE_QUIET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often [`producer_gate`] looks at a held gate again.
+#[cfg(unix)]
+const GATE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Take the producer's terminal exclusive root gate `gate`, the file at `at`, under the admission
+/// lock `admission` of `index`, preserving contention and other I/O kinds (GATE-WAIT). A gate
+/// found held is waited for while a holder on record runs and is not this process
+/// ([`gate::Holders::awaited`]), until `within` passes in which no running holder on record did
+/// any work `work` reads of its pid ([`gate::Watch`]). The wait lets the admission lock, which
+/// every producer of the index takes, go: every [`GATE_POLL`] it looks at the gate, which it takes
+/// for that look alone where the gate is free ([`gate::free`]), and reads its record and its
+/// holders' work, and it takes the admission lock again to try the gate only once the gate is
+/// free, its record names no such holder, or `within` has passed with no work done. So no other
+/// taker of the admission lock waits behind this one's holder or is refused by its wait. A gate
+/// held with no running holder on record (its holder recorded nothing, or has ended) is tried
+/// once more after one pause, since a holder of this module is off its record for a moment as it
+/// takes the gate and as it lets go ([`gate`]), and refused where that holds again. The
+/// `WouldBlock` refusal names the cache, the gate's holders as its last read of the record gives
+/// them ([`gate::Holders::words`]), how long it waited wherever it paused and, where it was
+/// refused for its holder's want of work, for how long none was seen, the gate file, and the
+/// processes with that inode open ([`gate_openers`]): the evidence left where a holder recorded
+/// nothing.
+///
+/// # Errors
+/// `WouldBlock`, as above; the gate or the admission lock could not be locked or opened again.
+#[cfg(unix)]
+fn producer_gate(
+    index: &Path,
+    mut admission: crate::lock::Flock,
+    mut gate: std::fs::File,
+    at: &Path,
     root: &Path,
-    gate: &Path,
-) -> std::io::Result<crate::lock::Flock> {
-    let probe = aterm_uds::kept_out(|| file.try_clone());
-    crate::lock::Flock::try_lock(file).map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!(
-                "the managed build cache {} is busy: its registration gate is held; gate={gate:?}; {}",
-                root.display(),
-                gate_openers(probe),
-            ),
-        ),
-        std::fs::TryLockError::Error(error) => std::io::Error::new(
-            error.kind(),
-            format!(
-                "the managed build cache {} registration gate could not be locked: {error}",
-                root.display()
-            ),
-        ),
-    })
+    within: std::time::Duration,
+    work: &mut dyn FnMut(i32) -> Option<u64>,
+) -> std::io::Result<(crate::lock::Flock, gate::Held)> {
+    let began = std::time::Instant::now();
+    let mut watch = gate::Watch::new();
+    let mut paused = false;
+    // Whether the last read found the gate held with no running holder on record.
+    let mut unrecorded = false;
+    loop {
+        // A second descriptor on the gate's own inode, for the refusal's scan of who has it open.
+        let probe = aterm_uds::kept_out(|| gate.try_clone());
+        match gate::try_exclusive(gate) {
+            Ok(held) => return Ok((admission, held)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "the managed build cache {} registration gate could not be locked: {error}",
+                        root.display()
+                    ),
+                ));
+            }
+        }
+        let holders = gate::holders(at);
+        watch.look(&holders, work);
+        if (unrecorded && !holders.awaited()) || watch.quiet() >= within {
+            let waited = match (paused, holders.awaited()) {
+                (false, _) => String::new(),
+                (true, false) => {
+                    format!(", after a wait of {:.1} s", began.elapsed().as_secs_f64())
+                }
+                (true, true) => format!(
+                    ", after a wait of {:.1} s, in the last {:.1} s of which no holder on record did any work this process could read",
+                    began.elapsed().as_secs_f64(),
+                    watch.quiet().as_secs_f64(),
+                ),
+            };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "the managed build cache {} is busy: its registration gate is {}{waited}; gate={at:?}; {}",
+                    root.display(),
+                    holders.words(),
+                    gate_openers(probe),
+                ),
+            ));
+        }
+        unrecorded = !holders.awaited();
+        drop(admission);
+        paused = true;
+        loop {
+            gate::seam::waiting(at);
+            std::thread::sleep(GATE_POLL);
+            if unrecorded || gate::free(at) {
+                break;
+            }
+            let now = gate::holders(at);
+            if !now.awaited() {
+                break;
+            }
+            watch.look(&now, work);
+            if watch.quiet() >= within {
+                break;
+            }
+        }
+        let again = open_admission(index).ok_or_else(|| {
+            std::io::Error::other("the managed build cache's owner could not be recorded")
+        })?;
+        admission = crate::lock::Flock::lock(again)?;
+        gate = gate::open(at)?;
+    }
 }
 
 /// Descriptor evidence is diagnostic only: a process with the gate open need not hold its
@@ -1437,7 +1547,7 @@ fn create_with_policy(
         // Serialize admission and archived-stage publication as well as each root. Counting
         // only JSON records bounds the index even when several independent builds start.
         let admission = open_admission(&index)?;
-        let _admission = crate::lock::Flock::lock(admission).ok()?;
+        let admission = crate::lock::Flock::lock(admission).ok()?;
         let key = key(root)?;
         let path = index.join(format!("{key}.json"));
         let lock_path = gate_path(&path)?;
@@ -1445,7 +1555,15 @@ fn create_with_policy(
         must_record = true;
         // The record may be between fresh creation and publication, so a busy gate is never
         // permission to use the directory without recording this producer's owner.
-        let _held = match try_producer_gate(lock, root, &lock_path) {
+        let (_admission, _held) = match producer_gate(
+            &index,
+            admission,
+            lock,
+            &lock_path,
+            root,
+            GATE_QUIET,
+            &mut gate::work,
+        ) {
             Ok(held) => held,
             Err(error) => {
                 refusal = Some(error);
@@ -1499,6 +1617,12 @@ fn create_with_policy(
             return None;
         }
         let mut receipt = match std::fs::symlink_metadata(root) {
+            // A cargo home's cache, or a folder in one, is the cache's, never a build's to own.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && home_cache(home, root) =>
+            {
+                return None;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 must_record = true;
                 created = true;
@@ -1786,12 +1910,20 @@ fn admit_linked(
     if !admission.metadata()?.is_file() {
         return Err(stop());
     }
-    let _admission = crate::lock::Flock::lock(admission)?;
+    let admission = crate::lock::Flock::lock(admission)?;
     let key = key(root).ok_or_else(stop)?;
     let path = index.join(format!("{key}.json"));
-    let lock_path = gate_path(&path).ok_or_else(stop)?;
-    let gate = open_gate(&lock_path).ok_or_else(stop)?;
-    let _held = try_producer_gate(gate, root, &lock_path)?;
+    let gate_at = gate_path(&path).ok_or_else(stop)?;
+    let gate = open_gate(&gate_at).ok_or_else(stop)?;
+    let (_admission, _held) = producer_gate(
+        &index,
+        admission,
+        gate,
+        &gate_at,
+        root,
+        GATE_QUIET,
+        &mut gate::work,
+    )?;
     if !linked.still() {
         return Ok(Err(LinkRefusal::Changed));
     }
@@ -1904,189 +2036,141 @@ fn pending_owned(home: &Path, receipt: &Receipt, pending: &Pending) -> bool {
                 })))
 }
 
-/// The same canonical directory and regular-manifest eligibility is required before
-/// selecting an owner, creating a root or admitting a producer through a linked root.
-fn workspace_is_owner(home: &Path, workspace: &Path) -> bool {
-    scope(home, workspace)
-        && std::fs::canonicalize(workspace).ok().as_deref() == Some(workspace)
-        && super::checkout::MANIFESTS.iter().any(|name| {
-            std::fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
-        })
-}
-
 /// Resolve the workspace on every supported driver's reading of its package home. Search
 /// boundaries use Targo's logical manifest spelling; custody records canonical directories.
+///
+/// The call `args` is read from the directory Targo works in ([`from_targo_cwd`]): Targo takes
+/// its package home, and with it the stop of its root walk, against that directory (`cli.rs`
+/// changes into a `-C` and reloads `homedir` there), so a relative `CARGO_HOME` (or
+/// `TARGO_HOME`) is that directory's, never the launcher's. The root is the one Targo finds for
+/// `manifest` on each package home ([`super::workspace_root`], the walk a local fallback's
+/// `target` is read from, which stops where `find_root_iter` stops), each manifest on the way
+/// read by the front's own reader ([`live_read`], whatever reader `machine` holds for its
+/// configs) as Targo reads it, through a final link ([`super::config_file`]). The walk inspects
+/// actual ancestors outside managed scope to detect an external workspace, but a manifest
+/// redirected through a link to a folder outside that ancestry and outside `home` grants no
+/// permission to read it.
+///
+/// `Ok(None)` for a package or a root outside `home`, where atpkg keeps no custody. `Err`
+/// where the owner cannot be told ([`workspace_at`]), where the directory Targo works in cannot
+/// be told, where a manifest on the way is one Targo refuses, this reader cannot read or is
+/// redirected outside that ancestry, and where the root does not hold the package as a member,
+/// which Targo refuses too.
 fn workspace(
     home: &Path,
     manifest: &Path,
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
-) -> Option<PathBuf> {
-    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
-    let cwd = targo_cwd(&args[at..], machine).ok()??;
-    let moved = super::Machine {
-        cwd: Some(&cwd),
-        ..*machine
-    };
-    let homes = super::package_homes(tool, &moved);
-    let mut selected = None;
-    for package_home in homes {
-        let package_home = normalize_with_cwd(package_home, Some(&cwd))?;
-        let owner = workspace_at(home, manifest, &package_home)?;
-        if selected.as_ref().is_some_and(|prior| prior != &owner) {
-            return None;
+) -> Result<Option<PathBuf>, ()> {
+    let package = manifest
+        .parent()
+        .and_then(|package| std::fs::canonicalize(package).ok());
+    let read = |path: &Path| -> Result<Option<String>, ()> {
+        match std::fs::canonicalize(path) {
+            Ok(real) => {
+                let directory = real.parent().ok_or(())?;
+                if !scope(home, directory)
+                    && !package
+                        .as_deref()
+                        .is_some_and(|package| package.starts_with(directory))
+                {
+                    return Err(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
         }
-        selected = Some(owner);
-    }
-    selected
+        live_read(path)
+    };
+    from_targo_cwd(args, tool, home, machine, &|_, moved| {
+        let moved = super::Machine {
+            read: &read,
+            ..*moved
+        };
+        Some(workspace_at(
+            home,
+            manifest,
+            super::workspace_root(manifest, tool, &moved).as_deref(),
+        ))
+    })
+    .unwrap_or(Err(()))
 }
 
 /// Every supported initial-manifest reading must resolve to the same canonical owner.
+/// `Ok(None)` only where every reading's owner lies where atpkg keeps no custody; `Err` where
+/// any reading's owner cannot be told ([`workspace`]) or two readings disagree.
 fn workspace_choices(
     home: &Path,
     manifests: &[PathBuf],
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, ()> {
     let mut selected = None;
     for manifest in manifests {
         let owner = workspace(home, manifest, args, tool, machine)?;
         if selected.as_ref().is_some_and(|prior| prior != &owner) {
-            return None;
+            return Err(());
         }
         selected = Some(owner);
     }
-    selected
+    selected.ok_or(())
 }
 
-/// A missing ancestor manifest is absent; unreadable, oversized or malformed data cannot
-/// prove a workspace owner. Read links as Targo does without changing their definition base.
-fn workspace_manifest(
-    home: &Path,
-    member: &Path,
-    file: &Path,
-) -> Result<Option<aterm_toml::Value>, ()> {
-    let real = match std::fs::canonicalize(file) {
-        Ok(real) => real,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
-    };
-    let directory = real.parent().ok_or(())?;
-    // Inspect actual ancestors outside managed scope to detect an external workspace,
-    // but a redirected manifest outside that ancestry grants no permission to read it.
-    if !scope(home, directory) && !member.starts_with(directory) {
-        return Err(());
-    }
-    let text = crate::metadata_io::read_bounded_regular_utf8(&real, 1 << 20).map_err(|_| ())?;
-    aterm_toml::from_str(&text).map(Some).map_err(|_| ())
-}
-
-/// Targo's root selection excludes literal prefixes unless an explicit member prefix wins.
-/// Unsupported field types stay unresolved instead of falling back to the member package.
-fn workspace_includes(root: &Path, table: &aterm_toml::Value, member: &Path) -> Option<bool> {
-    let table = table.as_table()?;
-    let paths = |name| -> Option<Vec<&str>> {
-        match table.get(name) {
-            None => Some(Vec::new()),
-            Some(value) => value
-                .as_array()?
-                .iter()
-                .map(aterm_toml::Value::as_str)
-                .collect(),
-        }
-    };
-    let included = paths("members")?
-        .iter()
-        .any(|path| member.starts_with(root.join(path)));
-    let excluded = paths("exclude")?
-        .iter()
-        .any(|path| member.starts_with(root.join(path)));
-    Some(included || !excluded)
-}
-
-fn workspace_definition(
-    home: &Path,
-    package: &Path,
-    file: &Path,
-    value: &aterm_toml::Value,
-    member: &Path,
-) -> Option<Option<PathBuf>> {
-    let directory = file.parent()?;
-    let pointer = value
-        .get("package")
-        .and_then(|package| package.get("workspace"));
-    if let Some(table) = value.get("workspace") {
-        if pointer.is_some() {
-            return None;
-        }
-        return Some(
-            workspace_includes(directory, table, member)?.then(|| directory.to_path_buf()),
-        );
-    }
-    let Some(pointer) = pointer else {
-        return Some(None);
-    };
-    let root = normalize_with_cwd(PathBuf::from(pointer.as_str()?), Some(directory))?;
-    if !scope(home, &std::fs::canonicalize(&root).ok()?) {
-        return None;
-    }
-    let definition = workspace_manifest(home, package, &root.join("Cargo.toml")).ok()??;
-    let table = definition.get("workspace")?;
-    // Validate the same root fields before accepting an explicit pointer. Exclusion is
-    // interpreted by the driver's later membership validation, not another parent search.
-    workspace_includes(&root, table, member)?;
-    Some(Some(root))
-}
-
-fn workspace_at(home: &Path, manifest: &Path, package_home: &Path) -> Option<PathBuf> {
-    let manifest = normalize_with_cwd(manifest.to_path_buf(), None)?;
-    let real = std::fs::canonicalize(&manifest).ok()?;
+/// The owner [`workspace`] records for the package whose manifest is `manifest`, given the root
+/// Targo finds for it, `root` (`None` where it cannot be told): that root spelled canonically,
+/// `Ok(None)` where the package or the root lies outside `home`, `Err` for a file not named as
+/// a manifest, a package or root that cannot be resolved, and a root in `home` no owner may be
+/// ([`workspace_is_owner`]).
+fn workspace_at(home: &Path, manifest: &Path, root: Option<&Path>) -> Result<Option<PathBuf>, ()> {
+    let name = manifest.file_name().ok_or(())?;
     if !super::checkout::MANIFESTS
         .iter()
-        .any(|name| real.file_name() == Some(name.as_ref()))
-        || !scope(home, real.parent()?)
+        .any(|manifest| name == std::ffi::OsStr::new(manifest))
     {
-        return None;
+        return Err(());
     }
-    let package = manifest.parent()?;
-    let package_owner = std::fs::canonicalize(package).ok()?;
+    let package_owner = std::fs::canonicalize(manifest.parent().ok_or(())?).map_err(|_| ())?;
     if !scope(home, &package_owner) {
-        return None;
+        return Ok(None);
     }
-    let owner = |root: PathBuf| {
-        let root = std::fs::canonicalize(root).ok()?;
+    let owner = |root: &Path| {
+        let root = std::fs::canonicalize(root).map_err(|_| ())?;
+        if !scope(home, &root) {
+            return Ok(None);
+        }
         // Workspace members are loaded as Cargo.toml and checked by manifest identity.
         // Native initial discovery does not make Targo.toml a member of an ancestor's
         // Cargo workspace, even when both files describe the same package directory.
         if root != package_owner && manifest.file_name() != Some("Cargo.toml".as_ref()) {
-            return None;
+            return Err(());
         }
-        workspace_is_owner(home, &root).then_some(root)
+        if !workspace_is_owner(home, &root) {
+            return Err(());
+        }
+        Ok(Some(root))
     };
-    let parsed = workspace_manifest(home, &package_owner, &manifest).ok()??;
-    if let Some(root) = workspace_definition(home, &package_owner, &manifest, &parsed, &manifest)? {
-        return owner(root);
-    }
-    for ancestor in package.ancestors().skip(1) {
-        // Match Targo's finite ancestor iterator: never cross a packaged-source boundary;
-        // visit the package home itself, then stop before its parent.
-        if ancestor.ends_with("target/package") {
-            break;
-        }
-        let path = ancestor.join("Cargo.toml");
-        if let Some(parsed) = workspace_manifest(home, &package_owner, &path).ok()?
-            && let Some(root) =
-                workspace_definition(home, &package_owner, &path, &parsed, &manifest)?
-        {
-            return owner(root);
-        }
-        if ancestor == package_home {
-            break;
-        }
-    }
-    owner(package.to_path_buf())
+    owner(root.ok_or(())?)
+}
+
+/// The same canonical directory and manifest eligibility is required before selecting an
+/// owner, creating a root or admitting a producer through a linked root: a folder in `home`,
+/// spelled canonically, that holds a manifest ([`holds_manifest`]).
+fn workspace_is_owner(home: &Path, workspace: &Path) -> bool {
+    scope(home, workspace)
+        && std::fs::canonicalize(workspace).ok().as_deref() == Some(workspace)
+        && holds_manifest(workspace)
+}
+
+/// Whether the folder `workspace` holds a manifest, a regular file at its name or through a
+/// final link, as Targo reads one ([`super::config_file`]): a root Targo finds there is one its
+/// owner may be. A link stands as the checkout's while it stands ([`super::checkout::gone`]
+/// reads the name, not what it names).
+fn holds_manifest(workspace: &Path) -> bool {
+    super::checkout::MANIFESTS.iter().any(|name| {
+        std::fs::metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
+    })
 }
 
 #[cfg(unix)]
@@ -2107,40 +2191,22 @@ fn canonical_existing_ancestor(home: &Path, path: &Path) -> bool {
 }
 
 /// The target directory `args` name, as `tool` reads them: the last `--target-dir` among
-/// Targo's own words ([`super::own_words`]: `run serve --target-dir out` hands it to `serve`),
-/// else `CARGO_TARGET_DIR`, else `CARGO_BUILD_TARGET_DIR`, each spelled `TARGO_` too where `tool`
-/// reads twins ([`super::cargo_var`]); `None` for none, or an empty one, which Targo refuses.
+/// Targo's own words ([`super::typed_target_dir`]: `run serve --target-dir out` hands it to
+/// `serve`), else `CARGO_TARGET_DIR`, else `CARGO_BUILD_TARGET_DIR`, each spelled `TARGO_` too
+/// where `tool` reads twins ([`super::cargo_var`]); `None` for none, or an empty variable, which
+/// Targo refuses. An empty typed one is the directory Targo works in (`value_of_path` joins it
+/// to it, and builds there).
 fn raw_target_spec(
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
 ) -> Option<PathBuf> {
-    let mut target = None;
-    let mut words = args[..super::own_words(args, tool)]
-        .iter()
-        .map(String::as_str)
-        .peekable();
-    while let Some(word) = words.next() {
-        match word {
-            "--" => break,
-            "--target-dir" => target = words.next().map(PathBuf::from),
-            "--manifest-path" | "--config" | "--color" | "--explain" => {
-                let _ = words.next();
-            }
-            _ => {
-                if let Some(path) = word.strip_prefix("--target-dir=") {
-                    target = Some(PathBuf::from(path));
-                } else if let Some((letter, None)) = super::shorts(word).and_then(|c| c.valued) {
-                    // A short option's value left to the next word, where clap takes it
-                    // ([`super::takes_next`]), as the reader that grants custody skips it.
-                    let _ = words.next_if(|next| super::takes_next(letter, next));
-                }
-            }
-        }
+    if let Some(typed) = super::typed_target_dir(args, tool) {
+        return Some(PathBuf::from(if typed.is_empty() { "." } else { typed }));
     }
-    let target = target
-        .or_else(|| super::cargo_var("CARGO_TARGET_DIR", tool, machine).map(PathBuf::from))
-        .or_else(|| super::cargo_var("CARGO_BUILD_TARGET_DIR", tool, machine).map(PathBuf::from))?;
+    let target = super::cargo_var("CARGO_TARGET_DIR", tool, machine)
+        .or_else(|| super::cargo_var("CARGO_BUILD_TARGET_DIR", tool, machine))
+        .map(PathBuf::from)?;
     (!target.as_os_str().is_empty()).then_some(target)
 }
 
@@ -2282,8 +2348,8 @@ fn suppress_unresolved(home: &Path, target: &Path) -> std::io::Result<bool> {
         let index = index(home).ok_or_else(stop)?;
         let key = key(&root).ok_or_else(stop)?;
         let path = index.join(format!("{key}.json"));
-        let lock = crate::metadata_io::open_regular(&gate_path(&path).ok_or_else(stop)?)?;
-        let _held = crate::lock::Flock::try_lock(lock).map_err(|_| stop())?;
+        let lock = gate::open(&gate_path(&path).ok_or_else(stop)?)?;
+        let _held = gate::try_exclusive(lock).map_err(|_| stop())?;
         if linked.as_ref().is_some_and(|linked| !linked.still()) {
             return Err(std::io::Error::other(LinkRefusal::Changed.why()));
         }
@@ -2325,8 +2391,8 @@ fn suppress_configured(home: &Path) -> std::io::Result<()> {
         {
             continue;
         }
-        let lock = crate::metadata_io::open_regular(&gate_path(&path).ok_or_else(stop)?)?;
-        let _held = crate::lock::Flock::try_lock(lock).map_err(|_| stop())?;
+        let lock = gate::open(&gate_path(&path).ok_or_else(stop)?)?;
+        let _held = gate::try_exclusive(lock).map_err(|_| stop())?;
         let mut receipt = read(&path).ok_or_else(stop)?;
         receipt.owners_unknown = true;
         write(&path, &receipt).ok_or_else(stop)?;
@@ -2359,9 +2425,13 @@ const READING_VERBS: &[&str] = &[
 /// target platforms, so the compiler's probe cache (`.rustc_info.json`) may be rewritten in a
 /// build directory that already stands, as every build there rewrites it: compiler facts, no
 /// artifact and no directory made (`paths::write` creates no parent), nothing a custody record
-/// keeps. Which verbs run without a lane is [`crate::reroute::LANE_FREE_QUERIES`], a separate
-/// rule. No alias or external `cargo-<verb>` can take a builtin's name: Targo and cargo run the
-/// builtin.
+/// keeps. Adoption never counts those facts alone: it also needs, beside them, a profile a
+/// compilation prepared with a unit's invocation fingerprint, or one holding the build lock
+/// `Layout::new` lays, with nothing a build prepares or every folder a compilation's `prepare`
+/// laid, and no unit's folder in any profile, as a `clean -p` leaves it, before any build or after
+/// one (`adoption::built`); no such verb lays that lock or a profile. Which verbs run without a
+/// lane is [`crate::reroute::LANE_FREE_QUERIES`], a separate rule. No alias or external
+/// `cargo-<verb>` can take a builtin's name: Targo and cargo run the builtin.
 const RESOLVING_VERBS: &[&str] = &["fetch", "tree", "metadata", "generate-lockfile", "update"];
 
 /// WHETHER A RESOLVING VERB'S LOCKFILE MAY LAND UNDER A TARGET OR BUILD DIRECTORY, which Targo then
@@ -2432,19 +2502,20 @@ fn lockfile_may_land_in_a_target(args: &[String], machine: &super::Machine<'_>) 
 }
 
 /// Whether config text, a file's or a `--config` value's, sets `resolver.lockfile-path` or an
-/// `include`. It is read as TOML, so a quoted key's escapes spell what Targo reads. Text this
-/// TOML 1.0 reader cannot parse (Targo's reads TOML 1.1) may still set either unless it holds
-/// neither word and no escape that could spell one ([`super::spells_by_escape`]).
+/// `include`. It is read as TOML 1.1, as Targo parses it ([`super::config_toml`]), so a quoted
+/// key's escapes spell what Targo reads. Text this reader cannot parse (Targo refuses it too)
+/// may still set either unless it holds neither word and no escape that could spell one
+/// ([`super::spells_by_escape`]).
 fn names_lock_root(text: &str) -> bool {
-    match aterm_toml::from_str::<aterm_toml::Value>(text) {
-        Ok(config) => {
+    match super::config_toml(text) {
+        Some(config) => {
             config.get("include").is_some()
                 || config
                     .get("resolver")
                     .and_then(|resolver| resolver.get("lockfile-path"))
                     .is_some()
         }
-        Err(_) => {
+        None => {
             text.contains("lockfile") || text.contains("include") || super::spells_by_escape(text)
         }
     }
@@ -2470,18 +2541,19 @@ fn cli_config_names(
 
 /// Whether a config Targo reads for this call holds what `names` finds in config text (a lock
 /// root, [`names_lock_root`]) or cannot be read: each
-/// `.cargo/config.toml` and `.cargo/config` from the working directory up, then each package
+/// `.cargo/config.toml` and `.cargo/config` from the working directory up as far as Targo walks
+/// ([`super::config_walk`]), then each package
 /// home's ([`super::package_homes`]): `CARGO_HOME` against the working directory, or `~/.cargo`
-/// where it is unset or empty, and a `TARGO_HOME` where `CARGO_HOME` is unset, since the store's
-/// Targo takes its home from the first and Trust's main from the second. They are read as
+/// where it is unset or empty, and a `TARGO_HOME` where `CARGO_HOME` is unset, since Targo
+/// 16387 takes its home from the first and Trust's main from the second. They are read as
 /// Targo's, whatever the tool: reroute observes Trust's own cargo as an upstream one, and a
 /// config read in excess only reads the call more warily.
 fn configs_name(machine: &super::Machine<'_>, names: &dyn Fn(&str) -> bool) -> bool {
     let Some(cwd) = machine.cwd else {
         return true;
     };
-    cwd.ancestors()
-        .map(|dir| dir.join(".cargo"))
+    super::config_walk(cwd, machine)
+        .into_iter()
         .chain(super::package_homes(super::Tool::Targo, machine))
         .flat_map(|dir| ["config.toml", "config"].map(|name| dir.join(name)))
         .any(|file| match super::config_file(&file, machine) {
@@ -2491,11 +2563,158 @@ fn configs_name(machine: &super::Machine<'_>, names: &dyn Fn(&str) -> bool) -> b
         })
 }
 
+/// The outputs and manifests `args` selected ([`super::selected_outputs`]), read from the
+/// directory Targo works in ([`targo_cwd`]). Placement still reads the original words: this
+/// observation never rewrites the compiler's argv or invents a build-directory plan, and unknown
+/// directories and configs grant no ownership. With a `-C` before the verb, Targo changes into
+/// its directory before it reads a config, an alias, a relative path or a relative package home
+/// (`cli.rs`), then runs the same call without it: so this reads the words without the `-C`
+/// ([`super::without_directory`]) on `machine` moved there, spelled under `home` where it lies
+/// there ([`under_home`]), as [`requires_managed_explicit`] judges what the call owes. That
+/// spelling is Targo's own config walk: [`targo_cwd`] reads the directory back as Targo's
+/// `getcwd` does, HOME's spelling for a folder in it; and under a HOME that is not its own
+/// canonical spelling nothing is granted ([`workspace`]'s scope,
+/// `create_with_policy`'s canonical ancestor). `None` for a `-C` this reader cannot resolve, a
+/// second one included, which Targo refuses, and for one Targo refuses for want of its gate
+/// ([`super::directory_refused`]: no `-Zunstable-options` clap keeps, or a channel that allows
+/// no nightly feature), where it builds nothing; the lint's words are its own, so a `-C` among
+/// them grants nothing.
+fn selected_call_outputs(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> Option<super::SelectedOutputs> {
+    from_targo_cwd(args, tool, home, machine, &|args, machine| {
+        super::selected_outputs(args, tool, machine, &|verb| {
+            user_alias(verb, args, tool, machine)
+        })
+    })
+}
+
+/// The `target` Targo builds `args` into where nothing names another
+/// ([`super::workspace_target`]), read from the directory Targo works in as [`fallback_chosen`]
+/// reads the fallback.
+fn workspace_target_chosen(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> Option<super::WorkspaceTarget> {
+    from_targo_cwd(args, tool, home, machine, &|args, machine| {
+        super::workspace_target(args, tool, machine, &|verb| {
+            user_alias(verb, args, tool, machine)
+        })
+    })
+}
+
+/// The manifests of the local fallback `args` chose ([`super::local_fallback_manifests`]) where
+/// `selected`, the placement the call was handed, is that fallback, read from the directory
+/// Targo works in as [`selected_call_outputs`] reads its outputs ([`from_targo_cwd`]): with a
+/// `-C` before the verb, the words without it on `machine` moved there, its inherited `$PWD`
+/// (the launcher's) hidden, as [`super::decide`] judged the placement from that directory.
+fn fallback_chosen(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+    selected: &super::BuildDir,
+) -> Option<Vec<PathBuf>> {
+    from_targo_cwd(args, tool, home, machine, &|args, machine| {
+        super::local_fallback_manifests(args, tool, machine, selected, &|verb| {
+            user_alias(verb, args, tool, machine)
+        })
+    })
+}
+
+/// `read` given the call `args` as Targo runs it from the directory it works in: `args` on
+/// `machine` where no `-C` stands before the verb (or the lint's words are read, which are its
+/// own), else the words without it ([`super::without_directory`]) on `machine` moved to that
+/// directory ([`targo_cwd`], spelled under `home` where it lies there, [`under_home`]) with its
+/// `$PWD`, the launcher's, hidden. `None` for a `-C` this reader cannot resolve and for one
+/// Targo refuses for want of its gate ([`super::directory_refused`]), where it builds nothing.
+/// An upstream cargo whose channel cannot be told is read from that directory: it refuses the
+/// `-C` before it reads anything, or runs there.
+fn from_targo_cwd<R>(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+    read: &dyn Fn(&[String], &super::Machine<'_>) -> Option<R>,
+) -> Option<R> {
+    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
+    let typed = &args[at..];
+    if tool == super::Tool::Tippy || super::directory_arg(typed).is_none() {
+        return read(args, machine);
+    }
+    if super::directory_refused(args, tool, machine) {
+        return None;
+    }
+    let cwd = targo_cwd(typed, machine).ok().flatten()?;
+    let cwd = under_home(&cwd, home).unwrap_or(cwd);
+    let mut moved_args = args[..at].to_vec();
+    moved_args.extend(super::without_directory(typed));
+    let env = |name: &str| {
+        if name == "PWD" {
+            None
+        } else {
+            (machine.env)(name)
+        }
+    };
+    let moved = super::Machine {
+        cwd: Some(&cwd),
+        env: &env,
+        ..*machine
+    };
+    read(&moved_args, &moved)
+}
+
+/// Whether this reader cannot tell which package home the call `args` reads: one by the cargo
+/// name (an upstream cargo's or Trust's Cargo-compatible name's, [`super::Tool::is_cargo`]) that
+/// may honour a `-C` (one [`super::directory_refused`] does not refuse), with a relative `CARGO_HOME` that names one
+/// home against the launcher's folder and another against that directory ([`super::package_homes`]
+/// on each). Targo run directly takes the `-C` directory's (`reload_cwd` recomputes `homedir`
+/// there); a rustup proxy, which a call by the cargo name may go through, exports to the cargo it
+/// runs the `CARGO_HOME` it resolved against the launcher's folder, absolute, which Targo then
+/// takes as it stands. Nothing in the call says which runs it, and each home's config, and the
+/// stop of the workspace's root walk, may name another target. A call by Targo's name, or the
+/// lint's, is read as Targo runs it.
+fn home_unsettled(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
+    if !tool.is_cargo() {
+        return false;
+    }
+    let at = usize::from(args.first().is_some_and(|arg| arg.starts_with('+')));
+    let typed = &args[at..];
+    let relative = (machine.env)("CARGO_HOME")
+        .is_some_and(|value| !value.is_empty() && Path::new(&value).is_relative());
+    if !relative
+        || super::directory_arg(typed).is_none()
+        || super::directory_refused(args, tool, machine)
+    {
+        return false;
+    }
+    let Ok(Some(moved)) = targo_cwd(typed, machine) else {
+        return false;
+    };
+    let homes = |cwd: &Path| {
+        super::package_homes(
+            tool,
+            &super::Machine {
+                cwd: Some(cwd),
+                ..*machine
+            },
+        )
+    };
+    machine
+        .cwd
+        .is_some_and(|launcher| homes(launcher) != homes(&moved))
+}
+
 /// The directory Targo works in for `args`, the words typed: the one a `-C` before the verb
-/// names ([`super::directory_arg`]), as the kernel resolves it from the launcher's (Targo changes
-/// into it and reads its own directory back, `cli.rs`, so a link's `..` is its target's parent),
-/// or else the launcher's. `Err` for a `-C` whose directory this reader cannot resolve, where
-/// Targo cannot change into it either.
+/// names ([`super::directory_arg`]), read back as Targo reads it once it has changed into it
+/// from the launcher's ([`super::changed_into`], `cli.rs`: a link's `..` is its target's parent,
+/// a firmlinked folder its root spelling), or else the launcher's. `Err` for a `-C` whose
+/// directory Targo cannot change into.
 fn targo_cwd(args: &[String], machine: &super::Machine<'_>) -> Result<Option<PathBuf>, ()> {
     match super::directory_arg(args) {
         None => Ok(machine.cwd.map(Path::to_path_buf)),
@@ -2506,36 +2725,125 @@ fn targo_cwd(args: &[String], machine: &super::Machine<'_>) -> Result<Option<Pat
             } else {
                 machine.cwd.ok_or(())?.join(dir)
             };
-            std::fs::canonicalize(dir).map(Some).map_err(|_| ())
+            super::changed_into(&dir).map(Some).ok_or(())
         }
         Some(_) => Err(()),
     }
 }
 
-/// Resolve selected outputs from the directory the compiler actually works in. Placement
-/// still reads the original words: this observation never rewrites the compiler's argv or
-/// invents a build-directory plan. Unknown directories and configs grant no ownership.
-fn selected_call_outputs(
+/// `f` given what `cargo-miri` reads for `args`, the words typed, besides its own words
+/// ([`super::Miri`]): `machine`'s variables, and `cargo metadata`'s target
+/// ([`super::miri_metadata_target`]) as Targo runs it, from the directory Targo works in
+/// ([`targo_cwd`], spelled under HOME where it lies there, as Targo's `getcwd` reads it back);
+/// none where that directory cannot be resolved, which Targo cannot change into either.
+fn with_miri<R>(
     args: &[String],
     tool: super::Tool,
     machine: &super::Machine<'_>,
-    alias: &dyn Fn(&str) -> super::UserAlias,
-) -> Option<super::SelectedOutputs> {
-    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
-    let typed = &args[at..];
-    if super::directory_arg(typed).is_none() {
-        return super::selected_outputs(args, tool, machine, alias);
+    f: impl FnOnce(&super::Miri<'_>) -> R,
+) -> R {
+    let cwd = targo_cwd(args, machine).ok().flatten().map(|dir| {
+        machine
+            .home
+            .and_then(|home| under_home(&dir, home))
+            .unwrap_or(dir)
+    });
+    let metadata_target = |words: &[String]| {
+        let cwd = cwd.as_deref()?;
+        super::miri_metadata_target(
+            words,
+            tool,
+            &super::Machine {
+                cwd: Some(cwd),
+                ..*machine
+            },
+        )
+    };
+    f(&super::Miri {
+        env: machine.env,
+        metadata_target: &metadata_target,
+    })
+}
+
+/// Whether `cargo-miri`'s sysroot setup ([`super::MiriCall::setup`]) for `args`, the words typed,
+/// writes nothing atpkg could record or must protect. Setup (`setup.rs`) runs a Targo of its own
+/// (`-Zjson-target-spec`, `RUSTC` its own) on the standard library's sources through
+/// `rustc-build-sysroot` (`build_from_source`, read at 0.5.14, the version `cargo-miri`'s lock
+/// pins): in a fresh workspace `tempfile` makes in the temporary folder (`Builder::tempdir`;
+/// `TMPDIR`, an empty or relative one against the directory Targo works in, as tempfile 3.27's
+/// `create_helper` joins it), with `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` both that
+/// workspace's `target`, which outrank every inherited variable, its `TARGO_` twin and every
+/// config, so no target or build directory the call names moves it. Beside the package home,
+/// into which that Targo fetches the standard library's registry dependencies (no target and no
+/// intermediates), its writes outside that workspace are in the sysroot folder (`MIRI_SYSROOT`,
+/// read the same way, else miri's cache folder, `~/Library/Caches/org.rust-lang.miri`): before
+/// that build it makes the folder's `lib/rustlib` and moves an earlier `lib/rustlib/<target>`
+/// aside into a temporary folder in it, deleted once the setup ends; after the build it stages
+/// the result in another temporary folder in it and renames that to `lib/rustlib/<target>`. A
+/// link at `lib` or `lib/rustlib` moves those writes to the folder it names, so the sysroot's
+/// `lib/rustlib` is judged as the sysroot is, each folder resolved as the kernel resolves it
+/// ([`standing`], then spelled under HOME, [`under_home`]), whatever its spelling, one under a
+/// folder of HOME atpkg never looks into included; a link at `lib/rustlib/<target>` is never written through (each rename that meets it
+/// fails). That Targo works where the call's does and is handed no `--config`. So setup is
+/// clear only where each of those folders lies outside every folder atpkg manages ([`scope`],
+/// HOME itself included, every spelling through [`under_home`]) and outside the shared cache's
+/// `~/Library/Caches/aterm`; where no variable names an artifact directory
+/// ([`super::ARTIFACT_DIR_ENV`], or its twin), into which that build would copy its output; and
+/// where no config Targo reads walking up from where it works names one or cannot be read
+/// ([`super::configs_name_artifacts`]). An unset `TMPDIR` is the platform's temporary folder
+/// (std's `temp_dir`: on macOS the per-user one `confstr` names), outside HOME. A `-C` this
+/// reader cannot resolve leaves it unclear.
+fn miri_setup_clear(
+    home: &Path,
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> bool {
+    let Ok(Some(cwd)) = targo_cwd(args, machine) else {
+        return false;
+    };
+    let cwd = under_home(&cwd, home).unwrap_or(cwd);
+    if super::cargo_var(super::ARTIFACT_DIR_ENV, tool, machine).is_some() {
+        return false;
     }
-    let cwd = targo_cwd(typed, machine).ok()??;
-    let cwd = machine
-        .home
-        .and_then(|home| under_home(&cwd, home))
-        .unwrap_or(cwd);
-    let moved = super::Machine {
+    let at = super::Machine {
         cwd: Some(&cwd),
         ..*machine
     };
-    super::selected_outputs(&super::without_directory(typed), tool, &moved, alias)
+    let base = |name: &str| (machine.env)(name).map(|value| cwd.join(value));
+    let sysroot =
+        base("MIRI_SYSROOT").unwrap_or_else(|| home.join("Library/Caches/org.rust-lang.miri"));
+    let shared = home.join("Library/Caches/aterm");
+    let rustlib = sysroot.join("lib/rustlib");
+    for folder in base("TMPDIR").into_iter().chain([sysroot, rustlib]) {
+        // As the kernel resolves it, whatever its spelling: one under a folder of HOME atpkg
+        // never looks into may still be, or hold, a link into one it manages.
+        let Some(resolved) = physical(folder, Some(&cwd)).map(|folder| standing(&folder)) else {
+            return false;
+        };
+        let spelled = under_home(&resolved, home).unwrap_or(resolved);
+        if spelled == home || scope(home, &spelled) || spelled.starts_with(&shared) {
+            return false;
+        }
+    }
+    !super::configs_name_artifacts(&cwd, tool, &at)
+}
+
+/// Whether the call `args`, the words typed, builds `cargo-miri`'s sysroot
+/// ([`super::miri_call`]'s `setup`: a `miri setup`, a verb it hands back with no `MIRI_SYSROOT`,
+/// or an alias the reader cannot tell where the call runs in the lane) somewhere
+/// [`miri_setup_clear`] does not clear.
+fn miri_setup_unclear(
+    args: &[String],
+    tool: super::Tool,
+    home: &Path,
+    machine: &super::Machine<'_>,
+) -> bool {
+    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
+    let alias = |verb: &str| user_alias(verb, args, tool, machine);
+    with_miri(&args[at..], tool, machine, |miri| {
+        super::miri_call(&args[at..], tool, &alias, miri).setup
+    }) && !miri_setup_clear(home, &args[at..], tool, machine)
 }
 
 /// One definition of an alias in a config file ([`user_alias`]): a string's words, an array's,
@@ -2551,15 +2859,18 @@ enum AliasDefinition {
 /// `file` gives, highest priority first, as Targo loads it (`context/mod.rs`'s `_load_file` and
 /// `load_includes`): its own value, then each file its `include` names, the last one first (a
 /// later include's value replaces an earlier one's, the file's own replaces all of them), each
-/// read the same way. An include is a string or a `{ path, optional }` table (any other key
-/// ignored, as Targo ignores it), the path relative to `file`'s folder, normalized as written; an
-/// optional one where nothing stands is skipped.
+/// read the same way. The text is read as TOML 1.1, as Targo parses it ([`super::config_toml`]),
+/// and the includes by the walk's own reader ([`super::config_includes`]): a string or a
+/// `{ path, optional }` table (any other key ignored, as Targo ignores it), the path relative to
+/// `file`'s folder, folded as written ([`super::include_file`]); an optional one where nothing
+/// stands is skipped.
 /// `None` where nothing stands at `file`. A definition this reader cannot tell
 /// ([`AliasDefinition::Unknown`]) where Targo refuses the config (a file it cannot read or whose
 /// `include` is malformed: no list, an entry of another type, a path that is no `.toml`, holds a
-/// glob or a brace, names nothing though not optional, or that `seen` already loaded, its cycle),
-/// or in text this TOML 1.0 reader cannot parse (Targo's reads TOML 1.1) that may spell one
-/// (holding `alias`, `include` or an escape that could spell either, [`super::spells_by_escape`]).
+/// glob, a brace or a control character, names nothing though not optional, or that `seen`
+/// already loaded, its cycle), or in text this reader cannot parse (Targo refuses it too) that
+/// may spell one (holding `alias`, `include` or an escape that could spell either,
+/// [`super::spells_by_escape`]).
 /// `seen` collects every file this file's walk loads, as Targo's does for each config file it
 /// finds (`load_file` starts a fresh set), and so bounds the walk as it bounds Targo's: each
 /// file loads once, and paths that differ only by looping through a link end at the kernel's
@@ -2583,9 +2894,9 @@ fn alias_definitions(
         return Some(vec![Unknown]);
     }
     seen.push(file.to_path_buf());
-    let config = match aterm_toml::from_str::<aterm_toml::Value>(&text) {
-        Ok(config) => config,
-        Err(_) => {
+    let config = match super::config_toml(&text) {
+        Some(config) => config,
+        None => {
             let may = text.contains("alias")
                 || text.contains("include")
                 || super::spells_by_escape(&text);
@@ -2593,42 +2904,22 @@ fn alias_definitions(
         }
     };
     let mut found: Vec<AliasDefinition> = alias_definition(&config, parts).into_iter().collect();
-    let Some(include) = config.get("include") else {
+    if config.get("include").is_none() {
         return Some(found);
-    };
+    }
     if !follow {
         return Some(vec![Unknown]);
     }
-    let Some(items) = include.as_array() else {
+    let Ok(includes) = super::config_includes(&config) else {
         return Some(vec![Unknown]);
     };
+    let base = file.parent().unwrap_or(Path::new("/"));
     let mut included = Vec::new();
-    for item in items {
-        let (path, optional) = match item {
-            aterm_toml::Value::String(path) => (path.as_str(), false),
-            aterm_toml::Value::Table(table) => match (table.get("path"), table.get("optional")) {
-                (Some(aterm_toml::Value::String(path)), None) => (path.as_str(), false),
-                (
-                    Some(aterm_toml::Value::String(path)),
-                    Some(aterm_toml::Value::Boolean(optional)),
-                ) => (path.as_str(), *optional),
-                _ => return Some(vec![Unknown]),
-            },
-            _ => return Some(vec![Unknown]),
-        };
-        if Path::new(path)
-            .extension()
-            .is_none_or(|extension| extension != "toml")
-            || path.contains(['*', '?', '[', ']', '{', '}'])
-        {
-            return Some(vec![Unknown]);
-        }
-        let Some(full) = normalize_with_cwd(PathBuf::from(path), file.parent()) else {
-            return Some(vec![Unknown]);
-        };
+    for include in &includes {
+        let full = super::include_file(base, include);
         match alias_definitions(machine, &full, parts, follow, seen) {
             Some(definitions) => included.push(definitions),
-            None if optional => {}
+            None if include.optional => {}
             None => return Some(vec![Unknown]),
         }
     }
@@ -2671,7 +2962,7 @@ fn alias_definition(config: &aterm_toml::Value, parts: &[&str]) -> Option<AliasD
 /// string's words split the same way or an array's strings. Those configs are each
 /// `.cargo/config` (or, where none stands, `.cargo/config.toml`, as Targo picks) from the
 /// directory Targo works in ([`targo_cwd`]: `cli.rs` changes into a `-C`'s before it expands an
-/// alias) up, then a package home's ([`super::package_homes`], resolved against that directory,
+/// alias) up as far as Targo walks ([`super::config_walk`]), then a package home's ([`super::package_homes`], resolved against that directory,
 /// as Targo's `reload_cwd` resolves it, unless it is an ancestor's, compared through links as
 /// Targo's `walk_tree` compares them). Targo expands an alias before it merges a `--config`, so
 /// none defines one. The variable wins over a config's string and the nearest config's string
@@ -2681,7 +2972,7 @@ fn alias_definition(config: &aterm_toml::Value, parts: &[&str]) -> Option<AliasD
 /// that is no UTF-8 text with no config string to fall back on, or a twin read by a tool
 /// observed as an upstream cargo (Trust's own cargo reads it); a definition
 /// [`alias_definitions`] cannot tell; an array beside any other definition (Targo joins them);
-/// package homes whose readings differ (the store's Targo reads `CARGO_HOME`'s, Trust's main
+/// package homes whose readings differ (Targo 16387 reads `CARGO_HOME`'s, Trust's main
 /// `TARGO_HOME`'s); and an alias for a name Targo may run as a manifest instead (a path, or a
 /// `.rs` file: `run.rs`'s `is_manifest_command`, which `-Zscript` keeps unexpanded).
 fn user_alias(
@@ -2739,7 +3030,7 @@ fn user_alias(
         })
         .unwrap_or_default()
     };
-    let ancestors: Vec<PathBuf> = cwd.ancestors().map(|dir| dir.join(".cargo")).collect();
+    let ancestors = super::config_walk(&cwd, machine);
     let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let near: Vec<Defined> = ancestors
         .iter()
@@ -2792,8 +3083,11 @@ fn user_alias(
 
 /// Known builtin commands that produce no build output need no owner observation: the
 /// [`READING_VERBS`], the [`RESOLVING_VERBS`] whose lockfile stays out of every target, help and
-/// clean, as the verb of the line Targo runs ([`super::targo_line`]: `h = "clean"` cleans). Clean
-/// must reach Cargo even for an unregistered target, without adopting it. A command name used as
+/// clean, as the verb of the line Targo runs ([`super::targo_line`]: `h = "clean"` cleans),
+/// Targo's `miri clean`, which removes and builds nothing, and its `miri setup` where it builds
+/// nothing or builds where nothing atpkg records or protects lies ([`miri_setup_unclear`]; with
+/// no HOME, only where Targo refuses it for want of its lane). Clean must reach Cargo even for an
+/// unregistered target, without adopting it. A command name used as
 /// an option value, an external alias or lint argument proves none of this, nor does a line whose
 /// alias cannot be told; a free verb still runs through every other rule of the shim's front. A
 /// version query is [`targo_query`]'s.
@@ -2834,7 +3128,9 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
     }
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     let alias = |verb: &str| user_alias(verb, args, tool, machine);
-    let Some(line) = super::targo_line(&args[at..], tool, &alias) else {
+    let Some(line) = with_miri(&args[at..], tool, machine, |miri| {
+        super::targo_line(&args[at..], tool, &alias, miri)
+    }) else {
         return false;
     };
     let mut words = line.iter().map(String::as_str);
@@ -2867,6 +3163,22 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
                     return false;
                 }
             }
+            // Targo's `miri` is its own `targo-miri`, whose subcommand is the word after its name
+            // (`phase_cargo_miri`): `clean` runs `targo metadata --no-deps` and removes what it
+            // names (`clean_target_dir`, `clean_sysroot`), and builds nothing, as `clean` does.
+            "miri" if tool == super::Tool::Targo => {
+                return match words.next() {
+                    Some("clean") => true,
+                    // `setup` builds only miri's sysroot, with a Targo of its own: free where it
+                    // builds nothing (help, or no lane, which Targo refuses), or where that
+                    // build writes nothing atpkg could record or must protect.
+                    Some("setup") => machine.home.map_or_else(
+                        || !super::in_lane(&args[at..], tool, machine.env),
+                        |home| !miri_setup_unclear(args, tool, home, machine),
+                    ),
+                    _ => false,
+                };
+            }
             _ => {
                 return matches!(word, "help" | "clean")
                     || READING_VERBS.contains(&word)
@@ -2894,7 +3206,10 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
 fn targo_query(args: &[String], tool: super::Tool, machine: &super::Machine<'_>) -> bool {
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     let alias = |verb: &str| user_alias(verb, args, tool, machine);
-    super::targo_reading(&args[at..], tool, &alias).is_some_and(|reading| reading.query)
+    with_miri(&args[at..], tool, machine, |miri| {
+        super::targo_reading(&args[at..], tool, &alias, miri)
+    })
+    .is_some_and(|reading| reading.query)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2959,26 +3274,46 @@ fn observe_with_placement(
     let placement = selected
         .cloned()
         .or_else(|| super::decide(args, tool, machine));
-    let chosen = selected_call_outputs(args, tool, machine, &alias)
-        .map(|chosen| (chosen, false))
+    let chosen = selected_call_outputs(args, tool, home, machine)
+        .map(|chosen| Ok((chosen, false)))
         .or_else(|| {
-            let manifest =
-                super::local_fallback_manifests(args, tool, machine, placement.as_ref()?, &alias)?;
-            let owner = workspace_choices(home, &manifest, args, tool, machine)?;
-            Some((
+            // Under the root Targo finds, where atpkg manages the package's workspace; a fallback
+            // there whose owner cannot be told is refused, its intermediates never prepared. A
+            // root atpkg never manages (HOME's) leaves its `target` held in custody below, as
+            // any call naming no target holds its root's.
+            let manifest = fallback_chosen(args, tool, home, machine, placement.as_ref()?)?;
+            let owner = match workspace_choices(home, &manifest, args, tool, machine) {
+                Ok(owner) => owner?,
+                Err(()) => {
+                    return Some(Err(std::io::Error::other(
+                        "the workspace that owns the local fallback could not be read; no build started",
+                    )));
+                }
+            };
+            Some(Ok((
                 super::SelectedOutputs {
                     target: super::FinalTarget::Explicit(owner.join("target")),
                     manifests: manifest,
+                    within: None,
                     intermediates: None,
                 },
                 true,
-            ))
-        });
+            )))
+        })
+        .transpose()?;
     let Some((chosen, local_fallback)) = chosen else {
         // The line Targo runs names the target and the directories; where its alias cannot be
         // told, the words typed name the target, and any registered root may be the one chosen.
         let typed = &args[at..];
-        let line = super::targo_line(typed, tool, &alias);
+        // A line `miri` hands back whose target this reader cannot tell may build into any of them.
+        let (line, unread, base) = with_miri(typed, tool, machine, |miri| {
+            let call = super::miri_call(typed, tool, &alias, miri);
+            (
+                super::targo_line(typed, tool, &alias, miri),
+                call.target_unread,
+                call.base,
+            )
+        });
         let named = line.as_deref().unwrap_or(typed);
         // Judged from the directory Targo works in, as [`requires_managed_explicit`] judges it:
         // a `-C` this reader resolves is that directory, its words dropped; one it cannot stays
@@ -2996,11 +3331,39 @@ fn observe_with_placement(
         };
         // A target is HOME's where the kernel reaches it there, whatever its spelling
         // ([`under_home`]: through HOME's other name or a link from outside it).
+        // With none named, Targo builds into its root's `target`; a root atpkg never manages
+        // (HOME's) records no owner there, so a root recorded at that folder for another
+        // workspace is held in custody, as one this call named explicitly would be, never
+        // retired once that workspace goes while this one still builds there.
+        // A `miri` line builds inside the folder whose `miri` its target is (`base`): a root
+        // recorded at that folder is held too, as the same call without `miri` would hold it.
         let protected = match target_name(&named, tool, &moved) {
             Some(target) => {
-                suppress_unresolved(home, &under_home(&target, home).unwrap_or(target))?
+                let within = target
+                    .parent()
+                    .filter(|_| base.is_some() && target.file_name() == Some("miri".as_ref()))
+                    .map(Path::to_path_buf);
+                let mut protected = false;
+                for output in std::iter::once(target).chain(within) {
+                    let output = under_home(&output, home).unwrap_or(output);
+                    protected |= suppress_unresolved(home, &output)?;
+                }
+                protected
             }
-            None => false,
+            None => match workspace_target_chosen(args, tool, home, machine) {
+                Some(default)
+                    if default.manifests.iter().any(|manifest| {
+                        matches!(
+                            workspace_at(home, manifest, default.target.parent()),
+                            Ok(None)
+                        )
+                    }) =>
+                {
+                    let target = under_home(&default.target, home).unwrap_or(default.target);
+                    suppress_unresolved(home, &target)?
+                }
+                _ => false,
+            },
         };
         let unresolved = match cwd
             .as_deref()
@@ -3008,13 +3371,18 @@ fn observe_with_placement(
         {
             Some(roots) => {
                 super::unresolved_words(&named, tool, &moved)
-                    || roots
-                        .iter()
-                        .any(|root| super::configs_unresolved(root, tool, &moved))
+                    || roots.iter().any(|root| {
+                        super::configs_unresolved(
+                            root,
+                            tool,
+                            &moved,
+                            super::reads_artifacts(&named),
+                        )
+                    })
             }
             None => super::unresolved_directory(&named, tool, &moved),
         };
-        if line.is_none() || unresolved {
+        if line.is_none() || unresolved || unread {
             suppress_configured(home)?;
         }
         return Ok(if protected {
@@ -3028,31 +3396,62 @@ fn observe_with_placement(
             .manifests
             .iter()
             .any(|manifest| !never_managed(home, manifest));
-    let Some(owner) = workspace_choices(home, &chosen.manifests, args, tool, machine) else {
-        let super::FinalTarget::Explicit(target) = &chosen.target else {
+    // An owner this reader cannot tell, or one where atpkg keeps no custody (a package outside
+    // HOME, a root at HOME), holds every output the call writes in custody: its target and the
+    // build directory it names apart ([`super::SelectedOutputs::intermediates`]), each spelled
+    // where the kernel reaches it in HOME.
+    let Ok(Some(owner)) = workspace_choices(home, &chosen.manifests, args, tool, machine) else {
+        let target = match &chosen.target {
+            super::FinalTarget::Explicit(target) => Some(target.clone()),
             // No canonical workspace means no default target. Keep unresolved configured
             // roots protected, as the unsupported-output path does, without guessing one.
-            return Ok(if managed_default {
+            super::FinalTarget::WorkspaceDefault if managed_default => {
                 suppress_configured(home)?;
-                Observation::DefaultOutputsUnowned
-            } else {
-                Observation::Unmanaged
-            });
-        };
-        let target = under_home(target, home).unwrap_or_else(|| target.clone());
-        return suppress_unresolved(home, &target).map(|protected| {
-            if protected {
-                Observation::Protected
-            } else {
-                Observation::Unmanaged
+                return Ok(Observation::DefaultOutputsUnowned);
             }
+            // A package atpkg never manages builds into the `target` of the root Targo finds
+            // for it, as a call that selects no output does (above).
+            super::FinalTarget::WorkspaceDefault => {
+                workspace_target_chosen(args, tool, home, machine).map(|default| default.target)
+            }
+        };
+        // A `miri` target is held with the folder it lies inside of ([`super::SelectedOutputs::within`]).
+        let mut protected = false;
+        for output in target
+            .iter()
+            .chain(chosen.within.as_ref())
+            .chain(chosen.intermediates.as_ref())
+        {
+            let output = under_home(output, home).unwrap_or_else(|| output.clone());
+            protected |= suppress_unresolved(home, &output)?;
+        }
+        return Ok(if protected {
+            Observation::Protected
+        } else {
+            Observation::Unmanaged
         });
     };
     let target = match chosen.target {
         super::FinalTarget::Explicit(target) => target,
         super::FinalTarget::WorkspaceDefault => owner.join("target"),
     };
+    // A `miri` line's target beside a build directory named apart (miri's line reads one as any
+    // line does, and its intermediates go there, not into the target) is held through the
+    // folder the target lies only inside of, as below: that folder and the build directory are
+    // admitted together, neither adopted nor admitted through a link, as no paired output is.
+    // Only where that folder neither became owned nor holds a marker (one whose absence cannot
+    // be read counts) is the line's own target admitted in its place, so no root is made
+    // inside a folder atpkg declares its own.
     if let Some(intermediates) = &chosen.intermediates {
+        if let Some(within) = &chosen.within {
+            let observed = observe_configured_outputs(home, &owner, within, intermediates)?;
+            if observed != Observation::Unmanaged
+                || !std::fs::symlink_metadata(within.join(MARKER))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(observed);
+            }
+        }
         let observed = observe_configured_outputs(home, &owner, &target, intermediates)?;
         return Ok(if managed_default && observed != Observation::Owned {
             Observation::DefaultOutputsUnowned
@@ -3082,7 +3481,41 @@ fn observe_with_placement(
         Some(Err(refusal)) => return Ok(Observation::Refused(refusal)),
         None => {}
     }
-    let owned = create_checked(home, &target, &owner)?;
+    // A `miri` line's target with no build directory named apart (one with it is admitted
+    // above) is owned through the folder the build writes only inside of, as
+    // that folder was owned when its `miri` was read as the target itself: through a link to a
+    // folder atpkg owns, as any target named through one is, and else that folder, recorded,
+    // created or adopted, so a later build that names it finds it owned (a root made inside a
+    // folder that has none would split its custody, leaving it one no build can take). Only
+    // where that folder cannot be owned is the line's own target owned in its place.
+    let declared = chosen
+        .within
+        .as_deref()
+        .filter(|within| std::fs::symlink_metadata(within.join(MARKER)).is_ok());
+    let mut owned = false;
+    if let Some(within) = &chosen.within {
+        #[cfg(unix)]
+        match through_link(home, within) {
+            Some(Ok(linked)) => {
+                return Ok(match admit_linked(home, &linked, &owner)? {
+                    Ok(()) => Observation::Owned,
+                    Err(refusal) => Observation::Refused(refusal),
+                });
+            }
+            Some(Err(refusal)) => return Ok(Observation::Refused(refusal)),
+            None => {}
+        }
+        owned = create_checked(home, within, &owner)?;
+    }
+    let through_within = owned;
+    if !owned && declared.is_none() {
+        owned = create_checked(home, &target, &owner)?;
+    }
+    // A target owned through the folder it lies in is a line `miri` hands back, run by an
+    // external command, which Targo hands no global `--config`: no build writes a placed folder
+    // there, so none is made (nor could one be under the target's record, which it has none of).
+    let quiet = quiet && !through_within;
+    // The quiet intermediates are prepared under the target's own record.
     #[cfg(unix)]
     if owned && quiet {
         prepare_intermediates(home, &target, &owner, &|| true)?;
@@ -3094,7 +3527,20 @@ fn observe_with_placement(
             Some(super::BuildDir::TrustEnv(directory)) => Some(directory.as_str()),
             _ => None,
         };
-        if local_fallback || directory.map(Path::new) == Some(child.as_path()) {
+        // Never a root inside a folder atpkg already declares its own, nor any folder in a cargo
+        // home's cache, its leaf's parent included. A local fallback's target is the `target` of
+        // the workspace root Targo finds, a folder holding a manifest, reached through no link
+        // (one returned above): that names no cargo home's cache (a folder in a package is its
+        // build's, [`adoption::home_cache`]), and what it keeps at its top (an xtask's
+        // `target/cache`) is no cache's, so its contents are not read as one.
+        #[cfg(unix)]
+        let cache = !local_fallback && adoption::home_cache(home, &target);
+        #[cfg(not(unix))]
+        let cache = false;
+        if declared.is_none()
+            && !cache
+            && (local_fallback || directory.map(Path::new) == Some(child.as_path()))
+        {
             #[cfg(unix)]
             if scope(home, &child) {
                 let parent = child
@@ -3247,10 +3693,10 @@ pub fn observe_command(
 /// Observe a native producer using its planned environment rather than this launcher's.
 /// The machine describes the call before producer-selected placement, as [`observe_command`]
 /// sees a call before the shim adds its directory. Explicit caller layouts retain that status.
-/// Outside macOS, or without a home, no managed ownership is claimed.
+/// Outside macOS no managed ownership is claimed.
 ///
 /// # Errors
-/// As [`observe_command`].
+/// As [`observe_command`]; without a home, a call that may build ([`homeless`]).
 pub fn observe_command_with(
     args: &[String],
     tool: super::Tool,
@@ -3260,9 +3706,30 @@ pub fn observe_command_with(
         return Ok(());
     }
     let Some(home) = machine.home else {
-        return Ok(());
+        return homeless(args, tool, machine);
     };
     observe_for_producer(args, tool, home, machine, true).map(|_| ())
+}
+
+/// The call `args` where `machine` has no home (HOME unset or no absolute path): this reader
+/// cannot tell which folders atpkg manages, while Targo still builds into them (its home is the
+/// account's, `getpwuid`'s, and a target a word, a variable or a config names may lie in it),
+/// so only a call that builds nothing goes on ([`non_producing_command`], [`targo_query`]).
+///
+/// # Errors
+/// Any other call, refused before it builds.
+fn homeless(
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> std::io::Result<()> {
+    if non_producing_command(args, tool, machine) || targo_query(args, tool, machine) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "HOME is unset or not an absolute path, so atpkg cannot tell which folders it manages; no build started",
+        ))
+    }
 }
 
 /// Validate the complete argv a native reroute actually selected, then observe ownership
@@ -3321,11 +3788,7 @@ fn with_machine<T>(
         root: None,
         cwd,
         env,
-        read: &|path| match crate::metadata_io::read_bounded_regular_utf8(path, 1 << 20) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err(()),
-        },
+        read: &live_read,
         read_manifest: &|path| match crate::metadata_io::read_bounded_regular_utf8(path, 1 << 20) {
             Ok(text) => Ok(Some(text)),
             // The metadata reader also calls redirected/non-regular inputs NotFound.
@@ -3338,6 +3801,17 @@ fn with_machine<T>(
         },
         writable: &super::writable,
     })
+}
+
+/// The front's own reader ([`with_machine`]'s): the regular UTF-8 file at `path`, of at most
+/// 1 MiB, its final link not followed; `Ok(None)` where nothing stands there, `Err` for anything
+/// else.
+fn live_read(path: &Path) -> Result<Option<String>, ()> {
+    match crate::metadata_io::read_bounded_regular_utf8(path, 1 << 20) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 fn command_observation(
@@ -3363,6 +3837,8 @@ fn command_observation(
 /// [`loses_config`](super::loses_config) (tippy, clippy); the words and the variable, which the
 /// call never had, are hidden here; `env`: it exported `CARGO_BUILD_BUILD_DIR` alone (the trust
 /// lane), which the call never had, hidden here; `-`: nothing), so the call is read as typed.
+/// A `-C` call whose trust.lock is not the launcher's is refused first
+/// ([`directory_lock_guard`]).
 ///
 /// With `build`, the answer is what an observed call that produces build output builds
 /// ([`ShimBuild`]), for the front's start line ([`crate::build_start`]), read by a second reader
@@ -3373,7 +3849,8 @@ fn command_observation(
 /// not resolve, and wherever calls are not observed (off macOS, or with no home).
 ///
 /// # Errors
-/// As [`observe_command`]'s, or `InvalidInput` for an unknown or mismatched placement claim.
+/// As [`observe_command`]'s, [`directory_lock_guard`]'s refusal, or `InvalidInput` for an
+/// unknown or mismatched placement claim.
 pub fn observe_shim_call(
     args: &[String],
     tool: super::Tool,
@@ -3381,6 +3858,7 @@ pub fn observe_shim_call(
     cwd: Option<&Path>,
     build: bool,
 ) -> std::io::Result<Option<ShimBuild>> {
+    directory_lock_guard(args, tool, placed, cwd)?;
     observation_with(
         args,
         tool,
@@ -3417,7 +3895,7 @@ pub struct ShimBuild {
 /// block did to the words, the variable it exported hidden). It reads manifests and configs
 /// and writes nothing: no receipt, no directory. `None` for a `placed` the block never says, a
 /// call that produces no build output ([`non_producing_command`], [`targo_query`]), a `-C` this
-/// reader cannot resolve, a call that names no manifest and finds none (`targo install x` in a
+/// reader cannot resolve or Targo refuses for want of its gate ([`from_targo_cwd`]), a call that names no manifest and finds none (`targo install x` in a
 /// folder with no `Cargo.toml` builds no workspace there), and a manifest whose workspace root
 /// this reader does not resolve (outside home, or read two ways): a line names the workspace a
 /// call compiles or nothing, never the folder it was typed in, which may hold many.
@@ -3449,7 +3927,9 @@ fn shim_build(
     let cwd = targo_cwd(words, original).ok()??;
     let cwd = under_home(&cwd, home).unwrap_or(cwd);
     let alias = |verb: &str| user_alias(verb, typed, tool, original);
-    let line = super::targo_line(words, tool, &alias);
+    let line = with_miri(words, tool, original, |miri| {
+        super::targo_line(words, tool, &alias, miri)
+    });
     let named = super::without_directory(line.as_deref().unwrap_or(words));
     let moved = &super::Machine {
         cwd: Some(&cwd),
@@ -3465,7 +3945,7 @@ fn shim_build(
                 super::InitialManifest::Absent | super::InitialManifest::Unreadable(_) => None,
             }),
     };
-    let workspace = workspace(home, &manifest?, typed, tool, original)?;
+    let workspace = workspace(home, &manifest?, typed, tool, original).ok()??;
     let directory = match placed {
         "config" => args
             .get(1)
@@ -3501,6 +3981,96 @@ fn shim_build(
         workspace,
         build_dir,
     })
+}
+
+/// THE `-C` TRUST.LOCK GUARD. The shim's hop (`build_admit`'s `run_hidden`) picks the Trust
+/// compiler by the `trust.lock` found above the launcher's directory `cwd`
+/// ([`crate::trust_lock::shim_target`]), while Targo works in the directory a `-C` before the
+/// verb names and builds the tree there. So a Targo call `args` (as the shim's block `placed`
+/// handed them, [`typed_call`]) with a `-C` is refused where the lock found above the directory
+/// Targo works in ([`super::changed_into`], as Targo's `getcwd` reads it back, a relative one
+/// against `cwd`) is another outcome than the launcher's, each found by
+/// [`crate::trust_lock::find`] as the hop would search from that directory: another lock file,
+/// a lock on one side only, or a lock that does not read on either side (the same file
+/// included). A `-C` this reader cannot resolve (a missing or second value, which Targo
+/// refuses, or a folder it cannot change into) and a launcher whose directory cannot be read
+/// are refused too. A `-C` whose outcome is the launcher's, a call with none, and the lint,
+/// whose words are its own, are not judged. The guard stands until the hop searches from the
+/// directory Targo works in, which makes it moot.
+///
+/// # Errors
+/// The refusal, naming the two outcomes and the remedy: run the call from the tree it builds.
+fn directory_lock_guard(
+    args: &[String],
+    tool: super::Tool,
+    placed: &str,
+    cwd: Option<&Path>,
+) -> std::io::Result<()> {
+    if tool != super::Tool::Targo {
+        return Ok(());
+    }
+    let typed = typed_call(args, placed).map_or(args, |(typed, _)| typed);
+    let Some(directory) = super::directory_arg(typed) else {
+        return Ok(());
+    };
+    let refuse = |why: String| {
+        Err(std::io::Error::other(format!(
+            "{why}; the compiler is picked by the trust.lock above the directory a call is \
+             launched from, so run the call from the tree it builds (cd there) rather than \
+             naming it with -C"
+        )))
+    };
+    let Some(cwd) = cwd else {
+        return refuse(
+            "this call names a -C directory, and the launcher's directory, whose trust.lock \
+             picks the compiler, cannot be read"
+                .to_owned(),
+        );
+    };
+    let worked = directory.filter(|dir| !dir.is_empty()).and_then(|dir| {
+        let dir = Path::new(dir);
+        super::changed_into(&if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            cwd.join(dir)
+        })
+    });
+    let Some(worked) = worked else {
+        return refuse(format!(
+            "this call's -C directory ({}) cannot be resolved, so the trust.lock it builds \
+             under cannot be compared with the launcher's",
+            directory.unwrap_or("no value")
+        ));
+    };
+    let launcher = crate::trust_lock::find(cwd);
+    let there = crate::trust_lock::find(&worked);
+    let same = match (&launcher, &there) {
+        (None, None) => true,
+        (Some(here), Some(there)) => {
+            here.path == there.path && here.lock.is_ok() && there.lock.is_ok()
+        }
+        _ => false,
+    };
+    if same {
+        return Ok(());
+    }
+    let outcome = |found: &Option<crate::trust_lock::Found>| match found {
+        None => "no trust.lock".to_owned(),
+        Some(found) => match &found.lock {
+            Ok(_) => format!("trust.lock {}", found.path.display()),
+            Err(why) => format!(
+                "trust.lock {}, which does not read ({why})",
+                found.path.display()
+            ),
+        },
+    };
+    refuse(format!(
+        "this call's -C directory {} builds under {}, but the launcher's {} finds {}",
+        worked.display(),
+        outcome(&there),
+        cwd.display(),
+        outcome(&launcher)
+    ))
 }
 
 /// The call as typed, from the words a shim's block `placed` handed its front
@@ -3612,10 +4182,12 @@ fn observe_selected_placement(
         require_explicit,
         Some(selected),
     )?;
+    // A call that builds nothing, a query Targo answers among them, writes no placed folder.
     if !matches!(
         observed,
         Observation::Owned | Observation::IntermediatesOwned
     ) && !non_producing_command(args, tool, machine)
+        && !targo_query(args, tool, machine)
     {
         // Judge the plan before writing the placement's directory, so a refused admission
         // leaves no build directory behind; the writability answer is held, so the cache
@@ -3644,7 +4216,9 @@ fn still_placed(
 
 /// Scope limits cache custody, not the privacy of intermediates the shim selected. Observe
 /// first so unknown-owner protection and custody refusals remain authoritative; this step
-/// only prepares the exact generated target and never writes an ownership receipt.
+/// only prepares the exact generated target and never writes an ownership receipt. The target is
+/// read from the directory Targo works in ([`selected_call_outputs`], [`fallback_chosen`]), where a
+/// `-C` before the verb moves it.
 fn prepare_unowned_placement(
     args: &[String],
     tool: super::Tool,
@@ -3662,13 +4236,13 @@ fn prepare_unowned_placement(
             "the selected quiet build target could not be resolved safely; no build started",
         )
     };
-    let target = if let Some(chosen) = selected_call_outputs(args, tool, machine, &|verb| {
-        user_alias(verb, args, tool, machine)
-    }) {
+    let target = if let Some(chosen) = selected_call_outputs(args, tool, home, machine) {
         let target = match chosen.target {
             super::FinalTarget::Explicit(target) => target,
             super::FinalTarget::WorkspaceDefault => {
                 workspace_choices(home, &chosen.manifests, args, tool, machine)
+                    .ok()
+                    .flatten()
                     .ok_or_else(stop)?
                     .join("target")
             }
@@ -3678,13 +4252,11 @@ fn prepare_unowned_placement(
         }
         target
     } else {
-        let manifest = super::local_fallback_manifests(args, tool, machine, selected, &|verb| {
-            user_alias(verb, args, tool, machine)
-        })
-        .ok_or_else(stop)?;
-        workspace_choices(home, &manifest, args, tool, machine)
+        fallback_chosen(args, tool, home, machine, selected).ok_or_else(stop)?;
+        // The root Targo finds, wherever the package lies: scope limits custody, not this.
+        workspace_target_chosen(args, tool, home, machine)
             .ok_or_else(stop)?
-            .join("target")
+            .target
     };
     prepare_target_build_dir(&target)
 }
@@ -3701,18 +4273,30 @@ fn observation_with(
         return Ok(false);
     }
     with_machine(cwd, env, |machine| {
-        let Some(home) = machine.home else {
-            return if placed.is_some_and(|claim| claim != "-") {
-                Err(invalid_shim_claim())
-            } else {
-                Ok(false)
-            };
-        };
-        match placed {
-            Some(placed) => observe_shim_on(args, tool, placed, home, machine, require_explicit),
-            None => observe_for_producer(args, tool, home, machine, require_explicit),
-        }
+        observation_on(args, tool, machine, require_explicit, placed)
     })
+}
+
+/// [`observation_with`]'s judgement on `machine`: a shim's call as `placed` says the block
+/// placed it ([`observe_shim_on`]), else the producer's call as typed; with no home, a claim of
+/// a placement the block never makes without one is refused, and the call goes to [`homeless`].
+fn observation_on(
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+    require_explicit: bool,
+    placed: Option<&str>,
+) -> std::io::Result<bool> {
+    let Some(home) = machine.home else {
+        if placed.is_some_and(|claim| claim != "-") {
+            return Err(invalid_shim_claim());
+        }
+        return homeless(args, tool, machine).map(|()| false);
+    };
+    match placed {
+        Some(placed) => observe_shim_on(args, tool, placed, home, machine, require_explicit),
+        None => observe_for_producer(args, tool, home, machine, require_explicit),
+    }
 }
 
 fn under_shared_cache(home: &Path, path: &Path, machine: &super::Machine<'_>) -> bool {
@@ -3729,29 +4313,31 @@ fn under_shared_cache(home: &Path, path: &Path, machine: &super::Machine<'_>) ->
             .is_some_and(|rest| rest.components().any(|c| c.as_os_str() == super::LEAF))
 }
 
-/// Whether the package whose manifest is `manifest` (a path to a `Cargo.toml` or `Targo.toml`,
-/// read through its links as [`workspace`] reads it) lies where atpkg never manages a workspace:
-/// its folder outside [`scope`], as HOME itself, a path outside HOME, a folder of HOME atpkg
-/// never looks into, app data and a file provider's domain are. A build of it owes no managed
-/// custody, wherever its target is.
+/// Whether the package whose manifest is `manifest` (a path to a `Cargo.toml` or `Targo.toml`)
+/// lies where atpkg never manages a workspace: its folder, the one the manifest is named in and
+/// resolved through its links as [`workspace`] resolves it (Targo's package root is that folder,
+/// wherever a final link names), outside [`scope`], as HOME itself, a path outside HOME, a
+/// folder of HOME atpkg never looks into, app data and a file provider's domain are. A build of
+/// it owes no managed custody, wherever its target is.
 fn never_managed(home: &Path, manifest: &Path) -> bool {
-    // Only an actual manifest file identifies a package through its links. An existing
-    // non-file selected in a managed directory must refuse, not borrow the target
-    // directory's parent (HOME itself or foreign scope) to pass as an unmanaged package.
-    let resolved = std::fs::canonicalize(manifest)
-        .ok()
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| manifest.to_path_buf());
-    resolved
+    // A manifest identifies its package by the folder it is named in, never through its links.
+    // An existing non-file, or a link to a file elsewhere, selected in a managed directory must
+    // refuse, not borrow its target's parent (HOME itself or foreign scope) to pass as an
+    // unmanaged package.
+    let resolved = manifest
         .parent()
-        .is_none_or(|package| !scope(home, package))
+        .map(|package| std::fs::canonicalize(package).unwrap_or_else(|_| package.to_path_buf()));
+    resolved.is_none_or(|package| !scope(home, &package))
 }
 
 /// Whether a producer call owes managed custody of its output ([`observe_for_producer`] refuses
 /// it when none can be established): it names a target or build directory under HOME outside
 /// the shared cache, or one atpkg cannot resolve, for a package atpkg could manage. A call whose
 /// manifest lies outside HOME, or that names none and runs outside HOME or in no package there,
-/// owes none, as does one whose package [`never_managed`] names. Each is judged on the line Targo
+/// owes none, as does one whose package [`never_managed`] names. A package atpkg could manage
+/// whose root lies where atpkg keeps no custody ([`workspace_at`]'s `Ok(None)`: HOME itself, or
+/// outside HOME) still owes custody of an output it names, and the producer refuses it: no
+/// owner can be recorded, and none is invented. Each is judged on the line Targo
 /// runs ([`super::targo_line`]: a user alias's words with the words after its name), from the
 /// directory Targo works in ([`targo_cwd`]), which accounts for every `-C`
 /// ([`super::without_directory`]); a `-C` this reader cannot resolve owes custody. A line whose
@@ -3759,8 +4345,13 @@ fn never_managed(home: &Path, manifest: &Path) -> bool {
 /// the words after its name up to a `--` Targo's, each prefix of them, so a `--target-dir` among
 /// them is read whatever the alias makes of the words after it; it owes custody where any of
 /// them, the environment or a config names a target under HOME. What the alias's own words name
-/// is unread there, and [`observe`] poisons every registered root's owners. A call Targo refuses
-/// builds nothing and owes none.
+/// is unread there, and [`observe`] poisons every registered root's owners. A line `miri` hands
+/// back whose target this reader cannot tell ([`super::MiriCall::target_unread`]) owes custody
+/// wherever its package is one atpkg could manage. A call Targo refuses ([`super::targo_line`]
+/// reads no line for it) builds nothing and owes none. A `-C` it refuses for want of its gate
+/// ([`super::directory_refused`]) is judged as the same call honoured, so one that names an
+/// output there is refused, naming the gate ([`observe_for_producer`]): a gate this reader
+/// misread would otherwise let a build Targo honours through unrecorded.
 fn requires_managed_explicit(
     args: &[String],
     tool: super::Tool,
@@ -3775,24 +4366,28 @@ fn requires_managed_explicit(
     // Spelled as Targo reads its directory back (`getcwd`), under HOME where it lies there: a
     // `-C` resolved through HOME's other name (`/System/Volumes/Data/Users/<me>`) is HOME's.
     let cwd = cwd.map(|dir| under_home(&dir, home).unwrap_or(dir));
-    let owes = |line: &[String]| {
-        let line = super::without_directory(line);
-        let manifest = named_manifest(&line, tool);
-        owes_custody(
-            manifest.as_deref(),
-            &line,
-            tool,
-            home,
-            cwd.as_deref(),
-            machine,
-        )
-    };
     let alias = |verb: &str| user_alias(verb, typed, tool, machine);
-    if let Some(line) = super::targo_line(typed, tool, &alias) {
-        return owes(&line);
-    }
-    super::untold_lines(typed, tool, &alias)
-        .is_some_and(|lines| lines.iter().any(|line| owes(line)))
+    with_miri(typed, tool, machine, |miri| {
+        let unread = super::miri_call(typed, tool, &alias, miri).target_unread;
+        let owes = |line: &[String]| {
+            let line = super::without_directory(line);
+            let manifest = named_manifest(&line, tool);
+            owes_custody(
+                manifest.as_deref(),
+                &line,
+                tool,
+                home,
+                cwd.as_deref(),
+                machine,
+                unread,
+            )
+        };
+        if let Some(line) = super::targo_line(typed, tool, &alias, miri) {
+            return owes(&line);
+        }
+        super::untold_lines(typed, tool, &alias, miri)
+            .is_some_and(|lines| lines.iter().any(|line| owes(line)))
+    })
 }
 
 /// The last manifest `line` names among Targo's own words ([`super::own_words`]):
@@ -3843,7 +4438,8 @@ fn named_manifest(line: &[String], tool: super::Tool) -> Option<String> {
 }
 
 /// [`requires_managed_explicit`]'s judgement of a call whose manifest is `manifest_arg`, `args`
-/// the line Targo runs, Targo working in `cwd`.
+/// the line Targo runs, Targo working in `cwd`, `target_unread` where it builds into a target
+/// this reader cannot tell ([`super::MiriCall::target_unread`]).
 fn owes_custody(
     manifest_arg: Option<&str>,
     args: &[String],
@@ -3851,7 +4447,24 @@ fn owes_custody(
     home: &Path,
     cwd: Option<&Path>,
     machine: &super::Machine<'_>,
+    target_unread: bool,
 ) -> bool {
+    // A package home is Targo's against the directory it works in, wherever the scan stands;
+    // the build directory is judged apart, in both spellings.
+    let env = |name: &str| match name {
+        super::BUILD_DIR_ENV | super::BUILD_DIR_TWIN => None,
+        "CARGO_HOME" | "TARGO_HOME" => (machine.env)(name).map(|value| match cwd {
+            Some(cwd) if !value.is_empty() => cwd.join(value).into_os_string(),
+            _ => value,
+        }),
+        _ => (machine.env)(name),
+    };
+    let at = super::Machine {
+        home: Some(home),
+        cwd,
+        env: &env,
+        ..*machine
+    };
     let scan_cwd = if let Some(raw) = manifest_arg {
         if !raw.is_empty() {
             if let Some(manifest) = normalize_with_cwd(PathBuf::from(raw), cwd) {
@@ -3906,6 +4519,11 @@ fn owes_custody(
         cwd.to_path_buf()
     };
 
+    // Its package is one atpkg could manage, and its target may be anywhere.
+    if target_unread {
+        return true;
+    }
+
     if let Some(raw) = raw_target_spec(args, tool, machine) {
         let Some(target) = physical(raw, cwd) else {
             return true;
@@ -3941,23 +4559,8 @@ fn owes_custody(
         }
     }
 
-    // The build directory was judged above, in both spellings. A package home is Targo's
-    // against the directory it works in, wherever the scan stands.
-    let env = |name: &str| match name {
-        super::BUILD_DIR_ENV | super::BUILD_DIR_TWIN => None,
-        "CARGO_HOME" | "TARGO_HOME" => (machine.env)(name).map(|value| match cwd {
-            Some(cwd) if !value.is_empty() => cwd.join(value).into_os_string(),
-            _ => value,
-        }),
-        _ => (machine.env)(name),
-    };
-    let at = super::Machine {
-        home: Some(home),
-        cwd,
-        env: &env,
-        ..*machine
-    };
-    let configs = |root: &Path| super::configs_unresolved(root, tool, &at);
+    let configs =
+        |root: &Path| super::configs_unresolved(root, tool, &at, super::reads_artifacts(args));
     // A `--config` file is read against the directory Targo works in, whatever its configs'.
     if super::unresolved_words(args, tool, &at) {
         return true;
@@ -4021,7 +4624,31 @@ fn observe_for_producer_with_placement(
     require_explicit: bool,
     selected: Option<&super::BuildDir>,
 ) -> std::io::Result<Observation> {
-    if non_producing_command(args, tool, machine) {
+    // Where the package home cannot be told ([`home_unsettled`]), the call is read in each home
+    // it may be: the `-C` directory's, as Targo run directly reads it, and the launcher's, which
+    // a rustup proxy exports absolute. A user alias is that home's, so only a call that builds
+    // nothing, or is a query, in both is one.
+    let unsettled = require_explicit && home_unsettled(args, tool, machine);
+    // Read only where unsettled: a call that names no relative home reads no environment here.
+    let launcher_home = machine
+        .cwd
+        .filter(|_| unsettled)
+        .and_then(|cwd| Some(cwd.join((machine.env)("CARGO_HOME")?).into_os_string()));
+    let launcher_env = |name: &str| {
+        if name == "CARGO_HOME" {
+            launcher_home.clone()
+        } else {
+            (machine.env)(name)
+        }
+    };
+    let launcher = super::Machine {
+        env: &launcher_env,
+        ..*machine
+    };
+    let in_every_home = |reads: &dyn Fn(&super::Machine<'_>) -> bool| {
+        reads(machine) && (!unsettled || reads(&launcher))
+    };
+    if in_every_home(&|machine| non_producing_command(args, tool, machine)) {
         return Ok(Observation::Unmanaged);
     }
     // A nested compiler can inherit the exact directory our shim placed. Classify the
@@ -4040,9 +4667,28 @@ fn observe_for_producer_with_placement(
             selected,
         );
     }
-    let query = targo_query(args, tool, machine);
+    if require_explicit && miri_setup_unclear(args, tool, home, machine) {
+        return Err(std::io::Error::other(
+            "miri's sysroot setup may build where atpkg manages builds, or where it cannot read; no build started",
+        ));
+    }
+    let query = in_every_home(&|machine| targo_query(args, tool, machine));
+    if unsettled && !query {
+        return Err(std::io::Error::other(
+            "a relative CARGO_HOME with -C names one package home against the launcher's folder (a rustup proxy's) and another against that directory (Targo's), and atpkg cannot tell which this cargo reads; set CARGO_HOME to an absolute path; no build started",
+        ));
+    }
     let explicit = requires_managed_explicit(args, tool, home, machine);
     let refusal = || {
+        let at =
+            usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
+        if super::directory_arg(&args[at..]).is_some()
+            && super::directory_refused(args, tool, machine)
+        {
+            return std::io::Error::other(
+                "this call names a -C without the gate Targo's -C needs (-Z unstable-options before the verb, on a nightly channel), which Targo refuses; add the gate, or run the call from the tree it builds (cd there); no build started",
+            );
+        }
         std::io::Error::other(
             "build outputs are unmanaged or unsupported; choose fresh output directories for managed cache ownership",
         )
@@ -4050,11 +4696,13 @@ fn observe_for_producer_with_placement(
     if require_explicit
         && explicit
         && !query
-        && selected_call_outputs(args, tool, machine, &|verb| {
-            user_alias(verb, args, tool, machine)
-        })
-        .and_then(|chosen| workspace_choices(home, &chosen.manifests, args, tool, machine))
-        .is_none()
+        && selected_call_outputs(args, tool, home, machine)
+            .and_then(|chosen| {
+                workspace_choices(home, &chosen.manifests, args, tool, machine)
+                    .ok()
+                    .flatten()
+            })
+            .is_none()
     {
         return Err(refusal());
     }
@@ -4488,10 +5136,15 @@ pub(super) fn plan_on(
         let Some(lock_path) = gate_path(&cache.receipt_path) else {
             continue;
         };
-        let Ok(lock) = crate::metadata_io::open_regular(&lock_path) else {
-            continue;
-        };
-        let Ok(_held_record) = crate::lock::Flock::try_lock(lock) else {
+        #[cfg(unix)]
+        let held = gate::open(&lock_path)
+            .ok()
+            .and_then(|lock| gate::try_exclusive(lock).ok());
+        #[cfg(not(unix))]
+        let held = crate::metadata_io::open_regular(&lock_path)
+            .ok()
+            .and_then(|lock| crate::lock::Flock::try_lock(lock).ok());
+        let Some(_held_record) = held else {
             continue;
         };
         let Some(receipt) = read(&cache.receipt_path) else {
@@ -4731,11 +5384,11 @@ fn reclaim_selected_on<'policy>(
             fence.note(&cache.root, super::KeepReason::RegistrationChanged);
             continue;
         };
-        let Ok(lock) = crate::metadata_io::open_regular(&lock_path) else {
+        let Ok(lock) = gate::open(&lock_path) else {
             fence.note(&cache.root, super::KeepReason::CoordinationUnavailable);
             continue;
         };
-        let Ok(_held_record) = crate::lock::Flock::try_lock(lock) else {
+        let Ok(_held_record) = gate::try_exclusive(lock) else {
             fence.note(&cache.root, super::KeepReason::CoordinationUnavailable);
             continue;
         };

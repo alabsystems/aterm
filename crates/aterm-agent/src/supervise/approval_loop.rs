@@ -933,7 +933,7 @@ impl<C: Ctl> Session<'_, C> {
             .sid
             .as_deref()
             .and_then(|s| s.strip_prefix('@'))
-            .filter(|s| aterm_types::control_verbs::is_minted_sid(s))
+            .filter(|s| aterm_types::control_request::Sid::parse(s).is_some())
             .map(str::to_string);
         let r = match stable.as_deref() {
             Some(sid) => self.ctl.call_at_host_of(sid, &["who"]),

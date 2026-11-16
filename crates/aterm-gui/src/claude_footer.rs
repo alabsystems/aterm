@@ -5313,7 +5313,8 @@ impl App {
         route: VisibleContentRoute,
         clock: &dyn Fn() -> footer::ReadClock<'static>,
     ) {
-        let Some(mut lists) = self.windows.get_mut(&wid).map(|ws| {
+        let Some(mut lists) = self.windows.get_mut(&wid).map(|mut ws| {
+            let ws = &mut **ws;
             let strip = ws
                 .input_scratch
                 .cells
@@ -5348,7 +5349,8 @@ impl App {
             }
         }
         lists.clear();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             ws.claude_footer_lists = lists;
         }
     }
@@ -5364,7 +5366,8 @@ impl App {
         grid: Option<crate::app_mouse::GlassGrid>,
     ) {
         let mut cards = Vec::new();
-        if let Some(ws) = self.windows.get_mut(&wid) {
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
             undo(&mut ws.claude_footer_undo, &mut ws.input_scratch);
             crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
             ws.claude_lights.clear_hits();
@@ -5372,7 +5375,8 @@ impl App {
             cards = ws.claude_card.take_leaves();
         }
         if !self.config.tab_status_or_default() {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.claude_footer_texts.borrow_mut().trim(0);
                 ws.claude_card.hide_all();
             }
@@ -6210,7 +6214,8 @@ impl App {
             self.observe_claude_lights(wid, pane.session, pane.lights, pane.click, pane.jobs);
             if let Some(autopilot) = pane.autopilot {
                 self.note_claude_autopilot(wid, pane.session, autopilot);
-            } else if let Some(ws) = self.windows.get_mut(&wid) {
+            } else if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                let ws = &mut **route_guard_ws;
                 ws.claude_lights.note_switch_face(pane.session, pane.switch);
             }
         }
@@ -6360,9 +6365,10 @@ impl App {
             });
         }
         {
-            let Some(ws) = self.windows.get_mut(&wid) else {
+            let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
                 return;
             };
+            let ws = &mut **route_guard_ws;
             let crate::WindowState {
                 claude_footer_undo,
                 input_scratch,
@@ -6371,7 +6377,7 @@ impl App {
                 claude_lights,
                 pet_chrome,
                 ..
-            } = &mut **ws;
+            } = &mut *ws;
             let texts = claude_footer_texts.borrow();
             let card_edits = claude_card.lines().map(crate::claude_card::CardLine::edit);
             let rules = lists.rules.iter().flat_map(|r| {
@@ -7437,7 +7443,8 @@ pub(crate) fn press_wait_on(t: &aterm_core::terminal::Terminal) -> Option<&'stat
     let rows: Vec<String> = (0..usize::from(t.rows()))
         .map(|r| crate::claude_lights::row_text(t, r))
         .collect();
-    Some(press_wait(&rows, Some(t.title()), draft))
+    let report = t.program_state().run_sign();
+    Some(press_wait(&rows, Some(t.title()), report.as_deref(), draft))
 }
 
 /// [`press_wait`]'s word for a row whose lane's last look waited on `wait`
@@ -7458,16 +7465,22 @@ fn press_wait_of(wait: &str) -> &'static str {
     }
 }
 
-/// What a press of the ⬆️ waits for on screen `rows` under window title `title`, `draft` whether
-/// its composer holds one: [`aterm_agent::harness::upgrade::press_gate`]'s word (a dialog, a
-/// draft, a usage limit, a login, a running turn, the title's included:
+/// What a press of the ⬆️ waits for on screen `rows` under window title `title`, with
+/// program-status report `report` standing, `draft` whether its composer holds one:
+/// [`aterm_agent::harness::upgrade::press_gate`]'s word (a dialog, a draft, a usage limit, a
+/// login, a running turn, the run sign's included:
 /// [`aterm_agent::harness::upgrade_drive::turn_runs`]), `""` for a press that restarts at once.
-fn press_wait(rows: &[String], title: Option<&str>, draft: bool) -> &'static str {
+fn press_wait(
+    rows: &[String],
+    title: Option<&str>,
+    report: Option<&str>,
+    draft: bool,
+) -> &'static str {
     use aterm_agent::harness::upgrade::{self, Gate};
     let facts = upgrade::Facts {
         composer_empty: !draft,
         approval_box: aterm_phase::prompt::prompt_box_span(rows).is_some(),
-        busy_footer: aterm_agent::harness::upgrade_drive::turn_runs(rows, title),
+        busy_footer: aterm_agent::harness::upgrade_drive::turn_runs(rows, title, report),
         limited: upgrade::limited(rows),
         login: upgrade::login_wall(upgrade::Agent::Claude, rows),
         ..upgrade::Facts::default()
@@ -8499,13 +8512,23 @@ const fn pack_rgb(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
 }
 
-/// The mark a program's top line wears ([`aterm_effects::cli_marks`]).
-const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
+/// The mark a program's top line wears: the one a harness record gives its agent (the registry
+/// last read, [`aterm_agent::harness::registry::snapshot`]), else the compiled one
+/// ([`aterm_effects::cli_marks`]).
+fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
+    let recorded = aterm_agent::harness::registry::snapshot()
+        .and_then(|registry| registry.mark_for(program).cloned())
+        .and_then(|spec| CliMark::from_spec(&spec).ok());
+    recorded.or_else(|| seed_mark(program))
+}
+
+/// The compiled mark a program's top line wears until a harness record gives it one.
+const fn seed_mark(program: aterm_phase::Program) -> Option<CliMark> {
     match program {
-        aterm_phase::Program::Claude => Some(CliMark::Claude),
-        aterm_phase::Program::Agy => Some(CliMark::Agy),
-        aterm_phase::Program::Muse => Some(CliMark::Muse),
-        aterm_phase::Program::Kimi => Some(CliMark::Kimi),
+        aterm_phase::Program::Claude => Some(CliMark::CLAUDE),
+        aterm_phase::Program::Agy => Some(CliMark::AGY),
+        aterm_phase::Program::Muse => Some(CliMark::MUSE),
+        aterm_phase::Program::Kimi => Some(CliMark::KIMI),
         aterm_phase::Program::Codex
         | aterm_phase::Program::Grok
         | aterm_phase::Program::Generic => None,
@@ -9409,8 +9432,8 @@ type MarkContent = (
 );
 
 impl MarkContents {
-    /// How many contents are kept.
-    const KEPT: usize = 2 * CliMark::ALL.len();
+    /// How many contents are kept: two per compiled mark, which a record's mark replaces.
+    const KEPT: usize = 2 * CliMark::SEEDS.len();
 
     /// `mark`'s content at `fit` on `ground` ([`Self::KEPT`]).
     fn content(

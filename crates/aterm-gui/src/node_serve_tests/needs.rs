@@ -20,7 +20,7 @@ use super::*;
 const AT: u64 = 1_793_160_000;
 
 fn sid(n: u8) -> Sid {
-    Sid::parse(&format!("s-{n:020x}")).expect("a minted sid")
+    Sid::from_bits(u64::from(n))
 }
 
 /// A row in which session 1, a worker of session 2, needs `word`.

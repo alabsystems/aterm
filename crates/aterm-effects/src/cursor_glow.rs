@@ -122,7 +122,8 @@ pub(crate) use ink_ledger::InkLedger;
 pub use ink_ledger::OverInkTier;
 pub use ink_ledger::letter_bar;
 pub(crate) use ink_ledger::{
-    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret, foot_ring,
+    LETTER_GUARD_RING, LetterGuard, RIM_SHOWN_SHARE, RIM_UNDER_LETTERS, ThinCaret, ThinHeld,
+    ThinHood, ThinLift, bar_width, foot_ring, word_glow_floor,
 };
 #[cfg(any(test, debug_assertions))]
 pub use ink_ledger::{with_aa_unrounded, with_share_over_aa};
@@ -1245,13 +1246,56 @@ pub struct CursorGlow {
     /// The thin caret this frame read and the ground it is read against
     /// ([`Self::hold_light_for_thin_caret`], [`Self::thin_caret_fill`]).
     pub(crate) thin_caret_read: Option<(ThinCaret, u32)>,
-    /// The frame's lights over a thin caret's cell, laid out, under the text and over it
-    /// ([`Self::hold_light_for_thin_caret`]).
-    pub(crate) thin_caret_laid: [Vec<GlowQuad>; 2],
     /// The light over a thin caret's cell, pixel by pixel, row-major.
     pub(crate) thin_caret_px: Vec<u32>,
     /// The channels of the light over a thin caret's cell, sampled for their medians.
     pub(crate) thin_caret_chans: [Vec<u8>; 3],
+    /// A thin caret's neighbourhood as the frame lays it, and its ring pixels the hold marks
+    /// ([`Self::hold_light_for_thin_caret`]).
+    pub(crate) thin_hood: ThinHood,
+    pub(crate) thin_marked: Vec<bool>,
+    /// A thin caret's last drawn lift ([`Self::thin_caret_fill`]).
+    pub(crate) thin_lift: Option<ThinLift>,
+    /// A test's negative control: a thin caret reads against its cell alone
+    /// ([`Self::set_thin_caret_ring`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_ring_off: bool,
+    /// A test's negative control: a thin caret's lift is given back at once
+    /// ([`Self::set_thin_caret_release`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_release_off: bool,
+    /// A test's negative control: a thin caret's cell is read with its letter left out
+    /// ([`Self::set_thin_caret_text`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_text_off: bool,
+    /// A test's negative control: a cell whose ink the frame cannot raster is never a thin
+    /// caret's ring ([`Self::set_thin_caret_unrastered`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_unrastered_off: bool,
+    /// A test's negative control: an underline caret's ring is read by pixel rows, not slice by
+    /// slice across its length ([`Self::set_thin_caret_across`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_rows_off: bool,
+    /// A test's negative control: a pinned thin caret is asked the bar the theme's caret is
+    /// ([`Self::set_thin_caret_pin_need`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) thin_pin_need_off: bool,
+    /// A test's negative control: a thin caret's held ring is cut out of the streams, as before,
+    /// not laid over the frame's light.
+    #[cfg(test)]
+    pub(crate) thin_ring_cut: bool,
+    /// A test's negative control: a foot rail or a page shade in a thin caret's ring is held
+    /// as any light there.
+    #[cfg(test)]
+    pub(crate) thin_keep_off: bool,
+    /// What a thin caret's hold kept of the light round it on the last frame it held
+    /// ([`Self::hold_light_for_thin_caret`]), given back no faster than the lift is.
+    pub(crate) thin_held: ThinHeld,
+    /// The hold's scratch: each hood pixel's share this frame, whether the carried hold alone
+    /// set it, and the carried hold's shares ([`Self::hold_light_for_thin_caret`]).
+    pub(crate) thin_px_kept: Vec<f32>,
+    pub(crate) thin_carried: Vec<bool>,
+    pub(crate) thin_floor: Vec<f32>,
     #[cfg(test)]
     fire_light_squat: bool,
     /// Test-only: lay a paper tongue's root in the flame's 2 px slabs over a 3 px ease, the

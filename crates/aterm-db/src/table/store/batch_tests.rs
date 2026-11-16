@@ -564,3 +564,164 @@ fn ingest_batch_crash_before_witness_relays_nothing_and_recovers_the_exact_group
         2
     );
 }
+
+/// A writer stopped with a group's permit durable and none of its records in the log, then
+/// each later point recovered exactly. The writing open retires the permit, and retires it again
+/// where a crash before that removal's directory flush kept it. The next scalar append moves
+/// custody past the permit's start, and the table opens whether that append's witness was
+/// published or its writer stopped after the commit: the one unwitnessed append a table with no
+/// pending permit allows. A retry of the group returns the retained record's receipt and
+/// commits the other.
+#[test]
+fn a_permit_whose_group_never_landed_is_retired_before_the_next_scalar_append() {
+    for witness_lost in [false, true] {
+        let lab = Lab::new(&[Role::Writer]);
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::open(&bootstrap).unwrap();
+        let mut store = Store::create(&session, &lab._home.path().join("unlanded")).unwrap();
+        let (scope, dir, claims, name) = (
+            store.scope,
+            store.data_dir.clone(),
+            store.claim_dir.clone(),
+            store.claim_name.clone(),
+        );
+        let wires = chain(&session, scope, 2);
+        APPEND_FAILS.with(|fails| fails.set(true));
+        let stopped = store.ingest_batch(&session, &[&wires[0], &wires[1]]);
+        APPEND_FAILS.with(|fails| fails.set(false));
+        assert!(stopped.is_err_and(|error| error.0.contains("injected append failure")));
+        let boundary = group::read(&claims, &name, &store.claim).unwrap();
+        assert_eq!(boundary.acknowledged().count, 0);
+        assert_eq!(boundary.end().map(|end| end.count), Some(2));
+        drop(store);
+        let permit = group::name(&name);
+        let pending = private_file::read_private(&claims, &permit, 1024).unwrap();
+        for case in [
+            "after the permit",
+            "before the retirement's directory flush",
+        ] {
+            let store = Store::open(&session, &dir, scope).unwrap();
+            assert_eq!(store.witness.count, 0, "{case}");
+            drop(store);
+            // A crash before the retirement's directory flush keeps the removed entry.
+            private_file::write_private_flushed(&claims, &permit, &pending, Flush::Durable)
+                .unwrap();
+        }
+        let id = aterm_digest::Sha256::digest(&wires[0]);
+        let mut store = Store::open(&session, &dir, scope).unwrap();
+        if witness_lost {
+            let failure = fail_witness_after_commit();
+            assert!(store.ingest(&session, &wires[0]).is_err());
+            drop(failure);
+        } else {
+            assert_eq!(store.ingest(&session, &wires[0]).unwrap().offset, 0);
+        }
+        drop(store);
+        assert_eq!(
+            Store::observe(&session, &dir, scope).unwrap().witness.count,
+            u64::from(!witness_lost)
+        );
+        let mut store = Store::open(&session, &dir, scope).unwrap();
+        assert_eq!(store.witness.count, 1);
+        assert!(matches!(
+            private_file::read_private(&claims, &permit, 1024),
+            Err(PrivateFileError::Missing)
+        ));
+        let scalar = store.records.get(&id).unwrap().receipt;
+        assert_eq!(scalar.offset, 0);
+        let retried = store
+            .ingest_batch(&session, &[&wires[0], &wires[1]])
+            .unwrap();
+        assert_eq!(retried[0], scalar);
+        assert_eq!(retried[1].offset, 1);
+        drop(store);
+        assert_eq!(
+            Store::observe(&session, &dir, scope).unwrap().witness.count,
+            2
+        );
+        let store = Store::open(&session, &dir, scope).unwrap();
+        assert_eq!(store.witness.count, 2);
+        assert_eq!(store.index().unwrap().project().ordered.len(), 2);
+    }
+}
+
+/// A custody check refused after a group's commit still hands each of its new records to the
+/// append sink once; the retry that then returns their receipts hands none of them again.
+#[test]
+fn ingest_batch_announces_its_commit_once_when_the_check_after_it_refuses() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::create(&session, &lab._home.path().join("announced")).unwrap();
+    let wires = chain(&session, store.scope, 2);
+    let sunk = Rc::new(RefCell::new(Vec::new()));
+    let sink = || {
+        let sunk = Rc::clone(&sunk);
+        move |record: &Appended<'_>| sunk.borrow_mut().push((record.offset, record.length))
+    };
+    let (claims, volume) = (
+        store.claim_dir.clone(),
+        format!("{}.volume", store.claim_name),
+    );
+    let kept = private_file::read_private(&claims, &volume, 1024).ok();
+    // The claim's volume witness damaged while the group commits: the check after it refuses.
+    let damage = {
+        let (claims, volume) = (claims.clone(), volume.clone());
+        aterm_journal::seam::before_each_commit(move || {
+            private_file::write_private_flushed(&claims, &volume, b"damaged", Flush::Durable)
+                .unwrap();
+        })
+    };
+    let refused = with_append_sink(sink(), || {
+        store.ingest_batch(&session, &[&wires[0], &wires[1]])
+    });
+    drop(damage);
+    let error = refused.unwrap_err();
+    assert!(error.0.contains("volume witness"), "{error}");
+    assert_eq!(store.witness.count, 2, "the group committed");
+    assert_eq!(*sunk.borrow(), [(0, 2), (1, 2)]);
+    match &kept {
+        Some(bytes) => {
+            private_file::write_private_flushed(&claims, &volume, bytes, Flush::Durable).unwrap();
+        }
+        None => {
+            private_file::remove_private(&claims, &volume).unwrap();
+        }
+    }
+    let receipts = with_append_sink(sink(), || {
+        store.ingest_batch(&session, &[&wires[0], &wires[1]])
+    })
+    .unwrap();
+    assert_eq!((receipts[0].offset, receipts[1].offset), (0, 1));
+    assert_eq!(*sunk.borrow(), [(0, 2), (1, 2)]);
+}
+
+/// A writing open keeps the permit of a group that reached the log until the group's witness is
+/// published: an open whose publication fails leaves the permit in place, and the next open
+/// adopts the exact group under it.
+#[test]
+fn a_writing_open_keeps_a_landed_groups_permit_until_its_witness_is_published() {
+    let lab = Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::create(&session, &lab._home.path().join("landed")).unwrap();
+    let (scope, dir) = (store.scope, store.data_dir.clone());
+    let wires = chain(&session, scope, 2);
+    let failure = fail_witness_after_commit();
+    assert!(
+        store
+            .ingest_batch(&session, &[&wires[0], &wires[1]])
+            .is_err()
+    );
+    drop(failure);
+    drop(store);
+    {
+        let _refused = aterm_uds::atomic_file::publication_seam::FailBeforeRename::with_kind(
+            std::io::ErrorKind::PermissionDenied,
+        );
+        assert!(Store::open(&session, &dir, scope).is_err());
+    }
+    let store = Store::open(&session, &dir, scope).unwrap();
+    assert_eq!(store.witness.count, 2);
+    assert_eq!(store.records.len(), 2);
+}

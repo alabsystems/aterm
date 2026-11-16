@@ -232,10 +232,10 @@ pub(crate) fn copy_service_image(from: &Path, to: &Path) -> Result<(), String> {
 /// own scratch dir, and the verify step's writes.
 pub(crate) const STAGE_FREE_SPACE_HEADROOM: u64 = 64 * 1024 * 1024;
 
-/// The one action a full disk's refusal names, the same for the download, the unpack and the
-/// free-space check.
+/// What a full disk's refusal says comes next, the same for the download, the unpack and the
+/// free-space check: the update retries by itself, and asks no one to free space.
 pub(crate) const FREE_SPACE_REMEDY: &str =
-    "free some space and check for updates, which retries it at once";
+    "the update retries on its own, and checking for updates retries it at once";
 
 fn ditto_failure(what: &str, status: std::process::ExitStatus, stderr: &str) -> String {
     match crate::verify::last_stderr_line(stderr) {
@@ -1165,8 +1165,9 @@ fn carried_for_failed_bytes(
 /// start are re-armed whatever the record's age, at the launches it carried (below the revert
 /// threshold, so the launch about to be counted decides); any other record re-arms at 0 within
 /// [`WINDOW_TRIAL_HEADLESS_WAIT`] and is dropped after it. Where the window-start failure record
-/// cannot be read, nothing is armed or dropped: the launch is not counted, and a later one decides
-/// once it reads, so one failed read never discards the bytes' re-trial nor its count.
+/// cannot be read, the bytes are taken as ones a window here saw fail: they are re-armed at the
+/// launches the settle's record carried whatever its age, and this launch is counted, so one
+/// failed read never drops or zeroes the bytes' re-trial nor leaves a window launch uncounted.
 fn rearm_window_unproven_trial(
     staging: &Staging,
     sentinel: &Sentinel,

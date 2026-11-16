@@ -93,7 +93,7 @@ function decodeText(ptr, len) {
 /// `passStringToWasm0` and its encoder.
 pub(crate) const PASS_STRING: &str = "\
 function passStringToWasm0(arg, malloc, realloc) {
-    if (realloc === undefined) {
+    if (realloc === undefined || typeof cachedTextEncoder.encodeInto !== 'function') {
         const buf = cachedTextEncoder.encode(arg);
         const ptr = malloc(buf.length, 1) >>> 0;
         getUint8ArrayMemory0().subarray(ptr, ptr + buf.length).set(buf);
@@ -103,44 +103,23 @@ function passStringToWasm0(arg, malloc, realloc) {
 
     let len = arg.length;
     let ptr = malloc(len, 1) >>> 0;
-
-    const mem = getUint8ArrayMemory0();
-
-    let offset = 0;
-
-    for (; offset < len; offset++) {
-        const code = arg.charCodeAt(offset);
-        if (code > 0x7F) break;
-        mem[ptr + offset] = code;
-    }
-    if (offset !== len) {
-        if (offset !== 0) {
-            arg = arg.slice(offset);
-        }
-        ptr = realloc(ptr, len, len = offset + arg.length * 3, 1) >>> 0;
-        const view = getUint8ArrayMemory0().subarray(ptr + offset, ptr + len);
-        const ret = cachedTextEncoder.encodeInto(arg, view);
-
-        offset += ret.written;
-        ptr = realloc(ptr, len, offset, 1) >>> 0;
+    const first = cachedTextEncoder.encodeInto(arg, getUint8ArrayMemory0().subarray(ptr, ptr + len));
+    let written = first.written;
+    if (first.read !== arg.length) {
+        arg = arg.slice(first.read);
+        const previous = len;
+        len = written + arg.length * 3;
+        ptr = realloc(ptr, previous, len, 1) >>> 0;
+        const rest = cachedTextEncoder.encodeInto(arg, getUint8ArrayMemory0().subarray(ptr + written, ptr + len));
+        written += rest.written;
+        ptr = realloc(ptr, len, written, 1) >>> 0;
     }
 
-    WASM_VECTOR_LEN = offset;
+    WASM_VECTOR_LEN = written;
     return ptr;
 }
 
 const cachedTextEncoder = new TextEncoder();
-
-if (!('encodeInto' in cachedTextEncoder)) {
-    cachedTextEncoder.encodeInto = function (arg, view) {
-        const buf = cachedTextEncoder.encode(arg);
-        view.set(buf);
-        return {
-            read: arg.length,
-            written: buf.length
-        };
-    };
-}
 ";
 
 /// The buffer length the last `pass*ToWasm0` wrote.

@@ -71,29 +71,6 @@ fn a_harness_is_a_word_then_the_suffix() {
     const _: () = assert!(is_harness("x-alab") && !is_harness("-alab"));
 }
 
-/// Grok and Kimi hand their sessions to their harnesses; no other vendor or harness name does.
-#[test]
-fn grok_and_kimi_hand_their_sessions_to_their_harnesses() {
-    for (vendor, harness) in [("grok", "grok-alab"), ("kimi", "kimi-alab")] {
-        assert_eq!(twin_harness(vendor), Some((harness, harness)));
-        assert!(is_harness(harness));
-    }
-    for other in [
-        "claude",
-        "codex",
-        "codex-old",
-        "agy",
-        "muse",
-        "grok-alab",
-        "kimi-alab",
-        "Grok",
-        "Kimi",
-        "",
-    ] {
-        assert_eq!(twin_harness(other), None, "{other:?}");
-    }
-}
-
 /// A complete, active store build of `program` at `build` that puts `tool` on PATH.
 fn lay(l: &crate::store::Layout, program: &str, build: u64, tool: &str) -> std::path::PathBuf {
     let dir = l.build_dir(program, build);
@@ -347,8 +324,8 @@ fn installed_lists_each_harness_package_with_its_recorded_version() {
 
     let cc_store = l.build_dir("claude-code-alab", 5);
     std::fs::create_dir_all(cc_store.join("bin")).unwrap();
-    let cc_store_exe = cc_store.join("bin/claude-alab");
-    let cc_wrong_exe = cc_store.join("bin/claude-code-alab");
+    let cc_store_exe = cc_store.join("bin").join(exe("claude-alab"));
+    let cc_wrong_exe = cc_store.join("bin").join(exe("claude-code-alab"));
     std::fs::write(&cc_store_exe, b"#!/bin/sh\nexit 0\n").unwrap();
     std::fs::write(&cc_wrong_exe, b"#!/bin/sh\nexit 0\n").unwrap();
     crate::store::mark_build_ready(&cc_store).unwrap();
@@ -362,6 +339,17 @@ fn installed_lists_each_harness_package_with_its_recorded_version() {
         None,
         "claude-code-alab exposes claude-alab, not claude-code-alab"
     );
+    if cfg!(windows) {
+        // NEGATIVE CONTROL: on Windows the store's executable is `<tool>.exe`; a file of the
+        // bare tool name beside it is no entrypoint.
+        let bare = cc_store.join("bin/claude-alab");
+        std::fs::write(&bare, b"#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(
+            store_build_version_of_exe(&l, "claude-code-alab", &bare),
+            None,
+            "a store build's file without the platform's executable spelling is refused"
+        );
+    }
     std::fs::write(
         cc_store.with_extension("exposes"),
         b"exposes v1\nclaude-code-alab\n",

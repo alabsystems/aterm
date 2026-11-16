@@ -1684,6 +1684,45 @@ fn the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter() {
     );
 }
 
+/// THE ENTER FOLLOWS THE FOCUS, NOT A QUIET SCREEN: once the arrow's focus has landed on the
+/// option, the Enter goes out on that read, with no wait for the screen to hold still between
+/// the two keys. Here the screen never holds still for the settle's quiet (a dialog over a
+/// ticking screen), which under a wait for quiet cost every arrow the whole cap. CONTROL:
+/// [`the_trust_dialog_is_never_entered_unconfirmed`], where the focus never lands and no Enter
+/// goes out.
+#[test]
+fn the_trust_dialog_enter_follows_the_focus_not_a_quiet_screen() {
+    let mut m = fenced(vec![trust_dialog(false), trust_dialog(true), idle_screen()]);
+    m.cwd = Some(TRUST_FOLDER.to_string());
+    m.vanish_after = Some(0);
+    m.idle_never_for = Some("500");
+    let (lines, _) = watch_lines_with(&mut m, &auto(30), |s| {
+        s.set_approval_env(owner_env());
+    });
+    assert_eq!(
+        lines[0],
+        format!("APPROVED seq=102 {TRUST_FOLDER}"),
+        "{lines:?}"
+    );
+    let key = |name: &str| {
+        m.requests
+            .iter()
+            .position(|r| verb_of(r) == "key" && r.ends_with(name))
+            .unwrap_or_else(|| panic!("no {name} key: {:?}", m.requests))
+    };
+    let (down, enter) = (key(" down"), key(" enter"));
+    assert!(down < enter, "{:?}", m.requests);
+    let between = &m.requests[down + 1..enter];
+    assert!(
+        !between.iter().any(|r| r.starts_with("await idle")),
+        "no wait for a quiet screen between the arrow and the Enter: {between:?}"
+    );
+    assert!(
+        between.iter().any(|r| r.starts_with("await seq")),
+        "the read after the arrow waits for the screen to move: {between:?}"
+    );
+}
+
 const TRUST_PUBLISHED_1S: &str = "prompt agent_detail=trust agent_rev=1 agent_since_ms=1000";
 
 fn full_power_watch(m: &mut Mock, tag: &str) -> (Vec<String>, Vec<String>) {
@@ -3384,9 +3423,11 @@ fn full_power_presses_the_same_box_every_time_it_comes_back() {
 
 #[test]
 fn the_trust_dialog_is_never_entered_unconfirmed() {
-    let mut m = fenced(vec![trust_dialog(false); 16]);
+    // A dialog that stands unmoved under every arrow: each arrow's read waits out the screen,
+    // finds the focus where it was, and the box is decided again, five times in all.
+    let mut m = fenced(vec![trust_dialog(false); 2]);
     m.cwd = Some(TRUST_FOLDER.to_string());
-    m.vanish_after = Some(0);
+    m.vanish_after = Some(64);
     watch_lines_with(&mut m, &auto(30), |s| s.set_approval_env(owner_env()));
     assert_eq!(count(&m, "key "), 5, "{:?}", m.requests);
     assert!(m.attention.is_some(), "handed over: {:?}", m.requests);

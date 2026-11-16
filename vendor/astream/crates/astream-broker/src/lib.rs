@@ -183,9 +183,9 @@ pub use client::connect_stream;
 pub use client::{
     ack, acks_owed, broker_refusal, client_walk_page_advance, client_walk_within_limit, connect,
     drain, protocol_mismatch, take, AcksOwed, AnyClient, AnyStream, AnySubscription, BrokerRefusal,
-    Client, Closer, CreditWindow, Event, Page, Pipelined, ProtocolMismatch, Record, StampedPage,
-    StampedRecord, SubjectBudget, Subscription, SubscriptionCloser, Transport, Walk, ACK_SEQ_BASE,
-    LAST_WALK_PAGES_MAX,
+    Client, Closer, CreditWindow, Event, FreshPublish, Page, Pipelined, ProtocolMismatch, Record,
+    StampedPage, StampedRecord, SubjectBudget, Subscription, SubscriptionCloser, Transport, Walk,
+    ACK_SEQ_BASE, LAST_WALK_PAGES_MAX, MAX_FRESH_PIPELINE_BYTES,
 };
 pub use federation::{
     federation_cursor_advance, federation_hop_allowed, federation_incarnation_fresh,
@@ -256,10 +256,10 @@ pub use logid::{
 };
 pub use proto::{
     AttachedProducerStats, FaceStats, Gap, HelloHealth, LogDevice, NonceExt, Request, Response,
-    ServedInfo, ServedReason, Tier, WireStats, ERR_RATE_LIMITED, ERR_RETIRE_REFUSED,
-    HELLO_REASON_MAX, RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES, REQUEST_BURST_MARKS,
-    REQUEST_GAP_FENCES, REQUEST_GAP_NOTICES, REQUEST_RELAY, REQUEST_RETIRE, REQUEST_SETTLE,
-    REQUEST_STATS, REQUEST_TOLD_FETCH,
+    ServedInfo, ServedReason, Tier, WireStats, ERR_FRESH_FENCED, ERR_FRESH_HELD, ERR_RATE_LIMITED,
+    ERR_RETIRE_REFUSED, HELLO_REASON_MAX, RATE_LIMITED_PREFIX, REQUEST_BROKER_TIMES,
+    REQUEST_BURST_MARKS, REQUEST_FRESH_PUBLISH, REQUEST_GAP_FENCES, REQUEST_GAP_NOTICES,
+    REQUEST_RELAY, REQUEST_RETIRE, REQUEST_SETTLE, REQUEST_STATS, REQUEST_TOLD_FETCH,
 };
 pub use recover::{recover_keep_within_len, recover_unit_start_advance};
 pub use refill::{

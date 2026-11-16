@@ -79,6 +79,7 @@ fn seal(ctx: &Arc<crate::SessionCtx>) -> Seal {
             thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
             wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
             identity: renewal::Identity::from_native("account", "user"),
+            limit: None,
         },
         sid: ctx.self_id.as_str().into(),
         old_pid: 4242,
@@ -588,6 +589,18 @@ fn codex_renewal_seal_is_exact_plan_claim_and_private_constructor_only() {
     let ctx = Arc::clone(&handle.ctx);
     install(&ctx, 71, &[Scope::Relaunch]);
     let seal = seal(&ctx);
+    // A hold refuses the seal beneath Meta, where it is read without the Inbox; its lift admits.
+    let held = crate::fabric::Hold {
+        reason: "fixture-held".into(),
+        origin: "local".into(),
+    };
+    assert!(crate::fabric::apply_hold_for_test(&ctx, Some(held)));
+    {
+        let meta = ctx.meta.lock().unwrap();
+        let snapshot = meta.supervisor_authority(crate::metrics::now_us());
+        assert!(!seal.admits(&snapshot, &seal.prepare), "a held session");
+    }
+    assert!(crate::fabric::apply_hold_for_test(&ctx, None));
     let meta = ctx.meta.lock().unwrap();
     let snapshot = meta.supervisor_authority(crate::metrics::now_us());
     assert!(seal.admits(&snapshot, &seal.prepare));

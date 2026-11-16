@@ -534,13 +534,18 @@ fn the_mail_streams_filter_parses_and_fails_closed() {
         "mail:from=tqn5r6e014u",
         "mail:from=tqn5r6e0148@",
         "mail:from=tqn5r6e0148@n lab",
+        "mail:from=s-w1",
+        "mail:from=s-w1@n-lab",
+        "mail:from=s-0123456789ABCDEF0123",
+        "mail:from=s-0123456789abcdef012",
+        "mail:from=s-0123456789abcdef0123@n-lab",
     ] {
         assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
     }
     for good in [
         "service",
         "other",
-        "s-w1@n-lab",
+        "s-0123456789abcdef0123",
         "a-svc",
         "tqn5r6e0148",
         "tqn5r6e0148@n-lab",
@@ -616,7 +621,7 @@ fn direct_mail_wakes_subscribers_with_an_independent_cursor_and_body_free_fact()
     let bus = crate::fabric::cmd_deliver(
         &store,
         &format!(
-            "{} off=7 from=s-peer kind=note trust=agent text=BUS_BODY",
+            "{} off=7 from=tpeer000001 kind=note trust=agent text=BUS_BODY",
             h.sid.as_str()
         ),
     );
@@ -624,7 +629,7 @@ fn direct_mail_wakes_subscribers_with_an_independent_cursor_and_body_free_fact()
     let mut out = String::new();
     drain_mail_events(&mut watch, "7", &mut out);
     assert!(
-        out.contains("MAIL 7 id=1 off=7 from=s-peer kind=note\n"),
+        out.contains("MAIL 7 id=1 off=7 from=tpeer000001 kind=note\n"),
         "{out}"
     );
     assert!(
@@ -686,7 +691,10 @@ fn the_gap_frame_names_what_the_ring_dropped() {
     };
     let over = crate::fabric::RING_CAP + 40;
     for n in 1..=over {
-        deliver(1000 + n as u64, &format!("s-p{n}"));
+        deliver(
+            1000 + n as u64,
+            aterm_types::tab_id::TabId::from_bits(n as u64).as_str(),
+        );
     }
     let mut w = new_watch(
         &target_of(&h),
@@ -884,7 +892,7 @@ fn a_fresh_watch_starts_at_every_live_high() {
     let reply = crate::fabric::cmd_deliver(
         &store,
         &format!(
-            "{} off=1 from=s-peer kind=note trust=agent text=x",
+            "{} off=1 from=tpeer000001 kind=note trust=agent text=x",
             h.sid.as_str()
         ),
     );

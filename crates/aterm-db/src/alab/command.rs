@@ -1555,7 +1555,7 @@ fn dry_plan_with<T>(
                 table,
                 sealer: &Unheld,
             });
-            let plan = import::plan_unheld(&sources.input(), sealed)?;
+            let plan = import::plan_unheld(&sources.input(), table, sealed)?;
             let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
             Ok((plan, "not held here", seeds, None))
         }
@@ -1957,6 +1957,8 @@ fn roll(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         "registers": rolled.registers,
         "archived": rolled.archived,
         "cover": rolled.cover,
+        "history": rolled.history,
+        "history_not_carried": rolled.history_left,
         "records": rolled.records,
         "sealed": rolled.sealed,
         "waiting": rolled.waiting.iter().map(keys::uuid32).collect::<Vec<_>>(),
@@ -2027,7 +2029,7 @@ pub(super) fn merge_plan(
             .collect(),
     );
     super::merge::plan(
-        &view.project(&MACHINE),
+        (view.collection(&MACHINE), &view.project(&MACHINE)),
         &view.project(&PREFERENCE),
         &facts,
         roster,
@@ -2376,15 +2378,16 @@ fn write_review(plan: &Plan, sheets: &[Sheet]) -> Result<aterm_tempfile::TempDir
     );
     for item in &plan.planned {
         let shown = match item.column.split_once('.') {
-            Some((_, elem)) => elem.to_owned(),
+            // A text set's member shows its text, which its element key only digests; a word
+            // or key set's member, or a removal, shows its key.
+            Some((_, elem)) => item.x.as_str().unwrap_or(elem).to_owned(),
             None => {
-                // The planner's own shape, the registry's newest: a planned number shows as it
-                // is, a secret reference by its entry name, and anything else a secret column
-                // holds (the mask of a sealed cell) as the mask.
-                let ty = registry::REGISTRY_3
-                    .collection(item.collection)
-                    .and_then(|c| c.column(&item.column))
-                    .map_or(Ty::Json(0), |c| c.ty);
+                // As the plan holds it ([`import::Plan::ty`]): a planned number shows as it is, a
+                // secret reference by its entry name, and anything else a secret column holds (the
+                // mask of a sealed cell) as the mask.
+                let ty = plan
+                    .ty(item.collection, &item.column)
+                    .unwrap_or(Ty::Json(0));
                 grid::show(&ty, &item.x)
             }
         };

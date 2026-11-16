@@ -8,18 +8,48 @@
 //!
 //! - **Rail.** One line per table: its name and its rows; the cells of it not yet written, where
 //!   there are any.
-//! - **Grid.** The row's key column (`label`, an address's `addr`) stays at the left while
-//!   the rest scroll across beside it: columns under STORED (the owner's), SET BY ATERM (cells
-//!   aterm keeps) and LINKED ROWS (how many rows of another table name this one). A stored cell
-//!   is edited in place: a press selects it, a second press opens it, Return stages it, Escape
-//!   leaves it.
+//! - **Grid.** A sheet: ruled cells of one height under a header line of column names, each row
+//!   numbered at its left. The header line stays at the top while the rows scroll under it, and
+//!   the row numbers and the row's key column (`label`, an address's `addr`) stay at the left
+//!   while the rest scroll across beside them (a sideways wheel or swipe, or a move of the
+//!   selection); a thumb along the grid's foot says where they stand, and a bar marks the key
+//!   column's edge while columns lie under it. A column is as wide as its header or its values
+//!   need until a person drags its header's right edge; a double press on that edge, or its
+//!   press from the keyboard, fits it to its widest value, and Left and Right on the focused
+//!   edge size it. A press on a header orders the rows by its column, from its least value up,
+//!   then from its greatest down, then as the registry holds them again; the header wears a
+//!   drawn mark and says which. The order is the view's alone: it writes nothing and survives
+//!   a new read. A row stands by the values the registry holds and is placed once for each
+//!   read, find and sort, so typing into the sorted column moves no row: a staged cell takes
+//!   its place when it is written and read back. Columns sit
+//!   under STORED (the owner's), SET BY ATERM (cells aterm keeps) and LINKED ROWS (how many rows
+//!   of another table name this one). A stored cell is edited in place: a press selects it, a
+//!   second press opens it, Return stages it, Escape leaves it.
+//! - **Keys** are a spreadsheet's. The arrows move the selection a cell; Tab and Shift-Tab move
+//!   it a cell across and onto the next row, and off the sheet's last or first cell leave the
+//!   grid as Tab leaves any control. Return opens the selected cell, and in an open one stages
+//!   what was typed and moves down; Tab there stages and moves across; Escape leaves the cell
+//!   as it was. A typed letter opens the cell with it. Delete or Backspace stages nothing in
+//!   each selected cell that takes an edit. Shift and an arrow grow the selection into a range
+//!   ([`StyleRef::CellRange`], each of its cells said selected) of the rows that lie between
+//!   its corners then: once the rows shown or their order change it is the one selected cell
+//!   again, as it is at Escape. A copy takes the selected cell's words, or the range's as
+//!   tab-separated lines a spreadsheet reads back cell for cell, as the grid shows them: a
+//!   secret's cell copies the entry name or mask it shows, never a value. A paste on a
+//!   selected cell stages the clipboard's lines down the rows and their cells across the
+//!   columns, each in a cell the page edits; in an open cell it is typed text. Save's key,
+//!   File ▸ Save and the palette's Write press Write. After a pointer's press on a header or
+//!   a drag of an edge the keys are the selected cell's again; pressed from the keyboard, a
+//!   header keeps them.
 //! - **Blue** means only "not yet written" ([`StyleRef::Unwritten`], the palette's one fixed
 //!   [`crate::native_appearance::NOT_WRITTEN`], never the accent): a staged cell, the rail's
 //!   count of them, the Write bar. Nothing else on the page wears it.
 //! - **Writers** are named by their Mac's label (`m73`), resolved from what aterm holds; a writer
 //!   none names shows the start of its machine id, dimmed.
 //! - **A conflict** shows every value, sorted by its words, and the pane lists each with its
-//!   writer and a Keep; no clock picks one.
+//!   writer and a Keep; no clock picks one. A Write is compared against what each staged cell
+//!   held when the person last saw it: when it was staged, or when it was opened, since an
+//!   open cell covers what a read brings.
 //! - **Secrets** never reach the page: a secret cell names its secret-store entry, read-only here.
 //!   Addresses and phone numbers are ordinary data and read as stored.
 //! - **As of.** Each history entry offers the table as that operation's causal past holds it
@@ -165,13 +195,25 @@ pub(crate) struct Shown {
     pub(crate) raw: bool,
 }
 
+/// How a column's cells are read when its rows are put in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnKind {
+    /// A whole number: ordered by its value, and set at the right of its cell.
+    Number,
+    /// A time or a day, which the grid shows as its number: ordered by its value.
+    Time,
+    /// Words: ordered without regard to case, a run of digits in them by its value (`m9`
+    /// before `m55`).
+    Text,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SheetColumn {
     pub(crate) name: String,
     pub(crate) label: String,
     pub(crate) group: Group,
     pub(crate) editable: bool,
-    pub(crate) numeric: bool,
+    pub(crate) kind: ColumnKind,
     /// The table a reference or a linked count names.
     pub(crate) links: Option<String>,
 }
@@ -306,6 +348,9 @@ pub(crate) struct TablesApp {
     /// Moves to another point asked for that have not answered: the page takes no edit until
     /// the last of them has, since each answer may land it on a past table.
     asked: usize,
+    /// How many reads the page has taken: a view works its rows' order out once for each
+    /// ([`TablesViewState::shown_rows`]).
+    reads: u64,
 }
 
 impl TablesApp {
@@ -380,6 +425,7 @@ impl TablesApp {
             sent: BTreeMap::new(),
             refused: BTreeMap::new(),
             asked: 0,
+            reads: 0,
         };
         let _ = app.work.send(Work::Read);
         Ok(app)
@@ -443,6 +489,7 @@ impl TablesApp {
             } => {
                 self.snapshot = Some(snapshot);
                 self.unread = None;
+                self.reads = self.reads.wrapping_add(1);
                 if moved {
                     self.asked = self.asked.saturating_sub(1);
                 }
@@ -566,6 +613,13 @@ impl TablesApp {
     /// Stage `text` in a cell, or take back what was staged where it is the written value. A
     /// past table takes no edit.
     fn stage(&mut self, sheet: &str, pk: &str, column: &str, text: String) {
+        self.stage_over(sheet, pk, column, text, None);
+    }
+
+    /// [`Self::stage`], for a cell the person last saw holding `saw` (an open cell, which covers
+    /// what a read brings while it is open): the Write is compared against that, not against
+    /// the read the cell is staged on.
+    fn stage_over(&mut self, sheet: &str, pk: &str, column: &str, text: String, saw: Option<Seen>) {
         if self.fixed() {
             return;
         }
@@ -580,18 +634,23 @@ impl TablesApp {
         if written {
             self.unstage(&at);
         } else {
-            self.put(at, text);
+            self.put(at, text, saw);
         }
     }
 
-    /// Stage `text` at `at`, remembering what the cell held in this read the first time.
-    fn put(&mut self, at: At, text: String) {
+    /// What the cell at `at` holds in this read, as a Write is compared against it.
+    fn held(&self, sheet: &str, pk: &str, column: &str) -> Option<Seen> {
+        self.sheet(sheet)
+            .and_then(|s| s.base.rows.iter().find(|(row, _)| row == pk))
+            .and_then(|(_, row)| row.get(column))
+            .cloned()
+    }
+
+    /// Stage `text` at `at`, remembering the first time what the person saw the cell hold:
+    /// `saw` where the cell was open, else what it holds in this read.
+    fn put(&mut self, at: At, text: String, saw: Option<Seen>) {
         if !self.seen.contains_key(&at)
-            && let Some(seen) = self
-                .sheet(&at.0)
-                .and_then(|s| s.base.rows.iter().find(|(pk, _)| *pk == at.1))
-                .and_then(|(_, row)| row.get(&at.2))
-                .cloned()
+            && let Some(seen) = saw.or_else(|| self.held(&at.0, &at.1, &at.2))
         {
             self.seen.insert(at.clone(), seen);
         }
@@ -696,7 +755,39 @@ pub(crate) struct Editing {
     pk: String,
     column: String,
     seed: String,
+    /// What the registry held in the cell when it was opened: the open field covers the cell,
+    /// so a value another Mac writes while it is open is one the person never saw.
+    saw: Option<Seen>,
     input: TextInputState,
+}
+
+/// The rows a sheet shows, top down, worked out once for each read, find and sort: a staged
+/// cell, a key and a redraw leave it as it is, so a row never moves under the selection.
+#[derive(Default)]
+struct Order {
+    /// What it was worked out from: the sheet, the read ([`TablesApp::reads`]), the find's
+    /// words and the sorted column with its direction.
+    of: Option<OrderOf>,
+    /// Each shown row's place among the sheet's rows.
+    rows: Vec<usize>,
+    /// Each shown row's key.
+    keys: Vec<String>,
+    /// Steps each time the rows shown, or their order, differ from the ones before: a range of
+    /// cells holds only while it stands ([`Corner::order`]).
+    stamp: u64,
+    /// How many times an order was worked out.
+    built: u64,
+}
+
+type OrderOf = (&'static str, u64, String, Option<(String, bool)>);
+
+/// A range's other corner: the cell it began at, among the rows as they stood then.
+struct Corner {
+    pk: String,
+    column: String,
+    /// The [`Order::stamp`] the range was grown on. Once the rows shown or their order change,
+    /// the rows between two corners are other rows, so the range is the one selected cell again.
+    order: u64,
 }
 
 pub(crate) struct TablesViewState {
@@ -715,8 +806,23 @@ pub(crate) struct TablesViewState {
     /// The grid's room across, and where each column of the shown sheet starts and ends.
     grid_room: Cell<f32>,
     spans: std::cell::RefCell<Vec<(String, f32, f32)>>,
-    /// The rows the grid listed last, in order.
-    listed: std::cell::RefCell<Vec<String>>,
+    /// How far the grid's last layout could scroll across.
+    across_limit: Cell<f32>,
+    /// The rows the shown sheet lists, in order, as last worked out.
+    order: std::cell::RefCell<Order>,
+    /// The widths a person gave columns, by sheet and column: view state, kept across reads.
+    widths: BTreeMap<String, BTreeMap<String, f32>>,
+    /// How wide each column of the shown sheet drew last.
+    drawn: std::cell::RefCell<BTreeMap<String, f32>>,
+    /// The column whose header edge is held, and how wide it was when the hold began.
+    resizing: Option<(String, f32)>,
+    /// The other corner of a range of cells, where Shift and an arrow grew the selection past
+    /// its one cell: the row and column it began at. `None` is the one selected cell.
+    anchor: Option<Corner>,
+    /// The column each sheet's rows are ordered by, and whether from its greatest value down:
+    /// view state, kept across reads and written nowhere. A sheet not named shows its rows in
+    /// the order the registry holds them.
+    sort: BTreeMap<String, (String, bool)>,
 }
 
 impl Default for TablesViewState {
@@ -736,7 +842,13 @@ impl Default for TablesViewState {
             pane_limit: Cell::new(0.0),
             grid_room: Cell::new(0.0),
             spans: std::cell::RefCell::new(Vec::new()),
-            listed: std::cell::RefCell::new(Vec::new()),
+            across_limit: Cell::new(0.0),
+            order: std::cell::RefCell::new(Order::default()),
+            widths: BTreeMap::new(),
+            drawn: std::cell::RefCell::new(BTreeMap::new()),
+            resizing: None,
+            anchor: None,
+            sort: BTreeMap::new(),
         }
     }
 }
@@ -747,14 +859,36 @@ const UNDO: &str = "tables/pane/undo/";
 const KEEP: &str = "tables/pane/keep/";
 const EDIT: &str = "tables/edit";
 const FIND: &str = "tables/find";
-const WRITE: &str = "tables/write";
+pub(crate) const WRITE: &str = "tables/write";
 const DISCARD: &str = "tables/discard";
 const AS_OF: &str = "tables/pane/asof/";
 const NOW: &str = "tables/now";
+/// A column's right edge in the header line: held and dragged, it sizes the column.
+const EDGE: &str = "tables/edge/";
+/// A column's header.
+const HEAD: &str = "tables/head/";
+/// The narrowest and the widest a person can make a column, in points at the text scale of 1.
+const NARROWEST: f32 = 36.0;
+const WIDEST: f32 = 900.0;
+/// How much Left or Right on a column's focused edge sizes it.
+const WIDTH_STEP: f32 = 16.0;
+/// A paste, which the window sends with the clipboard's text: into the field with focus, or
+/// from the selected cell on ([`TablesApp::paste`]).
+pub(crate) const PASTE: &str = "tables/paste";
 
 impl TablesViewState {
-    /// Scroll an `act` on a cell outside the grid's room into view; whether anything moved.
+    /// Scroll an `act` on a cell, a header or its edge outside the grid's room into view; whether
+    /// anything moved.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
+        if let Some(column) = key
+            .as_str()
+            .strip_prefix(EDGE)
+            .or_else(|| key.as_str().strip_prefix(HEAD))
+        {
+            let across = self.across;
+            self.reveal(column);
+            return across != self.across;
+        }
         let Some((pk, column)) = key
             .as_str()
             .strip_prefix(CELL)
@@ -762,18 +896,11 @@ impl TablesViewState {
         else {
             return false;
         };
-        let Some(at) = self.listed.borrow().iter().position(|listed| listed == pk) else {
+        let Some(at) = self.order.borrow().keys.iter().position(|key| key == pk) else {
             return false;
         };
         let (scroll, across) = (self.scroll, self.across);
-        let line = row_height();
-        let top = at as f32 * line;
-        let room = self.room.get();
-        if top < self.scroll {
-            self.scroll = top;
-        } else if room > 0.0 && top + line > self.scroll + room {
-            self.scroll = top + line - room;
-        }
+        self.keep_in_view(at);
         let column = column.split('/').next().unwrap_or(column).to_owned();
         self.reveal(&column);
         scroll != self.scroll || across != self.across
@@ -783,15 +910,51 @@ impl TablesViewState {
         self.common.last_focus = Some(UiKey::new(key.to_owned()));
     }
 
-    /// The rows the find field leaves, in the sheet's order; a row with a staged cell stays.
+    /// The rows the find field leaves, a row with a staged cell among them, in the order the
+    /// sheet's sorted column gives ([`Self::sort`]); in the sheet's own order where none is
+    /// sorted. Only this view is ordered: the sheet and what a Write is compared against are not.
+    ///
+    /// A cell stands by the value the registry holds, never by words staged in it, and the order
+    /// is worked out once for each read, find and sort ([`Order`]): typing into the sorted column
+    /// leaves every row where it is, so Return and Tab reach the cell that was beside the edited
+    /// one. A staged cell takes its place once it is written and read back.
     fn shown_rows<'a>(&self, app: &TablesApp, sheet: &'a Sheet) -> Vec<&'a SheetRow> {
-        let find = self.find.value().trim().to_lowercase();
-        sheet
+        self.put_in_order(app, sheet);
+        let order = self.order.borrow();
+        order
             .rows
             .iter()
-            .filter(|row| {
+            .filter_map(|at| sheet.rows.get(*at))
+            .collect()
+    }
+
+    /// How many rows the grid shows of `sheet`.
+    fn shown_count(&self, app: &TablesApp, sheet: &Sheet) -> usize {
+        self.put_in_order(app, sheet);
+        self.order.borrow().rows.len()
+    }
+
+    /// Work [`Self::order`] out where the read, the find or the sort it was worked out from is
+    /// no longer the one in force.
+    fn put_in_order(&self, app: &TablesApp, sheet: &Sheet) {
+        let find = self.find.value().trim().to_lowercase();
+        let of: OrderOf = (
+            sheet.name,
+            app.reads,
+            find,
+            self.sort.get(sheet.name).cloned(),
+        );
+        if self.order.borrow().of.as_ref() == Some(&of) {
+            return;
+        }
+        let find = of.2.as_str();
+        let mut rows: Vec<usize> = sheet
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
                 find.is_empty()
-                    || row.pk.starts_with(&find)
+                    || row.pk.starts_with(find)
                     || app
                         .staged
                         .keys()
@@ -801,10 +964,141 @@ impl TablesViewState {
                             && row
                                 .cells
                                 .get(&column.name)
-                                .is_some_and(|c| c.text.to_lowercase().contains(&find))
+                                .is_some_and(|c| c.text.to_lowercase().contains(find))
                     })
             })
-            .collect()
+            .map(|(at, _)| at)
+            .collect();
+        if let Some((column, descending)) = self.sorted(sheet) {
+            // Each cell's place is read from its words once, not at every comparison.
+            let mut ranked: Vec<(Option<Rank<'_>>, usize)> = rows
+                .iter()
+                .map(|at| {
+                    let shown = sheet.rows[*at]
+                        .cells
+                        .get(&column.name)
+                        .map_or("", |c| c.text.as_str());
+                    (
+                        (!shown.is_empty()).then(|| Rank::of(column.kind, shown)),
+                        *at,
+                    )
+                })
+                .collect();
+            // Stable: rows the column holds equal keep the sheet's order. Empty cells come last
+            // whichever way the rest run.
+            ranked.sort_by(|(a, _), (b, _)| match (a, b) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (Some(a), Some(b)) => {
+                    let order = a.cmp(b);
+                    if descending { order.reverse() } else { order }
+                }
+            });
+            rows.clear();
+            rows.extend(ranked.into_iter().map(|(_, at)| at));
+        }
+        let mut order = self.order.borrow_mut();
+        let same = order.keys.len() == rows.len()
+            && order
+                .keys
+                .iter()
+                .zip(&rows)
+                .all(|(key, at)| *key == sheet.rows[*at].pk);
+        if !same {
+            order.keys = rows.iter().map(|at| sheet.rows[*at].pk.clone()).collect();
+            order.stamp = order.stamp.wrapping_add(1);
+        }
+        order.rows = rows;
+        order.of = Some(of);
+        order.built = order.built.wrapping_add(1);
+    }
+
+    /// The range's other corner, while the rows stand as they did when it was grown. The order
+    /// is the one last worked out: a caller reads the rows first ([`Self::shown_rows`]).
+    fn corner(&self) -> Option<&Corner> {
+        self.anchor
+            .as_ref()
+            .filter(|corner| corner.order == self.order.borrow().stamp)
+    }
+
+    /// The column `sheet`'s rows are ordered by, where one of its columns is sorted, and
+    /// whether from its greatest value down.
+    fn sorted<'a>(&self, sheet: &'a Sheet) -> Option<(&'a SheetColumn, bool)> {
+        let (by, descending) = self.sort.get(sheet.name)?;
+        let column = sheet.columns.iter().find(|c| c.name == *by)?;
+        Some((column, *descending))
+    }
+
+    /// A press on `column`'s header: its rows from the least value up, then from the greatest
+    /// down, then in the sheet's own order again. An open cell is staged first, so its field
+    /// does not move with its row; the selected row stays in view, and a range whose rows moved
+    /// is one cell again ([`Corner::order`]).
+    fn sort_by(&mut self, app: &mut TablesApp, column: &str) {
+        let head = format!("{HEAD}{column}");
+        let keyboard = self.keyboard_on(&head);
+        self.close_edit(app, false);
+        let next = match self.sort.get(self.sheet) {
+            Some((by, false)) if by == column => Some(true),
+            Some((by, true)) if by == column => None,
+            _ => Some(false),
+        };
+        match next {
+            Some(descending) => {
+                self.sort
+                    .insert(self.sheet.to_owned(), (column.to_owned(), descending));
+            }
+            None => {
+                self.sort.remove(self.sheet);
+            }
+        }
+        self.rest_focus(&head, keyboard);
+        let Some(sheet) = app.sheet(self.sheet) else {
+            return;
+        };
+        let at = self.row.as_ref().and_then(|pk| {
+            self.shown_rows(app, sheet)
+                .iter()
+                .position(|row| row.pk == *pk)
+        });
+        match at {
+            Some(at) => self.keep_in_view(at),
+            None => self.scroll = 0.0,
+        }
+    }
+
+    /// Whether the keyboard's own focus stands on `key`: Tab reached it and its ring shows, so
+    /// Return presses it. A pointer's press puts focus on what it pressed without that ring.
+    fn keyboard_on(&self, key: &str) -> bool {
+        self.common.focus_visible
+            && self
+                .common
+                .last_focus
+                .as_ref()
+                .is_some_and(|focus| focus.as_str() == key)
+    }
+
+    /// Where the keys go after a press on `key`, a control of the sheet that is no cell (a
+    /// header, a column's edge). Pressed from the keyboard, they stay on it, so Return presses
+    /// it again. After a pointer's press they return to the selected cell, where there is one:
+    /// its ring says where the arrows, typing, Delete and a copy go, and it is still drawn.
+    fn rest_focus(&mut self, key: &str, keyboard: bool) {
+        match (keyboard, &self.row, &self.column) {
+            (false, Some(pk), Some(column)) => self.focus(&cell_key(pk, column)),
+            _ => self.focus(key),
+        }
+    }
+
+    /// Scroll so the grid's row `at` shows whole.
+    fn keep_in_view(&mut self, at: usize) {
+        let line = row_height();
+        let top = at as f32 * line;
+        let room = self.room.get();
+        if top < self.scroll {
+            self.scroll = top;
+        } else if room > 0.0 && top + line > self.scroll + room {
+            self.scroll = top + line - room;
+        }
     }
 
     /// Close the open cell: stage what it holds unless `cancel` or it is what it opened with.
@@ -813,11 +1107,12 @@ impl TablesViewState {
             return;
         };
         if !cancel && editing.input.value() != editing.seed {
-            app.stage(
+            app.stage_over(
                 self.sheet,
                 &editing.pk,
                 &editing.column,
                 editing.input.value().to_owned(),
+                editing.saw,
             );
         }
         self.focus(&cell_key(&editing.pk, &editing.column));
@@ -848,16 +1143,19 @@ impl TablesViewState {
         });
         let mut input = TextInputState::new(seed.clone());
         input.select_all();
+        self.anchor = None;
         self.editing = Some(Editing {
             pk: pk.to_owned(),
             column: column.to_owned(),
             seed,
+            saw: app.held(self.sheet, pk, column),
             input,
         });
         self.focus(EDIT);
     }
 
     fn select(&mut self, pk: &str, column: &str) {
+        self.anchor = None;
         self.row = Some(pk.to_owned());
         self.column = Some(column.to_owned());
         self.pane_scroll = 0.0;
@@ -865,19 +1163,73 @@ impl TablesViewState {
         self.reveal(column);
     }
 
-    /// Scroll across so `column` shows whole.
+    /// Scroll across so `column` shows whole. A column wider than the room beside the key
+    /// column cannot: the grid stays where it is while the room shows nothing but that column,
+    /// and otherwise shows it from its start.
     fn reveal(&mut self, column: &str) {
         let spans = self.spans.borrow();
         let room = self.grid_room.get();
         if let Some((_, start, end)) = spans.iter().find(|(name, ..)| name == column)
             && room > 0.0
         {
-            if *start < self.across {
-                self.across = *start;
-            } else if *end > self.across + room {
-                self.across = (*end - room).max(0.0);
-            }
+            self.across = across_for(self.across, *start, *end, room);
         }
+    }
+
+    /// A hold on `column`'s header edge: `input` is the pointer's travel since the press. The
+    /// column follows it; a double press that did not travel, or a press from the keyboard,
+    /// fits the column to its header and its widest value in every row. At the pointer's
+    /// release the keys return to the selected cell ([`Self::rest_focus`]).
+    fn size_column(&mut self, app: &TablesApp, column: &str, input: Option<&SemanticInput>) {
+        let Some(sheet) = app.sheet(self.sheet) else {
+            return;
+        };
+        let Some(found) = sheet.columns.iter().find(|c| c.name == column) else {
+            return;
+        };
+        let (low, high) = (NARROWEST * scale(), WIDEST * scale());
+        let set = |view: &mut Self, width: f32| {
+            view.widths
+                .entry(sheet.name.to_owned())
+                .or_default()
+                .insert(column.to_owned(), width.clamp(low, high));
+        };
+        match input {
+            Some(SemanticInput::Drag { dx, done, presses }) => {
+                let from = match &self.resizing {
+                    Some((held, from)) if held == column => *from,
+                    _ => match self.drawn.borrow().get(column) {
+                        Some(drawn) => *drawn,
+                        None => return,
+                    },
+                };
+                if *done && *presses >= 2 && dx.abs() < 2.0 {
+                    set(self, content_width(found, sheet.rows.iter()));
+                } else if self.resizing.is_some() || dx.abs() >= 1.0 {
+                    set(self, from + dx);
+                }
+                self.resizing = (!*done).then(|| (column.to_owned(), from));
+                if *done {
+                    self.rest_focus(&format!("{EDGE}{column}"), false);
+                }
+            }
+            None => set(self, content_width(found, sheet.rows.iter())),
+            Some(_) => {}
+        }
+    }
+
+    /// Left (`-1`) or Right (`1`) on `column`'s focused edge: the column a step narrower or
+    /// wider, within the bounds a drag keeps.
+    fn step_width(&mut self, column: &str, by: f32) {
+        let Some(drawn) = self.drawn.borrow().get(column).copied() else {
+            return;
+        };
+        let width =
+            (drawn + by * WIDTH_STEP * scale()).clamp(NARROWEST * scale(), WIDEST * scale());
+        self.widths
+            .entry(self.sheet.to_owned())
+            .or_default()
+            .insert(column.to_owned(), width);
     }
 
     /// Move the selection `rows` down (up where negative), or across by `columns`.
@@ -907,15 +1259,257 @@ impl TablesViewState {
         let pk = shown[row].pk.clone();
         let column = names[column as usize].to_owned();
         self.select(&pk, &column);
-        let line = row_height();
-        let top = row as f32 * line;
-        let room = self.room.get();
-        if top < self.scroll {
-            self.scroll = top;
-        } else if room > 0.0 && top + line > self.scroll + room {
-            self.scroll = top + line - room;
+        self.keep_in_view(row);
+    }
+
+    /// Where the selected cell stands among the rows and columns the grid shows, and how many
+    /// of each there are: (row, column, rows, columns).
+    fn stands(&self, app: &TablesApp) -> Option<(usize, usize, usize, usize)> {
+        let sheet = app.sheet(self.sheet)?;
+        let shown = self.shown_rows(app, sheet);
+        let columns = ordered(sheet);
+        let row = shown
+            .iter()
+            .position(|r| Some(&r.pk) == self.row.as_ref())?;
+        let column = columns
+            .iter()
+            .position(|c| Some(&c.name) == self.column.as_ref())?;
+        Some((row, column, shown.len(), columns.len()))
+    }
+
+    /// Tab (`1`) or Shift-Tab (`-1`): the cell after or before the selected one, a row's last
+    /// cell before the next row's first.
+    fn step_across(&mut self, app: &TablesApp, by: i32) {
+        let Some((row, column, rows, columns)) = self.stands(app) else {
+            return;
+        };
+        let to = (row * columns + column) as i64 + i64::from(by);
+        if to < 0 || to >= (rows * columns) as i64 {
+            return;
+        }
+        let (to_row, to_column) = (to as usize / columns, to as usize % columns);
+        self.step(
+            app,
+            to_row as i32 - row as i32,
+            to_column as i32 - column as i32,
+        );
+    }
+
+    /// Shift and an arrow: the selected cell moves and the range's other corner stays where the
+    /// range began; back on that corner the range is the one cell again.
+    fn extend(&mut self, app: &TablesApp, rows: i32, columns: i32) {
+        if let Some(sheet) = app.sheet(self.sheet) {
+            self.put_in_order(app, sheet);
+        }
+        let began = match self.corner() {
+            Some(corner) => Some((corner.pk.clone(), corner.column.clone())),
+            None => self.row.clone().zip(self.column.clone()),
+        };
+        self.step(app, rows, columns);
+        let order = self.order.borrow().stamp;
+        self.anchor = began
+            .filter(|(pk, column)| {
+                (Some(pk), Some(column)) != (self.row.as_ref(), self.column.as_ref())
+            })
+            .map(|(pk, column)| Corner { pk, column, order });
+    }
+
+    /// The rows and columns the selection holds, among those the grid shows: the selected cell's
+    /// own, or the range from its other corner while that stands ([`Self::corner`]).
+    fn range(
+        &self,
+        app: &TablesApp,
+    ) -> Option<(
+        std::ops::RangeInclusive<usize>,
+        std::ops::RangeInclusive<usize>,
+    )> {
+        let (row, column, ..) = self.stands(app)?;
+        let sheet = app.sheet(self.sheet)?;
+        let corner = self.corner().and_then(|corner| {
+            Some((
+                self.order
+                    .borrow()
+                    .keys
+                    .iter()
+                    .position(|key| *key == corner.pk)?,
+                ordered(sheet)
+                    .iter()
+                    .position(|c| c.name == corner.column)?,
+            ))
+        });
+        let (from_row, from_column) = corner.unwrap_or((row, column));
+        Some((
+            row.min(from_row)..=row.max(from_row),
+            column.min(from_column)..=column.max(from_column),
+        ))
+    }
+}
+
+/// Where the grid stands across so the column from `start` to `end` shows in `room`: scrolled
+/// no further than it takes to show the column whole. A column wider than the room is left
+/// where it is while it fills the room, and is otherwise shown from its start.
+fn across_for(across: f32, start: f32, end: f32, room: f32) -> f32 {
+    if end - start >= room {
+        if (start..=end - room).contains(&across) {
+            across
+        } else {
+            start
+        }
+    } else if start < across {
+        start
+    } else if end > across + room {
+        (end - room).max(0.0)
+    } else {
+        across
+    }
+}
+
+/// A cell's place in its column's order, read from its words once.
+enum Rank<'a> {
+    /// A whole number or a time, in a column of them.
+    Number(i128),
+    /// Words: without regard to case, then as they are written.
+    Words(String, &'a str),
+}
+
+impl<'a> Rank<'a> {
+    fn of(kind: ColumnKind, text: &'a str) -> Self {
+        match kind {
+            ColumnKind::Number | ColumnKind::Time => text
+                .trim()
+                .parse::<i128>()
+                .map_or_else(|_| Self::Words(text.to_lowercase(), text), Self::Number),
+            ColumnKind::Text => Self::Words(text.to_lowercase(), text),
         }
     }
+
+    /// Numbers and times by their value, one that is no number after those that are; words
+    /// without regard to case ([`natural_lowered`]), those that differ only in case in their own
+    /// order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Number(a), Self::Number(b)) => a.cmp(b),
+            (Self::Number(_), Self::Words(..)) => Ordering::Less,
+            (Self::Words(..), Self::Number(_)) => Ordering::Greater,
+            (Self::Words(low_a, a), Self::Words(low_b, b)) => {
+                natural_lowered(low_a, low_b).then_with(|| a.cmp(b))
+            }
+        }
+    }
+}
+
+/// Words already lowered, in order, each run of digits in them by its value: `m9` before
+/// `m55`, `rack 2` before `rack 10`; `Equal` where they differ only in the leading zeros of a
+/// run. [`Rank::cmp`] then stands words that differ only in case or zeros in their own order.
+fn natural_lowered(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    /// A leading run of digits, without its leading zeros, and what follows it.
+    fn digits(text: &str) -> (&str, &str) {
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        (text[..end].trim_start_matches('0'), &text[end..])
+    }
+    let (mut x, mut y) = (a, b);
+    loop {
+        match (x.chars().next(), y.chars().next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(p), Some(q)) if p.is_ascii_digit() && q.is_ascii_digit() => {
+                let ((run_x, rest_x), (run_y, rest_y)) = (digits(x), digits(y));
+                let order = run_x.len().cmp(&run_y.len()).then_with(|| run_x.cmp(run_y));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (x, y) = (rest_x, rest_y);
+            }
+            (Some(p), Some(q)) => {
+                if p != q {
+                    return p.cmp(&q);
+                }
+                (x, y) = (&x[p.len_utf8()..], &y[q.len_utf8()..]);
+            }
+        }
+    }
+}
+
+/// The cell a pasted field lands on ([`TablesApp::paste`]).
+struct Landing {
+    pk: String,
+    column: String,
+    /// Whether the page edits the cell: its column takes an edit and this build reads its value.
+    takes: bool,
+}
+
+/// A cell's words as one field of tab-separated text. Words that begin with `"` or hold a tab
+/// or a line end are set between `"`, each `"` in them doubled, as a spreadsheet writes them:
+/// it reads a field that begins with `"` as running to its closing one, tabs and line ends
+/// inside it part of the cell.
+fn tsv_field(text: &str) -> String {
+    if text.starts_with('"') || text.contains(['\t', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_owned()
+    }
+}
+
+/// The cells of tab-separated text, as a spreadsheet writes them and [`tsv_field`] does: a line
+/// is a row and a tab parts its cells; a cell that begins with `"` runs to its closing `"`,
+/// holding tabs and line ends as they are and `""` for one `"`. A `"` that never closes is the
+/// character itself. A line end at the very end ends the last row and begins no other.
+fn cells_of(text: &str) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut cell = String::new();
+        // A quoted cell: to the `"` that is not one of a pair.
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut at = 0;
+            let closed = loop {
+                match quoted[at..].find('"') {
+                    None => break None,
+                    Some(found) if quoted[at + found + 1..].starts_with('"') => {
+                        cell.push_str(&quoted[at..=at + found]);
+                        at += found + 2;
+                    }
+                    Some(found) => {
+                        cell.push_str(&quoted[at..at + found]);
+                        break Some(at + found + 1);
+                    }
+                }
+            };
+            match closed {
+                Some(end) => rest = &quoted[end..],
+                None => cell.clear(),
+            }
+        }
+        // What follows, to the tab or the line end that ends the cell.
+        let end = rest.find(['\t', '\n', '\r']).unwrap_or(rest.len());
+        cell.push_str(&rest[..end]);
+        row.push(cell);
+        rest = &rest[end..];
+        if let Some(after) = rest.strip_prefix('\t') {
+            rest = after;
+            if rest.is_empty() {
+                row.push(String::new());
+            }
+            continue;
+        }
+        let after = rest
+            .strip_prefix("\r\n")
+            .or_else(|| rest.strip_prefix(['\n', '\r']));
+        if let Some(after) = after {
+            rest = after;
+            rows.push(std::mem::take(&mut row));
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 fn cell_key(pk: &str, column: &str) -> String {
@@ -979,8 +1573,15 @@ impl TablesApp {
                     .and_then(|k| k.as_str().strip_prefix(CELL))
                     .and_then(|rest| rest.split_once('/'))
                 {
+                    if (view.row.as_deref(), view.column.as_deref()) != (Some(pk), Some(column)) {
+                        view.anchor = None;
+                    }
                     view.row = Some(pk.to_owned());
                     view.column = Some(column.to_owned());
+                }
+                // A cell, a header or an edge the grid holds off its screen comes into view.
+                if let Some(key) = focus.as_ref() {
+                    view.reveal_listed_control(key);
                 }
                 view.common.last_focus = focus;
                 true
@@ -998,6 +1599,9 @@ impl TablesApp {
                         view.find = TextInputState::new(value.clone());
                         view.scroll = 0.0;
                         return true;
+                    }
+                    if key == PASTE {
+                        return self.paste(view, value);
                     }
                 }
                 if let Some(SemanticInput::TextPosition { byte, extend }) = action.value.as_ref() {
@@ -1027,6 +1631,7 @@ impl TablesApp {
                     {
                         if view.sheet != *name {
                             view.sheet = name;
+                            view.anchor = None;
                             view.row = None;
                             view.column = None;
                             view.scroll = 0.0;
@@ -1050,6 +1655,19 @@ impl TablesApp {
                         view.select(pk, column);
                     }
                     return true;
+                }
+                if let Some(column) = key.strip_prefix(EDGE) {
+                    view.size_column(self, column, action.value.as_ref());
+                    return true;
+                }
+                if let Some(column) = key.strip_prefix(HEAD) {
+                    let listed = self
+                        .sheet(view.sheet)
+                        .is_some_and(|sheet| sheet.columns.iter().any(|c| c.name == column));
+                    if listed {
+                        view.sort_by(self, column);
+                    }
+                    return listed;
                 }
                 if let Some(column) = key.strip_prefix(UNDO) {
                     if let Some(pk) = view.row.clone() {
@@ -1079,7 +1697,7 @@ impl TablesApp {
                             pk.clone(),
                             column.to_owned(),
                         ));
-                        self.put((view.sheet.to_owned(), pk, column.to_owned()), value);
+                        self.put((view.sheet.to_owned(), pk, column.to_owned()), value, None);
                         self.note = None;
                     }
                     return true;
@@ -1134,8 +1752,11 @@ impl TablesApp {
                     .map(|k| k.as_str().to_owned());
                 match focus.as_deref() {
                     Some(EDIT) if view.editing.is_some() => match event {
+                        // Enter keeps what was typed and moves to the cell below, as a
+                        // spreadsheet's does; Escape leaves the cell as it was.
                         TextInputEvent::Submit => {
                             view.close_edit(self, false);
+                            view.step(self, 1, 0);
                             true
                         }
                         TextInputEvent::Cancel => {
@@ -1159,6 +1780,14 @@ impl TablesApp {
                         true
                     }
                     Some(key) if key.starts_with(CELL) => match event {
+                        TextInputEvent::Left { extend: true } => {
+                            view.extend(self, 0, -1);
+                            true
+                        }
+                        TextInputEvent::Right { extend: true } => {
+                            view.extend(self, 0, 1);
+                            true
+                        }
                         TextInputEvent::Left { .. } => {
                             view.step(self, 0, -1);
                             true
@@ -1167,12 +1796,23 @@ impl TablesApp {
                             view.step(self, 0, 1);
                             true
                         }
+                        // Delete or Backspace empties what the selection holds: staged, as
+                        // typing nothing into each cell would be.
+                        TextInputEvent::Backspace | TextInputEvent::Delete => {
+                            self.clear_selection(view);
+                            true
+                        }
                         TextInputEvent::Submit => {
                             if let (Some(pk), Some(column)) =
                                 (view.row.clone(), view.column.clone())
                             {
                                 view.open_edit(self, &pk, &column);
                             }
+                            true
+                        }
+                        // Escape on a range leaves the one selected cell.
+                        TextInputEvent::Cancel if view.anchor.is_some() => {
+                            view.anchor = None;
                             true
                         }
                         // Typing on a selected cell opens it with what was typed.
@@ -1189,12 +1829,32 @@ impl TablesApp {
                         }
                         _ => false,
                     },
+                    // Left and Right on a column's focused edge size the column.
+                    Some(key) if key.starts_with(EDGE) => {
+                        let by = match event {
+                            TextInputEvent::Left { .. } => -1.0,
+                            TextInputEvent::Right { .. } => 1.0,
+                            _ => return false,
+                        };
+                        view.step_width(&key[EDGE.len()..], by);
+                        true
+                    }
                     _ => false,
                 }
             }
             AppEvent::StepFocus(rows) => {
                 view.close_edit(self, false);
                 view.step(self, rows, 0);
+                true
+            }
+            AppEvent::StepAcross(by) => {
+                view.close_edit(self, false);
+                view.step_across(self, by);
+                true
+            }
+            AppEvent::ExtendFocus(rows) => {
+                view.close_edit(self, false);
+                view.extend(self, rows, 0);
                 true
             }
             AppEvent::ScrollAt { lines, key } if key.as_str().starts_with("tables/pane") => {
@@ -1207,6 +1867,11 @@ impl TablesApp {
                     (view.scroll + lines as f32 * row_height()).clamp(0.0, view.limit.get());
                 true
             }
+            AppEvent::ScrollAcross(lines) => {
+                view.across = (view.across + lines as f32 * ACROSS_STEP * scale().max(1.0))
+                    .clamp(0.0, view.across_limit.get());
+                true
+            }
             AppEvent::ScrollPage(pages) => {
                 view.scroll = (view.scroll + pages as f32 * view.room.get().max(row_height()))
                     .clamp(0.0, view.limit.get());
@@ -1214,6 +1879,224 @@ impl TablesApp {
             }
             _ => false,
         }
+    }
+
+    /// Whether Tab (or Shift-Tab, `backwards`) moves within the sheet: focus is on a cell or in
+    /// an open one, and a cell lies after (before) it. Past the sheet's last (first) cell Tab
+    /// leaves the grid for the next control, as it leaves any other.
+    pub(crate) fn tab_stays(&self, view: &TablesViewState, backwards: bool) -> bool {
+        let in_sheet = view
+            .common
+            .last_focus
+            .as_ref()
+            .is_some_and(|key| key.as_str() == EDIT || key.as_str().starts_with(CELL));
+        in_sheet
+            && view
+                .stands(self)
+                .is_some_and(|(row, column, rows, columns)| {
+                    if backwards {
+                        row > 0 || column > 0
+                    } else {
+                        row + 1 < rows || column + 1 < columns
+                    }
+                })
+    }
+
+    /// The cells the selection holds, top row first, each row's cells left to right: (row key,
+    /// column name) of each.
+    fn selection(&self, view: &TablesViewState) -> Vec<Vec<(String, String)>> {
+        let (Some(sheet), Some((rows, columns))) = (self.sheet(view.sheet), view.range(self))
+        else {
+            return Vec::new();
+        };
+        let shown = view.shown_rows(self, sheet);
+        let names = ordered(sheet);
+        rows.map(|row| {
+            columns
+                .clone()
+                .map(|column| (shown[row].pk.clone(), names[column].name.clone()))
+                .collect()
+        })
+        .collect()
+    }
+
+    /// What a copy takes while focus is on a cell: the words the grid shows in the selected
+    /// cell, or in each cell of the range, a row to a line and its cells a tab apart, as a
+    /// spreadsheet reads them back ([`tsv_field`]; [`cells_of`] reads them here). A cell shows a
+    /// secret's entry name or its mask, never its value, so neither does a copy.
+    pub(crate) fn selection_tsv(&self, view: &TablesViewState) -> Option<String> {
+        view.common
+            .last_focus
+            .as_ref()
+            .filter(|key| key.as_str().starts_with(CELL))?;
+        let sheet = self.sheet(view.sheet)?;
+        let lines: Vec<String> = self
+            .selection(view)
+            .iter()
+            .map(|cells| {
+                cells
+                    .iter()
+                    .map(|(pk, column)| {
+                        let at = (view.sheet.to_owned(), pk.clone(), column.clone());
+                        let text = self.staged.get(&at).cloned().unwrap_or_else(|| {
+                            sheet
+                                .rows
+                                .iter()
+                                .find(|row| row.pk == *pk)
+                                .and_then(|row| row.cells.get(column))
+                                .map(|cell| cell.text.clone())
+                                .unwrap_or_default()
+                        });
+                        tsv_field(&text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Stage nothing in each cell of the selection that takes an edit and shows something: a
+    /// column the page does not edit, a value this build cannot read and a past table are left.
+    fn clear_selection(&mut self, view: &TablesViewState) {
+        if self.fixed() {
+            return;
+        }
+        let sheet = view.sheet;
+        for (pk, column) in self.selection(view).into_iter().flatten() {
+            let takes = self.sheet(sheet).is_some_and(|s| {
+                let shown = s
+                    .rows
+                    .iter()
+                    .find(|row| row.pk == pk)
+                    .and_then(|row| row.cells.get(&column));
+                s.columns.iter().any(|c| c.name == column && c.editable)
+                    && !shown.is_some_and(|cell| cell.raw)
+            });
+            if takes {
+                self.stage(sheet, &pk, &column, String::new());
+            }
+        }
+    }
+
+    /// A paste of `text`. In the open cell or the find field it is typed text. On a selected
+    /// cell it is a block of cells ([`cells_of`]): its lines go down the rows the grid shows
+    /// from the selection's first cell and each line's cells across the columns, every one
+    /// staged where the page edits the cell; one cell pasted on a range fills the range. A
+    /// column the page does not edit, a value this build cannot read and what lies past the
+    /// sheet's last row or column are left, and the bar says how many. Nothing is written.
+    fn paste(&mut self, view: &mut TablesViewState, text: &str) -> bool {
+        let focus = view
+            .common
+            .last_focus
+            .as_ref()
+            .map(|key| key.as_str().to_owned());
+        match focus.as_deref() {
+            Some(EDIT) => {
+                let Some(editing) = view.editing.as_mut() else {
+                    return false;
+                };
+                edit(&mut editing.input, TextInputEvent::Commit(text.to_owned()));
+                return true;
+            }
+            Some(FIND) => {
+                edit(&mut view.find, TextInputEvent::Commit(text.to_owned()));
+                view.scroll = 0.0;
+                return true;
+            }
+            Some(key) if key.starts_with(CELL) => {}
+            _ => return false,
+        }
+        if self.fixed() {
+            return true;
+        }
+        let block = cells_of(text);
+        let (Some(sheet), Some((rows, columns))) = (self.sheet(view.sheet), view.range(self))
+        else {
+            return true;
+        };
+        // The cell each field lands on, where the sheet has one there.
+        let shown = view.shown_rows(self, sheet);
+        let names = ordered(sheet);
+        let lands = |row: usize, column: usize| {
+            let (row, column) = (shown.get(row)?, names.get(column)?);
+            Some(Landing {
+                pk: row.pk.clone(),
+                column: column.name.clone(),
+                takes: column.editable && !row.cells.get(&column.name).is_some_and(|c| c.raw),
+            })
+        };
+        let mut fields: Vec<(Option<Landing>, String)> = Vec::new();
+        let (mut last_row, mut last_column) = (*rows.start(), *columns.start());
+        if let [line] = block.as_slice()
+            && let [one] = line.as_slice()
+        {
+            for row in rows.clone() {
+                for column in columns.clone() {
+                    fields.push((lands(row, column), one.clone()));
+                }
+            }
+            (last_row, last_column) = (*rows.end(), *columns.end());
+        } else {
+            for (down, line) in block.into_iter().enumerate() {
+                for (over, text) in line.into_iter().enumerate() {
+                    let (row, column) = (rows.start() + down, columns.start() + over);
+                    let on = lands(row, column);
+                    if on.is_some() {
+                        (last_row, last_column) = (last_row.max(row), last_column.max(column));
+                    }
+                    fields.push((on, text));
+                }
+            }
+        }
+        // The pasted block is the selection, from its first cell to its last.
+        let first = lands(*rows.start(), *columns.start());
+        let last = lands(last_row, last_column);
+        let sheet = view.sheet;
+        let (mut pasted, mut left) = (0_usize, 0_usize);
+        for (on, text) in fields {
+            match on {
+                Some(on) if on.takes => {
+                    self.stage(sheet, &on.pk, &on.column, text);
+                    pasted += 1;
+                }
+                _ => left += 1,
+            }
+        }
+        if let (Some(first), Some(last)) = (first, last) {
+            view.select(&first.pk, &first.column);
+            if (&first.pk, &first.column) != (&last.pk, &last.column) {
+                view.anchor = Some(Corner {
+                    pk: last.pk,
+                    column: last.column,
+                    order: view.order.borrow().stamp,
+                });
+            }
+        }
+        if left > 0 {
+            self.note = Some(format!(
+                "Pasted {pasted} of {} cells: the rest fall past the sheet's last row or \
+                 column, or in cells the page does not edit",
+                pasted + left
+            ));
+        }
+        true
+    }
+
+    /// Whether a Write would send anything: cells are staged, none is being written, and the
+    /// page shows the table as it is.
+    fn can_write(&self) -> bool {
+        !self.staged.is_empty() && !self.writing && !self.fixed()
+    }
+
+    /// Whether File ▸ Save and its key press Write: a Write would send something
+    /// ([`Self::can_write`]), or would once it has staged what the open cell holds.
+    pub(crate) fn can_save(&self, view: &TablesViewState) -> bool {
+        let typed = view
+            .editing
+            .as_ref()
+            .is_some_and(|editing| editing.input.value() != editing.seed);
+        !self.writing && !self.fixed() && (typed || !self.staged.is_empty())
     }
 
     /// Whether the page holds a typed text field the focus is in.
@@ -1236,7 +2119,7 @@ impl NativeAppModel for TablesApp {
         AppDescriptor {
             kind: AppKind::Tables,
             name: TABLES_TITLE,
-            icon: AppIcon::Editor,
+            icon: AppIcon::Tables,
             singleton: true,
         }
     }
@@ -1259,12 +2142,34 @@ impl NativeAppModel for TablesApp {
         page(self, view, cx.viewport.width, cx.viewport.height)
     }
 
-    fn commands(&self, _: &Self::ViewState, _: &mut Vec<Command>) {}
+    /// Write and Discard, which the palette lists and Save's key presses: the sheet keeps Tab
+    /// for its cells, so neither is a long way off for the keyboard.
+    fn commands(&self, _: &Self::ViewState, out: &mut Vec<Command>) {
+        out.push(Command {
+            id: ActionId::new(WRITE),
+            title: "Tables: Write Changes".to_string(),
+            shortcut: Some(
+                if cfg!(target_os = "macos") {
+                    "Cmd-S"
+                } else {
+                    "Ctrl-S"
+                }
+                .to_string(),
+            ),
+            enabled: self.can_write(),
+        });
+        out.push(Command {
+            id: ActionId::new(DISCARD),
+            title: "Tables: Discard Changes".to_string(),
+            shortcut: None,
+            enabled: !self.staged.is_empty() && !self.writing,
+        });
+    }
 
     fn presentation(&self, _: &Self::ViewState) -> AppPresentation {
         AppPresentation {
             title: TABLES_TITLE.into(),
-            icon: AppIcon::Editor,
+            icon: AppIcon::Tables,
             indicators: AppIndicators {
                 dirty: !self.staged.is_empty(),
                 busy: self.writing,
@@ -1465,24 +2370,45 @@ pub(crate) fn when_words(at_ms: u64, now_ms: u64) -> String {
     )
 }
 
-/// How wide each column draws: its header or its widest value, within bounds.
-fn widths(sheet: &Sheet, columns: &[&SheetColumn]) -> Vec<f32> {
-    let pad = 20.0;
+/// How far one notch of a sideways wheel scrolls the grid across.
+const ACROSS_STEP: f32 = 48.0;
+/// The room a header keeps beside its name for its sort mark and its edge.
+const HEAD_ROOM: f32 = 16.0;
+/// How wide a column's edge is in the header line.
+const EDGE_WIDTH: f32 = 7.0;
+/// How wide a sorted header's mark is.
+const SORT_MARK: f32 = 10.0;
+/// How thick the bar is that says where the columns stand across, and the one down the key
+/// column's edge while columns lie under it.
+const ACROSS_BAR: f32 = 3.0;
+
+/// How wide `column` is where it shows its header and each of `rows`' values whole.
+fn content_width<'a>(column: &SheetColumn, rows: impl Iterator<Item = &'a SheetRow>) -> f32 {
+    let header = text_width(&column.label, SemanticRole::Text, StyleRef::Note) + HEAD_ROOM;
+    let widest = rows
+        .filter_map(|row| row.cells.get(&column.name))
+        .map(|cell| {
+            let tag = if cell.values.is_empty() { 0.0 } else { 70.0 };
+            text_width(&cell.text, SemanticRole::Text, StyleRef::Plain) + tag
+        })
+        .fold(0.0_f32, f32::max);
+    header.max(widest) + 20.0
+}
+
+/// How wide each column draws: as a person sized it, else as its header or the widest of its
+/// first rows needs, within bounds.
+fn widths(view: &TablesViewState, sheet: &Sheet, columns: &[&SheetColumn]) -> Vec<f32> {
+    let sized = view.widths.get(sheet.name);
     columns
         .iter()
         .map(|column| {
-            let header = text_width(&column.label, SemanticRole::Text, StyleRef::Note);
-            let widest = sheet
-                .rows
-                .iter()
-                .take(200)
-                .filter_map(|row| row.cells.get(&column.name))
-                .map(|cell| {
-                    let tag = if cell.values.is_empty() { 0.0 } else { 70.0 };
-                    text_width(&cell.text, SemanticRole::Text, StyleRef::Plain) + tag
+            sized
+                .and_then(|sized| sized.get(&column.name))
+                .copied()
+                .unwrap_or_else(|| {
+                    content_width(column, sheet.rows.iter().take(200))
+                        .clamp(56.0 * scale(), 260.0 * scale())
                 })
-                .fold(0.0_f32, f32::max);
-            (header.max(widest) + pad).clamp(56.0 * scale(), 260.0 * scale())
         })
         .collect()
 }
@@ -1612,21 +2538,69 @@ fn padded(key: String, inner: UiNode, width: f32) -> UiNode {
         .children(vec![inner])
 }
 
-/// The grid's lines: the group header, the column header and every row the find leaves.
+/// A header line's cell `width` wide: raised ground, ruled right and bottom.
+fn head_cell(key: String, width: f32, children: Vec<UiNode>) -> UiNode {
+    styled(key, StyleRef::CellHead)
+        .layout(Layout::default().width(Length::Fixed(width)))
+        .children(children)
+}
+
+/// A column's right edge in the header line ([`EDGE`]): the last points of its header cell. Its
+/// name says what a press does (it fits the column); a pointer drags it, and Left and Right
+/// size the column from the keyboard.
+fn edge(column: &SheetColumn) -> UiNode {
+    let key = format!("{EDGE}{}", column.name);
+    let handle = UiNode::new(
+        key.clone(),
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new(format!(
+                    "Fit {} column to its widest value",
+                    field_words(column)
+                ))
+                .visual_label(String::new())
+                .description("Left and Right make the column narrower and wider"),
+                ActionId::new(key.clone()),
+            )
+            .style(StyleRef::Navigation)
+            .drags(),
+        ),
+    )
+    .layout(Layout::default().width(Length::Fixed(EDGE_WIDTH)));
+    group(format!("{key}/lane"))
+        .layout(Layout::row())
+        .children(vec![
+            group(format!("{key}/lead")).layout(Layout::default().width(Length::Fill)),
+            handle,
+        ])
+}
+
+/// The grid: a sheet of ruled cells. The group line and the header line stay at its top, the
+/// row numbers and the key column at its left; every row the find leaves is listed under them.
 #[expect(clippy::too_many_lines, reason = "one grid, laid out in one pass")]
 fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, height: f32) -> UiNode {
     let columns = ordered(sheet);
-    let mut widths = widths(sheet, &columns);
+    let mut widths = widths(view, sheet, &columns);
     let line = row_height();
     let head_line = 22.0 * scale().max(1.0);
+    let rows = view.shown_rows(app, sheet);
+    // The frame rules the grid's four sides: a point at each.
     let room_across = (width - 2.0).max(1.0);
-    // The key column (the first) stays at the left, at most half the room; the rest scroll
-    // across in the room beside it.
+    // The row numbers stay at the left, then the key column (the first), at most half of what
+    // is left; the rest scroll across in the room beside them.
+    let gutter = (text_width(
+        &rows.len().max(1).to_string(),
+        SemanticRole::Text,
+        StyleRef::Primary,
+    ) + 16.0)
+        .max(36.0 * scale())
+        .min(room_across * 0.25);
+    let after_gutter = (room_across - gutter).max(1.0);
     if let Some(key) = widths.first_mut() {
-        *key = key.min(room_across * 0.5);
+        *key = key.min(after_gutter * 0.5);
     }
     let pinned = widths.first().copied().unwrap_or(0.0);
-    let room_beside = (room_across - pinned).max(1.0);
+    let room_beside = (after_gutter - pinned).max(1.0);
     view.grid_room.set(room_beside);
     let beside: f32 = widths.iter().skip(1).sum();
     {
@@ -1637,43 +2611,58 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             spans.push((column.name.clone(), at, at + w));
             at += w;
         }
+        *view.drawn.borrow_mut() = columns
+            .iter()
+            .zip(&widths)
+            .map(|(column, w)| (column.name.clone(), *w))
+            .collect();
     }
-    let across = view.across.min((beside - room_beside).max(0.0));
-    // A line of the grid: its key column's seat, then the rest, scrolled across and clipped
-    // where the key column ends.
-    let lane = |key: String, mut children: Vec<UiNode>, h: f32| {
-        let rest = if children.is_empty() {
-            Vec::new()
+    let across_limit = (beside - room_beside).max(0.0);
+    view.across_limit.set(across_limit);
+    let across = view.across.min(across_limit);
+    // A line of the grid: its number's and its key column's seats, then the rest, scrolled
+    // across and clipped where the key column ends.
+    // `listed` keeps what the lane scrolls off its side in the tree, as the rows' list keeps
+    // theirs: a header out of view is still named, and comes into view when focus reaches it.
+    let lane = |key: String, mut children: Vec<UiNode>, h: f32, listed: bool| {
+        let rest = if children.len() > 2 {
+            children.split_off(2)
         } else {
-            children.split_off(1)
+            Vec::new()
         };
-        children.push(
-            group(format!("{key}/across"))
-                .layout(
-                    Layout::row()
-                        .height(Length::Fixed(h))
-                        .clipped()
-                        .scrolled(across),
-                )
-                .children(rest),
-        );
+        let mut beside = group(format!("{key}/across"))
+            .layout(
+                Layout::row()
+                    .height(Length::Fixed(h))
+                    .clipped()
+                    .scrolled(across),
+            )
+            .children(rest);
+        if listed {
+            beside = beside.room(h, false).lists_every_row();
+        }
+        children.push(beside);
         group(key)
             .layout(Layout::row().height(Length::Fixed(h)))
             .children(children)
     };
-    // The group header: each group's word over its first column, its span ruled off. The key
+    // The group line: each group's word over its first column, its span ruled off. The key
     // column carries its group's word, so a group it begins reads once, over it.
-    let mut groups = Vec::new();
+    let mut groups = vec![head_cell("tables/groups/#".into(), gutter, Vec::new())];
     if let Some(first) = columns.first() {
-        groups.push(padded(
+        groups.push(head_cell(
             "tables/groups/0".into(),
-            fitted(
-                "tables/groups/0/word",
-                first.group.word(),
-                StyleRef::Note,
-                pinned - 10.0,
-            ),
             pinned,
+            vec![padded(
+                "tables/groups/0/pad".into(),
+                fitted(
+                    "tables/groups/0/word",
+                    first.group.word(),
+                    StyleRef::Note,
+                    pinned - 10.0,
+                ),
+                pinned,
+            )],
         ));
     }
     let mut at = 1;
@@ -1692,45 +2681,126 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         } else {
             group_of.word()
         };
-        groups.push(padded(
+        groups.push(head_cell(
             format!("tables/groups/{at}"),
-            fitted(
-                format!("tables/groups/{at}/word"),
-                word,
-                StyleRef::Note,
-                span - 10.0,
-            ),
             span,
+            vec![padded(
+                format!("tables/groups/{at}/pad"),
+                fitted(
+                    format!("tables/groups/{at}/word"),
+                    word,
+                    StyleRef::Note,
+                    span - 10.0,
+                ),
+                span,
+            )],
         ));
         at = end;
     }
-    let headers: Vec<UiNode> = columns
-        .iter()
-        .zip(&widths)
-        .map(|(column, w)| {
-            padded(
-                format!("tables/head/{}", column.name),
-                fitted(
-                    format!("tables/head/{}/word", column.name),
-                    &column.label,
-                    StyleRef::Note,
-                    w - 10.0,
-                ),
-                *w,
-            )
-        })
-        .collect();
-    let rows = view.shown_rows(app, sheet);
-    *view.listed.borrow_mut() = rows.iter().map(|r| r.pk.clone()).collect();
-    let room = (height - head_line - line - 8.0).max(0.0);
+    // The header line: `#` over the row numbers, then each column's name and its edge.
+    let mut headers = vec![head_cell(
+        "tables/head/#/seat".into(),
+        gutter,
+        vec![padded(
+            "tables/head/#/pad".into(),
+            fitted("tables/head/#", "#", StyleRef::Note, gutter - 10.0),
+            gutter,
+        )],
+    )];
+    let sorted = view.sorted(sheet);
+    for (column, w) in columns.iter().zip(&widths) {
+        // A header is a press that sorts by its column: its name says so, in the words a
+        // cell's is said in, and how the column is sorted; its face wears a drawn mark.
+        let key = format!("{HEAD}{}", column.name);
+        let state = sorted
+            .filter(|(by, _)| by.name == column.name)
+            .map(|(_, descending)| descending);
+        let (mark, said) = match state {
+            Some(false) => (Some(StyleRef::SortUp), ", sorted ascending"),
+            Some(true) => (Some(StyleRef::SortDown), ", sorted descending"),
+            None => (None, ""),
+        };
+        let mark_w = if mark.is_some() { SORT_MARK } else { 0.0 };
+        let mut face = vec![fitted(
+            format!("{key}/word"),
+            &column.label,
+            StyleRef::Note,
+            (w - 20.0 - mark_w).max(1.0),
+        )];
+        if let Some(mark) = mark {
+            face.push(group(format!("{key}/lead")).layout(Layout::default().width(Length::Fill)));
+            face.push(
+                styled(format!("{key}/mark"), mark)
+                    .layout(Layout::default().width(Length::Fixed(mark_w))),
+            );
+        }
+        headers.push(head_cell(
+            format!("{key}/seat"),
+            *w,
+            vec![
+                press(&key, format!("Sort by {}{said}", field_words(column))),
+                group(format!("{key}/face"))
+                    .layout(Layout::row().padding(Insets::symmetric(10.0, 0.0)))
+                    .children(face)
+                    .paint_only_tree(),
+                edge(column),
+            ],
+        ));
+    }
+    let room = (height - 3.0 - head_line - line).max(0.0);
     let limit = (rows.len() as f32 * line - room).max(0.0);
     view.room.set(room);
     view.limit.set(limit);
+    let scroll = view.scroll.min(limit);
+    // A cell far from what the grid shows keeps its seat and its press, which name it to the
+    // keyboard and to assistive technology, and draws nothing.
+    let (over_rows, over_across) = (line * 6.0, 240.0);
+    let range = view.corner().and_then(|_| view.range(app));
     let mut lines = Vec::with_capacity(rows.len());
-    for row in &rows {
+    for (n, row) in rows.iter().enumerate() {
+        let top = n as f32 * line;
+        let near_row = top + line >= scroll - over_rows && top <= scroll + room + over_rows;
         let selected = view.row.as_deref() == Some(row.pk.as_str());
-        let mut cells = Vec::with_capacity(columns.len());
-        for (column, w) in columns.iter().zip(&widths) {
+        let mut cells = Vec::with_capacity(columns.len() + 1);
+        let number_key = format!("tables/num/{}", row.pk);
+        let number = if near_row {
+            // On the header ground, where the note's ink reads and the tertiary one does not.
+            let style = if selected {
+                StyleRef::Primary
+            } else {
+                StyleRef::Note
+            };
+            let words = (n + 1).to_string();
+            let words_w = text_width(&words, SemanticRole::Text, style).min(gutter - 12.0);
+            vec![
+                group(format!("{number_key}/row"))
+                    .layout(Layout::row().padding(Insets {
+                        right: 8.0,
+                        ..Insets::default()
+                    }))
+                    .children(vec![
+                        group(format!("{number_key}/lead"))
+                            .layout(Layout::default().width(Length::Fill)),
+                        fitted(format!("{number_key}/n"), &words, style, words_w),
+                    ]),
+            ]
+        } else {
+            Vec::new()
+        };
+        cells.push(head_cell(number_key, gutter, number).layout_height(line));
+        let mut left = 0.0;
+        for (at, (column, w)) in columns.iter().zip(&widths).enumerate() {
+            let near = near_row
+                && (at == 0
+                    || (left + w >= across - over_across
+                        && left <= across + room_beside + over_across));
+            if at > 0 {
+                left += w;
+            }
+            // A cell a range holds beside the selected one.
+            let ranged = range
+                .as_ref()
+                .is_some_and(|(rows, columns)| rows.contains(&n) && columns.contains(&at));
             let key = cell_key(&row.pk, &column.name);
             let at = (sheet.name.to_owned(), row.pk.clone(), column.name.clone());
             let shown = row.cells.get(&column.name);
@@ -1750,10 +2820,8 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     ),
                 );
             } else {
-                if staged.is_some() {
+                if staged.is_some() && near {
                     seat.push(styled(format!("{key}/staged"), StyleRef::Unwritten));
-                } else if focused {
-                    seat.push(styled(format!("{key}/focus"), StyleRef::Secondary));
                 }
                 let text = staged
                     .cloned()
@@ -1778,51 +2846,65 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 if changed {
                     spoken.push_str(", changed since");
                 }
+                if ranged {
+                    spoken.push_str(", selected");
+                    // Under the ring on the selected cell and the blue of a staged one.
+                    if near && !focused && staged.is_none() {
+                        seat.push(styled(format!("{key}/range"), StyleRef::CellRange).paint_only());
+                    }
+                }
                 seat.push(press(&key, spoken));
                 let style = if column.group == Group::Stored {
                     StyleRef::Plain
                 } else {
                     StyleRef::Secondary
                 };
-                let mut face = Vec::new();
-                if conflict || changed {
-                    let n = shown.map_or(0, |c| c.values.len());
-                    let tag = if conflict {
-                        format!("{n} values")
+                if near {
+                    let mut face = Vec::new();
+                    if conflict || changed {
+                        let n = shown.map_or(0, |c| c.values.len());
+                        let tag = if conflict {
+                            format!("{n} values")
+                        } else {
+                            "changed".to_owned()
+                        };
+                        let tag_w = text_width(&tag, SemanticRole::Text, StyleRef::Chip) + 6.0;
+                        face.push(fitted(
+                            format!("{key}/text"),
+                            &text,
+                            style,
+                            (w - 20.0 - tag_w).max(1.0),
+                        ));
+                        face.push(words(
+                            format!("{key}/tag"),
+                            tag,
+                            StyleRef::Chip,
+                            Length::Fixed(tag_w),
+                        ));
+                    } else if column.kind == ColumnKind::Number {
+                        let tw = text_width(&text, SemanticRole::Text, style).min(w - 20.0);
+                        face.push(
+                            group(format!("{key}/lead"))
+                                .layout(Layout::default().width(Length::Fill)),
+                        );
+                        face.push(fitted(format!("{key}/text"), &text, style, tw));
                     } else {
-                        "changed".to_owned()
-                    };
-                    let tag_w = text_width(&tag, SemanticRole::Text, StyleRef::Chip) + 6.0;
-                    face.push(fitted(
-                        format!("{key}/text"),
-                        &text,
-                        style,
-                        (w - 20.0 - tag_w).max(1.0),
-                    ));
-                    face.push(words(
-                        format!("{key}/tag"),
-                        tag,
-                        StyleRef::Chip,
-                        Length::Fixed(tag_w),
-                    ));
-                } else if column.numeric {
-                    let tw = text_width(&text, SemanticRole::Text, style).min(w - 20.0);
-                    face.push(
-                        group(format!("{key}/lead")).layout(Layout::default().width(Length::Fill)),
+                        face.push(fitted(format!("{key}/text"), &text, style, w - 20.0));
+                    }
+                    seat.push(
+                        group(format!("{key}/face"))
+                            .layout(Layout::row().gap(4.0).padding(Insets::symmetric(10.0, 0.0)))
+                            .children(face)
+                            .paint_only_tree(),
                     );
-                    face.push(fitted(format!("{key}/text"), &text, style, tw));
-                } else {
-                    face.push(fitted(format!("{key}/text"), &text, style, w - 20.0));
                 }
-                seat.push(
-                    group(format!("{key}/face"))
-                        .layout(Layout::row().gap(4.0).padding(Insets::symmetric(10.0, 0.0)))
-                        .children(face)
-                        .paint_only_tree(),
-                );
+                if focused && near {
+                    // The selection's ring, over the cell: neutral ink, whatever the cell holds.
+                    seat.push(styled(format!("{key}/focus"), StyleRef::CellSelected).paint_only());
+                }
             }
             cells.push(
-                group(format!("{key}/seat"))
+                styled(format!("{key}/seat"), StyleRef::Cell)
                     .layout(
                         Layout::default()
                             .width(Length::Fixed(*w))
@@ -1831,19 +2913,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     .children(seat),
             );
         }
-        let mut band = Vec::new();
-        if selected {
-            band.push(styled(
-                format!("tables/row/{}/band", row.pk),
-                StyleRef::Code,
-            ));
-        }
-        band.push(lane(format!("tables/row/{}", row.pk), cells, line));
-        lines.push(
-            group(format!("tables/line/{}", row.pk))
-                .layout(Layout::default().height(Length::Fixed(line)))
-                .children(band),
-        );
+        lines.push(lane(format!("tables/row/{}", row.pk), cells, line, false));
     }
     if rows.is_empty() {
         let words_now = if sheet.rows.is_empty() {
@@ -1870,21 +2940,75 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             Layout::column()
                 .height(Length::Fixed(room))
                 .clipped()
-                .scrolled(view.scroll.min(limit)),
+                .scrolled(scroll),
         )
         .room(room, limit > 0.0)
         .lists_every_row()
         .children(lines);
-    styled("tables/grid", StyleRef::Secondary)
+    let sheet_lines = group("tables/grid/sheet")
+        .layout(Layout::column())
+        .children(vec![
+            styled("tables/grid/top", StyleRef::Cell)
+                .layout(Layout::default().height(Length::Fixed(1.0))),
+            lane("tables/groups".into(), groups, head_line, false),
+            lane("tables/head".into(), headers, line, true),
+            body,
+        ]);
+    // Over the sheet, where columns lie off its side: a thumb along its foot that says how
+    // many and where they stand, and a bar down the key column's edge while some lie under it.
+    let mut over = vec![sheet_lines];
+    if across_limit > 0.0 {
+        let thumb = (room_beside * room_beside / beside)
+            .max(24.0)
+            .min(room_beside);
+        let lead = (room_beside - thumb) * (across / across_limit);
+        let edge = if across > 0.0 {
+            styled("tables/grid/across/edge", StyleRef::SheetBar)
+        } else {
+            group("tables/grid/across/edge")
+        };
+        over.push(
+            group("tables/grid/across")
+                .layout(Layout::row())
+                .children(vec![
+                    group("tables/grid/across/frozen").layout(
+                        Layout::default()
+                            .width(Length::Fixed((gutter + pinned - ACROSS_BAR + 1.0).max(0.0))),
+                    ),
+                    edge.layout(Layout::default().width(Length::Fixed(ACROSS_BAR - 1.0))),
+                    group("tables/grid/across/track")
+                        .layout(Layout::column().width(Length::Fixed(room_beside)))
+                        .children(vec![
+                            group("tables/grid/across/space")
+                                .layout(Layout::default().height(Length::Fill)),
+                            group("tables/grid/across/foot")
+                                .layout(Layout::row().height(Length::Fixed(ACROSS_BAR)))
+                                .children(vec![
+                                    group("tables/grid/across/lead")
+                                        .layout(Layout::default().width(Length::Fixed(lead))),
+                                    styled("tables/grid/across/thumb", StyleRef::SheetBar)
+                                        .layout(Layout::default().width(Length::Fixed(thumb))),
+                                ]),
+                        ]),
+                ])
+                .paint_only_tree(),
+        );
+    }
+    // The frame: a rule down the left and along the top; the cells rule the rest.
+    styled("tables/grid", StyleRef::Cell)
         .layout(
-            Layout::column()
-                .padding(Insets::symmetric(1.0, 4.0))
+            Layout::row()
+                .padding(Insets {
+                    right: 1.0,
+                    bottom: 1.0,
+                    ..Insets::default()
+                })
                 .clipped(),
         )
         .children(vec![
-            lane("tables/groups".into(), groups, head_line),
-            lane("tables/head".into(), headers, line),
-            body,
+            styled("tables/grid/left", StyleRef::Cell)
+                .layout(Layout::default().width(Length::Fixed(1.0))),
+            group("tables/grid/over").children(over),
         ])
 }
 
@@ -2467,7 +3591,7 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
             (
                 *title,
                 sheet.map_or_else(String::new, |s| {
-                    rows_words(view.shown_rows(app, s).len(), s.rows.len())
+                    rows_words(view.shown_count(app, s), s.rows.len())
                 }),
             )
         });
@@ -2570,11 +3694,12 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     }
     let mut columns = vec![
         rail(app, view, rail_w),
+        // `main_w` is the room inside the column's padding.
         group("tables/main")
             .layout(
                 Layout::column()
                     .gap(10.0)
-                    .width(Length::Fixed(main_w))
+                    .width(Length::Fixed(main_w + 32.0))
                     .padding(Insets::all(16.0)),
             )
             .children(main),

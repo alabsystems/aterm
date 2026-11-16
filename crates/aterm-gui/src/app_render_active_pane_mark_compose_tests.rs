@@ -135,7 +135,7 @@ fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
 
     let later = now + Duration::from_millis(16);
     {
-        let ws = app.windows.get_mut(&wid).expect("test window");
+        let mut ws = app.windows.get_mut(&wid).expect("test window");
         ws.focused = false;
         ws.last_key_at = Some(later);
     }
@@ -255,6 +255,7 @@ fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
             assert!(
                 app.windows
                     .get_mut(&wid)
+                    .as_deref_mut()
                     .and_then(|window| window.tab_set.active_mut())
                     .is_some_and(|tab| tab.set_focus(view)),
                 "the leaf is live"

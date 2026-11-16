@@ -690,6 +690,7 @@ fn the_name_takes_only_cells_the_rule_spares() {
             let at = glyph(&app, wid);
             app.windows
                 .get_mut(&wid)
+                .as_deref_mut()
                 .and_then(|ws| ws.claude_lights.sessions.get_mut(&session))
                 .expect("noted")
                 .word = Some(land_at(t, true));

@@ -95,7 +95,19 @@ pub(crate) fn sill_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>,
 }
 
 fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
-    let inks = input.inks;
+    let mut inks = input.inks;
+    if !input.live.fresh {
+        // Keep the last geometry and figures; use the deck's stale-data mix.
+        let dim = |ink| aterm_vitals::ink::mix(inks.ground, ink, 0.55);
+        inks.load = inks.load.map(dim);
+        inks.mem = inks.mem.map(dim);
+        inks.aterm = dim(inks.aterm);
+        inks.tab = dim(inks.tab);
+        inks.tide = dim(inks.tide);
+        inks.rise = dim(inks.rise);
+        inks.warn = dim(inks.warn);
+        inks.critical = dim(inks.critical);
+    }
     let s = g.scale.max(0.5);
     let mut p = Painter::new(&inks, s, g.font_px, input.dwc);
     let mut hits = Vec::new();
@@ -453,10 +465,10 @@ fn memory_lanes(
             rgba(c, 0xFF),
         ));
     }
-    if m.sample.swap_used > 0 {
+    if let Some(swap_used) = m.sample.swap_used.filter(|used| *used > 0) {
         // Swap: a dashed capsule past the column's end, 1 pt after it and
         // ending 1 pt before the next column, so it stays in the gap.
-        let sw = (m.sample.swap_used as f32 / total * w)
+        let sw = (swap_used as f32 / total * w)
             .round()
             .clamp(p.px(2.0), p.px(COL_GAP_PT - 2.0));
         let sx = x + w + p.px(1.0);
